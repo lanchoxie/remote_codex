@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b1020" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>Mobile Codex Remote</title>
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="eyebrow">Mobile Codex Remote</div>
+          <h1>Navigator</h1>
+        </div>
+
+        <section class="nav-section">
+          <div class="section-header">
+            <div>
+              <div class="eyebrow">Overview</div>
+              <h2>Hosts</h2>
+            </div>
+          </div>
+
+          <div id="overview-stats" class="mini-stats"></div>
+
+          <form id="import-form" class="import-form">
+            <input id="import-host-id" placeholder="Import host id, e.g. hpc-login-01" />
+            <button type="submit">Import Host</button>
+          </form>
+
+          <div class="connector-cta">
+            <div>
+              <div class="eyebrow">HPC Connectors</div>
+              <div id="connector-summary" class="meta">No HPC connector profiles saved yet.</div>
+            </div>
+            <button id="open-connector-manager-button" type="button" class="secondary-button">Manage HPC</button>
+          </div>
+
+          <div id="host-overview-list" class="list compact-list"></div>
+          <div id="dismissed-hosts" class="dismissed-hosts"></div>
+        </section>
+
+        <section class="nav-section">
+          <div class="section-header">
+            <div>
+              <div class="eyebrow">Selected Host</div>
+              <h2 id="selected-host-title">No host selected</h2>
+            </div>
+            <div id="selected-host-meta" class="meta"></div>
+          </div>
+
+          <form id="new-session-form" class="new-session-form">
+            <div class="path-input-row">
+              <input id="new-session-cwd" placeholder="Path on selected host, e.g. /home/me/project or D:\\work\\repo" />
+              <button id="browse-directory-button" type="button" class="secondary-button">Browse</button>
+            </div>
+            <input id="new-session-label" placeholder="Optional conversation title" />
+            <div class="inline-actions">
+              <button type="submit">New In Directory</button>
+              <button id="use-selected-path-button" type="button" class="secondary-button">Use Selected Path</button>
+            </div>
+          </form>
+
+          <div id="session-list" class="list conversation-list"></div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="detail-header">
+          <div>
+            <div class="eyebrow">Conversation</div>
+            <h2 id="session-title">No session selected</h2>
+            <div id="session-meta" class="meta"></div>
+          </div>
+          <div class="detail-actions">
+            <button id="toggle-status-button" type="button" class="secondary-button">Status</button>
+            <button id="import-selected-host-button" type="button" class="secondary-button">Import Host</button>
+            <button id="toggle-alerts-button" type="button" class="secondary-button">Alerts</button>
+            <button id="join-session-button" type="button" class="secondary-button">Join Running Session</button>
+            <button id="resume-session-button" type="button" class="secondary-button">Resume From History</button>
+            <button id="fork-session-button" type="button">Fork New Branch</button>
+          </div>
+        </header>
+
+        <section class="panel detail-panel">
+          <div class="detail-grid">
+            <div class="detail-card">
+              <div class="eyebrow">Path</div>
+              <div id="session-path" class="detail-path">(unknown path)</div>
+            </div>
+            <div class="detail-card">
+              <div class="eyebrow">Status</div>
+              <div id="session-status" class="detail-value">No session selected</div>
+            </div>
+            <div class="detail-card">
+              <div class="eyebrow">Runner</div>
+              <div id="session-runner" class="detail-value">Unknown</div>
+            </div>
+            <div class="detail-card detail-card-wide">
+              <div class="eyebrow">Latest User Message</div>
+              <div id="latest-user-message" class="detail-copy">Select a conversation to inspect it.</div>
+            </div>
+            <div class="detail-card detail-card-wide">
+              <div class="eyebrow">Latest Agent Message</div>
+              <div id="latest-agent-message" class="detail-copy">A managed session can continue work from this workspace.</div>
+            </div>
+            <div class="detail-card detail-card-wide">
+              <div class="eyebrow">Session Variants</div>
+              <div id="session-variants" class="variant-strip"></div>
+            </div>
+            <div id="session-warning-card" class="detail-card detail-card-wide warning-card hidden">
+              <div class="eyebrow">Runner Notes</div>
+              <div id="session-warning" class="detail-copy">No warning.</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel runtime-panel">
+          <div class="runtime-panel-header">
+            <div>
+              <div class="eyebrow">Live Runtime</div>
+              <div id="runtime-panel-title" class="runtime-panel-title">No live session attached</div>
+              <div id="runtime-panel-subtitle" class="runtime-panel-subtitle">Select or start a managed session to see live status, timers, and commands.</div>
+            </div>
+            <div class="runtime-panel-actions">
+              <button id="runtime-open-status-button" type="button" class="secondary-button">Full Status</button>
+              <button id="runtime-interrupt-button" type="button" class="danger-button">Interrupt</button>
+              <button id="runtime-compact-button" type="button" class="secondary-button">/compact</button>
+            </div>
+          </div>
+          <div id="runtime-chip-row" class="runtime-chip-row"></div>
+          <div class="runtime-inline-grid">
+            <section class="runtime-command-card">
+              <div class="runtime-command-title">Steer Current Turn</div>
+              <form id="inline-steer-form" class="status-inline-form">
+                <textarea id="inline-steer-input" rows="3" placeholder="Guide the active turn without starting a new one..."></textarea>
+                <button id="inline-steer-submit-button" type="submit" class="secondary-button">Steer Turn</button>
+              </form>
+            </section>
+            <section class="runtime-command-card">
+              <div class="runtime-command-title">Shell Command</div>
+              <form id="inline-shell-command-form" class="status-inline-form">
+                <input id="inline-shell-command-input" placeholder="Run a host shell command through thread/shellCommand" />
+                <button id="inline-shell-command-submit-button" type="submit" class="danger-button">Run Command</button>
+              </form>
+              <div class="runtime-command-note">Runs through `thread/shellCommand` on the selected host.</div>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel transcript-panel">
+          <div id="session-log" class="log"></div>
+          <form id="input-form" class="composer">
+            <input id="input-text" placeholder="Send a follow-up prompt to the live managed session..." autocomplete="off" />
+            <button type="submit">Send</button>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <button id="alerts-fab" type="button" class="alerts-fab hidden">
+      Alerts
+      <span id="alerts-fab-count" class="alerts-fab-count">0</span>
+    </button>
+
+    <aside id="alerts-window" class="alerts-window hidden" aria-live="polite">
+      <div class="alerts-header">
+        <div>
+          <div class="eyebrow">Session Alerts</div>
+          <div id="alerts-title" class="alerts-title">No session selected</div>
+        </div>
+        <button id="close-alerts-button" type="button" class="secondary-button">Minimize</button>
+      </div>
+      <div id="alerts-empty" class="empty-state">No important warnings or errors for this session.</div>
+      <div id="alerts-list" class="alerts-list"></div>
+    </aside>
+
+    <div id="status-window-overlay" class="status-window-overlay hidden">
+      <section id="status-window" class="status-window-modal" role="dialog" aria-modal="true" aria-labelledby="status-window-title">
+        <div class="status-window-header">
+          <div>
+            <div class="eyebrow">Codex Status</div>
+            <div id="status-window-title" class="status-window-title">No session selected</div>
+            <div id="status-window-subtitle" class="status-window-subtitle">Status details will appear here.</div>
+          </div>
+          <button id="close-status-window-button" type="button" class="secondary-button">Close</button>
+        </div>
+        <div class="status-window-actions">
+          <button id="interrupt-turn-button" type="button" class="danger-button">Interrupt Turn</button>
+          <button id="compact-thread-button" type="button" class="secondary-button">Compact Context</button>
+          <button id="refresh-status-button" type="button" class="secondary-button">Refresh</button>
+        </div>
+        <div class="status-control-grid">
+          <section class="status-section">
+            <div class="status-section-label">Steer Current Turn</div>
+            <form id="steer-form" class="status-inline-form">
+              <textarea id="steer-input" rows="3" placeholder="Adjust the current Codex turn without starting a new one..."></textarea>
+              <button id="steer-submit-button" type="submit">Steer Turn</button>
+            </form>
+          </section>
+          <section class="status-section">
+            <div class="status-section-label">Shell Command</div>
+            <form id="shell-command-form" class="status-inline-form">
+              <input id="shell-command-input" placeholder="Run a host shell command through thread/shellCommand" />
+              <button id="shell-command-submit-button" type="submit" class="danger-button">Run Shell Command</button>
+            </form>
+            <div class="status-request-note">This path is intentionally powerful. `thread/shellCommand` runs unsandboxed on the selected host.</div>
+          </section>
+        </div>
+        <div id="status-summary-grid" class="status-summary-grid"></div>
+        <div class="status-section">
+          <div class="status-section-label">Thinking</div>
+          <div id="status-thinking" class="status-copy">No reasoning summary yet.</div>
+        </div>
+        <div class="status-section">
+          <div class="status-section-label">Token Usage</div>
+          <div id="status-usage" class="status-copy">No token usage reported yet.</div>
+        </div>
+        <div class="status-section">
+          <div class="status-section-label">Rate Limits</div>
+          <div id="status-rate-limits" class="status-copy">No rate limit snapshot yet.</div>
+        </div>
+        <div class="status-section">
+          <div class="status-section-label">Requests</div>
+          <div id="status-requests" class="status-request-list"></div>
+        </div>
+        <div class="status-section">
+          <div class="status-section-label">Warnings & Errors</div>
+          <div id="status-alerts" class="status-alert-list"></div>
+        </div>
+        <div class="status-section">
+          <div class="status-section-label">Event Timeline</div>
+          <div id="status-diagnostics" class="status-diagnostic-list"></div>
+        </div>
+      </section>
+    </div>
+
+    <div id="directory-picker-overlay" class="directory-picker-overlay hidden">
+      <section id="directory-picker" class="directory-picker-modal" role="dialog" aria-modal="true" aria-labelledby="picker-host">
+        <div class="picker-header">
+          <div>
+            <div class="eyebrow">Directory Picker</div>
+            <div id="picker-host" class="picker-title">No host selected</div>
+          </div>
+          <button id="close-directory-picker-button" type="button" class="secondary-button">Close</button>
+        </div>
+        <div id="picker-status" class="picker-status">Choose a host to browse its directories.</div>
+        <div id="picker-current-path" class="picker-current-path">(no path selected)</div>
+        <div class="picker-actions">
+          <button id="picker-up-button" type="button" class="secondary-button">Up</button>
+          <button id="picker-refresh-button" type="button" class="secondary-button">Refresh</button>
+          <button id="picker-select-button" type="button">Use This Directory</button>
+        </div>
+        <div>
+          <div class="picker-section-label">Roots</div>
+          <div id="picker-roots" class="picker-chip-row"></div>
+        </div>
+        <div>
+          <div class="picker-section-label">Recent</div>
+          <div id="picker-recents" class="picker-entry-list"></div>
+        </div>
+        <div>
+          <div class="picker-section-label">Folders</div>
+          <div id="picker-directories" class="picker-entry-list"></div>
+        </div>
+      </section>
+    </div>
+
+    <div id="connector-manager-overlay" class="connector-manager-overlay hidden">
+      <section id="connector-manager" class="connector-manager-modal" role="dialog" aria-modal="true" aria-labelledby="connector-manager-title">
+        <div class="connector-manager-header">
+          <div>
+            <div class="eyebrow">HPC Connector Manager</div>
+            <div id="connector-manager-title" class="status-window-title">Saved connector profiles</div>
+            <div class="status-window-subtitle">Save the route, gateway, and bootstrap recipe. Do not store passwords, OTP codes, or captcha answers.</div>
+          </div>
+          <button id="close-connector-manager-button" type="button" class="secondary-button">Close</button>
+        </div>
+        <div class="connector-manager-note">Best default: run a host agent on the HPC login node, let it dial the relay outward, and use tmux or a user service to keep it alive.</div>
+        <div class="connector-manager-grid">
+          <section class="connector-library">
+            <div class="connector-library-header">
+              <div>
+                <div class="eyebrow">Saved Connectors</div>
+                <div class="connector-library-title">Profiles</div>
+              </div>
+              <button id="new-connector-button" type="button" class="secondary-button">New Connector</button>
+            </div>
+            <div id="connector-list" class="connector-list"></div>
+          </section>
+
+          <section id="connector-editor" class="connector-editor-panel">
+            <div class="connector-editor-heading">
+              <div class="eyebrow">Connector Editor</div>
+              <div id="connector-editor-title" class="connector-editor-title">New connector</div>
+              <div id="connector-editor-subtitle" class="status-window-subtitle">Create a saved HPC recipe.</div>
+            </div>
+            <div class="connector-runbook">
+              <div class="connector-runbook-header">
+                <div>
+                  <div class="connector-group-title">Generated Bootstrap</div>
+                  <div id="connector-runbook-summary" class="connector-plan">Save a connector to generate its tmux command.</div>
+                </div>
+                <div class="connector-runbook-actions">
+                  <button id="copy-connector-login-button" type="button" class="secondary-button">Copy Login</button>
+                  <button id="copy-connector-smoke-button" type="button" class="secondary-button">Copy Test</button>
+                  <button id="copy-connector-command-button" type="button" class="secondary-button">Copy Bootstrap</button>
+                </div>
+              </div>
+              <div class="connector-group-title">SSH Login</div>
+              <pre id="connector-login-command" class="connector-command-preview">(no login command yet)</pre>
+              <div class="connector-group-title">SSH Smoke Test</div>
+              <pre id="connector-smoke-command" class="connector-command-preview">(no smoke test yet)</pre>
+              <div class="connector-group-title">tmux Bootstrap</div>
+              <pre id="connector-bootstrap-command" class="connector-command-preview">(no command yet)</pre>
+              <div id="connector-plan-steps" class="connector-runbook-list"></div>
+              <div id="connector-plan-warnings" class="connector-runbook-list warning"></div>
+            </div>
+            <form id="connector-form" class="connector-form">
+              <input type="hidden" id="connector-id" />
+              <div class="connector-group">
+                <div class="connector-group-title">Basics</div>
+                <div class="connector-field-grid">
+                  <input id="connector-label" placeholder="Label, e.g. Campus HPC" />
+                  <select id="connector-kind">
+                    <option value="outbound_agent">Outbound Agent</option>
+                    <option value="ssh_jump">SSH Jump</option>
+                    <option value="gateway_agent">Gateway Sidecar</option>
+                    <option value="reverse_tunnel">Reverse Tunnel</option>
+                    <option value="manual_only">Manual Only</option>
+                  </select>
+                  <input id="connector-host-id" placeholder="Optional host id, e.g. hpc-login-01" />
+                  <input id="connector-relay-url" placeholder="Relay URL, e.g. https://relay.example.com" />
+                  <input id="connector-target-host" placeholder="Target host, e.g. login.cluster.edu" />
+                  <input id="connector-target-port" type="number" min="1" step="1" placeholder="22" />
+                  <input id="connector-username" placeholder="Login username" />
+                  <input id="connector-codex-home" placeholder="CODEX_HOME, e.g. ~/.codex" />
+                  <textarea id="connector-workspace-roots" rows="3" placeholder="Workspace roots, one per line"></textarea>
+                </div>
+              </div>
+
+              <div class="connector-group">
+                <div class="connector-group-title">Gateway</div>
+                <div class="connector-field-grid">
+                  <select id="connector-gateway-enabled">
+                    <option value="false">Gateway Disabled</option>
+                    <option value="true">Gateway Enabled</option>
+                  </select>
+                  <input id="connector-gateway-host" placeholder="Gateway host" />
+                  <input id="connector-gateway-port" type="number" min="1" step="1" placeholder="22" />
+                  <input id="connector-gateway-username" placeholder="Gateway username" />
+                  <input id="connector-proxy-jump" placeholder="ProxyJump / jump rule" />
+                  <select id="connector-gateway-auth-method">
+                    <option value="ssh_key">Gateway SSH Key</option>
+                    <option value="ssh_agent">Gateway SSH Agent</option>
+                    <option value="password">Gateway Password</option>
+                    <option value="keyboard_interactive">Gateway Keyboard-Interactive</option>
+                    <option value="otp">Gateway OTP / MFA</option>
+                    <option value="browser_sso">Gateway Browser SSO</option>
+                    <option value="manual_captcha">Gateway Captcha</option>
+                  </select>
+                  <input id="connector-gateway-otp-source" placeholder="Gateway OTP source, authenticator, or notes" />
+                </div>
+              </div>
+
+              <div class="connector-group">
+                <div class="connector-group-title">Target Auth</div>
+                <div class="connector-field-grid">
+                  <select id="connector-auth-method">
+                    <option value="ssh_key">SSH Key</option>
+                    <option value="ssh_agent">SSH Agent</option>
+                    <option value="password">Password</option>
+                    <option value="keyboard_interactive">Keyboard-Interactive</option>
+                    <option value="otp">OTP / MFA</option>
+                    <option value="browser_sso">Browser SSO</option>
+                    <option value="manual_captcha">Manual Captcha</option>
+                  </select>
+                  <input id="connector-auth-key-path" placeholder="SSH key path, if any" />
+                  <select id="connector-auth-agent-forwarding">
+                    <option value="true">Agent Forwarding On</option>
+                    <option value="false">Agent Forwarding Off</option>
+                  </select>
+                  <select id="connector-auth-remember-device">
+                    <option value="false">Do Not Remember Device</option>
+                    <option value="true">Remember Device</option>
+                  </select>
+                  <input id="connector-auth-otp-source" placeholder="OTP source, authenticator, or notes" />
+                </div>
+              </div>
+
+              <div class="connector-group">
+                <div class="connector-group-title">Bootstrap</div>
+                <div class="connector-field-grid">
+                  <select id="connector-bootstrap-mode">
+                    <option value="manual_tmux">Manual + tmux</option>
+                    <option value="manual_systemd">Manual + systemd</option>
+                    <option value="ssh_exec">SSH Exec</option>
+                    <option value="gateway_launcher">Gateway Launcher</option>
+                    <option value="manual_only">Manual Only</option>
+                  </select>
+                  <input id="connector-bootstrap-remote-directory" placeholder="Remote agent directory" />
+                  <input id="connector-bootstrap-tmux-session" placeholder="tmux session name" />
+                  <input id="connector-bootstrap-service-name" placeholder="systemd service name" />
+                  <input id="connector-bootstrap-launch-command" placeholder="Optional custom launch command" />
+                </div>
+              </div>
+
+              <div class="connector-group">
+                <div class="connector-group-title">Notes</div>
+                <textarea id="connector-notes" rows="4" placeholder="Notes, warnings, or campus-specific steps"></textarea>
+              </div>
+
+              <div class="connector-form-actions">
+                <button id="save-connector-button" type="submit">Save Connector</button>
+                <button id="delete-connector-button" type="button" class="danger-button hidden">Delete Connector</button>
+              </div>
+            </form>
+          </section>
+        </div>
+      </section>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

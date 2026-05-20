@@ -1,0 +1,9 @@
+{
+  "name": "Mobile Codex Remote",
+  "short_name": "Codex Remote",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1020",
+  "theme_color": "#0b1020",
+  "description": "Mobile-first control surface for Codex sessions on PC and HPC hosts."
+}

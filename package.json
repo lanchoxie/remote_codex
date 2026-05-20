@@ -1,0 +1,13 @@
+{
+  "name": "mobile-codex-remote",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Mobile control plane for Codex sessions on PCs and HPC hosts.",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "relay": "node apps/relay/server.js",
+    "agent": "node apps/host-agent/agent.js",
+    "test:managed": "node scripts/test-managed-session.js"
+  }
+}
