@@ -8,3 +8,6 @@ Thumbs.db
 *.pid
 logs/
 tmp/connectors.json
+tmp/connector-secrets.json
+tmp/remote-codex-askpass.cmd
+tmp/askpass-state-*.txt

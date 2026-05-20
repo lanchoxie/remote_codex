@@ -96,6 +96,10 @@ Supported actions:
 - `status`: checks the remote tmux agent session when the connector can use non-interactive SSH.
 - `bootstrap`: starts the remote host agent through SSH when the connector can use non-interactive SSH.
 
+Saved connector passwords are kept out of connector profiles. They live in the
+ignored local file `tmp/connector-secrets.json` and are used only by connector
+actions on the relay machine.
+
 ## Event model
 
 Host agents poll `/api/agent/commands` and post events to `/api/agent/events`.

@@ -367,6 +367,7 @@
                     <option value="browser_sso">Gateway Browser SSO</option>
                     <option value="manual_captcha">Gateway Captcha</option>
                   </select>
+                  <input id="connector-gateway-password" type="password" autocomplete="new-password" placeholder="Gateway password, saved locally only" />
                   <input id="connector-gateway-otp-source" placeholder="Gateway OTP source, authenticator, or notes" />
                 </div>
               </div>
@@ -384,6 +385,7 @@
                     <option value="manual_captcha">Manual Captcha</option>
                   </select>
                   <input id="connector-auth-key-path" placeholder="SSH key path, if any" />
+                  <input id="connector-auth-password" type="password" autocomplete="new-password" placeholder="Target password, saved locally only" />
                   <select id="connector-auth-agent-forwarding">
                     <option value="true">Agent Forwarding On</option>
                     <option value="false">Agent Forwarding Off</option>

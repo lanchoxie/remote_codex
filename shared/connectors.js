@@ -377,6 +377,15 @@ function buildSshCommandParts(connector, options = {}) {
   if (options.connectTimeout) {
     args.push('-o', `ConnectTimeout=${normalizePort(options.connectTimeout, 8)}`);
   }
+  if (options.strictHostKeyChecking) {
+    args.push('-o', `StrictHostKeyChecking=${options.strictHostKeyChecking}`);
+  }
+  if (options.userKnownHostsFile) {
+    args.push('-o', `UserKnownHostsFile=${options.userKnownHostsFile}`);
+  }
+  if (options.numberOfPasswordPrompts) {
+    args.push('-o', `NumberOfPasswordPrompts=${normalizePort(options.numberOfPasswordPrompts, 1)}`);
+  }
   if (options.preferredAuthentications) {
     args.push('-o', `PreferredAuthentications=${options.preferredAuthentications}`);
   }

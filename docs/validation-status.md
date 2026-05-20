@@ -17,7 +17,7 @@ This document tracks what we have actually verified versus what is still design 
 | Interrupt/steer/compact/shell command controls | UI and relay command routes are wired | Individual Codex backend behaviors still need dedicated tests |
 | Connector persistence API | `/api/connectors` returns saved profiles from relay storage | Stored under `tmp/connectors.json` |
 | HPC connector command generation | `shared/connectors.js` generates `tmux` bootstrap commands | Command format verified locally, not yet run on HPC |
-| HPC connector actions | Relay can run non-interactive SSH smoke/status/bootstrap actions | Requires key-based or agent-based SSH; interactive auth stays manual |
+| HPC connector actions | Relay can run SSH smoke/status/bootstrap actions | Supports key/agent auth and local saved password auth; OTP/SSO/captcha still manual |
 
 ## Partially verified
 

@@ -13,6 +13,12 @@ const {
   requiresInteractiveAuth,
   saveConnectors,
 } = require('../../shared/connectors');
+const {
+  getConnectorSecretStatus,
+  loadConnectorSecrets,
+  normalizeConnectorSecretsInput,
+  saveConnectorSecrets,
+} = require('../../shared/connector-secrets');
 const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 
 const PORT = Number(process.env.PORT || 8787);
@@ -31,6 +37,7 @@ const state = {
   sessionRequests: new Map(),
   pendingDirectoryRequests: new Map(),
   connectors: new Map(),
+  connectorSecrets: loadConnectorSecrets(),
   nextCommandId: 1,
 };
 
@@ -523,6 +530,29 @@ function persistConnectors() {
   saveConnectors(Array.from(state.connectors.values()));
 }
 
+function persistConnectorSecrets() {
+  saveConnectorSecrets(state.connectorSecrets);
+}
+
+function upsertConnectorSecretsFromBody(connectorId, body) {
+  const input = body?.secrets || {};
+  const gatewayPassword = typeof input.gatewayPassword === 'string' ? input.gatewayPassword : '';
+  const targetPassword = typeof input.targetPassword === 'string' ? input.targetPassword : '';
+  if (!gatewayPassword && !targetPassword) {
+    return false;
+  }
+
+  const existing = state.connectorSecrets.get(connectorId) || null;
+  const next = normalizeConnectorSecretsInput({
+    connectorId,
+    gatewayPassword: gatewayPassword || existing?.gatewayPassword || '',
+    targetPassword: targetPassword || existing?.targetPassword || '',
+  }, existing);
+  state.connectorSecrets.set(connectorId, next);
+  persistConnectorSecrets();
+  return true;
+}
+
 function getConnectorHost(connector) {
   if (!connector?.hostId) {
     return null;
@@ -532,13 +562,20 @@ function getConnectorHost(connector) {
 }
 
 function decorateSingleConnector(connector) {
-  return decorateConnector(connector, getConnectorHost(connector));
+  const secret = state.connectorSecrets.get(connector.connectorId) || null;
+  return {
+    ...decorateConnector(connector, getConnectorHost(connector)),
+    secretStatus: getConnectorSecretStatus(secret),
+  };
 }
 
 function getConnectorList() {
   const hosts = new Map(getHostList().map((host) => [host.hostId, host]));
   return Array.from(state.connectors.values())
-    .map((connector) => decorateConnector(connector, connector.hostId ? hosts.get(connector.hostId) || null : null))
+    .map((connector) => ({
+      ...decorateConnector(connector, connector.hostId ? hosts.get(connector.hostId) || null : null),
+      secretStatus: getConnectorSecretStatus(state.connectorSecrets.get(connector.connectorId) || null),
+    }))
     .sort((a, b) => {
       const phaseDelta = String(a.runtime?.phaseLabel || '').localeCompare(String(b.runtime?.phaseLabel || ''));
       if (phaseDelta !== 0) {
@@ -582,6 +619,10 @@ function runProcess(command, args, options = {}) {
       child = spawn(command, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
+        env: {
+          ...process.env,
+          ...(options.env || {}),
+        },
       });
     } catch (error) {
       finish({
@@ -627,22 +668,121 @@ function runProcess(command, args, options = {}) {
   });
 }
 
-function connectorRequiresManualAuth(connector) {
-  return requiresInteractiveAuth(connector.auth?.method)
-    || (connectorUsesGateway(connector) && requiresInteractiveAuth(connector.gateway?.authMethod));
+function connectorPasswordMethod(method) {
+  return method === 'password' || method === 'keyboard_interactive';
 }
 
-function buildConnectorAction(connector, action) {
+function connectorNeedsManualAuth(connector, secret) {
+  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
+  const targetMethod = connector.auth?.method || 'ssh_key';
+  const gatewayNeedsSecret = connectorUsesGateway(connector) && requiresInteractiveAuth(gatewayMethod);
+  const targetNeedsSecret = requiresInteractiveAuth(targetMethod);
+  const gatewayCovered = connectorPasswordMethod(gatewayMethod) && Boolean(secret?.gatewayPassword);
+  const targetCovered = connectorPasswordMethod(targetMethod) && Boolean(secret?.targetPassword);
+
+  return (gatewayNeedsSecret && !gatewayCovered)
+    || (targetNeedsSecret && !targetCovered)
+    || (gatewayNeedsSecret && !connectorPasswordMethod(gatewayMethod))
+    || (targetNeedsSecret && !connectorPasswordMethod(targetMethod));
+}
+
+function connectorUsesAskpass(connector, secret) {
+  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
+  const targetMethod = connector.auth?.method || 'ssh_key';
+  return Boolean(
+    (connectorUsesGateway(connector) && connectorPasswordMethod(gatewayMethod) && secret?.gatewayPassword)
+    || (connectorPasswordMethod(targetMethod) && secret?.targetPassword)
+  );
+}
+
+function ensureAskpassHelper() {
+  const helperPath = path.join(process.cwd(), 'tmp', 'remote-codex-askpass.cmd');
+  const script = [
+    '@echo off',
+    'setlocal EnableExtensions',
+    'set "STATE_FILE=%RC_ASKPASS_STATE_FILE%"',
+    'set "INDEX=1"',
+    'if defined STATE_FILE if exist "%STATE_FILE%" set /p INDEX=<"%STATE_FILE%"',
+    'if "%INDEX%"=="1" (',
+    '  if defined STATE_FILE >"%STATE_FILE%" echo 2',
+    '  set "B64=%RC_ASKPASS_PASSWORD_1_B64%"',
+    ') else (',
+    '  if defined STATE_FILE >"%STATE_FILE%" echo 2',
+    '  set "B64=%RC_ASKPASS_PASSWORD_2_B64%"',
+    ')',
+    'if not defined B64 set "B64=%RC_ASKPASS_PASSWORD_1_B64%"',
+    'powershell -NoProfile -Command "$b64=$env:B64; if ([string]::IsNullOrWhiteSpace($b64)) { exit 1 }; [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))"',
+  ].join('\r\n');
+  fs.mkdirSync(path.dirname(helperPath), { recursive: true });
+  fs.writeFileSync(helperPath, script, 'utf8');
+  return helperPath;
+}
+
+function base64Secret(value) {
+  return Buffer.from(String(value || ''), 'utf8').toString('base64');
+}
+
+function buildAskpassEnv(connector, secret) {
+  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
+  const targetMethod = connector.auth?.method || 'ssh_key';
+  const gatewayNeedsPassword = connectorUsesGateway(connector) && connectorPasswordMethod(gatewayMethod);
+  const targetNeedsPassword = connectorPasswordMethod(targetMethod);
+  const firstPassword = gatewayNeedsPassword
+    ? (secret?.gatewayPassword || secret?.targetPassword || '')
+    : (secret?.targetPassword || secret?.gatewayPassword || '');
+  const secondPassword = targetNeedsPassword
+    ? (secret?.targetPassword || firstPassword)
+    : firstPassword;
+  const statePath = path.join(process.cwd(), 'tmp', `askpass-state-${connector.connectorId || makeId()}.txt`);
+
+  try {
+    fs.rmSync(statePath, { force: true });
+  } catch (_) {
+    // Best effort. A stale state file only changes which saved password is tried first.
+  }
+
+  return {
+    SSH_ASKPASS: ensureAskpassHelper(),
+    SSH_ASKPASS_REQUIRE: 'force',
+    DISPLAY: process.env.DISPLAY || 'remote-codex',
+    RC_ASKPASS_STATE_FILE: statePath,
+    RC_ASKPASS_PASSWORD_1_B64: base64Secret(firstPassword),
+    RC_ASKPASS_PASSWORD_2_B64: base64Secret(secondPassword || firstPassword),
+  };
+}
+
+function buildSshActionOptions(connector, action, secret) {
+  const useAskpass = connectorUsesAskpass(connector, secret);
+  const options = {
+    connectTimeout: action === 'bootstrap' ? 12 : 8,
+    disableTty: true,
+    strictHostKeyChecking: 'accept-new',
+  };
+
+  if (useAskpass) {
+    options.preferredAuthentications = 'password,keyboard-interactive';
+  } else {
+    options.batchMode = true;
+  }
+
+  return options;
+}
+
+function buildConnectorAction(connector, action, secret = null) {
+  const baseOptions = buildSshActionOptions(connector, action, secret);
+  const env = connectorUsesAskpass(connector, secret)
+    ? buildAskpassEnv(connector, secret)
+    : null;
+
   if (action === 'smoke_test') {
     return {
       timeoutMs: 12_000,
       commandParts: buildSshCommandParts(connector, {
-        batchMode: true,
-        connectTimeout: 8,
-        disableTty: true,
+        ...baseOptions,
         remoteCommand: 'echo SSH_OK',
       }),
       displayCommand: decorateSingleConnector(connector).plan.sshSmokeTestCommand,
+      env,
     };
   }
 
@@ -650,12 +790,11 @@ function buildConnectorAction(connector, action) {
     return {
       timeoutMs: 12_000,
       commandParts: buildSshCommandParts(connector, {
-        batchMode: true,
-        connectTimeout: 8,
-        disableTty: true,
+        ...baseOptions,
         remoteCommand: buildRemoteStatusCommand(connector),
       }),
       displayCommand: decorateSingleConnector(connector).plan.sshStatusCommand,
+      env,
     };
   }
 
@@ -665,14 +804,13 @@ function buildConnectorAction(connector, action) {
       timeoutMs: 20_000,
       commandParts: remoteCommand
         ? buildSshCommandParts(connector, {
-          batchMode: true,
-          connectTimeout: 12,
-          disableTty: true,
+          ...baseOptions,
           remoteCommand,
         })
         : null,
       displayCommand: decorateSingleConnector(connector).plan.sshBootstrapCommand,
       remoteCommand,
+      env,
     };
   }
 
@@ -721,6 +859,7 @@ function classifyConnectorAction(action, run) {
 
 async function runConnectorAction(connector, action) {
   const decorated = decorateSingleConnector(connector);
+  const secret = state.connectorSecrets.get(connector.connectorId) || null;
   const manualCommand = decorated.plan.sshLoginCommand;
   const manualBootstrapCommand = decorated.plan.bootstrapCommand;
 
@@ -731,14 +870,14 @@ async function runConnectorAction(connector, action) {
     };
   }
 
-  if ((action === 'status' || action === 'bootstrap') && connectorRequiresManualAuth(connector)) {
+  if (connectorNeedsManualAuth(connector, secret)) {
     return {
       httpStatus: 200,
       payload: {
         ok: false,
         action,
         status: 'manual_required',
-        message: 'This connector uses interactive auth. Run the SSH login and bootstrap commands manually, then wait for the host to appear online.',
+        message: 'This connector needs a saved local password or a manual SSH login before the relay can run it automatically.',
         command: manualCommand,
         bootstrapCommand: manualBootstrapCommand,
         connector: decorated,
@@ -746,7 +885,7 @@ async function runConnectorAction(connector, action) {
     };
   }
 
-  const actionConfig = buildConnectorAction(connector, action);
+  const actionConfig = buildConnectorAction(connector, action, secret);
   if (!actionConfig?.commandParts) {
     return {
       httpStatus: 200,
@@ -764,7 +903,10 @@ async function runConnectorAction(connector, action) {
   const run = await runProcess(
     actionConfig.commandParts.command,
     actionConfig.commandParts.args,
-    { timeoutMs: actionConfig.timeoutMs }
+    {
+      timeoutMs: actionConfig.timeoutMs,
+      env: actionConfig.env || null,
+    }
   );
   const classification = classifyConnectorAction(action, run);
   return {
@@ -1048,8 +1190,9 @@ async function handleRequest(req, res) {
     const body = await readBody(req);
     const connector = normalizeConnectorInput(body);
     state.connectors.set(connector.connectorId, connector);
+    upsertConnectorSecretsFromBody(connector.connectorId, body);
     persistConnectors();
-    sendJson(res, 200, { ok: true, connector: decorateConnector(connector) });
+    sendJson(res, 200, { ok: true, connector: decorateSingleConnector(connector) });
     return;
   }
 
@@ -1064,8 +1207,9 @@ async function handleRequest(req, res) {
     const body = await readBody(req);
     const connector = normalizeConnectorInput({ ...body, connectorId }, existing);
     state.connectors.set(connector.connectorId, connector);
+    upsertConnectorSecretsFromBody(connector.connectorId, body);
     persistConnectors();
-    sendJson(res, 200, { ok: true, connector: decorateConnector(connector) });
+    sendJson(res, 200, { ok: true, connector: decorateSingleConnector(connector) });
     return;
   }
 
@@ -1075,6 +1219,9 @@ async function handleRequest(req, res) {
     if (!existed) {
       sendJson(res, 404, { error: 'connector not found' });
       return;
+    }
+    if (state.connectorSecrets.delete(connectorId)) {
+      persistConnectorSecrets();
     }
     persistConnectors();
     sendJson(res, 200, { ok: true, connectorId });

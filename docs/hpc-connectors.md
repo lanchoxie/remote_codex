@@ -20,10 +20,14 @@ This project treats HPC access as a saved connector profile, not as ad-hoc phone
 
 ## What it must not store
 
-- passwords;
 - OTP codes;
 - captcha answers;
 - long-lived session cookies.
+
+Passwords are not stored in `tmp/connectors.json`. If the user explicitly saves
+one for local automation, it is kept in the local-only
+`tmp/connector-secrets.json` file, which is ignored by Git and should be treated
+as sensitive machine-local state.
 
 ## Password prompts
 
@@ -53,9 +57,11 @@ Use the smoke test when you want a quick "does this key-based path connect?" che
 If it succeeds, the path is effectively passwordless for that host combination.
 If it fails and the login command still prompts for a password or MFA, the profile is saved but not yet passwordless.
 
-The executable actions intentionally use `BatchMode=yes`. Password, OTP, browser SSO,
-and captcha flows still stay manual: run `SSH Login`, finish the prompt yourself,
-then run the generated `tmux Bootstrap` command on the target.
+For key-based paths, executable actions use `BatchMode=yes`. For saved password
+paths, the relay uses the local OpenSSH askpass mechanism so the password does
+not appear in the command line. OTP, browser SSO, and captcha flows still stay
+manual: run `SSH Login`, finish the prompt yourself, then run the generated
+`tmux Bootstrap` command on the target.
 
 ## Auth modes
 
@@ -81,6 +87,7 @@ For `Start Agent` to work, the relay machine must have:
 
 - the `ssh` executable available;
 - key-based or agent-based access to the final login node;
+- or a saved local password secret for password / keyboard-interactive auth;
 - any configured gateway reachable through `ProxyJump`;
 - the project already present at the connector's remote directory;
 - `node` and `tmux` available on the remote host for the default `manual_tmux` mode.

@@ -971,6 +971,10 @@ function buildConnectorDraft() {
       interactiveAuth: false,
       attachedHostOnline: false,
     },
+    secretStatus: {
+      hasGatewayPassword: false,
+      hasTargetPassword: false,
+    },
   };
 }
 
@@ -1056,9 +1060,17 @@ function populateConnectorForm(connector) {
   el('connector-gateway-username').value = draft.gateway?.username || '';
   el('connector-proxy-jump').value = draft.gateway?.proxyJump || '';
   el('connector-gateway-auth-method').value = draft.gateway?.authMethod || 'ssh_key';
+  el('connector-gateway-password').value = '';
+  el('connector-gateway-password').placeholder = draft.secretStatus?.hasGatewayPassword
+    ? 'Gateway password saved locally; leave blank to keep it'
+    : 'Gateway password, saved locally only';
   el('connector-gateway-otp-source').value = draft.gateway?.otpSource || '';
   el('connector-auth-method').value = draft.auth?.method || 'ssh_key';
   el('connector-auth-key-path').value = draft.auth?.keyPath || '';
+  el('connector-auth-password').value = '';
+  el('connector-auth-password').placeholder = draft.secretStatus?.hasTargetPassword
+    ? 'Target password saved locally; leave blank to keep it'
+    : 'Target password, saved locally only';
   el('connector-auth-agent-forwarding').value = draft.auth?.agentForwarding ? 'true' : 'false';
   el('connector-auth-remember-device').value = draft.auth?.rememberDevice ? 'true' : 'false';
   el('connector-auth-otp-source').value = draft.auth?.otpSource || '';
@@ -1103,6 +1115,10 @@ function readConnectorForm() {
       agentForwarding: el('connector-auth-agent-forwarding').value === 'true',
       rememberDevice: el('connector-auth-remember-device').value === 'true',
       otpSource: el('connector-auth-otp-source').value.trim(),
+    },
+    secrets: {
+      gatewayPassword: el('connector-gateway-password').value,
+      targetPassword: el('connector-auth-password').value,
     },
     bootstrap: {
       mode: el('connector-bootstrap-mode').value,
@@ -1235,6 +1251,10 @@ function renderConnectorManager() {
       const item = document.createElement('button');
       item.type = 'button';
       item.className = `connector-card ${connector.connectorId === state.connectorEditorId ? 'active' : ''}`;
+      const secretSummary = [
+        connector.secretStatus?.hasGatewayPassword ? 'gateway password saved' : '',
+        connector.secretStatus?.hasTargetPassword ? 'target password saved' : '',
+      ].filter(Boolean).join(' | ') || 'no saved password';
       item.innerHTML = `
         <div class="connector-card-top">
           <div>
@@ -1245,6 +1265,7 @@ function renderConnectorManager() {
         </div>
         <div class="connector-meta">${connector.hostId || connector.targetHost || '(unbound target)'}</div>
         <div class="connector-meta">${connector.gatewaySummary} | Gateway ${connector.gatewayAuthLabel || 'Auth'} | Target ${connector.authLabel}</div>
+        <div class="connector-meta">${secretSummary}</div>
         <div class="connector-plan">${connector.plan?.summary || 'Saved connector recipe.'}</div>
         <div class="connector-plan">${host ? `Attached host: ${host.label} | ${host.online ? 'online' : 'offline'}` : 'No attached host yet.'}</div>
       `;

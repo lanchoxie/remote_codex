@@ -47,6 +47,7 @@ Interactive auth modes should be treated as human bootstrap steps.
 - UI can create/edit/delete connector profiles.
 - UI displays generated SSH login commands, non-interactive smoke test commands, bootstrap commands, steps, and warnings.
 - Relay can execute non-interactive connector actions: SSH smoke test, tmux status check, and detached host-agent bootstrap.
+- Relay can use a local-only saved password secret through OpenSSH askpass for password / keyboard-interactive paths.
 - UI can run those connector actions and display stdout/stderr/status.
 - Generated `manual_tmux` command is designed for a Linux/HPC shell.
 
@@ -54,7 +55,7 @@ Interactive auth modes should be treated as human bootstrap steps.
 
 - Interactive SSH runner.
 - Gateway launcher daemon.
-- Password or keyboard-interactive prompt relay.
+- Live password or keyboard-interactive prompt relay.
 - Captcha automation.
 - Real HPC validation on a campus cluster.
 - `tmux` pane attach/control runtime.
