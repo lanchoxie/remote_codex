@@ -20,6 +20,8 @@ const state = {
   connectorManagerOpen: false,
   connectors: [],
   connectorEditorId: null,
+  connectorActionResults: new Map(),
+  connectorActionBusy: null,
   directoryPicker: {
     open: false,
     hostId: null,
@@ -33,6 +35,15 @@ const state = {
 };
 
 const el = (id) => document.getElementById(id);
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
@@ -1130,6 +1141,16 @@ function renderConnectorRunbook(connector) {
   const copyButton = el('copy-connector-command-button');
   const copyLoginButton = el('copy-connector-login-button');
   const copySmokeButton = el('copy-connector-smoke-button');
+  const runSmokeButton = el('run-connector-smoke-button');
+  const runStatusButton = el('run-connector-status-button');
+  const runBootstrapButton = el('run-connector-bootstrap-button');
+  const actionResult = el('connector-action-result');
+  const actionKey = connector?.connectorId || '';
+  const busyAction = state.connectorActionBusy?.connectorId === actionKey
+    ? state.connectorActionBusy.action
+    : null;
+  const actionBusy = Boolean(busyAction);
+  const result = actionKey ? state.connectorActionResults.get(actionKey) : null;
   el('connector-runbook-summary').textContent = summary;
   el('connector-login-command').textContent = loginCommand || '(no login command yet)';
   el('connector-smoke-command').textContent = smokeCommand || '(no smoke test yet)';
@@ -1137,8 +1158,52 @@ function renderConnectorRunbook(connector) {
   copyButton.disabled = !command;
   copyLoginButton.disabled = !loginCommand;
   copySmokeButton.disabled = !smokeCommand;
+  runSmokeButton.disabled = !connector || actionBusy;
+  runStatusButton.disabled = !connector || actionBusy;
+  runBootstrapButton.disabled = !connector || actionBusy;
+  runSmokeButton.textContent = busyAction === 'smoke_test' ? 'Running...' : 'Run Test';
+  runStatusButton.textContent = busyAction === 'status' ? 'Checking...' : 'Check Status';
+  runBootstrapButton.textContent = busyAction === 'bootstrap' ? 'Starting...' : 'Start Agent';
+  renderConnectorActionResult(actionResult, result, actionBusy);
   renderConnectorRunbookList(el('connector-plan-steps'), connector?.plan?.steps || [], 'No bootstrap steps yet.');
   renderConnectorRunbookList(el('connector-plan-warnings'), connector?.plan?.warnings || [], 'No MFA or auth warnings.');
+}
+
+function renderConnectorActionResult(container, result, busy) {
+  if (!result && !busy) {
+    container.className = 'connector-action-result hidden';
+    container.textContent = '';
+    return;
+  }
+
+  container.className = `connector-action-result ${result?.ok ? 'success' : result ? 'failure' : ''}`.trim();
+  const lines = [];
+  if (busy) {
+    lines.push('Running remote connector action...');
+  }
+  if (result) {
+    lines.push(`${prettyStatusLabel(result.status || result.action || 'Result')}: ${result.message || ''}`.trim());
+    if (result.expectedHostId) {
+      lines.push(`Expected host: ${result.expectedHostId}`);
+    }
+    if (typeof result.exitCode !== 'undefined' && result.exitCode !== null) {
+      lines.push(`Exit code: ${result.exitCode}`);
+    }
+    if (result.stdout) {
+      lines.push(`stdout:\n${result.stdout}`);
+    }
+    if (result.stderr) {
+      lines.push(`stderr:\n${result.stderr}`);
+    }
+    if (result.command && result.status === 'manual_required') {
+      lines.push(`manual login:\n${result.command}`);
+    }
+    if (result.bootstrapCommand && result.status === 'manual_required') {
+      lines.push(`manual bootstrap:\n${result.bootstrapCommand}`);
+    }
+  }
+
+  container.innerHTML = `<pre>${escapeHtml(lines.join('\n\n'))}</pre>`;
 }
 
 function renderConnectorManager() {
@@ -2811,6 +2876,41 @@ async function copyConnectorSmokeCommand() {
   await navigator.clipboard.writeText(command);
 }
 
+async function runConnectorAction(action) {
+  const connector = state.connectorEditorId ? getConnector(state.connectorEditorId) : null;
+  if (!connector?.connectorId) {
+    reportError(new Error('Save or select an HPC connector first.'));
+    return null;
+  }
+
+  state.connectorActionBusy = {
+    connectorId: connector.connectorId,
+    action,
+  };
+  renderConnectorManager();
+
+  try {
+    const result = await fetchJson(`/api/connectors/${encodeURIComponent(connector.connectorId)}/actions`, {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    });
+    state.connectorActionResults.set(connector.connectorId, result);
+    if (result.connector) {
+      const index = state.connectors.findIndex((item) => item.connectorId === connector.connectorId);
+      if (index >= 0) {
+        state.connectors[index] = result.connector;
+      }
+    }
+    await refresh();
+    state.connectorEditorId = connector.connectorId;
+    renderConnectorManager();
+    return result;
+  } finally {
+    state.connectorActionBusy = null;
+    renderConnectorManager();
+  }
+}
+
 function getOriginSessionId(session) {
   return session.originSessionId || session.conversationKey || session.sessionId;
 }
@@ -3205,6 +3305,30 @@ el('copy-connector-login-button').addEventListener('click', async () => {
 el('copy-connector-smoke-button').addEventListener('click', async () => {
   try {
     await copyConnectorSmokeCommand();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('run-connector-smoke-button').addEventListener('click', async () => {
+  try {
+    await runConnectorAction('smoke_test');
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('run-connector-status-button').addEventListener('click', async () => {
+  try {
+    await runConnectorAction('status');
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('run-connector-bootstrap-button').addEventListener('click', async () => {
+  try {
+    await runConnectorAction('bootstrap');
   } catch (error) {
     reportError(error);
   }

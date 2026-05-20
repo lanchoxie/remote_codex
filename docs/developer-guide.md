@@ -78,10 +78,23 @@ The relay is a no-dependency HTTP server. Important routes:
 - `POST /api/connectors`
 - `PATCH /api/connectors/:connectorId`
 - `DELETE /api/connectors/:connectorId`
+- `POST /api/connectors/:connectorId/actions`
 - `POST /api/agent/register`
 - `POST /api/agent/heartbeat`
 - `GET /api/agent/commands`
 - `POST /api/agent/events`
+
+Connector action payloads use:
+
+```json
+{ "action": "smoke_test" }
+```
+
+Supported actions:
+
+- `smoke_test`: runs a non-interactive `ssh` check with `BatchMode=yes`.
+- `status`: checks the remote tmux agent session when the connector can use non-interactive SSH.
+- `bootstrap`: starts the remote host agent through SSH when the connector can use non-interactive SSH.
 
 ## Event model
 

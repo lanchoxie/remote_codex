@@ -17,6 +17,7 @@ This document tracks what we have actually verified versus what is still design 
 | Interrupt/steer/compact/shell command controls | UI and relay command routes are wired | Individual Codex backend behaviors still need dedicated tests |
 | Connector persistence API | `/api/connectors` returns saved profiles from relay storage | Stored under `tmp/connectors.json` |
 | HPC connector command generation | `shared/connectors.js` generates `tmux` bootstrap commands | Command format verified locally, not yet run on HPC |
+| HPC connector actions | Relay can run non-interactive SSH smoke/status/bootstrap actions | Requires key-based or agent-based SSH; interactive auth stays manual |
 
 ## Partially verified
 
@@ -26,7 +27,7 @@ This document tracks what we have actually verified versus what is still design 
 | Request/approval UI | Relay and UI can display and respond to structured request objects | Needs more real Codex request fixtures and edge-case coverage |
 | Thinking trace UI | UI can render structured reasoning/plan diagnostics in the chat flow | Codex does not emit structured thinking every turn |
 | Real app-server runner | Can start/resume threads and stream model output locally | Needs stable automated integration harness and failure-mode tests |
-| HPC onboarding | Connector model and generated manual `tmux` command exist | Needs real login node validation, gateway cases, and agent packaging |
+| HPC onboarding | Connector model, generated manual command, and non-interactive SSH actions exist | Needs real login node validation, gateway cases, remote install/sync, and agent packaging |
 | Android readiness | PWA-style mobile UI and manifest exist | Native Android wrapper, notifications, and background reconnect are not implemented |
 
 ## Not done yet
@@ -51,4 +52,3 @@ This document tracks what we have actually verified versus what is still design 
 3. Keep HPC live sessions in `tmux`.
 4. Add an explicit onboarding status flow: saved connector -> manual SSH -> tmux bootstrap -> host online -> start Codex.
 5. Add SSH runner later only if the manual bootstrap flow is too painful.
-

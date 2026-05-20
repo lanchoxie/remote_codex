@@ -40,16 +40,22 @@ saved by the relay.
 
 ## Connectivity checks
 
-The connector editor now generates two useful commands:
+The connector editor now generates two useful commands and can run the
+non-interactive path from the relay machine:
 
 - `SSH Login`: an interactive login command that you can paste into a terminal or Termux;
 - `SSH Smoke Test`: a non-interactive `BatchMode=yes` command that checks whether passwordless SSH actually works.
+- `Run Test`: executes the smoke test from the relay machine.
+- `Check Status`: checks whether the configured remote tmux agent is already running.
+- `Start Agent`: runs the detached remote bootstrap command over SSH.
 
 Use the smoke test when you want a quick "does this key-based path connect?" check.
 If it succeeds, the path is effectively passwordless for that host combination.
 If it fails and the login command still prompts for a password or MFA, the profile is saved but not yet passwordless.
 
-The app does not execute these checks for you yet. It only stores the recipe and generates the commands.
+The executable actions intentionally use `BatchMode=yes`. Password, OTP, browser SSO,
+and captcha flows still stay manual: run `SSH Login`, finish the prompt yourself,
+then run the generated `tmux Bootstrap` command on the target.
 
 ## Auth modes
 
@@ -68,3 +74,13 @@ The app does not execute these checks for you yet. It only stores the recipe and
 Start the host agent on the login node, point it at the relay, and keep it inside `tmux`.
 
 That gives the phone a stable control path without needing the phone to understand campus networking.
+
+## Automated bootstrap prerequisites
+
+For `Start Agent` to work, the relay machine must have:
+
+- the `ssh` executable available;
+- key-based or agent-based access to the final login node;
+- any configured gateway reachable through `ProxyJump`;
+- the project already present at the connector's remote directory;
+- `node` and `tmux` available on the remote host for the default `manual_tmux` mode.

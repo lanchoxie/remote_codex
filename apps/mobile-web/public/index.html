@@ -309,6 +309,9 @@
                   <button id="copy-connector-login-button" type="button" class="secondary-button">Copy Login</button>
                   <button id="copy-connector-smoke-button" type="button" class="secondary-button">Copy Test</button>
                   <button id="copy-connector-command-button" type="button" class="secondary-button">Copy Bootstrap</button>
+                  <button id="run-connector-smoke-button" type="button" class="secondary-button">Run Test</button>
+                  <button id="run-connector-status-button" type="button" class="secondary-button">Check Status</button>
+                  <button id="run-connector-bootstrap-button" type="button">Start Agent</button>
                 </div>
               </div>
               <div class="connector-group-title">SSH Login</div>
@@ -317,6 +320,7 @@
               <pre id="connector-smoke-command" class="connector-command-preview">(no smoke test yet)</pre>
               <div class="connector-group-title">tmux Bootstrap</div>
               <pre id="connector-bootstrap-command" class="connector-command-preview">(no command yet)</pre>
+              <div id="connector-action-result" class="connector-action-result hidden"></div>
               <div id="connector-plan-steps" class="connector-runbook-list"></div>
               <div id="connector-plan-warnings" class="connector-runbook-list warning"></div>
             </div>

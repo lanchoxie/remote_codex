@@ -355,6 +355,37 @@ textarea {
   font-size: 12px;
 }
 
+.connector-action-result {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.connector-action-result.success {
+  border-color: rgba(125, 231, 203, 0.36);
+  background: rgba(125, 231, 203, 0.08);
+  color: var(--text);
+}
+
+.connector-action-result.failure {
+  border-color: rgba(255, 114, 118, 0.34);
+  background: rgba(255, 114, 118, 0.08);
+  color: #ffd0d1;
+}
+
+.connector-action-result pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: inherit;
+}
+
 .connector-runbook-list {
   display: grid;
   gap: 8px;

@@ -126,6 +126,10 @@ function shellEnvValue(value, options = {}) {
   return shellDoubleQuote(text);
 }
 
+function shellCommand(command, args = []) {
+  return [command, ...args.map((arg) => shellQuote(arg))].join(' ');
+}
+
 function kindLabel(kind) {
   return {
     outbound_agent: 'Outbound Agent',
@@ -229,7 +233,7 @@ function normalizeConnectorInput(input = {}, existing = null) {
   };
 }
 
-function buildBootstrapCommand(connector) {
+function buildAgentLaunchCommand(connector) {
   const exports = [];
   if (connector.relayUrl) {
     exports.push(`RELAY_URL=${shellEnvValue(connector.relayUrl)}`);
@@ -245,12 +249,16 @@ function buildBootstrapCommand(connector) {
   }
 
   const envBlock = exports.length ? `${exports.join(' ')} ` : '';
-  const remoteDir = connector.bootstrap.remoteDirectory || '~/mobile-codex-remote';
-  const launchCommand = connector.bootstrap.launchCommand
+  return connector.bootstrap.launchCommand
     || `${envBlock}node apps/host-agent/agent.js`;
+}
+
+function buildBootstrapCommand(connector) {
+  const remoteDir = connector.bootstrap.remoteDirectory || '~/mobile-codex-remote';
+  const launchCommand = buildAgentLaunchCommand(connector);
 
   if (connector.bootstrap.mode === 'manual_tmux') {
-    return `cd ${shellPathArg(remoteDir)} && tmux new -As ${shellQuote(connector.bootstrap.tmuxSession)} ${shellQuote(launchCommand)}`;
+    return `cd ${shellPathArg(remoteDir)} && tmux new -As ${shellQuote(connector.bootstrap.tmuxSession)} sh -lc ${shellQuote(launchCommand)}`;
   }
 
   if (connector.bootstrap.mode === 'manual_systemd') {
@@ -268,6 +276,43 @@ function buildBootstrapCommand(connector) {
   return launchCommand;
 }
 
+function buildDetachedBootstrapCommand(connector) {
+  const remoteDir = connector.bootstrap.remoteDirectory || '~/mobile-codex-remote';
+  const launchCommand = buildAgentLaunchCommand(connector);
+
+  if (connector.bootstrap.mode === 'manual_tmux') {
+    const tmuxSession = connector.bootstrap.tmuxSession || 'codex-remote';
+    return [
+      `cd ${shellPathArg(remoteDir)}`,
+      `(tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null || tmux new-session -d -s ${shellQuote(tmuxSession)} sh -lc ${shellQuote(launchCommand)})`,
+      'echo CODEX_REMOTE_AGENT_BOOTSTRAPPED',
+    ].join(' && ');
+  }
+
+  if (connector.bootstrap.mode === 'ssh_exec' || connector.bootstrap.mode === 'gateway_launcher') {
+    return [
+      `cd ${shellPathArg(remoteDir)}`,
+      `nohup sh -lc ${shellQuote(launchCommand)} > codex-remote.agent.log 2>&1 < /dev/null &`,
+      'echo CODEX_REMOTE_AGENT_BOOTSTRAPPED',
+    ].join(' && ');
+  }
+
+  if (connector.bootstrap.mode === 'manual_systemd') {
+    return `systemctl --user restart ${shellQuote(connector.bootstrap.serviceName || 'codex-remote')} && echo CODEX_REMOTE_AGENT_BOOTSTRAPPED`;
+  }
+
+  return '';
+}
+
+function buildRemoteStatusCommand(connector) {
+  if (connector.bootstrap?.mode === 'manual_tmux') {
+    const tmuxSession = connector.bootstrap.tmuxSession || 'codex-remote';
+    return `tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null && echo CODEX_REMOTE_AGENT_TMUX_RUNNING || echo CODEX_REMOTE_AGENT_TMUX_MISSING`;
+  }
+
+  return 'echo CODEX_REMOTE_AGENT_STATUS_UNKNOWN';
+}
+
 function buildSshLoginCommand(connector) {
   return buildSshCommand(connector, {});
 }
@@ -276,6 +321,7 @@ function buildSshSmokeTestCommand(connector) {
   const target = buildSshCommand(connector, {
     batchMode: true,
     connectTimeout: 8,
+    disableTty: true,
     remoteCommand: 'echo SSH_OK',
   });
   if (!target) {
@@ -284,20 +330,61 @@ function buildSshSmokeTestCommand(connector) {
   return target;
 }
 
-function buildSshCommand(connector, options = {}) {
-  if (!connector.targetHost) {
+function buildSshBootstrapCommand(connector) {
+  const remoteCommand = buildDetachedBootstrapCommand(connector);
+  if (!remoteCommand) {
     return '';
   }
 
-  const parts = ['ssh'];
+  return buildSshCommand(connector, {
+    batchMode: true,
+    connectTimeout: 12,
+    disableTty: true,
+    remoteCommand,
+  });
+}
+
+function buildSshStatusCommand(connector) {
+  return buildSshCommand(connector, {
+    batchMode: true,
+    connectTimeout: 8,
+    disableTty: true,
+    remoteCommand: buildRemoteStatusCommand(connector),
+  });
+}
+
+function buildSshCommand(connector, options = {}) {
+  const parts = buildSshCommandParts(connector, options);
+  if (!parts) {
+    return '';
+  }
+
+  return shellCommand(parts.command, parts.args);
+}
+
+function buildSshCommandParts(connector, options = {}) {
+  if (!connector.targetHost) {
+    return null;
+  }
+
+  const args = [];
+  if (options.disableTty) {
+    args.push('-T');
+  }
   if (options.batchMode) {
-    parts.push('-o', 'BatchMode=yes');
+    args.push('-o', 'BatchMode=yes');
   }
   if (options.connectTimeout) {
-    parts.push('-o', `ConnectTimeout=${normalizePort(options.connectTimeout, 8)}`);
+    args.push('-o', `ConnectTimeout=${normalizePort(options.connectTimeout, 8)}`);
   }
   if (options.preferredAuthentications) {
-    parts.push('-o', `PreferredAuthentications=${options.preferredAuthentications}`);
+    args.push('-o', `PreferredAuthentications=${options.preferredAuthentications}`);
+  }
+  if (connector.auth?.keyPath) {
+    args.push('-i', connector.auth.keyPath);
+  }
+  if (connector.auth?.agentForwarding) {
+    args.push('-A');
   }
   const gateway = connector.gateway || {};
   const gatewayTarget = connectorUsesGateway(connector) && (gateway.proxyJump
@@ -308,20 +395,23 @@ function buildSshCommand(connector, options = {}) {
     ));
 
   if (gatewayTarget) {
-    parts.push('-J', shellQuote(gatewayTarget));
+    args.push('-J', gatewayTarget);
   }
   if (connector.targetPort && Number(connector.targetPort) !== 22) {
-    parts.push('-p', String(connector.targetPort));
+    args.push('-p', String(connector.targetPort));
   }
 
   const target = `${connector.username ? `${connector.username}@` : ''}${connector.targetHost}`;
-  parts.push(shellQuote(target));
+  args.push(target);
 
   if (options.remoteCommand) {
-    parts.push(shellQuote(options.remoteCommand));
+    args.push(options.remoteCommand);
   }
 
-  return parts.join(' ');
+  return {
+    command: 'ssh',
+    args,
+  };
 }
 
 function describeAuthPrompt(scope, method) {
@@ -428,6 +518,8 @@ function buildConnectorPlan(connector) {
     recommendations,
     sshSmokeTestCommand: buildSshSmokeTestCommand(connector),
     sshLoginCommand: buildSshLoginCommand(connector),
+    sshStatusCommand: buildSshStatusCommand(connector),
+    sshBootstrapCommand: buildSshBootstrapCommand(connector),
     bootstrapCommand: buildBootstrapCommand(connector),
   };
 }
@@ -546,7 +638,11 @@ function saveConnectors(connectors, storePath = DEFAULT_STORE_PATH) {
 
 module.exports = {
   DEFAULT_STORE_PATH,
+  buildDetachedBootstrapCommand,
+  buildRemoteStatusCommand,
+  buildSshCommandParts,
   decorateConnector,
+  connectorUsesGateway,
   loadConnectors,
   normalizeConnectorInput,
   requiresInteractiveAuth,

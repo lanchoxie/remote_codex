@@ -1,10 +1,16 @@
+const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const {
+  buildDetachedBootstrapCommand,
+  buildRemoteStatusCommand,
+  buildSshCommandParts,
+  connectorUsesGateway,
   decorateConnector,
   loadConnectors,
   normalizeConnectorInput,
+  requiresInteractiveAuth,
   saveConnectors,
 } = require('../../shared/connectors');
 const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
@@ -517,6 +523,18 @@ function persistConnectors() {
   saveConnectors(Array.from(state.connectors.values()));
 }
 
+function getConnectorHost(connector) {
+  if (!connector?.hostId) {
+    return null;
+  }
+  const host = state.hosts.get(connector.hostId) || null;
+  return host ? { ...host, online: hostOnline(host) } : null;
+}
+
+function decorateSingleConnector(connector) {
+  return decorateConnector(connector, getConnectorHost(connector));
+}
+
 function getConnectorList() {
   const hosts = new Map(getHostList().map((host) => [host.hostId, host]));
   return Array.from(state.connectors.values())
@@ -528,6 +546,245 @@ function getConnectorList() {
       }
       return String(a.label || a.connectorId).localeCompare(String(b.label || b.connectorId));
     });
+}
+
+function limitOutput(existing, chunk, limit = 8000) {
+  const next = `${existing}${chunk.toString('utf8')}`;
+  return next.length > limit ? next.slice(next.length - limit) : next;
+}
+
+function runProcess(command, args, options = {}) {
+  const timeoutMs = options.timeoutMs || 15_000;
+  const startedAt = nowIso();
+
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    let child = null;
+
+    function finish(result) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({
+        ...result,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        startedAt,
+        completedAt: nowIso(),
+      });
+    }
+
+    try {
+      child = spawn(command, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (error) {
+      finish({
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        error: error.message,
+      });
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (child && !child.killed) {
+        child.kill();
+      }
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout = limitOutput(stdout, chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = limitOutput(stderr, chunk);
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      finish({
+        exitCode: null,
+        signal: null,
+        timedOut,
+        error: error.message,
+      });
+    });
+    child.on('close', (exitCode, signal) => {
+      clearTimeout(timer);
+      finish({
+        exitCode,
+        signal,
+        timedOut,
+        error: null,
+      });
+    });
+  });
+}
+
+function connectorRequiresManualAuth(connector) {
+  return requiresInteractiveAuth(connector.auth?.method)
+    || (connectorUsesGateway(connector) && requiresInteractiveAuth(connector.gateway?.authMethod));
+}
+
+function buildConnectorAction(connector, action) {
+  if (action === 'smoke_test') {
+    return {
+      timeoutMs: 12_000,
+      commandParts: buildSshCommandParts(connector, {
+        batchMode: true,
+        connectTimeout: 8,
+        disableTty: true,
+        remoteCommand: 'echo SSH_OK',
+      }),
+      displayCommand: decorateSingleConnector(connector).plan.sshSmokeTestCommand,
+    };
+  }
+
+  if (action === 'status') {
+    return {
+      timeoutMs: 12_000,
+      commandParts: buildSshCommandParts(connector, {
+        batchMode: true,
+        connectTimeout: 8,
+        disableTty: true,
+        remoteCommand: buildRemoteStatusCommand(connector),
+      }),
+      displayCommand: decorateSingleConnector(connector).plan.sshStatusCommand,
+    };
+  }
+
+  if (action === 'bootstrap') {
+    const remoteCommand = buildDetachedBootstrapCommand(connector);
+    return {
+      timeoutMs: 20_000,
+      commandParts: remoteCommand
+        ? buildSshCommandParts(connector, {
+          batchMode: true,
+          connectTimeout: 12,
+          disableTty: true,
+          remoteCommand,
+        })
+        : null,
+      displayCommand: decorateSingleConnector(connector).plan.sshBootstrapCommand,
+      remoteCommand,
+    };
+  }
+
+  return null;
+}
+
+function classifyConnectorAction(action, run) {
+  const stdout = run.stdout || '';
+  if (run.timedOut) {
+    return { ok: false, status: 'timeout', message: 'SSH command timed out.' };
+  }
+  if (run.error) {
+    return { ok: false, status: 'error', message: run.error };
+  }
+  if (action === 'smoke_test') {
+    const ok = run.exitCode === 0 && stdout.includes('SSH_OK');
+    return {
+      ok,
+      status: ok ? 'ssh_ok' : 'ssh_failed',
+      message: ok ? 'SSH smoke test succeeded.' : 'SSH smoke test failed.',
+    };
+  }
+  if (action === 'status') {
+    if (run.exitCode !== 0) {
+      return { ok: false, status: 'status_failed', message: 'Unable to query remote agent status.' };
+    }
+    if (stdout.includes('CODEX_REMOTE_AGENT_TMUX_RUNNING')) {
+      return { ok: true, status: 'remote_agent_running', message: 'Remote tmux agent session is running.' };
+    }
+    if (stdout.includes('CODEX_REMOTE_AGENT_TMUX_MISSING')) {
+      return { ok: true, status: 'remote_agent_missing', message: 'Remote tmux agent session is not running yet.' };
+    }
+    return { ok: true, status: 'remote_status_unknown', message: 'Remote status command completed, but no known status marker was returned.' };
+  }
+  if (action === 'bootstrap') {
+    const ok = run.exitCode === 0 && stdout.includes('CODEX_REMOTE_AGENT_BOOTSTRAPPED');
+    return {
+      ok,
+      status: ok ? 'bootstrapped' : 'bootstrap_failed',
+      message: ok ? 'Remote host-agent bootstrap command completed.' : 'Remote host-agent bootstrap command failed.',
+    };
+  }
+
+  return { ok: false, status: 'unknown_action', message: 'Unknown connector action.' };
+}
+
+async function runConnectorAction(connector, action) {
+  const decorated = decorateSingleConnector(connector);
+  const manualCommand = decorated.plan.sshLoginCommand;
+  const manualBootstrapCommand = decorated.plan.bootstrapCommand;
+
+  if (!['smoke_test', 'status', 'bootstrap'].includes(action)) {
+    return {
+      httpStatus: 400,
+      payload: { ok: false, action, status: 'invalid_action', message: 'Unsupported connector action.' },
+    };
+  }
+
+  if ((action === 'status' || action === 'bootstrap') && connectorRequiresManualAuth(connector)) {
+    return {
+      httpStatus: 200,
+      payload: {
+        ok: false,
+        action,
+        status: 'manual_required',
+        message: 'This connector uses interactive auth. Run the SSH login and bootstrap commands manually, then wait for the host to appear online.',
+        command: manualCommand,
+        bootstrapCommand: manualBootstrapCommand,
+        connector: decorated,
+      },
+    };
+  }
+
+  const actionConfig = buildConnectorAction(connector, action);
+  if (!actionConfig?.commandParts) {
+    return {
+      httpStatus: 200,
+      payload: {
+        ok: false,
+        action,
+        status: 'not_ready',
+        message: 'This connector does not have enough target or bootstrap information to run automatically.',
+        command: actionConfig?.displayCommand || manualCommand || manualBootstrapCommand,
+        connector: decorated,
+      },
+    };
+  }
+
+  const run = await runProcess(
+    actionConfig.commandParts.command,
+    actionConfig.commandParts.args,
+    { timeoutMs: actionConfig.timeoutMs }
+  );
+  const classification = classifyConnectorAction(action, run);
+  return {
+    httpStatus: 200,
+    payload: {
+      ...classification,
+      action,
+      command: actionConfig.displayCommand,
+      stdout: run.stdout,
+      stderr: run.stderr,
+      exitCode: run.exitCode,
+      signal: run.signal,
+      timedOut: run.timedOut,
+      error: run.error,
+      startedAt: run.startedAt,
+      completedAt: run.completedAt,
+      expectedHostId: connector.hostId || null,
+      connector: decorateSingleConnector(connector),
+    },
+  };
 }
 
 function getStats() {
@@ -821,6 +1078,21 @@ async function handleRequest(req, res) {
     }
     persistConnectors();
     sendJson(res, 200, { ok: true, connectorId });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/connectors\/[^/]+\/actions$/)) {
+    const connectorId = decodeURIComponent(url.pathname.split('/')[3]);
+    const connector = state.connectors.get(connectorId);
+    if (!connector) {
+      sendJson(res, 404, { error: 'connector not found' });
+      return;
+    }
+
+    const body = await readBody(req);
+    const action = String(body.action || '').trim();
+    const result = await runConnectorAction(connector, action);
+    sendJson(res, result.httpStatus, result.payload);
     return;
   }
 

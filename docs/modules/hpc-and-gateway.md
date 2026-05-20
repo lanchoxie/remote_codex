@@ -46,23 +46,25 @@ Interactive auth modes should be treated as human bootstrap steps.
 - Connector profiles persist to `tmp/connectors.json`.
 - UI can create/edit/delete connector profiles.
 - UI displays generated SSH login commands, non-interactive smoke test commands, bootstrap commands, steps, and warnings.
+- Relay can execute non-interactive connector actions: SSH smoke test, tmux status check, and detached host-agent bootstrap.
+- UI can run those connector actions and display stdout/stderr/status.
 - Generated `manual_tmux` command is designed for a Linux/HPC shell.
 
 ## Not implemented yet
 
-- SSH runner.
+- Interactive SSH runner.
 - Gateway launcher daemon.
 - Password or keyboard-interactive prompt relay.
 - Captcha automation.
-- Real HPC validation.
+- Real HPC validation on a campus cluster.
 - `tmux` pane attach/control runtime.
 - Browser-side SSH execution and live password/MFA prompt handling.
 
 ## Recommended next implementation
 
 1. Add a connector onboarding state machine in the UI.
-2. Generate SSH login commands for target and ProxyJump paths.
-3. Let users run the generated smoke test to confirm key-based or agent-based passwordless login.
-4. After the user runs the tmux command, watch for the matching `HOST_ID` to appear online.
-5. Add a host-agent package/install script for Linux.
-6. Only then consider an SSH runner.
+2. Watch for the matching `HOST_ID` to appear online after `Start Agent`.
+3. Add a host-agent package/install script for Linux.
+4. Add a remote install/sync step for the agent directory.
+5. Add `tmux` pane attach/control runtime.
+6. Only then consider an interactive SSH runner.
