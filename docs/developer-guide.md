@@ -33,6 +33,15 @@ http://127.0.0.1:8797
 
 The relay serves both APIs and the static mobile web UI.
 
+## Git workflow
+
+- Keep `main` in a demoable state.
+- Use one focused branch per change, such as `feat/mobile-status`, `fix/agent-heartbeat`, or `docs/remodex-notes`.
+- Prefer small commits that describe one behavior change at a time.
+- Run `npm run test:managed` before merging code that changes the relay, host agent, or session transport.
+- Do not commit local secrets or runtime state such as `tmp/connectors.json`, local `.env` files, OTP values, or private keys.
+- Treat `protocol_dump/` and `tmp/app-server-schema/` as versioned reference artifacts for now; if we later automate regeneration, document the refresh flow in the same change.
+
 ## Test coverage
 
 `npm run test:managed` starts:
@@ -112,4 +121,3 @@ A runtime should expose these behaviors to `agent.js`:
 - close cleanly when the session stops.
 
 The current real runtime is `codex-app-server-runner.js`. The test runtime is `demo-session.js`.
-

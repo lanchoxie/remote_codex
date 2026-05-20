@@ -11,6 +11,7 @@ This directory separates product architecture, implementation modules, validatio
 ## Existing design docs
 
 - [Architecture](mobile-codex-remote-architecture.md): product-level architecture and communication model.
+- [Remodex Comparison](remodex-comparison.md): what we can borrow from Remodex for phone-to-PC pairing and live connectivity.
 - [Session Discovery And Control](session-discovery-and-control.md): how imported history and live managed sessions differ.
 - [Host Onboarding](host-onboarding.md): how a PC or HPC host joins the relay.
 - [HPC Connectors](hpc-connectors.md): saved HPC/gateway/MFA connector model.
@@ -24,4 +25,3 @@ This directory separates product architecture, implementation modules, validatio
 - [Mobile Web](modules/mobile-web.md)
 - [Shared Libraries](modules/shared.md)
 - [HPC And Gateway](modules/hpc-and-gateway.md)
-

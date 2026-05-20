@@ -105,6 +105,7 @@ Useful environment variables for the agent:
 - [Module Map](docs/module-map.md)
 - [Validation Status](docs/validation-status.md)
 - [Developer Guide](docs/developer-guide.md)
+- [Remodex Comparison](docs/remodex-comparison.md)
 - [Architecture](docs/mobile-codex-remote-architecture.md)
 - [HPC Connectors](docs/hpc-connectors.md)
 - [Host Onboarding](docs/host-onboarding.md)

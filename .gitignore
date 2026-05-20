@@ -1,6 +1,10 @@
 node_modules/
 .env
+.env.local
+.env.*.local
 .DS_Store
+Thumbs.db
 *.log
+*.pid
 logs/
 tmp/connectors.json
