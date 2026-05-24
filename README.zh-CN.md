@@ -178,6 +178,7 @@ Manage HPC
 - `Run Test`：测试 SSH 是否能连通。
 - `Check Status`：检查远端 tmux/agent 状态。
 - `Start Agent`：把 host-agent 启动到远端 tmux 里。
+- `Restart Agent`：杀掉远端 tmux 里的旧 host-agent，并用当前代码重新启动。更新功能后如果看到“host agent needs to be restarted”，用这个按钮。
 - `Copy Login` / `Copy Bootstrap`：复制命令，必要时手动在终端执行。
 
 ## OTP / 验证码说明

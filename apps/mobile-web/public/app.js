@@ -1524,6 +1524,7 @@ function renderConnectorRunbook(connector) {
   const runSmokeButton = el('run-connector-smoke-button');
   const runStatusButton = el('run-connector-status-button');
   const runBootstrapButton = el('run-connector-bootstrap-button');
+  const runRestartButton = el('run-connector-restart-button');
   const actionResult = el('connector-action-result');
   const actionKey = connector?.connectorId || '';
   const busyAction = state.connectorActionBusy?.connectorId === actionKey
@@ -1541,9 +1542,11 @@ function renderConnectorRunbook(connector) {
   runSmokeButton.disabled = !connector || actionBusy;
   runStatusButton.disabled = !connector || actionBusy;
   runBootstrapButton.disabled = !connector || actionBusy;
+  runRestartButton.disabled = !connector || actionBusy;
   runSmokeButton.textContent = busyAction === 'smoke_test' ? 'Running...' : 'Run Test';
   runStatusButton.textContent = busyAction === 'status' ? 'Checking...' : 'Check Status';
   runBootstrapButton.textContent = busyAction === 'bootstrap' ? 'Starting...' : 'Start Agent';
+  runRestartButton.textContent = busyAction === 'restart' ? 'Restarting...' : 'Restart Agent';
   renderConnectorActionResult(actionResult, result, actionBusy);
   renderConnectorRunbookList(el('connector-plan-steps'), connector?.plan?.steps || [], 'No bootstrap steps yet.');
   renderConnectorRunbookList(el('connector-plan-warnings'), connector?.plan?.warnings || [], 'No MFA or auth warnings.');
@@ -4640,6 +4643,14 @@ el('run-connector-status-button').addEventListener('click', async () => {
 el('run-connector-bootstrap-button').addEventListener('click', async () => {
   try {
     await runConnectorAction('bootstrap');
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('run-connector-restart-button').addEventListener('click', async () => {
+  try {
+    await runConnectorAction('restart');
   } catch (error) {
     reportError(error);
   }
