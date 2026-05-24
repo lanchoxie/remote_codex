@@ -19,29 +19,50 @@ Reading `~/.codex` is useful for discovery, but it is not enough for control.
 To let Codex continue running on another machine, we need a host-side agent that
 owns the live Codex process and streams input/output over a secure channel.
 
-## Current prototype
+## Version 0.2.0: 基础多平台版本
 
-The repository now contains a no-dependency Node prototype with three parts:
+This release is the first usable multi-platform baseline. It is still a local
+tooling project, but it can now control local and remote Codex hosts from the
+same browser/mobile UI.
+
+The repository contains a no-dependency Node implementation with three parts:
 
 - `apps/relay`: in-memory relay and API server;
-- `apps/host-agent`: host agent that discovers local `~/.codex` sessions and
-  starts one managed session;
+- `apps/host-agent`: host agent that discovers `~/.codex` sessions and starts
+  managed Codex app-server sessions;
 - `apps/mobile-web`: mobile-first web UI served by the relay.
 
-What the prototype already does:
+What this version does:
 
-- discovers local Codex session metadata from `~/.codex`;
-- groups sessions by host and exposes them through the relay API;
-- starts one managed live session per host agent on boot;
-- lets the browser send input to a live session;
-- streams session output back over Server-Sent Events.
+- discovers Codex history from local and HPC `~/.codex` directories;
+- connects multiple hosts through outbound agents, including SSH/HPC bootstrap
+  flows with gateway/jump-host support;
+- supports switching between local PC and HPC hosts from the same UI;
+- starts, resumes, and forks managed Codex sessions from selected directories;
+- streams live output, status, diagnostics, approval requests, and alerts over
+  Server-Sent Events;
+- provides host health checks before switching or sending commands;
+- supports session search by keyword, path, and title-like metadata;
+- supports cross-host session collections/favorites;
+- supports directory browsing on remote hosts, including `~` and `/` roots;
+- supports Codex app-server controls: model selection, reasoning effort,
+  reasoning summaries, approval policy, approval reviewer, sandbox mode,
+  plan-only turns, review turns, interrupt, steer, compact, and shell-command
+  control;
+- supports image input from the browser and host-local image paths;
+- supports drag-and-drop image attachments plus drag-and-drop text/code files
+  that are embedded into the prompt.
 
-Current limitation:
+Current limitations:
 
-- imported historical sessions are shown as `history only`;
-- only managed sessions are interactive;
-- the relay keeps state in memory for now;
-- the default managed session is a local demo process, not the real Codex CLI.
+- the relay is intentionally lightweight and still keeps most runtime state in
+  memory;
+- imported historical sessions are readable, but need resume/fork to become
+  interactive;
+- remote hosts must run the matching host-agent version before new controls
+  such as model listing, review, and image input are available;
+- there is no built-in authentication layer on the relay yet, so do not expose a
+  running relay to untrusted networks.
 
 ## Quick start
 
@@ -50,7 +71,7 @@ Requirements:
 - Node.js 22 or newer is recommended;
 - a local `~/.codex` directory is optional but useful for discovery.
 
-Run the relay and one local demo agent:
+Run the relay and one local agent:
 
 ```bash
 npm run dev
@@ -73,6 +94,36 @@ npm run test:managed
 `npm run test:managed` boots a relay plus one agent, waits for a live managed
 session, sends one prompt, and verifies that streamed session output contains
 the prompt text.
+
+## Sharing with a friend
+
+The safest way to let someone else try this project is to send the GitHub
+repository link or a release/tag link, not your running relay URL and not a zip
+of your working directory.
+
+Safe to share:
+
+- the GitHub repository URL;
+- a clean checkout of the source code;
+- public docs and screenshots.
+
+Do not share:
+
+- `tmp/connectors.json`;
+- `tmp/connector-secrets.json`;
+- `.env` or `.env.local`;
+- your running `http://<your-ip>:8797` relay URL unless you intentionally want
+  that person to see and control the sessions currently attached to your relay.
+
+Friend experience:
+
+- after cloning the repo, your friend will not have your PC/HPC credentials;
+- they will not be able to log in to your host or HPC from the repo alone;
+- they need to configure their own hosts, SSH keys, passwords, OTP prompts, and
+  Codex account/session state;
+- if you expose your live relay on a LAN or public network, the current app has
+  no auth wall yet, so anyone who can reach it may be able to control attached
+  sessions.
 
 ## Android-friendly groundwork
 

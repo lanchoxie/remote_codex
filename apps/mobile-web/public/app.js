@@ -22,6 +22,18 @@ const state = {
   connectorEditorId: null,
   connectorActionResults: new Map(),
   connectorActionBusy: null,
+  sessionCollections: [],
+  selectedCollectionId: 'default',
+  sessionSearchQuery: '',
+  sessionSearchMode: 'keyword',
+  overviewCollapsed: false,
+  newSessionCollapsed: false,
+  hostSwitchBusyId: null,
+  codexControls: {
+    modelOptionsBySession: new Map(),
+    attachments: [],
+    modelsLoading: false,
+  },
   directoryPicker: {
     open: false,
     hostId: null,
@@ -34,6 +46,35 @@ const state = {
   },
 };
 
+const MAX_COMPOSER_IMAGES = 4;
+const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_COMPOSER_TEXT_FILES = 4;
+const MAX_COMPOSER_TEXT_FILE_BYTES = 768 * 1024;
+const TEXT_FILE_EXTENSIONS = new Set([
+  'bat',
+  'cmd',
+  'css',
+  'csv',
+  'html',
+  'js',
+  'json',
+  'jsonl',
+  'jsx',
+  'log',
+  'md',
+  'markdown',
+  'ps1',
+  'py',
+  'sh',
+  'toml',
+  'ts',
+  'tsx',
+  'txt',
+  'xml',
+  'yaml',
+  'yml',
+]);
+
 const el = (id) => document.getElementById(id);
 
 function escapeHtml(value) {
@@ -43,6 +84,19 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function makeClientId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 async function fetchJson(url, options = {}) {
@@ -158,6 +212,7 @@ function prettyStatusLabel(value) {
     active: 'Thinking',
     thinking: 'Thinking',
     planning: 'Planning',
+    reviewing: 'Reviewing',
     reconnecting: 'Reconnecting',
     retrying: 'Retrying',
     interrupted: 'Interrupted',
@@ -524,6 +579,24 @@ function getHost(hostId) {
   return state.hosts.find((host) => host.hostId === hostId) || null;
 }
 
+async function verifyHostAvailable(hostId) {
+  const host = getHost(hostId);
+  if (!host) {
+    throw new Error(`Host ${hostId || '(unknown)'} is not registered.`);
+  }
+  if (!host.online) {
+    throw new Error(`Host ${host.label || host.hostId} is offline. Start its agent or restart the HPC connector first.`);
+  }
+
+  const result = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/probe`, {
+    method: 'POST',
+  });
+  if (!result?.ok) {
+    throw new Error(result?.error || `Host ${host.label || host.hostId} did not answer the health check.`);
+  }
+  return result;
+}
+
 function getSessionsForHost(hostId) {
   return state.sessions.filter((session) => session.hostId === hostId);
 }
@@ -594,6 +667,10 @@ function getConversationGroups(hostId) {
     });
 }
 
+function getAllConversationGroups() {
+  return state.hosts.flatMap((host) => getConversationGroups(host.hostId));
+}
+
 function firstNonEmpty(values) {
   for (const value of values) {
     if (value) {
@@ -601,6 +678,246 @@ function firstNonEmpty(values) {
     }
   }
   return null;
+}
+
+function getConversationSearchText(group) {
+  const titleValues = [
+    group.title,
+    ...(group.sessions || []).map((session) => session.title),
+  ];
+  const pathValues = [
+    group.cwd,
+    ...(group.sessions || []).map((session) => session.cwd),
+  ];
+  if (state.sessionSearchMode === 'title') {
+    return titleValues.filter(Boolean).join(' ').toLowerCase();
+  }
+  if (state.sessionSearchMode === 'path') {
+    return pathValues.filter(Boolean).join(' ').toLowerCase();
+  }
+
+  return [
+    ...titleValues,
+    ...pathValues,
+    group.conversationKey,
+    group.latestUserMessage,
+    group.latestAgentMessage,
+    ...(group.sessions || []).flatMap((session) => [
+      session.sessionId,
+      session.nativeThreadId,
+      session.bridgeSessionId,
+      session.latestUserMessage,
+      session.latestAgentMessage,
+      ...(Array.isArray(session.transcriptPreview) ? session.transcriptPreview.map((entry) => entry.text) : []),
+      ...(state.transcripts.get(makeSessionKey(session.hostId, session.sessionId)) || []).map((entry) => entry.text),
+    ]),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function filterConversationGroups(groups) {
+  const query = String(state.sessionSearchQuery || '').trim().toLowerCase();
+  if (!query) {
+    return groups;
+  }
+
+  const terms = query.split(/\s+/).filter(Boolean);
+  return groups.filter((group) => {
+    const haystack = getConversationSearchText(group);
+    return terms.every((term) => haystack.includes(term));
+    });
+}
+
+function getSelectedCollection() {
+  return state.sessionCollections.find((collection) => collection.collectionId === state.selectedCollectionId)
+    || state.sessionCollections[0]
+    || { collectionId: 'default', name: 'Default', system: true, items: [] };
+}
+
+function getConversationGroupsForCollection(collection = getSelectedCollection()) {
+  if (!collection || collection.collectionId === 'default') {
+    return state.selectedHostId ? getConversationGroups(state.selectedHostId) : [];
+  }
+
+  const allGroups = getAllConversationGroups();
+  const groupMap = new Map(allGroups.map((group) => [`${group.hostId}::${group.conversationKey}`, group]));
+  return (collection.items || [])
+    .map((item) => {
+      const key = `${item.hostId}::${item.conversationKey}`;
+      const group = groupMap.get(key) || findCollectionConversationGroup(allGroups, item);
+      if (group) {
+        return {
+          ...group,
+          collectionItem: item,
+        };
+      }
+
+      return {
+        hostId: item.hostId,
+        hostLabel: item.hostLabel,
+        conversationKey: item.conversationKey,
+        sessions: [],
+        totalCount: item.sessionId ? 1 : 0,
+        liveCount: 0,
+        preferredSession: null,
+        cwd: item.cwd || null,
+        title: item.title || item.conversationKey,
+        lastUpdatedAt: item.updatedAt || item.addedAt || null,
+        latestUserMessage: null,
+        latestAgentMessage: null,
+        collectionOnly: true,
+        collectionItem: item,
+      };
+    })
+    .sort((a, b) => {
+      const delta = parseSessionTime({ lastUpdatedAt: b.lastUpdatedAt }) - parseSessionTime({ lastUpdatedAt: a.lastUpdatedAt });
+      if (delta !== 0) {
+        return delta;
+      }
+      return String(a.title || a.conversationKey).localeCompare(String(b.title || b.conversationKey));
+    });
+}
+
+function findCollectionConversationGroup(groups, item) {
+  if (!item || !item.hostId) {
+    return null;
+  }
+
+  const candidates = groups.filter((group) => group.hostId === item.hostId);
+  const identities = [
+    item.conversationKey,
+    item.sessionId,
+  ].filter(Boolean).map(String);
+
+  if (identities.length) {
+    const exact = candidates.find((group) => {
+      const values = getConversationIdentityValues(group);
+      return identities.some((identity) => values.has(identity));
+    });
+    if (exact) {
+      return exact;
+    }
+  }
+
+  const itemPath = normalizeConversationPath(item.cwd);
+  if (!itemPath) {
+    return null;
+  }
+
+  const itemTitle = normalizeConversationTitle(item.title);
+  return candidates.find((group) => {
+    if (normalizeConversationPath(group.cwd) !== itemPath) {
+      return false;
+    }
+    if (!itemTitle) {
+      return true;
+    }
+    const groupTitles = [
+      group.title,
+      ...(group.sessions || []).map((session) => session.title),
+    ].map(normalizeConversationTitle).filter(Boolean);
+    return groupTitles.includes(itemTitle);
+  }) || candidates.find((group) => normalizeConversationPath(group.cwd) === itemPath) || null;
+}
+
+function getConversationIdentityValues(group) {
+  const values = new Set();
+  const add = (value) => {
+    if (value) {
+      values.add(String(value));
+    }
+  };
+
+  add(group.conversationKey);
+  for (const session of group.sessions || []) {
+    add(session.sessionId);
+    add(session.conversationKey);
+    add(session.originSessionId);
+    add(session.sourceSessionId);
+    add(session.bridgeSessionId);
+    add(session.nativeThreadId);
+  }
+  return values;
+}
+
+function normalizeConversationPath(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .replace(/\/$/, '')
+    .toLowerCase();
+}
+
+function normalizeConversationTitle(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getHostSnapshotForCollection(hostId) {
+  const host = getHost(hostId) || {};
+  const connector = state.connectors.find((item) => item.hostId === hostId) || null;
+  return {
+    hostLabel: host.label || hostId,
+    hostPlatform: host.platform || '',
+    targetHost: connector?.targetHost || '',
+    targetPort: connector?.targetPort || null,
+    connectorId: connector?.connectorId || '',
+    connectorLabel: connector?.label || '',
+    relayUrl: connector?.relayUrl || '',
+  };
+}
+
+function buildCollectionItemFromConversation(group) {
+  const session = group.preferredSession || group.sessions?.[0] || null;
+  return {
+    hostId: group.hostId,
+    conversationKey: group.conversationKey,
+    sessionId: session?.sessionId || group.collectionItem?.sessionId || '',
+    title: group.title || session?.title || group.conversationKey,
+    cwd: group.cwd || session?.cwd || '',
+    ...getHostSnapshotForCollection(group.hostId),
+  };
+}
+
+async function refreshSessionCollections() {
+  const response = await fetchJson('/api/session-collections');
+  state.sessionCollections = response.collections || [];
+  if (!state.sessionCollections.some((collection) => collection.collectionId === state.selectedCollectionId)) {
+    state.selectedCollectionId = state.sessionCollections[0]?.collectionId || 'default';
+  }
+}
+
+async function createSessionCollection(name) {
+  const response = await fetchJson('/api/session-collections', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+  await refreshSessionCollections();
+  state.selectedCollectionId = response.collection?.collectionId || state.selectedCollectionId;
+  renderAll();
+}
+
+async function addConversationToCollection(collectionId, group) {
+  if (!collectionId || collectionId === 'default') {
+    return;
+  }
+  await fetchJson(`/api/session-collections/${encodeURIComponent(collectionId)}/items`, {
+    method: 'POST',
+    body: JSON.stringify({ item: buildCollectionItemFromConversation(group) }),
+  });
+  await refreshSessionCollections();
+  renderAll();
+}
+
+async function removeConversationFromCollection(collectionId, group) {
+  if (!collectionId || collectionId === 'default') {
+    return;
+  }
+  await fetchJson(`/api/session-collections/${encodeURIComponent(collectionId)}/items/remove`, {
+    method: 'POST',
+    body: JSON.stringify({ item: buildCollectionItemFromConversation(group) }),
+  });
+  await refreshSessionCollections();
+  renderAll();
 }
 
 function getLiveSessionForConversation(conversation) {
@@ -629,7 +946,8 @@ function getSelectedSession() {
 
 function ensureSelections() {
   if (!state.selectedHostId || !getHost(state.selectedHostId)) {
-    state.selectedHostId = state.hosts[0]?.hostId || null;
+    const fallbackHost = state.hosts.find((host) => host.online) || state.hosts[0] || null;
+    state.selectedHostId = fallbackHost?.hostId || null;
   }
 
   if (!state.selectedHostId) {
@@ -724,9 +1042,39 @@ function appendAlertForSession(hostId, sessionId, alert) {
   state.alerts.set(key, dedupeAlerts([...existing, alert]));
 }
 
+function shouldDisplayAlert(entry) {
+  const message = String(entry?.message || '');
+  return !(
+    /codex_app_server: failed to initialize sqlite state db/i.test(message)
+    || /Codex could not find bubblewrap on PATH/i.test(message)
+    || /sandbox prerequisites/i.test(message)
+    || /concepts\/sandboxing#prerequisites/i.test(message)
+  );
+}
+
+function isStaleStartupFailureAlert(entry, session) {
+  if (!session?.live) {
+    return false;
+  }
+
+  const message = String(entry?.message || '');
+  if (!/runner: no pipe-in provided|codex app-server exited early|failed to spawn managed session|failed:spawn-error|exited:1:null/i.test(message)) {
+    return false;
+  }
+
+  const runtime = getRuntimeForSession(session) || session.runtime || null;
+  const recoveredAt = Date.parse(runtime?.updatedAt || session.lastUpdatedAt || '');
+  const alertAt = Date.parse(entry?.timestamp || '');
+  return !Number.isFinite(recoveredAt) || !Number.isFinite(alertAt) || alertAt < recoveredAt;
+}
+
 function getAlertsForSession(session) {
   const key = getSessionKey(session);
-  return key ? state.alerts.get(key) || [] : [];
+  return key
+    ? (state.alerts.get(key) || [])
+      .filter(shouldDisplayAlert)
+      .filter((entry) => !isStaleStartupFailureAlert(entry, session))
+    : [];
 }
 
 function getTranscriptForSession(session) {
@@ -916,6 +1264,22 @@ function getStreamStatusForSession(session) {
 
 function getConnector(connectorId) {
   return state.connectors.find((connector) => connector.connectorId === connectorId) || null;
+}
+
+function normalizeMatchText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getConnectorForHost(hostId) {
+  const host = getHost(hostId);
+  return state.connectors.find((connector) => connector.hostId === hostId || connector.runtime?.attachedHostId === hostId)
+    || state.connectors.find((connector) => {
+      if (!host) {
+        return false;
+      }
+      return normalizeMatchText(connector.label) === normalizeMatchText(host.label);
+    })
+    || null;
 }
 
 function syncModalBodyState() {
@@ -1202,8 +1566,27 @@ function renderConnectorActionResult(container, result, busy) {
     if (result.expectedHostId) {
       lines.push(`Expected host: ${result.expectedHostId}`);
     }
+    if (result.multiplexFallback) {
+      lines.push(`SSH multiplex fallback: ${result.multiplexFallback.reason || 'ControlMaster failed; retried without multiplexing.'}`);
+      if (result.multiplexFallback.controlPath) {
+        lines.push(`ControlPath: ${result.multiplexFallback.controlPath}`);
+      }
+    }
     if (typeof result.exitCode !== 'undefined' && result.exitCode !== null) {
       lines.push(`Exit code: ${result.exitCode}`);
+    }
+    if (result.deploy) {
+      lines.push(`deploy: ${prettyStatusLabel(result.deploy.status || 'deploy')} - ${result.deploy.message || ''}`.trim());
+      for (const step of result.deploy.steps || []) {
+        const stepLines = [`${step.name || 'step'} exit ${step.exitCode}`];
+        if (step.stdout) {
+          stepLines.push(`stdout:\n${step.stdout}`);
+        }
+        if (step.stderr) {
+          stepLines.push(`stderr:\n${step.stderr}`);
+        }
+        lines.push(stepLines.join('\n'));
+      }
     }
     if (result.stdout) {
       lines.push(`stdout:\n${result.stdout}`);
@@ -1312,9 +1695,15 @@ function renderHostNav() {
     actions.className = 'host-actions';
 
     const switchButton = createActionButton('Switch', 'secondary-button');
-    switchButton.onclick = (event) => {
+    switchButton.disabled = state.hostSwitchBusyId === host.hostId;
+    switchButton.textContent = state.hostSwitchBusyId === host.hostId ? 'Checking...' : 'Switch';
+    switchButton.onclick = async (event) => {
       event.stopPropagation();
-      setSelectedHost(host.hostId);
+      try {
+        await setSelectedHost(host.hostId);
+      } catch (error) {
+        reportError(error);
+      }
     };
 
     const importButton = createActionButton('Import', 'secondary-button');
@@ -1331,9 +1720,36 @@ function renderHostNav() {
 
     actions.append(switchButton, importButton, deleteButton);
     item.append(top, actions);
-    item.onclick = () => setSelectedHost(host.hostId);
+    item.onclick = () => {
+      setSelectedHost(host.hostId).catch(reportError);
+    };
     hostList.appendChild(item);
   }
+}
+
+function renderHostSwitcher() {
+  const switcher = el('host-switcher');
+  const selectedHostId = state.selectedHostId || '';
+  switcher.innerHTML = '';
+
+  if (!state.hosts.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No hosts available';
+    switcher.appendChild(option);
+    switcher.disabled = true;
+    return;
+  }
+
+  for (const host of state.hosts) {
+    const option = document.createElement('option');
+    option.value = host.hostId;
+    option.textContent = `${host.label} (${host.online ? 'online' : 'offline'})`;
+    switcher.appendChild(option);
+  }
+
+  switcher.disabled = Boolean(state.hostSwitchBusyId);
+  switcher.value = selectedHostId;
 }
 
 function getVariantLabels(sessions) {
@@ -1418,7 +1834,30 @@ function renderVariantButtons(container, conversation, selectedSessionId) {
     button.title = `${session.title || session.sessionId}\n${session.sessionId}`;
     button.onclick = (event) => {
       event.stopPropagation();
-      selectSession(session);
+      selectSession(session).catch(reportError);
+    };
+    container.appendChild(button);
+  }
+}
+
+function renderCollectionTabs() {
+  const container = el('session-collection-tabs');
+  if (!container) {
+    return;
+  }
+  container.innerHTML = '';
+
+  for (const collection of state.sessionCollections) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `collection-tab secondary-button ${collection.collectionId === state.selectedCollectionId ? 'active' : ''}`.trim();
+    button.innerHTML = `
+      <span>${escapeHtml(collection.name || 'Collection')}</span>
+      <span class="collection-count">${collection.itemCount || 0}</span>
+    `;
+    button.onclick = () => {
+      state.selectedCollectionId = collection.collectionId;
+      renderAll();
     };
     container.appendChild(button);
   }
@@ -1431,17 +1870,51 @@ function renderConversationNav() {
   const host = getHost(state.selectedHostId);
   el('selected-host-title').textContent = host ? host.label : 'No host selected';
   el('selected-host-meta').textContent = host ? `${host.platform} | ${host.online ? 'online' : 'offline'}` : '';
+  renderHostSwitcher();
+  renderCollectionTabs();
 
-  const groups = state.selectedHostId ? getConversationGroups(state.selectedHostId) : [];
+  const collection = getSelectedCollection();
+  const groups = getConversationGroupsForCollection(collection);
+  const visibleGroups = filterConversationGroups(groups);
+  const searchInput = el('session-search-input');
+  const searchMode = el('session-search-mode');
+  const searchSummary = el('session-search-summary');
+  if (searchInput && document.activeElement !== searchInput) {
+    searchInput.value = state.sessionSearchQuery;
+  }
+  if (searchMode) {
+    searchMode.value = state.sessionSearchMode;
+  }
+  if (searchSummary) {
+    const query = state.sessionSearchQuery.trim();
+    const scope = collection.collectionId === 'default'
+      ? `Default on ${host?.label || 'selected host'}`
+      : collection.name;
+    searchSummary.textContent = query
+      ? `${visibleGroups.length} of ${groups.length} in ${scope} match "${query}"`
+      : groups.length
+        ? `${groups.length} conversations in ${scope}`
+        : '';
+  }
+
   if (!groups.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = 'Import a host or start a managed session to see conversations here.';
+    empty.textContent = collection.collectionId === 'default'
+      ? 'Import a host or start a managed session to see conversations here.'
+      : 'This collection is empty. Save a conversation into it from Default.';
+    list.appendChild(empty);
+    return;
+  }
+  if (!visibleGroups.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = 'No conversations match this search.';
     list.appendChild(empty);
     return;
   }
 
-  for (const group of groups) {
+  for (const group of visibleGroups) {
     const preview = group.latestUserMessage
       ? `You: ${truncatePreview(group.latestUserMessage)}`
       : group.latestAgentMessage
@@ -1453,20 +1926,20 @@ function renderConversationNav() {
     item.innerHTML = `
       <div class="conversation-card-top">
         <div>
-          <div class="title">${group.title || group.conversationKey}</div>
-          <div class="sub">${group.liveCount > 0 ? `${group.liveCount} live` : 'history only'} | ${group.totalCount} variants</div>
+          <div class="title">${escapeHtml(group.title || group.conversationKey)}</div>
+          <div class="sub">${escapeHtml(group.hostLabel || getHost(group.hostId)?.label || group.hostId)} | ${group.liveCount > 0 ? `${group.liveCount} live` : 'history only'} | ${group.totalCount} variants</div>
         </div>
         <div class="conversation-stats">
           <div class="count">${group.totalCount}</div>
           <div class="label">sessions</div>
         </div>
       </div>
-      <div class="path">${group.cwd || '(unknown path)'}</div>
+      <div class="path">${escapeHtml(group.cwd || '(unknown path)')}</div>
       <div class="conversation-summary">
-        <span>${formatTime(group.lastUpdatedAt) || 'No recent activity'}</span>
+        <span>${escapeHtml(formatTime(group.lastUpdatedAt) || 'No recent activity')}</span>
         <span>${group.liveCount > 0 ? 'Joinable live session' : 'History can be resumed'}</span>
       </div>
-      <div class="preview">${preview}</div>
+      <div class="preview">${escapeHtml(preview)}</div>
     `;
 
     const variantRow = document.createElement('div');
@@ -1474,8 +1947,391 @@ function renderConversationNav() {
     renderVariantButtons(variantRow, group, state.selectedSessionId);
     item.appendChild(variantRow);
 
-    item.onclick = () => selectConversation(group);
+    const actions = document.createElement('div');
+    actions.className = 'conversation-card-actions';
+    const collectionSelect = document.createElement('select');
+    collectionSelect.className = 'collection-move-select';
+    collectionSelect.innerHTML = '<option value="">Save to collection...</option>';
+    for (const target of state.sessionCollections.filter((entry) => entry.collectionId !== 'default')) {
+      const option = document.createElement('option');
+      option.value = target.collectionId;
+      option.textContent = target.name;
+      collectionSelect.appendChild(option);
+    }
+    collectionSelect.disabled = group.collectionOnly || state.sessionCollections.length <= 1;
+    collectionSelect.onclick = (event) => event.stopPropagation();
+    collectionSelect.onchange = async (event) => {
+      event.stopPropagation();
+      const targetCollectionId = event.target.value;
+      event.target.value = '';
+      if (!targetCollectionId) {
+        return;
+      }
+      try {
+        await addConversationToCollection(targetCollectionId, group);
+      } catch (error) {
+        reportError(error);
+      }
+    };
+    actions.appendChild(collectionSelect);
+    if (collection.collectionId !== 'default') {
+      const removeButton = document.createElement('button');
+      removeButton.type = 'button';
+      removeButton.className = 'secondary-button collection-remove-button';
+      removeButton.textContent = 'Remove';
+      removeButton.onclick = async (event) => {
+        event.stopPropagation();
+        try {
+          await removeConversationFromCollection(collection.collectionId, group);
+        } catch (error) {
+          reportError(error);
+        }
+      };
+      actions.appendChild(removeButton);
+    }
+    item.appendChild(actions);
+
+    item.onclick = () => {
+      if (!group.collectionOnly) {
+        selectConversation(group).catch(reportError);
+      }
+    };
     list.appendChild(item);
+  }
+}
+
+function modelCacheKey(session) {
+  return getSessionKey(session) || 'none';
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '';
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+  return `${bytes} B`;
+}
+
+function fileExtension(name) {
+  const text = String(name || '').trim().toLowerCase();
+  const index = text.lastIndexOf('.');
+  return index === -1 ? '' : text.slice(index + 1);
+}
+
+function isTextLikeFile(file) {
+  const type = String(file?.type || '').toLowerCase();
+  if (type.startsWith('text/')) {
+    return true;
+  }
+  if (type === 'application/json' || type === 'application/x-ndjson' || type === 'application/xml') {
+    return true;
+  }
+  return TEXT_FILE_EXTENSIONS.has(fileExtension(file?.name));
+}
+
+function renderComposerModelOptions(session) {
+  const datalist = el('codex-model-options');
+  if (!datalist) {
+    return;
+  }
+
+  datalist.innerHTML = '';
+  const models = state.codexControls.modelOptionsBySession.get(modelCacheKey(session)) || [];
+  for (const model of models) {
+    const modelId = String(model.model || model.id || '').trim();
+    if (!modelId) {
+      continue;
+    }
+    const option = document.createElement('option');
+    option.value = modelId;
+    const displayName = String(model.displayName || modelId).trim();
+    const effort = model.defaultReasoningEffort ? ` | ${model.defaultReasoningEffort}` : '';
+    option.label = `${displayName}${model.isDefault ? ' | default' : ''}${effort}`;
+    datalist.appendChild(option);
+  }
+}
+
+function renderAttachmentChips() {
+  const container = el('codex-attachment-chips');
+  if (!container) {
+    return;
+  }
+
+  container.innerHTML = '';
+  for (const attachment of state.codexControls.attachments) {
+    const chip = document.createElement('div');
+    chip.className = `attachment-chip ${attachment.type === 'textFile' ? 'file' : ''}`.trim();
+    const label = attachment.type === 'textFile' ? 'File' : 'Image';
+    chip.innerHTML = `<span>${label}: ${escapeHtml(attachment.name || 'attached file')}${attachment.size ? ` (${escapeHtml(formatBytes(attachment.size))})` : ''}</span>`;
+    container.appendChild(chip);
+  }
+
+  const localPath = el('codex-local-image-path')?.value.trim();
+  if (localPath) {
+    const chip = document.createElement('div');
+    chip.className = 'attachment-chip muted';
+    chip.innerHTML = `<span>Host image: ${escapeHtml(localPath)}</span>`;
+    container.appendChild(chip);
+  }
+}
+
+function renderComposerControls(session, disabled) {
+  renderComposerModelOptions(session);
+  renderAttachmentChips();
+
+  const controlIds = [
+    'codex-model-input',
+    'codex-effort-select',
+    'codex-summary-select',
+    'codex-mode-select',
+    'codex-approval-policy-select',
+    'codex-reviewer-select',
+    'codex-sandbox-mode-select',
+    'codex-image-files',
+    'codex-local-image-path',
+    'codex-clear-attachments-button',
+    'codex-plan-button',
+    'codex-send-button',
+  ];
+  for (const id of controlIds) {
+    const node = el(id);
+    if (node) {
+      node.disabled = disabled;
+    }
+  }
+
+  const modelButton = el('codex-model-refresh-button');
+  if (modelButton) {
+    modelButton.disabled = disabled || !session?.live || state.codexControls.modelsLoading;
+    modelButton.textContent = state.codexControls.modelsLoading ? 'Loading...' : 'Models';
+  }
+
+  const reviewButton = el('codex-review-button');
+  if (reviewButton) {
+    reviewButton.disabled = disabled || !session?.live;
+  }
+}
+
+function getComposerInputItems() {
+  const inputItems = state.codexControls.attachments
+    .filter((attachment) => attachment.type === 'image')
+    .map((attachment) => ({
+      type: 'image',
+      url: attachment.url,
+      name: attachment.name || 'image',
+    }));
+  const localImagePath = el('codex-local-image-path')?.value.trim();
+  if (localImagePath) {
+    inputItems.push({
+      type: 'localImage',
+      path: localImagePath,
+      name: basename(localImagePath),
+    });
+  }
+  return inputItems;
+}
+
+function getComposerTextFileSections() {
+  return state.codexControls.attachments
+    .filter((attachment) => attachment.type === 'textFile')
+    .map((attachment) => [
+      `Attached file: ${attachment.name || 'untitled'}`,
+      '```text',
+      String(attachment.text || '').replace(/```/g, '` ` `'),
+      '```',
+    ].join('\n'));
+}
+
+function getComposerOptions() {
+  return {
+    model: el('codex-model-input')?.value.trim() || null,
+    effort: el('codex-effort-select')?.value || null,
+    summary: el('codex-summary-select')?.value || null,
+    mode: el('codex-mode-select')?.value || 'default',
+    approvalPolicy: el('codex-approval-policy-select')?.value || 'on-request',
+    approvalsReviewer: el('codex-reviewer-select')?.value || 'user',
+    sandboxMode: el('codex-sandbox-mode-select')?.value || 'workspaceWrite',
+  };
+}
+
+function buildPlanPrompt(text, hasAttachments) {
+  const request = text || (hasAttachments ? 'Please inspect the attached image(s) and propose a safe next-step plan.' : '');
+  return [
+    'Plan mode: do not modify files, do not run destructive commands, and do not make irreversible changes.',
+    'Analyze the request, list the concrete steps you would take, and call out risks or decisions that need confirmation.',
+    '',
+    'User request:',
+    request,
+  ].join('\n').trim();
+}
+
+function buildComposerPayload(rawText, overrides = {}) {
+  const inputItems = getComposerInputItems();
+  const textFileSections = getComposerTextFileSections();
+  const options = {
+    ...getComposerOptions(),
+    ...overrides,
+  };
+  let text = String(rawText || '').trim();
+  const hasOriginalContent = Boolean(text || inputItems.length || textFileSections.length);
+  if (textFileSections.length) {
+    text = [
+      text,
+      'Attached text file contents:',
+      ...textFileSections,
+    ].filter(Boolean).join('\n\n');
+  }
+  if (!text && inputItems.length) {
+    text = 'Please inspect the attached image(s).';
+  }
+  if (options.mode === 'plan' && hasOriginalContent) {
+    text = buildPlanPrompt(text, inputItems.length > 0);
+    options.approvalPolicy = 'never';
+    options.sandboxMode = 'readOnly';
+  }
+
+  return {
+    ...options,
+    text,
+    inputItems,
+  };
+}
+
+function clearComposerFileAttachments() {
+  state.codexControls.attachments = [];
+  const fileInput = el('codex-image-files');
+  if (fileInput) {
+    fileInput.value = '';
+  }
+  renderAttachmentChips();
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('failed to read image file'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('failed to read text file'));
+    reader.readAsText(file);
+  });
+}
+
+async function addComposerImageFiles(files) {
+  const incoming = Array.from(files || []).filter((file) => file && String(file.type || '').startsWith('image/'));
+  if (!incoming.length) {
+    return;
+  }
+  const existingImages = state.codexControls.attachments.filter((attachment) => attachment.type === 'image').length;
+  const available = Math.max(0, MAX_COMPOSER_IMAGES - existingImages);
+  if (!available) {
+    throw new Error(`You can attach up to ${MAX_COMPOSER_IMAGES} images at once.`);
+  }
+
+  const selected = incoming.slice(0, available);
+  for (const file of selected) {
+    if (file.size > MAX_COMPOSER_IMAGE_BYTES) {
+      throw new Error(`${file.name} is too large for inline upload; limit is ${formatBytes(MAX_COMPOSER_IMAGE_BYTES)} per image.`);
+    }
+    const url = await readFileAsDataUrl(file);
+    state.codexControls.attachments.push({
+      type: 'image',
+      url,
+      name: file.name,
+      size: file.size,
+    });
+  }
+  renderAttachmentChips();
+}
+
+async function addComposerTextFiles(files) {
+  const incoming = Array.from(files || []).filter((file) => file && isTextLikeFile(file));
+  if (!incoming.length) {
+    return;
+  }
+  const existingTextFiles = state.codexControls.attachments.filter((attachment) => attachment.type === 'textFile').length;
+  const available = Math.max(0, MAX_COMPOSER_TEXT_FILES - existingTextFiles);
+  if (!available) {
+    throw new Error(`You can attach up to ${MAX_COMPOSER_TEXT_FILES} text files at once.`);
+  }
+
+  const selected = incoming.slice(0, available);
+  for (const file of selected) {
+    if (file.size > MAX_COMPOSER_TEXT_FILE_BYTES) {
+      throw new Error(`${file.name} is too large for inline text upload; limit is ${formatBytes(MAX_COMPOSER_TEXT_FILE_BYTES)} per file.`);
+    }
+    const text = await readFileAsText(file);
+    state.codexControls.attachments.push({
+      type: 'textFile',
+      text,
+      name: file.name,
+      size: file.size,
+    });
+  }
+  renderAttachmentChips();
+}
+
+async function addComposerFiles(files) {
+  const allFiles = Array.from(files || []).filter(Boolean);
+  if (!allFiles.length) {
+    return;
+  }
+
+  const imageFiles = allFiles.filter((file) => String(file.type || '').startsWith('image/'));
+  const textFiles = allFiles.filter((file) => !String(file.type || '').startsWith('image/') && isTextLikeFile(file));
+  const unsupported = allFiles.filter((file) => !imageFiles.includes(file) && !textFiles.includes(file));
+
+  await addComposerImageFiles(imageFiles);
+  await addComposerTextFiles(textFiles);
+
+  if (unsupported.length) {
+    const names = unsupported.slice(0, 3).map((file) => file.name || 'unnamed').join(', ');
+    throw new Error(`Unsupported drag/drop file type: ${names}. Images are sent as attachments; text/code files are embedded into the prompt.`);
+  }
+}
+
+function isFileDragEvent(event) {
+  return Array.from(event.dataTransfer?.types || []).includes('Files');
+}
+
+function setComposerDragActive(active) {
+  const composer = el('input-form');
+  if (composer) {
+    composer.classList.toggle('drag-active', Boolean(active));
+  }
+}
+
+async function handleComposerDrop(event) {
+  if (!isFileDragEvent(event)) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  setComposerDragActive(false);
+
+  const composer = el('input-form');
+  if (composer?.classList.contains('disabled')) {
+    reportError(new Error('Select or start a live session before attaching files.'));
+    return;
+  }
+
+  try {
+    await addComposerFiles(event.dataTransfer?.files);
+  } catch (error) {
+    reportError(error);
   }
 }
 
@@ -1560,8 +2416,10 @@ function renderSessionDetails() {
     forkButton.textContent = session.live ? 'Fork Running Session' : 'Fork New Branch';
   }
 
-  composer.classList.toggle('disabled', !session || (!session.live && !canActivateHistory));
-  input.disabled = !session || (!session.live && !canActivateHistory);
+  const composerDisabled = !session || (!session.live && !canActivateHistory);
+  composer.classList.toggle('disabled', composerDisabled);
+  input.disabled = composerDisabled;
+  renderComposerControls(session, composerDisabled);
   if (session?.live) {
     input.placeholder = 'Send a follow-up prompt to the live managed session...';
   } else if (canActivateHistory) {
@@ -2416,6 +3274,18 @@ function renderTranscript(session = getSelectedSession()) {
 }
 
 function renderAll() {
+  const sidebar = document.querySelector('.sidebar');
+  sidebar?.classList.toggle('overview-collapsed', state.overviewCollapsed);
+  el('overview-body')?.classList.toggle('hidden', state.overviewCollapsed);
+  el('new-session-body')?.classList.toggle('hidden', state.newSessionCollapsed);
+  const overviewButton = el('toggle-overview-button');
+  const newSessionButton = el('toggle-new-session-button');
+  if (overviewButton) {
+    overviewButton.textContent = state.overviewCollapsed ? 'Show' : 'Hide';
+  }
+  if (newSessionButton) {
+    newSessionButton.textContent = state.newSessionCollapsed ? 'Show New' : 'Hide New';
+  }
   renderOverview();
   renderHostNav();
   renderConversationNav();
@@ -2640,7 +3510,7 @@ async function showSession(session = getSelectedSession()) {
   }
 }
 
-function setSelectedHost(hostId) {
+function applySelectedHost(hostId) {
   if (state.selectedHostId === hostId) {
     return;
   }
@@ -2656,9 +3526,119 @@ function setSelectedHost(hostId) {
   showSession().catch(reportError);
 }
 
-function selectConversation(conversation) {
+async function refreshHostAndConnectorSnapshots() {
+  const [hostsResponse, connectorsResponse] = await Promise.all([
+    fetchJson('/api/hosts'),
+    fetchJson('/api/connectors'),
+  ]);
+  state.hosts = hostsResponse.hosts || [];
+  state.dismissedHosts = hostsResponse.dismissedHosts || [];
+  state.connectors = connectorsResponse.connectors || [];
+  renderAll();
+}
+
+async function waitForRecoveredHost(hostId, timeoutMs = 90000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    await refreshHostAndConnectorSnapshots();
+    const host = getHost(hostId);
+    if (host?.online) {
+      try {
+        return await verifyHostAvailable(hostId);
+      } catch (error) {
+        lastError = error;
+      }
+    } else {
+      lastError = new Error(`Host ${host?.label || hostId} is still offline after connector restart.`);
+    }
+    await delay(1500);
+  }
+
+  throw lastError || new Error(`Timed out while waiting for host ${hostId} to reconnect.`);
+}
+
+async function recoverHostForSwitch(hostId, cause) {
+  const connector = getConnectorForHost(hostId);
+  if (!connector) {
+    return false;
+  }
+
+  const host = getHost(hostId);
+  state.connectorActionResults.set(connector.connectorId, {
+    ok: false,
+    status: 'recovering_host',
+    message: `${host?.label || hostId} is not ready: ${cause?.message || 'health check failed'}. Starting connector ${connector.label || connector.connectorId}...`,
+  });
+  renderConnectorManager();
+
+  const result = await executeConnectorAction(connector, 'bootstrap', connector, {
+    refreshAfter: false,
+    selectEditor: false,
+    reportMissing: false,
+  });
+  if (!result) {
+    throw new Error(`Recovery for ${host?.label || hostId} was cancelled.`);
+  }
+  if (!result.ok) {
+    throw new Error(`Host ${host?.label || hostId} is unavailable, and connector ${connector.label || connector.connectorId} could not restart it:\n${connectorActionResultSummary(result)}`);
+  }
+
+  await waitForRecoveredHost(hostId);
+  await refresh();
+  return true;
+}
+
+async function ensureHostAvailable(hostId) {
+  try {
+    return await verifyHostAvailable(hostId);
+  } catch (error) {
+    const recovered = await recoverHostForSwitch(hostId, error);
+    if (recovered) {
+      return { ok: true, mode: 'connector-recovered' };
+    }
+    throw error;
+  }
+}
+
+async function setSelectedHost(hostId, options = {}) {
+  if (state.selectedHostId === hostId) {
+    return;
+  }
+
+  const verify = options.verify !== false;
+  state.hostSwitchBusyId = hostId;
+  renderAll();
+
+  try {
+    if (verify) {
+      await ensureHostAvailable(hostId);
+    }
+    applySelectedHost(hostId);
+  } finally {
+    state.hostSwitchBusyId = null;
+    renderAll();
+  }
+}
+
+function setSessionSearchQuery(query) {
+  state.sessionSearchQuery = String(query || '').trim();
+  renderAll();
+}
+
+function setSessionSearchMode(mode) {
+  state.sessionSearchMode = ['keyword', 'path', 'title'].includes(mode) ? mode : 'keyword';
+  renderAll();
+}
+
+async function selectConversation(conversation) {
   if (!conversation) {
     return;
+  }
+
+  if (state.selectedHostId !== conversation.hostId) {
+    await ensureHostAvailable(conversation.hostId);
   }
 
   state.selectedHostId = conversation.hostId;
@@ -2668,9 +3648,13 @@ function selectConversation(conversation) {
   showSession().catch(reportError);
 }
 
-function selectSession(session) {
+async function selectSession(session) {
   if (!session) {
     return;
+  }
+
+  if (state.selectedHostId !== session.hostId) {
+    await ensureHostAvailable(session.hostId);
   }
 
   state.selectedHostId = session.hostId;
@@ -2683,16 +3667,21 @@ function selectSession(session) {
 async function refresh() {
   const previousKey = getSessionKey(getSelectedSession());
 
-  const [stats, hostsResponse, connectorsResponse] = await Promise.all([
+  const [stats, hostsResponse, connectorsResponse, collectionsResponse] = await Promise.all([
     fetchJson('/api/stats'),
     fetchJson('/api/hosts'),
     fetchJson('/api/connectors'),
+    fetchJson('/api/session-collections'),
   ]);
 
   state.stats = stats;
   state.hosts = hostsResponse.hosts || [];
   state.dismissedHosts = hostsResponse.dismissedHosts || [];
   state.connectors = connectorsResponse.connectors || [];
+  state.sessionCollections = collectionsResponse.collections || [];
+  if (!state.sessionCollections.some((collection) => collection.collectionId === state.selectedCollectionId)) {
+    state.selectedCollectionId = state.sessionCollections[0]?.collectionId || 'default';
+  }
 
   const sessionResponses = await Promise.all(
     state.hosts.map((host) => fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/sessions`))
@@ -2739,21 +3728,24 @@ async function refresh() {
   }
 }
 
-async function waitForSession(hostId, sessionId, predicate, timeoutMs = 12000) {
+async function waitForSession(hostId, sessionId, predicate, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
+  let lastSession = null;
   while (Date.now() < deadline) {
     const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/sessions`);
     const session = (response.sessions || []).find((item) => item.sessionId === sessionId || item.bridgeSessionId === sessionId) || null;
+    lastSession = session || lastSession;
     if (session && predicate(session)) {
       return session;
     }
     await sleep(400);
   }
 
-  throw new Error('Timed out while waiting for the live session to start.');
+  const stateText = lastSession?.state ? ` Last state: ${lastSession.state}.` : '';
+  throw new Error(`Timed out while waiting for the live session to start.${stateText}`);
 }
 
-async function waitForSessionReady(hostId, sessionId, timeoutMs = 12000) {
+async function waitForSessionReady(hostId, sessionId, timeoutMs = 60000) {
   return waitForSession(
     hostId,
     sessionId,
@@ -2775,7 +3767,7 @@ async function importHostById(hostId) {
 
   await refresh();
   if (response?.host?.hostId) {
-    setSelectedHost(response.host.hostId);
+    await setSelectedHost(response.host.hostId);
   }
 }
 
@@ -2828,8 +3820,7 @@ async function deleteHost(hostId) {
   await refresh();
 }
 
-async function saveConnectorProfile() {
-  const payload = readConnectorForm();
+async function saveConnectorProfile(payload = readConnectorForm()) {
   if (!payload.label) {
     reportError(new Error('Connector label is required.'));
     return null;
@@ -2897,10 +3888,195 @@ async function copyConnectorSmokeCommand() {
   await navigator.clipboard.writeText(command);
 }
 
-async function runConnectorAction(action) {
-  const connector = state.connectorEditorId ? getConnector(state.connectorEditorId) : null;
+function connectorNeedsOneTimePrompt(method, otpSource, context = {}) {
+  const normalized = String(method || '').trim();
+  if (normalized === 'otp' || normalized === 'manual_captcha') {
+    return true;
+  }
+  if (normalized === 'keyboard_interactive' && String(context.keyPath || '').trim()) {
+    return true;
+  }
+  return Boolean(String(otpSource || '').trim())
+    && (normalized === 'password' || normalized === 'keyboard_interactive');
+}
+
+function connectorOneTimePromptName(method) {
+  return method === 'manual_captcha' ? 'captcha / manual challenge response' : 'OTP / MFA code';
+}
+
+function promptConnectorOneTimeCode(scope, method, otpSource, action, options = {}) {
+  const promptName = connectorOneTimePromptName(method);
+  const actionLabel = {
+    smoke_test: 'Test',
+    status: 'Status',
+    bootstrap: 'Start Agent',
+    restart: 'Restart Agent',
+    diagnose: 'Diagnose',
+    logs: 'Logs',
+  }[action] || action || 'SSH';
+  const sourceNote = String(otpSource || '').trim()
+    ? `\nSource/notes: ${String(otpSource || '').trim()}`
+    : '';
+  const retryNote = options.retry
+    ? `\n\nPrevious authentication failed. The code may have expired; enter a fresh one.`
+    : '';
+  const attemptNote = options.maxAttempts && options.attempt
+    ? `\nAttempt ${options.attempt} of ${options.maxAttempts}.`
+    : '';
+  const value = window.prompt(
+    `${scope} requires a current ${promptName} for ${actionLabel}.${sourceNote}${retryNote}${attemptNote}\n\nThis code is sent once and is not saved.`
+  );
+  if (value === null) {
+    return null;
+  }
+  const code = String(value).trim();
+  if (!code) {
+    throw new Error(`${scope} ${promptName} is required for this connector action.`);
+  }
+  return code;
+}
+
+function connectorActionUsesOneTimeCode(payload) {
+  const gatewayMethod = payload.gateway?.authMethod || 'ssh_key';
+  const targetMethod = payload.auth?.method || 'ssh_key';
+  return Boolean(
+    (payload.gateway?.enabled && connectorNeedsOneTimePrompt(gatewayMethod, payload.gateway?.otpSource))
+    || connectorNeedsOneTimePrompt(targetMethod, payload.auth?.otpSource, {
+      keyPath: payload.auth?.keyPath || '',
+    })
+  );
+}
+
+function collectConnectorActionSecrets(payload, action, promptOptions = {}) {
+  const secrets = { ...(payload.secrets || {}) };
+  const gatewayMethod = payload.gateway?.authMethod || 'ssh_key';
+  const targetMethod = payload.auth?.method || 'ssh_key';
+  const passthrough = Boolean(promptOptions.interactivePassthrough);
+
+  if (
+    payload.gateway?.enabled
+    && connectorNeedsOneTimePrompt(gatewayMethod, payload.gateway?.otpSource)
+    && !(passthrough && gatewayMethod === 'keyboard_interactive')
+  ) {
+    const gatewayOtp = promptConnectorOneTimeCode('Gateway', gatewayMethod, payload.gateway?.otpSource, action, promptOptions);
+    if (gatewayOtp === null) {
+      return null;
+    }
+    secrets.gatewayOtp = gatewayOtp;
+  }
+
+  if (connectorNeedsOneTimePrompt(targetMethod, payload.auth?.otpSource, {
+    keyPath: payload.auth?.keyPath || '',
+  }) && !(passthrough && targetMethod === 'keyboard_interactive')) {
+    const targetOtp = promptConnectorOneTimeCode('Target', targetMethod, payload.auth?.otpSource, action, promptOptions);
+    if (targetOtp === null) {
+      return null;
+    }
+    secrets.targetOtp = targetOtp;
+  }
+
+  return secrets;
+}
+
+function connectorActionFailureText(result) {
+  const chunks = [
+    result?.status,
+    result?.message,
+    result?.stdout,
+    result?.stderr,
+    result?.error,
+    result?.deploy?.status,
+    result?.deploy?.message,
+  ];
+  for (const step of result?.deploy?.steps || []) {
+    chunks.push(step?.name, step?.stdout, step?.stderr, step?.error);
+  }
+  return chunks.filter(Boolean).join('\n').toLowerCase();
+}
+
+function shouldRetryConnectorOneTimeCode(payload, result) {
+  if (!result || result.ok || !connectorActionUsesOneTimeCode(payload)) {
+    return false;
+  }
+  const text = connectorActionFailureText(result);
+  return /permission denied.*keyboard-interactive|keyboard-interactive.*permission denied|verification|authenticator|passcode|otp|mfa|token|connection closed/.test(text);
+}
+
+function updateConnectorFromActionResult(connectorId, result) {
+  if (!result?.connector) {
+    return;
+  }
+  const index = state.connectors.findIndex((item) => item.connectorId === connectorId);
+  if (index >= 0) {
+    state.connectors[index] = result.connector;
+  }
+}
+
+function connectorActionResultSummary(result) {
+  if (!result) {
+    return 'No connector action result was returned.';
+  }
+  return [
+    result.message,
+    result.error,
+    result.stderr,
+    result.deploy?.message,
+  ].filter(Boolean).join('\n') || result.status || 'Connector action failed.';
+}
+
+function makeConnectorAskpassContext() {
+  return {
+    actionId: makeClientId(),
+    token: `${makeClientId()}-${makeClientId()}`,
+  };
+}
+
+async function answerConnectorAskpassPrompt(connectorId, askpass, prompt, answer) {
+  await fetchJson(`/api/connectors/${encodeURIComponent(connectorId)}/action-prompts/${encodeURIComponent(prompt.promptId)}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      actionId: askpass.actionId,
+      token: askpass.token,
+      cancel: answer === null,
+      response: answer === null ? '' : String(answer),
+    }),
+  });
+}
+
+async function watchConnectorAskpassPrompts(connectorId, askpass, control) {
+  const seen = new Set();
+  while (!control.done) {
+    try {
+      const result = await fetchJson(
+        `/api/connectors/${encodeURIComponent(connectorId)}/action-prompts?actionId=${encodeURIComponent(askpass.actionId)}&token=${encodeURIComponent(askpass.token)}`
+      );
+      for (const prompt of result.prompts || []) {
+        if (!prompt?.promptId || seen.has(prompt.promptId)) {
+          continue;
+        }
+        seen.add(prompt.promptId);
+        const answer = window.prompt(
+          `SSH is asking for input:\n\n${prompt.prompt || 'Authentication prompt'}\n\nType the exact response for this prompt. It is sent once and is not saved.`
+        );
+        await answerConnectorAskpassPrompt(connectorId, askpass, prompt, answer);
+        if (answer === null) {
+          control.cancelled = true;
+          control.done = true;
+          return;
+        }
+      }
+    } catch (_) {
+      // The action may not be registered yet, or it may have just finished.
+    }
+    await delay(500);
+  }
+}
+
+async function executeConnectorAction(connector, action, payload = connector, options = {}) {
   if (!connector?.connectorId) {
-    reportError(new Error('Save or select an HPC connector first.'));
+    if (options.reportMissing !== false) {
+      reportError(new Error('Save or select an HPC connector first.'));
+    }
     return null;
   }
 
@@ -2911,25 +4087,85 @@ async function runConnectorAction(action) {
   renderConnectorManager();
 
   try {
-    const result = await fetchJson(`/api/connectors/${encodeURIComponent(connector.connectorId)}/actions`, {
-      method: 'POST',
-      body: JSON.stringify({ action }),
-    });
-    state.connectorActionResults.set(connector.connectorId, result);
-    if (result.connector) {
-      const index = state.connectors.findIndex((item) => item.connectorId === connector.connectorId);
-      if (index >= 0) {
-        state.connectors[index] = result.connector;
+    const usePromptPassthrough = true;
+    const maxAttempts = usePromptPassthrough ? 1 : connectorActionUsesOneTimeCode(payload) ? 3 : 1;
+    let lastResult = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let actionSecrets = null;
+      try {
+        actionSecrets = collectConnectorActionSecrets(payload, action, {
+          retry: attempt > 1,
+          attempt,
+          maxAttempts,
+          interactivePassthrough: usePromptPassthrough,
+        });
+      } catch (error) {
+        reportError(error);
+        return lastResult;
       }
+      if (!actionSecrets) {
+        return lastResult;
+      }
+
+      const askpass = makeConnectorAskpassContext();
+      const promptControl = { done: false };
+      const promptWatcher = watchConnectorAskpassPrompts(connector.connectorId, askpass, promptControl);
+      let result = null;
+      try {
+        result = await fetchJson(`/api/connectors/${encodeURIComponent(connector.connectorId)}/actions`, {
+          method: 'POST',
+          body: JSON.stringify({
+            action,
+            clientOrigin: window.location.origin,
+            secrets: actionSecrets,
+            askpass,
+          }),
+        });
+      } finally {
+        promptControl.done = true;
+        promptWatcher.catch(() => {});
+      }
+      lastResult = result;
+      state.connectorActionResults.set(connector.connectorId, result);
+      updateConnectorFromActionResult(connector.connectorId, result);
+      renderConnectorManager();
+
+      const shouldRetry = !promptControl.cancelled
+        && attempt < maxAttempts
+        && shouldRetryConnectorOneTimeCode(payload, result);
+      if (!shouldRetry) {
+        if (options.refreshAfter !== false) {
+          await refresh();
+        }
+        if (options.selectEditor !== false) {
+          state.connectorEditorId = connector.connectorId;
+        }
+        renderConnectorManager();
+        return result;
+      }
+
+      state.connectorActionResults.set(connector.connectorId, {
+        ...result,
+        ok: false,
+        status: 'auth_retry',
+        message: `${result.message || 'Authentication failed.'} Requesting a fresh OTP and retrying...`,
+      });
+      renderConnectorManager();
     }
-    await refresh();
-    state.connectorEditorId = connector.connectorId;
-    renderConnectorManager();
-    return result;
+    return lastResult;
   } finally {
     state.connectorActionBusy = null;
     renderConnectorManager();
   }
+}
+
+async function runConnectorAction(action) {
+  const payload = readConnectorForm();
+  const savedConnector = await saveConnectorProfile(payload);
+  return executeConnectorAction(savedConnector?.connectorId ? savedConnector : null, action, payload, {
+    refreshAfter: true,
+    selectEditor: true,
+  });
 }
 
 function getOriginSessionId(session) {
@@ -3058,7 +4294,7 @@ async function joinLiveSession() {
   if (!liveSession) {
     return;
   }
-  selectSession(liveSession);
+  await selectSession(liveSession);
 }
 
 async function startManagedSession(options = {}) {
@@ -3070,16 +4306,22 @@ async function startManagedSession(options = {}) {
   const hostId = options.hostId || sourceSession?.hostId || state.selectedHostId;
   const cwd = String(options.cwd || sourceSession?.cwd || '').trim();
   const label = String(options.label || sourceSession?.title || pathLeaf(cwd) || cwd || '').trim();
+  const host = hostId ? getHost(hostId) : null;
 
   if (!hostId) {
     reportError(new Error('Select a host before starting a managed session.'));
     return null;
+  }
+  if (host && !host.online) {
+    throw new Error(`Host ${host.label || host.hostId} is offline. Start its agent first, then try again.`);
   }
 
   if (!cwd) {
     reportError(new Error('No workspace path is available for this conversation.'));
     return null;
   }
+
+  await verifyHostAvailable(hostId);
 
   const body = {
     cwd,
@@ -3117,10 +4359,10 @@ async function startManagedSession(options = {}) {
   await refresh();
   const next = state.sessions.find((item) => item.hostId === hostId && item.sessionId === startedSession.sessionId) || null;
   if (next) {
-    selectSession(next);
+    await selectSession(next);
   }
-  if (next && options.initialText) {
-    await sendInputToSession(next, options.initialText);
+  if (next && (options.initialText || options.initialInputOptions?.inputItems?.length)) {
+    await sendInputToSession(next, options.initialText || '', options.initialInputOptions || {});
   }
   return next;
 }
@@ -3200,17 +4442,28 @@ function useSelectedSessionPath() {
   }
 }
 
-async function sendInputToSession(session, text) {
+async function sendInputToSession(session, text, options = {}) {
+  await verifyHostAvailable(session.hostId);
   await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
     method: 'POST',
     body: JSON.stringify({
       hostId: session.hostId,
       text,
+      inputItems: Array.isArray(options.inputItems) ? options.inputItems : [],
+      mode: options.mode || null,
+      model: options.model || null,
+      effort: options.effort || null,
+      summary: options.summary || null,
+      approvalPolicy: options.approvalPolicy || null,
+      approvalsReviewer: options.approvalsReviewer || null,
+      sandboxMode: options.sandboxMode || null,
+      serviceTier: options.serviceTier || null,
+      personality: options.personality || null,
     }),
   });
 }
 
-async function sendInput(text) {
+async function sendInput(text, options = {}) {
   const session = getSelectedSession();
   if (!session) {
     return;
@@ -3221,11 +4474,48 @@ async function sendInput(text) {
       reportError(new Error('This history session does not have a workspace path to activate.'));
       return;
     }
-    await resumeFromHistory({ session, initialText: text });
+    await resumeFromHistory({ session, initialText: text, initialInputOptions: options });
     return;
   }
 
-  await sendInputToSession(session, text);
+  await sendInputToSession(session, text, options);
+}
+
+async function loadModelOptionsForSelectedSession() {
+  const session = getSelectedSession();
+  if (!session?.live) {
+    throw new Error('Select a live managed session before loading models.');
+  }
+
+  state.codexControls.modelsLoading = true;
+  renderSessionDetails();
+  try {
+    await verifyHostAvailable(session.hostId);
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models?hostId=${encodeURIComponent(session.hostId)}&limit=100`);
+    state.codexControls.modelOptionsBySession.set(modelCacheKey(session), Array.isArray(response.models) ? response.models : []);
+  } finally {
+    state.codexControls.modelsLoading = false;
+    renderSessionDetails();
+  }
+}
+
+async function startReviewForCurrentSession() {
+  const session = getSelectedSession();
+  if (!session?.live) {
+    throw new Error('Select a live managed session before starting a review.');
+  }
+
+  await verifyHostAvailable(session.hostId);
+  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/review`, {
+    method: 'POST',
+    body: JSON.stringify({
+      hostId: session.hostId,
+      target: {
+        type: 'uncommittedChanges',
+      },
+      delivery: 'inline',
+    }),
+  });
 }
 
 function sleep(ms) {
@@ -3535,8 +4825,65 @@ el('new-session-form').addEventListener('submit', async (event) => {
   }
 });
 
+el('toggle-overview-button').addEventListener('click', () => {
+  state.overviewCollapsed = !state.overviewCollapsed;
+  renderAll();
+});
+
+el('toggle-new-session-button').addEventListener('click', () => {
+  state.newSessionCollapsed = !state.newSessionCollapsed;
+  renderAll();
+});
+
+el('session-search-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  setSessionSearchQuery(el('session-search-input').value);
+});
+
+el('session-search-input').addEventListener('input', (event) => {
+  if (!event.target.value.trim() && state.sessionSearchQuery) {
+    setSessionSearchQuery('');
+  }
+});
+
+el('session-search-mode').addEventListener('change', (event) => {
+  setSessionSearchMode(event.target.value);
+});
+
+el('clear-session-search-button').addEventListener('click', () => {
+  el('session-search-input').value = '';
+  setSessionSearchQuery('');
+});
+
+el('collection-create-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = el('collection-name-input');
+  const name = input.value.trim();
+  if (!name) {
+    return;
+  }
+  input.value = '';
+  try {
+    await createSessionCollection(name);
+  } catch (error) {
+    reportError(error);
+  }
+});
+
 el('use-selected-path-button').addEventListener('click', () => {
   useSelectedSessionPath();
+});
+
+el('host-switcher').addEventListener('change', async (event) => {
+  const hostId = event.target.value;
+  if (hostId) {
+    try {
+      await setSelectedHost(hostId);
+    } catch (error) {
+      event.target.value = state.selectedHostId || '';
+      reportError(error);
+    }
+  }
 });
 
 el('browse-directory-button').addEventListener('click', async () => {
@@ -3581,6 +4928,91 @@ el('picker-select-button').addEventListener('click', () => {
   applyPickedDirectory();
 });
 
+el('codex-model-refresh-button').addEventListener('click', async () => {
+  try {
+    await loadModelOptionsForSelectedSession();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('codex-image-files').addEventListener('change', async (event) => {
+  try {
+    await addComposerFiles(event.target.files);
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('codex-local-image-path').addEventListener('input', () => {
+  renderAttachmentChips();
+});
+
+el('codex-clear-attachments-button').addEventListener('click', () => {
+  clearComposerFileAttachments();
+});
+
+el('codex-plan-button').addEventListener('click', async () => {
+  const input = el('input-text');
+  const payload = buildComposerPayload(input.value, { mode: 'plan' });
+  if (!payload.text && !payload.inputItems.length) {
+    return;
+  }
+
+  try {
+    await sendInput(payload.text, payload);
+    input.value = '';
+    clearComposerFileAttachments();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('codex-review-button').addEventListener('click', async () => {
+  try {
+    await startReviewForCurrentSession();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('input-text').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    el('input-form').requestSubmit();
+  }
+});
+
+el('input-form').addEventListener('dragenter', (event) => {
+  if (!isFileDragEvent(event)) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  setComposerDragActive(true);
+});
+
+el('input-form').addEventListener('dragover', (event) => {
+  if (!isFileDragEvent(event)) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  event.dataTransfer.dropEffect = 'copy';
+  setComposerDragActive(true);
+});
+
+el('input-form').addEventListener('dragleave', (event) => {
+  if (!isFileDragEvent(event)) {
+    return;
+  }
+  if (!event.currentTarget.contains(event.relatedTarget)) {
+    setComposerDragActive(false);
+  }
+});
+
+el('input-form').addEventListener('drop', handleComposerDrop);
+
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') {
     return;
@@ -3602,14 +5034,15 @@ document.addEventListener('keydown', (event) => {
 el('input-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = el('input-text');
-  const text = input.value.trim();
-  if (!text) {
+  const payload = buildComposerPayload(input.value);
+  if (!payload.text && !payload.inputItems.length) {
     return;
   }
 
-  input.value = '';
   try {
-    await sendInput(text);
+    await sendInput(payload.text, payload);
+    input.value = '';
+    clearComposerFileAttachments();
   } catch (error) {
     reportError(error);
   }

@@ -22,6 +22,23 @@ const MANAGED_CWD = process.env.MANAGED_CWD || process.cwd();
 const liveSessions = new Map();
 let lastCommandId = 0;
 
+function getCapabilities() {
+  return {
+    discovery: true,
+    managedSessions: true,
+    directoryBrowse: true,
+    structuredStatus: true,
+    requestResponses: true,
+    interrupt: true,
+    hostProbe: true,
+    turnControls: true,
+    modelList: true,
+    review: true,
+    imageInput: true,
+    demoMode: MANAGED_COMMAND === 'demo',
+  };
+}
+
 function fetchJson(targetUrl, options = {}) {
   const parsed = new URL(targetUrl);
   const client = parsed.protocol === 'https:' ? https : http;
@@ -71,22 +88,13 @@ async function postEvent(event) {
 }
 
 async function registerHost() {
-  const demoMode = MANAGED_COMMAND === 'demo';
   await fetchJson(`${RELAY_URL}/api/agent/register`, {
     method: 'POST',
     body: {
       hostId: HOST_ID,
       label: HOST_LABEL,
       platform: process.platform,
-      capabilities: {
-        discovery: true,
-        managedSessions: true,
-        directoryBrowse: true,
-        structuredStatus: true,
-        requestResponses: true,
-        interrupt: true,
-        demoMode,
-      },
+      capabilities: getCapabilities(),
     },
   });
 }
@@ -94,7 +102,13 @@ async function registerHost() {
 async function heartbeat() {
   await fetchJson(`${RELAY_URL}/api/agent/heartbeat`, {
     method: 'POST',
-    body: { hostId: HOST_ID, time: nowIso() },
+    body: {
+      hostId: HOST_ID,
+      label: HOST_LABEL,
+      platform: process.platform,
+      capabilities: getCapabilities(),
+      time: nowIso(),
+    },
   });
 }
 
@@ -112,6 +126,38 @@ async function sendDiscovery() {
     originSessionId: session.originSessionId || null,
     conversationKey: session.conversationKey || session.sessionId,
   }));
+
+  const seenRunners = new Set();
+  for (const runner of liveSessions.values()) {
+    if (!runner || seenRunners.has(runner)) {
+      continue;
+    }
+    seenRunners.add(runner);
+    const liveSessionId = typeof runner.currentSessionId === 'function'
+      ? runner.currentSessionId()
+      : runner.sessionId;
+    if (!liveSessionId) {
+      continue;
+    }
+    sessions.push({
+      sessionId: liveSessionId,
+      title: runner.title || runner.runtime?.cwd || liveSessionId,
+      cwd: runner.cwd || runner.runtime?.cwd || MANAGED_CWD,
+      source: 'managed',
+      live: true,
+      updatedAt: nowIso(),
+      latestUserMessage: null,
+      latestAgentMessage: null,
+      transcriptPreview: [],
+      originSessionId: runner.originSessionId || null,
+      sourceSessionId: runner.sourceSessionId || null,
+      conversationKey: runner.conversationKey || runner.originSessionId || liveSessionId,
+      bridgeSessionId: runner.bridgeSessionId || null,
+      nativeThreadId: runner.nativeThreadId || liveSessionId,
+      launchMode: runner.launchMode || null,
+      runtime: runner.runtime || null,
+    });
+  }
 
   await postEvent({
     type: 'session.discovery',
@@ -135,13 +181,25 @@ function listBrowseRoots() {
     return roots.length ? roots : [{ name: MANAGED_CWD, path: MANAGED_CWD }];
   }
 
-  return [{ name: '/', path: '/' }];
+  const home = os.homedir();
+  const roots = [];
+  if (home && fs.existsSync(home)) {
+    roots.push({ name: '~', path: home });
+  }
+  roots.push({ name: '/', path: '/' });
+  return roots;
 }
 
 function normalizeBrowsePath(inputPath) {
   const raw = String(inputPath || '').trim();
   if (!raw) {
     return null;
+  }
+  if (raw === '~') {
+    return os.homedir();
+  }
+  if (raw.startsWith('~/')) {
+    return path.join(os.homedir(), raw.slice(2));
   }
   return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(MANAGED_CWD, raw);
 }
@@ -296,6 +354,13 @@ function startProcessManagedSession({ sessionId, cwd, command, args, label, orig
   const child = spawn(command, args, spawnOptions);
   const runner = {
     kind: 'process',
+    sessionId,
+    title: label || cwd || sessionId,
+    cwd,
+    originSessionId: originSessionId || null,
+    sourceSessionId: sourceSessionId || null,
+    conversationKey: conversationKey || originSessionId || sessionId,
+    launchMode: launchMode || null,
     runtime: {
       kind: 'child_process',
       command,
@@ -473,6 +538,19 @@ async function handleCommand(command) {
     return;
   }
 
+  if (command.type === 'host.probe') {
+    await postEvent({
+      type: 'host.probe',
+      hostId: HOST_ID,
+      requestId: command.requestId || makeId(),
+      label: HOST_LABEL,
+      platform: process.platform,
+      capabilities: getCapabilities(),
+      timestamp: nowIso(),
+    });
+    return;
+  }
+
   if (command.type === 'directory.list') {
     await handleDirectoryList(command);
     return;
@@ -491,7 +569,77 @@ async function handleCommand(command) {
   }
 
   if (command.type === 'session.input') {
-    await runner.sendInput(String(command.text || ''));
+    try {
+      await runner.sendInput(String(command.text || ''), {
+        inputItems: Array.isArray(command.inputItems) ? command.inputItems : [],
+        attachments: Array.isArray(command.attachments) ? command.attachments : [],
+        mode: command.mode || null,
+        model: command.model || null,
+        effort: command.effort || null,
+        summary: command.summary || null,
+        approvalPolicy: command.approvalPolicy || null,
+        approvalsReviewer: command.approvalsReviewer || null,
+        sandboxMode: command.sandboxMode || null,
+        serviceTier: command.serviceTier || null,
+        personality: command.personality || null,
+      });
+    } catch (error) {
+      await postEvent({
+        type: 'session.error',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        message: `Unable to start Codex turn: ${error.message}`,
+        timestamp: nowIso(),
+      });
+    }
+    return;
+  }
+
+  if (command.type === 'session.model_list') {
+    if (typeof runner.listModels === 'function') {
+      try {
+        const result = await runner.listModels({
+          cursor: command.cursor || null,
+          includeHidden: command.includeHidden === true,
+          limit: command.limit || 80,
+        });
+        await postEvent({
+          type: 'session.model_listed',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          requestId: command.requestId || makeId(),
+          models: Array.isArray(result?.data) ? result.data : [],
+          nextCursor: result?.nextCursor || null,
+          timestamp: nowIso(),
+        });
+      } catch (error) {
+        await postEvent({
+          type: 'session.model_listed',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          requestId: command.requestId || makeId(),
+          error: error.message,
+          timestamp: nowIso(),
+        });
+        await postEvent({
+          type: 'session.error',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          message: `Unable to list Codex models: ${error.message}`,
+          timestamp: nowIso(),
+        });
+      }
+      return;
+    }
+
+    await postEvent({
+      type: 'session.model_listed',
+      hostId: HOST_ID,
+      sessionId: command.sessionId,
+      requestId: command.requestId || makeId(),
+      error: 'This runner does not support model listing.',
+      timestamp: nowIso(),
+    });
     return;
   }
 
@@ -538,6 +686,35 @@ async function handleCommand(command) {
       hostId: HOST_ID,
       sessionId: command.sessionId,
       message: 'This runner does not support thread compaction.',
+      timestamp: nowIso(),
+    });
+    return;
+  }
+
+  if (command.type === 'session.review_start') {
+    if (typeof runner.startReview === 'function') {
+      try {
+        await runner.startReview({
+          target: command.target || { type: 'uncommittedChanges' },
+          delivery: command.delivery || 'inline',
+        });
+      } catch (error) {
+        await postEvent({
+          type: 'session.error',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          message: `Unable to start Codex review: ${error.message}`,
+          timestamp: nowIso(),
+        });
+      }
+      return;
+    }
+
+    await postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: command.sessionId,
+      message: 'This runner does not support Codex reviews.',
       timestamp: nowIso(),
     });
     return;
@@ -634,12 +811,16 @@ async function main() {
   await sendDiscovery();
 
   if (AUTO_START_SESSION) {
-    await startManagedSession({
-      command: MANAGED_COMMAND,
-      args: MANAGED_ARGS,
-      cwd: MANAGED_CWD,
-      label: MANAGED_COMMAND === 'demo' ? `${HOST_LABEL} demo` : `${HOST_LABEL} live`,
-    });
+    try {
+      await startManagedSession({
+        command: MANAGED_COMMAND,
+        args: MANAGED_ARGS,
+        cwd: MANAGED_CWD,
+        label: MANAGED_COMMAND === 'demo' ? `${HOST_LABEL} demo` : `${HOST_LABEL} live`,
+      });
+    } catch (error) {
+      console.error('[agent] auto-start session failed:', error.message);
+    }
   }
 
   await Promise.all([pollCommandsLoop(), discoveryLoop(), heartbeatLoop()]);

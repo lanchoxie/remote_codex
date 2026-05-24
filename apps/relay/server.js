@@ -1,6 +1,7 @@
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const {
   buildDetachedBootstrapCommand,
@@ -23,6 +24,90 @@ const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_DIR = path.join(__dirname, '..', 'mobile-web', 'public');
+const SESSION_COLLECTIONS_PATH = path.join(process.cwd(), 'tmp', 'session-collections.json');
+const DEFAULT_COLLECTION_ID = 'default';
+const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
+const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 25 * 1024 * 1024);
+
+function normalizeSessionCollectionItem(input = {}) {
+  const hostId = String(input.hostId || '').trim();
+  const conversationKey = String(input.conversationKey || input.originSessionId || input.sessionId || '').trim();
+  const sessionId = String(input.sessionId || '').trim();
+  if (!hostId || !conversationKey) {
+    return null;
+  }
+
+  return {
+    hostId,
+    conversationKey,
+    sessionId,
+    title: String(input.title || '').trim(),
+    cwd: String(input.cwd || '').trim(),
+    hostLabel: String(input.hostLabel || '').trim(),
+    hostPlatform: String(input.hostPlatform || '').trim(),
+    targetHost: String(input.targetHost || '').trim(),
+    targetPort: Number(input.targetPort || 0) || null,
+    connectorId: String(input.connectorId || '').trim(),
+    connectorLabel: String(input.connectorLabel || '').trim(),
+    relayUrl: String(input.relayUrl || '').trim(),
+    addedAt: input.addedAt || nowIso(),
+    updatedAt: nowIso(),
+  };
+}
+
+function collectionItemKey(item) {
+  return `${item.hostId}::${item.conversationKey}`;
+}
+
+function normalizeSessionCollection(input = {}) {
+  const collectionId = String(input.collectionId || input.id || makeId()).trim();
+  const name = String(input.name || '').trim() || 'Untitled';
+  const seen = new Set();
+  const items = [];
+
+  for (const rawItem of Array.isArray(input.items) ? input.items : []) {
+    const item = normalizeSessionCollectionItem(rawItem);
+    if (!item) {
+      continue;
+    }
+    const key = collectionItemKey(item);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    items.push(item);
+  }
+
+  return {
+    collectionId,
+    name,
+    system: collectionId === DEFAULT_COLLECTION_ID,
+    items,
+    createdAt: input.createdAt || nowIso(),
+    updatedAt: input.updatedAt || nowIso(),
+  };
+}
+
+function loadSessionCollections() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSION_COLLECTIONS_PATH, 'utf8'));
+    const collections = Array.isArray(parsed.collections) ? parsed.collections : [];
+    return collections.map(normalizeSessionCollection);
+  } catch {
+    return [];
+  }
+}
+
+function saveSessionCollections(collections) {
+  fs.mkdirSync(path.dirname(SESSION_COLLECTIONS_PATH), { recursive: true });
+  fs.writeFileSync(SESSION_COLLECTIONS_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    collections: collections.map((collection) => ({
+      ...collection,
+      items: collection.collectionId === DEFAULT_COLLECTION_ID ? [] : collection.items,
+    })),
+  }, null, 2), 'utf8');
+}
 
 const state = {
   hosts: new Map(),
@@ -36,13 +121,32 @@ const state = {
   sessionDiagnostics: new Map(),
   sessionRequests: new Map(),
   pendingDirectoryRequests: new Map(),
+  pendingHostProbes: new Map(),
+  pendingModelRequests: new Map(),
+  askpassActions: new Map(),
+  sshMultiplexDisabled: new Map(),
   connectors: new Map(),
   connectorSecrets: loadConnectorSecrets(),
-  nextCommandId: 1,
+  sessionCollections: new Map(),
+  // Agents keep their last command id in memory across relay restarts, so use
+  // a monotonic-ish epoch instead of restarting command ids at 1.
+  nextCommandId: Date.now(),
 };
 
 for (const connector of loadConnectors()) {
   state.connectors.set(connector.connectorId, connector);
+}
+
+for (const collection of loadSessionCollections()) {
+  state.sessionCollections.set(collection.collectionId, collection);
+}
+if (!state.sessionCollections.has(DEFAULT_COLLECTION_ID)) {
+  state.sessionCollections.set(DEFAULT_COLLECTION_ID, normalizeSessionCollection({
+    collectionId: DEFAULT_COLLECTION_ID,
+    name: 'Default',
+    system: true,
+    items: [],
+  }));
 }
 
 function sendJson(res, statusCode, payload) {
@@ -58,14 +162,24 @@ function sendJson(res, statusCode, payload) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
+    let totalBytes = 0;
+    let rejected = false;
     req.on('data', (chunk) => {
+      if (rejected) {
+        return;
+      }
       chunks.push(chunk);
-      if (Buffer.concat(chunks).length > 1_000_000) {
-        reject(new Error('request body too large'));
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_JSON_BODY_BYTES) {
+        rejected = true;
+        reject(new Error(`request body too large; limit is ${MAX_JSON_BODY_BYTES} bytes`));
         req.destroy();
       }
     });
     req.on('end', () => {
+      if (rejected) {
+        return;
+      }
       const raw = Buffer.concat(chunks).toString('utf8').trim();
       if (!raw) {
         resolve({});
@@ -92,6 +206,54 @@ function hostOnline(host) {
   }
   const lastSeen = host.lastSeenAt ? Date.parse(host.lastSeenAt) : 0;
   return Date.now() - lastSeen < 30_000;
+}
+
+function hostHeartbeatAgeMs(host) {
+  const lastSeen = host?.lastSeenAt ? Date.parse(host.lastSeenAt) : 0;
+  return lastSeen ? Date.now() - lastSeen : Number.POSITIVE_INFINITY;
+}
+
+function hostHasFreshHeartbeat(host, maxAgeMs = 15_000) {
+  return hostHeartbeatAgeMs(host) <= maxAgeMs;
+}
+
+function connectorAttachKey(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function attachMatchingConnectorsToHost(host) {
+  const hostLabel = connectorAttachKey(host?.label);
+  if (!host?.hostId || !hostLabel) {
+    return false;
+  }
+
+  let changed = false;
+  for (const connector of state.connectors.values()) {
+    if (connector.hostId || connectorAttachKey(connector.label) !== hostLabel) {
+      continue;
+    }
+    state.connectors.set(connector.connectorId, {
+      ...connector,
+      hostId: host.hostId,
+      updatedAt: nowIso(),
+    });
+    changed = true;
+  }
+  if (changed) {
+    persistConnectors();
+  }
+  return changed;
+}
+
+function getHostUnavailableError(hostId) {
+  const host = state.hosts.get(hostId);
+  if (!host) {
+    return { statusCode: 404, error: 'host not found' };
+  }
+  if (!hostOnline(host)) {
+    return { statusCode: 409, error: `host ${host.label || hostId} is offline` };
+  }
+  return null;
 }
 
 function getHostList() {
@@ -534,6 +696,29 @@ function persistConnectorSecrets() {
   saveConnectorSecrets(state.connectorSecrets);
 }
 
+function persistSessionCollections() {
+  saveSessionCollections(Array.from(state.sessionCollections.values()));
+}
+
+function getSessionCollectionList() {
+  return Array.from(state.sessionCollections.values())
+    .map((collection) => ({
+      ...collection,
+      itemCount: collection.collectionId === DEFAULT_COLLECTION_ID
+        ? Array.from(state.sessions.values()).length
+        : collection.items.length,
+    }))
+    .sort((a, b) => {
+      if (a.collectionId === DEFAULT_COLLECTION_ID) {
+        return -1;
+      }
+      if (b.collectionId === DEFAULT_COLLECTION_ID) {
+        return 1;
+      }
+      return String(a.name).localeCompare(String(b.name));
+    });
+}
+
 function upsertConnectorSecretsFromBody(connectorId, body) {
   const input = body?.secrets || {};
   const gatewayPassword = typeof input.gatewayPassword === 'string' ? input.gatewayPassword : '';
@@ -553,6 +738,130 @@ function upsertConnectorSecretsFromBody(connectorId, body) {
   return true;
 }
 
+function buildConnectorActionSecret(connectorId, body) {
+  const input = body?.secrets || {};
+  const askpass = body?.askpass || {};
+  const existing = state.connectorSecrets.get(connectorId) || null;
+  const gatewayPassword = typeof input.gatewayPassword === 'string' ? input.gatewayPassword : '';
+  const targetPassword = typeof input.targetPassword === 'string' ? input.targetPassword : '';
+  const gatewayOtp = typeof input.gatewayOtp === 'string' ? input.gatewayOtp.trim() : '';
+  const targetOtp = typeof input.targetOtp === 'string' ? input.targetOtp.trim() : '';
+  const askpassActionId = String(askpass.actionId || body?.askpassActionId || '').trim();
+  const askpassToken = String(askpass.token || body?.askpassToken || '').trim();
+
+  return {
+    connectorId,
+    gatewayPassword: gatewayPassword || existing?.gatewayPassword || '',
+    targetPassword: targetPassword || existing?.targetPassword || '',
+    gatewayOtp,
+    targetOtp,
+    askpassActionId,
+    askpassToken,
+    interactiveAskpass: Boolean(askpassActionId && askpassToken),
+  };
+}
+
+function askpassActionKey(connectorId, actionId) {
+  return `${connectorId}::${actionId}`;
+}
+
+function registerAskpassAction(connectorId, action, secret) {
+  if (!secret?.interactiveAskpass) {
+    return null;
+  }
+
+  const record = {
+    connectorId,
+    action,
+    actionId: secret.askpassActionId,
+    token: secret.askpassToken,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    closed: false,
+    cancelled: false,
+    maxPrompts: ASKPASS_MAX_PROMPTS_PER_ACTION,
+    prompts: new Map(),
+  };
+  state.askpassActions.set(askpassActionKey(connectorId, secret.askpassActionId), record);
+  return record;
+}
+
+function getAskpassAction(connectorId, actionId, token) {
+  const record = state.askpassActions.get(askpassActionKey(connectorId, actionId));
+  if (!record || record.token !== token) {
+    return null;
+  }
+  return record;
+}
+
+function closeAskpassAction(record) {
+  if (!record) {
+    return;
+  }
+  record.closed = true;
+  record.updatedAt = nowIso();
+  for (const prompt of record.prompts.values()) {
+    if (!prompt.responseReady) {
+      prompt.cancelled = true;
+      prompt.updatedAt = nowIso();
+    }
+  }
+  setTimeout(() => {
+    state.askpassActions.delete(askpassActionKey(record.connectorId, record.actionId));
+  }, 60_000).unref?.();
+}
+
+function cancelAskpassAction(record) {
+  if (!record) {
+    return;
+  }
+  record.cancelled = true;
+  closeAskpassAction(record);
+}
+
+function createAskpassPrompt({ connectorId, actionId, token, prompt }) {
+  const record = getAskpassAction(connectorId, actionId, token);
+  if (!record || record.closed || record.cancelled) {
+    return null;
+  }
+  if (record.prompts.size >= record.maxPrompts) {
+    cancelAskpassAction(record);
+    return null;
+  }
+
+  const promptId = makeId();
+  const entry = {
+    promptId,
+    connectorId,
+    actionId,
+    prompt: String(prompt || 'SSH authentication prompt').trim() || 'SSH authentication prompt',
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    responseReady: false,
+    response: '',
+    cancelled: false,
+  };
+  record.prompts.set(promptId, entry);
+  record.updatedAt = nowIso();
+  return entry;
+}
+
+function getAskpassPrompt(record, promptId) {
+  return record?.prompts?.get(promptId) || null;
+}
+
+function publicAskpassPrompt(prompt) {
+  return {
+    promptId: prompt.promptId,
+    connectorId: prompt.connectorId,
+    actionId: prompt.actionId,
+    prompt: prompt.prompt,
+    createdAt: prompt.createdAt,
+    updatedAt: prompt.updatedAt,
+    status: prompt.cancelled ? 'cancelled' : prompt.responseReady ? 'answered' : 'pending',
+  };
+}
+
 function getConnectorHost(connector) {
   if (!connector?.hostId) {
     return null;
@@ -567,6 +876,69 @@ function decorateSingleConnector(connector) {
     ...decorateConnector(connector, getConnectorHost(connector)),
     secretStatus: getConnectorSecretStatus(secret),
   };
+}
+
+function isLoopbackHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'localhost'
+    || host === '::1'
+    || host === '[::1]'
+    || host.startsWith('127.');
+}
+
+function safeRelayOrigin(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (!['http:', 'https:'].includes(url.protocol) || isLoopbackHost(url.hostname)) {
+      return '';
+    }
+    return url.origin;
+  } catch (_) {
+    return '';
+  }
+}
+
+function localRelayOrigin() {
+  const candidates = [];
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (!entry || entry.family !== 'IPv4' || entry.internal || !entry.address) {
+        continue;
+      }
+      candidates.push(entry.address);
+    }
+  }
+
+  const preferred = candidates.find((address) => /^10\./.test(address))
+    || candidates.find((address) => /^172\.(1[6-9]|2\d|3[0-1])\./.test(address))
+    || candidates.find((address) => /^192\.168\./.test(address))
+    || candidates[0];
+
+  return preferred ? `http://${preferred}:${PORT}` : '';
+}
+
+function connectorWithActionRelayOrigin(connector, actionOrigin) {
+  const origin = safeRelayOrigin(actionOrigin) || localRelayOrigin();
+  if (!origin) {
+    return connector;
+  }
+
+  try {
+    const relayUrl = new URL(String(connector.relayUrl || ''));
+    if (!connector.relayUrl || isLoopbackHost(relayUrl.hostname)) {
+      return {
+        ...connector,
+        relayUrl: origin,
+      };
+    }
+  } catch (_) {
+    return {
+      ...connector,
+      relayUrl: origin,
+    };
+  }
+
+  return connector;
 }
 
 function getConnectorList() {
@@ -593,6 +965,7 @@ function limitOutput(existing, chunk, limit = 8000) {
 function runProcess(command, args, options = {}) {
   const timeoutMs = options.timeoutMs || 15_000;
   const startedAt = nowIso();
+  const input = options.input || null;
 
   return new Promise((resolve) => {
     let stdout = '';
@@ -617,7 +990,7 @@ function runProcess(command, args, options = {}) {
 
     try {
       child = spawn(command, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'],
         windowsHide: true,
         env: {
           ...process.env,
@@ -632,6 +1005,11 @@ function runProcess(command, args, options = {}) {
         error: error.message,
       });
       return;
+    }
+
+    if (input && child.stdin) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(input);
     }
 
     const timer = setTimeout(() => {
@@ -672,48 +1050,188 @@ function connectorPasswordMethod(method) {
   return method === 'password' || method === 'keyboard_interactive';
 }
 
+function connectorOneTimeMethod(method) {
+  return method === 'otp' || method === 'manual_captcha';
+}
+
+function connectorMethodCanUseAskpass(method) {
+  return connectorPasswordMethod(method) || connectorOneTimeMethod(method);
+}
+
+function connectorMethodCovered(method, password, oneTimeCode, interactiveAskpass = false) {
+  if (!requiresInteractiveAuth(method)) {
+    return true;
+  }
+  if (interactiveAskpass && connectorMethodCanUseAskpass(method)) {
+    return true;
+  }
+  if (method === 'browser_sso') {
+    return false;
+  }
+  if (method === 'password') {
+    return Boolean(password);
+  }
+  if (method === 'keyboard_interactive') {
+    return Boolean(password || oneTimeCode);
+  }
+  if (connectorOneTimeMethod(method)) {
+    return Boolean(oneTimeCode);
+  }
+  return false;
+}
+
+function connectorAskpassResponsesForMethod(method, password, oneTimeCode) {
+  const responses = [];
+  if ((method === 'password' || method === 'keyboard_interactive') && password) {
+    responses.push(password);
+  }
+  if (
+    (method === 'password'
+      || method === 'keyboard_interactive'
+      || connectorOneTimeMethod(method))
+    && oneTimeCode
+  ) {
+    responses.push(oneTimeCode);
+  }
+  return responses;
+}
+
+function connectorAskpassResponses(connector, secret) {
+  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
+  const targetMethod = connector.auth?.method || 'ssh_key';
+  const responses = [];
+
+  if (connectorUsesGateway(connector) && connectorMethodCanUseAskpass(gatewayMethod)) {
+    responses.push(...connectorAskpassResponsesForMethod(
+      gatewayMethod,
+      secret?.gatewayPassword || '',
+      secret?.gatewayOtp || ''
+    ));
+  }
+
+  if (connectorMethodCanUseAskpass(targetMethod)) {
+    responses.push(...connectorAskpassResponsesForMethod(
+      targetMethod,
+      secret?.targetPassword || '',
+      secret?.targetOtp || ''
+    ));
+  }
+
+  return responses.filter(Boolean);
+}
+
+function connectorHasAskpassPromptableAuth(connector) {
+  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
+  const targetMethod = connector.auth?.method || 'ssh_key';
+  return Boolean(
+    (connectorUsesGateway(connector) && connectorMethodCanUseAskpass(gatewayMethod))
+    || connectorMethodCanUseAskpass(targetMethod)
+  );
+}
+
+function connectorPrefersKeyboardInteractive(connector) {
+  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
+  const targetMethod = connector.auth?.method || 'ssh_key';
+  return [
+    connectorUsesGateway(connector) ? gatewayMethod : '',
+    targetMethod,
+  ].some((method) => ['keyboard_interactive', 'otp', 'manual_captcha'].includes(method));
+}
+
+function connectorPreferredAuthentications(connector, secret) {
+  if (!connectorUsesAskpass(connector, secret)) {
+    return undefined;
+  }
+  return connectorPrefersKeyboardInteractive(connector)
+    ? 'publickey,keyboard-interactive,password'
+    : 'publickey,password,keyboard-interactive';
+}
+
 function connectorNeedsManualAuth(connector, secret) {
   const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
   const targetMethod = connector.auth?.method || 'ssh_key';
   const gatewayNeedsSecret = connectorUsesGateway(connector) && requiresInteractiveAuth(gatewayMethod);
   const targetNeedsSecret = requiresInteractiveAuth(targetMethod);
-  const gatewayCovered = connectorPasswordMethod(gatewayMethod) && Boolean(secret?.gatewayPassword);
-  const targetCovered = connectorPasswordMethod(targetMethod) && Boolean(secret?.targetPassword);
+  const gatewayCovered = connectorMethodCovered(
+    gatewayMethod,
+    secret?.gatewayPassword || '',
+    secret?.gatewayOtp || '',
+    Boolean(secret?.interactiveAskpass)
+  );
+  const targetCovered = connectorMethodCovered(
+    targetMethod,
+    secret?.targetPassword || '',
+    secret?.targetOtp || '',
+    Boolean(secret?.interactiveAskpass)
+  );
 
   return (gatewayNeedsSecret && !gatewayCovered)
-    || (targetNeedsSecret && !targetCovered)
-    || (gatewayNeedsSecret && !connectorPasswordMethod(gatewayMethod))
-    || (targetNeedsSecret && !connectorPasswordMethod(targetMethod));
+    || (targetNeedsSecret && !targetCovered);
 }
 
 function connectorUsesAskpass(connector, secret) {
-  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
-  const targetMethod = connector.auth?.method || 'ssh_key';
-  return Boolean(
-    (connectorUsesGateway(connector) && connectorPasswordMethod(gatewayMethod) && secret?.gatewayPassword)
-    || (connectorPasswordMethod(targetMethod) && secret?.targetPassword)
-  );
+  return connectorAskpassResponses(connector, secret).length > 0
+    || (Boolean(secret?.interactiveAskpass) && connectorHasAskpassPromptableAuth(connector));
 }
 
 function ensureAskpassHelper() {
   const helperPath = path.join(process.cwd(), 'tmp', 'remote-codex-askpass.cmd');
+  const helperScriptPath = path.join(process.cwd(), 'tmp', 'remote-codex-askpass.ps1');
+  const psScript = [
+    '$ErrorActionPreference = "SilentlyContinue"',
+    '$promptText = [string]$env:RC_ASKPASS_PROMPT',
+    'function Decode-B64([string]$value) {',
+    '  if ([string]::IsNullOrWhiteSpace($value)) { return "" }',
+    '  try { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) } catch { return "" }',
+    '}',
+    'function Encode-Query([string]$value) {',
+    '  return [uri]::EscapeDataString($value)',
+    '}',
+    'function Try-BrokerPrompt {',
+    '  if ([string]::IsNullOrWhiteSpace($env:RC_ASKPASS_RELAY_URL) -or [string]::IsNullOrWhiteSpace($env:RC_ASKPASS_CONNECTOR_ID) -or [string]::IsNullOrWhiteSpace($env:RC_ASKPASS_ACTION_ID) -or [string]::IsNullOrWhiteSpace($env:RC_ASKPASS_TOKEN)) { return $null }',
+    '  $timeoutSeconds = 180',
+    '  if ($env:RC_ASKPASS_TIMEOUT_SECONDS) { try { $timeoutSeconds = [Math]::Max(10, [int]$env:RC_ASKPASS_TIMEOUT_SECONDS) } catch {} }',
+    '  $base = [string]$env:RC_ASKPASS_RELAY_URL',
+    '  $body = @{ connectorId = [string]$env:RC_ASKPASS_CONNECTOR_ID; actionId = [string]$env:RC_ASKPASS_ACTION_ID; token = [string]$env:RC_ASKPASS_TOKEN; prompt = $promptText } | ConvertTo-Json -Compress',
+    '  try { $created = Invoke-RestMethod -Method Post -Uri "$base/api/askpass/prompts" -ContentType "application/json; charset=utf-8" -Body $body -TimeoutSec 8 } catch { exit 1 }',
+    '  if (-not $created -or [string]::IsNullOrWhiteSpace([string]$created.promptId)) { exit 1 }',
+    '  $promptId = [string]$created.promptId',
+    '  $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)',
+    '  $query = "connectorId=$(Encode-Query $env:RC_ASKPASS_CONNECTOR_ID)&actionId=$(Encode-Query $env:RC_ASKPASS_ACTION_ID)&token=$(Encode-Query $env:RC_ASKPASS_TOKEN)"',
+    '  while ([DateTime]::UtcNow -lt $deadline) {',
+    '    try { $status = Invoke-RestMethod -Method Get -Uri "$base/api/askpass/prompts/$promptId`?$query" -TimeoutSec 8 } catch { Start-Sleep -Milliseconds 700; continue }',
+    '    if ($status.status -eq "answered") { [Console]::Out.Write([string]$status.response); exit 0 }',
+    '    if ($status.status -eq "cancelled" -or $status.status -eq "closed") { exit 1 }',
+    '    Start-Sleep -Milliseconds 500',
+    '  }',
+    '  exit 1',
+    '}',
+    'Try-BrokerPrompt | Out-Null',
+    '$index = 1',
+    'if ($env:RC_ASKPASS_STATE_FILE -and (Test-Path -LiteralPath $env:RC_ASKPASS_STATE_FILE)) { try { $index = [int](Get-Content -LiteralPath $env:RC_ASKPASS_STATE_FILE -TotalCount 1) } catch { $index = 1 } }',
+    'if ($index -lt 1) { $index = 1 }',
+    '$nextIndex = $index + 1',
+    'if ($env:RC_ASKPASS_STATE_FILE) { try { Set-Content -LiteralPath $env:RC_ASKPASS_STATE_FILE -Value ([string]$nextIndex) -NoNewline } catch {} }',
+    '$b64 = [Environment]::GetEnvironmentVariable("RC_ASKPASS_PASSWORD_${index}_B64")',
+    'if ([string]::IsNullOrWhiteSpace($b64)) { $b64 = $env:RC_ASKPASS_PASSWORD_LAST_B64 }',
+    'if ([string]::IsNullOrWhiteSpace($b64)) { $b64 = $env:RC_ASKPASS_PASSWORD_1_B64 }',
+    'if ($env:RC_ASKPASS_OTP_B64 -and $promptText -match "(?i)(otp|mfa|verification|authenticator|passcode|one[- _]?time|2fa|two[- _]?factor|totp|google|duo|challenge|token|code)") {',
+    '  $b64 = $env:RC_ASKPASS_OTP_B64',
+    '} elseif ($env:RC_ASKPASS_PASSWORD_PROMPT_B64 -and $promptText -match "(?i)password") {',
+    '  $b64 = $env:RC_ASKPASS_PASSWORD_PROMPT_B64',
+    '}',
+    '$answer = Decode-B64 $b64',
+    'if ([string]::IsNullOrWhiteSpace($answer)) { exit 1 }',
+    '[Console]::Out.Write($answer)',
+  ].join('\r\n');
   const script = [
     '@echo off',
     'setlocal EnableExtensions',
-    'set "STATE_FILE=%RC_ASKPASS_STATE_FILE%"',
-    'set "INDEX=1"',
-    'if defined STATE_FILE if exist "%STATE_FILE%" set /p INDEX=<"%STATE_FILE%"',
-    'if "%INDEX%"=="1" (',
-    '  if defined STATE_FILE >"%STATE_FILE%" echo 2',
-    '  set "B64=%RC_ASKPASS_PASSWORD_1_B64%"',
-    ') else (',
-    '  if defined STATE_FILE >"%STATE_FILE%" echo 2',
-    '  set "B64=%RC_ASKPASS_PASSWORD_2_B64%"',
-    ')',
-    'if not defined B64 set "B64=%RC_ASKPASS_PASSWORD_1_B64%"',
-    'powershell -NoProfile -Command "$b64=$env:B64; if ([string]::IsNullOrWhiteSpace($b64)) { exit 1 }; [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))"',
+    'set "RC_ASKPASS_PROMPT=%*"',
+    `powershell -NoProfile -ExecutionPolicy Bypass -File "${helperScriptPath.replace(/"/g, '""')}"`,
   ].join('\r\n');
   fs.mkdirSync(path.dirname(helperPath), { recursive: true });
+  fs.writeFileSync(helperScriptPath, psScript, 'utf8');
   fs.writeFileSync(helperPath, script, 'utf8');
   return helperPath;
 }
@@ -723,31 +1241,513 @@ function base64Secret(value) {
 }
 
 function buildAskpassEnv(connector, secret) {
-  const gatewayMethod = connector.gateway?.authMethod || 'ssh_key';
-  const targetMethod = connector.auth?.method || 'ssh_key';
-  const gatewayNeedsPassword = connectorUsesGateway(connector) && connectorPasswordMethod(gatewayMethod);
-  const targetNeedsPassword = connectorPasswordMethod(targetMethod);
-  const firstPassword = gatewayNeedsPassword
-    ? (secret?.gatewayPassword || secret?.targetPassword || '')
-    : (secret?.targetPassword || secret?.gatewayPassword || '');
-  const secondPassword = targetNeedsPassword
-    ? (secret?.targetPassword || firstPassword)
-    : firstPassword;
+  const responses = connectorAskpassResponses(connector, secret);
+  const passwordResponses = [
+    secret?.gatewayPassword || '',
+    secret?.targetPassword || '',
+  ].filter(Boolean);
+  const otpResponses = [
+    secret?.gatewayOtp || '',
+    secret?.targetOtp || '',
+  ].filter(Boolean);
+  const firstResponse = responses[0] || '';
+  const lastResponse = responses[responses.length - 1] || firstResponse;
   const statePath = path.join(process.cwd(), 'tmp', `askpass-state-${connector.connectorId || makeId()}.txt`);
 
   try {
     fs.rmSync(statePath, { force: true });
   } catch (_) {
-    // Best effort. A stale state file only changes which saved password is tried first.
+    // Best effort. A stale state file only changes which response is tried first.
   }
 
-  return {
+  const env = {
     SSH_ASKPASS: ensureAskpassHelper(),
     SSH_ASKPASS_REQUIRE: 'force',
     DISPLAY: process.env.DISPLAY || 'remote-codex',
     RC_ASKPASS_STATE_FILE: statePath,
-    RC_ASKPASS_PASSWORD_1_B64: base64Secret(firstPassword),
-    RC_ASKPASS_PASSWORD_2_B64: base64Secret(secondPassword || firstPassword),
+    RC_ASKPASS_PASSWORD_1_B64: base64Secret(firstResponse),
+    RC_ASKPASS_PASSWORD_LAST_B64: base64Secret(lastResponse),
+    RC_ASKPASS_PASSWORD_PROMPT_B64: base64Secret(passwordResponses[0] || ''),
+    RC_ASKPASS_OTP_B64: base64Secret(otpResponses[0] || ''),
+  };
+
+  if (secret?.interactiveAskpass) {
+    env.RC_ASKPASS_RELAY_URL = `http://127.0.0.1:${PORT}`;
+    env.RC_ASKPASS_CONNECTOR_ID = connector.connectorId || secret.connectorId || '';
+    env.RC_ASKPASS_ACTION_ID = secret.askpassActionId || '';
+    env.RC_ASKPASS_TOKEN = secret.askpassToken || '';
+    env.RC_ASKPASS_TIMEOUT_SECONDS = '180';
+  }
+
+  responses.slice(0, 8).forEach((response, index) => {
+    env[`RC_ASKPASS_PASSWORD_${index + 1}_B64`] = base64Secret(response);
+  });
+
+  return env;
+}
+
+function remoteShellPath(value) {
+  const text = String(value || '~/mobile-codex-remote').trim() || '~/mobile-codex-remote';
+  if (text.startsWith('~/')) {
+    return `"$HOME/${text.slice(2).replace(/"/g, '\\"')}"`;
+  }
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+function remoteScpPath(value) {
+  return String(value || '~/mobile-codex-remote').trim() || '~/mobile-codex-remote';
+}
+
+function remoteScpChildPath(base, child) {
+  return `${remoteScpPath(base).replace(/\/+$/, '')}/${String(child || '').replace(/^\/+/, '')}`;
+}
+
+function makeRemoteDeploymentDirectory(connector) {
+  const base = connector.bootstrap?.remoteDirectory || '~/mobile-codex-remote';
+  const id = `deploy-${Date.now()}-${makeId().slice(0, 8)}`.replace(/[^a-zA-Z0-9_.-]+/g, '-');
+  return remoteScpChildPath(base, `.deployments/${id}`);
+}
+
+function withConnectorRemoteDirectory(connector, remoteDirectory) {
+  return {
+    ...connector,
+    bootstrap: {
+      ...(connector.bootstrap || {}),
+      remoteDirectory,
+    },
+  };
+}
+
+function localScpPath(value) {
+  return String(value || '').replace(/\\/g, '/');
+}
+
+function buildSshMultiplexOptions(connector) {
+  const safeId = String(connector?.connectorId || connector?.hostId || makeId())
+    .replace(/[^a-zA-Z0-9_.-]+/g, '-')
+    .slice(0, 48) || 'connector';
+  const controlRoot = process.platform === 'win32'
+    ? path.join('C:\\tmp', 'remote-codex-ssh-control')
+    : path.join(process.cwd(), 'tmp', 'ssh-control');
+  const controlPath = localScpPath(path.join(controlRoot, safeId));
+  fs.mkdirSync(path.dirname(controlPath), { recursive: true });
+  return {
+    controlMaster: 'auto',
+    controlPersist: '24h',
+    controlPath,
+    streamLocalBindUnlink: 'yes',
+  };
+}
+
+function sshRunText(run) {
+  return [
+    run?.stdout,
+    run?.stderr,
+    run?.error,
+    run?.message,
+    run?.status,
+  ].filter(Boolean).join('\n');
+}
+
+function isSshMultiplexSocketFailureText(text) {
+  return /getsockname failed|not a socket|controlpath|controlmaster|mux_client|stale control socket/i.test(String(text || ''));
+}
+
+function isSshMultiplexSocketFailureStep(step) {
+  return Boolean(step && (
+    isSshMultiplexSocketFailureText(sshRunText(step))
+    || (Number(step.exitCode) === 4294967295 && /unknown error|read from remote host/i.test(sshRunText(step)))
+  ));
+}
+
+function deploymentHasSshMultiplexSocketFailure(deployment) {
+  return Boolean(deployment?.steps?.some(isSshMultiplexSocketFailureStep));
+}
+
+function cleanupSshMultiplexOptions(sshOptions = {}) {
+  if (!sshOptions.controlPath) {
+    return;
+  }
+  try {
+    fs.rmSync(sshOptions.controlPath, { force: true });
+  } catch (_) {
+    // Best effort: a failed cleanup should not hide the real SSH result.
+  }
+}
+
+function connectorSshMultiplexDisabled(connector) {
+  return state.sshMultiplexDisabled.get(connector?.connectorId || connector?.hostId || '') || null;
+}
+
+function disableConnectorSshMultiplex(connector, reason) {
+  const key = connector?.connectorId || connector?.hostId || '';
+  if (!key) {
+    return;
+  }
+  state.sshMultiplexDisabled.set(key, {
+    reason: reason || 'ControlMaster socket failure',
+    disabledAt: nowIso(),
+  });
+}
+
+function getConnectorSshOptions(connector, action, secret) {
+  // Bootstrap now runs as one SSH tar stream, so ControlMaster is no longer on
+  // the critical path for MFA-heavy hosts or Windows OpenSSH clients.
+  void connector;
+  void action;
+  void secret;
+  return {};
+}
+
+function buildScpCommandParts(connector, localSources, remoteDirectory, options = {}) {
+  if (!connector.targetHost) {
+    return null;
+  }
+
+  const args = ['-r'];
+  if (options.connectTimeout) {
+    args.push('-o', `ConnectTimeout=${options.connectTimeout}`);
+  }
+  if (options.strictHostKeyChecking) {
+    args.push('-o', `StrictHostKeyChecking=${options.strictHostKeyChecking}`);
+  }
+  if (options.numberOfPasswordPrompts) {
+    args.push('-o', `NumberOfPasswordPrompts=${Math.max(1, Number(options.numberOfPasswordPrompts) || 1)}`);
+  }
+  if (options.preferredAuthentications) {
+    args.push('-o', `PreferredAuthentications=${options.preferredAuthentications}`);
+  }
+  if (options.controlMaster) {
+    args.push('-o', `ControlMaster=${options.controlMaster}`);
+  }
+  if (options.controlPersist) {
+    args.push('-o', `ControlPersist=${options.controlPersist}`);
+  }
+  if (options.controlPath) {
+    args.push('-o', `ControlPath=${options.controlPath}`);
+  }
+  if (options.streamLocalBindUnlink) {
+    args.push('-o', `StreamLocalBindUnlink=${options.streamLocalBindUnlink}`);
+  }
+  if (connector.auth?.keyPath) {
+    args.push('-i', connector.auth.keyPath);
+    args.push('-o', 'IdentitiesOnly=yes');
+    args.push('-o', 'IdentityAgent=none');
+  }
+
+  const gateway = connector.gateway || {};
+  const gatewayTarget = connectorUsesGateway(connector) && (gateway.proxyJump
+    || (
+      gateway.host
+        ? `${gateway.username || connector.username ? `${gateway.username || connector.username}@` : ''}${gateway.host}${gateway.port ? `:${gateway.port}` : ''}`
+        : ''
+    ));
+
+  if (gatewayTarget) {
+    args.push('-o', `ProxyJump=${gatewayTarget}`);
+  }
+  if (connector.targetPort && Number(connector.targetPort) !== 22) {
+    args.push('-P', String(connector.targetPort));
+  }
+
+  const target = `${connector.username ? `${connector.username}@` : ''}${connector.targetHost}`;
+  args.push(...localSources, `${target}:${remoteScpPath(remoteDirectory).replace(/\/+$/, '')}/`);
+  return {
+    command: 'scp',
+    args,
+  };
+}
+
+function normalizeTarPath(value) {
+  return String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .split('/')
+    .filter((part) => part && part !== '.' && part !== '..')
+    .join('/');
+}
+
+function writeTarString(buffer, offset, length, value) {
+  const text = Buffer.from(String(value || ''), 'utf8');
+  text.copy(buffer, offset, 0, Math.min(text.length, length));
+}
+
+function writeTarOctal(buffer, offset, length, value) {
+  const text = Math.max(0, Number(value) || 0).toString(8).padStart(length - 1, '0').slice(-(length - 1));
+  writeTarString(buffer, offset, length, `${text}\0`);
+}
+
+function splitTarName(name) {
+  if (Buffer.byteLength(name) <= 100) {
+    return { name, prefix: '' };
+  }
+
+  const parts = name.split('/');
+  for (let index = 1; index < parts.length; index += 1) {
+    const prefix = parts.slice(0, index).join('/');
+    const suffix = parts.slice(index).join('/');
+    if (Buffer.byteLength(prefix) <= 155 && Buffer.byteLength(suffix) <= 100) {
+      return { name: suffix, prefix };
+    }
+  }
+  throw new Error(`tar path is too long: ${name}`);
+}
+
+function createTarHeader(name, stats, size, typeFlag = '0') {
+  const header = Buffer.alloc(512, 0);
+  const splitName = splitTarName(name);
+  writeTarString(header, 0, 100, splitName.name);
+  writeTarOctal(header, 100, 8, stats?.mode ? stats.mode & 0o777 : 0o644);
+  writeTarOctal(header, 108, 8, 0);
+  writeTarOctal(header, 116, 8, 0);
+  writeTarOctal(header, 124, 12, size);
+  writeTarOctal(header, 136, 12, Math.floor((stats?.mtimeMs || Date.now()) / 1000));
+  header.fill(0x20, 148, 156);
+  writeTarString(header, 156, 1, typeFlag);
+  writeTarString(header, 257, 6, 'ustar');
+  writeTarString(header, 263, 2, '00');
+  writeTarString(header, 345, 155, splitName.prefix);
+  let checksum = 0;
+  for (const byte of header) {
+    checksum += byte;
+  }
+  writeTarString(header, 148, 8, `${checksum.toString(8).padStart(6, '0')}\0 `);
+  return header;
+}
+
+function collectTarEntries(sourcePath, archivePath, entries) {
+  const stats = fs.statSync(sourcePath);
+  const normalizedArchivePath = normalizeTarPath(archivePath);
+  if (!normalizedArchivePath) {
+    return;
+  }
+
+  if (stats.isDirectory()) {
+    entries.push({
+      type: 'directory',
+      sourcePath,
+      archivePath: `${normalizedArchivePath.replace(/\/+$/, '')}/`,
+      stats,
+    });
+    for (const entry of fs.readdirSync(sourcePath, { withFileTypes: true })) {
+      collectTarEntries(
+        path.join(sourcePath, entry.name),
+        `${normalizedArchivePath}/${entry.name}`,
+        entries
+      );
+    }
+    return;
+  }
+
+  if (stats.isFile()) {
+    entries.push({
+      type: 'file',
+      sourcePath,
+      archivePath: normalizedArchivePath,
+      stats,
+    });
+  }
+}
+
+function createTarArchive(localSources) {
+  const tarSources = (localSources || []).map((source) => String(source || '').trim()).filter(Boolean);
+  if (tarSources.length > 0) {
+    const systemTar = spawnSync('tar', ['-cf', '-', ...tarSources], {
+      cwd: process.cwd(),
+      encoding: null,
+      maxBuffer: 1024 * 1024 * 768,
+      windowsHide: true,
+    });
+    if (systemTar.status === 0 && systemTar.stdout?.length) {
+      return systemTar.stdout;
+    }
+  }
+
+  const entries = [];
+  for (const source of tarSources) {
+    const sourceText = String(source || '');
+    const sourcePath = path.resolve(process.cwd(), sourceText);
+    if (!fs.existsSync(sourcePath)) {
+      throw new Error(`local source does not exist: ${source}`);
+    }
+    const archivePath = path.isAbsolute(sourceText)
+      ? path.basename(sourcePath)
+      : normalizeTarPath(sourceText);
+    collectTarEntries(sourcePath, archivePath || path.basename(sourcePath), entries);
+  }
+
+  const chunks = [];
+  for (const entry of entries) {
+    if (entry.type === 'directory') {
+      chunks.push(createTarHeader(entry.archivePath, entry.stats, 0, '5'));
+      continue;
+    }
+    const data = fs.readFileSync(entry.sourcePath);
+    chunks.push(createTarHeader(entry.archivePath, entry.stats, data.length, '0'));
+    chunks.push(data);
+    const padding = (512 - (data.length % 512)) % 512;
+    if (padding) {
+      chunks.push(Buffer.alloc(padding, 0));
+    }
+  }
+  chunks.push(Buffer.alloc(1024, 0));
+  return Buffer.concat(chunks);
+}
+
+function buildRemoteTarExtractCommand(remoteDirectory, afterCommand = '') {
+  const remoteDir = remoteShellPath(remoteDirectory);
+  const commands = [
+    `mkdir -p ${remoteDir}`,
+    `cd ${remoteDir}`,
+  ];
+  commands.push('tar -xf -');
+  if (afterCommand) {
+    commands.push(afterCommand);
+  }
+  return commands.join(' && ');
+}
+
+async function runSshTarExtract(connector, secret, localSources, remoteDirectory, afterCommand, stepName, timeoutMs, sshOptions = {}) {
+  const archive = createTarArchive(localSources);
+  const commandParts = buildConnectorSshActionCommand(
+    connector,
+    buildRemoteTarExtractCommand(remoteDirectory, afterCommand),
+    secret,
+    'bootstrap',
+    sshOptions
+  );
+  if (!commandParts) {
+    return {
+      ok: false,
+      status: `${stepName || 'tar_extract'}_not_ready`,
+      message: 'Connector does not have enough SSH information to upload files over SSH.',
+      step: null,
+    };
+  }
+  const run = await runProcess(commandParts.command, commandParts.args, {
+    timeoutMs: authAwareTimeout(timeoutMs || 90_000, secret),
+    env: connectorUsesAskpass(connector, secret) ? buildAskpassEnv(connector, secret) : null,
+    input: archive,
+  });
+  return {
+    ok: run.exitCode === 0,
+    status: run.exitCode === 0 ? 'uploaded' : 'upload_failed',
+    message: run.exitCode === 0 ? 'Files uploaded over a single SSH stream.' : 'Unable to upload files over SSH.',
+    step: { name: stepName || 'ssh_tar_upload', ...run },
+  };
+}
+
+function getLocalNodeRuntimeArchive() {
+  const archiveName = 'node-v16.20.2-linux-x64.tar.xz';
+  const archivePath = path.join(process.cwd(), 'tmp', archiveName);
+  if (!fs.existsSync(archivePath)) {
+    return null;
+  }
+  return {
+    archiveName,
+    localPath: localScpPath(path.relative(process.cwd(), archivePath)),
+  };
+}
+
+function copyDirectoryRecursive(sourceDir, targetDir) {
+  fs.mkdirSync(targetDir, { recursive: true });
+  const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const sourcePath = path.join(sourceDir, entry.name);
+    const targetPath = path.join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectoryRecursive(sourcePath, targetPath);
+      continue;
+    }
+    if (entry.isFile()) {
+      fs.copyFileSync(sourcePath, targetPath);
+    }
+  }
+}
+
+function getLocalCodexLinuxSourceDir() {
+  const override = String(process.env.CODEX_LINUX_RUNTIME_DIR || '').trim();
+  if (override && fs.existsSync(path.join(override, 'codex'))) {
+    return path.resolve(override);
+  }
+
+  const cursorExtensions = path.join(os.homedir(), '.cursor', 'extensions');
+  if (!fs.existsSync(cursorExtensions)) {
+    return null;
+  }
+
+  const extensionDirs = fs.readdirSync(cursorExtensions, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('openai.chatgpt-'))
+    .map((entry) => entry.name)
+    .sort()
+    .reverse();
+
+  for (const entry of extensionDirs) {
+    const binDir = path.join(cursorExtensions, entry, 'bin', 'linux-x86_64');
+    if (fs.existsSync(path.join(binDir, 'codex'))) {
+      return binDir;
+    }
+  }
+
+  return null;
+}
+
+function stageLocalCodexLinuxRuntime() {
+  const sourceDir = getLocalCodexLinuxSourceDir();
+  if (!sourceDir) {
+    return null;
+  }
+
+  const sourceCodex = path.join(sourceDir, 'codex');
+  const codexStat = fs.statSync(sourceCodex);
+  const tmpRoot = path.resolve(process.cwd(), 'tmp');
+  const stageDir = path.join(tmpRoot, 'codex-linux-x86_64');
+  const markerPath = path.join(stageDir, '.source.json');
+  const marker = {
+    sourceDir,
+    codexSize: codexStat.size,
+    codexMtimeMs: Math.trunc(codexStat.mtimeMs),
+  };
+
+  let staged = false;
+  try {
+    const current = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    staged = current.sourceDir === marker.sourceDir
+      && current.codexSize === marker.codexSize
+      && current.codexMtimeMs === marker.codexMtimeMs
+      && fs.existsSync(path.join(stageDir, 'codex'));
+  } catch {
+    staged = false;
+  }
+
+  if (!staged) {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+    fs.mkdirSync(stageDir, { recursive: true });
+    for (const name of ['codex', 'rg', 'codex-resources']) {
+      const sourcePath = path.join(sourceDir, name);
+      const targetPath = path.join(stageDir, name);
+      if (!fs.existsSync(sourcePath)) {
+        continue;
+      }
+      const stats = fs.statSync(sourcePath);
+      if (stats.isDirectory()) {
+        copyDirectoryRecursive(sourcePath, targetPath);
+      } else if (stats.isFile()) {
+        fs.copyFileSync(sourcePath, targetPath);
+      }
+    }
+    fs.writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`);
+  }
+
+  const localSources = ['codex', 'rg', 'codex-resources']
+    .map((name) => path.join(stageDir, name))
+    .filter((sourcePath) => fs.existsSync(sourcePath))
+    .map((sourcePath) => localScpPath(path.relative(process.cwd(), sourcePath)));
+
+  return {
+    sourceDir,
+    stageDir,
+    localSources,
   };
 }
 
@@ -760,7 +1760,8 @@ function buildSshActionOptions(connector, action, secret) {
   };
 
   if (useAskpass) {
-    options.preferredAuthentications = 'password,keyboard-interactive';
+    options.preferredAuthentications = connectorPreferredAuthentications(connector, secret);
+    options.numberOfPasswordPrompts = 6;
   } else {
     options.batchMode = true;
   }
@@ -768,7 +1769,319 @@ function buildSshActionOptions(connector, action, secret) {
   return options;
 }
 
-function buildConnectorAction(connector, action, secret = null) {
+function authAwareTimeout(baseMs, secret) {
+  return secret?.interactiveAskpass ? Math.max(baseMs, 180_000) : baseMs;
+}
+
+function buildRemotePrepareCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return [
+    `mkdir -p ${remoteDir}`,
+    `test -d ${remoteDir}`,
+    'echo CODEX_REMOTE_AGENT_DIR_READY',
+  ].join(' && ');
+}
+
+function buildRemoteDeploymentCheckCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return [
+    `test -f ${remoteDir}/apps/host-agent/agent.js && echo CODEX_REMOTE_CHECK_AGENT=ok || echo CODEX_REMOTE_CHECK_AGENT=missing`,
+    `test -f ${remoteDir}/shared/protocol.js && echo CODEX_REMOTE_CHECK_SHARED=ok || echo CODEX_REMOTE_CHECK_SHARED=missing`,
+    `NODE_BIN="$(command -v node || command -v nodejs || test -x ${remoteDir}/.runtime/node/bin/node && printf '%s\\n' ${remoteDir}/.runtime/node/bin/node || true)"`,
+    'test -n "$NODE_BIN" && echo CODEX_REMOTE_CHECK_NODE=$NODE_BIN || echo CODEX_REMOTE_CHECK_NODE=missing',
+    'test -n "$NODE_BIN" && "$NODE_BIN" -v 2>/dev/null || true',
+    `CODEX_BIN="$(command -v codex || test -x ${remoteDir}/.runtime/codex/codex && printf '%s\\n' ${remoteDir}/.runtime/codex/codex || true)"`,
+    'test -n "$CODEX_BIN" && echo CODEX_REMOTE_CHECK_CODEX=$CODEX_BIN || echo CODEX_REMOTE_CHECK_CODEX=missing',
+    'command -v tmux >/dev/null && echo CODEX_REMOTE_CHECK_TMUX=$(command -v tmux) || echo CODEX_REMOTE_CHECK_TMUX=missing',
+    'tmux -V 2>/dev/null || true',
+    `test -f ${remoteDir}/apps/host-agent/agent.js && test -f ${remoteDir}/shared/protocol.js && test -n "$NODE_BIN" && test -n "$CODEX_BIN" && command -v tmux >/dev/null && echo CODEX_REMOTE_AGENT_DEPLOYED`,
+  ].join('; ');
+}
+
+function buildRemoteBundleCheckCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return [
+    `test -f ${remoteDir}/apps/host-agent/agent.js && echo CODEX_REMOTE_CHECK_AGENT=ok || echo CODEX_REMOTE_CHECK_AGENT=missing`,
+    `test -f ${remoteDir}/shared/protocol.js && echo CODEX_REMOTE_CHECK_SHARED=ok || echo CODEX_REMOTE_CHECK_SHARED=missing`,
+    `test -f ${remoteDir}/apps/host-agent/agent.js && test -f ${remoteDir}/shared/protocol.js && echo CODEX_REMOTE_BUNDLE_DEPLOYED`,
+  ].join('; ');
+}
+
+function buildRemoteNodeProbeCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return [
+    `NODE_BIN="$(command -v node || command -v nodejs || test -x ${remoteDir}/.runtime/node/bin/node && printf '%s\\n' ${remoteDir}/.runtime/node/bin/node || true)"`,
+    'test -n "$NODE_BIN" && echo CODEX_REMOTE_NODE_PRESENT=$NODE_BIN || echo CODEX_REMOTE_NODE_MISSING',
+  ].join('; ');
+}
+
+function buildRemoteCodexProbeCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return [
+    `CODEX_BIN="$(command -v codex || test -x ${remoteDir}/.runtime/codex/codex && printf '%s\\n' ${remoteDir}/.runtime/codex/codex || true)"`,
+    'test -n "$CODEX_BIN" && echo CODEX_REMOTE_CODEX_PRESENT=$CODEX_BIN || echo CODEX_REMOTE_CODEX_MISSING',
+  ].join('; ');
+}
+
+function buildRemoteRuntimePrepareCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return `mkdir -p ${remoteDir}/.runtime && echo CODEX_REMOTE_RUNTIME_DIR_READY`;
+}
+
+function buildRemoteCodexRuntimePrepareCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return `mkdir -p ${remoteDir}/.runtime/codex && echo CODEX_REMOTE_CODEX_RUNTIME_DIR_READY`;
+}
+
+function buildRemoteRuntimeExtractCommand(connector, archiveName) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  const archive = String(archiveName || '').replace(/'/g, '');
+  return [
+    `mkdir -p ${remoteDir}/.runtime/node`,
+    `tar -xJf ${remoteDir}/.runtime/${archive} -C ${remoteDir}/.runtime/node --strip-components=1`,
+    `test -x ${remoteDir}/.runtime/node/bin/node`,
+    `${remoteDir}/.runtime/node/bin/node -v`,
+    'echo CODEX_REMOTE_NODE_RUNTIME_READY',
+  ].join(' && ');
+}
+
+function buildRemoteCodexRuntimeVerifyCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return [
+    `chmod +x ${remoteDir}/.runtime/codex/codex ${remoteDir}/.runtime/codex/rg ${remoteDir}/.runtime/codex/codex-resources/bwrap 2>/dev/null || true`,
+    `test -x ${remoteDir}/.runtime/codex/codex`,
+    `CODEX_HOME="\${CODEX_HOME:-$HOME/.codex}" ${remoteDir}/.runtime/codex/codex --help >/dev/null`,
+    `echo CODEX_REMOTE_CODEX_RUNTIME_READY=${remoteDir}/.runtime/codex/codex`,
+  ].join(' && ');
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value || '').replace(/'/g, "'\\''")}'`;
+}
+
+function buildRemoteCodexResolutionScript(connector, codexRuntimeIncluded) {
+  const codexHome = remoteShellPath(connector.codexHome || '~/.codex');
+  const lines = [
+    `CODEX_HOME_DIR=${codexHome}`,
+    'CODEX_BIN="$(command -v codex 2>/dev/null || true)"',
+    'if [ -z "$CODEX_BIN" ]; then',
+    '  for p in "$CODEX_HOME_DIR/bin/codex" "$CODEX_HOME_DIR/codex" "$CODEX_HOME_DIR/bin/codex-x86_64-unknown-linux-musl" "$CODEX_HOME_DIR/bin/codex-x86_64-unknown-linux-gnu" "$CODEX_HOME_DIR/node_modules/.bin/codex"; do',
+    '    if [ -x "$p" ]; then CODEX_BIN="$p"; break; fi',
+    '  done',
+    'fi',
+    'if [ -z "$CODEX_BIN" ] && [ -d "$CODEX_HOME_DIR" ]; then',
+    '  CODEX_BIN="$(find "$CODEX_HOME_DIR" -maxdepth 5 -type f \\( -name codex -o -name "codex-*" -o -name codex.exe \\) -perm -111 2>/dev/null | head -n 1 || true)"',
+    'fi',
+  ];
+
+  if (codexRuntimeIncluded) {
+    lines.push(
+      'if [ -z "$CODEX_BIN" ] && [ -f "tmp/codex-linux-x86_64/codex" ]; then',
+      '  mkdir -p .runtime/codex',
+      '  cp -R "tmp/codex-linux-x86_64/." .runtime/codex/',
+      '  chmod +x .runtime/codex/codex .runtime/codex/rg .runtime/codex/codex-resources/bwrap 2>/dev/null || true',
+      '  if [ -x .runtime/codex/codex ]; then CODEX_BIN="$PWD/.runtime/codex/codex"; fi',
+      'fi'
+    );
+  }
+
+  return lines.join('\n');
+}
+
+function buildRemoteOneShotBootstrapCommand(connector, action, payload = {}) {
+  const nodeArchive = String(payload.nodeArchiveName || '').replace(/'/g, '');
+  const bootstrapCommand = buildDetachedBootstrapCommand(connector, { restart: action === 'restart' });
+  const script = [
+    'echo CODEX_REMOTE_AGENT_DIR_READY',
+    'test -f apps/host-agent/agent.js && echo CODEX_REMOTE_CHECK_AGENT=ok || { echo CODEX_REMOTE_CHECK_AGENT=missing; exit 70; }',
+    'test -f shared/protocol.js && echo CODEX_REMOTE_CHECK_SHARED=ok || { echo CODEX_REMOTE_CHECK_SHARED=missing; exit 71; }',
+    'echo CODEX_REMOTE_BUNDLE_DEPLOYED',
+    'NODE_BIN="$(command -v node 2>/dev/null || command -v nodejs 2>/dev/null || true)"',
+    'if [ -z "$NODE_BIN" ] && [ -x .runtime/node/bin/node ]; then NODE_BIN="$PWD/.runtime/node/bin/node"; fi',
+    nodeArchive
+      ? [
+        'if [ -z "$NODE_BIN" ] && [ -f "tmp/' + nodeArchive + '" ]; then',
+        '  mkdir -p .runtime/node',
+        '  tar -xJf "tmp/' + nodeArchive + '" -C .runtime/node --strip-components=1',
+        '  if [ -x .runtime/node/bin/node ]; then NODE_BIN="$PWD/.runtime/node/bin/node"; fi',
+        '  test -n "$NODE_BIN" && echo CODEX_REMOTE_NODE_RUNTIME_READY',
+        'fi',
+      ].join('\n')
+      : 'true',
+    'test -n "$NODE_BIN" && echo "CODEX_REMOTE_CHECK_NODE=$NODE_BIN" || { echo CODEX_REMOTE_CHECK_NODE=missing; exit 72; }',
+    '"$NODE_BIN" -v 2>/dev/null || true',
+    buildRemoteCodexResolutionScript(connector, Boolean(payload.codexRuntimeIncluded)),
+    'test -n "$CODEX_BIN" && echo "CODEX_REMOTE_CHECK_CODEX=$CODEX_BIN" || { echo CODEX_REMOTE_CHECK_CODEX=missing; exit 73; }',
+    '"$CODEX_BIN" --help >/dev/null 2>&1 && echo CODEX_REMOTE_CODEX_HELP_OK || echo CODEX_REMOTE_CODEX_HELP_WARNING',
+    'command -v tmux >/dev/null && echo CODEX_REMOTE_CHECK_TMUX=$(command -v tmux) || { echo CODEX_REMOTE_CHECK_TMUX=missing; exit 74; }',
+    bootstrapCommand,
+    'echo CODEX_REMOTE_ONESHOT_BOOTSTRAP_DONE',
+  ].filter(Boolean).join('\n');
+
+  return `sh -lc ${shellSingleQuote(script)}`;
+}
+
+function collectOneShotBootstrapSources() {
+  const sources = ['apps', 'shared', 'package.json'];
+  const nodeRuntime = getLocalNodeRuntimeArchive();
+  if (nodeRuntime) {
+    sources.push(nodeRuntime.localPath);
+  }
+
+  const codexRuntime = stageLocalCodexLinuxRuntime();
+  if (codexRuntime?.localSources?.length) {
+    sources.push(...codexRuntime.localSources);
+  }
+
+  return {
+    sources,
+    nodeArchiveName: nodeRuntime?.archiveName || '',
+    codexRuntimeIncluded: Boolean(codexRuntime?.localSources?.length),
+  };
+}
+
+function classifyOneShotBootstrapFailure(action, step) {
+  const text = sshRunText(step);
+  if (step?.timedOut) {
+    return { status: 'timeout', message: 'SSH one-shot bootstrap timed out.' };
+  }
+  if (step?.error) {
+    return { status: 'error', message: step.error };
+  }
+  if (/CODEX_REMOTE_CHECK_AGENT=missing|CODEX_REMOTE_CHECK_SHARED=missing/.test(text)) {
+    return { status: 'verify_failed', message: 'Remote bundle uploaded, but the host-agent files did not verify.' };
+  }
+  if (/CODEX_REMOTE_CHECK_NODE=missing/.test(text)) {
+    return { status: 'node_runtime_missing', message: 'No usable Node runtime was found or uploaded for the remote host.' };
+  }
+  if (/CODEX_REMOTE_CHECK_CODEX=missing/.test(text)) {
+    return { status: 'codex_runtime_missing', message: 'No usable Codex CLI was found in PATH, CODEX_HOME, or the uploaded runtime.' };
+  }
+  if (/CODEX_REMOTE_CHECK_TMUX=missing/.test(text)) {
+    return { status: 'tmux_missing', message: 'tmux is required to keep the remote host-agent alive, but it was not found.' };
+  }
+  if (/permission denied/i.test(text)) {
+    return { status: 'ssh_failed', message: 'SSH authentication or remote permissions failed during one-shot bootstrap.' };
+  }
+  return {
+    status: action === 'restart' ? 'restart_failed' : 'bootstrap_failed',
+    message: action === 'restart'
+      ? 'Remote host-agent restart failed during one-shot bootstrap.'
+      : 'Remote host-agent bootstrap failed during one-shot bootstrap.',
+  };
+}
+
+async function runConnectorBootstrapOneShot(connector, action, secret) {
+  const remoteDirectory = makeRemoteDeploymentDirectory(connector);
+  const deploymentConnector = withConnectorRemoteDirectory(connector, remoteDirectory);
+  let payload;
+  try {
+    payload = collectOneShotBootstrapSources();
+  } catch (error) {
+    return {
+      ok: false,
+      status: 'local_runtime_stage_failed',
+      message: `Unable to prepare the local one-shot bootstrap payload: ${error.message}`,
+      remoteDirectory,
+      connector: deploymentConnector,
+      steps: [],
+    };
+  }
+
+  const remoteCommand = buildRemoteOneShotBootstrapCommand(deploymentConnector, action, payload);
+  let upload;
+  try {
+    upload = await runSshTarExtract(
+      deploymentConnector,
+      secret,
+      payload.sources,
+      remoteDirectory,
+      remoteCommand,
+      'oneshot_bootstrap',
+      600_000,
+      {}
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      status: 'local_archive_failed',
+      message: `Unable to build the local one-shot bootstrap archive: ${error.message}`,
+      remoteDirectory,
+      connector: deploymentConnector,
+      steps: [],
+      payload: {
+        nodeRuntimeIncluded: Boolean(payload.nodeArchiveName),
+        codexRuntimeIncluded: payload.codexRuntimeIncluded,
+      },
+    };
+  }
+  const steps = upload.step ? [upload.step] : [];
+  const ok = upload.ok && upload.step?.stdout?.includes('CODEX_REMOTE_AGENT_BOOTSTRAPPED');
+  const classification = ok
+    ? {
+      status: action === 'restart' ? 'restarted' : 'bootstrapped',
+      message: action === 'restart'
+        ? 'Remote host-agent restarted with a single SSH bootstrap stream.'
+        : 'Remote host-agent bootstrapped with a single SSH stream.',
+    }
+    : classifyOneShotBootstrapFailure(action, upload.step || upload);
+
+  return {
+    ok,
+    ...classification,
+    remoteDirectory,
+    connector: deploymentConnector,
+    command: decorateSingleConnector(deploymentConnector).plan.sshBootstrapCommand,
+    step: upload.step || null,
+    steps,
+    payload: {
+      nodeRuntimeIncluded: Boolean(payload.nodeArchiveName),
+      codexRuntimeIncluded: payload.codexRuntimeIncluded,
+    },
+  };
+}
+
+function buildRemoteDiagnosticCommand(connector = null) {
+  const remoteDir = remoteShellPath(connector?.bootstrap?.remoteDirectory);
+  const script = [
+    'echo CODEX_REMOTE_DIAG_BEGIN',
+    'echo SHELL=$SHELL',
+    'echo HOME=$HOME',
+    `REMOTE_CODEX_DIR=${remoteDir}/.runtime/codex`,
+    'uname -a || true',
+    'echo --commands--',
+    'for c in codex codex.exe node nodejs npm tmux conda module ml; do type "$c" 2>&1 || true; done',
+    'echo --codex-paths--',
+    'for d in "$REMOTE_CODEX_DIR" "${CODEX_HOME:-$HOME/.codex}" "$HOME/.cursor/extensions" "$HOME/.conda/envs" "$HOME/.nvm/versions/node" "$HOME/.local/bin" "$HOME/bin"; do [ -d "$d" ] && timeout 6s find "$d" -maxdepth 5 -type f \\( -name "codex" -o -name "codex.exe" -o -name "codex-*" \\) -perm -111 2>/dev/null; done | head -80 || true',
+    'echo --codex-home-top--',
+    'ls -la "${CODEX_HOME:-$HOME/.codex}" 2>/dev/null | head -80 || true',
+    'echo --node-paths--',
+    'ls -1 /usr/bin/node* /usr/local/bin/node* /opt/*/bin/node* /hpc/*/*/bin/node* 2>/dev/null | head -80 || true',
+    'echo --module-node--',
+    'module avail node 2>&1 | head -80 || true',
+    'echo --module-js--',
+    'module avail 2>&1 | grep -i -E "node|javascript|js" | head -80 || true',
+    'echo --conda-envs--',
+    'conda env list 2>/dev/null | head -80 || true',
+    'echo CODEX_REMOTE_DIAG_END',
+  ].join('\n');
+  return `bash -lc ${shellSingleQuote(script)}`;
+}
+
+function buildRemoteAgentLogCommand(connector) {
+  const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  return `cd ${remoteDir} && tail -n 160 codex-remote.agent.log 2>/dev/null || true`;
+}
+
+function buildConnectorSshActionCommand(connector, remoteCommand, secret, action = 'bootstrap', sshOptions = {}) {
+  return buildSshCommandParts(connector, {
+    ...buildSshActionOptions(connector, action, secret),
+    ...(sshOptions || {}),
+    remoteCommand,
+  });
+}
+
+function buildConnectorAction(connector, action, secret = null, sshOptions = {}) {
   const baseOptions = buildSshActionOptions(connector, action, secret);
   const env = connectorUsesAskpass(connector, secret)
     ? buildAskpassEnv(connector, secret)
@@ -776,9 +2089,10 @@ function buildConnectorAction(connector, action, secret = null) {
 
   if (action === 'smoke_test') {
     return {
-      timeoutMs: 12_000,
+      timeoutMs: authAwareTimeout(12_000, secret),
       commandParts: buildSshCommandParts(connector, {
         ...baseOptions,
+        ...(sshOptions || {}),
         remoteCommand: 'echo SSH_OK',
       }),
       displayCommand: decorateSingleConnector(connector).plan.sshSmokeTestCommand,
@@ -788,9 +2102,10 @@ function buildConnectorAction(connector, action, secret = null) {
 
   if (action === 'status') {
     return {
-      timeoutMs: 12_000,
+      timeoutMs: authAwareTimeout(12_000, secret),
       commandParts: buildSshCommandParts(connector, {
         ...baseOptions,
+        ...(sshOptions || {}),
         remoteCommand: buildRemoteStatusCommand(connector),
       }),
       displayCommand: decorateSingleConnector(connector).plan.sshStatusCommand,
@@ -798,13 +2113,57 @@ function buildConnectorAction(connector, action, secret = null) {
     };
   }
 
+  if (action === 'diagnose') {
+    return {
+      timeoutMs: authAwareTimeout(20_000, secret),
+      commandParts: buildSshCommandParts(connector, {
+        ...baseOptions,
+        ...(sshOptions || {}),
+        remoteCommand: buildRemoteDiagnosticCommand(connector),
+      }),
+      displayCommand: 'remote environment diagnostic',
+      env,
+    };
+  }
+
+  if (action === 'logs') {
+    return {
+      timeoutMs: authAwareTimeout(12_000, secret),
+      commandParts: buildSshCommandParts(connector, {
+        ...baseOptions,
+        ...(sshOptions || {}),
+        remoteCommand: buildRemoteAgentLogCommand(connector),
+      }),
+      displayCommand: 'remote host-agent logs',
+      env,
+    };
+  }
+
   if (action === 'bootstrap') {
     const remoteCommand = buildDetachedBootstrapCommand(connector);
     return {
-      timeoutMs: 20_000,
+      timeoutMs: authAwareTimeout(20_000, secret),
       commandParts: remoteCommand
         ? buildSshCommandParts(connector, {
           ...baseOptions,
+          ...(sshOptions || {}),
+          remoteCommand,
+        })
+        : null,
+      displayCommand: decorateSingleConnector(connector).plan.sshBootstrapCommand,
+      remoteCommand,
+      env,
+    };
+  }
+
+  if (action === 'restart') {
+    const remoteCommand = buildDetachedBootstrapCommand(connector, { restart: true });
+    return {
+      timeoutMs: authAwareTimeout(20_000, secret),
+      commandParts: remoteCommand
+        ? buildSshCommandParts(connector, {
+          ...baseOptions,
+          ...(sshOptions || {}),
           remoteCommand,
         })
         : null,
@@ -815,6 +2174,225 @@ function buildConnectorAction(connector, action, secret = null) {
   }
 
   return null;
+}
+
+async function deployConnectorBundle(connector, secret, sshOptions = {}) {
+  const useAskpass = connectorUsesAskpass(connector, secret);
+  const makeEnv = () => (useAskpass ? buildAskpassEnv(connector, secret) : null);
+  const remoteDirectory = makeRemoteDeploymentDirectory(connector);
+  const deploymentConnector = withConnectorRemoteDirectory(connector, remoteDirectory);
+  const upload = await runSshTarExtract(
+    deploymentConnector,
+    secret,
+    ['apps', 'shared', 'package.json'],
+    remoteDirectory,
+    [
+      'echo CODEX_REMOTE_AGENT_DIR_READY',
+      buildRemoteBundleCheckCommand(deploymentConnector),
+    ].join(' && '),
+    'upload_bundle',
+    120_000,
+    sshOptions
+  );
+  const steps = [];
+  if (upload.step) {
+    steps.push(upload.step);
+  }
+  if (!upload.ok) {
+    return {
+      ok: false,
+      status: upload.status,
+      message: 'Unable to upload the host-agent bundle over SSH.',
+      steps,
+    };
+  }
+  if (!upload.step.stdout.includes('CODEX_REMOTE_AGENT_DIR_READY')) {
+    return {
+      ok: false,
+      status: 'remote_directory_failed',
+      message: 'Unable to create or verify the remote agent directory.',
+      steps,
+    };
+  }
+
+  const nodeRuntime = await ensureRemoteNodeRuntime(deploymentConnector, secret, remoteDirectory, makeEnv, steps, sshOptions);
+  if (!nodeRuntime.ok) {
+    return nodeRuntime;
+  }
+
+  const codexRuntime = await ensureRemoteCodexRuntime(deploymentConnector, secret, remoteDirectory, makeEnv, steps, sshOptions);
+  if (!codexRuntime.ok) {
+    return codexRuntime;
+  }
+
+  if (!upload.step.stdout.includes('CODEX_REMOTE_CHECK_AGENT=ok')
+    || !upload.step.stdout.includes('CODEX_REMOTE_CHECK_SHARED=ok')
+    || !upload.step.stdout.includes('CODEX_REMOTE_BUNDLE_DEPLOYED')) {
+    return {
+      ok: false,
+      status: 'verify_failed',
+      message: 'Remote bundle uploaded, but verification failed.',
+      steps,
+    };
+  }
+
+  const checkCommandParts = buildConnectorSshActionCommand(deploymentConnector, buildRemoteDeploymentCheckCommand(deploymentConnector), secret, 'bootstrap', sshOptions);
+  if (!checkCommandParts) {
+    return {
+      ok: false,
+      status: 'verify_not_ready',
+      message: 'Connector does not have enough SSH information to verify the deployed runtime.',
+      steps,
+    };
+  }
+  const check = await runProcess(checkCommandParts.command, checkCommandParts.args, {
+    timeoutMs: authAwareTimeout(30_000, secret),
+    env: makeEnv(),
+  });
+  steps.push({ name: 'verify_deployment', ...check });
+  if (check.exitCode !== 0 || !check.stdout.includes('CODEX_REMOTE_AGENT_DEPLOYED')) {
+    return {
+      ok: false,
+      status: 'verify_failed',
+      message: 'Remote bundle and runtime uploaded, but final verification failed.',
+      steps,
+    };
+  }
+
+  return {
+    ok: true,
+    status: 'deployed',
+    message: 'Remote host-agent bundle is deployed and verified.',
+    remoteDirectory,
+    connector: deploymentConnector,
+    steps,
+  };
+}
+
+async function ensureRemoteNodeRuntime(connector, secret, remoteDirectory, makeEnv, steps, sshOptions = {}) {
+  const probeCommandParts = buildConnectorSshActionCommand(connector, buildRemoteNodeProbeCommand(connector), secret, 'bootstrap', sshOptions);
+  if (!probeCommandParts) {
+    return {
+      ok: false,
+      status: 'node_probe_not_ready',
+      message: 'Connector does not have enough SSH information to check the remote Node runtime.',
+      steps,
+    };
+  }
+
+  const probe = await runProcess(probeCommandParts.command, probeCommandParts.args, {
+    timeoutMs: authAwareTimeout(15_000, secret),
+    env: makeEnv(),
+  });
+  steps.push({ name: 'probe_node_runtime', ...probe });
+  if (probe.exitCode === 0 && probe.stdout.includes('CODEX_REMOTE_NODE_PRESENT=')) {
+    return { ok: true };
+  }
+
+  const archive = getLocalNodeRuntimeArchive();
+  if (!archive) {
+    return {
+      ok: false,
+      status: 'node_runtime_missing',
+      message: 'No system Node was found on the remote host, and no local Node runtime archive is available in tmp/.',
+      steps,
+    };
+  }
+
+  const upload = await runSshTarExtract(
+    connector,
+    secret,
+    [archive.localPath],
+    remoteScpChildPath(remoteDirectory, '.runtime'),
+    buildRemoteRuntimeExtractCommand(connector, archive.archiveName),
+    'upload_node_runtime',
+    240_000,
+    sshOptions
+  );
+  if (upload.step) {
+    steps.push(upload.step);
+  }
+  if (!upload.ok) {
+    return {
+      ok: false,
+      status: 'node_runtime_upload_failed',
+      message: 'Unable to upload the Node runtime archive over SSH.',
+      steps,
+    };
+  }
+  if (!upload.step.stdout.includes('CODEX_REMOTE_NODE_RUNTIME_READY')) {
+    return {
+      ok: false,
+      status: 'node_runtime_extract_failed',
+      message: 'Unable to extract or verify the Node runtime on the remote host.',
+      steps,
+    };
+  }
+
+  return { ok: true };
+}
+
+async function ensureRemoteCodexRuntime(connector, secret, remoteDirectory, makeEnv, steps, sshOptions = {}) {
+  const probeCommandParts = buildConnectorSshActionCommand(connector, buildRemoteCodexProbeCommand(connector), secret, 'bootstrap', sshOptions);
+  if (!probeCommandParts) {
+    return {
+      ok: false,
+      status: 'codex_probe_not_ready',
+      message: 'Connector does not have enough SSH information to check the remote Codex CLI.',
+      steps,
+    };
+  }
+
+  const probe = await runProcess(probeCommandParts.command, probeCommandParts.args, {
+    timeoutMs: authAwareTimeout(15_000, secret),
+    env: makeEnv(),
+  });
+  steps.push({ name: 'probe_codex_runtime', ...probe });
+  if (probe.exitCode === 0 && probe.stdout.includes('CODEX_REMOTE_CODEX_PRESENT=')) {
+    return { ok: true };
+  }
+
+  const codexRuntime = stageLocalCodexLinuxRuntime();
+  if (!codexRuntime || !codexRuntime.localSources.length) {
+    return {
+      ok: false,
+      status: 'codex_runtime_missing',
+      message: 'No remote Codex CLI was found, and no local linux-x86_64 Codex runtime is available to deploy.',
+      steps,
+    };
+  }
+
+  const upload = await runSshTarExtract(
+    connector,
+    secret,
+    codexRuntime.localSources,
+    remoteScpChildPath(remoteDirectory, '.runtime/codex'),
+    buildRemoteCodexRuntimeVerifyCommand(connector),
+    'upload_codex_runtime',
+    360_000,
+    sshOptions
+  );
+  if (upload.step) {
+    steps.push(upload.step);
+  }
+  if (!upload.ok) {
+    return {
+      ok: false,
+      status: 'codex_runtime_upload_failed',
+      message: 'Unable to upload the Codex CLI runtime over SSH.',
+      steps,
+    };
+  }
+  if (!upload.step.stdout.includes('CODEX_REMOTE_CODEX_RUNTIME_READY=')) {
+    return {
+      ok: false,
+      status: 'codex_runtime_verify_failed',
+      message: 'The Codex CLI runtime uploaded to the remote host, but it did not pass verification.',
+      steps,
+    };
+  }
+
+  return { ok: true };
 }
 
 function classifyConnectorAction(action, run) {
@@ -845,6 +2423,21 @@ function classifyConnectorAction(action, run) {
     }
     return { ok: true, status: 'remote_status_unknown', message: 'Remote status command completed, but no known status marker was returned.' };
   }
+  if (action === 'diagnose') {
+    const ok = run.exitCode === 0 && stdout.includes('CODEX_REMOTE_DIAG_END');
+    return {
+      ok,
+      status: ok ? 'diagnosed' : 'diagnose_failed',
+      message: ok ? 'Remote environment diagnostic completed.' : 'Remote environment diagnostic failed.',
+    };
+  }
+  if (action === 'logs') {
+    return {
+      ok: run.exitCode === 0,
+      status: run.exitCode === 0 ? 'logs_read' : 'logs_failed',
+      message: run.exitCode === 0 ? 'Remote host-agent logs captured.' : 'Unable to read remote host-agent logs.',
+    };
+  }
   if (action === 'bootstrap') {
     const ok = run.exitCode === 0 && stdout.includes('CODEX_REMOTE_AGENT_BOOTSTRAPPED');
     return {
@@ -853,17 +2446,27 @@ function classifyConnectorAction(action, run) {
       message: ok ? 'Remote host-agent bootstrap command completed.' : 'Remote host-agent bootstrap command failed.',
     };
   }
+  if (action === 'restart') {
+    const ok = run.exitCode === 0 && stdout.includes('CODEX_REMOTE_AGENT_BOOTSTRAPPED');
+    return {
+      ok,
+      status: ok ? 'restarted' : 'restart_failed',
+      message: ok ? 'Remote host-agent restarted with the latest bundle.' : 'Remote host-agent restart failed.',
+    };
+  }
 
   return { ok: false, status: 'unknown_action', message: 'Unknown connector action.' };
 }
 
-async function runConnectorAction(connector, action) {
+async function runConnectorAction(connector, action, secretOverride = null) {
   const decorated = decorateSingleConnector(connector);
-  const secret = state.connectorSecrets.get(connector.connectorId) || null;
+  const secret = secretOverride || state.connectorSecrets.get(connector.connectorId) || null;
   const manualCommand = decorated.plan.sshLoginCommand;
   const manualBootstrapCommand = decorated.plan.bootstrapCommand;
+  const sshOptions = getConnectorSshOptions(connector, action, secret);
+  let activeSshOptions = sshOptions;
 
-  if (!['smoke_test', 'status', 'bootstrap'].includes(action)) {
+  if (!['smoke_test', 'status', 'diagnose', 'logs', 'bootstrap', 'restart'].includes(action)) {
     return {
       httpStatus: 400,
       payload: { ok: false, action, status: 'invalid_action', message: 'Unsupported connector action.' },
@@ -885,7 +2488,37 @@ async function runConnectorAction(connector, action) {
     };
   }
 
-  const actionConfig = buildConnectorAction(connector, action, secret);
+  if (action === 'bootstrap' || action === 'restart') {
+    const bootstrap = await runConnectorBootstrapOneShot(connector, action, secret);
+    return {
+      httpStatus: 200,
+      payload: {
+        ok: bootstrap.ok,
+        action,
+        status: bootstrap.status,
+        message: bootstrap.message,
+        command: bootstrap.command || manualBootstrapCommand,
+        stdout: bootstrap.step?.stdout || '',
+        stderr: bootstrap.step?.stderr || '',
+        exitCode: bootstrap.step?.exitCode ?? null,
+        signal: bootstrap.step?.signal ?? null,
+        timedOut: Boolean(bootstrap.step?.timedOut),
+        error: bootstrap.step?.error || null,
+        remoteDirectory: bootstrap.remoteDirectory,
+        deploy: {
+          ok: bootstrap.ok,
+          status: bootstrap.status,
+          message: bootstrap.message,
+          remoteDirectory: bootstrap.remoteDirectory,
+          payload: bootstrap.payload,
+          steps: bootstrap.steps,
+        },
+        connector: decorateSingleConnector(bootstrap.connector || connector),
+      },
+    };
+  }
+
+  const actionConfig = buildConnectorAction(connector, action, secret, activeSshOptions);
   if (!actionConfig?.commandParts) {
     return {
       httpStatus: 200,
@@ -900,7 +2533,7 @@ async function runConnectorAction(connector, action) {
     };
   }
 
-  const run = await runProcess(
+  let run = await runProcess(
     actionConfig.commandParts.command,
     actionConfig.commandParts.args,
     {
@@ -908,6 +2541,26 @@ async function runConnectorAction(connector, action) {
       env: actionConfig.env || null,
     }
   );
+  let actionMultiplexFallback = null;
+  if (activeSshOptions.controlPath && isSshMultiplexSocketFailureStep(run)) {
+    disableConnectorSshMultiplex(connector, 'ControlMaster socket failure during action command');
+    cleanupSshMultiplexOptions(activeSshOptions);
+    const fallbackActionConfig = buildConnectorAction(connector, action, secret, {});
+    if (fallbackActionConfig?.commandParts) {
+      actionMultiplexFallback = {
+        controlPath: activeSshOptions.controlPath,
+        failedRun: run,
+      };
+      run = await runProcess(
+        fallbackActionConfig.commandParts.command,
+        fallbackActionConfig.commandParts.args,
+        {
+          timeoutMs: fallbackActionConfig.timeoutMs,
+          env: fallbackActionConfig.env || null,
+        }
+      );
+    }
+  }
   const classification = classifyConnectorAction(action, run);
   return {
     httpStatus: 200,
@@ -923,6 +2576,8 @@ async function runConnectorAction(connector, action) {
       error: run.error,
       startedAt: run.startedAt,
       completedAt: run.completedAt,
+      deploy: deployment,
+      multiplexFallback: deployment?.multiplexFallback || actionMultiplexFallback,
       expectedHostId: connector.hostId || null,
       connector: decorateSingleConnector(connector),
     },
@@ -1028,6 +2683,154 @@ function awaitDirectoryRequest(requestId, timeoutMs = 12000) {
       },
     });
   });
+}
+
+function awaitHostProbe(requestId, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingHostProbes.delete(requestId);
+      reject(new Error('host health check timed out'));
+    }, timeoutMs);
+
+    state.pendingHostProbes.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingHostProbes.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingHostProbes.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function awaitModelListRequest(requestId, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingModelRequests.delete(requestId);
+      reject(new Error('model list request timed out'));
+    }, timeoutMs);
+
+    state.pendingModelRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingModelRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingModelRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function normalizeTurnInputItems(rawItems) {
+  const items = [];
+  for (const rawItem of Array.isArray(rawItems) ? rawItems.slice(0, 8) : []) {
+    if (!rawItem || typeof rawItem !== 'object') {
+      continue;
+    }
+
+    const type = String(rawItem.type || '').trim();
+    if (type === 'image') {
+      const url = String(rawItem.url || rawItem.dataUrl || '').trim();
+      if (url) {
+        items.push({
+          type: 'image',
+          url,
+          name: String(rawItem.name || '').trim(),
+        });
+      }
+      continue;
+    }
+
+    if (type === 'localImage') {
+      const imagePath = String(rawItem.path || '').trim();
+      if (imagePath) {
+        items.push({
+          type: 'localImage',
+          path: imagePath,
+          name: String(rawItem.name || '').trim(),
+        });
+      }
+      continue;
+    }
+
+    if (type === 'mention' || type === 'skill') {
+      const name = String(rawItem.name || '').trim();
+      const itemPath = String(rawItem.path || '').trim();
+      if (name && itemPath) {
+        items.push({
+          type,
+          name,
+          path: itemPath,
+        });
+      }
+    }
+  }
+  return items;
+}
+
+function summarizeTurnInput(text, inputItems) {
+  const pieces = [];
+  const prompt = String(text || '').trim();
+  if (prompt) {
+    pieces.push(prompt);
+  }
+
+  for (const [index, item] of inputItems.entries()) {
+    if (item.type === 'image') {
+      pieces.push(`[image ${index + 1}${item.name ? `: ${item.name}` : ''}]`);
+    } else if (item.type === 'localImage') {
+      pieces.push(`[local image: ${item.path}]`);
+    } else if (item.type === 'mention') {
+      pieces.push(`[mention: ${item.name}]`);
+    } else if (item.type === 'skill') {
+      pieces.push(`[skill: ${item.name}]`);
+    }
+  }
+
+  return pieces.join('\n').trim().slice(0, 4000);
+}
+
+function normalizeReviewTarget(input = {}) {
+  const rawTarget = input.target && typeof input.target === 'object' ? input.target : input;
+  const type = String(rawTarget.type || input.targetType || 'uncommittedChanges').trim();
+
+  if (type === 'baseBranch') {
+    const branch = String(rawTarget.branch || input.branch || '').trim();
+    if (!branch) {
+      throw new Error('baseBranch review requires branch');
+    }
+    return { type, branch };
+  }
+
+  if (type === 'commit') {
+    const sha = String(rawTarget.sha || input.sha || '').trim();
+    if (!sha) {
+      throw new Error('commit review requires sha');
+    }
+    return {
+      type,
+      sha,
+      title: String(rawTarget.title || input.title || '').trim() || null,
+    };
+  }
+
+  if (type === 'custom') {
+    const instructions = String(rawTarget.instructions || input.instructions || '').trim();
+    if (!instructions) {
+      throw new Error('custom review requires instructions');
+    }
+    return { type, instructions };
+  }
+
+  return { type: 'uncommittedChanges' };
 }
 
 function upsertSession(hostId, patch) {
@@ -1144,6 +2947,7 @@ function serveStatic(req, res, pathname) {
 
   res.writeHead(200, {
     'Content-Type': mime,
+    'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
   });
   fs.createReadStream(filePath).pipe(res);
@@ -1178,6 +2982,132 @@ async function handleRequest(req, res) {
 
   if (req.method === 'GET' && url.pathname === '/api/stats') {
     sendJson(res, 200, getStats());
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/session-collections') {
+    sendJson(res, 200, { collections: getSessionCollectionList() });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/session-collections') {
+    const body = await readBody(req);
+    const collection = normalizeSessionCollection({
+      name: body.name || 'Untitled',
+      items: [],
+    });
+    state.sessionCollections.set(collection.collectionId, collection);
+    persistSessionCollections();
+    sendJson(res, 200, { ok: true, collection });
+    return;
+  }
+
+  if (req.method === 'PATCH' && url.pathname.match(/^\/api\/session-collections\/[^/]+$/)) {
+    const collectionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const existing = state.sessionCollections.get(collectionId);
+    if (!existing) {
+      sendJson(res, 404, { error: 'collection not found' });
+      return;
+    }
+    if (collectionId === DEFAULT_COLLECTION_ID) {
+      sendJson(res, 409, { error: 'default collection cannot be renamed' });
+      return;
+    }
+
+    const body = await readBody(req);
+    const name = String(body.name || '').trim();
+    if (!name) {
+      sendJson(res, 400, { error: 'collection name is required' });
+      return;
+    }
+
+    const collection = {
+      ...existing,
+      name,
+      updatedAt: nowIso(),
+    };
+    state.sessionCollections.set(collectionId, collection);
+    persistSessionCollections();
+    sendJson(res, 200, { ok: true, collection });
+    return;
+  }
+
+  if (req.method === 'DELETE' && url.pathname.match(/^\/api\/session-collections\/[^/]+$/)) {
+    const collectionId = decodeURIComponent(url.pathname.split('/')[3]);
+    if (collectionId === DEFAULT_COLLECTION_ID) {
+      sendJson(res, 409, { error: 'default collection cannot be deleted' });
+      return;
+    }
+    const existed = state.sessionCollections.delete(collectionId);
+    if (!existed) {
+      sendJson(res, 404, { error: 'collection not found' });
+      return;
+    }
+    persistSessionCollections();
+    sendJson(res, 200, { ok: true, collectionId });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/session-collections\/[^/]+\/items$/)) {
+    const collectionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const collection = state.sessionCollections.get(collectionId);
+    if (!collection) {
+      sendJson(res, 404, { error: 'collection not found' });
+      return;
+    }
+    if (collectionId === DEFAULT_COLLECTION_ID) {
+      sendJson(res, 409, { error: 'default collection already contains all sessions' });
+      return;
+    }
+
+    const body = await readBody(req);
+    const item = normalizeSessionCollectionItem(body.item || body);
+    if (!item) {
+      sendJson(res, 400, { error: 'hostId and conversationKey are required' });
+      return;
+    }
+
+    const key = collectionItemKey(item);
+    const existingItems = collection.items.filter((entry) => collectionItemKey(entry) !== key);
+    const next = {
+      ...collection,
+      items: [...existingItems, item],
+      updatedAt: nowIso(),
+    };
+    state.sessionCollections.set(collectionId, next);
+    persistSessionCollections();
+    sendJson(res, 200, { ok: true, collection: next, item });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/session-collections\/[^/]+\/items\/remove$/)) {
+    const collectionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const collection = state.sessionCollections.get(collectionId);
+    if (!collection) {
+      sendJson(res, 404, { error: 'collection not found' });
+      return;
+    }
+    if (collectionId === DEFAULT_COLLECTION_ID) {
+      sendJson(res, 409, { error: 'default collection items cannot be removed' });
+      return;
+    }
+
+    const body = await readBody(req);
+    const item = normalizeSessionCollectionItem(body.item || body);
+    if (!item) {
+      sendJson(res, 400, { error: 'hostId and conversationKey are required' });
+      return;
+    }
+
+    const key = collectionItemKey(item);
+    const next = {
+      ...collection,
+      items: collection.items.filter((entry) => collectionItemKey(entry) !== key),
+      updatedAt: nowIso(),
+    };
+    state.sessionCollections.set(collectionId, next);
+    persistSessionCollections();
+    sendJson(res, 200, { ok: true, collection: next });
     return;
   }
 
@@ -1228,6 +3158,90 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/connectors\/[^/]+\/action-prompts$/)) {
+    const connectorId = decodeURIComponent(url.pathname.split('/')[3]);
+    const actionId = String(url.searchParams.get('actionId') || '').trim();
+    const token = String(url.searchParams.get('token') || '').trim();
+    const record = getAskpassAction(connectorId, actionId, token);
+    if (!record) {
+      sendJson(res, 404, { error: 'askpass action not found', prompts: [] });
+      return;
+    }
+    const prompts = Array.from(record.prompts.values())
+      .filter((prompt) => !prompt.responseReady && !prompt.cancelled)
+      .map(publicAskpassPrompt);
+    sendJson(res, 200, { ok: true, prompts, closed: record.closed });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/connectors\/[^/]+\/action-prompts\/[^/]+$/)) {
+    const parts = url.pathname.split('/');
+    const connectorId = decodeURIComponent(parts[3]);
+    const promptId = decodeURIComponent(parts[5]);
+    const body = await readBody(req);
+    const actionId = String(body.actionId || '').trim();
+    const token = String(body.token || '').trim();
+    const record = getAskpassAction(connectorId, actionId, token);
+    const prompt = getAskpassPrompt(record, promptId);
+    if (!prompt) {
+      sendJson(res, 404, { error: 'askpass prompt not found' });
+      return;
+    }
+    if (body.cancel) {
+      prompt.cancelled = true;
+      prompt.responseReady = false;
+      prompt.updatedAt = nowIso();
+      cancelAskpassAction(record);
+      sendJson(res, 200, { ok: true, prompt: publicAskpassPrompt(prompt) });
+      return;
+    }
+    prompt.response = String(body.response || '');
+    prompt.responseReady = true;
+    prompt.updatedAt = nowIso();
+    record.updatedAt = nowIso();
+    sendJson(res, 200, { ok: true, prompt: publicAskpassPrompt(prompt) });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/askpass/prompts') {
+    const body = await readBody(req);
+    const prompt = createAskpassPrompt({
+      connectorId: String(body.connectorId || '').trim(),
+      actionId: String(body.actionId || '').trim(),
+      token: String(body.token || '').trim(),
+      prompt: String(body.prompt || '').trim(),
+    });
+    if (!prompt) {
+      sendJson(res, 403, { error: 'askpass action not available' });
+      return;
+    }
+    sendJson(res, 200, publicAskpassPrompt(prompt));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/askpass\/prompts\/[^/]+$/)) {
+    const promptId = decodeURIComponent(url.pathname.split('/')[4]);
+    const connectorId = String(url.searchParams.get('connectorId') || '').trim();
+    const actionId = String(url.searchParams.get('actionId') || '').trim();
+    const token = String(url.searchParams.get('token') || '').trim();
+    const record = getAskpassAction(connectorId, actionId, token);
+    const prompt = getAskpassPrompt(record, promptId);
+    if (!prompt) {
+      sendJson(res, 404, { status: 'closed' });
+      return;
+    }
+    if (prompt.cancelled || record.closed) {
+      sendJson(res, 200, { status: 'cancelled' });
+      return;
+    }
+    if (prompt.responseReady) {
+      sendJson(res, 200, { status: 'answered', response: prompt.response });
+      return;
+    }
+    sendJson(res, 200, { status: 'pending' });
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/connectors\/[^/]+\/actions$/)) {
     const connectorId = decodeURIComponent(url.pathname.split('/')[3]);
     const connector = state.connectors.get(connectorId);
@@ -1237,15 +3251,83 @@ async function handleRequest(req, res) {
     }
 
     const body = await readBody(req);
+    upsertConnectorSecretsFromBody(connector.connectorId, body);
     const action = String(body.action || '').trim();
-    const result = await runConnectorAction(connector, action);
-    sendJson(res, result.httpStatus, result.payload);
+    const requestOrigin = body.clientOrigin || (req.headers.host ? `http://${req.headers.host}` : '');
+    const actionConnector = (action === 'bootstrap' || action === 'restart')
+      ? connectorWithActionRelayOrigin(connector, requestOrigin)
+      : connector;
+    const actionSecret = buildConnectorActionSecret(connector.connectorId, body);
+    const askpassRecord = registerAskpassAction(connector.connectorId, action, actionSecret);
+    try {
+      const result = await runConnectorAction(actionConnector, action, actionSecret);
+      sendJson(res, result.httpStatus, result.payload);
+    } finally {
+      closeAskpassAction(askpassRecord);
+    }
     return;
   }
 
   if (req.method === 'GET' && url.pathname.match(/^\/api\/hosts\/[^/]+\/sessions$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
     sendJson(res, 200, { sessions: getSessionsForHost(hostId) });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/probe$/)) {
+    const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    const host = state.hosts.get(hostId);
+    if (!host) {
+      sendJson(res, 404, { error: 'host not found' });
+      return;
+    }
+    if (!hostOnline(host)) {
+      sendJson(res, 409, { error: `host ${host.label || hostId} is offline` });
+      return;
+    }
+
+    if (!host.capabilities?.hostProbe) {
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        mode: 'heartbeat',
+        message: 'Host is online by heartbeat. Restart its agent to enable active probe checks.',
+      });
+      return;
+    }
+
+    const requestId = makeId();
+    enqueueCommand(hostId, {
+      type: 'host.probe',
+      requestId,
+    });
+
+    try {
+      const result = await awaitHostProbe(requestId);
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        mode: 'active',
+        ...result,
+      });
+    } catch (error) {
+      const currentHost = state.hosts.get(hostId) || host;
+      if (hostHasFreshHeartbeat(currentHost)) {
+        sendJson(res, 200, {
+          ok: true,
+          hostId,
+          mode: 'heartbeat-fallback',
+          warning: `Active health check timed out, but ${currentHost.label || hostId} has a fresh heartbeat.`,
+          heartbeatAgeMs: Math.max(0, Math.round(hostHeartbeatAgeMs(currentHost))),
+        });
+        return;
+      }
+      sendJson(res, 504, {
+        ok: false,
+        hostId,
+        error: `host ${host.label || hostId} did not answer the health check: ${error.message}`,
+      });
+    }
     return;
   }
 
@@ -1370,6 +3452,8 @@ async function handleRequest(req, res) {
       lastSeenAt: nowIso(),
     };
     state.hosts.set(body.hostId, host);
+    attachMatchingConnectorsToHost(host);
+    state.commandQueues.delete(body.hostId);
     sendJson(res, 200, { ok: true, host });
     return;
   }
@@ -1382,8 +3466,23 @@ async function handleRequest(req, res) {
     }
     const host = state.hosts.get(body.hostId);
     if (host) {
+      host.label = body.label || host.label || body.hostId;
+      host.platform = body.platform || host.platform || 'unknown';
+      host.capabilities = body.capabilities || host.capabilities || {};
       host.lastSeenAt = nowIso();
       state.hosts.set(body.hostId, host);
+      attachMatchingConnectorsToHost(host);
+    } else if (body.hostId) {
+      const nextHost = {
+        hostId: body.hostId,
+        label: body.label || body.hostId,
+        platform: body.platform || 'unknown',
+        capabilities: body.capabilities || {},
+        registeredAt: nowIso(),
+        lastSeenAt: nowIso(),
+      };
+      state.hosts.set(body.hostId, nextHost);
+      attachMatchingConnectorsToHost(nextHost);
     }
     sendJson(res, 200, { ok: true });
     return;
@@ -1407,6 +3506,10 @@ async function handleRequest(req, res) {
     const host = state.hosts.get(hostId);
     if (!host) {
       sendJson(res, 404, { error: 'host not found' });
+      return;
+    }
+    if (!hostOnline(host)) {
+      sendJson(res, 409, { error: `host ${host.label || hostId} is offline` });
       return;
     }
 
@@ -1467,12 +3570,16 @@ async function handleRequest(req, res) {
     return;
   }
 
-  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/input$/)) {
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/models$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
-    const body = await readBody(req);
-    const hostId = body.hostId;
+    const hostId = url.searchParams.get('hostId');
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
 
@@ -1486,14 +3593,92 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const host = state.hosts.get(hostId);
+    if (!host?.capabilities?.modelList) {
+      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can list Codex models' });
+      return;
+    }
+
+    const requestId = makeId();
+    const pending = awaitModelListRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'session.model_list',
+      sessionId,
+      requestId,
+      includeHidden: url.searchParams.get('includeHidden') === 'true',
+      cursor: url.searchParams.get('cursor') || null,
+      limit: Number(url.searchParams.get('limit') || 80) || 80,
+    });
+
+    try {
+      const payload = await pending;
+      sendJson(res, 200, payload);
+    } catch (error) {
+      sendJson(res, 504, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/input$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = body.hostId;
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+
+    const session = getSession(hostId, sessionId);
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (!session.live) {
+      sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+
+    const text = String(body.text || '');
+    const inputItems = normalizeTurnInputItems(body.inputItems || body.attachments || []);
+    const transcriptText = summarizeTurnInput(text, inputItems);
+    if (!transcriptText) {
+      sendJson(res, 400, { error: 'text or inputItems are required' });
+      return;
+    }
+    const host = state.hosts.get(hostId);
+    if (inputItems.length && !host?.capabilities?.imageInput) {
+      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can receive image inputs' });
+      return;
+    }
+    const advancedTurnControlRequested = Boolean(
+      String(body.model || '').trim()
+      || String(body.effort || '').trim()
+      || String(body.summary || '').trim()
+      || String(body.serviceTier || '').trim()
+      || String(body.personality || '').trim()
+      || String(body.mode || '').trim() === 'plan'
+      || (String(body.sandboxMode || '').trim() && String(body.sandboxMode || '').trim() !== 'workspaceWrite')
+      || (String(body.approvalsReviewer || '').trim() && String(body.approvalsReviewer || '').trim() !== 'user')
+      || (String(body.approvalPolicy || '').trim() && String(body.approvalPolicy || '').trim() !== 'on-request')
+    );
+    if (advancedTurnControlRequested && !host?.capabilities?.turnControls) {
+      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can use Codex turn controls' });
+      return;
+    }
+
     emitTranscriptEntry(hostId, sessionId, {
       speaker: 'user',
-      text: String(body.text || ''),
+      text: transcriptText,
       timestamp: nowIso(),
     });
     const next = upsertSession(hostId, {
       sessionId,
-      latestUserMessage: String(body.text || ''),
+      latestUserMessage: transcriptText,
       lastUpdatedAt: nowIso(),
     });
     broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
@@ -1501,7 +3686,77 @@ async function handleRequest(req, res) {
     const command = enqueueCommand(hostId, {
       type: 'session.input',
       sessionId,
-      text: String(body.text || ''),
+      text,
+      inputItems,
+      mode: String(body.mode || '').trim() || null,
+      model: String(body.model || '').trim() || null,
+      effort: String(body.effort || '').trim() || null,
+      summary: String(body.summary || '').trim() || null,
+      approvalPolicy: typeof body.approvalPolicy === 'object' ? body.approvalPolicy : String(body.approvalPolicy || '').trim() || null,
+      approvalsReviewer: String(body.approvalsReviewer || '').trim() || null,
+      sandboxMode: String(body.sandboxMode || '').trim() || null,
+      serviceTier: String(body.serviceTier || '').trim() || null,
+      personality: String(body.personality || '').trim() || null,
+    });
+    sendJson(res, 200, { ok: true, command });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/review$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = body.hostId;
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+
+    const session = getSession(hostId, sessionId);
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (!session.live) {
+      sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+
+    const host = state.hosts.get(hostId);
+    if (!host?.capabilities?.review) {
+      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can run Codex reviews' });
+      return;
+    }
+
+    let target = null;
+    try {
+      target = normalizeReviewTarget(body);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return;
+    }
+
+    const delivery = String(body.delivery || 'inline').trim() === 'detached' ? 'detached' : 'inline';
+    const command = enqueueCommand(hostId, {
+      type: 'session.review_start',
+      sessionId,
+      target,
+      delivery,
+    });
+    emitSessionDiagnostic(hostId, sessionId, {
+      severity: 'info',
+      source: 'ui',
+      kind: 'control',
+      method: 'review/start',
+      message: `Review requested: ${target.type}`,
+      data: {
+        target,
+        delivery,
+      },
     });
     sendJson(res, 200, { ok: true, command });
     return;
@@ -1513,6 +3768,11 @@ async function handleRequest(req, res) {
     const hostId = body.hostId;
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
 
@@ -1532,6 +3792,11 @@ async function handleRequest(req, res) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
 
     const command = enqueueCommand(hostId, {
       type: 'session.interrupt',
@@ -1547,6 +3812,11 @@ async function handleRequest(req, res) {
     const hostId = body.hostId;
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
 
@@ -1573,6 +3843,11 @@ async function handleRequest(req, res) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
 
     const command = enqueueCommand(hostId, {
       type: 'session.compact',
@@ -1588,6 +3863,11 @@ async function handleRequest(req, res) {
     const hostId = body.hostId;
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
 
@@ -1614,6 +3894,11 @@ async function handleRequest(req, res) {
     const hostId = body.hostId;
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
 
@@ -1711,8 +3996,8 @@ function applyAgentEvent(event) {
         sourceSessionId: session.sourceSessionId || null,
         conversationKey: session.conversationKey || session.originSessionId || session.sessionId,
         launchMode: session.launchMode || null,
-        runtime: preserveManagedState ? existing.runtime || null : existing?.runtime || null,
-        bridgeSessionId: existing?.bridgeSessionId || null,
+        runtime: preserveManagedState ? existing.runtime || null : session.runtime || existing?.runtime || null,
+        bridgeSessionId: session.bridgeSessionId || existing?.bridgeSessionId || null,
         nativeThreadId: existing?.nativeThreadId || session.nativeThreadId || session.sessionId,
       });
       if (!preserveManagedState && !next.live && Array.isArray(session.transcriptPreview)) {
@@ -1741,6 +4026,37 @@ function applyAgentEvent(event) {
     const pending = state.pendingDirectoryRequests.get(event.requestId);
     if (pending) {
       pending.reject(new Error(event.message || 'directory listing failed'));
+    }
+    return;
+  }
+
+  if (event.type === 'host.probe' && event.requestId) {
+    const pending = state.pendingHostProbes.get(event.requestId);
+    if (pending) {
+      pending.resolve({
+        requestId: event.requestId,
+        answeredAt: event.timestamp || nowIso(),
+        label: event.label || null,
+        platform: event.platform || null,
+        capabilities: event.capabilities || null,
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'session.model_listed' && event.requestId) {
+    const pending = state.pendingModelRequests.get(event.requestId);
+    if (pending) {
+      if (event.error) {
+        pending.reject(new Error(event.error));
+      } else {
+        pending.resolve({
+          models: Array.isArray(event.models) ? event.models : [],
+          nextCursor: event.nextCursor || null,
+          hostId: event.hostId,
+          sessionId: event.sessionId || null,
+        });
+      }
     }
     return;
   }
@@ -1866,6 +4182,26 @@ function applyAgentEvent(event) {
       ...(runtime || {}),
       hostId: event.hostId,
       sessionId: effectiveSessionId,
+    });
+    return;
+  }
+
+  if (event.type === 'session.review_started') {
+    const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+      severity: 'info',
+      source: 'codex',
+      kind: 'control',
+      method: 'review/start',
+      message: `Review started${event.reviewThreadId ? `: ${event.reviewThreadId}` : ''}`,
+      data: {
+        reviewThreadId: event.reviewThreadId || null,
+        turnId: event.turnId || null,
+        target: event.target || null,
+        delivery: event.delivery || null,
+      },
+      turnId: event.turnId || null,
+      timestamp: event.timestamp || nowIso(),
     });
     return;
   }

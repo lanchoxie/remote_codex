@@ -247,10 +247,19 @@ function buildAgentLaunchCommand(connector) {
   if (connector.codexHome) {
     exports.push(`CODEX_HOME=${shellEnvValue(connector.codexHome, { allowHome: true })}`);
   }
+  exports.push('AUTO_START_SESSION=false');
 
   const envBlock = exports.length ? `${exports.join(' ')} ` : '';
   return connector.bootstrap.launchCommand
-    || `${envBlock}node apps/host-agent/agent.js`;
+    || `NODE_BIN="$(command -v node || command -v nodejs || test -x .runtime/node/bin/node && printf '%s\\n' "$PWD/.runtime/node/bin/node" || true)" && test -n "$NODE_BIN" && ${envBlock}"$NODE_BIN" apps/host-agent/agent.js`;
+}
+
+function tmuxShellCommand(command) {
+  return shellQuote(`sh -lc ${shellQuote(command)}`);
+}
+
+function agentLogCommand(command) {
+  return `echo "[remote-codex] start $(date -Is 2>/dev/null || date)" >> codex-remote.agent.log; { ${command}; } >> codex-remote.agent.log 2>&1`;
 }
 
 function buildBootstrapCommand(connector) {
@@ -258,7 +267,7 @@ function buildBootstrapCommand(connector) {
   const launchCommand = buildAgentLaunchCommand(connector);
 
   if (connector.bootstrap.mode === 'manual_tmux') {
-    return `cd ${shellPathArg(remoteDir)} && tmux new -As ${shellQuote(connector.bootstrap.tmuxSession)} sh -lc ${shellQuote(launchCommand)}`;
+    return `cd ${shellPathArg(remoteDir)} && tmux new -As ${shellQuote(connector.bootstrap.tmuxSession)} ${tmuxShellCommand(agentLogCommand(launchCommand))}`;
   }
 
   if (connector.bootstrap.mode === 'manual_systemd') {
@@ -276,15 +285,19 @@ function buildBootstrapCommand(connector) {
   return launchCommand;
 }
 
-function buildDetachedBootstrapCommand(connector) {
+function buildDetachedBootstrapCommand(connector, options = {}) {
   const remoteDir = connector.bootstrap.remoteDirectory || '~/mobile-codex-remote';
   const launchCommand = buildAgentLaunchCommand(connector);
 
   if (connector.bootstrap.mode === 'manual_tmux') {
     const tmuxSession = connector.bootstrap.tmuxSession || 'codex-remote';
+    const startCommand = `tmux new-session -d -s ${shellQuote(tmuxSession)} ${tmuxShellCommand(agentLogCommand(launchCommand))}`;
+    const tmuxCommand = options.restart
+      ? `(tmux kill-session -t ${shellQuote(tmuxSession)} 2>/dev/null || true) && ${startCommand}`
+      : `(tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null || ${startCommand})`;
     return [
       `cd ${shellPathArg(remoteDir)}`,
-      `(tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null || tmux new-session -d -s ${shellQuote(tmuxSession)} sh -lc ${shellQuote(launchCommand)})`,
+      tmuxCommand,
       'echo CODEX_REMOTE_AGENT_BOOTSTRAPPED',
     ].join(' && ');
   }
@@ -389,8 +402,22 @@ function buildSshCommandParts(connector, options = {}) {
   if (options.preferredAuthentications) {
     args.push('-o', `PreferredAuthentications=${options.preferredAuthentications}`);
   }
+  if (options.controlMaster) {
+    args.push('-o', `ControlMaster=${options.controlMaster}`);
+  }
+  if (options.controlPersist) {
+    args.push('-o', `ControlPersist=${options.controlPersist}`);
+  }
+  if (options.controlPath) {
+    args.push('-o', `ControlPath=${options.controlPath}`);
+  }
+  if (options.streamLocalBindUnlink) {
+    args.push('-o', `StreamLocalBindUnlink=${options.streamLocalBindUnlink}`);
+  }
   if (connector.auth?.keyPath) {
     args.push('-i', connector.auth.keyPath);
+    args.push('-o', 'IdentitiesOnly=yes');
+    args.push('-o', 'IdentityAgent=none');
   }
   if (connector.auth?.agentForwarding) {
     args.push('-A');
@@ -426,19 +453,19 @@ function buildSshCommandParts(connector, options = {}) {
 function describeAuthPrompt(scope, method) {
   const label = authLabel(method);
   if (method === 'password') {
-    return `${scope} uses Password auth. Type it into the SSH prompt when it appears; this manager does not store it.`;
+    return `${scope} uses Password auth. Enter it in this manager to save it locally, or type it into a manual SSH prompt.`;
   }
   if (method === 'keyboard_interactive') {
-    return `${scope} uses keyboard-interactive auth. Finish the prompt in your terminal or Termux.`;
+    return `${scope} uses keyboard-interactive auth. Save the password locally, or add OTP notes so this manager prompts for the current code.`;
   }
   if (method === 'otp') {
-    return `${scope} requires OTP / MFA. Enter the current code only in the SSH prompt.`;
+    return `${scope} requires OTP / MFA. This manager prompts for the current code when you run Test, Status, or Start Agent.`;
   }
   if (method === 'browser_sso') {
     return `${scope} requires browser SSO. Complete that login outside this manager, then keep the agent alive.`;
   }
   if (method === 'manual_captcha') {
-    return `${scope} requires a captcha/manual challenge. Complete it outside this manager.`;
+    return `${scope} requires a captcha/manual challenge. This manager can prompt for the current challenge response when SSH accepts askpass.`;
   }
   if (method === 'ssh_key' || method === 'ssh_agent') {
     return `${scope} uses ${label}; keep keys and passphrases in your SSH agent or local terminal.`;
@@ -497,7 +524,7 @@ function buildConnectorPlan(connector) {
   }
 
   if (requiresInteractiveAuth(gatewayAuthMethod) || requiresInteractiveAuth(targetAuthMethod)) {
-    warnings.push('The current prototype does not pop password dialogs in the browser. Use the generated SSH login command in a terminal or Termux, then run the tmux bootstrap command on the target host.');
+    warnings.push('Saved passwords are stored only on this relay machine in an ignored local secret file. For shared machines, prefer manual SSH or SSH keys.');
   }
 
   if (connector.auth.rememberDevice) {
