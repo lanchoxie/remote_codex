@@ -1,5 +1,7 @@
 # Mobile Codex Remote Notes
 
+[中文说明 / Chinese README](README.zh-CN.md)
+
 This workspace captures an MVP design for controlling Codex sessions on a PC
 and on HPC hosts from a phone.
 
