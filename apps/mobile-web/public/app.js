@@ -3,6 +3,20 @@ const state = {
   dismissedHosts: [],
   sessions: [],
   stats: null,
+  auth: {
+    ready: false,
+    required: false,
+    authenticated: true,
+    hasAccount: false,
+    setupRequired: false,
+    username: '',
+    tokenHint: '',
+    tokenFile: '',
+    accountFile: '',
+    accountOpen: false,
+    error: '',
+    accountError: '',
+  },
   selectedHostId: null,
   selectedConversationKey: null,
   selectedSessionId: null,
@@ -13,6 +27,8 @@ const state = {
   runtime: new Map(),
   diagnostics: new Map(),
   requests: new Map(),
+  receivedFiles: new Map(),
+  receivedFilesLoadingKeys: new Set(),
   streamStatus: new Map(),
   thinkingPanels: new Map(),
   alertWindowOpen: false,
@@ -31,8 +47,14 @@ const state = {
   hostSwitchBusyId: null,
   codexControls: {
     modelOptionsBySession: new Map(),
+    modelOptionsLoadingKeys: new Set(),
     attachments: [],
     modelsLoading: false,
+  },
+  slashMenu: {
+    open: false,
+    query: '',
+    selectedIndex: 0,
   },
   directoryPicker: {
     open: false,
@@ -50,6 +72,9 @@ const MAX_COMPOSER_IMAGES = 4;
 const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_COMPOSER_TEXT_FILES = 4;
 const MAX_COMPOSER_TEXT_FILE_BYTES = 768 * 1024;
+const MAX_COMPOSER_UPLOAD_FILES = 8;
+const MAX_COMPOSER_UPLOAD_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 24 * 1024 * 1024;
 const TEXT_FILE_EXTENSIONS = new Set([
   'bat',
   'cmd',
@@ -73,6 +98,59 @@ const TEXT_FILE_EXTENSIONS = new Set([
   'xml',
   'yaml',
   'yml',
+]);
+const IMAGE_FILE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'jpeg', 'jpg', 'png', 'svg', 'tif', 'tiff', 'webp']);
+const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
+  ...IMAGE_FILE_EXTENSIONS,
+  'c',
+  'cpp',
+  'cs',
+  'css',
+  'csv',
+  'doc',
+  'docx',
+  'go',
+  'ipynb',
+  'java',
+  'js',
+  'jsx',
+  'h',
+  'hpp',
+  'mjs',
+  'ps1',
+  'py',
+  'r',
+  'rs',
+  'sh',
+  'sql',
+  'toml',
+  'ts',
+  'tsx',
+  'gz',
+  'h5',
+  'hdf5',
+  'html',
+  'json',
+  'jsonl',
+  'log',
+  'md',
+  'mov',
+  'mp4',
+  'npy',
+  'npz',
+  'parquet',
+  'pdf',
+  'pkl',
+  'tar',
+  'tgz',
+  'txt',
+  'webm',
+  'xlsx',
+  'xml',
+  'xz',
+  'yaml',
+  'yml',
+  'zip',
 ]);
 
 const el = (id) => document.getElementById(id);
@@ -110,9 +188,176 @@ async function fetchJson(url, options = {}) {
 
   const body = await response.json();
   if (!response.ok) {
-    throw new Error(body.error || `request failed: ${response.status}`);
+    const error = new Error(body.error || `request failed: ${response.status}`);
+    error.status = response.status;
+    error.body = body;
+    error.url = url;
+    if (response.status === 401 && body?.authRequired && !options.skipAuthHandling) {
+      requireRelayLogin(error.message);
+    }
+    throw error;
   }
   return body;
+}
+
+function authAllowsRequests() {
+  return !state.auth.required || state.auth.authenticated;
+}
+
+function renderAuthGate() {
+  const gate = el('auth-gate');
+  if (!gate) {
+    return;
+  }
+  const locked = state.auth.required && !state.auth.authenticated;
+  gate.classList.toggle('hidden', !locked);
+  gate.setAttribute('aria-hidden', locked ? 'false' : 'true');
+
+  const title = el('auth-title');
+  if (title) {
+    title.textContent = state.auth.setupRequired ? 'Set admin account' : 'Sign in';
+  }
+
+  const subtitle = el('auth-subtitle');
+  if (subtitle) {
+    subtitle.textContent = state.auth.setupRequired
+      ? 'Create the browser login. The password is stored as a local scrypt hash, not plaintext.'
+      : 'Use your relay account. The recovery token is still available for emergency access.';
+  }
+
+  const usernameInput = el('auth-username-input');
+  if (usernameInput && document.activeElement !== usernameInput && !usernameInput.value) {
+    usernameInput.value = state.auth.username || 'admin';
+  }
+
+  el('auth-password-confirm-input')?.classList.toggle('hidden', !state.auth.setupRequired);
+  el('auth-recovery-details')?.classList.toggle('hidden', state.auth.setupRequired);
+
+  const hint = el('auth-token-hint');
+  if (hint) {
+    if (!state.auth.required) {
+      hint.textContent = 'Relay auth is disabled.';
+    } else if (state.auth.setupRequired) {
+      hint.textContent = `Account file: ${state.auth.accountFile || 'tmp/relay-auth-account.json'}. Recovery token: ${state.auth.tokenHint || '(new token)'}.`;
+    } else {
+      hint.textContent = `Signed account: ${state.auth.username || 'admin'}. Recovery token file: ${state.auth.tokenFile || 'tmp/relay-auth-token.txt'}.`;
+    }
+  }
+
+  const error = el('auth-error');
+  if (error) {
+    error.textContent = state.auth.error || '';
+  }
+
+  const accountButton = el('account-button');
+  if (accountButton) {
+    accountButton.hidden = !state.auth.required || !state.auth.authenticated || !state.auth.hasAccount;
+  }
+
+  const logoutButton = el('logout-button');
+  if (logoutButton) {
+    logoutButton.hidden = !state.auth.required || !state.auth.authenticated;
+  }
+
+  renderAccountDialog();
+}
+
+function renderAccountDialog() {
+  const dialog = el('account-dialog');
+  if (!dialog) {
+    return;
+  }
+  const open = state.auth.accountOpen;
+  dialog.classList.toggle('hidden', !open);
+  dialog.setAttribute('aria-hidden', open ? 'false' : 'true');
+  const usernameInput = el('account-username-input');
+  if (usernameInput && open && document.activeElement !== usernameInput && !usernameInput.value) {
+    usernameInput.value = state.auth.username || 'admin';
+  }
+  const error = el('account-error');
+  if (error) {
+    error.textContent = state.auth.accountError || '';
+  }
+}
+
+function requireRelayLogin(message = '') {
+  state.auth.required = true;
+  state.auth.authenticated = false;
+  state.auth.error = message || 'Relay login is required.';
+  closeStream();
+  renderAuthGate();
+}
+
+function applyAuthConfig(config = {}) {
+  state.auth.ready = true;
+  state.auth.required = Boolean(config.authRequired);
+  state.auth.authenticated = !state.auth.required || Boolean(config.authenticated);
+  state.auth.hasAccount = Boolean(config.hasAccount);
+  state.auth.setupRequired = Boolean(config.setupRequired);
+  state.auth.username = config.username || state.auth.username || '';
+  state.auth.tokenHint = config.tokenHint || '';
+  state.auth.tokenFile = config.tokenFile || 'tmp/relay-auth-token.txt';
+  state.auth.accountFile = config.accountFile || 'tmp/relay-auth-account.json';
+}
+
+async function refreshAuthState() {
+  const config = await fetchJson('/api/auth/config', { skipAuthHandling: true });
+  applyAuthConfig(config);
+  if (state.auth.authenticated) {
+    state.auth.error = '';
+  }
+  renderAuthGate();
+  return state.auth.authenticated;
+}
+
+async function setupRelayAccount(username, password, confirmPassword) {
+  const response = await fetchJson('/api/auth/setup', {
+    method: 'POST',
+    body: JSON.stringify({ username, password, confirmPassword }),
+    skipAuthHandling: true,
+  });
+  applyAuthConfig(response);
+  state.auth.error = '';
+  renderAuthGate();
+  await refresh();
+}
+
+async function loginRelay(credentials) {
+  const response = await fetchJson('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(credentials),
+    skipAuthHandling: true,
+  });
+  applyAuthConfig(response);
+  state.auth.error = '';
+  renderAuthGate();
+  await refresh();
+}
+
+async function changeRelayPassword(payload) {
+  const response = await fetchJson('/api/auth/change-password', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    skipAuthHandling: true,
+  });
+  applyAuthConfig(response);
+  state.auth.accountOpen = false;
+  state.auth.accountError = '';
+  renderAuthGate();
+}
+
+async function logoutRelay() {
+  await fetchJson('/api/auth/logout', {
+    method: 'POST',
+    body: JSON.stringify({}),
+    skipAuthHandling: true,
+  }).catch(() => null);
+  state.auth.required = true;
+  state.auth.authenticated = false;
+  state.auth.accountOpen = false;
+  state.auth.error = 'Logged out.';
+  closeStream();
+  renderAuthGate();
 }
 
 function makeSessionKey(hostId, sessionId) {
@@ -496,12 +741,43 @@ function shortId(value) {
   return text.length > 16 ? `${text.slice(0, 8)}...${text.slice(-6)}` : text;
 }
 
+function normalizeTranscriptFiles(rawFiles) {
+  const files = [];
+  const seen = new Set();
+  for (const rawFile of Array.isArray(rawFiles) ? rawFiles : []) {
+    if (!rawFile || typeof rawFile !== 'object') {
+      continue;
+    }
+    const pathValue = String(rawFile.path || rawFile.remotePath || '').trim();
+    const name = String(rawFile.name || basename(pathValue) || 'file').trim();
+    if (!pathValue && !name) {
+      continue;
+    }
+    const key = `${pathValue}|${name}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const mime = String(rawFile.mime || rawFile.type || '').trim();
+    files.push({
+      fileId: String(rawFile.fileId || rawFile.id || key),
+      name,
+      path: pathValue,
+      size: Number(rawFile.size || 0) || 0,
+      mime,
+      isImage: Boolean(rawFile.isImage) || /^image\//i.test(mime) || IMAGE_FILE_EXTENSIONS.has(fileExtension(name || pathValue)),
+    });
+  }
+  return files;
+}
+
 function dedupeTranscript(entries) {
   const seen = new Set();
   const deduped = [];
 
   for (const entry of entries || []) {
-    if (!entry || !entry.text) {
+    const files = normalizeTranscriptFiles(entry?.files || entry?.attachments || []);
+    if (!entry || (!entry.text && !files.length)) {
       continue;
     }
 
@@ -510,8 +786,9 @@ function dedupeTranscript(entries) {
       text: String(entry.text || ''),
       timestamp: entry.timestamp || null,
       stream: entry.stream || null,
+      files,
     };
-    const key = `${normalized.speaker}|${normalized.timestamp || ''}|${normalized.text}`;
+    const key = `${normalized.speaker}|${normalized.timestamp || ''}|${normalized.text}|${files.map((file) => file.path || file.name).join(',')}`;
     if (seen.has(key)) {
       continue;
     }
@@ -1233,6 +1510,21 @@ function resolveRequestForSession(hostId, sessionId, request) {
 function getRequestsForSession(session) {
   const key = getSessionKey(session);
   return key ? state.requests.get(key) || [] : [];
+}
+
+function setReceivedFilesForSession(hostId, sessionId, files) {
+  const key = makeSessionKey(hostId, sessionId);
+  state.receivedFiles.set(key, Array.isArray(files) ? files : []);
+}
+
+function getReceivedFilesForSession(session) {
+  const key = getSessionKey(session);
+  return key ? state.receivedFiles.get(key) || [] : [];
+}
+
+function isReceivedFilesLoading(session) {
+  const key = getSessionKey(session);
+  return key ? state.receivedFilesLoadingKeys.has(key) : false;
 }
 
 function setStreamStatusForSession(hostId, sessionId, patch) {
@@ -2038,26 +2330,320 @@ function isTextLikeFile(file) {
   return TEXT_FILE_EXTENSIONS.has(fileExtension(file?.name));
 }
 
+function isImageFileRef(file) {
+  const mime = String(file?.mime || file?.type || '').toLowerCase();
+  return mime.startsWith('image/') || IMAGE_FILE_EXTENSIONS.has(fileExtension(file?.name || file?.path));
+}
+
+function formatHostCapabilityName(host) {
+  return host?.label || host?.hostId || 'selected host';
+}
+
+function isDownloadablePath(value) {
+  const text = String(value || '').trim();
+  if (!text || /^(https?:|data:|mailto:)/i.test(text)) {
+    return false;
+  }
+  return DOWNLOADABLE_FILE_EXTENSIONS.has(fileExtension(text));
+}
+
+function stripPathPunctuation(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/[)\].,;:!?]+$/g, '');
+}
+
+function decodePathCandidate(value) {
+  const cleaned = stripPathPunctuation(value);
+  try {
+    return decodeURIComponent(cleaned);
+  } catch {
+    return cleaned;
+  }
+}
+
+function extractFileRefsFromText(text) {
+  const source = String(text || '');
+  const refs = [];
+  const addRef = (candidate, label = '') => {
+    const pathValue = decodePathCandidate(candidate);
+    if (!isDownloadablePath(pathValue)) {
+      return;
+    }
+    if (refs.some((entry) => entry.path === pathValue)) {
+      return;
+    }
+    refs.push({
+      name: label || basename(pathValue) || pathValue,
+      path: pathValue,
+      mime: '',
+      size: 0,
+      isImage: IMAGE_FILE_EXTENSIONS.has(fileExtension(pathValue)),
+    });
+  };
+
+  const markdownLinkPattern = /!?\[([^\]]*)\]\(([^)]+)\)/g;
+  let match = null;
+  while ((match = markdownLinkPattern.exec(source))) {
+    addRef(match[2], match[1]);
+  }
+
+  const explicitPattern = /remote-codex-file:([^\s"'<>`]+)/g;
+  while ((match = explicitPattern.exec(source))) {
+    addRef(match[1]);
+  }
+
+  const extensionPattern = Array.from(DOWNLOADABLE_FILE_EXTENSIONS).join('|');
+  const unixPattern = new RegExp(`(?:~|\\/)[^\\s"'<>\\|` + '`' + `]+?\\.(${extensionPattern})(?=[\\s\\)\\]\\},.;:!?]|$)`, 'gi');
+  while ((match = unixPattern.exec(source))) {
+    addRef(match[0]);
+  }
+
+  const windowsPattern = new RegExp(`[A-Za-z]:\\\\[^\\n"'<>\\|` + '`' + `]+?\\.(${extensionPattern})(?=[\\s\\)\\]\\},.;:!?]|$)`, 'gi');
+  while ((match = windowsPattern.exec(source))) {
+    addRef(match[0]);
+  }
+
+  const relativePattern = new RegExp(
+    `(?:^|[\\s\\(\\[\\{])((?:\\.{1,2}[\\\\/])?(?:[A-Za-z0-9_.@+~-]+[\\\\/])*[A-Za-z0-9_.@+~-]+\\.(${extensionPattern}))(?=[\\s\\)\\]\\},.;:!?]|$)`,
+    'gi'
+  );
+  while ((match = relativePattern.exec(source))) {
+    addRef(match[1]);
+  }
+
+  return refs;
+}
+
+function getTranscriptFileRefs(entry) {
+  const explicit = normalizeTranscriptFiles(entry?.files || entry?.attachments || []);
+  const extracted = extractFileRefsFromText(entry?.text || '');
+  const seen = new Set();
+  const merged = [];
+  for (const file of [...explicit, ...extracted]) {
+    const key = file.path || file.name;
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(file);
+  }
+  return merged;
+}
+
+function buildHostFileUrl(session, file, inline = false) {
+  const params = new URLSearchParams({
+    path: file.path || '',
+    sessionId: session?.sessionId || '',
+  });
+  if (session?.cwd) {
+    params.set('cwd', session.cwd);
+  }
+  if (inline) {
+    params.set('inline', '1');
+  }
+  return `/api/hosts/${encodeURIComponent(session.hostId)}/files/download?${params.toString()}`;
+}
+
+function buildReceivedFileUrl(file, inline = false) {
+  const params = new URLSearchParams();
+  if (inline) {
+    params.set('inline', '1');
+  }
+  return `/api/received-files/${encodeURIComponent(file.fileId)}${params.toString() ? `?${params.toString()}` : ''}`;
+}
+
+const FALLBACK_REASONING_EFFORTS = [
+  { value: 'minimal', label: 'Minimal / 最小' },
+  { value: 'low', label: 'Low / 低' },
+  { value: 'medium', label: 'Medium / 中' },
+  { value: 'high', label: 'High / 高' },
+  { value: 'xhigh', label: 'XHigh / 超高' },
+];
+
+const REASONING_EFFORT_LABELS = {
+  none: 'None / 关闭',
+  minimal: 'Minimal / 最小',
+  low: 'Low / 低',
+  medium: 'Medium / 中',
+  high: 'High / 高',
+  xhigh: 'XHigh / 超高',
+};
+
+function normalizeModelOption(model) {
+  const modelId = String(model?.model || model?.id || '').trim();
+  if (!modelId) {
+    return null;
+  }
+  return {
+    ...model,
+    id: String(model?.id || modelId).trim(),
+    model: modelId,
+    displayName: String(model?.displayName || modelId).trim(),
+    description: String(model?.description || '').trim(),
+    inputModalities: Array.isArray(model?.inputModalities) ? model.inputModalities.map(String) : [],
+    supportedReasoningEfforts: Array.isArray(model?.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts
+      : [],
+    defaultReasoningEffort: String(model?.defaultReasoningEffort || '').trim(),
+    hidden: Boolean(model?.hidden),
+    isDefault: Boolean(model?.isDefault),
+    supportsPersonality: model?.supportsPersonality === true,
+  };
+}
+
+function getModelOptions(session) {
+  const seen = new Set();
+  const models = [];
+  for (const rawModel of state.codexControls.modelOptionsBySession.get(modelCacheKey(session)) || []) {
+    const model = normalizeModelOption(rawModel);
+    if (!model || seen.has(model.model)) {
+      continue;
+    }
+    seen.add(model.model);
+    models.push(model);
+  }
+  return models;
+}
+
+function findModelOption(session, modelId) {
+  const normalized = String(modelId || '').trim();
+  if (!normalized) {
+    return getModelOptions(session).find((model) => model.isDefault) || null;
+  }
+  return getModelOptions(session).find((model) => model.model === normalized || model.id === normalized) || null;
+}
+
+function inferModelCategory(model) {
+  const id = String(model?.model || model?.id || '').toLowerCase();
+  if (model?.isDefault) {
+    return 'Recommended / 默认推荐';
+  }
+  if (model?.hidden) {
+    return 'Hidden / System';
+  }
+  if (/mini|nano|small|lite/.test(id)) {
+    return 'Small / Fast';
+  }
+  if (/codex|code/.test(id)) {
+    return 'Codex / Coding';
+  }
+  if (/^gpt[-_.]?\d/.test(id)) {
+    return 'GPT / General';
+  }
+  return 'Other';
+}
+
+function modelSelectLabel(model) {
+  const badges = [];
+  if (model.isDefault) {
+    badges.push('default');
+  }
+  if (model.inputModalities.includes('image')) {
+    badges.push('img');
+  }
+  if (model.defaultReasoningEffort) {
+    badges.push(model.defaultReasoningEffort);
+  }
+  return `${model.displayName || model.model}${badges.length ? ` | ${badges.join(' | ')}` : ''}`;
+}
+
+function syncModelSelectFromInput(session) {
+  const select = el('codex-model-select');
+  const input = el('codex-model-input');
+  if (!select || !input) {
+    return;
+  }
+  const value = input.value.trim();
+  const matched = value ? findModelOption(session, value) : null;
+  select.value = matched ? matched.model : '';
+}
+
 function renderComposerModelOptions(session) {
   const datalist = el('codex-model-options');
-  if (!datalist) {
+  const select = el('codex-model-select');
+  if (!datalist || !select) {
     return;
   }
 
   datalist.innerHTML = '';
-  const models = state.codexControls.modelOptionsBySession.get(modelCacheKey(session)) || [];
+  select.innerHTML = '';
+
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  const models = getModelOptions(session);
+  const defaultModel = models.find((model) => model.isDefault) || null;
+  defaultOption.textContent = defaultModel
+    ? `Auto: ${defaultModel.displayName || defaultModel.model}`
+    : 'Model: auto/default';
+  select.appendChild(defaultOption);
+
+  const grouped = new Map();
   for (const model of models) {
-    const modelId = String(model.model || model.id || '').trim();
-    if (!modelId) {
-      continue;
-    }
     const option = document.createElement('option');
-    option.value = modelId;
-    const displayName = String(model.displayName || modelId).trim();
-    const effort = model.defaultReasoningEffort ? ` | ${model.defaultReasoningEffort}` : '';
-    option.label = `${displayName}${model.isDefault ? ' | default' : ''}${effort}`;
+    option.value = model.model;
+    const effort = model.defaultReasoningEffort ? ` | effort ${model.defaultReasoningEffort}` : '';
+    option.label = `${model.displayName || model.model}${model.isDefault ? ' | default' : ''}${effort}${model.description ? ` | ${model.description}` : ''}`;
     datalist.appendChild(option);
+
+    const category = inferModelCategory(model);
+    if (!grouped.has(category)) {
+      grouped.set(category, []);
+    }
+    grouped.get(category).push(model);
   }
+
+  for (const [category, categoryModels] of grouped.entries()) {
+    const group = document.createElement('optgroup');
+    group.label = category;
+    for (const model of categoryModels) {
+      const option = document.createElement('option');
+      option.value = model.model;
+      option.textContent = modelSelectLabel(model);
+      group.appendChild(option);
+    }
+    select.appendChild(group);
+  }
+
+  syncModelSelectFromInput(session);
+}
+
+function supportedEffortValues(model) {
+  return (model?.supportedReasoningEfforts || [])
+    .map((effort) => String(effort?.reasoningEffort || effort || '').trim())
+    .filter(Boolean);
+}
+
+function renderReasoningEffortOptions(session) {
+  const select = el('codex-effort-select');
+  if (!select) {
+    return;
+  }
+
+  const current = select.value;
+  const selectedModel = findModelOption(session, el('codex-model-input')?.value.trim());
+  const supported = selectedModel ? supportedEffortValues(selectedModel) : [];
+  const options = supported.length
+    ? supported.map((value) => ({ value, label: REASONING_EFFORT_LABELS[value] || value }))
+    : FALLBACK_REASONING_EFFORTS;
+
+  select.innerHTML = '';
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  defaultOption.textContent = selectedModel?.defaultReasoningEffort
+    ? `Effort: model default (${selectedModel.defaultReasoningEffort})`
+    : 'Effort: default';
+  select.appendChild(defaultOption);
+
+  for (const optionSpec of options) {
+    const option = document.createElement('option');
+    option.value = optionSpec.value;
+    option.textContent = optionSpec.label;
+    select.appendChild(option);
+  }
+
+  select.value = options.some((optionSpec) => optionSpec.value === current) ? current : '';
 }
 
 function renderAttachmentChips() {
@@ -2067,11 +2653,19 @@ function renderAttachmentChips() {
   }
 
   container.innerHTML = '';
-  for (const attachment of state.codexControls.attachments) {
+  for (const [index, attachment] of state.codexControls.attachments.entries()) {
     const chip = document.createElement('div');
-    chip.className = `attachment-chip ${attachment.type === 'textFile' ? 'file' : ''}`.trim();
-    const label = attachment.type === 'textFile' ? 'File' : 'Image';
-    chip.innerHTML = `<span>${label}: ${escapeHtml(attachment.name || 'attached file')}${attachment.size ? ` (${escapeHtml(formatBytes(attachment.size))})` : ''}</span>`;
+    chip.className = `attachment-chip ${attachment.type === 'uploadFile' || attachment.type === 'textFile' ? 'file' : ''}`.trim();
+    const label = attachment.remotePath
+      ? 'Uploaded'
+      : attachment.type === 'image'
+        ? 'Image'
+        : 'File';
+    const note = attachment.remotePath ? ` -> ${attachment.remotePath}` : '';
+    chip.innerHTML = `
+      <span>${escapeHtml(label)}: ${escapeHtml(attachment.name || 'attached file')}${attachment.size ? ` (${escapeHtml(formatBytes(attachment.size))})` : ''}${escapeHtml(note)}</span>
+      <button class="attachment-chip-remove" type="button" data-attachment-index="${index}" aria-label="Remove ${escapeHtml(attachment.name || 'attachment')}">x</button>
+    `;
     container.appendChild(chip);
   }
 
@@ -2079,23 +2673,33 @@ function renderAttachmentChips() {
   if (localPath) {
     const chip = document.createElement('div');
     chip.className = 'attachment-chip muted';
-    chip.innerHTML = `<span>Host image: ${escapeHtml(localPath)}</span>`;
+    chip.innerHTML = `
+      <span>Host image: ${escapeHtml(localPath)}</span>
+      <button class="attachment-chip-remove" type="button" data-clear-local-image="true" aria-label="Remove host image path">x</button>
+    `;
     container.appendChild(chip);
   }
+
+  container.classList.toggle('hidden', container.childElementCount === 0);
 }
 
 function renderComposerControls(session, disabled) {
   renderComposerModelOptions(session);
+  renderReasoningEffortOptions(session);
   renderAttachmentChips();
+  requestModelOptionsForSession(session);
 
   const controlIds = [
     'codex-model-input',
+    'codex-model-select',
     'codex-effort-select',
     'codex-summary-select',
     'codex-mode-select',
     'codex-approval-policy-select',
     'codex-reviewer-select',
     'codex-sandbox-mode-select',
+    'codex-personality-select',
+    'codex-file-picker-button',
     'codex-image-files',
     'codex-local-image-path',
     'codex-clear-attachments-button',
@@ -2111,8 +2715,9 @@ function renderComposerControls(session, disabled) {
 
   const modelButton = el('codex-model-refresh-button');
   if (modelButton) {
-    modelButton.disabled = disabled || !session?.live || state.codexControls.modelsLoading;
-    modelButton.textContent = state.codexControls.modelsLoading ? 'Loading...' : 'Models';
+    const loadingModels = isModelOptionsLoading(session);
+    modelButton.disabled = disabled || !session?.live || loadingModels;
+    modelButton.textContent = loadingModels ? 'Loading...' : 'Refresh';
   }
 
   const reviewButton = el('codex-review-button');
@@ -2121,7 +2726,7 @@ function renderComposerControls(session, disabled) {
   }
 }
 
-function getComposerInputItems() {
+function getComposerInputItems(uploadedFiles = []) {
   const inputItems = state.codexControls.attachments
     .filter((attachment) => attachment.type === 'image')
     .map((attachment) => ({
@@ -2129,6 +2734,16 @@ function getComposerInputItems() {
       url: attachment.url,
       name: attachment.name || 'image',
     }));
+  for (const file of uploadedFiles.filter(isImageFileRef)) {
+    if (!file.path) {
+      continue;
+    }
+    inputItems.push({
+      type: 'localImage',
+      path: file.path,
+      name: file.name || basename(file.path),
+    });
+  }
   const localImagePath = el('codex-local-image-path')?.value.trim();
   if (localImagePath) {
     inputItems.push({
@@ -2151,6 +2766,20 @@ function getComposerTextFileSections() {
     ].join('\n'));
 }
 
+function getComposerUploadedFileSections(uploadedFiles = []) {
+  if (!uploadedFiles.length) {
+    return [];
+  }
+  return [
+    [
+      'Files uploaded to the selected host:',
+      ...uploadedFiles.map((file) => `- ${file.name || basename(file.path)}: ${file.path}${file.size ? ` (${formatBytes(file.size)})` : ''}`),
+      '',
+      'Use these remote host paths directly. For images, inspect the attached localImage items; for other files, open/read the paths as needed.',
+    ].join('\n'),
+  ];
+}
+
 function getComposerOptions() {
   return {
     model: el('codex-model-input')?.value.trim() || null,
@@ -2160,6 +2789,7 @@ function getComposerOptions() {
     approvalPolicy: el('codex-approval-policy-select')?.value || 'on-request',
     approvalsReviewer: el('codex-reviewer-select')?.value || 'user',
     sandboxMode: el('codex-sandbox-mode-select')?.value || 'workspaceWrite',
+    personality: el('codex-personality-select')?.value || null,
   };
 }
 
@@ -2174,19 +2804,505 @@ function buildPlanPrompt(text, hasAttachments) {
   ].join('\n').trim();
 }
 
-function buildComposerPayload(rawText, overrides = {}) {
-  const inputItems = getComposerInputItems();
+const SLASH_COMMANDS = [
+  {
+    id: 'plan',
+    command: '/plan',
+    title: 'Plan Mode',
+    category: 'Codex',
+    description: 'Turn on plan-only mode for the next message.',
+    keywords: ['计划', 'plan mode'],
+    run: async () => {
+      setSelectValue('codex-mode-select', 'plan');
+      focusComposerInput();
+    },
+  },
+  {
+    id: 'review',
+    command: '/review',
+    title: 'Code Review',
+    category: 'Codex',
+    description: 'Start a Codex review for current workspace changes.',
+    keywords: ['代码审查', '审查'],
+    run: startReviewForCurrentSession,
+  },
+  {
+    id: 'compact',
+    command: '/compact',
+    title: 'Compact Context',
+    category: 'Codex',
+    description: 'Compact the current live Codex thread context.',
+    keywords: ['压缩', '上下文'],
+    run: compactCurrentThread,
+  },
+  {
+    id: 'status',
+    command: '/status',
+    title: 'Status',
+    category: 'Runtime',
+    description: 'Open session status, requests, diagnostics, and usage.',
+    keywords: ['状态', 'quota', 'diagnostics'],
+    run: async () => setStatusWindowOpen(true),
+  },
+  {
+    id: 'model-gpt-55',
+    command: '/gpt-5.5',
+    title: 'Model: GPT-5.5',
+    category: 'Model',
+    description: 'Use GPT-5.5 for the next turn.',
+    keywords: ['模型', 'model', 'gpt'],
+    run: async () => {
+      setInputValue('codex-model-input', 'gpt-5.5');
+      focusComposerInput();
+    },
+  },
+  {
+    id: 'models',
+    command: '/models',
+    title: 'Open Model List',
+    category: 'Model',
+    description: 'Load available model IDs from the selected live session.',
+    keywords: ['model list', '模型列表'],
+    run: async () => {
+      await loadModelOptionsForSelectedSession();
+      el('codex-model-select')?.focus();
+    },
+  },
+  {
+    id: 'reasoning-xhigh',
+    command: '/reasoning',
+    title: 'Reasoning: XHigh',
+    category: 'Model',
+    description: 'Set reasoning effort to xhigh for the next turn.',
+    keywords: ['推理', '超高', 'think', 'ultrathink'],
+    run: async () => {
+      setSelectValue('codex-effort-select', 'xhigh');
+      focusComposerInput();
+    },
+  },
+  {
+    id: 'personality-friendly',
+    command: '/personality',
+    title: 'Personality: Friendly',
+    category: 'Model',
+    description: 'Set Codex personality to friendly for the next turn.',
+    keywords: ['个性', 'friendly'],
+    run: async () => {
+      setSelectValue('codex-personality-select', 'friendly');
+      focusComposerInput();
+    },
+  },
+  {
+    id: 'personality-pragmatic',
+    command: '/pragmatic',
+    title: 'Personality: Pragmatic',
+    category: 'Model',
+    description: 'Set Codex personality to pragmatic for the next turn.',
+    keywords: ['个性', 'pragmatic'],
+    run: async () => {
+      setSelectValue('codex-personality-select', 'pragmatic');
+      focusComposerInput();
+    },
+  },
+  {
+    id: 'fork',
+    command: '/fork',
+    title: 'Fork New Branch',
+    category: 'Session',
+    description: 'Create a new live branch from the selected conversation.',
+    keywords: ['派生', 'branch'],
+    run: forkNewBranch,
+  },
+  {
+    id: 'upload',
+    command: '/upload',
+    title: 'Upload File',
+    category: 'Files',
+    description: 'Open file picker and upload files to the selected host on send.',
+    keywords: ['file', 'image', '图片', '文件'],
+    run: async () => el('codex-image-files')?.click(),
+  },
+  {
+    id: 'clear-files',
+    command: '/clear-files',
+    title: 'Clear Files',
+    category: 'Files',
+    description: 'Remove queued file and image attachments from composer.',
+    keywords: ['clear attachments', '清除'],
+    run: async () => {
+      clearComposerFileAttachments();
+      focusComposerInput();
+    },
+  },
+  {
+    id: 'shell',
+    command: '/shell',
+    title: 'Shell Command',
+    category: 'Runtime',
+    description: 'Open status panel and focus the shell-command control.',
+    keywords: ['terminal', '命令', 'shell command'],
+    run: async () => {
+      setStatusWindowOpen(true);
+      window.setTimeout(() => el('shell-command-input')?.focus(), 0);
+    },
+  },
+  {
+    id: 'mcp',
+    command: '/mcp',
+    title: 'MCP Status',
+    category: 'Bridge',
+    description: 'Ask Codex to inspect MCP status if that host supports MCP.',
+    keywords: ['mcp', '服务器状态'],
+    insert: 'Please show MCP server status for this Codex environment. If MCP is not available through this relay yet, explain what is missing and how to verify it on the host.',
+  },
+  {
+    id: 'ide-context',
+    command: '/ide-context',
+    title: 'IDE Context',
+    category: 'Bridge',
+    description: 'Record that IDE context is not currently tunneled by this relay.',
+    keywords: ['ide', '上下文', 'close ide context'],
+    insert: 'IDE context is not currently tunneled through this mobile relay. Please rely on the selected workspace files and paths on this host instead.',
+  },
+  {
+    id: 'feedback',
+    command: '/feedback',
+    title: 'Feedback',
+    category: 'Meta',
+    description: 'Insert a feedback note template for this remote-control app.',
+    keywords: ['反馈'],
+    insert: 'Feedback for Mobile Codex Remote:\n- What felt good:\n- What broke or felt confusing:\n- What should be improved next:',
+  },
+  {
+    id: 'memory',
+    command: '/memory',
+    title: 'Memory',
+    category: 'Meta',
+    description: 'Ask Codex to draft durable project memory or next-run notes.',
+    keywords: ['记忆', 'memory.md'],
+    insert: 'Please generate durable project memory for future sessions: summarize stable facts, host setup notes, commands, gotchas, and next steps. If a MEMORY.md or project notes file exists, propose a safe update before editing.',
+  },
+  {
+    id: 'skill-imagegen',
+    command: '/imagegen',
+    title: 'Skill: Image Gen',
+    category: 'Skills',
+    description: 'Ask Codex to use Image Gen when available.',
+    keywords: ['skill', '图片生成', 'image gen'],
+    insert: 'Use the Image Gen skill if it is available in this Codex environment. Generate or edit the requested image, then save the output file in the current workspace and reply with its full path.',
+  },
+  {
+    id: 'skill-openai-docs',
+    command: '/openai-docs',
+    title: 'Skill: OpenAI Docs',
+    category: 'Skills',
+    description: 'Use official OpenAI docs when available.',
+    keywords: ['skill', 'openai docs', '文档'],
+    insert: 'Use the OpenAI Docs skill if it is available. Check official OpenAI documentation before answering, and cite the specific docs used.',
+  },
+  {
+    id: 'skill-plugin-creator',
+    command: '/plugin-creator',
+    title: 'Skill: Plugin Creator',
+    category: 'Skills',
+    description: 'Scaffold or update a Codex plugin.',
+    keywords: ['skill', 'plugin'],
+    insert: 'Use the Plugin Creator skill if it is available. Scaffold or update the requested Codex plugin and list the files changed.',
+  },
+  {
+    id: 'skill-creator',
+    command: '/skill-creator',
+    title: 'Skill: Skill Creator',
+    category: 'Skills',
+    description: 'Create or update a Codex skill.',
+    keywords: ['skill', '创建 skill'],
+    insert: 'Use the Skill Creator skill if it is available. Create or update the requested skill and explain how to test it.',
+  },
+  {
+    id: 'skill-installer',
+    command: '/skill-installer',
+    title: 'Skill: Skill Installer',
+    category: 'Skills',
+    description: 'Install curated or repo-hosted Codex skills.',
+    keywords: ['skill', 'install', '安装'],
+    insert: 'Use the Skill Installer skill if it is available. Install the requested skill source and summarize where it was installed.',
+  },
+];
+
+function setInputValue(id, value) {
+  const node = el(id);
+  if (!node) {
+    return;
+  }
+  node.value = value;
+  node.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function setSelectValue(id, value) {
+  const node = el(id);
+  if (!node) {
+    return;
+  }
+  node.value = value;
+  node.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function focusComposerInput() {
+  const input = el('input-text');
+  if (input) {
+    input.focus();
+  }
+}
+
+function getSlashTokenMatch(input = el('input-text')) {
+  if (!input) {
+    return null;
+  }
+  const caret = input.selectionStart ?? input.value.length;
+  const before = input.value.slice(0, caret);
+  const match = before.match(/(^|[\s\n])\/([\w.-]*)$/);
+  if (!match) {
+    return null;
+  }
+  return {
+    start: before.length - match[0].length + match[1].length,
+    end: caret,
+    query: match[2] || '',
+  };
+}
+
+function getFilteredSlashCommands() {
+  const query = String(state.slashMenu.query || '').trim().toLowerCase();
+  if (!query) {
+    return SLASH_COMMANDS;
+  }
+  const terms = query.split(/\s+/).filter(Boolean);
+  return SLASH_COMMANDS.filter((command) => {
+    const haystack = [
+      command.command,
+      command.title,
+      command.category,
+      command.description,
+      ...(command.keywords || []),
+    ].join(' ').toLowerCase();
+    return terms.every((term) => haystack.includes(term));
+  });
+}
+
+function hideSlashMenu() {
+  state.slashMenu.open = false;
+  state.slashMenu.query = '';
+  state.slashMenu.selectedIndex = 0;
+  renderSlashMenu();
+}
+
+function updateSlashMenuFromInput() {
+  const input = el('input-text');
+  const match = getSlashTokenMatch(input);
+  if (!match || input?.disabled || el('input-form')?.classList.contains('disabled')) {
+    if (state.slashMenu.open) {
+      hideSlashMenu();
+    }
+    return;
+  }
+
+  state.slashMenu.open = true;
+  state.slashMenu.query = match.query;
+  const commands = getFilteredSlashCommands();
+  state.slashMenu.selectedIndex = Math.min(state.slashMenu.selectedIndex, Math.max(0, commands.length - 1));
+  renderSlashMenu();
+}
+
+function replaceSlashToken(replacement = '') {
+  const input = el('input-text');
+  const match = getSlashTokenMatch(input);
+  if (!input || !match) {
+    return;
+  }
+
+  const before = input.value.slice(0, match.start);
+  const after = input.value.slice(match.end);
+  const spacer = replacement && before && !/\s$/.test(before) ? ' ' : '';
+  const next = `${before}${spacer}${replacement}${replacement && after && !/^\s/.test(after) ? ' ' : ''}${after}`;
+  const caret = (before + spacer + replacement).length;
+  input.value = next;
+  input.selectionStart = caret;
+  input.selectionEnd = caret;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+async function executeSlashCommand(command) {
+  if (!command) {
+    return;
+  }
+
+  if (command.insert) {
+    replaceSlashToken(command.insert);
+    hideSlashMenu();
+    focusComposerInput();
+    return;
+  }
+
+  replaceSlashToken('');
+  hideSlashMenu();
+  await command.run();
+}
+
+function renderSlashMenu() {
+  const menu = el('slash-command-menu');
+  if (!menu) {
+    return;
+  }
+  if (!state.slashMenu.open) {
+    menu.classList.add('hidden');
+    menu.innerHTML = '';
+    return;
+  }
+
+  const commands = getFilteredSlashCommands();
+  menu.classList.remove('hidden');
+  menu.innerHTML = '';
+
+  if (!commands.length) {
+    const empty = document.createElement('div');
+    empty.className = 'slash-command-empty';
+    empty.textContent = 'No slash commands match this search.';
+    menu.appendChild(empty);
+    return;
+  }
+
+  commands.forEach((command, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `slash-command-item ${index === state.slashMenu.selectedIndex ? 'active' : ''}`.trim();
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', index === state.slashMenu.selectedIndex ? 'true' : 'false');
+    button.innerHTML = `
+      <div class="slash-command-icon">${escapeHtml(command.command)}</div>
+      <div class="slash-command-copy">
+        <div class="slash-command-title-row">
+          <span class="slash-command-title">${escapeHtml(command.title)}</span>
+          <span class="slash-command-category">${escapeHtml(command.category)}</span>
+        </div>
+        <div class="slash-command-description">${escapeHtml(command.description)}</div>
+      </div>
+    `;
+    button.onmouseenter = () => {
+      state.slashMenu.selectedIndex = index;
+      renderSlashMenu();
+    };
+    button.onmousedown = (event) => {
+      event.preventDefault();
+    };
+    button.onclick = async () => {
+      try {
+        await executeSlashCommand(command);
+      } catch (error) {
+        reportError(error);
+      }
+    };
+    menu.appendChild(button);
+  });
+}
+
+async function uploadComposerFiles(session) {
+  const uploadAttachments = state.codexControls.attachments
+    .filter((attachment) => attachment.type === 'uploadFile');
+  if (!uploadAttachments.length) {
+    return [];
+  }
+  if (!session?.hostId) {
+    throw new Error('Select a host session before uploading files.');
+  }
+
+  await verifyHostAvailable(session.hostId);
+  const host = getHost(session.hostId);
+  if (!host?.capabilities?.fileTransfer) {
+    throw new Error(`${formatHostCapabilityName(host)} has not enabled file transfer yet. Restart the relay and this host-agent, then refresh the page. For HPC hosts, use Manage HPC -> Restart Agent.`);
+  }
+
+  const reusable = [];
+  const pending = [];
+  for (const attachment of uploadAttachments) {
+    if (
+      attachment.remotePath
+      && attachment.uploadHostId === session.hostId
+      && attachment.uploadCwd === session.cwd
+    ) {
+      reusable.push({
+        fileId: attachment.fileId || attachment.name,
+        name: attachment.remoteName || attachment.name,
+        path: attachment.remotePath,
+        size: attachment.size || 0,
+        mime: attachment.mime || '',
+        isImage: isImageFileRef(attachment),
+      });
+      continue;
+    }
+    pending.push(attachment);
+  }
+
+  let uploaded = [];
+  if (pending.length) {
+    let response = null;
+    try {
+      response = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/upload`, {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          targetDirectory: session.cwd || '',
+          files: pending.map((attachment) => ({
+            fileId: attachment.fileId,
+            name: attachment.name,
+            mime: attachment.mime || 'application/octet-stream',
+            size: attachment.size || 0,
+            dataBase64: attachment.dataBase64,
+          })),
+        }),
+      });
+    } catch (error) {
+      if (error.status === 404 && /\/files\/upload/.test(String(error.url || ''))) {
+        throw new Error('The running relay does not have the file upload API yet. Restart the relay/server process, restart the selected host-agent, then refresh the browser.');
+      }
+      throw error;
+    }
+    uploaded = normalizeTranscriptFiles(response.files || []);
+    for (const [index, file] of uploaded.entries()) {
+      const attachment = pending[index];
+      if (!attachment) {
+        continue;
+      }
+      attachment.remotePath = file.path;
+      attachment.remoteName = file.name;
+      attachment.uploadHostId = session.hostId;
+      attachment.uploadCwd = session.cwd;
+      attachment.mime = file.mime || attachment.mime;
+      attachment.size = file.size || attachment.size;
+    }
+    renderAttachmentChips();
+  }
+
+  return [...reusable, ...uploaded];
+}
+
+async function buildComposerPayload(rawText, overrides = {}) {
+  const session = getSelectedSession();
+  const uploadedFiles = await uploadComposerFiles(session);
+  const inputItems = getComposerInputItems(uploadedFiles);
   const textFileSections = getComposerTextFileSections();
+  const uploadedFileSections = getComposerUploadedFileSections(uploadedFiles);
   const options = {
     ...getComposerOptions(),
     ...overrides,
   };
-  let text = String(rawText || '').trim();
-  const hasOriginalContent = Boolean(text || inputItems.length || textFileSections.length);
-  if (textFileSections.length) {
+  const userVisibleText = String(rawText || '').trim();
+  let text = userVisibleText;
+  const hasOriginalContent = Boolean(text || inputItems.length || textFileSections.length || uploadedFileSections.length);
+  if (uploadedFileSections.length || textFileSections.length) {
     text = [
       text,
-      'Attached text file contents:',
+      ...uploadedFileSections,
+      textFileSections.length ? 'Attached text file contents:' : '',
       ...textFileSections,
     ].filter(Boolean).join('\n\n');
   }
@@ -2202,7 +3318,9 @@ function buildComposerPayload(rawText, overrides = {}) {
   return {
     ...options,
     text,
+    displayText: userVisibleText || (hasOriginalContent ? 'Please inspect the attached file(s).' : ''),
     inputItems,
+    uploadedFiles,
   };
 }
 
@@ -2210,6 +3328,18 @@ function clearComposerFileAttachments() {
   state.codexControls.attachments = [];
   const fileInput = el('codex-image-files');
   if (fileInput) {
+    fileInput.value = '';
+  }
+  renderAttachmentChips();
+}
+
+function removeComposerAttachment(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= state.codexControls.attachments.length) {
+    return;
+  }
+  state.codexControls.attachments.splice(index, 1);
+  const fileInput = el('codex-image-files');
+  if (fileInput && !state.codexControls.attachments.length) {
     fileInput.value = '';
   }
   renderAttachmentChips();
@@ -2231,6 +3361,12 @@ function readFileAsText(file) {
     reader.onerror = () => reject(reader.error || new Error('failed to read text file'));
     reader.readAsText(file);
   });
+}
+
+function dataUrlToBase64(dataUrl) {
+  const text = String(dataUrl || '');
+  const comma = text.indexOf(',');
+  return comma === -1 ? text : text.slice(comma + 1);
 }
 
 async function addComposerImageFiles(files) {
@@ -2293,17 +3429,35 @@ async function addComposerFiles(files) {
     return;
   }
 
-  const imageFiles = allFiles.filter((file) => String(file.type || '').startsWith('image/'));
-  const textFiles = allFiles.filter((file) => !String(file.type || '').startsWith('image/') && isTextLikeFile(file));
-  const unsupported = allFiles.filter((file) => !imageFiles.includes(file) && !textFiles.includes(file));
-
-  await addComposerImageFiles(imageFiles);
-  await addComposerTextFiles(textFiles);
-
-  if (unsupported.length) {
-    const names = unsupported.slice(0, 3).map((file) => file.name || 'unnamed').join(', ');
-    throw new Error(`Unsupported drag/drop file type: ${names}. Images are sent as attachments; text/code files are embedded into the prompt.`);
+  const existingUploads = state.codexControls.attachments.filter((attachment) => attachment.type === 'uploadFile').length;
+  const available = Math.max(0, MAX_COMPOSER_UPLOAD_FILES - existingUploads);
+  if (!available) {
+    throw new Error(`You can attach up to ${MAX_COMPOSER_UPLOAD_FILES} files at once.`);
   }
+  const selected = allFiles.slice(0, available);
+  const totalBytes = state.codexControls.attachments
+    .filter((attachment) => attachment.type === 'uploadFile')
+    .reduce((sum, attachment) => sum + (Number(attachment.size || 0) || 0), 0)
+    + selected.reduce((sum, file) => sum + (Number(file.size || 0) || 0), 0);
+  if (totalBytes > MAX_COMPOSER_UPLOAD_TOTAL_BYTES) {
+    throw new Error(`Attached files are too large; total limit is ${formatBytes(MAX_COMPOSER_UPLOAD_TOTAL_BYTES)}.`);
+  }
+
+  for (const file of selected) {
+    if (file.size > MAX_COMPOSER_UPLOAD_FILE_BYTES) {
+      throw new Error(`${file.name} is too large for remote upload; limit is ${formatBytes(MAX_COMPOSER_UPLOAD_FILE_BYTES)} per file.`);
+    }
+    const dataUrl = await readFileAsDataUrl(file);
+    state.codexControls.attachments.push({
+      type: 'uploadFile',
+      fileId: makeClientId(),
+      dataBase64: dataUrlToBase64(dataUrl),
+      name: file.name || 'upload',
+      mime: file.type || 'application/octet-stream',
+      size: file.size,
+    });
+  }
+  renderAttachmentChips();
 }
 
 function isFileDragEvent(event) {
@@ -2432,6 +3586,8 @@ function renderSessionDetails() {
   } else {
     input.placeholder = 'Join or start a live session first...';
   }
+
+  renderApprovalPopup();
 }
 
 function createRuntimeChip(container, label, value, tone = 'info') {
@@ -2710,6 +3866,91 @@ function buildPermissionsDeclineResponse() {
   };
 }
 
+function appendApprovalPopupButton(actions, label, className, onClick) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className || '';
+  button.textContent = label;
+  button.onclick = async () => {
+    const buttons = Array.from(actions.querySelectorAll('button'));
+    buttons.forEach((item) => {
+      item.disabled = true;
+    });
+    try {
+      await onClick();
+    } catch (error) {
+      buttons.forEach((item) => {
+        item.disabled = false;
+      });
+      reportError(error);
+    }
+  };
+  actions.appendChild(button);
+  return button;
+}
+
+function renderApprovalPopup() {
+  const popup = el('approval-popup');
+  if (!popup) {
+    return;
+  }
+
+  const session = getSelectedSession();
+  const pendingRequests = getRequestsForSession(session).filter((request) => request.status === 'pending');
+  const request = pendingRequests[0] || null;
+  if (!session || !request) {
+    popup.classList.add('hidden');
+    return;
+  }
+
+  const title = request.title || request.method || request.kind || 'Codex request';
+  const message = request.message || request.summary || 'Codex needs a response before it can continue.';
+  const detailText = request.summary && request.summary !== message
+    ? request.summary
+    : request.payload
+      ? summarizeData(request.payload)
+      : '';
+  const actions = el('approval-popup-actions');
+
+  el('approval-popup-title').textContent = title;
+  el('approval-popup-message').textContent = message;
+  const detail = el('approval-popup-detail');
+  detail.textContent = detailText;
+  detail.classList.toggle('hidden', !detailText);
+  actions.innerHTML = '';
+
+  if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
+    appendApprovalPopupButton(actions, 'Approve', '', async () => {
+      await respondToSessionRequest(session, request, { decision: 'accept' });
+    });
+    appendApprovalPopupButton(actions, 'Decline', 'secondary-button', async () => {
+      await respondToSessionRequest(session, request, { decision: 'decline' });
+    });
+    appendApprovalPopupButton(actions, 'Cancel Turn', 'secondary-button', async () => {
+      await respondToSessionRequest(session, request, { decision: 'cancel' });
+    });
+  } else if (request.method === 'item/permissions/requestApproval') {
+    appendApprovalPopupButton(actions, 'Decline Permissions', 'secondary-button', async () => {
+      await respondToSessionRequest(session, request, buildPermissionsDeclineResponse());
+    });
+  } else if (request.method === 'item/tool/requestUserInput') {
+    const questions = Array.isArray(request.payload?.questions) ? request.payload.questions : [];
+    if (questions.length === 1 && Array.isArray(questions[0].options) && questions[0].options.length <= 3) {
+      for (const option of questions[0].options) {
+        appendApprovalPopupButton(actions, option.label, 'secondary-button', async () => {
+          await respondToSessionRequest(session, request, buildToolAnswerResponse(questions[0].id, option.label));
+        });
+      }
+    }
+  }
+
+  appendApprovalPopupButton(actions, 'Open Status', 'secondary-button', async () => {
+    setStatusWindowOpen(true);
+  });
+
+  popup.classList.remove('hidden');
+}
+
 async function interruptActiveTurn() {
   const session = getSelectedSession();
   if (!session) {
@@ -2801,6 +4042,7 @@ function renderStatusWindow() {
   const diagnostics = getDiagnosticsForSession(session);
   const requests = getRequestsForSession(session);
   const pendingRequests = requests.filter((request) => request.status === 'pending');
+  requestReceivedFilesForSession(session);
 
   el('status-window-title').textContent = `${session.title || session.sessionId} status`;
   const summaryGrid = el('status-summary-grid');
@@ -2966,6 +4208,56 @@ function renderStatusWindow() {
       }
 
       requestList.appendChild(item);
+    }
+  }
+
+  const receivedList = el('status-received-files');
+  if (receivedList) {
+    receivedList.innerHTML = '';
+    const receivedFiles = getReceivedFilesForSession(session);
+    if (isReceivedFilesLoading(session)) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.textContent = 'Loading received files...';
+      receivedList.appendChild(empty);
+    } else if (!receivedFiles.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.textContent = 'No files have been received into the relay cache for this session yet. Open or Save a file card to receive it.';
+      receivedList.appendChild(empty);
+    } else {
+      for (const file of receivedFiles.slice(0, 20)) {
+        const item = document.createElement('div');
+        item.className = 'status-request-card resolved';
+        const openUrl = buildReceivedFileUrl(file, true);
+        const saveUrl = buildReceivedFileUrl(file, false);
+        const expires = file.expiresAt ? `Expires ${formatTime(file.expiresAt)}` : 'No expiry reported';
+        item.innerHTML = `
+          <div class="status-request-top">
+            <div class="status-request-title">${escapeHtml(file.name || 'received file')}</div>
+            <div class="status-request-badge">${escapeHtml(formatBytes(file.size || 0))}</div>
+          </div>
+          <div class="status-request-copy">${escapeHtml(file.remotePath || '')}</div>
+          <div class="status-request-meta">Received ${formatTime(file.receivedAt)} | ${escapeHtml(expires)}</div>
+        `;
+        const actions = document.createElement('div');
+        actions.className = 'status-request-actions';
+        const openLink = document.createElement('a');
+        openLink.className = 'secondary-button';
+        openLink.href = openUrl;
+        openLink.target = '_blank';
+        openLink.rel = 'noopener';
+        openLink.textContent = 'Open';
+        const saveLink = document.createElement('a');
+        saveLink.className = 'secondary-button';
+        saveLink.href = saveUrl;
+        saveLink.download = file.name || 'download';
+        saveLink.textContent = 'Save';
+        actions.appendChild(openLink);
+        actions.appendChild(saveLink);
+        item.appendChild(actions);
+        receivedList.appendChild(item);
+      }
     }
   }
 
@@ -3210,6 +4502,71 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   return wrapper;
 }
 
+function renderFileCards(container, session, entry) {
+  const files = getTranscriptFileRefs(entry);
+  if (!session || !files.length) {
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'message-file-list';
+  for (const file of files.slice(0, 8)) {
+    if (!file.path) {
+      continue;
+    }
+    const card = document.createElement('div');
+    card.className = `message-file-card ${isImageFileRef(file) ? 'image' : ''}`.trim();
+    const inlineUrl = buildHostFileUrl(session, file, true);
+    const downloadUrl = buildHostFileUrl(session, file, false);
+    const name = file.name || basename(file.path) || 'remote file';
+    const meta = [
+      file.mime || (isImageFileRef(file) ? 'image' : 'file'),
+      file.size ? formatBytes(file.size) : '',
+      'received on first open/save',
+    ].filter(Boolean).join(' | ');
+
+    if (isImageFileRef(file)) {
+      const preview = document.createElement('img');
+      preview.className = 'message-file-preview';
+      preview.loading = 'lazy';
+      preview.alt = name;
+      preview.src = inlineUrl;
+      card.appendChild(preview);
+    }
+
+    const body = document.createElement('div');
+    body.className = 'message-file-body';
+    body.innerHTML = `
+      <div class="message-file-name">${escapeHtml(name)}</div>
+      <div class="message-file-path">${escapeHtml(file.path)}</div>
+      <div class="message-file-meta">${escapeHtml(meta || 'remote file')}</div>
+    `;
+
+    const actions = document.createElement('div');
+    actions.className = 'message-file-actions';
+    const openLink = document.createElement('a');
+    openLink.className = 'secondary-button';
+    openLink.href = inlineUrl;
+    openLink.target = '_blank';
+    openLink.rel = 'noopener';
+    openLink.textContent = 'Open';
+    const saveLink = document.createElement('a');
+    saveLink.className = 'secondary-button';
+    saveLink.href = downloadUrl;
+    saveLink.download = name;
+    saveLink.textContent = 'Save';
+    actions.appendChild(openLink);
+    actions.appendChild(saveLink);
+    body.appendChild(actions);
+    card.appendChild(body);
+    list.appendChild(card);
+  }
+
+  if (list.childElementCount) {
+    container.appendChild(list);
+  }
+}
+
 function renderTranscript(session = getSelectedSession()) {
   const log = el('session-log');
   log.innerHTML = '';
@@ -3255,6 +4612,7 @@ function renderTranscript(session = getSelectedSession()) {
     bubble.className = 'bubble';
     bubble.textContent = entry.text || '';
     message.appendChild(bubble);
+    renderFileCards(message, session, entry);
 
     log.appendChild(message);
 
@@ -3277,6 +4635,7 @@ function renderTranscript(session = getSelectedSession()) {
 }
 
 function renderAll() {
+  renderAuthGate();
   const sidebar = document.querySelector('.sidebar');
   sidebar?.classList.toggle('overview-collapsed', state.overviewCollapsed);
   el('overview-body')?.classList.toggle('hidden', state.overviewCollapsed);
@@ -3298,6 +4657,7 @@ function renderAll() {
   renderAlertsWindow();
   renderStatusWindow();
   renderDirectoryPicker();
+  renderSlashMenu();
 }
 
 function closeStream() {
@@ -3446,6 +4806,7 @@ function subscribeSession(session) {
     upsertRequestForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
     state.statusWindowOpen = true;
     renderSessionDetails();
+    renderApprovalPopup();
     renderStatusWindow();
   });
 
@@ -3453,6 +4814,7 @@ function subscribeSession(session) {
     const payload = JSON.parse(event.data);
     resolveRequestForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
     renderSessionDetails();
+    renderApprovalPopup();
     renderStatusWindow();
   });
 }
@@ -3668,6 +5030,11 @@ async function selectSession(session) {
 }
 
 async function refresh() {
+  if (!authAllowsRequests()) {
+    renderAuthGate();
+    return;
+  }
+
   const previousKey = getSessionKey(getSelectedSession());
 
   const [stats, hostsResponse, connectorsResponse, collectionsResponse] = await Promise.all([
@@ -4445,25 +5812,85 @@ function useSelectedSessionPath() {
   }
 }
 
+function getActiveTurnBlocker(session) {
+  if (!session?.live) {
+    return null;
+  }
+
+  const runtime = getRuntimeForSession(session) || session.runtime || {};
+  const phase = String(runtime.phase || '').toLowerCase();
+  const pendingCount = getRequestsForSession(session).filter((request) => request.status === 'pending').length;
+  const activePhase = [
+    'thinking',
+    'planning',
+    'reviewing',
+    'waiting-approval',
+    'waiting-user-input',
+    'retrying',
+    'reconnecting',
+  ].includes(phase);
+
+  if (!runtime.activeTurnId && !runtime.busy && !runtime.waitingOnApproval && !runtime.waitingOnUserInput && !activePhase) {
+    return null;
+  }
+
+  if (runtime.waitingOnApproval || phase === 'waiting-approval') {
+    return pendingCount
+      ? `Codex is waiting for ${pendingCount} approval request. Open Status to approve, decline, or interrupt it before sending another prompt.`
+      : 'Codex is waiting for approval. Open Status to approve, decline, or interrupt it before sending another prompt.';
+  }
+
+  if (runtime.waitingOnUserInput || phase === 'waiting-user-input') {
+    return pendingCount
+      ? `Codex is waiting for ${pendingCount} input request. Open Status to answer or interrupt it before sending another prompt.`
+      : 'Codex is waiting for user input. Open Status to answer or interrupt it before sending another prompt.';
+  }
+
+  return 'Codex is still working on the previous turn. Use Status to steer or interrupt it, then send the next prompt.';
+}
+
+function openStatusForActiveTurnBlocker() {
+  state.statusWindowOpen = true;
+  renderSessionDetails();
+  renderRuntimePanel();
+  renderStatusWindow();
+}
+
 async function sendInputToSession(session, text, options = {}) {
+  const blocker = getActiveTurnBlocker(session);
+  if (blocker) {
+    openStatusForActiveTurnBlocker();
+    throw new Error(blocker);
+  }
+
   await verifyHostAvailable(session.hostId);
-  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
-    method: 'POST',
-    body: JSON.stringify({
-      hostId: session.hostId,
-      text,
-      inputItems: Array.isArray(options.inputItems) ? options.inputItems : [],
-      mode: options.mode || null,
-      model: options.model || null,
-      effort: options.effort || null,
-      summary: options.summary || null,
-      approvalPolicy: options.approvalPolicy || null,
-      approvalsReviewer: options.approvalsReviewer || null,
-      sandboxMode: options.sandboxMode || null,
-      serviceTier: options.serviceTier || null,
-      personality: options.personality || null,
-    }),
-  });
+  try {
+    await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
+      method: 'POST',
+      body: JSON.stringify({
+        hostId: session.hostId,
+        text,
+        displayText: options.displayText || text,
+        inputItems: Array.isArray(options.inputItems) ? options.inputItems : [],
+        uploadedFiles: Array.isArray(options.uploadedFiles) ? options.uploadedFiles : [],
+        mode: options.mode || null,
+        model: options.model || null,
+        effort: options.effort || null,
+        summary: options.summary || null,
+        approvalPolicy: options.approvalPolicy || null,
+        approvalsReviewer: options.approvalsReviewer || null,
+        sandboxMode: options.sandboxMode || null,
+        serviceTier: options.serviceTier || null,
+        personality: options.personality || null,
+      }),
+    });
+  } catch (error) {
+    if (/still working on the previous turn/i.test(error.message || '')) {
+      openStatusForActiveTurnBlocker();
+      throw new Error('Codex is still working on the previous turn. Open Status to approve, decline, steer, or interrupt the active turn before sending another prompt.');
+    }
+    throw error;
+  }
 }
 
 async function sendInput(text, options = {}) {
@@ -4484,22 +5911,103 @@ async function sendInput(text, options = {}) {
   await sendInputToSession(session, text, options);
 }
 
-async function loadModelOptionsForSelectedSession() {
-  const session = getSelectedSession();
+function isModelOptionsLoading(session) {
+  return state.codexControls.modelOptionsLoadingKeys.has(modelCacheKey(session));
+}
+
+async function loadModelOptionsForSession(session, options = {}) {
   if (!session?.live) {
     throw new Error('Select a live managed session before loading models.');
   }
+  const host = getHost(session.hostId);
+  if (!host?.capabilities?.modelList) {
+    throw new Error(`${host?.label || session.hostId} does not support model listing yet. Restart its host-agent if needed.`);
+  }
 
-  state.codexControls.modelsLoading = true;
+  const key = modelCacheKey(session);
+  if (!options.force && state.codexControls.modelOptionsBySession.has(key)) {
+    return state.codexControls.modelOptionsBySession.get(key) || [];
+  }
+  if (state.codexControls.modelOptionsLoadingKeys.has(key)) {
+    return state.codexControls.modelOptionsBySession.get(key) || [];
+  }
+
+  state.codexControls.modelOptionsLoadingKeys.add(key);
+  state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
   renderSessionDetails();
   try {
     await verifyHostAvailable(session.hostId);
-    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models?hostId=${encodeURIComponent(session.hostId)}&limit=100`);
+    const includeHidden = options.includeHidden === true ? '&includeHidden=true' : '';
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models?hostId=${encodeURIComponent(session.hostId)}&limit=100${includeHidden}`);
     state.codexControls.modelOptionsBySession.set(modelCacheKey(session), Array.isArray(response.models) ? response.models : []);
+    return state.codexControls.modelOptionsBySession.get(key) || [];
   } finally {
-    state.codexControls.modelsLoading = false;
+    state.codexControls.modelOptionsLoadingKeys.delete(key);
+    state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
     renderSessionDetails();
   }
+}
+
+function requestModelOptionsForSession(session) {
+  if (!session?.live) {
+    return;
+  }
+  const host = getHost(session.hostId);
+  const key = modelCacheKey(session);
+  if (
+    !host?.capabilities?.modelList
+    || state.codexControls.modelOptionsBySession.has(key)
+    || isModelOptionsLoading(session)
+  ) {
+    return;
+  }
+  loadModelOptionsForSession(session).catch((error) => {
+    if (!/model listing/i.test(error.message || '')) {
+      reportError(error);
+    }
+  });
+}
+
+async function loadModelOptionsForSelectedSession() {
+  return loadModelOptionsForSession(getSelectedSession(), { force: true });
+}
+
+async function loadReceivedFilesForSession(session, options = {}) {
+  if (!session?.sessionId || !session?.hostId) {
+    return [];
+  }
+  const key = getSessionKey(session);
+  if (!key) {
+    return [];
+  }
+  if (!options.force && state.receivedFiles.has(key)) {
+    return state.receivedFiles.get(key) || [];
+  }
+  if (state.receivedFilesLoadingKeys.has(key)) {
+    return state.receivedFiles.get(key) || [];
+  }
+
+  state.receivedFilesLoadingKeys.add(key);
+  renderStatusWindow();
+  try {
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/received-files?hostId=${encodeURIComponent(session.hostId)}`);
+    setReceivedFilesForSession(session.hostId, session.sessionId, response.files || []);
+    return getReceivedFilesForSession(session);
+  } finally {
+    state.receivedFilesLoadingKeys.delete(key);
+    renderStatusWindow();
+  }
+}
+
+function requestReceivedFilesForSession(session) {
+  if (!session?.sessionId || !session?.hostId) {
+    return;
+  }
+  const key = getSessionKey(session);
+  if (!key || state.receivedFiles.has(key) || state.receivedFilesLoadingKeys.has(key)) {
+    return;
+  }
+  loadReceivedFilesForSession(session).catch(reportError);
 }
 
 async function startReviewForCurrentSession() {
@@ -4559,6 +6067,86 @@ el('import-form').addEventListener('submit', async (event) => {
   input.value = '';
   try {
     await importHostById(hostId);
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('auth-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const username = el('auth-username-input').value.trim();
+  const password = el('auth-password-input').value;
+  const confirmPassword = el('auth-password-confirm-input').value;
+  const token = el('auth-token-input').value.trim();
+
+  try {
+    if (state.auth.setupRequired) {
+      if (!username || !password || !confirmPassword) {
+        throw new Error('Username, password, and confirmation are required.');
+      }
+      await setupRelayAccount(username, password, confirmPassword);
+    } else if (token && !password) {
+      await loginRelay({ token });
+    } else {
+      if (!username || !password) {
+        throw new Error('Username and password are required.');
+      }
+      await loginRelay({ username, password });
+    }
+    el('auth-password-input').value = '';
+    el('auth-password-confirm-input').value = '';
+    el('auth-token-input').value = '';
+  } catch (error) {
+    state.auth.error = error.message || 'Login failed.';
+    renderAuthGate();
+  }
+});
+
+el('account-button').addEventListener('click', () => {
+  state.auth.accountOpen = true;
+  state.auth.accountError = '';
+  el('account-current-password-input').value = '';
+  el('account-new-password-input').value = '';
+  el('account-confirm-password-input').value = '';
+  el('account-recovery-token-input').value = '';
+  renderAccountDialog();
+});
+
+el('close-account-dialog-button').addEventListener('click', () => {
+  state.auth.accountOpen = false;
+  renderAccountDialog();
+});
+
+el('account-dialog').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) {
+    state.auth.accountOpen = false;
+    renderAccountDialog();
+  }
+});
+
+el('account-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    await changeRelayPassword({
+      username: el('account-username-input').value.trim(),
+      currentPassword: el('account-current-password-input').value,
+      recoveryToken: el('account-recovery-token-input').value.trim(),
+      newPassword: el('account-new-password-input').value,
+      confirmPassword: el('account-confirm-password-input').value,
+    });
+    el('account-current-password-input').value = '';
+    el('account-new-password-input').value = '';
+    el('account-confirm-password-input').value = '';
+    el('account-recovery-token-input').value = '';
+  } catch (error) {
+    state.auth.accountError = error.message || 'Unable to update password.';
+    renderAccountDialog();
+  }
+});
+
+el('logout-button').addEventListener('click', async () => {
+  try {
+    await logoutRelay();
   } catch (error) {
     reportError(error);
   }
@@ -4726,6 +6314,7 @@ el('status-window-overlay').addEventListener('click', (event) => {
 el('refresh-status-button').addEventListener('click', async () => {
   try {
     await refresh();
+    await loadReceivedFilesForSession(getSelectedSession(), { force: true });
   } catch (error) {
     reportError(error);
   }
@@ -4947,16 +6536,53 @@ el('codex-model-refresh-button').addEventListener('click', async () => {
   }
 });
 
+el('codex-model-select').addEventListener('change', () => {
+  const select = el('codex-model-select');
+  const input = el('codex-model-input');
+  if (input && select) {
+    input.value = select.value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+});
+
+el('codex-model-input').addEventListener('input', () => {
+  const session = getSelectedSession();
+  syncModelSelectFromInput(session);
+  renderReasoningEffortOptions(session);
+});
+
+el('codex-file-picker-button').addEventListener('click', () => {
+  el('codex-image-files')?.click();
+});
+
 el('codex-image-files').addEventListener('change', async (event) => {
   try {
     await addComposerFiles(event.target.files);
   } catch (error) {
     reportError(error);
+  } finally {
+    event.target.value = '';
   }
 });
 
 el('codex-local-image-path').addEventListener('input', () => {
   renderAttachmentChips();
+});
+
+el('codex-attachment-chips').addEventListener('click', (event) => {
+  const removeButton = event.target.closest('.attachment-chip-remove');
+  if (!removeButton) {
+    return;
+  }
+  if (removeButton.dataset.clearLocalImage) {
+    const input = el('codex-local-image-path');
+    if (input) {
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    return;
+  }
+  removeComposerAttachment(Number(removeButton.dataset.attachmentIndex));
 });
 
 el('codex-clear-attachments-button').addEventListener('click', () => {
@@ -4965,12 +6591,11 @@ el('codex-clear-attachments-button').addEventListener('click', () => {
 
 el('codex-plan-button').addEventListener('click', async () => {
   const input = el('input-text');
-  const payload = buildComposerPayload(input.value, { mode: 'plan' });
-  if (!payload.text && !payload.inputItems.length) {
-    return;
-  }
-
   try {
+    const payload = await buildComposerPayload(input.value, { mode: 'plan' });
+    if (!payload.text && !payload.inputItems.length) {
+      return;
+    }
     await sendInput(payload.text, payload);
     input.value = '';
     clearComposerFileAttachments();
@@ -4988,10 +6613,50 @@ el('codex-review-button').addEventListener('click', async () => {
 });
 
 el('input-text').addEventListener('keydown', (event) => {
+  if (state.slashMenu.open) {
+    const commands = getFilteredSlashCommands();
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      state.slashMenu.selectedIndex = commands.length
+        ? (state.slashMenu.selectedIndex + 1) % commands.length
+        : 0;
+      renderSlashMenu();
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      state.slashMenu.selectedIndex = commands.length
+        ? (state.slashMenu.selectedIndex - 1 + commands.length) % commands.length
+        : 0;
+      renderSlashMenu();
+      return;
+    }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      if (commands.length) {
+        event.preventDefault();
+        executeSlashCommand(commands[state.slashMenu.selectedIndex]).catch(reportError);
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      hideSlashMenu();
+      return;
+    }
+  }
+
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
     event.preventDefault();
     el('input-form').requestSubmit();
   }
+});
+
+el('input-text').addEventListener('input', () => {
+  updateSlashMenuFromInput();
+});
+
+el('input-text').addEventListener('click', () => {
+  updateSlashMenuFromInput();
 });
 
 el('input-form').addEventListener('dragenter', (event) => {
@@ -5029,6 +6694,10 @@ document.addEventListener('keydown', (event) => {
     return;
   }
 
+  if (state.slashMenu.open) {
+    hideSlashMenu();
+  }
+
   if (state.connectorManagerOpen) {
     closeConnectorManager();
   }
@@ -5040,17 +6709,21 @@ document.addEventListener('keydown', (event) => {
   if (state.statusWindowOpen) {
     setStatusWindowOpen(false);
   }
+
+  if (state.auth.accountOpen) {
+    state.auth.accountOpen = false;
+    renderAccountDialog();
+  }
 });
 
 el('input-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = el('input-text');
-  const payload = buildComposerPayload(input.value);
-  if (!payload.text && !payload.inputItems.length) {
-    return;
-  }
-
   try {
+    const payload = await buildComposerPayload(input.value);
+    if (!payload.text && !payload.inputItems.length) {
+      return;
+    }
     await sendInput(payload.text, payload);
     input.value = '';
     clearComposerFileAttachments();
@@ -5059,14 +6732,32 @@ el('input-form').addEventListener('submit', async (event) => {
   }
 });
 
-refresh().catch(reportError);
+async function boot() {
+  try {
+    const authenticated = await refreshAuthState();
+    if (authenticated) {
+      await refresh();
+    }
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+boot();
 
 setInterval(() => {
+  if (!authAllowsRequests()) {
+    return;
+  }
   renderRuntimePanel();
   renderThinkingPanel();
+  renderApprovalPopup();
   renderStatusWindow();
 }, 1000);
 
 setInterval(() => {
+  if (!authAllowsRequests()) {
+    return;
+  }
   refresh().catch(reportError);
 }, 8000);

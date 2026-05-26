@@ -10,6 +10,43 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <div id="auth-gate" class="auth-gate hidden" aria-hidden="true">
+      <form id="auth-form" class="auth-card">
+        <div class="eyebrow">Relay Locked</div>
+        <h1 id="auth-title">Sign in</h1>
+        <p id="auth-subtitle">This protects your Codex hosts when the relay is reachable from a phone, Tailscale, or another network.</p>
+        <input id="auth-username-input" type="text" placeholder="Username" autocomplete="username" />
+        <input id="auth-password-input" type="password" placeholder="Password" autocomplete="current-password" />
+        <input id="auth-password-confirm-input" class="hidden" type="password" placeholder="Confirm password" autocomplete="new-password" />
+        <details id="auth-recovery-details" class="auth-recovery">
+          <summary>Use recovery token instead</summary>
+          <input id="auth-token-input" type="password" placeholder="Relay recovery token" autocomplete="off" />
+        </details>
+        <button type="submit">Unlock Remote Codex</button>
+        <div id="auth-token-hint" class="meta"></div>
+        <div id="auth-error" class="auth-error"></div>
+      </form>
+    </div>
+    <div id="account-dialog" class="auth-gate hidden" aria-hidden="true">
+      <form id="account-form" class="auth-card">
+        <div class="eyebrow">Relay Account</div>
+        <h1>Change login</h1>
+        <p>Update the browser login account. Host-agents still use the separate machine token.</p>
+        <input id="account-username-input" type="text" placeholder="Username" autocomplete="username" />
+        <input id="account-current-password-input" type="password" placeholder="Current password" autocomplete="current-password" />
+        <input id="account-new-password-input" type="password" placeholder="New password" autocomplete="new-password" />
+        <input id="account-confirm-password-input" type="password" placeholder="Confirm new password" autocomplete="new-password" />
+        <details class="auth-recovery">
+          <summary>Forgot current password? Use recovery token</summary>
+          <input id="account-recovery-token-input" type="password" placeholder="Relay recovery token" autocomplete="off" />
+        </details>
+        <div class="auth-actions">
+          <button type="submit">Update Password</button>
+          <button id="close-account-dialog-button" type="button" class="secondary-button">Cancel</button>
+        </div>
+        <div id="account-error" class="auth-error"></div>
+      </form>
+    </div>
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
@@ -105,6 +142,8 @@
           </div>
           <div class="detail-actions">
             <button id="toggle-status-button" type="button" class="secondary-button">Status</button>
+            <button id="account-button" type="button" class="secondary-button" hidden>Account</button>
+            <button id="logout-button" type="button" class="secondary-button" hidden>Lock</button>
             <button id="import-selected-host-button" type="button" class="secondary-button">Import Host</button>
             <button id="toggle-alerts-button" type="button" class="secondary-button">Alerts</button>
             <button id="join-session-button" type="button" class="secondary-button">Join Running Session</button>
@@ -183,8 +222,11 @@
           <div id="session-log" class="log"></div>
           <form id="input-form" class="composer">
             <div class="composer-control-grid">
-              <input id="codex-model-input" list="codex-model-options" placeholder="Default model or type model id" autocomplete="off" />
+              <input id="codex-model-input" type="hidden" autocomplete="off" />
               <datalist id="codex-model-options"></datalist>
+              <select id="codex-model-select" aria-label="Supported model">
+                <option value="">Model: auto/default</option>
+              </select>
               <button id="codex-model-refresh-button" type="button" class="secondary-button">Models</button>
               <select id="codex-effort-select" aria-label="Reasoning effort">
                 <option value="">Effort: default</option>
@@ -220,15 +262,25 @@
                 <option value="readOnly">Read only</option>
                 <option value="dangerFullAccess">Danger full access</option>
               </select>
+              <select id="codex-personality-select" aria-label="Personality">
+                <option value="">Personality: default</option>
+                <option value="friendly">Friendly</option>
+                <option value="pragmatic">Pragmatic</option>
+                <option value="none">None</option>
+              </select>
             </div>
             <div class="composer-attachment-grid">
-              <input id="codex-image-files" type="file" accept="image/*,.txt,.md,.markdown,.json,.jsonl,.js,.jsx,.ts,.tsx,.py,.sh,.ps1,.bat,.cmd,.css,.html,.xml,.yaml,.yml,.toml,.csv,.log" multiple />
+              <input id="codex-image-files" class="file-picker-input" type="file" multiple />
+              <button id="codex-file-picker-button" type="button" class="secondary-button">Attach Files</button>
               <input id="codex-local-image-path" placeholder="Image path on selected host, e.g. ~/shot.png" autocomplete="off" />
               <button id="codex-clear-attachments-button" type="button" class="secondary-button">Clear Files</button>
             </div>
-            <div id="codex-attachment-chips" class="attachment-chip-list"></div>
+            <div id="codex-attachment-chips" class="attachment-chip-list hidden" aria-live="polite"></div>
             <div class="composer-main-row">
-              <textarea id="input-text" rows="3" placeholder="Send a follow-up prompt to the live managed session..."></textarea>
+              <div class="composer-input-wrap">
+                <textarea id="input-text" rows="3" placeholder="Send a follow-up prompt to the live managed session..."></textarea>
+                <div id="slash-command-menu" class="slash-command-menu hidden" role="listbox" aria-label="Slash commands"></div>
+              </div>
               <div class="composer-action-stack">
                 <button id="codex-plan-button" type="button" class="secondary-button">Plan</button>
                 <button id="codex-review-button" type="button" class="secondary-button">Review</button>
@@ -307,6 +359,10 @@
           <div id="status-requests" class="status-request-list"></div>
         </div>
         <div class="status-section">
+          <div class="status-section-label">Received Files</div>
+          <div id="status-received-files" class="status-request-list"></div>
+        </div>
+        <div class="status-section">
           <div class="status-section-label">Warnings & Errors</div>
           <div id="status-alerts" class="status-alert-list"></div>
         </div>
@@ -315,6 +371,14 @@
           <div id="status-diagnostics" class="status-diagnostic-list"></div>
         </div>
       </section>
+    </div>
+
+    <div id="approval-popup" class="approval-popup hidden" role="alertdialog" aria-live="assertive" aria-labelledby="approval-popup-title">
+      <div class="approval-popup-eyebrow">Codex Needs You</div>
+      <div id="approval-popup-title" class="approval-popup-title">Approval required</div>
+      <div id="approval-popup-message" class="approval-popup-message"></div>
+      <div id="approval-popup-detail" class="approval-popup-detail hidden"></div>
+      <div id="approval-popup-actions" class="approval-popup-actions"></div>
     </div>
 
     <div id="directory-picker-overlay" class="directory-picker-overlay hidden">

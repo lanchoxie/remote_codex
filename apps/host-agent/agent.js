@@ -9,6 +9,7 @@ const { makeId, nowIso, normalizeArgs } = require('../../shared/protocol');
 const { startCodexAppServerSession } = require('./codex-app-server-runner');
 
 const RELAY_URL = process.env.RELAY_URL || 'http://127.0.0.1:8787';
+const RELAY_AUTH_TOKEN = loadRelayAuthToken();
 const HOST_ID = process.env.HOST_ID || os.hostname();
 const HOST_LABEL = process.env.HOST_LABEL || HOST_ID;
 const CODEX_HOME = process.env.CODEX_HOME || getDefaultCodexHome();
@@ -18,9 +19,22 @@ const AUTO_START_SESSION = String(process.env.AUTO_START_SESSION || 'true') !== 
 const MANAGED_COMMAND = process.env.MANAGED_COMMAND || 'codex-app-server';
 const MANAGED_ARGS = normalizeArgs(process.env.MANAGED_ARGS_JSON || '[]');
 const MANAGED_CWD = process.env.MANAGED_CWD || process.cwd();
+const MAX_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_FILE_TRANSFER_BYTES || 24 * 1024 * 1024);
 
 const liveSessions = new Map();
 let lastCommandId = 0;
+
+function loadRelayAuthToken() {
+  const envToken = String(process.env.RELAY_AUTH_TOKEN || '').trim();
+  if (envToken) {
+    return envToken;
+  }
+  try {
+    return fs.readFileSync(path.join(process.cwd(), 'tmp', 'relay-auth-token.txt'), 'utf8').trim();
+  } catch (_) {
+    return '';
+  }
+}
 
 function getCapabilities() {
   return {
@@ -35,6 +49,7 @@ function getCapabilities() {
     modelList: true,
     review: true,
     imageInput: true,
+    fileTransfer: true,
     demoMode: MANAGED_COMMAND === 'demo',
   };
 }
@@ -42,6 +57,9 @@ function getCapabilities() {
 function fetchJson(targetUrl, options = {}) {
   const parsed = new URL(targetUrl);
   const client = parsed.protocol === 'https:' ? https : http;
+  const authHeaders = RELAY_AUTH_TOKEN
+    ? { Authorization: `Bearer ${RELAY_AUTH_TOKEN}` }
+    : {};
 
   return new Promise((resolve, reject) => {
     const req = client.request(
@@ -52,6 +70,7 @@ function fetchJson(targetUrl, options = {}) {
         path: `${parsed.pathname}${parsed.search}`,
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
+          ...authHeaders,
           ...(options.headers || {}),
         },
       },
@@ -65,6 +84,10 @@ function fetchJson(targetUrl, options = {}) {
             body = raw ? JSON.parse(raw) : null;
           } catch (error) {
             reject(new Error(`invalid JSON from ${targetUrl}: ${error.message}`));
+            return;
+          }
+          if ((res.statusCode || 0) >= 400) {
+            reject(new Error((body && body.error) || `relay request failed with ${res.statusCode}`));
             return;
           }
           resolve({ statusCode: res.statusCode || 0, body });
@@ -218,6 +241,224 @@ function listDirectoriesAt(targetPath) {
 function getParentDirectory(targetPath) {
   const parent = path.dirname(targetPath);
   return parent && parent !== targetPath ? parent : null;
+}
+
+function safeFileName(value, fallback = 'file') {
+  const raw = String(value || '').trim();
+  const leaf = raw.split(/[\\/]/).filter(Boolean).pop() || fallback;
+  return leaf
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[<>:"|?*]/g, '_')
+    .replace(/^\.+$/, fallback)
+    .slice(0, 180) || fallback;
+}
+
+function pathInside(parent, candidate) {
+  const root = path.resolve(parent);
+  const target = path.resolve(candidate);
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function uniqueFilePath(directory, filename) {
+  const parsed = path.parse(safeFileName(filename));
+  let candidate = path.join(directory, `${parsed.name}${parsed.ext}`);
+  let index = 2;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(directory, `${parsed.name}-${index}${parsed.ext}`);
+    index += 1;
+  }
+  return candidate;
+}
+
+function mimeFromPath(filePath, fallback = 'application/octet-stream') {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  return {
+    '.avif': 'image/avif',
+    '.bmp': 'image/bmp',
+    '.c': 'text/plain; charset=utf-8',
+    '.cpp': 'text/plain; charset=utf-8',
+    '.cs': 'text/plain; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.csv': 'text/csv; charset=utf-8',
+    '.go': 'text/plain; charset=utf-8',
+    '.h': 'text/plain; charset=utf-8',
+    '.hpp': 'text/plain; charset=utf-8',
+    '.gif': 'image/gif',
+    '.htm': 'text/html; charset=utf-8',
+    '.html': 'text/html; charset=utf-8',
+    '.ipynb': 'application/json; charset=utf-8',
+    '.java': 'text/plain; charset=utf-8',
+    '.jpeg': 'image/jpeg',
+    '.jpg': 'image/jpeg',
+    '.js': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.jsonl': 'application/x-ndjson; charset=utf-8',
+    '.log': 'text/plain; charset=utf-8',
+    '.md': 'text/markdown; charset=utf-8',
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.ps1': 'text/plain; charset=utf-8',
+    '.py': 'text/x-python; charset=utf-8',
+    '.r': 'text/plain; charset=utf-8',
+    '.rs': 'text/plain; charset=utf-8',
+    '.sh': 'text/x-shellscript; charset=utf-8',
+    '.sql': 'text/plain; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.toml': 'application/toml; charset=utf-8',
+    '.ts': 'application/typescript; charset=utf-8',
+    '.tsx': 'application/typescript; charset=utf-8',
+    '.txt': 'text/plain; charset=utf-8',
+    '.webp': 'image/webp',
+    '.xml': 'application/xml; charset=utf-8',
+    '.yaml': 'application/yaml; charset=utf-8',
+    '.yml': 'application/yaml; charset=utf-8',
+    '.zip': 'application/zip',
+  }[ext] || fallback;
+}
+
+function isImageMime(mime, filePath) {
+  return /^image\//i.test(String(mime || '')) || /\.(png|jpe?g|gif|webp|bmp|svg|avif|tiff?)$/i.test(String(filePath || ''));
+}
+
+function getRunnerForSession(sessionId) {
+  return liveSessions.get(sessionId) || null;
+}
+
+function resolveCommandCwd(command = {}) {
+  const runner = getRunnerForSession(command.sessionId);
+  const cwd = String(command.cwd || command.targetDirectory || runner?.cwd || MANAGED_CWD || '').trim();
+  return resolveManagedCwd(cwd || MANAGED_CWD);
+}
+
+function resolveRemoteFilePath(inputPath, baseCwd) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) {
+    throw new Error('file path is required');
+  }
+  if (raw === '~') {
+    return os.homedir();
+  }
+  if (raw.startsWith('~/')) {
+    return path.join(os.homedir(), raw.slice(2));
+  }
+  return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(baseCwd || MANAGED_CWD, raw);
+}
+
+async function handleFileUpload(command) {
+  const requestId = command.requestId || makeId();
+  const sessionId = command.sessionId || null;
+
+  try {
+    const baseCwd = resolveCommandCwd(command);
+    if (!fs.existsSync(baseCwd) || !fs.statSync(baseCwd).isDirectory()) {
+      throw new Error(`upload target directory does not exist: ${baseCwd}`);
+    }
+
+    const sessionSegment = sessionId ? safeFileName(sessionId, 'session') : 'sessionless';
+    const uploadRoot = path.join(baseCwd, '.codex-remote-files', 'uploads', sessionSegment, requestId);
+    fs.mkdirSync(uploadRoot, { recursive: true });
+
+    const files = [];
+    for (const rawFile of Array.isArray(command.files) ? command.files.slice(0, 8) : []) {
+      const name = safeFileName(rawFile?.name || 'upload');
+      const dataBase64 = String(rawFile?.dataBase64 || '').replace(/^data:[^,]+,/, '').trim();
+      if (!dataBase64) {
+        continue;
+      }
+
+      const data = Buffer.from(dataBase64, 'base64');
+      if (data.length > MAX_FILE_TRANSFER_BYTES) {
+        throw new Error(`${name} is too large; limit is ${MAX_FILE_TRANSFER_BYTES} bytes`);
+      }
+
+      const targetPath = uniqueFilePath(uploadRoot, name);
+      if (!pathInside(uploadRoot, targetPath)) {
+        throw new Error(`refusing to write outside upload directory: ${name}`);
+      }
+
+      fs.writeFileSync(targetPath, data);
+      const mime = String(rawFile?.mime || rawFile?.type || mimeFromPath(targetPath)).trim() || mimeFromPath(targetPath);
+      files.push({
+        fileId: rawFile?.fileId || makeId(),
+        name: path.basename(targetPath),
+        originalName: name,
+        path: targetPath,
+        size: data.length,
+        mime,
+        isImage: isImageMime(mime, targetPath),
+        uploadedAt: nowIso(),
+      });
+    }
+
+    if (!files.length) {
+      throw new Error('no uploadable files were provided');
+    }
+
+    await postEvent({
+      type: 'file.uploaded',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      targetDirectory: uploadRoot,
+      files,
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'file.error',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      message: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleFileDownload(command) {
+  const requestId = command.requestId || makeId();
+  const sessionId = command.sessionId || null;
+
+  try {
+    const baseCwd = resolveCommandCwd(command);
+    const targetPath = resolveRemoteFilePath(command.path, baseCwd);
+    if (!fs.existsSync(targetPath)) {
+      throw new Error(`file does not exist: ${targetPath}`);
+    }
+
+    const stats = fs.statSync(targetPath);
+    if (!stats.isFile()) {
+      throw new Error(`path is not a regular file: ${targetPath}`);
+    }
+    if (stats.size > MAX_FILE_TRANSFER_BYTES) {
+      throw new Error(`file is too large to transfer (${stats.size} bytes); limit is ${MAX_FILE_TRANSFER_BYTES} bytes`);
+    }
+
+    const mime = mimeFromPath(targetPath);
+    await postEvent({
+      type: 'file.downloaded',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      name: path.basename(targetPath),
+      path: targetPath,
+      size: stats.size,
+      mime,
+      isImage: isImageMime(mime, targetPath),
+      dataBase64: fs.readFileSync(targetPath).toString('base64'),
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'file.error',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      message: error.message,
+      timestamp: nowIso(),
+    });
+  }
 }
 
 async function handleDirectoryList(command) {
@@ -553,6 +794,16 @@ async function handleCommand(command) {
 
   if (command.type === 'directory.list') {
     await handleDirectoryList(command);
+    return;
+  }
+
+  if (command.type === 'host.file_upload') {
+    await handleFileUpload(command);
+    return;
+  }
+
+  if (command.type === 'host.file_download') {
+    await handleFileDownload(command);
     return;
   }
 

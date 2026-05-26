@@ -1298,6 +1298,28 @@ class CodexAppServerRunner {
     return true;
   }
 
+  async resolvePendingRequestsForClosedTurn(status, message) {
+    if (!this.pendingRequests.size) {
+      return;
+    }
+
+    const pendingEntries = Array.from(this.pendingRequests.entries());
+    this.pendingRequests.clear();
+    for (const [requestId, pending] of pendingEntries) {
+      await this.emitRequestResolved({
+        requestId,
+        status: status || 'expired',
+        method: pending.method,
+        summary: pending.summary,
+        message: message || 'Request closed because the Codex turn is no longer active.',
+        response: {
+          status: status || 'expired',
+          reason: message || 'Request closed because the Codex turn is no longer active.',
+        },
+      });
+    }
+  }
+
   async handleNotification(message) {
     const method = message.method;
     const params = message.params || {};
@@ -1524,6 +1546,10 @@ class CodexAppServerRunner {
       if (turnId && turnId === this.activeTurnId) {
         this.activeTurnId = null;
       }
+      await this.resolvePendingRequestsForClosedTurn(
+        params.turn?.status?.type === 'failed' ? 'failed' : 'expired',
+        `Request closed because the turn completed as ${params.turn?.status?.type || 'completed'}.`
+      );
       await this.emitRuntime({
         activeTurnId: null,
         busy: false,
@@ -1584,6 +1610,10 @@ class CodexAppServerRunner {
           message: text,
         });
       } else {
+        await this.resolvePendingRequestsForClosedTurn(
+          'failed',
+          'Request closed because the Codex turn failed.'
+        );
         await this.emitRuntime({
           phase: codexError === 'usageLimitExceeded' || codexError === 'contextWindowExceeded' ? 'quota-exhausted' : 'error',
           busy: false,
@@ -1760,7 +1790,10 @@ class CodexAppServerRunner {
     this.turnBuffers.clear();
     this.planBuffers.clear();
     this.reasoningBuffers.clear();
-    this.pendingRequests.clear();
+    await this.resolvePendingRequestsForClosedTurn(
+      'cancelled',
+      'Request closed because the Codex app-server exited.'
+    );
     await this.emitRuntime({
       connection: 'closed',
       busy: false,
@@ -1864,6 +1897,7 @@ class CodexAppServerRunner {
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
       requestId: String(entry.requestId || ''),
+      status: entry.status || 'resolved',
       method: entry.method || null,
       summary: entry.summary || null,
       response: entry.response || null,

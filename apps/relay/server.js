@@ -1,4 +1,5 @@
 const { spawn, spawnSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
@@ -25,9 +26,152 @@ const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_DIR = path.join(__dirname, '..', 'mobile-web', 'public');
 const SESSION_COLLECTIONS_PATH = path.join(process.cwd(), 'tmp', 'session-collections.json');
+const RECEIVED_FILES_ROOT = path.join(process.cwd(), 'tmp', 'received-files');
+const RECEIVED_FILES_MANIFEST_PATH = path.join(RECEIVED_FILES_ROOT, 'manifest.json');
+const RELAY_AUTH_TOKEN_PATH = process.env.RELAY_AUTH_TOKEN_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-token.txt');
+const RELAY_AUTH_ACCOUNT_PATH = process.env.RELAY_AUTH_ACCOUNT_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-account.json');
+const RELAY_AUTH_COOKIE_NAME = 'remote_codex_auth';
 const DEFAULT_COLLECTION_ID = 'default';
 const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
-const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 25 * 1024 * 1024);
+const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 40 * 1024 * 1024);
+const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES || 24 * 1024 * 1024);
+const RECEIVED_FILE_TTL_MS = Number(process.env.RELAY_RECEIVED_FILE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const RELAY_AUTH_TOKEN = loadRelayAuthToken();
+let relayAuthAccount = loadRelayAuthAccount();
+
+function truthyEnv(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+}
+
+function loadRelayAuthToken() {
+  if (truthyEnv(process.env.RELAY_AUTH_DISABLED)) {
+    return '';
+  }
+
+  const envToken = String(process.env.RELAY_AUTH_TOKEN || '').trim();
+  if (envToken) {
+    return envToken;
+  }
+
+  try {
+    const saved = fs.readFileSync(RELAY_AUTH_TOKEN_PATH, 'utf8').trim();
+    if (saved) {
+      return saved;
+    }
+  } catch (_) {
+    // Missing token file is expected on first run.
+  }
+
+  const token = crypto.randomBytes(24).toString('base64url');
+  fs.mkdirSync(path.dirname(RELAY_AUTH_TOKEN_PATH), { recursive: true });
+  try {
+    fs.writeFileSync(RELAY_AUTH_TOKEN_PATH, `${token}\n`, { encoding: 'utf8', flag: 'wx' });
+    return token;
+  } catch (_) {
+    const saved = fs.readFileSync(RELAY_AUTH_TOKEN_PATH, 'utf8').trim();
+    return saved || token;
+  }
+}
+
+function loadRelayAuthAccount() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(RELAY_AUTH_ACCOUNT_PATH, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || !parsed.username || !parsed.passwordHash) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveRelayAuthAccount(account) {
+  fs.mkdirSync(path.dirname(RELAY_AUTH_ACCOUNT_PATH), { recursive: true });
+  relayAuthAccount = {
+    version: 1,
+    username: account.username,
+    passwordHash: account.passwordHash,
+    createdAt: account.createdAt || nowIso(),
+    updatedAt: nowIso(),
+  };
+  fs.writeFileSync(RELAY_AUTH_ACCOUNT_PATH, JSON.stringify(relayAuthAccount, null, 2), 'utf8');
+  return relayAuthAccount;
+}
+
+function normalizeAuthUsername(value) {
+  return String(value || '').trim().slice(0, 64);
+}
+
+function validateAuthUsername(username) {
+  if (!/^[A-Za-z0-9._@-]{2,64}$/.test(username)) {
+    throw new Error('username must be 2-64 characters: letters, numbers, dot, underscore, dash, or @');
+  }
+}
+
+function validateAuthPassword(password) {
+  const text = String(password || '');
+  if (text.length < 8) {
+    throw new Error('password must be at least 8 characters');
+  }
+  if (text.length > 256) {
+    throw new Error('password is too long');
+  }
+}
+
+function hashAuthPassword(password) {
+  validateAuthPassword(password);
+  const salt = crypto.randomBytes(16);
+  const params = {
+    N: 16384,
+    r: 8,
+    p: 1,
+    keyLength: 64,
+  };
+  const key = crypto.scryptSync(String(password), salt, params.keyLength, {
+    N: params.N,
+    r: params.r,
+    p: params.p,
+    maxmem: 64 * 1024 * 1024,
+  });
+  return {
+    algorithm: 'scrypt',
+    params,
+    salt: salt.toString('base64'),
+    hash: key.toString('base64'),
+  };
+}
+
+function verifyAuthPassword(password, account = relayAuthAccount) {
+  if (!account?.passwordHash || account.passwordHash.algorithm !== 'scrypt') {
+    return false;
+  }
+  try {
+    const params = account.passwordHash.params || {};
+    const keyLength = Number(params.keyLength || 64);
+    const expected = Buffer.from(String(account.passwordHash.hash || ''), 'base64');
+    if (!expected.length || expected.length !== keyLength) {
+      return false;
+    }
+    const actual = crypto.scryptSync(String(password || ''), Buffer.from(String(account.passwordHash.salt || ''), 'base64'), keyLength, {
+      N: Number(params.N || 16384),
+      r: Number(params.r || 8),
+      p: Number(params.p || 1),
+      maxmem: 64 * 1024 * 1024,
+    });
+    return crypto.timingSafeEqual(actual, expected);
+  } catch {
+    return false;
+  }
+}
+
+function createRelayAuthAccount(username, password) {
+  const normalizedUsername = normalizeAuthUsername(username || 'admin');
+  validateAuthUsername(normalizedUsername);
+  return saveRelayAuthAccount({
+    username: normalizedUsername,
+    passwordHash: hashAuthPassword(password),
+  });
+}
 
 function normalizeSessionCollectionItem(input = {}) {
   const hostId = String(input.hostId || '').trim();
@@ -109,6 +253,41 @@ function saveSessionCollections(collections) {
   }, null, 2), 'utf8');
 }
 
+function safePathSegment(value, fallback = 'item') {
+  const text = String(value || '').trim()
+    .replace(/[^A-Za-z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 96);
+  return text || fallback;
+}
+
+function pathInside(parent, candidate) {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function loadReceivedFiles() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(RECEIVED_FILES_MANIFEST_PATH, 'utf8'));
+    const files = Array.isArray(parsed.files) ? parsed.files : [];
+    return new Map(files
+      .filter((file) => file?.fileId && file?.localPath)
+      .map((file) => [String(file.fileId), file]));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveReceivedFiles() {
+  fs.mkdirSync(RECEIVED_FILES_ROOT, { recursive: true });
+  fs.writeFileSync(RECEIVED_FILES_MANIFEST_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    ttlMs: RECEIVED_FILE_TTL_MS,
+    root: RECEIVED_FILES_ROOT,
+    files: Array.from(state.receivedFiles.values()),
+  }, null, 2), 'utf8');
+}
+
 const state = {
   hosts: new Map(),
   sessions: new Map(),
@@ -123,11 +302,13 @@ const state = {
   pendingDirectoryRequests: new Map(),
   pendingHostProbes: new Map(),
   pendingModelRequests: new Map(),
+  pendingFileRequests: new Map(),
   askpassActions: new Map(),
   sshMultiplexDisabled: new Map(),
   connectors: new Map(),
   connectorSecrets: loadConnectorSecrets(),
   sessionCollections: new Map(),
+  receivedFiles: loadReceivedFiles(),
   // Agents keep their last command id in memory across relay restarts, so use
   // a monotonic-ish epoch instead of restarting command ids at 1.
   nextCommandId: Date.now(),
@@ -149,12 +330,13 @@ if (!state.sessionCollections.has(DEFAULT_COLLECTION_ID)) {
   }));
 }
 
-function sendJson(res, statusCode, payload) {
+function sendJson(res, statusCode, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload, null, 2);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Access-Control-Allow-Origin': '*',
+    ...extraHeaders,
   });
   res.end(body);
 }
@@ -198,6 +380,135 @@ function readBody(req) {
 
 function parseUrl(req) {
   return new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+}
+
+function parseCookies(req) {
+  const header = String(req.headers.cookie || '');
+  const cookies = new Map();
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=');
+    if (index === -1) {
+      continue;
+    }
+    const name = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (name) {
+      cookies.set(name, decodeURIComponent(value));
+    }
+  }
+  return cookies;
+}
+
+function constantTimeEqual(a, b) {
+  const left = crypto.createHash('sha256').update(String(a || '')).digest();
+  const right = crypto.createHash('sha256').update(String(b || '')).digest();
+  return crypto.timingSafeEqual(left, right);
+}
+
+function getAuthTokenFromRequest(req, url) {
+  const authorization = String(req.headers.authorization || '').trim();
+  if (/^bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^bearer\s+/i, '').trim();
+  }
+  const headerToken = String(req.headers['x-relay-auth-token'] || '').trim();
+  if (headerToken) {
+    return headerToken;
+  }
+  const queryToken = String(url.searchParams.get('authToken') || '').trim();
+  if (queryToken) {
+    return queryToken;
+  }
+  return '';
+}
+
+function authCookieHeader(maxAgeSeconds) {
+  const secure = truthyEnv(process.env.RELAY_AUTH_COOKIE_SECURE) ? '; Secure' : '';
+  if (maxAgeSeconds <= 0) {
+    return `${RELAY_AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
+  }
+  return `${RELAY_AUTH_COOKIE_NAME}=${encodeURIComponent(currentAuthCookieValue())}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`;
+}
+
+function currentAuthCookieValue() {
+  if (!RELAY_AUTH_TOKEN) {
+    return '';
+  }
+  const accountMarker = relayAuthAccount?.passwordHash?.hash || 'no-account';
+  return crypto
+    .createHmac('sha256', RELAY_AUTH_TOKEN)
+    .update(`remote-codex-auth-cookie-v2:${accountMarker}`)
+    .digest('base64url');
+}
+
+function relayAuthStatus(req, url = null) {
+  if (!RELAY_AUTH_TOKEN) {
+    return { required: false, authenticated: true };
+  }
+
+  const parsedUrl = url || parseUrl(req);
+  const token = getAuthTokenFromRequest(req, parsedUrl);
+  if (token && constantTimeEqual(token, RELAY_AUTH_TOKEN)) {
+    return { required: true, authenticated: true };
+  }
+
+  const cookieValue = parseCookies(req).get(RELAY_AUTH_COOKIE_NAME) || '';
+  if (cookieValue && constantTimeEqual(cookieValue, currentAuthCookieValue())) {
+    return { required: true, authenticated: true };
+  }
+
+  return { required: true, authenticated: false };
+}
+
+function relayAuthHint() {
+  return RELAY_AUTH_TOKEN
+    ? `${RELAY_AUTH_TOKEN.slice(0, 4)}...${RELAY_AUTH_TOKEN.slice(-4)}`
+    : '';
+}
+
+function relayAuthConfig(req, url = null) {
+  const status = relayAuthStatus(req, url);
+  return {
+    authRequired: status.required,
+    authenticated: status.authenticated,
+    hasAccount: Boolean(relayAuthAccount?.username),
+    setupRequired: Boolean(status.required && !relayAuthAccount?.username),
+    username: relayAuthAccount?.username || '',
+    tokenHint: relayAuthHint(),
+    tokenFile: RELAY_AUTH_TOKEN ? RELAY_AUTH_TOKEN_PATH : null,
+    accountFile: RELAY_AUTH_TOKEN ? RELAY_AUTH_ACCOUNT_PATH : null,
+  };
+}
+
+function requestIsPublic(req, url) {
+  if (req.method === 'OPTIONS') {
+    return true;
+  }
+  if (req.method === 'GET' && url.pathname === '/health') {
+    return true;
+  }
+  if (url.pathname === '/api/auth/config' || url.pathname === '/api/auth/login' || url.pathname === '/api/auth/setup') {
+    return true;
+  }
+  if (req.method === 'GET' && !url.pathname.startsWith('/api/')) {
+    return true;
+  }
+  return false;
+}
+
+function authorizeRequest(req, res, url) {
+  if (requestIsPublic(req, url)) {
+    return true;
+  }
+  const status = relayAuthStatus(req, url);
+  if (status.authenticated) {
+    return true;
+  }
+  sendJson(res, 401, {
+    error: relayAuthAccount?.username ? 'relay login is required' : 'relay setup or recovery token is required',
+    authRequired: true,
+    setupRequired: Boolean(!relayAuthAccount?.username),
+  });
+  return false;
 }
 
 function hostOnline(host) {
@@ -256,6 +567,21 @@ function getHostUnavailableError(hostId) {
   return null;
 }
 
+function getHostCapabilityError(hostId, capability, message) {
+  const hostError = getHostUnavailableError(hostId);
+  if (hostError) {
+    return hostError;
+  }
+  const host = state.hosts.get(hostId);
+  if (!host?.capabilities?.[capability]) {
+    return {
+      statusCode: 409,
+      error: message || `this host agent needs to be restarted before it can use ${capability}`,
+    };
+  }
+  return null;
+}
+
 function getHostList() {
   return Array.from(state.hosts.values()).map((host) => ({
     ...host,
@@ -294,6 +620,38 @@ function getSessionDetail(hostId, sessionId) {
     diagnostics,
     requests,
   };
+}
+
+function safeFileDisplayName(value, fallback = 'download') {
+  const text = String(value || '').trim();
+  const leaf = text.split(/[\\/]/).filter(Boolean).pop() || fallback;
+  return leaf.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 180) || fallback;
+}
+
+function normalizeFileTransferRefs(rawFiles) {
+  const files = [];
+  for (const rawFile of Array.isArray(rawFiles) ? rawFiles.slice(0, 16) : []) {
+    if (!rawFile || typeof rawFile !== 'object') {
+      continue;
+    }
+
+    const remotePath = String(rawFile.path || rawFile.remotePath || '').trim();
+    const name = safeFileDisplayName(rawFile.name || remotePath || 'file');
+    if (!remotePath && !rawFile.dataBase64) {
+      continue;
+    }
+
+    files.push({
+      fileId: String(rawFile.fileId || rawFile.id || makeId()).trim(),
+      name,
+      path: remotePath,
+      size: Number(rawFile.size || 0) || 0,
+      mime: String(rawFile.mime || rawFile.type || 'application/octet-stream').trim() || 'application/octet-stream',
+      isImage: Boolean(rawFile.isImage) || /^image\//i.test(String(rawFile.mime || rawFile.type || '')),
+      uploadedAt: rawFile.uploadedAt || rawFile.timestamp || nowIso(),
+    });
+  }
+  return files;
 }
 
 function setSessionLog(hostId, sessionId, entries) {
@@ -421,13 +779,21 @@ function emitSessionRequest(hostId, sessionId, entry) {
 }
 
 function resolveSessionRequest(hostId, sessionId, requestId, patch = {}) {
+  const key = sessionKey(hostId, sessionId);
+  const existing = (state.sessionRequests.get(key) || [])
+    .find((item) => String(item.requestId || '') === String(requestId || ''));
   const resolved = upsertSessionRequest(hostId, sessionId, {
     requestId,
+    createdAt: existing?.createdAt || patch.createdAt || nowIso(),
     status: patch.status || 'resolved',
     updatedAt: patch.updatedAt || nowIso(),
-    response: patch.response || null,
-    summary: patch.summary || null,
-    message: patch.message || null,
+    kind: patch.kind ?? existing?.kind ?? 'request',
+    method: patch.method ?? existing?.method ?? null,
+    title: patch.title ?? existing?.title ?? null,
+    message: patch.message ?? existing?.message ?? null,
+    summary: patch.summary ?? existing?.summary ?? null,
+    payload: patch.payload ?? existing?.payload ?? null,
+    response: patch.response ?? existing?.response ?? null,
   });
   const payload = {
     ...resolved,
@@ -438,6 +804,24 @@ function resolveSessionRequest(hostId, sessionId, requestId, patch = {}) {
   return payload;
 }
 
+function resolvePendingSessionRequests(hostId, sessionId, patch = {}) {
+  const key = sessionKey(hostId, sessionId);
+  const requests = state.sessionRequests.get(key) || [];
+  const pending = requests.filter((item) => item.status === 'pending');
+  for (const request of pending) {
+    resolveSessionRequest(hostId, sessionId, request.requestId, {
+      status: patch.status || 'expired',
+      updatedAt: patch.updatedAt || nowIso(),
+      message: patch.message || request.message || 'Request closed because the Codex turn is no longer active.',
+      summary: patch.summary ?? request.summary ?? null,
+      response: patch.response || {
+        status: patch.status || 'expired',
+        reason: patch.message || 'Request closed because the Codex turn is no longer active.',
+      },
+    });
+  }
+}
+
 function appendSessionLog(hostId, sessionId, entry) {
   const key = sessionKey(hostId, sessionId);
   const existing = state.sessionLogs.get(key) || [];
@@ -446,6 +830,7 @@ function appendSessionLog(hostId, sessionId, entry) {
     speaker: entry.speaker || 'system',
     text: entry.text || '',
     stream: entry.stream || null,
+    files: normalizeFileTransferRefs(entry.files || entry.attachments || []),
   };
   existing.push(nextEntry);
   state.sessionLogs.set(key, existing.slice(-200));
@@ -870,10 +1255,26 @@ function getConnectorHost(connector) {
   return host ? { ...host, online: hostOnline(host) } : null;
 }
 
+function connectorWithRelayAuth(connector) {
+  if (!RELAY_AUTH_TOKEN) {
+    return connector;
+  }
+  return {
+    ...connector,
+    relayAuthToken: RELAY_AUTH_TOKEN,
+  };
+}
+
+function decorateConnectorForClient(connector, host = null) {
+  const decorated = decorateConnector(connectorWithRelayAuth(connector), host);
+  delete decorated.relayAuthToken;
+  return decorated;
+}
+
 function decorateSingleConnector(connector) {
   const secret = state.connectorSecrets.get(connector.connectorId) || null;
   return {
-    ...decorateConnector(connector, getConnectorHost(connector)),
+    ...decorateConnectorForClient(connector, getConnectorHost(connector)),
     secretStatus: getConnectorSecretStatus(secret),
   };
 }
@@ -945,7 +1346,7 @@ function getConnectorList() {
   const hosts = new Map(getHostList().map((host) => [host.hostId, host]));
   return Array.from(state.connectors.values())
     .map((connector) => ({
-      ...decorateConnector(connector, connector.hostId ? hosts.get(connector.hostId) || null : null),
+      ...decorateConnectorForClient(connector, connector.hostId ? hosts.get(connector.hostId) || null : null),
       secretStatus: getConnectorSecretStatus(state.connectorSecrets.get(connector.connectorId) || null),
     }))
     .sort((a, b) => {
@@ -1192,14 +1593,16 @@ function ensureAskpassHelper() {
     '  $timeoutSeconds = 180',
     '  if ($env:RC_ASKPASS_TIMEOUT_SECONDS) { try { $timeoutSeconds = [Math]::Max(10, [int]$env:RC_ASKPASS_TIMEOUT_SECONDS) } catch {} }',
     '  $base = [string]$env:RC_ASKPASS_RELAY_URL',
+    '  $headers = @{}',
+    '  if (-not [string]::IsNullOrWhiteSpace($env:RC_RELAY_AUTH_TOKEN)) { $headers["Authorization"] = "Bearer $env:RC_RELAY_AUTH_TOKEN" }',
     '  $body = @{ connectorId = [string]$env:RC_ASKPASS_CONNECTOR_ID; actionId = [string]$env:RC_ASKPASS_ACTION_ID; token = [string]$env:RC_ASKPASS_TOKEN; prompt = $promptText } | ConvertTo-Json -Compress',
-    '  try { $created = Invoke-RestMethod -Method Post -Uri "$base/api/askpass/prompts" -ContentType "application/json; charset=utf-8" -Body $body -TimeoutSec 8 } catch { exit 1 }',
+    '  try { $created = Invoke-RestMethod -Method Post -Uri "$base/api/askpass/prompts" -Headers $headers -ContentType "application/json; charset=utf-8" -Body $body -TimeoutSec 8 } catch { exit 1 }',
     '  if (-not $created -or [string]::IsNullOrWhiteSpace([string]$created.promptId)) { exit 1 }',
     '  $promptId = [string]$created.promptId',
     '  $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)',
     '  $query = "connectorId=$(Encode-Query $env:RC_ASKPASS_CONNECTOR_ID)&actionId=$(Encode-Query $env:RC_ASKPASS_ACTION_ID)&token=$(Encode-Query $env:RC_ASKPASS_TOKEN)"',
     '  while ([DateTime]::UtcNow -lt $deadline) {',
-    '    try { $status = Invoke-RestMethod -Method Get -Uri "$base/api/askpass/prompts/$promptId`?$query" -TimeoutSec 8 } catch { Start-Sleep -Milliseconds 700; continue }',
+    '    try { $status = Invoke-RestMethod -Method Get -Uri "$base/api/askpass/prompts/$promptId`?$query" -Headers $headers -TimeoutSec 8 } catch { Start-Sleep -Milliseconds 700; continue }',
     '    if ($status.status -eq "answered") { [Console]::Out.Write([string]$status.response); exit 0 }',
     '    if ($status.status -eq "cancelled" -or $status.status -eq "closed") { exit 1 }',
     '    Start-Sleep -Milliseconds 500',
@@ -1277,6 +1680,9 @@ function buildAskpassEnv(connector, secret) {
     env.RC_ASKPASS_ACTION_ID = secret.askpassActionId || '';
     env.RC_ASKPASS_TOKEN = secret.askpassToken || '';
     env.RC_ASKPASS_TIMEOUT_SECONDS = '180';
+    if (RELAY_AUTH_TOKEN) {
+      env.RC_RELAY_AUTH_TOKEN = RELAY_AUTH_TOKEN;
+    }
   }
 
   responses.slice(0, 8).forEach((response, index) => {
@@ -2459,6 +2865,7 @@ function classifyConnectorAction(action, run) {
 }
 
 async function runConnectorAction(connector, action, secretOverride = null) {
+  connector = connectorWithRelayAuth(connector);
   const decorated = decorateSingleConnector(connector);
   const secret = secretOverride || state.connectorSecrets.get(connector.connectorId) || null;
   const manualCommand = decorated.plan.sshLoginCommand;
@@ -2729,6 +3136,210 @@ function awaitModelListRequest(requestId, timeoutMs = 15000) {
   });
 }
 
+function awaitFileRequest(requestId, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingFileRequests.delete(requestId);
+      reject(new Error('file transfer request timed out'));
+    }, timeoutMs);
+
+    state.pendingFileRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingFileRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingFileRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function resolvePendingFileRequest(requestId, payload) {
+  const pending = state.pendingFileRequests.get(requestId);
+  if (pending) {
+    pending.resolve(payload);
+  }
+}
+
+function rejectPendingFileRequest(requestId, message) {
+  const pending = state.pendingFileRequests.get(requestId);
+  if (pending) {
+    pending.reject(new Error(message || 'file transfer failed'));
+  }
+}
+
+function removeQueuedFileCommand(hostId, requestId) {
+  if (!hostId || !requestId) {
+    return;
+  }
+  const queue = state.commandQueues.get(hostId);
+  if (!queue?.length) {
+    return;
+  }
+  state.commandQueues.set(
+    hostId,
+    queue.filter((command) => String(command.requestId || '') !== String(requestId))
+  );
+}
+
+function validateUploadFiles(rawFiles) {
+  const files = [];
+  let totalBytes = 0;
+  for (const rawFile of Array.isArray(rawFiles) ? rawFiles.slice(0, 8) : []) {
+    if (!rawFile || typeof rawFile !== 'object') {
+      continue;
+    }
+    const name = safeFileDisplayName(rawFile.name || 'upload');
+    const dataBase64 = String(rawFile.dataBase64 || '').replace(/^data:[^,]+,/, '').trim();
+    if (!dataBase64) {
+      continue;
+    }
+    const size = Number(rawFile.size || 0) || Math.floor(dataBase64.length * 0.75);
+    if (size > MAX_FILE_TRANSFER_BYTES) {
+      throw new Error(`${name} is too large; limit is ${MAX_FILE_TRANSFER_BYTES} bytes per file`);
+    }
+    totalBytes += size;
+    if (totalBytes > MAX_FILE_TRANSFER_BYTES) {
+      throw new Error(`uploaded files are too large; total limit is ${MAX_FILE_TRANSFER_BYTES} bytes`);
+    }
+    files.push({
+      fileId: String(rawFile.fileId || rawFile.id || makeId()).trim(),
+      name,
+      mime: String(rawFile.mime || rawFile.type || 'application/octet-stream').trim() || 'application/octet-stream',
+      size,
+      dataBase64,
+    });
+  }
+  return files;
+}
+
+function contentDispositionValue(disposition, filename) {
+  const name = safeFileDisplayName(filename || 'download');
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'download';
+  return `${disposition}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+function receivedFileIsExpired(record, now = Date.now()) {
+  const expiresAt = record?.expiresAt ? Date.parse(record.expiresAt) : 0;
+  return Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= now;
+}
+
+function pruneReceivedFiles() {
+  const root = path.resolve(RECEIVED_FILES_ROOT);
+  let changed = false;
+  for (const [fileId, record] of state.receivedFiles) {
+    const localPath = record?.localPath ? path.resolve(record.localPath) : '';
+    const expired = receivedFileIsExpired(record);
+    const missing = !localPath || !fs.existsSync(localPath);
+    if (!expired && !missing) {
+      continue;
+    }
+    if (expired && localPath && pathInside(root, localPath) && fs.existsSync(localPath)) {
+      try {
+        fs.unlinkSync(localPath);
+      } catch {
+        // The manifest is still updated below; stale files can be retried later.
+      }
+    }
+    state.receivedFiles.delete(fileId);
+    changed = true;
+  }
+  if (changed) {
+    saveReceivedFiles();
+  }
+}
+
+function findReceivedFile(hostId, sessionId, remotePath) {
+  pruneReceivedFiles();
+  const normalizedHost = String(hostId || '');
+  const normalizedSession = String(sessionId || '');
+  const normalizedRemotePath = String(remotePath || '');
+  for (const record of state.receivedFiles.values()) {
+    if (
+      record.hostId === normalizedHost
+      && record.sessionId === normalizedSession
+      && record.remotePath === normalizedRemotePath
+      && record.localPath
+      && fs.existsSync(record.localPath)
+    ) {
+      return record;
+    }
+  }
+  return null;
+}
+
+function storeReceivedFile({ hostId, sessionId, remotePath, name, mime, buffer }) {
+  pruneReceivedFiles();
+  const fileId = makeId();
+  const filename = safeFileDisplayName(name || remotePath || 'download');
+  const hostSegment = safePathSegment(hostId, 'host');
+  const sessionSegment = safePathSegment(sessionId, 'session');
+  const targetDirectory = path.join(RECEIVED_FILES_ROOT, hostSegment, sessionSegment);
+  fs.mkdirSync(targetDirectory, { recursive: true });
+
+  const localPath = path.resolve(targetDirectory, `${fileId}-${filename}`);
+  if (!pathInside(RECEIVED_FILES_ROOT, localPath)) {
+    throw new Error('refusing to cache outside received-files directory');
+  }
+  fs.writeFileSync(localPath, buffer);
+
+  const expiresAt = new Date(Date.now() + RECEIVED_FILE_TTL_MS).toISOString();
+  const existing = findReceivedFile(hostId, sessionId, remotePath);
+  if (existing?.localPath && pathInside(RECEIVED_FILES_ROOT, existing.localPath) && fs.existsSync(existing.localPath)) {
+    try {
+      fs.unlinkSync(existing.localPath);
+    } catch {
+      // The new cache copy is already written; stale files are cleaned by TTL.
+    }
+    state.receivedFiles.delete(existing.fileId);
+  }
+
+  const record = {
+    fileId,
+    hostId: String(hostId || ''),
+    sessionId: String(sessionId || ''),
+    remotePath: String(remotePath || ''),
+    name: filename,
+    mime: String(mime || 'application/octet-stream'),
+    size: buffer.length,
+    localPath,
+    receivedAt: nowIso(),
+    lastAccessedAt: nowIso(),
+    expiresAt,
+  };
+  state.receivedFiles.set(fileId, record);
+  saveReceivedFiles();
+  return record;
+}
+
+function serveReceivedFile(res, record, inline) {
+  if (!record?.localPath || !fs.existsSync(record.localPath)) {
+    sendJson(res, 404, { error: 'received file not found or expired' });
+    return;
+  }
+  record.lastAccessedAt = nowIso();
+  state.receivedFiles.set(record.fileId, record);
+  saveReceivedFiles();
+  const buffer = fs.readFileSync(record.localPath);
+  res.writeHead(200, {
+    'Content-Type': record.mime || 'application/octet-stream',
+    'Content-Length': buffer.length,
+    'Content-Disposition': contentDispositionValue(inline ? 'inline' : 'attachment', record.name || 'download'),
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': 'sandbox',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Codex-Received-File-Id': record.fileId,
+    'X-Codex-Received-Expires-At': record.expiresAt || '',
+    'X-Codex-Remote-Path': encodeURIComponent(record.remotePath || ''),
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.end(buffer);
+}
+
 function normalizeTurnInputItems(rawItems) {
   const items = [];
   for (const rawItem of Array.isArray(rawItems) ? rawItems.slice(0, 8) : []) {
@@ -2776,7 +3387,7 @@ function normalizeTurnInputItems(rawItems) {
   return items;
 }
 
-function summarizeTurnInput(text, inputItems) {
+function summarizeTurnInput(text, inputItems, files = []) {
   const pieces = [];
   const prompt = String(text || '').trim();
   if (prompt) {
@@ -2793,6 +3404,11 @@ function summarizeTurnInput(text, inputItems) {
     } else if (item.type === 'skill') {
       pieces.push(`[skill: ${item.name}]`);
     }
+  }
+
+  for (const file of files) {
+    const label = file.path || file.name || 'file';
+    pieces.push(`[uploaded file: ${label}]`);
   }
 
   return pieces.join('\n').trim().slice(0, 4000);
@@ -2961,14 +3577,145 @@ async function handleRequest(req, res) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Relay-Auth-Token',
     });
     res.end();
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/auth/config') {
+    sendJson(res, 200, relayAuthConfig(req, url));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/setup') {
+    const body = await readBody(req);
+    if (!RELAY_AUTH_TOKEN) {
+      sendJson(res, 409, { error: 'relay auth is disabled' });
+      return;
+    }
+    if (relayAuthAccount?.username) {
+      sendJson(res, 409, { error: 'relay account is already configured' });
+      return;
+    }
+    const password = String(body.password || '');
+    const confirmPassword = String(body.confirmPassword || body.passwordConfirm || '');
+    if (password !== confirmPassword) {
+      sendJson(res, 400, { error: 'password confirmation does not match' });
+      return;
+    }
+    try {
+      createRelayAuthAccount(body.username || 'admin', password);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      ...relayAuthConfig(req, url),
+      authenticated: true,
+    }, {
+      'Set-Cookie': authCookieHeader(30 * 24 * 60 * 60),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/login') {
+    const body = await readBody(req);
+    if (!RELAY_AUTH_TOKEN) {
+      sendJson(res, 200, relayAuthConfig(req, url));
+      return;
+    }
+
+    const token = String(body.token || '').trim();
+    const username = normalizeAuthUsername(body.username || '');
+    const password = String(body.password || '');
+    const tokenOk = token && constantTimeEqual(token, RELAY_AUTH_TOKEN);
+    const passwordOk = relayAuthAccount?.username
+      && constantTimeEqual(username.toLowerCase(), String(relayAuthAccount.username).toLowerCase())
+      && verifyAuthPassword(password, relayAuthAccount);
+    if (!tokenOk && !passwordOk) {
+      sendJson(res, 401, {
+        error: relayAuthAccount?.username ? 'invalid username or password' : 'setup is required or recovery token is invalid',
+        authRequired: true,
+        setupRequired: Boolean(!relayAuthAccount?.username),
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      ...relayAuthConfig(req, url),
+      authenticated: true,
+    }, {
+      'Set-Cookie': authCookieHeader(30 * 24 * 60 * 60),
+    });
+    return;
+  }
+
+  if (!authorizeRequest(req, res, url)) {
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+    sendJson(res, 200, {
+      ok: true,
+      authRequired: Boolean(RELAY_AUTH_TOKEN),
+      authenticated: false,
+    }, {
+      'Set-Cookie': authCookieHeader(0),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/change-password') {
+    if (!relayAuthAccount?.username) {
+      sendJson(res, 409, { error: 'relay account is not configured yet' });
+      return;
+    }
+    const body = await readBody(req);
+    const currentPassword = String(body.currentPassword || '');
+    const recoveryToken = String(body.recoveryToken || '').trim();
+    const authorizedByPassword = currentPassword && verifyAuthPassword(currentPassword, relayAuthAccount);
+    const authorizedByToken = recoveryToken && RELAY_AUTH_TOKEN && constantTimeEqual(recoveryToken, RELAY_AUTH_TOKEN);
+    if (!authorizedByPassword && !authorizedByToken) {
+      sendJson(res, 401, { error: 'current password or recovery token is required' });
+      return;
+    }
+
+    const newPassword = String(body.newPassword || body.password || '');
+    const confirmPassword = String(body.confirmPassword || body.passwordConfirm || '');
+    if (newPassword !== confirmPassword) {
+      sendJson(res, 400, { error: 'password confirmation does not match' });
+      return;
+    }
+
+    try {
+      const nextUsername = normalizeAuthUsername(body.username || relayAuthAccount.username);
+      validateAuthUsername(nextUsername);
+      saveRelayAuthAccount({
+        ...relayAuthAccount,
+        username: nextUsername,
+        passwordHash: hashAuthPassword(newPassword),
+        createdAt: relayAuthAccount.createdAt || nowIso(),
+      });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return;
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      ...relayAuthConfig(req, url),
+      authenticated: true,
+    }, {
+      'Set-Cookie': authCookieHeader(30 * 24 * 60 * 60),
+    });
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/health') {
-    sendJson(res, 200, { ok: true, time: nowIso() });
+    sendJson(res, 200, { ok: true, time: nowIso(), authRequired: Boolean(RELAY_AUTH_TOKEN) });
     return;
   }
 
@@ -3356,6 +4103,154 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/upload$/)) {
+    const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    const capabilityError = getHostCapabilityError(
+      hostId,
+      'fileTransfer',
+      'this host agent needs to be restarted before it can upload files'
+    );
+    if (capabilityError) {
+      sendJson(res, capabilityError.statusCode, { error: capabilityError.error });
+      return;
+    }
+
+    const body = await readBody(req);
+    let files = [];
+    try {
+      files = validateUploadFiles(body.files || []);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return;
+    }
+    if (!files.length) {
+      sendJson(res, 400, { error: 'files are required' });
+      return;
+    }
+
+    const requestId = makeId();
+    const pending = awaitFileRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'host.file_upload',
+      requestId,
+      sessionId: String(body.sessionId || '').trim() || null,
+      targetDirectory: String(body.targetDirectory || body.cwd || '').trim() || null,
+      files,
+    });
+
+    try {
+      const result = await pending;
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        requestId,
+        files: normalizeFileTransferRefs(result.files || []),
+      });
+    } catch (error) {
+      sendJson(res, 504, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/received-files\/[^/]+$/)) {
+    pruneReceivedFiles();
+    const fileId = decodeURIComponent(url.pathname.split('/')[3]);
+    const record = state.receivedFiles.get(fileId);
+    const inline = url.searchParams.get('inline') === '1' || url.searchParams.get('inline') === 'true';
+    serveReceivedFile(res, record, inline);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/received-files$/)) {
+    pruneReceivedFiles();
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = String(url.searchParams.get('hostId') || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+
+    const files = Array.from(state.receivedFiles.values())
+      .filter((file) => file.hostId === hostId && file.sessionId === sessionId)
+      .sort((a, b) => String(b.receivedAt || '').localeCompare(String(a.receivedAt || '')))
+      .map((file) => ({
+        fileId: file.fileId,
+        hostId: file.hostId,
+        sessionId: file.sessionId,
+        remotePath: file.remotePath,
+        name: file.name,
+        mime: file.mime,
+        size: file.size,
+        receivedAt: file.receivedAt,
+        lastAccessedAt: file.lastAccessedAt,
+        expiresAt: file.expiresAt,
+        url: `/api/received-files/${encodeURIComponent(file.fileId)}`,
+      }));
+    sendJson(res, 200, {
+      root: RECEIVED_FILES_ROOT,
+      ttlMs: RECEIVED_FILE_TTL_MS,
+      files,
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/download$/)) {
+    const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    const sessionId = String(url.searchParams.get('sessionId') || '').trim() || null;
+    const remotePath = String(url.searchParams.get('path') || '').trim();
+    const inline = url.searchParams.get('inline') === '1' || url.searchParams.get('inline') === 'true';
+    const refresh = url.searchParams.get('refresh') === '1' || url.searchParams.get('refresh') === 'true';
+    if (!remotePath) {
+      sendJson(res, 400, { error: 'path is required' });
+      return;
+    }
+
+    const cached = !refresh ? findReceivedFile(hostId, sessionId || '', remotePath) : null;
+    if (cached) {
+      serveReceivedFile(res, cached, inline);
+      return;
+    }
+
+    const capabilityError = getHostCapabilityError(
+      hostId,
+      'fileTransfer',
+      'this host agent needs to be restarted before it can download files'
+    );
+    if (capabilityError) {
+      sendJson(res, capabilityError.statusCode, { error: capabilityError.error });
+      return;
+    }
+
+    const requestId = makeId();
+    const pending = awaitFileRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'host.file_download',
+      requestId,
+      sessionId,
+      path: remotePath,
+      cwd: String(url.searchParams.get('cwd') || '').trim() || null,
+    });
+
+    try {
+      const result = await pending;
+      const dataBase64 = String(result.dataBase64 || '');
+      const buffer = Buffer.from(dataBase64, 'base64');
+      const filename = safeFileDisplayName(result.name || result.path || remotePath);
+      const received = storeReceivedFile({
+        hostId,
+        sessionId: sessionId || '',
+        remotePath,
+        name: filename,
+        mime: result.mime || 'application/octet-stream',
+        buffer,
+      });
+      serveReceivedFile(res, received, inline);
+    } catch (error) {
+      sendJson(res, 504, { error: error.message });
+    }
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/detail$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const hostId = url.searchParams.get('hostId');
@@ -3645,7 +4540,11 @@ async function handleRequest(req, res) {
 
     const text = String(body.text || '');
     const inputItems = normalizeTurnInputItems(body.inputItems || body.attachments || []);
-    const transcriptText = summarizeTurnInput(text, inputItems);
+    const uploadedFiles = normalizeFileTransferRefs(body.uploadedFiles || body.files || []);
+    const hasDisplayText = Object.prototype.hasOwnProperty.call(body, 'displayText');
+    const displayText = hasDisplayText ? String(body.displayText || '') : text;
+    const transcriptText = summarizeTurnInput(displayText, inputItems, uploadedFiles)
+      || summarizeTurnInput(text, inputItems, uploadedFiles);
     if (!transcriptText) {
       sendJson(res, 400, { error: 'text or inputItems are required' });
       return;
@@ -3674,6 +4573,7 @@ async function handleRequest(req, res) {
     emitTranscriptEntry(hostId, sessionId, {
       speaker: 'user',
       text: transcriptText,
+      files: uploadedFiles,
       timestamp: nowIso(),
     });
     const next = upsertSession(hostId, {
@@ -4061,6 +4961,46 @@ function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'file.uploaded' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    resolvePendingFileRequest(event.requestId, {
+      hostId: event.hostId,
+      sessionId: event.sessionId || null,
+      files: Array.isArray(event.files) ? event.files : [],
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'file.downloaded' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    resolvePendingFileRequest(event.requestId, {
+      hostId: event.hostId,
+      sessionId: event.sessionId || null,
+      name: event.name || null,
+      path: event.path || null,
+      size: event.size || 0,
+      mime: event.mime || 'application/octet-stream',
+      dataBase64: event.dataBase64 || '',
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'file.error' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    rejectPendingFileRequest(event.requestId, event.message || 'file transfer failed');
+    if (event.sessionId) {
+      emitSessionAlert(event.hostId, event.sessionId, {
+        severity: 'error',
+        source: 'file-transfer',
+        message: event.message || 'file transfer failed',
+        timestamp: event.timestamp || nowIso(),
+      });
+    }
+    return;
+  }
+
   const sessionId = event.sessionId;
   if (!sessionId) {
     return;
@@ -4178,6 +5118,19 @@ function applyAgentEvent(event) {
       ...(event.patch || {}),
       updatedAt: event.timestamp || nowIso(),
     });
+    const phase = String(runtime?.phase || '').toLowerCase();
+    const turnIsInactive = !runtime?.activeTurnId
+      && !runtime?.busy
+      && !runtime?.waitingOnApproval
+      && !runtime?.waitingOnUserInput
+      && ['idle', 'error', 'interrupted', 'closed', 'quota-exhausted'].includes(phase);
+    if (turnIsInactive) {
+      resolvePendingSessionRequests(event.hostId, effectiveSessionId, {
+        status: phase === 'error' || phase === 'quota-exhausted' ? 'failed' : 'expired',
+        updatedAt: event.timestamp || nowIso(),
+        message: `Request closed because the session runtime is ${phase}.`,
+      });
+    }
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.runtime', {
       ...(runtime || {}),
       hostId: event.hostId,
@@ -4287,4 +5240,12 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`relay listening on http://127.0.0.1:${PORT}`);
+  if (RELAY_AUTH_TOKEN) {
+    console.log(`relay auth enabled; token file: ${RELAY_AUTH_TOKEN_PATH}`);
+    console.log(relayAuthAccount?.username
+      ? `relay web login enabled for user: ${relayAuthAccount.username}`
+      : `relay web login setup pending; account file: ${RELAY_AUTH_ACCOUNT_PATH}`);
+  } else {
+    console.warn('relay auth disabled by RELAY_AUTH_DISABLED');
+  }
 });

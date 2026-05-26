@@ -2,7 +2,7 @@
 
 `Mobile Codex Remote` 是一个用手机或浏览器控制多台电脑 / HPC 上 Codex 会话的轻量控制面板。
 
-当前版本：`v0.2.0-basic-multiplatform`，也就是“基础多平台版本”。
+当前版本：`v2.0.1`，也就是“基础多平台版本 + 登录保护 + 文件传输版本”。
 
 ## 这个项目能做什么
 
@@ -15,23 +15,26 @@
 - 搜索会话，支持关键词、路径、标题类信息。
 - 用收藏夹管理跨 host 的会话。
 - 使用 Codex app-server 能力：切换模型、推理强度、summary、审批策略、审批 reviewer、沙盒模式、plan-only、review、interrupt、steer、compact、shell command。
-- 支持图片输入、host 本地图片路径、拖拽图片、拖拽文本/代码文件进入对话。
+- 支持真实文件上行/下行：拖拽文件会先上传到选中 host 的工作目录，图片会作为远端 `localImage` 交给 Codex，聊天里识别出的远端图片/文件路径可以直接打开或保存。
 - 支持 HPC connector：保存 SSH/gateway/MFA/bootstrap 配置，并通过 tmux 在 HPC 上启动 host-agent。
 
 ## 重要安全提醒
 
-这个项目目前适合自己在可信网络里使用，还没有登录鉴权系统。
+这个项目默认会给 relay 加一层登录保护。网页登录使用你自己设置的账号密码，密码只以 scrypt 哈希形式保存在本机 `tmp/relay-auth-account.json`；本地/HPC host-agent 使用单独的机器 token 连 relay，token 保存在 `tmp/relay-auth-token.txt`。这些文件都不会提交到 GitHub。
 
 - 不要把正在运行的 `http://你的IP:8797` 直接暴露到公网。
 - 不要把 live relay 地址发给不可信的人。
-- 如果别人能访问你的 live relay，就可能看到或控制你当前挂在 relay 上的本地 / HPC Codex 会话。
+- 如果别人能访问你的 live relay 并拿到登录密码或 recovery token，就可能看到或控制你当前挂在 relay 上的本地 / HPC Codex 会话。
 - 给朋友体验时，发 GitHub 仓库链接最安全，不要发你正在运行的服务地址。
+- 如果确实要在外网/手机流量下访问，优先用 Tailscale/WireGuard 这类私有网络，不要裸开公网端口。
 
 不会被提交到 GitHub 的本地敏感文件包括：
 
 - `tmp/connectors.json`
 - `tmp/connector-secrets.json`
 - `tmp/session-collections.json`
+- `tmp/relay-auth-token.txt`
+- `tmp/relay-auth-account.json`
 - `.env`
 - `.env.local`
 - `tmp/remote-codex-askpass.*`
@@ -119,6 +122,29 @@ http://192.168.1.20:8797
 - Windows 防火墙可能需要允许 Node.js 监听局域网。
 - 不要把这个地址发到公网群里。
 
+## 用 Tailscale 安全访问
+
+推荐架构是：
+
+```text
+手机浏览器 -> Tailscale 私有网络 -> 你的电脑 relay:8797 -> 本地/HPC host-agent
+```
+
+步骤：
+
+1. 在电脑和手机上都安装 Tailscale，并登录同一个 tailnet。
+2. 电脑上启动 relay 和本地 host-agent。
+3. 在电脑上查看 Tailscale 分配的私有 IP，通常是 `100.x.y.z`。
+4. 手机连上 Tailscale 后访问 `http://100.x.y.z:8797`。
+5. 页面会先要求你设置或输入 relay 账号密码。首次设置后，后续手机和电脑都用这个账号密码登录。
+
+安全建议：
+
+- 不要在路由器上做公网端口转发，不要直接把 `8797` 暴露到公网。
+- Tailscale 账号打开 MFA，并且只把自己的手机/电脑加入 tailnet。
+- 如果要给朋友体验，优先让他 clone 仓库自己跑；不要把你的 Tailscale 设备、网页登录密码或 recovery token 给出去。
+- 如果你想临时关闭登录保护，仅限本机调试时设置 `RELAY_AUTH_DISABLED=1` 再启动 relay。
+
 ## 本地 host 怎么用
 
 启动后，左侧会出现本机 host。
@@ -138,8 +164,10 @@ http://192.168.1.20:8797
 - 切换 effort / summary / approval / sandbox。
 - 点 `Plan` 只让 Codex 给计划，不直接改文件。
 - 点 `Review` 审查当前工作区改动。
-- 拖图片进去作为图片输入。
-- 拖 `.md/.py/.js/.json/.txt` 等文本文件进去，内容会嵌入 prompt。
+- 拖任意常见文件进去，文件会上传到当前 host 的 `.codex-remote-files/uploads/...` 目录。
+- 图片上传后会作为远端 `localImage` 发给 Codex；文本、表格、压缩包等文件会以远端路径形式写进 prompt，让 Codex 按路径读取。
+- 如果 Codex 回复里出现远端图片或文件路径，聊天气泡会显示文件卡片，可以 `Open` 预览或 `Save` 下载到本机/手机。
+- 在输入框里输入 `/` 会弹出命令菜单，支持计划模式、状态、模型、推理强度、个性、代码审查、压缩、fork、上传、MCP/IDE/memory 模板，以及常见 skills 提示。
 
 ## HPC host 怎么用
 
@@ -261,11 +289,11 @@ https://github.com/lanchoxie/remote_codex/tree/v0.2.0-basic-multiplatform
 ## 当前限制
 
 - relay 多数 runtime 状态仍在内存里，重启后 live 状态需要 host-agent 重新上报。
-- 没有用户登录 / 权限系统。
+- 目前是单 token 登录保护，还不是多用户权限系统。
 - 不建议暴露公网。
 - 不同 HPC 的 MFA 和 SSH 策略差异很大，可能需要针对集群微调。
-- 图片输入依赖当前 Codex app-server 支持 image input。
-- 普通二进制文件目前不能作为 blob 附件直接发给 Codex。
+- 图片输入依赖当前 Codex app-server 支持 image input；远端 host-agent 更新后才有 `fileTransfer` 能力。
+- 文件传输走 relay/host-agent JSON 通道，默认单文件/总量限制适合图片和中小文件；超大数据集仍建议让 Codex 在 HPC 上直接处理路径，不要从手机上传。
 
 ## 开发验证
 

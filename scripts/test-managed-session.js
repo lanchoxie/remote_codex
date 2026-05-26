@@ -1,10 +1,13 @@
 const { spawn } = require('child_process');
+const fs = require('fs');
 const http = require('http');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
 const PORT = 8792;
 const RELAY_URL = `http://127.0.0.1:${PORT}`;
+const RELAY_AUTH_TOKEN = 'managed-test-relay-token';
+const RELAY_AUTH_ACCOUNT_PATH = path.join(ROOT, 'tmp', 'runtime', `managed-test-auth-account-${process.pid}.json`);
 const HOST_ID = 'managed-test-host';
 const HOST_LABEL = 'Managed Test Host';
 
@@ -12,11 +15,14 @@ async function main() {
   const relay = spawnNode(path.join(ROOT, 'apps', 'relay', 'server.js'), {
     ...process.env,
     PORT: String(PORT),
+    RELAY_AUTH_TOKEN,
+    RELAY_AUTH_ACCOUNT_PATH,
   });
 
   const agent = spawnNode(path.join(ROOT, 'apps', 'host-agent', 'agent.js'), {
     ...process.env,
     RELAY_URL,
+    RELAY_AUTH_TOKEN,
     HOST_ID,
     HOST_LABEL,
     AUTO_START_SESSION: 'true',
@@ -30,6 +36,20 @@ async function main() {
 
   try {
     await waitForHealth();
+    const setupState = await getJsonNoAuth('/api/auth/config');
+    if (!setupState.setupRequired) {
+      throw new Error('relay auth account setup should be required in isolated test');
+    }
+    await postJsonNoAuth('/api/auth/setup', {
+      username: 'admin',
+      password: 'managed-test-password',
+      confirmPassword: 'managed-test-password',
+    });
+    await postJsonNoAuth('/api/auth/login', {
+      username: 'admin',
+      password: 'managed-test-password',
+    });
+
     const session = await waitForLiveManagedSession();
     const transcript = [];
     sseRequest = subscribeToSession(session.hostId, session.sessionId, transcript);
@@ -45,6 +65,38 @@ async function main() {
       (entry) => entry.type === 'session.output' && String(entry.data.chunk || '').includes(prompt),
       8000
     );
+
+    const uploadText = `remote-file-smoke-${Date.now()}`;
+    const uploadDirectory = path.join(ROOT, 'tmp');
+    fs.mkdirSync(uploadDirectory, { recursive: true });
+    const upload = await postJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/upload`, {
+      sessionId: session.sessionId,
+      targetDirectory: uploadDirectory,
+      files: [{
+        name: 'managed-smoke.txt',
+        mime: 'text/plain',
+        size: Buffer.byteLength(uploadText),
+        dataBase64: Buffer.from(uploadText).toString('base64'),
+      }],
+    });
+    const uploadedFile = upload.files && upload.files[0];
+    if (!uploadedFile?.path) {
+      throw new Error('file upload did not return a remote path');
+    }
+    const downloaded = await getBuffer(`/api/hosts/${encodeURIComponent(session.hostId)}/files/download?sessionId=${encodeURIComponent(session.sessionId)}&path=${encodeURIComponent(uploadedFile.path)}`);
+    if (downloaded.toString('utf8') !== uploadText) {
+      throw new Error('downloaded file content did not match uploaded content');
+    }
+    const received = await getJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/received-files?hostId=${encodeURIComponent(session.hostId)}`);
+    const receivedFile = (received.files || []).find((file) => file.remotePath === uploadedFile.path);
+    if (!receivedFile?.fileId) {
+      throw new Error('downloaded file was not cached in the relay received-files inbox');
+    }
+    const cached = await getBuffer(`/api/received-files/${encodeURIComponent(receivedFile.fileId)}`);
+    if (cached.toString('utf8') !== uploadText) {
+      throw new Error('cached received file content did not match uploaded content');
+    }
+
     const stats = await getJson('/api/stats');
 
     console.log(JSON.stringify({
@@ -53,6 +105,11 @@ async function main() {
       hostId: session.hostId,
       sessionId: session.sessionId,
       matchedOutput: matched.data.chunk,
+      fileTransfer: {
+        uploadedPath: uploadedFile.path,
+        downloadedBytes: downloaded.length,
+        receivedFileId: receivedFile.fileId,
+      },
       stats: {
         totalHosts: stats.summary.totalHosts,
         liveSessions: stats.summary.liveSessions,
@@ -115,6 +172,7 @@ function subscribeToSession(hostId, sessionId, transcript) {
       method: 'GET',
       headers: {
         Accept: 'text/event-stream',
+        Authorization: `Bearer ${RELAY_AUTH_TOKEN}`,
       },
     },
     (res) => {
@@ -188,14 +246,57 @@ async function waitFor(fn, timeoutMs, intervalMs) {
 }
 
 async function getJson(pathname) {
-  const response = await fetch(`${RELAY_URL}${pathname}`);
+  const response = await fetch(`${RELAY_URL}${pathname}`, {
+    headers: authHeaders(),
+  });
   if (!response.ok) {
     throw new Error(`GET ${pathname} failed with ${response.status}`);
   }
   return response.json();
 }
 
+async function getJsonNoAuth(pathname) {
+  const response = await fetch(`${RELAY_URL}${pathname}`);
+  const json = await response.json();
+  if (!response.ok) {
+    throw new Error(json.error || `GET ${pathname} failed with ${response.status}`);
+  }
+  return json;
+}
+
+async function getBuffer(pathname) {
+  const response = await fetch(`${RELAY_URL}${pathname}`, {
+    headers: authHeaders(),
+  });
+  if (!response.ok) {
+    let errorText = '';
+    try {
+      errorText = await response.text();
+    } catch (_) {
+      errorText = '';
+    }
+    throw new Error(`GET ${pathname} failed with ${response.status}${errorText ? `: ${errorText}` : ''}`);
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
 async function postJson(pathname, body) {
+  const response = await fetch(`${RELAY_URL}${pathname}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(),
+    },
+    body: JSON.stringify(body),
+  });
+  const json = await response.json();
+  if (!response.ok) {
+    throw new Error(json.error || `POST ${pathname} failed with ${response.status}`);
+  }
+  return json;
+}
+
+async function postJsonNoAuth(pathname, body) {
   const response = await fetch(`${RELAY_URL}${pathname}`, {
     method: 'POST',
     headers: {
@@ -208,6 +309,12 @@ async function postJson(pathname, body) {
     throw new Error(json.error || `POST ${pathname} failed with ${response.status}`);
   }
   return json;
+}
+
+function authHeaders() {
+  return {
+    Authorization: `Bearer ${RELAY_AUTH_TOKEN}`,
+  };
 }
 
 function sleep(ms) {

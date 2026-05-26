@@ -238,6 +238,9 @@ function buildAgentLaunchCommand(connector) {
   if (connector.relayUrl) {
     exports.push(`RELAY_URL=${shellEnvValue(connector.relayUrl)}`);
   }
+  if (connector.relayAuthToken) {
+    exports.push(`RELAY_AUTH_TOKEN=${shellEnvValue(connector.relayAuthToken)}`);
+  }
   if (connector.hostId) {
     exports.push(`HOST_ID=${shellEnvValue(connector.hostId)}`);
   }

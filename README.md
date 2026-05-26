@@ -21,7 +21,7 @@ Reading `~/.codex` is useful for discovery, but it is not enough for control.
 To let Codex continue running on another machine, we need a host-side agent that
 owns the live Codex process and streams input/output over a secure channel.
 
-## Version 0.2.0: 基础多平台版本
+## Version 2.0.1: 基础多平台版本
 
 This release is the first usable multi-platform baseline. It is still a local
 tooling project, but it can now control local and remote Codex hosts from the
@@ -51,9 +51,13 @@ What this version does:
   reasoning summaries, approval policy, approval reviewer, sandbox mode,
   plan-only turns, review turns, interrupt, steer, compact, and shell-command
   control;
-- supports image input from the browser and host-local image paths;
-- supports drag-and-drop image attachments plus drag-and-drop text/code files
-  that are embedded into the prompt.
+- supports real file transfer through the relay/host-agent channel: dropped
+  files are uploaded into the selected host workspace, uploaded images are sent
+  to Codex as host-local `localImage` inputs, and remote file paths in chat can
+  be opened or saved from the browser.
+- adds a Codex-like `/` command menu in the composer for plan mode, status,
+  model controls, reasoning effort, personality, review, compact, fork, upload,
+  and skill-oriented prompt templates.
 
 Current limitations:
 
@@ -63,8 +67,9 @@ Current limitations:
   interactive;
 - remote hosts must run the matching host-agent version before new controls
   such as model listing, review, and image input are available;
-- there is no built-in authentication layer on the relay yet, so do not expose a
-  running relay to untrusted networks.
+- relay authentication is a single shared token, not a multi-user permission
+  system; keep using a private network such as Tailscale instead of exposing a
+  running relay to the public internet.
 
 ## Quick start
 
@@ -85,6 +90,18 @@ Then open:
 http://127.0.0.1:8787
 ```
 
+The web UI uses a local username/password login. On first run, the browser asks
+you to create the account; the password is stored only as a local scrypt hash in
+`tmp/relay-auth-account.json`. Host-agents still use a separate machine token at
+`tmp/relay-auth-token.txt` so HPC agents can connect back without a browser. To
+disable auth only for local debugging, start the relay with
+`RELAY_AUTH_DISABLED=1`.
+
+For phone access away from the same Wi-Fi, the recommended path is Tailscale:
+install Tailscale on the relay machine and on the phone, sign in to the same
+tailnet, then open `http://<relay-machine-tailscale-ip>:8787` or `:8797`.
+Do not port-forward the relay directly from your router.
+
 Useful scripts:
 
 ```bash
@@ -94,8 +111,8 @@ npm run test:managed
 ```
 
 `npm run test:managed` boots a relay plus one agent, waits for a live managed
-session, sends one prompt, and verifies that streamed session output contains
-the prompt text.
+session, sends one prompt, verifies streamed output, and checks a real
+upload/download round trip through the host-agent file channel.
 
 ## Sharing with a friend
 
@@ -113,6 +130,8 @@ Do not share:
 
 - `tmp/connectors.json`;
 - `tmp/connector-secrets.json`;
+- `tmp/relay-auth-token.txt`;
+- `tmp/relay-auth-account.json`;
 - `.env` or `.env.local`;
 - your running `http://<your-ip>:8797` relay URL unless you intentionally want
   that person to see and control the sessions currently attached to your relay.
@@ -123,9 +142,9 @@ Friend experience:
 - they will not be able to log in to your host or HPC from the repo alone;
 - they need to configure their own hosts, SSH keys, passwords, OTP prompts, and
   Codex account/session state;
-- if you expose your live relay on a LAN or public network, the current app has
-  no auth wall yet, so anyone who can reach it may be able to control attached
-  sessions.
+- if you expose your live relay on a LAN or private network, anyone who can
+  reach it and has the login password or recovery token may be able to control
+  attached sessions.
 
 ## Android-friendly groundwork
 
@@ -144,6 +163,8 @@ This is still a browser-first UI, but it gives us a clean bridge into either:
 Useful environment variables for the agent:
 
 - `RELAY_URL`: relay base URL, default `http://127.0.0.1:8787`
+- `RELAY_AUTH_TOKEN`: shared relay machine token; remote host-agents need this
+  when relay auth is enabled
 - `HOST_ID`: stable host identifier
 - `HOST_LABEL`: display name for the host
 - `CODEX_HOME`: override the local `.codex` directory
