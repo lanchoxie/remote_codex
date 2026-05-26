@@ -235,14 +235,19 @@ async function waitForTranscriptLine(transcript, predicate, timeoutMs) {
 
 async function waitFor(fn, timeoutMs, intervalMs) {
   const deadline = Date.now() + timeoutMs;
+  let lastError = null;
   while (Date.now() < deadline) {
-    const value = await fn();
-    if (value) {
-      return value;
+    try {
+      const value = await fn();
+      if (value) {
+        return value;
+      }
+    } catch (error) {
+      lastError = error;
     }
     await sleep(intervalMs);
   }
-  throw new Error(`timeout after ${timeoutMs}ms`);
+  throw lastError || new Error(`timeout after ${timeoutMs}ms`);
 }
 
 async function getJson(pathname) {

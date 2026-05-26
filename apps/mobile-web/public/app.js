@@ -33,6 +33,7 @@ const state = {
   thinkingPanels: new Map(),
   alertWindowOpen: false,
   statusWindowOpen: false,
+  sessionDetailsOpen: false,
   connectorManagerOpen: false,
   connectors: [],
   connectorEditorId: null,
@@ -40,16 +41,32 @@ const state = {
   connectorActionBusy: null,
   sessionCollections: [],
   selectedCollectionId: 'default',
+  collectionManagerOpen: false,
   sessionSearchQuery: '',
   sessionSearchMode: 'keyword',
   overviewCollapsed: false,
-  newSessionCollapsed: false,
+  newSessionCollapsed: true,
+  navigatorCollapsed: true,
+  settingsOpen: false,
+  ui: {
+    locale: 'zh-CN',
+    apiProfiles: [],
+    selectedApiProfileId: 'default',
+    defaultApiProfileId: 'default',
+    hostApiProfiles: {},
+  },
   hostSwitchBusyId: null,
   codexControls: {
     modelOptionsBySession: new Map(),
     modelOptionsLoadingKeys: new Set(),
+    sessionOptionsByKey: new Map(),
+    persistedSessionOptionKeys: new Set(),
     attachments: [],
     modelsLoading: false,
+    steerQueue: [],
+    queueAutoSendScheduled: false,
+    activeDraftsBySession: new Map(),
+    steerNotice: null,
   },
   slashMenu: {
     open: false,
@@ -75,6 +92,383 @@ const MAX_COMPOSER_TEXT_FILE_BYTES = 768 * 1024;
 const MAX_COMPOSER_UPLOAD_FILES = 8;
 const MAX_COMPOSER_UPLOAD_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 24 * 1024 * 1024;
+const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
+const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
+const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
+const DEFAULT_COMPOSER_OPTIONS = {
+  model: '',
+  effort: 'xhigh',
+  summary: '',
+  mode: 'default',
+  approvalPolicy: 'on-request',
+  approvalsReviewer: 'auto_review',
+  sandboxMode: 'workspaceWrite',
+  personality: '',
+};
+const DEFAULT_UI_SETTINGS = {
+  locale: 'zh-CN',
+  selectedApiProfileId: 'default',
+  defaultApiProfileId: 'default',
+  hostApiProfiles: {},
+  apiProfiles: [{
+    profileId: 'default',
+    label: 'OpenAI',
+    provider: 'OpenAI',
+    baseUrl: '',
+    apiKey: '',
+    rememberApiKey: false,
+  }],
+};
+const UI_TEXT = {
+  en: {
+    'common.close': 'Close',
+    'common.save': 'Save settings',
+    'nav.open': 'Open nav',
+    'nav.close': 'Collapse nav',
+    'nav.languageToggle': '中文',
+    'nav.settings': 'Settings',
+    'settings.eyebrow': 'Remote Settings',
+    'settings.title': 'Language, API, and Session',
+    'settings.subtitle': 'These preferences are stored in this browser only.',
+    'settings.languageTitle': 'Interface language',
+    'settings.languageCopy': 'Switch the browser UI between Chinese and English.',
+    'settings.hostsTitle': 'Hosts and connectors',
+    'settings.hostsCopy': 'Manage connected hosts, import a host id, or open HPC connector profiles.',
+    'settings.sessionDefaultsTitle': 'Session defaults',
+    'settings.sessionDefaultsCopy': 'These controls are remembered per selected session. Switching sessions restores that session\'s model, effort, reviewer, sandbox, and personality choices.',
+    'settings.apiTitle': 'API profiles',
+    'settings.apiCopy': 'Create multiple API profiles and choose which host uses which key. Changes apply to newly started Codex app-server sessions.',
+    'settings.profileSelect': 'Editing profile',
+    'settings.addProfile': 'New profile',
+    'settings.deleteProfile': 'Delete profile',
+    'settings.profileName': 'Profile name',
+    'settings.apiProvider': 'Provider label',
+    'settings.api-base-url': 'Base URL',
+    'settings.api-key': 'API key',
+    'settings.defaultProfile': 'Default API profile',
+    'settings.hostMappingTitle': 'Host API mapping',
+    'settings.hostMappingCopy': 'A host can use the default profile or a dedicated profile.',
+    'settings.rememberKey': 'Remember API key in this browser',
+    'settings.apiWarning': 'Do not use this on an untrusted relay or shared browser. The key is sent through your relay when starting a session.',
+    'settings.clearKey': 'Clear API key',
+    'settings.clearKeyConfirm': 'Clear the API key for "{profile}"? This removes it from this browser only. Already running sessions keep their current environment.',
+    'settings.deleteProfileConfirm': 'Delete API profile "{profile}"? This cannot be undone.',
+    'settings.deleteProfileConfirmWithHosts': 'Delete API profile "{profile}"? It is assigned to: {hosts}. Those hosts will fall back to the default profile. This cannot be undone.',
+    'settings.accountTitle': 'Account security',
+    'settings.accountCopy': 'Change the relay web login or lock this browser session.',
+    'top.status': 'Status',
+    'top.account': 'Account',
+    'top.lock': 'Lock',
+    'top.import': 'Import Host',
+    'top.alerts': 'Alerts',
+    'session.endConfirm': 'End this live Codex session? The history stays available and can be resumed later.',
+    'session.endAlreadyClosed': 'This conversation is already history only.',
+  },
+  'zh-CN': {
+    'common.close': '关闭',
+    'common.save': '保存设置',
+    'nav.open': '打开导航',
+    'nav.close': '收起导航',
+    'nav.languageToggle': 'EN',
+    'nav.settings': '设置',
+    'settings.eyebrow': '远程设置',
+    'settings.title': '语言、API 和会话',
+    'settings.subtitle': '这些偏好只保存在当前浏览器。',
+    'settings.languageTitle': '界面语言',
+    'settings.languageCopy': '在中文和英文界面之间切换。',
+    'settings.hostsTitle': 'Host 与连接器',
+    'settings.hostsCopy': '管理已连接的 host、导入 host id，或打开 HPC 连接器配置。',
+    'settings.sessionDefaultsTitle': '会话默认参数',
+    'settings.sessionDefaultsCopy': '这些控件按当前选中的 session 单独记忆。切换 session 时，会恢复那个 session 自己的模型、推理强度、审查者、沙盒和个性选择。',
+    'settings.apiTitle': 'API 配置',
+    'settings.apiCopy': 'Base URL 和 API Key 会作用于新启动的 Codex app-server 会话。已经 live 的会话需要重启才会生效。',
+    'settings.apiProvider': '提供方标签',
+    'settings.api-base-url': 'Base URL',
+    'settings.api-key': 'API Key',
+    'settings.profileSelect': '正在编辑',
+    'settings.addProfile': '新建配置',
+    'settings.deleteProfile': '删除配置',
+    'settings.profileName': '配置名称',
+    'settings.defaultProfile': '默认 API 配置',
+    'settings.hostMappingTitle': 'Host API 映射',
+    'settings.hostMappingCopy': '每个 host 可以使用默认配置，也可以指定专用配置。',
+    'settings.rememberKey': '在当前浏览器记住 API Key',
+    'settings.apiWarning': '不要在不可信 relay 或共享浏览器上使用。启动会话时，这个 key 会经过你的 relay 发送到对应 host。',
+    'settings.clearKey': '清除 API Key',
+    'settings.clearKeyConfirm': '确定清除“{profile}”的 API Key 吗？这只会从当前浏览器移除。已经运行中的 session 会继续使用当前环境。',
+    'settings.deleteProfileConfirm': '确定删除 API 配置“{profile}”吗？这个操作不能撤销。',
+    'settings.deleteProfileConfirmWithHosts': '确定删除 API 配置“{profile}”吗？它正在被这些 host 使用：{hosts}。这些 host 会回退到默认配置。这个操作不能撤销。',
+    'settings.accountTitle': '账号安全',
+    'settings.accountCopy': '修改 relay 网页登录账号，或锁定当前浏览器会话。',
+    'top.status': '状态',
+    'top.account': '账号',
+    'top.lock': '锁定',
+    'top.import': '导入 Host',
+    'top.alerts': '提醒',
+    'session.endConfirm': '结束当前 live Codex 会话？历史仍然保留，之后可以继续 Resume。',
+    'session.endAlreadyClosed': '这个对话已经是历史状态。',
+  },
+};
+const ZH_STATIC_TEXT = {
+  'Relay Locked': 'Relay 已锁定',
+  'Sign in': '登录',
+  'This protects your Codex hosts when the relay is reachable from a phone, Tailscale, or another network.': '当 relay 可以从手机、Tailscale 或其他网络访问时，这会保护你的 Codex hosts。',
+  'Username': '用户名',
+  'Password': '密码',
+  'Confirm password': '确认密码',
+  'Use recovery token instead': '改用恢复 token',
+  'Relay recovery token': 'Relay 恢复 token',
+  'Unlock Remote Codex': '解锁 Remote Codex',
+  'Relay Account': 'Relay 账号',
+  'Change login': '修改登录',
+  'Update the browser login account. Host-agents still use the separate machine token.': '更新浏览器登录账号。Host-agent 仍然使用单独的机器 token。',
+  'Current password': '当前密码',
+  'New password': '新密码',
+  'Confirm new password': '确认新密码',
+  'Forgot current password? Use recovery token': '忘记当前密码？使用恢复 token',
+  'Update Password': '更新密码',
+  'Cancel': '取消',
+  'Mobile Codex Remote': 'Mobile Codex Remote',
+  'Navigator': '导航',
+  'Overview': '总览',
+  'Hosts': 'Host 列表',
+  'Hide': '隐藏',
+  'Show': '显示',
+  'Import host id, e.g. hpc-login-01': '导入 host id，例如 hpc-login-01',
+  'Import Host': '导入 Host',
+  'HPC Connectors': 'HPC 连接器',
+  'No HPC connector profiles saved yet.': '还没有保存 HPC 连接器配置。',
+  'Manage HPC': '管理 HPC',
+  'Selected Host': '已选 Host',
+  'No host selected': '未选择 Host',
+  'Hide New': '隐藏新建',
+  'Show New': '显示新建',
+  'Active host': '当前 Host',
+  'Switch active host': '切换当前 Host',
+  'Path on selected host, e.g. /home/me/project or D:\\work\\repo': '所选 host 上的路径，例如 /home/me/project 或 D:\\work\\repo',
+  'Browse': '浏览',
+  'Optional conversation title': '可选对话标题',
+  'New In Directory': '在目录中新建',
+  'Use Selected Path': '使用所选路径',
+  'New collection name': '新收藏夹名称',
+  'Add': '添加',
+  'Keyword': '关键词',
+  'Path': '路径',
+  'Title': '标题',
+  'Search mode': '搜索模式',
+  'Search conversations...': '搜索对话...',
+  'Search': '搜索',
+  'Clear': '清除',
+  'Conversation': '对话',
+  'Status': '状态',
+  'End Session': '结束会话',
+  'Account': '账号',
+  'Lock': '锁定',
+  'Alerts': '提醒',
+  'Join Running Session': '加入运行会话',
+  'Resume From History': '从历史恢复',
+  'Fork New Branch': '派生新分支',
+  'Session': '会话',
+  'Runtime': '运行时',
+  'No session selected': '未选择会话',
+  'No session': '无会话',
+  'Details': '详情',
+  'Session Detail': '会话详情',
+  'Path, runner, runtime, latest messages, and variants.': '路径、运行器、运行时、最新消息和变体。',
+  'Full Status': '完整状态',
+  'Close': '关闭',
+  'Runner': '运行器',
+  'Latest User Message': '最新用户消息',
+  'Latest Agent Message': '最新 Codex 消息',
+  'Session Variants': '会话变体',
+  'Runner Notes': '运行器备注',
+  'No warning.': '无警告。',
+  'Live Runtime': '实时运行时',
+  'Advanced live controls.': '高级实时控制。',
+  'Steer Current Turn': '引导当前轮次',
+  'Guide the active turn without starting a new one...': '不新开轮次，直接引导当前轮次...',
+  'Steer Turn': '引导',
+  'Shell Command': 'Shell 命令',
+  'Run a host shell command through thread/shellCommand': '通过 thread/shellCommand 在 host 上运行 shell 命令',
+  'Run Command': '运行命令',
+  'Supported model': '支持的模型',
+  'Model: auto/default': '模型：自动/默认',
+  'Models': '模型',
+  'Reasoning effort': '推理强度',
+  'Effort: default': '推理：默认',
+  'Effort: model default': '推理：模型默认',
+  'Reasoning summary': '推理摘要',
+  'Summary: default': '摘要：默认',
+  'Auto summary': '自动摘要',
+  'Concise': '简洁',
+  'Detailed': '详细',
+  'No summary': '无摘要',
+  'Send mode': '发送模式',
+  'Default mode': '默认模式',
+  'Plan only': '仅计划',
+  'Approval policy': '审批策略',
+  'Approval: on request': '审批：按需',
+  'On failure': '失败时',
+  'Untrusted': '不信任',
+  'Never': '永不',
+  'Approval reviewer': '审批审查者',
+  'Auto review': '自动审查',
+  'Reviewer: user': '用户审查',
+  'Sandbox mode': '沙盒模式',
+  'Workspace write': '工作区可写',
+  'Read only': '只读',
+  'Danger full access': '危险：完全访问',
+  'Personality': '个性',
+  'Personality: default': '个性：默认',
+  'Friendly': '友好',
+  'Pragmatic': '务实',
+  'None': '无',
+  'Attach Files': '添加文件',
+  'Image path on selected host, e.g. ~/shot.png': '所选 host 上的图片路径，例如 ~/shot.png',
+  'Clear Files': '清除文件',
+  'Active turn updated': '当前轮次已更新',
+  'Your message was added to the current Codex turn.': '你的消息已加入当前 Codex 轮次。',
+  'Interrupt & Send': '打断并发送',
+  'Plan': '计划',
+  'Review': '审查',
+  'Interrupt': '打断',
+  'Send': '发送',
+  'Session Alerts': '会话提醒',
+  'Minimize': '最小化',
+  'No important warnings or errors for this session.': '这个会话没有重要警告或错误。',
+  'Codex Status': 'Codex 状态',
+  'Status details will appear here.': '状态详情会显示在这里。',
+  'Interrupt Turn': '打断当前轮次',
+  'End Live Session': '结束 Live 会话',
+  'Session Ended': '会话已结束',
+  'Ending Session...': '正在结束会话...',
+  'Compact Context': '压缩上下文',
+  'Refresh': '刷新',
+  'Run Shell Command': '运行 Shell 命令',
+  'This path is intentionally powerful. `thread/shellCommand` runs unsandboxed on the selected host.': '这个入口刻意很强力：`thread/shellCommand` 会在所选 host 上以非沙盒方式运行。',
+  'Open': '打开',
+  'Save': '保存',
+  'Copy': '复制',
+  'No live session attached': '未连接实时会话',
+  'Select or start a managed session to see live status, timers, and commands.': '选择或启动 managed session 后查看实时状态、计时和命令。',
+  'Select a conversation to inspect path, status, runtime, messages, and variants.': '选择一个对话以查看路径、状态、运行时、消息和变体。',
+  'Select a conversation to inspect it.': '选择一个对话以查看详情。',
+  'A managed session can continue work from this workspace.': 'Managed session 可以从这个工作区继续。',
+  'API profiles': 'API 配置组',
+  'Create multiple API profiles and choose which host uses which key. Changes apply to newly started Codex app-server sessions.': '可以创建多个 API 配置，并指定每个 host 使用哪个 key。改动会作用于新启动的 Codex app-server 会话。',
+  'Editing profile': '正在编辑',
+  'New profile': '新建配置',
+  'Delete profile': '删除配置',
+  'Profile name': '配置名称',
+  'OpenAI main, HPC proxy, lab key...': 'OpenAI 主账号、HPC 代理、实验室 key...',
+  'Default API profile': '默认 API 配置',
+  'Host API mapping': 'Host API 映射',
+  'A host can use the default profile or a dedicated profile.': '每个 host 可以使用默认配置，也可以指定专用配置。',
+  'Use default': '使用默认',
+  'No hosts are connected yet. Start or import a host to assign API profiles.': '还没有连接 host。先启动或导入 host 后再分配 API 配置。',
+  'Thinking': '思考',
+  'Token Usage': 'Token 使用',
+  'Rate Limits': '速率限制',
+  'Requests': '请求',
+  'Received Files': '已接收文件',
+  'Warnings & Errors': '警告和错误',
+  'Event Timeline': '事件时间线',
+  'No reasoning summary yet.': '还没有推理摘要。',
+  'No token usage reported yet.': '还没有 token 使用报告。',
+  'No rate limit snapshot yet.': '还没有速率限制快照。',
+  'Codex Needs You': 'Codex 需要你',
+  'Approval required': '需要批准',
+  'Directory Picker': '目录选择器',
+  'Choose a host to browse its directories.': '选择一个 host 来浏览目录。',
+  '(no path selected)': '（未选择路径）',
+  'Up': '上一级',
+  'Use This Directory': '使用此目录',
+  'Roots': '根目录',
+  'Recent': '最近',
+  'Folders': '文件夹',
+  'HPC Connector Manager': 'HPC 连接器管理',
+  'Saved connector profiles': '已保存连接器配置',
+  'Save the route, gateway, and bootstrap recipe. Do not store passwords, OTP codes, or captcha answers.': '保存路由、网关和启动方案。不要保存密码、OTP 或验证码答案。',
+  'Best default: run a host agent on the HPC login node, let it dial the relay outward, and use tmux or a user service to keep it alive.': '推荐默认方案：在 HPC 登录节点运行 host-agent，让它主动连回 relay，并用 tmux 或用户服务保活。',
+  'Saved Connectors': '已保存连接器',
+  'Profiles': '配置',
+  'New Connector': '新建连接器',
+  'Connector Editor': '连接器编辑器',
+  'New connector': '新连接器',
+  'Create a saved HPC recipe.': '创建一套保存的 HPC 方案。',
+  'Generated Bootstrap': '生成的启动命令',
+  'Save a connector to generate its tmux command.': '保存连接器后生成 tmux 命令。',
+  'Copy Login': '复制登录',
+  'Copy Test': '复制测试',
+  'Copy Bootstrap': '复制启动',
+  'Run Test': '运行测试',
+  'Check Status': '检查状态',
+  'Start Agent': '启动 Agent',
+  'Restart Agent': '重启 Agent',
+  'SSH Login': 'SSH 登录',
+  'SSH Smoke Test': 'SSH 连通测试',
+  'tmux Bootstrap': 'tmux 启动',
+  '(no login command yet)': '（还没有登录命令）',
+  '(no smoke test yet)': '（还没有测试命令）',
+  '(no command yet)': '（还没有命令）',
+  'Basics': '基础',
+  'Gateway': '网关',
+  'Target Auth': '目标认证',
+  'Bootstrap': '启动',
+  'Notes': '备注',
+  'Label, e.g. Campus HPC': '标签，例如 Campus HPC',
+  'Outbound Agent': '出站 Agent',
+  'SSH Jump': 'SSH 跳板',
+  'Gateway Sidecar': '网关侧 Agent',
+  'Reverse Tunnel': '反向隧道',
+  'Manual Only': '仅手动',
+  'Optional host id, e.g. hpc-login-01': '可选 host id，例如 hpc-login-01',
+  'Relay URL, e.g. https://relay.example.com': 'Relay URL，例如 https://relay.example.com',
+  'Target host, e.g. login.cluster.edu': '目标 host，例如 login.cluster.edu',
+  'Login username': '登录用户名',
+  'CODEX_HOME, e.g. ~/.codex': 'CODEX_HOME，例如 ~/.codex',
+  'Workspace roots, one per line': '工作区根目录，每行一个',
+  'Gateway Disabled': '禁用网关',
+  'Gateway Enabled': '启用网关',
+  'Gateway host': '网关 host',
+  'Gateway username': '网关用户名',
+  'ProxyJump / jump rule': 'ProxyJump / 跳转规则',
+  'Gateway SSH Key': '网关 SSH Key',
+  'Gateway SSH Agent': '网关 SSH Agent',
+  'Gateway Password': '网关密码',
+  'Gateway Keyboard-Interactive': '网关键盘交互',
+  'Gateway OTP / MFA': '网关 OTP / MFA',
+  'Gateway Browser SSO': '网关浏览器 SSO',
+  'Gateway Captcha': '网关验证码',
+  'Gateway password, saved locally only': '网关密码，仅本地保存',
+  'Gateway OTP source, authenticator, or notes': '网关 OTP 来源、验证器或备注',
+  'SSH Key': 'SSH Key',
+  'SSH Agent': 'SSH Agent',
+  'Password': '密码',
+  'Keyboard-Interactive': '键盘交互',
+  'OTP / MFA': 'OTP / MFA',
+  'Browser SSO': '浏览器 SSO',
+  'Manual Captcha': '手动验证码',
+  'SSH key path, if any': 'SSH key 路径（如有）',
+  'Target password, saved locally only': '目标密码，仅本地保存',
+  'Agent Forwarding On': '开启 Agent 转发',
+  'Agent Forwarding Off': '关闭 Agent 转发',
+  'Do Not Remember Device': '不记住设备',
+  'Remember Device': '记住设备',
+  'OTP source, authenticator, or notes': 'OTP 来源、验证器或备注',
+  'Manual + tmux': '手动 + tmux',
+  'Manual + systemd': '手动 + systemd',
+  'SSH Exec': 'SSH 执行',
+  'Gateway Launcher': '网关启动器',
+  'Remote agent directory': '远端 agent 目录',
+  'tmux session name': 'tmux 会话名',
+  'systemd service name': 'systemd 服务名',
+  'Optional custom launch command': '可选自定义启动命令',
+  'Notes, warnings, or campus-specific steps': '备注、警告或学校/集群特殊步骤',
+  'Save Connector': '保存连接器',
+  'Delete Connector': '删除连接器',
+};
+const EN_STATIC_TEXT = Object.fromEntries(Object.entries(ZH_STATIC_TEXT).map(([english, chinese]) => [chinese, english]));
 const TEXT_FILE_EXTENSIONS = new Set([
   'bat',
   'cmd',
@@ -177,6 +571,268 @@ function delay(ms) {
   });
 }
 
+function readLocalStorageJson(key, fallback) {
+  try {
+    const raw = window.localStorage?.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function writeLocalStorageJson(key, value) {
+  try {
+    window.localStorage?.setItem(key, JSON.stringify(value));
+  } catch (_) {
+    // Local storage may be unavailable in private or restricted browsers.
+  }
+}
+
+function makeApiProfileId() {
+  return `api-${makeClientId()}`;
+}
+
+function normalizeApiProfile(input = {}, index = 0) {
+  const fallback = DEFAULT_UI_SETTINGS.apiProfiles[0];
+  const profileId = String(input.profileId || input.id || (index === 0 ? fallback.profileId : makeApiProfileId())).trim() || makeApiProfileId();
+  const label = String(input.label || input.name || input.provider || (index === 0 ? fallback.label : `API Profile ${index + 1}`)).trim();
+  return {
+    profileId,
+    label: label || `API Profile ${index + 1}`,
+    provider: String(input.provider || fallback.provider).trim() || fallback.provider,
+    baseUrl: String(input.baseUrl || '').trim(),
+    apiKey: String(input.apiKey || ''),
+    rememberApiKey: input.rememberApiKey === true,
+  };
+}
+
+function normalizeApiProfiles(input = {}) {
+  const rawProfiles = Array.isArray(input.apiProfiles) && input.apiProfiles.length
+    ? input.apiProfiles
+    : input.apiSettings
+      ? [{
+        profileId: 'default',
+        label: input.apiSettings.provider || input.apiSettings.label || 'OpenAI',
+        ...input.apiSettings,
+      }]
+      : DEFAULT_UI_SETTINGS.apiProfiles;
+  const seen = new Set();
+  const profiles = [];
+  rawProfiles.forEach((profile, index) => {
+    const normalized = normalizeApiProfile(profile, index);
+    if (seen.has(normalized.profileId)) {
+      normalized.profileId = makeApiProfileId();
+    }
+    seen.add(normalized.profileId);
+    profiles.push(normalized);
+  });
+  return profiles.length ? profiles : DEFAULT_UI_SETTINGS.apiProfiles.map(normalizeApiProfile);
+}
+
+function normalizeHostApiProfiles(value = {}, profiles = []) {
+  const profileIds = new Set(profiles.map((profile) => profile.profileId));
+  const next = {};
+  if (!value || typeof value !== 'object') {
+    return next;
+  }
+  for (const [hostId, profileId] of Object.entries(value)) {
+    if (profileIds.has(profileId)) {
+      next[hostId] = profileId;
+    }
+  }
+  return next;
+}
+
+function normalizeUiSettings(input = {}) {
+  const locale = input.locale === 'en' ? 'en' : 'zh-CN';
+  const apiProfiles = normalizeApiProfiles(input);
+  const profileIds = new Set(apiProfiles.map((profile) => profile.profileId));
+  const fallbackProfileId = apiProfiles[0]?.profileId || 'default';
+  const defaultApiProfileId = profileIds.has(input.defaultApiProfileId) ? input.defaultApiProfileId : fallbackProfileId;
+  const selectedApiProfileId = profileIds.has(input.selectedApiProfileId) ? input.selectedApiProfileId : defaultApiProfileId;
+  return {
+    locale,
+    apiProfiles,
+    selectedApiProfileId,
+    defaultApiProfileId,
+    hostApiProfiles: normalizeHostApiProfiles(input.hostApiProfiles, apiProfiles),
+  };
+}
+
+function initializePersistentUiState() {
+  state.navigatorCollapsed = readLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, true) !== false;
+  const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
+  state.ui.locale = storedUi.locale;
+  state.ui.apiProfiles = storedUi.apiProfiles;
+  state.ui.selectedApiProfileId = storedUi.selectedApiProfileId;
+  state.ui.defaultApiProfileId = storedUi.defaultApiProfileId;
+  state.ui.hostApiProfiles = storedUi.hostApiProfiles;
+  const storedOptions = readLocalStorageJson(COMPOSER_SESSION_OPTIONS_STORAGE_KEY, {});
+  if (storedOptions && typeof storedOptions === 'object') {
+    for (const [key, value] of Object.entries(storedOptions)) {
+      state.codexControls.sessionOptionsByKey.set(key, normalizeComposerOptionValues(value));
+      state.codexControls.persistedSessionOptionKeys.add(key);
+    }
+  }
+}
+
+function persistUiSettings() {
+  const normalized = normalizeUiSettings(state.ui);
+  const apiProfiles = normalized.apiProfiles.map((profile) => ({
+    ...profile,
+    apiKey: profile.rememberApiKey ? profile.apiKey : '',
+  }));
+  writeLocalStorageJson(UI_SETTINGS_STORAGE_KEY, {
+    locale: normalized.locale,
+    apiProfiles,
+    selectedApiProfileId: normalized.selectedApiProfileId,
+    defaultApiProfileId: normalized.defaultApiProfileId,
+    hostApiProfiles: normalized.hostApiProfiles,
+  });
+}
+
+function currentLocale() {
+  return state.ui.locale === 'en' ? 'en' : 'zh-CN';
+}
+
+function t(key) {
+  return UI_TEXT[currentLocale()]?.[key] || UI_TEXT.en[key] || key;
+}
+
+function formatUiText(key, values = {}) {
+  return t(key).replace(/\{([A-Za-z0-9_]+)\}/g, (match, name) => (
+    Object.prototype.hasOwnProperty.call(values, name) ? String(values[name]) : match
+  ));
+}
+
+function translateStaticText(value) {
+  const text = String(value || '');
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return text;
+  }
+  const dictionary = currentLocale() === 'zh-CN' ? ZH_STATIC_TEXT : EN_STATIC_TEXT;
+  const translated = dictionary[trimmed];
+  return translated ? text.replace(trimmed, translated) : text;
+}
+
+function shouldSkipLocalizationNode(node) {
+  const parent = node?.parentElement || node;
+  if (!parent || !(parent instanceof Element)) {
+    return false;
+  }
+  return Boolean(parent.closest('#session-log, .markdown-body, pre, code, script, style'));
+}
+
+function applyStaticLocalization(root = document.body) {
+  if (!root) {
+    return;
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue?.trim() || shouldSkipLocalizationNode(node)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const textNodes = [];
+  while (walker.nextNode()) {
+    textNodes.push(walker.currentNode);
+  }
+  for (const node of textNodes) {
+    node.nodeValue = translateStaticText(node.nodeValue);
+  }
+
+  for (const element of root.querySelectorAll('[placeholder], [aria-label], [title]')) {
+    if (shouldSkipLocalizationNode(element)) {
+      continue;
+    }
+    for (const attribute of ['placeholder', 'aria-label', 'title']) {
+      if (element.hasAttribute(attribute)) {
+        element.setAttribute(attribute, translateStaticText(element.getAttribute(attribute)));
+      }
+    }
+  }
+}
+
+function getApiProfiles() {
+  const normalized = normalizeUiSettings(state.ui);
+  state.ui.apiProfiles = normalized.apiProfiles;
+  state.ui.selectedApiProfileId = normalized.selectedApiProfileId;
+  state.ui.defaultApiProfileId = normalized.defaultApiProfileId;
+  state.ui.hostApiProfiles = normalized.hostApiProfiles;
+  return state.ui.apiProfiles;
+}
+
+function getApiProfile(profileId) {
+  return getApiProfiles().find((profile) => profile.profileId === profileId) || getApiProfiles()[0] || null;
+}
+
+function getSelectedApiProfile() {
+  return getApiProfile(state.ui.selectedApiProfileId);
+}
+
+function getApiProfileForHost(hostId) {
+  const hostProfileId = hostId ? state.ui.hostApiProfiles?.[hostId] : '';
+  return getApiProfile(hostProfileId || state.ui.defaultApiProfileId);
+}
+
+function getApiRequestConfig(hostId = state.selectedHostId) {
+  const api = getApiProfileForHost(hostId);
+  if (!api) {
+    return null;
+  }
+  const config = {
+    provider: api.provider,
+    baseUrl: api.baseUrl,
+    apiKey: api.apiKey,
+    profileId: api.profileId,
+    label: api.label,
+  };
+  return config.baseUrl || config.apiKey ? config : null;
+}
+
+function getSessionApiProfileSummary(session) {
+  if (!session) {
+    return {
+      label: 'API: none',
+      title: 'No API profile recorded for this session.',
+      source: 'none',
+    };
+  }
+
+  const recorded = session.apiProfile || session.runtime?.apiProfile || null;
+  if (recorded?.label || recorded?.profileId || recorded?.provider || recorded?.baseUrl) {
+    const label = recorded.label || recorded.profileId || recorded.provider || 'API profile';
+    const details = [
+      recorded.provider ? `Provider: ${recorded.provider}` : '',
+      recorded.baseUrl ? `Base URL: ${recorded.baseUrl}` : '',
+      recorded.profileId ? `Profile ID: ${recorded.profileId}` : '',
+    ].filter(Boolean).join('\n');
+    return {
+      label: `API: ${label}`,
+      title: details || 'API profile recorded when this session started.',
+      source: 'recorded',
+    };
+  }
+
+  const mapped = getApiProfileForHost(session.hostId);
+  if (mapped) {
+    return {
+      label: `API: ${mapped.label || mapped.provider || 'Default'}`,
+      title: 'No profile was recorded on this session yet; showing the current host/default mapping.',
+      source: 'mapped',
+    };
+  }
+
+  return {
+    label: 'API: default',
+    title: 'No API profile is configured; Codex will use the host environment.',
+    source: 'default',
+  };
+}
+
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
     headers: {
@@ -257,6 +913,11 @@ function renderAuthGate() {
   const logoutButton = el('logout-button');
   if (logoutButton) {
     logoutButton.hidden = !state.auth.required || !state.auth.authenticated;
+  }
+
+  const accountSection = el('account-settings-section');
+  if (accountSection) {
+    accountSection.classList.toggle('hidden', !state.auth.required);
   }
 
   renderAccountDialog();
@@ -661,7 +1322,24 @@ function buildThinkingEntriesForSession(session) {
   const transcript = getTranscriptForSession(session)
     .filter((entry) => entry && (entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant'));
   const diagnostics = getDiagnosticsForSession(session)
-    .filter((entry) => entry && (entry.kind === 'reasoning' || entry.kind === 'plan'));
+    .filter((entry) => entry && (
+      entry.kind === 'reasoning'
+      || entry.kind === 'plan'
+      || isFileChangeDiagnostic(entry)
+    ));
+  const requestDiagnostics = getRequestsForSession(session)
+    .filter((request) => request && isFileChangeDiagnostic(request))
+    .map((request) => ({
+      timestamp: request.createdAt || request.updatedAt || new Date().toISOString(),
+      severity: request.status === 'pending' ? 'warning' : 'info',
+      source: 'codex',
+      kind: 'file-change',
+      method: request.method || 'item/fileChange/requestApproval',
+      message: request.summary || request.message || 'File change approval requested',
+      data: request.payload || null,
+      turnId: request.payload?.turnId || null,
+    }));
+  const thinkingDiagnostics = [...diagnostics, ...requestDiagnostics];
 
   const transcriptTimes = transcript.map((entry) => Date.parse(entry.timestamp || '')).map((value) => (Number.isFinite(value) ? value : null));
   const segments = [];
@@ -696,7 +1374,7 @@ function buildThinkingEntriesForSession(session) {
       }
     }
 
-    const windowEntries = diagnostics
+    const windowEntries = thinkingDiagnostics
       .filter((diag) => {
         const diagTime = Date.parse(diag.timestamp || '');
         return Number.isFinite(diagTime) && diagTime >= startTime && diagTime <= replyTime;
@@ -706,18 +1384,21 @@ function buildThinkingEntriesForSession(session) {
     const merged = [];
     for (const diag of windowEntries) {
       const text = normalizeThinkingMessage(diag);
-      if (!text) {
+      const fileChanges = normalizeFileChanges(diag);
+      if (!text && !fileChanges.length) {
         continue;
       }
+      const normalizedKind = isFileChangeDiagnostic(diag) ? 'file-change' : (diag.kind || 'thinking');
       const previous = merged[merged.length - 1];
-      if (previous && previous.kind === diag.kind && previous.text === text) {
+      if (previous && previous.kind === normalizedKind && previous.text === text && !fileChanges.length) {
         continue;
       }
       merged.push({
-        kind: diag.kind || 'thinking',
+        kind: normalizedKind,
         method: diag.method || null,
-        text,
+        text: text || 'File changes updated',
         timestamp: diag.timestamp || null,
+        fileChanges,
       });
     }
 
@@ -731,6 +1412,173 @@ function buildThinkingEntriesForSession(session) {
   }
 
   return segments;
+}
+
+function isFileChangeDiagnostic(entry) {
+  const method = String(entry?.method || '').toLowerCase();
+  const kind = String(entry?.kind || '').toLowerCase();
+  const message = String(entry?.message || '').toLowerCase();
+  return kind === 'file-change'
+    || kind === 'filechange'
+    || method.includes('filechange')
+    || method.includes('file_change')
+    || method.includes('patch')
+    || method.includes('diff')
+    || /\b(file|files)\b.*\b(change|changed|edit|edited|patch|diff)\b/.test(message);
+}
+
+function countDiffLines(diffText) {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of String(diffText || '').split(/\r?\n/)) {
+    if (line.startsWith('+++') || line.startsWith('---')) {
+      continue;
+    }
+    if (line.startsWith('+')) {
+      additions += 1;
+    } else if (line.startsWith('-')) {
+      deletions += 1;
+    }
+  }
+  return { additions, deletions };
+}
+
+function toCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function pathFromDiffHeader(diffText) {
+  const text = String(diffText || '');
+  const gitMatch = text.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+  if (gitMatch) {
+    return gitMatch[2] || gitMatch[1];
+  }
+  const plusMatch = text.match(/^\+\+\+\s+(?:b\/)?(.+)$/m);
+  if (plusMatch && plusMatch[1] !== '/dev/null') {
+    return plusMatch[1];
+  }
+  const minusMatch = text.match(/^---\s+(?:a\/)?(.+)$/m);
+  if (minusMatch && minusMatch[1] !== '/dev/null') {
+    return minusMatch[1];
+  }
+  return '';
+}
+
+function splitUnifiedDiff(diffText) {
+  const text = String(diffText || '').trim();
+  if (!text) {
+    return [];
+  }
+  const chunks = text.split(/\n(?=diff --git\s+)/);
+  return chunks.filter(Boolean).map((chunk) => {
+    const counts = countDiffLines(chunk);
+    return {
+      path: pathFromDiffHeader(chunk) || 'workspace change',
+      additions: counts.additions,
+      deletions: counts.deletions,
+      diff: chunk,
+    };
+  });
+}
+
+function normalizeFileChangeRecord(raw, fallbackPath = '') {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const diff = String(raw.diff || raw.patch || raw.unifiedDiff || raw.unified_diff || raw.content || raw.text || '').trim();
+  const counts = countDiffLines(diff);
+  const pathValue = String(
+    raw.path
+      || raw.filePath
+      || raw.file_path
+      || raw.absolutePath
+      || raw.relativePath
+      || raw.filename
+      || raw.name
+      || fallbackPath
+      || pathFromDiffHeader(diff)
+      || ''
+  ).trim();
+  const additions = toCount(raw.additions ?? raw.added ?? raw.insertions ?? raw.linesAdded ?? raw.addedLines) ?? counts.additions;
+  const deletions = toCount(raw.deletions ?? raw.deleted ?? raw.removed ?? raw.linesDeleted ?? raw.deletedLines) ?? counts.deletions;
+  if (!pathValue && !diff && !additions && !deletions) {
+    return null;
+  }
+  return {
+    path: pathValue || 'workspace change',
+    additions,
+    deletions,
+    diff,
+  };
+}
+
+function normalizeFileChanges(entry) {
+  const roots = [
+    entry?.data,
+    entry?.payload,
+    entry?.data?.payload,
+    entry?.data?.changes,
+    entry?.data?.files,
+    entry?.data?.fileChanges,
+    entry?.data?.edits,
+    entry?.data?.patches,
+  ].filter(Boolean);
+  const records = [];
+  const seen = new Set();
+
+  function addRecord(record) {
+    if (!record) {
+      return;
+    }
+    const key = `${record.path}|${record.additions}|${record.deletions}|${record.diff.slice(0, 80)}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    records.push(record);
+  }
+
+  function visit(value, fallbackPath = '', depth = 0) {
+    if (!value || depth > 5) {
+      return;
+    }
+    if (typeof value === 'string') {
+      if (/^(diff --git|--- |\+\+\+ |@@ )/m.test(value)) {
+        for (const record of splitUnifiedDiff(value)) {
+          addRecord(record);
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item, fallbackPath, depth + 1);
+      }
+      return;
+    }
+    if (typeof value !== 'object') {
+      return;
+    }
+
+    const nextFallback = String(value.path || value.filePath || value.file_path || value.filename || value.name || fallbackPath || '');
+    addRecord(normalizeFileChangeRecord(value, nextFallback));
+    for (const key of ['changes', 'files', 'fileChanges', 'file_changes', 'edits', 'patches', 'diffs', 'items']) {
+      if (value[key]) {
+        visit(value[key], nextFallback, depth + 1);
+      }
+    }
+    for (const key of ['diff', 'patch', 'unifiedDiff', 'unified_diff']) {
+      if (typeof value[key] === 'string') {
+        visit(value[key], nextFallback, depth + 1);
+      }
+    }
+  }
+
+  for (const root of roots) {
+    visit(root);
+  }
+  return records.slice(0, 12);
 }
 
 function shortId(value) {
@@ -933,6 +1781,7 @@ function getConversationGroups(hostId) {
       group.lastUpdatedAt = group.sessions[0]?.lastUpdatedAt || null;
       group.latestUserMessage = firstNonEmpty(group.sessions.map((session) => session.latestUserMessage));
       group.latestAgentMessage = firstNonEmpty(group.sessions.map((session) => session.latestAgentMessage));
+      group.apiProfile = group.preferredSession?.apiProfile || group.sessions.find((session) => session.apiProfile)?.apiProfile || null;
       return group;
     })
     .sort((a, b) => {
@@ -1173,6 +2022,33 @@ async function createSessionCollection(name) {
   renderAll();
 }
 
+async function renameSessionCollection(collectionId, name) {
+  if (!collectionId || collectionId === 'default') {
+    return;
+  }
+  const response = await fetchJson(`/api/session-collections/${encodeURIComponent(collectionId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  });
+  await refreshSessionCollections();
+  state.selectedCollectionId = response.collection?.collectionId || state.selectedCollectionId;
+  renderAll();
+}
+
+async function deleteSessionCollection(collectionId) {
+  if (!collectionId || collectionId === 'default') {
+    return;
+  }
+  await fetchJson(`/api/session-collections/${encodeURIComponent(collectionId)}`, {
+    method: 'DELETE',
+  });
+  if (state.selectedCollectionId === collectionId) {
+    state.selectedCollectionId = 'default';
+  }
+  await refreshSessionCollections();
+  renderAll();
+}
+
 async function addConversationToCollection(collectionId, group) {
   if (!collectionId || collectionId === 'default') {
     return;
@@ -1357,6 +2233,26 @@ function getAlertsForSession(session) {
 function getTranscriptForSession(session) {
   const key = getSessionKey(session);
   return key ? state.transcripts.get(key) || [] : [];
+}
+
+function isTranscriptPinnedToBottom(log) {
+  if (!log) {
+    return true;
+  }
+  const distanceFromBottom = log.scrollHeight - log.scrollTop - log.clientHeight;
+  return distanceFromBottom < 96;
+}
+
+function restoreTranscriptScroll(log, options = {}) {
+  if (!log) {
+    return;
+  }
+  if (options.forceScroll || options.shouldStickToBottom) {
+    log.scrollTop = log.scrollHeight;
+    return;
+  }
+  const bottomOffset = Number.isFinite(options.bottomOffset) ? options.bottomOffset : 0;
+  log.scrollTop = Math.max(0, log.scrollHeight - log.clientHeight - bottomOffset);
 }
 
 function setRuntimeForSession(hostId, sessionId, runtime) {
@@ -1575,7 +2471,13 @@ function getConnectorForHost(hostId) {
 }
 
 function syncModalBodyState() {
-  const open = Boolean(state.connectorManagerOpen || state.directoryPicker.open || state.statusWindowOpen);
+  const open = Boolean(
+    state.connectorManagerOpen
+    || state.directoryPicker.open
+    || state.statusWindowOpen
+    || state.sessionDetailsOpen
+    || state.settingsOpen
+  );
   document.body.classList.toggle('modal-open', open);
 }
 
@@ -1844,6 +2746,40 @@ function renderConnectorRunbook(connector) {
   renderConnectorRunbookList(el('connector-plan-warnings'), connector?.plan?.warnings || [], 'No MFA or auth warnings.');
 }
 
+function connectorCodexInstallGuidance(result) {
+  if (!result) {
+    return [];
+  }
+  const statusText = [
+    result.status,
+    result.deploy?.status,
+    result.message,
+    result.deploy?.message,
+  ].filter(Boolean).join(' ');
+  if (!/codex_runtime_missing|no .*codex cli|codex cli .*not found|CODEX_REMOTE_CHECK_CODEX=missing/i.test(statusText)) {
+    return [];
+  }
+
+  return [
+    'Remote Codex CLI install guide:',
+    'Option A, shared HPC/conda:',
+    'conda create -n codex-node -c conda-forge nodejs=20 -y',
+    'conda activate codex-node',
+    'npm install -g @openai/codex',
+    'codex --help',
+    '',
+    'Option B, personal Linux server:',
+    'curl -fsSL https://fnm.vercel.app/install | bash',
+    'source ~/.bashrc',
+    'fnm install 20',
+    'fnm use 20',
+    'npm install -g @openai/codex',
+    'codex --help',
+    '',
+    'After installation, run Start Agent again. The remote scanner checks PATH, ~/.codex, common conda/nvm locations, and the uploaded runtime.',
+  ];
+}
+
 function renderConnectorActionResult(container, result, busy) {
   if (!result && !busy) {
     container.className = 'connector-action-result hidden';
@@ -1894,6 +2830,10 @@ function renderConnectorActionResult(container, result, busy) {
     }
     if (result.bootstrapCommand && result.status === 'manual_required') {
       lines.push(`manual bootstrap:\n${result.bootstrapCommand}`);
+    }
+    const installGuidance = connectorCodexInstallGuidance(result);
+    if (installGuidance.length) {
+      lines.push(installGuidance.join('\n'));
     }
   }
 
@@ -2136,25 +3076,85 @@ function renderVariantButtons(container, conversation, selectedSessionId) {
 }
 
 function renderCollectionTabs() {
-  const container = el('session-collection-tabs');
-  if (!container) {
+  const select = el('session-collection-select');
+  const popover = el('collection-manager-popover');
+  const list = el('collection-manager-list');
+  if (!select) {
     return;
   }
-  container.innerHTML = '';
 
+  select.innerHTML = '';
   for (const collection of state.sessionCollections) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = `collection-tab secondary-button ${collection.collectionId === state.selectedCollectionId ? 'active' : ''}`.trim();
-    button.innerHTML = `
-      <span>${escapeHtml(collection.name || 'Collection')}</span>
-      <span class="collection-count">${collection.itemCount || 0}</span>
+    const option = document.createElement('option');
+    option.value = collection.collectionId;
+    option.textContent = `${collection.name || 'Collection'} (${collection.itemCount || 0})`;
+    select.appendChild(option);
+  }
+  select.value = state.selectedCollectionId;
+
+  if (popover) {
+    popover.classList.toggle('hidden', !state.collectionManagerOpen);
+  }
+  if (!list) {
+    return;
+  }
+  list.innerHTML = '';
+  for (const collection of state.sessionCollections) {
+    const row = document.createElement('div');
+    row.className = 'collection-manager-row';
+    const isDefault = collection.collectionId === 'default';
+    row.innerHTML = `
+      <div class="collection-manager-copy">
+        <strong>${escapeHtml(collection.name || 'Collection')}</strong>
+        <span>${escapeHtml(isDefault ? 'Default collection keeps every session.' : `${collection.itemCount || 0} saved conversation${collection.itemCount === 1 ? '' : 's'}.`)}</span>
+      </div>
     `;
-    button.onclick = () => {
-      state.selectedCollectionId = collection.collectionId;
-      renderAll();
-    };
-    container.appendChild(button);
+    const actions = document.createElement('div');
+    actions.className = 'collection-manager-actions';
+    if (!isDefault) {
+      const renameButton = document.createElement('button');
+      renameButton.type = 'button';
+      renameButton.className = 'secondary-button';
+      renameButton.textContent = 'Rename';
+      renameButton.onclick = async () => {
+        const currentName = collection.name || 'Collection';
+        const nextName = window.prompt(`Rename collection "${currentName}" to:`, currentName);
+        const trimmed = String(nextName || '').trim();
+        if (!trimmed || trimmed === currentName) {
+          return;
+        }
+        if (!window.confirm(`Rename "${currentName}" to "${trimmed}"?`)) {
+          return;
+        }
+        try {
+          await renameSessionCollection(collection.collectionId, trimmed);
+        } catch (error) {
+          reportError(error);
+        }
+      };
+      const deleteButton = document.createElement('button');
+      deleteButton.type = 'button';
+      deleteButton.className = 'danger-button';
+      deleteButton.textContent = 'Delete';
+      deleteButton.onclick = async () => {
+        if (!window.confirm(`Delete collection "${collection.name || 'Collection'}"? Sessions will stay in Default.`)) {
+          return;
+        }
+        try {
+          await deleteSessionCollection(collection.collectionId);
+        } catch (error) {
+          reportError(error);
+        }
+      };
+      actions.append(renameButton, deleteButton);
+    } else {
+      const badge = document.createElement('span');
+      badge.className = 'collection-manager-badge';
+      badge.textContent = 'System';
+      actions.appendChild(badge);
+    }
+    row.appendChild(actions);
+    list.appendChild(row);
   }
 }
 
@@ -2174,6 +3174,7 @@ function renderConversationNav() {
   const searchInput = el('session-search-input');
   const searchMode = el('session-search-mode');
   const searchSummary = el('session-search-summary');
+  const clearSearchButton = el('clear-session-search-button');
   if (searchInput && document.activeElement !== searchInput) {
     searchInput.value = state.sessionSearchQuery;
   }
@@ -2190,6 +3191,9 @@ function renderConversationNav() {
       : groups.length
         ? `${groups.length} conversations in ${scope}`
         : '';
+  }
+  if (clearSearchButton) {
+    clearSearchButton.classList.toggle('hidden', !state.sessionSearchQuery.trim());
   }
 
   if (!groups.length) {
@@ -2210,6 +3214,10 @@ function renderConversationNav() {
   }
 
   for (const group of visibleGroups) {
+    const apiSummary = getSessionApiProfileSummary(group.preferredSession || group.sessions?.[0] || {
+      hostId: group.hostId,
+      apiProfile: group.apiProfile,
+    });
     const preview = group.latestUserMessage
       ? `You: ${truncatePreview(group.latestUserMessage)}`
       : group.latestAgentMessage
@@ -2230,6 +3238,9 @@ function renderConversationNav() {
         </div>
       </div>
       <div class="path">${escapeHtml(group.cwd || '(unknown path)')}</div>
+      <div class="conversation-tag-row">
+        <span class="api-profile-chip ${apiSummary.source === 'recorded' ? 'recorded' : 'fallback'}" title="${escapeHtml(apiSummary.title)}">${escapeHtml(apiSummary.label)}</span>
+      </div>
       <div class="conversation-summary">
         <span>${escapeHtml(formatTime(group.lastUpdatedAt) || 'No recent activity')}</span>
         <span>${group.liveCount > 0 ? 'Joinable live session' : 'History can be resumed'}</span>
@@ -2347,6 +3358,15 @@ function isDownloadablePath(value) {
   return DOWNLOADABLE_FILE_EXTENSIONS.has(fileExtension(text));
 }
 
+function isBareDownloadableFilename(value) {
+  const text = String(value || '').trim();
+  return Boolean(text)
+    && !/[\\/]/.test(text)
+    && !/^[A-Za-z]:/.test(text)
+    && !text.startsWith('~')
+    && isDownloadablePath(text);
+}
+
 function stripPathPunctuation(value) {
   return String(value || '')
     .trim()
@@ -2410,7 +3430,13 @@ function extractFileRefsFromText(text) {
     'gi'
   );
   while ((match = relativePattern.exec(source))) {
-    addRef(match[1]);
+    const pathValue = decodePathCandidate(match[1]);
+    // Markdown labels like [plot.png] are often just display names for an
+    // absolute path listed nearby. Treating bare names as paths makes the
+    // browser auto-preview missing files and spam repeated download errors.
+    if (!isBareDownloadableFilename(pathValue)) {
+      addRef(pathValue);
+    }
   }
 
   return refs;
@@ -2423,7 +3449,7 @@ function getTranscriptFileRefs(entry) {
   const merged = [];
   for (const file of [...explicit, ...extracted]) {
     const key = file.path || file.name;
-    if (!key || seen.has(key)) {
+    if (!key || seen.has(key) || isBareDownloadableFilename(file.path || '')) {
       continue;
     }
     seen.add(key);
@@ -2646,6 +3672,146 @@ function renderReasoningEffortOptions(session) {
   select.value = options.some((optionSpec) => optionSpec.value === current) ? current : '';
 }
 
+function normalizeComposerOptionValues(options = {}) {
+  return {
+    ...DEFAULT_COMPOSER_OPTIONS,
+    model: String(options.model || '').trim(),
+    effort: String(options.effort || '').trim() || DEFAULT_COMPOSER_OPTIONS.effort,
+    summary: String(options.summary || '').trim(),
+    mode: String(options.mode || '').trim() || DEFAULT_COMPOSER_OPTIONS.mode,
+    approvalPolicy: typeof options.approvalPolicy === 'object'
+      ? options.approvalPolicy
+      : String(options.approvalPolicy || '').trim() || DEFAULT_COMPOSER_OPTIONS.approvalPolicy,
+    approvalsReviewer: String(options.approvalsReviewer || '').trim() || DEFAULT_COMPOSER_OPTIONS.approvalsReviewer,
+    sandboxMode: String(options.sandboxMode || '').trim() || DEFAULT_COMPOSER_OPTIONS.sandboxMode,
+    personality: String(options.personality || '').trim(),
+  };
+}
+
+function inferComposerOptionsFromText(text) {
+  const source = String(text || '');
+  const inferred = {};
+  const modelMatch = source.match(/\bmodel\s*[:=]\s*([A-Za-z0-9._/-]+)/i);
+  if (modelMatch) {
+    inferred.model = modelMatch[1];
+  }
+  const effortMatch = source.match(/\b(?:effort|reasoning(?: effort)?)\s*[:=]\s*(minimal|low|medium|high|xhigh)\b/i);
+  if (effortMatch) {
+    inferred.effort = effortMatch[1].toLowerCase();
+  }
+  const reviewerMatch = source.match(/\b(?:reviewer|approvalsReviewer|approvals reviewer)\s*[:=]\s*(auto[_-]?review|user)\b/i);
+  if (reviewerMatch) {
+    inferred.approvalsReviewer = reviewerMatch[1].replace('-', '_').toLowerCase();
+  }
+  return inferred;
+}
+
+function inferComposerOptionsFromSession(session) {
+  if (!session) {
+    return { ...DEFAULT_COMPOSER_OPTIONS };
+  }
+  const runtime = getRuntimeForSession(session) || session.runtime || {};
+  const diagnostics = getDiagnosticsForSession(session);
+  const latestTurnControl = [...diagnostics].reverse().find((entry) => (
+    entry?.kind === 'control'
+    && entry?.method === 'turn/start'
+    && entry?.data
+  ));
+  const textInferred = inferComposerOptionsFromText([
+    session.latestUserMessage,
+    session.latestAgentMessage,
+    ...(Array.isArray(session.transcriptPreview) ? session.transcriptPreview.map((entry) => entry.text) : []),
+  ].filter(Boolean).join('\n'));
+  return normalizeComposerOptionValues({
+    ...textInferred,
+    ...(session.codexOptions || {}),
+    ...(latestTurnControl?.data || {}),
+    model: runtime.model || latestTurnControl?.data?.model || session.codexOptions?.model || textInferred.model || '',
+    effort: runtime.effort || latestTurnControl?.data?.effort || session.codexOptions?.effort || textInferred.effort || '',
+    summary: runtime.summary || latestTurnControl?.data?.summary || session.codexOptions?.summary || '',
+    approvalPolicy: runtime.approvalPolicy || latestTurnControl?.data?.approvalPolicy || session.codexOptions?.approvalPolicy || '',
+    approvalsReviewer: runtime.approvalsReviewer || latestTurnControl?.data?.approvalsReviewer || session.codexOptions?.approvalsReviewer || textInferred.approvalsReviewer || '',
+    sandboxMode: runtime.sandboxMode || session.codexOptions?.sandboxMode || '',
+    personality: runtime.personality || session.codexOptions?.personality || '',
+  });
+}
+
+function getComposerOptionsForSession(session) {
+  const key = getSessionKey(session);
+  if (!key) {
+    return { ...DEFAULT_COMPOSER_OPTIONS };
+  }
+  if (!state.codexControls.sessionOptionsByKey.has(key)) {
+    state.codexControls.sessionOptionsByKey.set(key, inferComposerOptionsFromSession(session));
+  }
+  return state.codexControls.sessionOptionsByKey.get(key);
+}
+
+function refreshInferredComposerOptionsForSession(session) {
+  const key = getSessionKey(session);
+  if (!key || state.codexControls.persistedSessionOptionKeys.has(key)) {
+    return;
+  }
+  state.codexControls.sessionOptionsByKey.set(key, inferComposerOptionsFromSession(session));
+}
+
+function persistComposerSessionOptions() {
+  const serialized = {};
+  for (const [key, value] of state.codexControls.sessionOptionsByKey.entries()) {
+    if (!state.codexControls.persistedSessionOptionKeys.has(key)) {
+      continue;
+    }
+    serialized[key] = normalizeComposerOptionValues(value);
+  }
+  writeLocalStorageJson(COMPOSER_SESSION_OPTIONS_STORAGE_KEY, serialized);
+}
+
+function setSelectIfAvailable(id, value) {
+  const node = el(id);
+  if (!node) {
+    return;
+  }
+  const stringValue = String(value || '');
+  const hasValue = Array.from(node.options || []).some((option) => option.value === stringValue);
+  node.value = hasValue ? stringValue : '';
+}
+
+function applyComposerOptionsToControls(session) {
+  const options = getComposerOptionsForSession(session);
+  const modelInput = el('codex-model-input');
+  if (modelInput) {
+    modelInput.value = options.model || '';
+  }
+  setSelectIfAvailable('codex-effort-select', options.effort);
+  setSelectIfAvailable('codex-summary-select', options.summary);
+  setSelectIfAvailable('codex-mode-select', options.mode);
+  setSelectIfAvailable('codex-approval-policy-select', options.approvalPolicy);
+  setSelectIfAvailable('codex-reviewer-select', options.approvalsReviewer);
+  setSelectIfAvailable('codex-sandbox-mode-select', options.sandboxMode);
+  setSelectIfAvailable('codex-personality-select', options.personality);
+  syncModelSelectFromInput(session);
+}
+
+function saveComposerOptionsFromControls(session = getSelectedSession()) {
+  const key = getSessionKey(session);
+  if (!key) {
+    return;
+  }
+  const next = normalizeComposerOptionValues({
+    model: el('codex-model-input')?.value.trim() || '',
+    effort: el('codex-effort-select')?.value || '',
+    summary: el('codex-summary-select')?.value || '',
+    mode: el('codex-mode-select')?.value || 'default',
+    approvalPolicy: el('codex-approval-policy-select')?.value || 'on-request',
+    approvalsReviewer: el('codex-reviewer-select')?.value || '',
+    sandboxMode: el('codex-sandbox-mode-select')?.value || 'workspaceWrite',
+    personality: el('codex-personality-select')?.value || '',
+  });
+  state.codexControls.sessionOptionsByKey.set(key, next);
+  state.codexControls.persistedSessionOptionKeys.add(key);
+  persistComposerSessionOptions();
+}
+
 function renderAttachmentChips() {
   const container = el('codex-attachment-chips');
   if (!container) {
@@ -2684,10 +3850,14 @@ function renderAttachmentChips() {
 }
 
 function renderComposerControls(session, disabled) {
+  refreshInferredComposerOptionsForSession(session);
   renderComposerModelOptions(session);
+  applyComposerOptionsToControls(session);
   renderReasoningEffortOptions(session);
+  applyComposerOptionsToControls(session);
   renderAttachmentChips();
   requestModelOptionsForSession(session);
+  renderComposerTurnNotice();
 
   const controlIds = [
     'codex-model-input',
@@ -2723,6 +3893,242 @@ function renderComposerControls(session, disabled) {
   const reviewButton = el('codex-review-button');
   if (reviewButton) {
     reviewButton.disabled = disabled || !session?.live;
+  }
+
+  const runtime = getRuntimeForSession(session) || session?.runtime || {};
+  const activeTurn = Boolean(session?.live && runtimeIsActive(runtime));
+  const interruptButton = el('codex-interrupt-button');
+  if (interruptButton) {
+    interruptButton.classList.toggle('hidden', !activeTurn);
+    interruptButton.disabled = disabled || !activeTurn;
+  }
+  const sendButton = el('codex-send-button');
+  if (sendButton) {
+    sendButton.textContent = activeTurn ? 'Queue' : 'Send';
+  }
+  maybeScheduleQueuedPromptSend(session);
+}
+
+function getSelectedSteerQueue() {
+  const selectedKey = getSessionKey(getSelectedSession());
+  if (!selectedKey) {
+    return [];
+  }
+  return state.codexControls.steerQueue.filter((item) => item.sessionKey === selectedKey);
+}
+
+function findSteerQueueItem(itemId) {
+  return state.codexControls.steerQueue.find((item) => item.id === itemId) || null;
+}
+
+function getSteerQueueText(item) {
+  return String(item?.text || item?.payload?.text || item?.payload?.displayText || '');
+}
+
+function setSteerQueueItemText(item, text) {
+  if (!item) {
+    return;
+  }
+  const nextText = String(text || '');
+  item.text = nextText;
+  item.updatedAt = new Date().toISOString();
+  item.payload = {
+    ...(item.payload || {}),
+    text: nextText,
+    displayText: nextText,
+  };
+  if (item.payload.composerDraft) {
+    item.payload.composerDraft = {
+      ...item.payload.composerDraft,
+      text: nextText,
+    };
+  }
+}
+
+function addSteerQueueItem(session, payload, steerText) {
+  const text = String(steerText || '').trim();
+  const item = {
+    id: makeClientId(),
+    sessionKey: getSessionKey(session),
+    hostId: session.hostId,
+    sessionId: session.sessionId,
+    text,
+    payload: {
+      ...payload,
+      text,
+      displayText: text,
+    },
+    createdAt: new Date().toISOString(),
+    sentAt: null,
+    status: 'queued',
+    sending: false,
+    forceSending: false,
+    error: '',
+  };
+  state.codexControls.steerQueue.push(item);
+  return item;
+}
+
+function removeSteerQueueItem(itemId) {
+  state.codexControls.steerQueue = state.codexControls.steerQueue.filter((item) => item.id !== itemId);
+}
+
+function clearSteerQueueForSession(session) {
+  const key = getSessionKey(session);
+  if (!key) {
+    return;
+  }
+  state.codexControls.steerQueue = state.codexControls.steerQueue.filter((item) => item.sessionKey !== key);
+}
+
+function summarizeQueuedPayload(payload) {
+  const pieces = [];
+  const uploadedCount = Array.isArray(payload?.uploadedFiles) ? payload.uploadedFiles.length : 0;
+  const itemCount = Array.isArray(payload?.inputItems) ? payload.inputItems.length : 0;
+  if (uploadedCount) {
+    pieces.push(`${uploadedCount} file${uploadedCount === 1 ? '' : 's'}`);
+  }
+  if (itemCount) {
+    pieces.push(`${itemCount} input item${itemCount === 1 ? '' : 's'}`);
+  }
+  if (payload?.mode && payload.mode !== 'default') {
+    pieces.push(payload.mode);
+  }
+  return pieces.join(' · ');
+}
+
+function getFirstQueuedPrompt(session = getSelectedSession()) {
+  const sessionKey = getSessionKey(session);
+  if (!sessionKey) {
+    return null;
+  }
+  return state.codexControls.steerQueue.find((item) => (
+    item.sessionKey === sessionKey
+    && item.status === 'queued'
+    && !item.sending
+    && !item.forceSending
+  )) || null;
+}
+
+function getQueueStatusLabel(item) {
+  if (item.forceSending) {
+    return 'interrupting';
+  }
+  if (item.sending) {
+    return 'sending';
+  }
+  if (item.status === 'guided') {
+    return 'guided';
+  }
+  if (item.status === 'failed') {
+    return 'failed';
+  }
+  return 'waiting';
+}
+
+function renderComposerTurnNotice() {
+  const notice = el('composer-turn-notice');
+  if (!notice) {
+    return;
+  }
+  const queue = getSelectedSteerQueue();
+  const steerNotice = state.codexControls.steerNotice;
+  const show = Boolean(queue.length || steerNotice);
+  notice.classList.toggle('hidden', !show);
+  if (!show) {
+    return;
+  }
+
+  const title = el('composer-turn-notice-title');
+  const copy = el('composer-turn-notice-copy');
+  const forceButton = el('composer-force-send-button');
+  const list = el('composer-steer-queue-list');
+  if (queue.length) {
+    const waitingCount = queue.filter((item) => item.status === 'queued').length;
+    title.textContent = `Pending queue (${queue.length})`;
+    copy.textContent = waitingCount
+      ? 'These prompts are waiting in order. Edit or remove them, guide one into the current turn, or interrupt and send one immediately.'
+      : 'These prompts were guided into the current turn. They stay visible so you can edit, remove, or force-send a fresh turn if needed.';
+    forceButton.classList.remove('hidden');
+    forceButton.disabled = queue.some((item) => item.forceSending);
+    forceButton.textContent = 'Interrupt & Send First';
+  } else {
+    title.textContent = steerNotice?.title || 'Active turn updated';
+    copy.textContent = steerNotice?.message || 'Your message was added to the current Codex turn.';
+    forceButton.classList.add('hidden');
+    forceButton.disabled = true;
+  }
+
+  if (!list) {
+    return;
+  }
+  list.innerHTML = '';
+  list.classList.toggle('hidden', !queue.length);
+  for (const [index, item] of queue.entries()) {
+    const card = document.createElement('div');
+    card.className = 'steer-queue-item';
+
+    const header = document.createElement('div');
+    header.className = 'steer-queue-item-header';
+
+    const label = document.createElement('div');
+    label.className = 'steer-queue-item-label';
+    label.textContent = `#${index + 1} · ${getQueueStatusLabel(item)}`;
+    header.appendChild(label);
+
+    const meta = summarizeQueuedPayload(item.payload);
+    if (meta) {
+      const metaNode = document.createElement('div');
+      metaNode.className = 'steer-queue-item-meta';
+      metaNode.textContent = meta;
+      header.appendChild(metaNode);
+    }
+    card.appendChild(header);
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'steer-queue-text';
+    textarea.dataset.steerQueueText = item.id;
+    textarea.rows = 3;
+    textarea.value = getSteerQueueText(item);
+    textarea.placeholder = 'Edit this waiting prompt before it is sent or guided...';
+    card.appendChild(textarea);
+
+    if (item.error) {
+      const error = document.createElement('div');
+      error.className = 'steer-queue-error';
+      error.textContent = item.error;
+      card.appendChild(error);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'steer-queue-actions';
+
+    const force = document.createElement('button');
+    force.type = 'button';
+    force.className = 'secondary-button';
+    force.dataset.forceSteerQueueId = item.id;
+    force.disabled = item.forceSending || item.sending;
+    force.textContent = item.forceSending ? 'Interrupting...' : 'Interrupt & Send';
+    actions.appendChild(force);
+
+    const guide = document.createElement('button');
+    guide.type = 'button';
+    guide.className = 'secondary-button';
+    guide.dataset.guideSteerQueueId = item.id;
+    guide.disabled = item.forceSending || item.sending || item.status === 'guided' || !runtimeIsActive(getRuntimeForSession(getSelectedSession()) || getSelectedSession()?.runtime || {});
+    guide.textContent = item.status === 'guided' ? 'Guided' : 'Guide';
+    actions.appendChild(guide);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'secondary-button';
+    remove.dataset.removeSteerQueueId = item.id;
+    remove.disabled = item.forceSending || item.sending;
+    remove.textContent = 'Remove';
+    actions.appendChild(remove);
+
+    card.appendChild(actions);
+    list.appendChild(card);
   }
 }
 
@@ -2787,10 +4193,97 @@ function getComposerOptions() {
     summary: el('codex-summary-select')?.value || null,
     mode: el('codex-mode-select')?.value || 'default',
     approvalPolicy: el('codex-approval-policy-select')?.value || 'on-request',
-    approvalsReviewer: el('codex-reviewer-select')?.value || 'user',
+    approvalsReviewer: el('codex-reviewer-select')?.value || 'auto_review',
     sandboxMode: el('codex-sandbox-mode-select')?.value || 'workspaceWrite',
     personality: el('codex-personality-select')?.value || null,
   };
+}
+
+function cloneComposerAttachment(attachment) {
+  return {
+    ...attachment,
+  };
+}
+
+function snapshotComposerDraft(rawText) {
+  return {
+    text: String(rawText || ''),
+    attachments: state.codexControls.attachments.map(cloneComposerAttachment),
+    localImagePath: el('codex-local-image-path')?.value || '',
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function setActiveDraftForSession(session, payload) {
+  const key = getSessionKey(session);
+  const draft = payload?.composerDraft;
+  if (!key || !draft) {
+    return;
+  }
+  state.codexControls.activeDraftsBySession.set(key, {
+    ...draft,
+    text: String(draft.text || payload.displayText || payload.text || ''),
+  });
+}
+
+function clearActiveDraftForSession(session) {
+  const key = getSessionKey(session);
+  if (key) {
+    state.codexControls.activeDraftsBySession.delete(key);
+  }
+}
+
+function restoreComposerDraft(draft, options = {}) {
+  if (!draft) {
+    return false;
+  }
+  const input = el('input-text');
+  if (input) {
+    const draftText = String(options.textOverride ?? draft.text ?? '');
+    if (options.replace || !input.value.trim()) {
+      input.value = draftText;
+    } else if (draftText) {
+      input.value = `${input.value.trimEnd()}\n\n${draftText}`;
+    }
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  const nextAttachments = Array.isArray(draft.attachments)
+    ? draft.attachments.map(cloneComposerAttachment)
+    : [];
+  if (nextAttachments.length) {
+    const existingKeys = new Set(state.codexControls.attachments.map((attachment) => (
+      attachment.fileId || `${attachment.type}|${attachment.name}|${attachment.size}|${attachment.remotePath || ''}`
+    )));
+    for (const attachment of nextAttachments) {
+      const key = attachment.fileId || `${attachment.type}|${attachment.name}|${attachment.size}|${attachment.remotePath || ''}`;
+      if (!existingKeys.has(key)) {
+        state.codexControls.attachments.push(attachment);
+        existingKeys.add(key);
+      }
+    }
+  }
+
+  const localImageInput = el('codex-local-image-path');
+  if (localImageInput && draft.localImagePath && !localImageInput.value.trim()) {
+    localImageInput.value = draft.localImagePath;
+    localImageInput.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  renderAttachmentChips();
+  return true;
+}
+
+function restoreActiveDraftForSession(session) {
+  const key = getSessionKey(session);
+  if (!key) {
+    return false;
+  }
+  const draft = state.codexControls.activeDraftsBySession.get(key);
+  if (!restoreComposerDraft(draft, { replace: false })) {
+    return false;
+  }
+  state.codexControls.activeDraftsBySession.delete(key);
+  return true;
 }
 
 function buildPlanPrompt(text, hasAttachments) {
@@ -3287,6 +4780,7 @@ async function uploadComposerFiles(session) {
 
 async function buildComposerPayload(rawText, overrides = {}) {
   const session = getSelectedSession();
+  const composerDraft = snapshotComposerDraft(rawText);
   const uploadedFiles = await uploadComposerFiles(session);
   const inputItems = getComposerInputItems(uploadedFiles);
   const textFileSections = getComposerTextFileSections();
@@ -3321,6 +4815,7 @@ async function buildComposerPayload(rawText, overrides = {}) {
     displayText: userVisibleText || (hasOriginalContent ? 'Please inspect the attached file(s).' : ''),
     inputItems,
     uploadedFiles,
+    composerDraft,
   };
 }
 
@@ -3494,12 +4989,16 @@ async function handleComposerDrop(event) {
 
 function renderSessionDetails() {
   const session = getSelectedSession();
+  if (!session && state.sessionDetailsOpen) {
+    state.sessionDetailsOpen = false;
+  }
   const conversation = getSelectedConversation();
   const joinButton = el('join-session-button');
   const resumeButton = el('resume-session-button');
   const forkButton = el('fork-session-button');
   const alertsButton = el('toggle-alerts-button');
   const statusButton = el('toggle-status-button');
+  const endSessionButton = el('end-session-button');
   const composer = el('input-form');
   const input = el('input-text');
   const runner = getRunnerSummary(session);
@@ -3508,11 +5007,42 @@ function renderSessionDetails() {
   const alerts = getAlertsForSession(session);
   const pendingRequests = getRequestsForSession(session).filter((request) => request.status === 'pending');
   const runtime = getRuntimeForSession(session);
+  const summaryTitle = el('session-detail-summary-title');
+  const summaryPath = el('session-detail-summary-path');
+  const summaryStatus = el('session-detail-summary-status');
+  const modalTitle = el('session-detail-modal-title');
+  const modalSubtitle = el('session-detail-modal-subtitle');
+  const detailsButton = el('session-details-button');
+  const overlay = el('session-details-overlay');
+  const modal = el('session-details-modal');
+  const apiSummary = getSessionApiProfileSummary(session);
+
+  if (overlay && modal) {
+    overlay.classList.toggle('hidden', !state.sessionDetailsOpen);
+    modal.classList.toggle('hidden', !state.sessionDetailsOpen);
+    syncModalBodyState();
+  }
 
   el('session-title').textContent = session ? session.title || session.sessionId : 'No session selected';
-  el('session-meta').textContent = session
-    ? `${session.hostId} | ${conversation?.totalCount || 1} variants | ${session.state || 'unknown'}`
-    : '';
+  const headerMeta = el('session-meta');
+  if (headerMeta) {
+    if (session) {
+      const metaLine = [
+        session.hostId,
+        `${conversation?.totalCount || 1} variants`,
+        session.state || 'unknown',
+        apiSummary.label,
+      ].filter(Boolean).join(' | ');
+      headerMeta.innerHTML = [
+        escapeHtml(metaLine),
+        session.cwd ? `<span class="session-meta-path">${escapeHtml(session.cwd)}</span>` : '',
+      ].filter(Boolean).join('<br>');
+      headerMeta.title = [metaLine, session.cwd || ''].filter(Boolean).join('\n');
+    } else {
+      headerMeta.textContent = '';
+      headerMeta.title = '';
+    }
+  }
   el('session-path').textContent = session?.cwd || '(unknown path)';
   el('session-status').textContent = session
     ? `${session.live ? 'Live' : 'History only'} | ${session.state || 'unknown'}`
@@ -3520,6 +5050,32 @@ function renderSessionDetails() {
   el('session-runner').textContent = runner.label;
   el('latest-user-message').textContent = session?.latestUserMessage || 'No recent user prompt captured.';
   el('latest-agent-message').textContent = getLatestFormalAgentMessage(session);
+  if (summaryTitle) {
+    summaryTitle.textContent = session ? session.title || session.sessionId : 'No session selected';
+  }
+  if (summaryPath) {
+    summaryPath.textContent = session?.cwd || 'Select a conversation to inspect path, status, messages, and variants.';
+  }
+  if (summaryStatus) {
+    summaryStatus.textContent = session
+      ? `${session.live ? 'Live' : 'History only'} | ${session.state || 'unknown'} | ${apiSummary.label}`
+      : 'No session';
+    summaryStatus.title = session ? apiSummary.title : '';
+    summaryStatus.className = `runtime-chip ${session?.live ? 'active' : session ? 'info' : 'warning'}`;
+  }
+  if (modalTitle) {
+    modalTitle.textContent = session ? session.title || session.sessionId : 'No session selected';
+  }
+  if (modalSubtitle) {
+    modalSubtitle.textContent = session
+      ? `${session.hostId} | ${conversation?.totalCount || 1} variants | ${apiSummary.label} | ${session.cwd || '(unknown path)'}`
+      : 'Path, runner, latest messages, and variants.';
+    modalSubtitle.title = session ? apiSummary.title : '';
+  }
+  if (detailsButton) {
+    detailsButton.disabled = !session;
+    detailsButton.classList.add('hidden');
+  }
   if (runner.warning) {
     warningText.textContent = runner.warning;
     warningCard.classList.remove('hidden');
@@ -3535,6 +5091,13 @@ function renderSessionDetails() {
     : runtime?.phase
       ? `Status: ${prettyStatusLabel(runtime.phase)}`
       : 'Status';
+  if (endSessionButton) {
+    endSessionButton.hidden = true;
+    endSessionButton.disabled = true;
+    endSessionButton.textContent = runtime?.phase === 'ending' || runtime?.connection === 'closing'
+      ? 'Ending Session...'
+      : 'End Session';
+  }
 
   renderVariantButtons(el('session-variants'), conversation, state.selectedSessionId);
 
@@ -3546,6 +5109,8 @@ function renderSessionDetails() {
     joinButton.textContent = 'Join Running Session';
     resumeButton.disabled = true;
     resumeButton.textContent = 'Resume From History';
+    resumeButton.classList.remove('danger-button');
+    resumeButton.classList.add('secondary-button');
     forkButton.disabled = true;
     forkButton.textContent = 'Fork New Branch';
   } else {
@@ -3560,13 +5125,21 @@ function renderSessionDetails() {
       joinButton.textContent = 'Join Running Session';
     }
 
-    resumeButton.disabled = !canActivateHistory;
-    if (canActivateHistory && liveSession) {
-      resumeButton.textContent = 'Resume History Again';
-    } else if (canActivateHistory) {
-      resumeButton.textContent = 'Resume From History';
+    const isEnding = runtime?.phase === 'ending' || runtime?.connection === 'closing';
+    resumeButton.classList.toggle('danger-button', Boolean(session.live));
+    resumeButton.classList.toggle('secondary-button', !session.live);
+    if (session.live) {
+      resumeButton.disabled = isEnding;
+      resumeButton.textContent = isEnding ? 'Stopping Session...' : 'Stop Session';
     } else {
-      resumeButton.textContent = session.live ? 'Already Live' : 'Cannot Resume';
+      resumeButton.disabled = !canActivateHistory;
+      if (canActivateHistory && liveSession) {
+        resumeButton.textContent = 'Resume History Again';
+      } else if (canActivateHistory) {
+        resumeButton.textContent = 'Resume From History';
+      } else {
+        resumeButton.textContent = 'Cannot Resume';
+      }
     }
 
     forkButton.disabled = !canFork;
@@ -3588,6 +5161,8 @@ function renderSessionDetails() {
   }
 
   renderApprovalPopup();
+  renderStatusWindow();
+  renderLocaleLabels();
 }
 
 function createRuntimeChip(container, label, value, tone = 'info') {
@@ -3604,30 +5179,63 @@ function renderRuntimePanel() {
   const requests = getRequestsForSession(session).filter((request) => request.status === 'pending');
   const titleEl = el('runtime-panel-title');
   const subtitleEl = el('runtime-panel-subtitle');
+  const detailTitleEl = el('runtime-detail-title');
+  const detailSubtitleEl = el('runtime-detail-subtitle');
   const chipRow = el('runtime-chip-row');
-  const interruptButton = el('runtime-interrupt-button');
-  const compactButton = el('runtime-compact-button');
-  const statusButton = el('runtime-open-status-button');
+  const detailChipRow = el('runtime-detail-chip-row');
+  const detailsButton = el('session-details-button');
+  const statusButton = el('runtime-modal-open-status-button');
   const steerInput = el('inline-steer-input');
   const steerSubmit = el('inline-steer-submit-button');
   const shellInput = el('inline-shell-command-input');
   const shellSubmit = el('inline-shell-command-submit-button');
 
-  chipRow.innerHTML = '';
+  if (chipRow) {
+    chipRow.innerHTML = '';
+  }
+  if (detailChipRow) {
+    detailChipRow.innerHTML = '';
+  }
+
+  const appendRuntimeChip = (label, value, tone = 'info') => {
+    if (chipRow) {
+      createRuntimeChip(chipRow, label, value, tone);
+    }
+    if (detailChipRow) {
+      createRuntimeChip(detailChipRow, label, value, tone);
+    }
+  };
 
   if (!session) {
     titleEl.textContent = 'No live session attached';
     subtitleEl.textContent = 'Select or start a managed session to see live status, timers, and commands.';
-    interruptButton.disabled = true;
-    compactButton.disabled = true;
-    statusButton.disabled = true;
-    steerInput.disabled = true;
-    steerSubmit.disabled = true;
-    shellInput.disabled = true;
-    shellSubmit.disabled = true;
-    steerInput.placeholder = 'No active turn to steer';
-    shellInput.placeholder = 'No live Codex thread is attached';
-    createRuntimeChip(chipRow, 'State', 'No session selected', 'info');
+    if (detailTitleEl) {
+      detailTitleEl.textContent = titleEl.textContent;
+    }
+    if (detailSubtitleEl) {
+      detailSubtitleEl.textContent = subtitleEl.textContent;
+    }
+    if (detailsButton) {
+      detailsButton.disabled = true;
+    }
+    if (statusButton) {
+      statusButton.disabled = true;
+    }
+    if (steerInput) {
+      steerInput.disabled = true;
+      steerInput.placeholder = 'No active turn to steer';
+    }
+    if (steerSubmit) {
+      steerSubmit.disabled = true;
+    }
+    if (shellInput) {
+      shellInput.disabled = true;
+      shellInput.placeholder = 'No live Codex thread is attached';
+    }
+    if (shellSubmit) {
+      shellSubmit.disabled = true;
+    }
+    appendRuntimeChip('State', 'No session selected', 'info');
     return;
   }
 
@@ -3659,30 +5267,32 @@ function renderRuntimePanel() {
     titleEl.textContent = `${session.title || session.sessionId} is history only`;
     subtitleEl.textContent = 'You can resume it, fork it, or open a different live variant from this workspace.';
   }
+  if (detailTitleEl) {
+    detailTitleEl.textContent = titleEl.textContent;
+  }
+  if (detailSubtitleEl) {
+    detailSubtitleEl.textContent = subtitleEl.textContent;
+  }
 
-  createRuntimeChip(chipRow, 'Bridge', prettyStatusLabel(runtimeState.connection), connectionTone);
-  createRuntimeChip(
-    chipRow,
+  appendRuntimeChip('Bridge', prettyStatusLabel(runtimeState.connection), connectionTone);
+  appendRuntimeChip(
     'Phase',
     `${runtimeState.phase}${phaseSince ? ` | ${phaseSince}` : ''}`,
     phaseTone
   );
-  createRuntimeChip(
-    chipRow,
+  appendRuntimeChip(
     'Turn',
     runtime.activeTurnId
       ? `${shortId(runtime.activeTurnId)} | ${runtimeState.turn}`
       : runtimeState.turn,
     runtime.activeTurnId ? 'active' : 'info'
   );
-  createRuntimeChip(
-    chipRow,
+  appendRuntimeChip(
     'Requests',
     requests.length ? `${requests.length} pending` : 'None',
     requests.length ? 'warning' : 'info'
   );
-  createRuntimeChip(
-    chipRow,
+  appendRuntimeChip(
     'Processing',
     runtime.busy
       ? `Running for ${formatElapsedSince(runtime.busyStartedAt || runtime.phaseStartedAt || runtime.updatedAt) || '0s'}`
@@ -3690,27 +5300,38 @@ function renderRuntimePanel() {
     runtime.busy ? 'active' : 'info'
   );
   if (pingSince) {
-    createRuntimeChip(chipRow, 'Heartbeat', `${pingSince} ago`, 'info');
+    appendRuntimeChip('Heartbeat', `${pingSince} ago`, 'info');
   }
   if (runtime.lastCodexError) {
-    createRuntimeChip(chipRow, 'Error', limitText(runtime.lastCodexError, 96), 'error');
+    appendRuntimeChip('Error', limitText(runtime.lastCodexError, 96), 'error');
   } else if (runtime.rateLimits?.rateLimitReachedType) {
-    createRuntimeChip(chipRow, 'API', prettyStatusLabel(runtime.rateLimits.rateLimitReachedType), 'warning');
+    appendRuntimeChip('API', prettyStatusLabel(runtime.rateLimits.rateLimitReachedType), 'warning');
   }
 
-  interruptButton.disabled = !session.live || !runtime.activeTurnId;
-  compactButton.disabled = !session.live || !runtime.threadId;
-  statusButton.disabled = false;
-  steerInput.disabled = !session.live || !runtime.activeTurnId;
-  steerSubmit.disabled = !session.live || !runtime.activeTurnId;
-  steerInput.placeholder = runtime.activeTurnId
-    ? 'Guide the current live turn without sending a fresh prompt'
-    : 'No active turn to steer right now';
-  shellInput.disabled = !session.live || !runtime.threadId;
-  shellSubmit.disabled = !session.live || !runtime.threadId;
-  shellInput.placeholder = runtime.threadId
-    ? 'Run a host shell command through thread/shellCommand'
-    : 'No live Codex thread is attached';
+  if (detailsButton) {
+    detailsButton.disabled = false;
+  }
+  if (statusButton) {
+    statusButton.disabled = false;
+  }
+  if (steerInput) {
+    steerInput.disabled = !session.live || !runtime.activeTurnId;
+    steerInput.placeholder = runtime.activeTurnId
+      ? 'Guide the current live turn without sending a fresh prompt'
+      : 'No active turn to steer right now';
+  }
+  if (steerSubmit) {
+    steerSubmit.disabled = !session.live || !runtime.activeTurnId;
+  }
+  if (shellInput) {
+    shellInput.disabled = !session.live || !runtime.threadId;
+    shellInput.placeholder = runtime.threadId
+      ? 'Run a host shell command through thread/shellCommand'
+      : 'No live Codex thread is attached';
+  }
+  if (shellSubmit) {
+    shellSubmit.disabled = !session.live || !runtime.threadId;
+  }
 }
 
 function renderThinkingPanel() {
@@ -3951,7 +5572,7 @@ function renderApprovalPopup() {
   popup.classList.remove('hidden');
 }
 
-async function interruptActiveTurn() {
+async function interruptActiveTurn(options = {}) {
   const session = getSelectedSession();
   if (!session) {
     return;
@@ -3963,6 +5584,9 @@ async function interruptActiveTurn() {
       hostId: session.hostId,
     }),
   });
+  if (options.restoreDraft) {
+    restoreActiveDraftForSession(session);
+  }
 }
 
 async function steerActiveTurn(text) {
@@ -3999,6 +5623,47 @@ async function compactCurrentThread() {
   });
 }
 
+async function endCurrentSession() {
+  const session = getSelectedSession();
+  if (!session) {
+    return;
+  }
+  if (!session.live) {
+    throw new Error(t('session.endAlreadyClosed'));
+  }
+  if (!window.confirm(t('session.endConfirm'))) {
+    return;
+  }
+
+  patchRuntimeForSession(session.hostId, session.sessionId, {
+    phase: 'ending',
+    connection: 'closing',
+    busy: false,
+    activeTurnId: null,
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+  });
+  renderAll();
+
+  try {
+    await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/stop`, {
+      method: 'POST',
+      body: JSON.stringify({
+        hostId: session.hostId,
+      }),
+    });
+  } catch (error) {
+    patchRuntimeForSession(session.hostId, session.sessionId, {
+      phase: 'error',
+      connection: 'ready',
+      lastError: error.message,
+    });
+    throw error;
+  }
+  await delay(600);
+  await refresh();
+}
+
 async function runThreadShellCommand(command) {
   const session = getSelectedSession();
   if (!session) {
@@ -4019,19 +5684,34 @@ async function runThreadShellCommand(command) {
   });
 }
 
+function ensureStatusPanelMounted() {
+  const overlay = el('status-window-overlay');
+  const modal = el('status-window');
+  const slot = el('session-status-panel-slot');
+  if (slot && modal && modal.parentElement !== slot) {
+    slot.appendChild(modal);
+  }
+  if (overlay) {
+    overlay.classList.add('hidden');
+  }
+}
+
 function renderStatusWindow() {
+  ensureStatusPanelMounted();
   const overlay = el('status-window-overlay');
   const modal = el('status-window');
   const session = getSelectedSession();
+  const visible = Boolean(state.sessionDetailsOpen && session);
 
-  if (!state.statusWindowOpen || !session) {
+  if (overlay) {
     overlay.classList.add('hidden');
-    modal.classList.add('hidden');
+  }
+  if (!visible || !session) {
+    modal?.classList.add('hidden');
     syncModalBodyState();
     return;
   }
 
-  overlay.classList.remove('hidden');
   modal.classList.remove('hidden');
   syncModalBodyState();
 
@@ -4089,6 +5769,7 @@ function renderStatusWindow() {
   el('status-rate-limits').textContent = formatRateLimits(runtime);
 
   const interruptButton = el('interrupt-turn-button');
+  const endSessionButton = el('end-session-status-button');
   const compactButton = el('compact-thread-button');
   const steerInput = el('steer-input');
   const steerSubmitButton = el('steer-submit-button');
@@ -4096,6 +5777,10 @@ function renderStatusWindow() {
   const shellCommandSubmitButton = el('shell-command-submit-button');
   interruptButton.disabled = !session.live || !runtime.activeTurnId;
   interruptButton.textContent = runtime.activeTurnId ? 'Interrupt Active Turn' : 'No Active Turn';
+  endSessionButton.disabled = !session.live || runtime.phase === 'ending' || runtime.connection === 'closing';
+  endSessionButton.textContent = session.live
+    ? (endSessionButton.disabled ? 'Ending Session...' : 'End Live Session')
+    : 'Session Ended';
   compactButton.disabled = !session.live || !runtime.threadId;
   compactButton.textContent = runtime.threadId ? 'Compact Context' : 'No Thread';
   steerInput.disabled = !session.live || !runtime.activeTurnId;
@@ -4427,6 +6112,302 @@ function renderDirectoryPicker() {
   );
 }
 
+function renderDiffLine(line) {
+  const row = document.createElement('div');
+  row.className = 'diff-line';
+  if (line.startsWith('+') && !line.startsWith('+++')) {
+    row.classList.add('added');
+  } else if (line.startsWith('-') && !line.startsWith('---')) {
+    row.classList.add('removed');
+  } else if (line.startsWith('@@')) {
+    row.classList.add('hunk');
+  }
+  row.textContent = line || ' ';
+  return row;
+}
+
+function renderFileChangeDetails(fileChanges = []) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'thinking-file-change-list';
+  for (const change of fileChanges) {
+    const details = document.createElement('details');
+    details.className = 'thinking-file-change-card';
+    const additions = Number(change.additions || 0);
+    const deletions = Number(change.deletions || 0);
+    details.innerHTML = `
+      <summary class="thinking-file-change-summary">
+        <span class="thinking-file-path">${escapeHtml(change.path || 'workspace change')}</span>
+        <span class="diff-stat added">+${additions}</span>
+        <span class="diff-stat removed">-${deletions}</span>
+      </summary>
+    `;
+    const diff = document.createElement('div');
+    diff.className = 'thinking-diff-block';
+    const diffText = String(change.diff || '').trim();
+    if (diffText) {
+      for (const line of diffText.split(/\r?\n/).slice(0, 240)) {
+        diff.appendChild(renderDiffLine(line));
+      }
+      if (diffText.split(/\r?\n/).length > 240) {
+        const truncated = document.createElement('div');
+        truncated.className = 'diff-line hunk';
+        truncated.textContent = '... diff truncated in mobile view ...';
+        diff.appendChild(truncated);
+      }
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'thinking-text';
+      empty.textContent = 'No unified diff body was provided by Codex for this file change.';
+      diff.appendChild(empty);
+    }
+    details.appendChild(diff);
+    wrapper.appendChild(details);
+  }
+  return wrapper;
+}
+
+function renderInlineMarkdown(parent, text) {
+  const source = String(text || '');
+  const tokenPattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
+  let lastIndex = 0;
+  let match = tokenPattern.exec(source);
+  while (match) {
+    if (match.index > lastIndex) {
+      parent.appendChild(document.createTextNode(source.slice(lastIndex, match.index)));
+    }
+    const token = match[0];
+    if (token.startsWith('`') && token.endsWith('`')) {
+      const code = document.createElement('code');
+      code.textContent = token.slice(1, -1);
+      parent.appendChild(code);
+    } else if (token.startsWith('**') && token.endsWith('**')) {
+      const strong = document.createElement('strong');
+      strong.textContent = token.slice(2, -2);
+      parent.appendChild(strong);
+    } else if (token.startsWith('*') && token.endsWith('*')) {
+      const em = document.createElement('em');
+      em.textContent = token.slice(1, -1);
+      parent.appendChild(em);
+    } else if (match[2]) {
+      const label = token.slice(1, token.indexOf(']('));
+      const link = document.createElement('a');
+      link.href = match[2];
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = label || match[2];
+      parent.appendChild(link);
+    } else {
+      parent.appendChild(document.createTextNode(token));
+    }
+    lastIndex = tokenPattern.lastIndex;
+    match = tokenPattern.exec(source);
+  }
+  if (lastIndex < source.length) {
+    parent.appendChild(document.createTextNode(source.slice(lastIndex)));
+  }
+}
+
+function appendMarkdownParagraph(container, text) {
+  const paragraph = document.createElement('p');
+  renderInlineMarkdown(paragraph, text);
+  container.appendChild(paragraph);
+}
+
+function appendMarkdownList(container, items, ordered = false) {
+  const list = document.createElement(ordered ? 'ol' : 'ul');
+  for (const itemText of items) {
+    const item = document.createElement('li');
+    renderInlineMarkdown(item, itemText);
+    list.appendChild(item);
+  }
+  container.appendChild(list);
+}
+
+function appendCodeBlock(container, codeText, language = '') {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'markdown-code-card';
+  const header = document.createElement('div');
+  header.className = 'markdown-code-header';
+  const label = document.createElement('span');
+  label.textContent = language || 'code';
+  const copyButton = document.createElement('button');
+  copyButton.type = 'button';
+  copyButton.className = 'markdown-copy-code secondary-button';
+  copyButton.dataset.copyText = codeText;
+  copyButton.textContent = 'Copy';
+  header.appendChild(label);
+  header.appendChild(copyButton);
+  const pre = document.createElement('pre');
+  const code = document.createElement('code');
+  code.className = language ? `language-${language}` : '';
+  code.textContent = codeText;
+  pre.appendChild(code);
+  wrapper.appendChild(header);
+  wrapper.appendChild(pre);
+  container.appendChild(wrapper);
+}
+
+function renderMarkdown(container, text) {
+  container.innerHTML = '';
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  let paragraph = [];
+  let listItems = [];
+  let orderedListItems = [];
+  let blockquote = [];
+  let codeLines = [];
+  let inCode = false;
+  let codeLanguage = '';
+
+  function flushParagraph() {
+    if (paragraph.length) {
+      appendMarkdownParagraph(container, paragraph.join('\n'));
+      paragraph = [];
+    }
+  }
+
+  function flushLists() {
+    if (listItems.length) {
+      appendMarkdownList(container, listItems, false);
+      listItems = [];
+    }
+    if (orderedListItems.length) {
+      appendMarkdownList(container, orderedListItems, true);
+      orderedListItems = [];
+    }
+  }
+
+  function flushBlockquote() {
+    if (!blockquote.length) {
+      return;
+    }
+    const quote = document.createElement('blockquote');
+    renderInlineMarkdown(quote, blockquote.join('\n'));
+    container.appendChild(quote);
+    blockquote = [];
+  }
+
+  function flushCode() {
+    appendCodeBlock(container, codeLines.join('\n'), codeLanguage);
+    codeLines = [];
+    codeLanguage = '';
+  }
+
+  for (const line of lines) {
+    const fence = line.match(/^```([A-Za-z0-9_-]+)?\s*$/);
+    if (fence) {
+      if (inCode) {
+        inCode = false;
+        flushCode();
+      } else {
+        flushParagraph();
+        flushLists();
+        flushBlockquote();
+        inCode = true;
+        codeLanguage = fence[1] || '';
+        codeLines = [];
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushLists();
+      flushBlockquote();
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushLists();
+      flushBlockquote();
+      const level = Math.min(4, heading[1].length + 1);
+      const node = document.createElement(`h${level}`);
+      renderInlineMarkdown(node, heading[2]);
+      container.appendChild(node);
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-*]\s+(.+)$/);
+    if (unordered) {
+      flushParagraph();
+      flushBlockquote();
+      if (orderedListItems.length) {
+        appendMarkdownList(container, orderedListItems, true);
+        orderedListItems = [];
+      }
+      listItems.push(unordered[1]);
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (ordered) {
+      flushParagraph();
+      flushBlockquote();
+      if (listItems.length) {
+        appendMarkdownList(container, listItems, false);
+        listItems = [];
+      }
+      orderedListItems.push(ordered[1]);
+      continue;
+    }
+
+    const quote = line.match(/^\s*>\s?(.+)$/);
+    if (quote) {
+      flushParagraph();
+      flushLists();
+      blockquote.push(quote[1]);
+      continue;
+    }
+
+    flushLists();
+    flushBlockquote();
+    paragraph.push(line);
+  }
+
+  if (inCode) {
+    flushCode();
+  }
+  flushParagraph();
+  flushLists();
+  flushBlockquote();
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || '');
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', 'readonly');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  textarea.remove();
+}
+
+function flashCopyButton(button, label = 'Copied') {
+  if (!button) {
+    return;
+  }
+  const previous = button.textContent;
+  button.textContent = label;
+  button.disabled = true;
+  window.setTimeout(() => {
+    button.textContent = previous || 'Copy';
+    button.disabled = false;
+  }, 1200);
+}
+
 function buildThinkingMessageElement(session, segment, runtime, stream, isLivePlaceholder = false) {
   const keyBase = getSessionKey(session) || session.sessionId || 'session';
   const stateKey = `${keyBase}::thinking::${segment?.userTimestamp || 'live'}`;
@@ -4476,15 +6457,22 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
         </div>
         <div class="thinking-history-text">${entry.text}</div>
       `;
+      if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
+        item.appendChild(renderFileChangeDetails(entry.fileChanges));
+      }
       history.appendChild(item);
     }
     content.appendChild(history);
   } else {
+    const liveThinking = [
+      runtime.reasoningSummary ? `Reasoning:\n${runtime.reasoningSummary}` : '',
+      runtime.planSummary ? `Plan:\n${runtime.planSummary}` : '',
+    ].filter(Boolean).join('\n\n');
     const block = document.createElement('div');
     block.className = 'thinking-block';
     block.innerHTML = `
       <div class="thinking-label">Live Turn</div>
-      <div class="thinking-text">Codex is still working on this turn. Structured reasoning or plan records have not arrived yet.</div>
+      <div class="thinking-text">${escapeHtml(liveThinking || 'Codex is still working on this turn. Structured reasoning, plan, or file-change records have not arrived yet.')}</div>
     `;
     content.appendChild(block);
   }
@@ -4511,7 +6499,7 @@ function renderFileCards(container, session, entry) {
   const list = document.createElement('div');
   list.className = 'message-file-list';
   for (const file of files.slice(0, 8)) {
-    if (!file.path) {
+    if (!file.path || isBareDownloadableFilename(file.path)) {
       continue;
     }
     const card = document.createElement('div');
@@ -4567,15 +6555,21 @@ function renderFileCards(container, session, entry) {
   }
 }
 
-function renderTranscript(session = getSelectedSession()) {
+function renderTranscript(session = getSelectedSession(), options = {}) {
   const log = el('session-log');
+  const key = getSessionKey(session) || '';
+  const previousKey = log.dataset.sessionKey || '';
+  const shouldStickToBottom = options.forceScroll || previousKey !== key || isTranscriptPinnedToBottom(log);
+  const bottomOffset = log.scrollHeight - log.scrollTop - log.clientHeight;
   log.innerHTML = '';
+  log.dataset.sessionKey = key;
 
   if (!session) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
     empty.textContent = 'Select a conversation on the left to inspect it here.';
     log.appendChild(empty);
+    restoreTranscriptScroll(log, { forceScroll: true });
     return;
   }
 
@@ -4593,6 +6587,7 @@ function renderTranscript(session = getSelectedSession()) {
       ? 'Waiting for the managed session transcript...'
       : 'No transcript preview was captured for this imported session.';
     log.appendChild(empty);
+    restoreTranscriptScroll(log, { forceScroll: options.forceScroll || previousKey !== key });
     return;
   }
 
@@ -4600,17 +6595,27 @@ function renderTranscript(session = getSelectedSession()) {
     const message = document.createElement('div');
     const speaker = entry.speaker === 'assistant' ? 'agent' : entry.speaker;
     message.className = `message ${speaker || 'agent'}`;
+    message.title = entry.timestamp ? `Sent ${formatTime(entry.timestamp)}` : '';
 
     if (speaker !== 'system') {
+      const toolbar = document.createElement('div');
+      toolbar.className = 'message-toolbar';
       const meta = document.createElement('div');
       meta.className = 'message-meta';
       meta.textContent = `${speaker === 'user' ? 'You' : 'Codex'} ${formatTime(entry.timestamp)}`.trim();
-      message.appendChild(meta);
+      toolbar.appendChild(meta);
+      const copyButton = document.createElement('button');
+      copyButton.type = 'button';
+      copyButton.className = 'message-copy-button secondary-button';
+      copyButton.dataset.copyText = entry.text || '';
+      copyButton.textContent = 'Copy';
+      toolbar.appendChild(copyButton);
+      message.appendChild(toolbar);
     }
 
     const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    bubble.textContent = entry.text || '';
+    bubble.className = 'bubble markdown-body';
+    renderMarkdown(bubble, entry.text || '');
     message.appendChild(bubble);
     renderFileCards(message, session, entry);
 
@@ -4631,11 +6636,178 @@ function renderTranscript(session = getSelectedSession()) {
     }
   }
 
-  log.scrollTop = log.scrollHeight;
+  restoreTranscriptScroll(log, {
+    forceScroll: options.forceScroll,
+    shouldStickToBottom,
+    bottomOffset,
+  });
+}
+
+function renderLocaleLabels() {
+  document.documentElement.lang = currentLocale();
+  for (const node of document.querySelectorAll('[data-i18n-key]')) {
+    node.textContent = t(node.dataset.i18nKey);
+  }
+
+  const navigatorButton = el('toggle-navigator-button');
+  if (navigatorButton) {
+    navigatorButton.textContent = state.navigatorCollapsed ? t('nav.open') : t('nav.close');
+    navigatorButton.setAttribute('aria-expanded', state.navigatorCollapsed ? 'false' : 'true');
+  }
+  const languageButton = el('toggle-language-button');
+  if (languageButton) {
+    languageButton.textContent = t('nav.languageToggle');
+    languageButton.title = currentLocale() === 'zh-CN' ? 'Switch to English' : '切换到中文';
+  }
+  const settingsButton = el('open-settings-button');
+  if (settingsButton) {
+    settingsButton.textContent = t('nav.settings');
+  }
+
+  const accountButton = el('account-button');
+  if (accountButton) {
+    accountButton.textContent = t('top.account');
+  }
+  const logoutButton = el('logout-button');
+  if (logoutButton) {
+    logoutButton.textContent = t('top.lock');
+  }
+  const importButton = el('import-selected-host-button');
+  if (importButton) {
+    importButton.textContent = t('top.import');
+  }
+  const statusButton = el('toggle-status-button');
+  if (statusButton) {
+    const countMatch = statusButton.textContent.match(/[（(](\d+)[）)]/);
+    const phaseMatch = statusButton.textContent.match(/(?:Status|状态)[:：]\s*(.+)$/);
+    statusButton.textContent = countMatch
+      ? `${t('top.status')} (${countMatch[1]})`
+      : phaseMatch
+        ? `${t('top.status')}: ${phaseMatch[1]}`
+        : t('top.status');
+  }
+  const alertsButton = el('toggle-alerts-button');
+  if (alertsButton) {
+    const countMatch = alertsButton.textContent.match(/[（(](\d+)[）)]/);
+    alertsButton.textContent = countMatch ? `${t('top.alerts')} (${countMatch[1]})` : t('top.alerts');
+  }
+  applyStaticLocalization(document.body);
+}
+
+function appendApiProfileOptions(select, options = {}) {
+  if (!select) {
+    return;
+  }
+  const profiles = getApiProfiles();
+  select.innerHTML = '';
+  if (options.includeDefault) {
+    const defaultOption = document.createElement('option');
+    defaultOption.value = '';
+    defaultOption.textContent = 'Use default';
+    select.appendChild(defaultOption);
+  }
+  for (const profile of profiles) {
+    const option = document.createElement('option');
+    option.value = profile.profileId;
+    option.textContent = `${profile.label}${profile.baseUrl ? ` | ${profile.baseUrl}` : ''}`;
+    select.appendChild(option);
+  }
+}
+
+function populateApiProfileEditor(profile = getSelectedApiProfile()) {
+  const current = profile || getApiProfiles()[0] || normalizeApiProfile();
+  el('settings-api-profile-select').value = current.profileId;
+  el('settings-api-profile-label').value = current.label || '';
+  el('settings-api-provider').value = current.provider || '';
+  el('settings-api-base-url').value = current.baseUrl || '';
+  el('settings-api-key').value = current.apiKey || '';
+  el('settings-api-key-remember').checked = current.rememberApiKey === true;
+  el('settings-delete-api-profile-button').disabled = getApiProfiles().length <= 1;
+}
+
+function saveActiveApiProfileFromSettingsForm() {
+  const profile = getSelectedApiProfile();
+  if (!profile) {
+    return null;
+  }
+  profile.label = el('settings-api-profile-label').value.trim() || profile.label || 'API Profile';
+  profile.provider = el('settings-api-provider').value.trim() || 'OpenAI';
+  profile.baseUrl = el('settings-api-base-url').value.trim();
+  profile.apiKey = el('settings-api-key').value;
+  profile.rememberApiKey = el('settings-api-key-remember').checked;
+  return profile;
+}
+
+function renderHostApiProfileList() {
+  const container = el('settings-host-api-list');
+  if (!container) {
+    return;
+  }
+  container.innerHTML = '';
+  if (!state.hosts.length) {
+    const empty = document.createElement('div');
+    empty.className = 'settings-empty';
+    empty.textContent = 'No hosts are connected yet. Start or import a host to assign API profiles.';
+    container.appendChild(empty);
+    return;
+  }
+
+  for (const host of state.hosts) {
+    const row = document.createElement('label');
+    row.className = 'settings-host-api-row';
+    const label = document.createElement('span');
+    label.textContent = `${host.label || host.hostId} (${host.hostId})`;
+    const select = document.createElement('select');
+    select.dataset.hostApiProfileHost = host.hostId;
+    appendApiProfileOptions(select, { includeDefault: true });
+    select.value = state.ui.hostApiProfiles?.[host.hostId] || '';
+    row.append(label, select);
+    container.appendChild(row);
+  }
+}
+
+function populateSettingsForm() {
+  const settings = normalizeUiSettings(state.ui);
+  state.ui.locale = settings.locale;
+  state.ui.apiProfiles = settings.apiProfiles;
+  state.ui.selectedApiProfileId = settings.selectedApiProfileId;
+  state.ui.defaultApiProfileId = settings.defaultApiProfileId;
+  state.ui.hostApiProfiles = settings.hostApiProfiles;
+  el('settings-language-select').value = settings.locale;
+  appendApiProfileOptions(el('settings-api-profile-select'));
+  appendApiProfileOptions(el('settings-default-api-profile'));
+  el('settings-default-api-profile').value = settings.defaultApiProfileId;
+  populateApiProfileEditor(getSelectedApiProfile());
+  renderHostApiProfileList();
+  applyStaticLocalization(el('settings-dialog'));
+}
+
+function renderSettingsDialog() {
+  const dialog = el('settings-dialog');
+  if (!dialog) {
+    return;
+  }
+  dialog.classList.toggle('hidden', !state.settingsOpen);
+  dialog.setAttribute('aria-hidden', state.settingsOpen ? 'false' : 'true');
+  syncModalBodyState();
+}
+
+function openSettingsDialog() {
+  state.settingsOpen = true;
+  populateSettingsForm();
+  renderSettingsDialog();
+  renderLocaleLabels();
+}
+
+function closeSettingsDialog() {
+  state.settingsOpen = false;
+  renderSettingsDialog();
 }
 
 function renderAll() {
   renderAuthGate();
+  const shell = document.querySelector('.shell');
+  shell?.classList.toggle('navigator-collapsed', state.navigatorCollapsed);
   const sidebar = document.querySelector('.sidebar');
   sidebar?.classList.toggle('overview-collapsed', state.overviewCollapsed);
   el('overview-body')?.classList.toggle('hidden', state.overviewCollapsed);
@@ -4658,6 +6830,8 @@ function renderAll() {
   renderStatusWindow();
   renderDirectoryPicker();
   renderSlashMenu();
+  renderSettingsDialog();
+  renderLocaleLabels();
 }
 
 function closeStream() {
@@ -4769,9 +6943,15 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.transcript', (event) => {
     const payload = JSON.parse(event.data);
     appendTranscriptEntry(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
+    if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
+      clearActiveDraftForSession({
+        hostId: payload.hostId || session.hostId,
+        sessionId: payload.sessionId || session.sessionId,
+      });
+    }
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === key) {
-      renderTranscript(selected);
+      renderTranscript(selected, { forceScroll: payload.speaker === 'user' });
       renderThinkingPanel();
     }
   });
@@ -4789,6 +6969,19 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.runtime', (event) => {
     const payload = JSON.parse(event.data);
     patchRuntimeForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
+    const runtimeStopped = !runtimeIsActive(payload);
+    const status = String(payload.currentTurnStatus || payload.phase || '').toLowerCase();
+    if (runtimeStopped && status && status !== 'interrupted') {
+      clearActiveDraftForSession({
+        hostId: payload.hostId || session.hostId,
+        sessionId: payload.sessionId || session.sessionId,
+      });
+    }
+    const selected = getSelectedSession();
+    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+      maybeScheduleQueuedPromptSend(selected);
+      refreshInferredComposerOptionsForSession(selected);
+    }
     renderSessionDetails();
     renderRuntimePanel();
     renderThinkingPanel();
@@ -4798,13 +6991,26 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.diagnostic', (event) => {
     const payload = JSON.parse(event.data);
     appendDiagnosticForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
+    const selected = getSelectedSession();
+    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+      refreshInferredComposerOptionsForSession(selected);
+      renderSessionDetails();
+      renderTranscript(selected);
+      renderThinkingPanel();
+    }
     renderStatusWindow();
   });
 
   state.eventSource.addEventListener('session.request', (event) => {
     const payload = JSON.parse(event.data);
     upsertRequestForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
-    state.statusWindowOpen = true;
+    state.statusWindowOpen = false;
+    state.sessionDetailsOpen = true;
+    const selected = getSelectedSession();
+    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+      renderTranscript(selected);
+      renderThinkingPanel();
+    }
     renderSessionDetails();
     renderApprovalPopup();
     renderStatusWindow();
@@ -4813,6 +7019,11 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.request.resolved', (event) => {
     const payload = JSON.parse(event.data);
     resolveRequestForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
+    const selected = getSelectedSession();
+    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+      renderTranscript(selected);
+      renderThinkingPanel();
+    }
     renderSessionDetails();
     renderApprovalPopup();
     renderStatusWindow();
@@ -4823,7 +7034,7 @@ async function showSession(session = getSelectedSession()) {
   renderSessionDetails();
   renderRuntimePanel();
   renderThinkingPanel();
-  renderTranscript(session);
+  renderTranscript(session, { forceScroll: true });
 
   if (!session) {
     closeStream();
@@ -4853,7 +7064,7 @@ async function showSession(session = getSelectedSession()) {
       renderThinkingPanel();
       renderAlertsWindow();
       renderStatusWindow();
-      renderTranscript(selected);
+      renderTranscript(selected, { forceScroll: true });
     }
   } catch (error) {
     appendAlertForSession(session.hostId, session.sessionId, {
@@ -5646,7 +7857,11 @@ function toggleAlertWindow() {
 }
 
 function setStatusWindowOpen(open) {
-  state.statusWindowOpen = Boolean(open);
+  state.statusWindowOpen = false;
+  if (open && getSelectedSession()) {
+    state.sessionDetailsOpen = true;
+    renderSessionDetails();
+  }
   renderStatusWindow();
 }
 
@@ -5655,7 +7870,9 @@ function toggleStatusWindow() {
   if (!session) {
     return;
   }
-  setStatusWindowOpen(!state.statusWindowOpen);
+  state.sessionDetailsOpen = !state.sessionDetailsOpen;
+  renderSessionDetails();
+  renderStatusWindow();
 }
 
 async function joinLiveSession() {
@@ -5698,6 +7915,10 @@ async function startManagedSession(options = {}) {
     label: label || cwd,
     launchMode,
   };
+  const apiConfig = getApiRequestConfig(hostId);
+  if (apiConfig) {
+    body.apiConfig = apiConfig;
+  }
 
   if (options.command) {
     body.command = options.command;
@@ -5849,15 +8070,32 @@ function getActiveTurnBlocker(session) {
   return 'Codex is still working on the previous turn. Use Status to steer or interrupt it, then send the next prompt.';
 }
 
+function runtimeIsActive(runtime = {}) {
+  const phase = String(runtime.phase || '').toLowerCase();
+  const activePhase = [
+    'thinking',
+    'planning',
+    'reviewing',
+    'waiting-approval',
+    'waiting-user-input',
+    'retrying',
+    'reconnecting',
+    'running-shell-command',
+    'compacting',
+  ].includes(phase);
+  return Boolean(runtime.activeTurnId || runtime.busy || runtime.waitingOnApproval || runtime.waitingOnUserInput || activePhase);
+}
+
 function openStatusForActiveTurnBlocker() {
-  state.statusWindowOpen = true;
+  state.statusWindowOpen = false;
+  state.sessionDetailsOpen = true;
   renderSessionDetails();
   renderRuntimePanel();
   renderStatusWindow();
 }
 
 async function sendInputToSession(session, text, options = {}) {
-  const blocker = getActiveTurnBlocker(session);
+  const blocker = options.skipActiveTurnBlocker ? null : getActiveTurnBlocker(session);
   if (blocker) {
     openStatusForActiveTurnBlocker();
     throw new Error(blocker);
@@ -5911,6 +8149,273 @@ async function sendInput(text, options = {}) {
   await sendInputToSession(session, text, options);
 }
 
+async function submitComposerPayload(payload, input) {
+  const session = getSelectedSession();
+  if (!session) {
+    return;
+  }
+
+  if (session.live && runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
+    const queuedText = String(payload.text || payload.displayText || '').trim();
+    const hasInputs = Boolean(payload.inputItems?.length || payload.uploadedFiles?.length);
+    if (!queuedText && !hasInputs) {
+      throw new Error('Codex is already working. Add text or files to queue, or interrupt it first.');
+    }
+    addSteerQueueItem(session, payload, queuedText || payload.displayText || 'Please inspect the attached file(s).');
+    state.codexControls.steerNotice = null;
+    if (input) {
+      input.value = '';
+    }
+    clearComposerFileAttachments();
+    renderComposerTurnNotice();
+    return;
+  }
+
+  const wasLive = Boolean(session.live);
+  await sendInput(payload.text, payload);
+  if (wasLive) {
+    setActiveDraftForSession(session, payload);
+  }
+  state.codexControls.steerNotice = null;
+  if (input) {
+    input.value = '';
+  }
+  clearComposerFileAttachments();
+  renderComposerTurnNotice();
+}
+
+async function waitForActiveTurnToClear(session, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastRuntime = getRuntimeForSession(session) || session?.runtime || {};
+  while (Date.now() < deadline) {
+    lastRuntime = getRuntimeForSession(session) || lastRuntime || {};
+    if (!runtimeIsActive(lastRuntime)) {
+      return true;
+    }
+
+    try {
+      const detail = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/detail?hostId=${encodeURIComponent(session.hostId)}`);
+      if (detail?.runtime) {
+        setRuntimeForSession(session.hostId, session.sessionId, detail.runtime);
+        lastRuntime = detail.runtime;
+        if (!runtimeIsActive(lastRuntime)) {
+          return true;
+        }
+      }
+    } catch (_) {
+      // SSE may update runtime faster than detail polling; keep waiting.
+    }
+
+    await delay(650);
+  }
+  throw new Error('Timed out waiting for the active Codex turn to stop.');
+}
+
+async function sendQueuedPrompt(itemId) {
+  const item = findSteerQueueItem(itemId);
+  if (!item?.payload || !item?.sessionKey) {
+    removeSteerQueueItem(itemId);
+    renderComposerTurnNotice();
+    return;
+  }
+
+  const session = getSelectedSession();
+  if (!session || getSessionKey(session) !== item.sessionKey) {
+    return;
+  }
+
+  const text = getSteerQueueText(item).trim();
+  const hasInputs = Boolean(item.payload?.inputItems?.length || item.payload?.uploadedFiles?.length);
+  if (!text && !hasInputs) {
+    item.status = 'failed';
+    item.error = 'This queued prompt is empty. Edit it or remove it from the queue.';
+    renderComposerTurnNotice();
+    return;
+  }
+
+  if (runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
+    return;
+  }
+
+  setSteerQueueItemText(item, text || item.payload.displayText || 'Please inspect the attached file(s).');
+  item.sending = true;
+  item.error = '';
+  renderComposerTurnNotice();
+
+  try {
+    await sendInputToSession(session, item.payload.text, {
+      ...item.payload,
+      skipActiveTurnBlocker: true,
+    });
+    setActiveDraftForSession(session, item.payload);
+    removeSteerQueueItem(item.id);
+    state.codexControls.steerNotice = {
+      title: 'Queued prompt sent',
+      message: 'The previous turn finished, so the first waiting prompt was sent as the next Codex turn.',
+    };
+    window.setTimeout(() => {
+      if (state.codexControls.steerNotice?.title === 'Queued prompt sent') {
+        state.codexControls.steerNotice = null;
+        renderComposerTurnNotice();
+      }
+    }, 5000);
+  } catch (error) {
+    const latest = findSteerQueueItem(item.id);
+    if (latest) {
+      latest.sending = false;
+      latest.status = 'failed';
+      latest.error = error.message || 'Failed to send this queued prompt.';
+    }
+    throw error;
+  } finally {
+    const latest = findSteerQueueItem(item.id);
+    if (latest) {
+      latest.sending = false;
+    }
+    renderComposerTurnNotice();
+  }
+}
+
+function maybeScheduleQueuedPromptSend(session = getSelectedSession()) {
+  if (!session?.live || state.codexControls.queueAutoSendScheduled) {
+    return;
+  }
+  const runtime = getRuntimeForSession(session) || session.runtime || {};
+  if (runtimeIsActive(runtime)) {
+    return;
+  }
+  const next = getFirstQueuedPrompt(session);
+  if (!next) {
+    return;
+  }
+  state.codexControls.queueAutoSendScheduled = true;
+  window.setTimeout(() => {
+    state.codexControls.queueAutoSendScheduled = false;
+    const current = getSelectedSession();
+    if (!current || getSessionKey(current) !== next.sessionKey) {
+      return;
+    }
+    sendQueuedPrompt(next.id).catch(reportError);
+  }, 350);
+}
+
+async function guideQueuedPrompt(itemId) {
+  const item = findSteerQueueItem(itemId);
+  if (!item?.payload || !item?.sessionKey) {
+    removeSteerQueueItem(itemId);
+    renderComposerTurnNotice();
+    return;
+  }
+
+  const session = getSelectedSession();
+  if (!session || getSessionKey(session) !== item.sessionKey) {
+    throw new Error('Select the original live session before guiding this prompt.');
+  }
+  if (!runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
+    await sendQueuedPrompt(item.id);
+    return;
+  }
+
+  const text = getSteerQueueText(item).trim();
+  if (!text) {
+    throw new Error('This queued prompt is empty. Edit it or remove it from the queue.');
+  }
+
+  setSteerQueueItemText(item, text || item.payload.displayText || 'Please inspect the attached file(s).');
+  item.sending = true;
+  item.error = '';
+  renderComposerTurnNotice();
+  try {
+    await steerActiveTurn(text);
+    const latest = findSteerQueueItem(item.id);
+    if (latest) {
+      latest.status = 'guided';
+      latest.sentAt = new Date().toISOString();
+      latest.sending = false;
+    }
+  } catch (error) {
+    const latest = findSteerQueueItem(item.id);
+    if (latest) {
+      latest.sending = false;
+      latest.status = 'failed';
+      latest.error = error.message || 'Failed to guide this prompt.';
+    }
+    throw error;
+  } finally {
+    renderComposerTurnNotice();
+  }
+}
+
+async function interruptAndSendQueuedPrompt(itemId) {
+  const item = findSteerQueueItem(itemId);
+  if (!item?.payload || !item?.sessionKey) {
+    removeSteerQueueItem(itemId);
+    renderComposerTurnNotice();
+    return;
+  }
+
+  const session = getSelectedSession();
+  if (!session || getSessionKey(session) !== item.sessionKey) {
+    throw new Error('Select the original live session before forcing this prompt into a new turn.');
+  }
+
+  const text = getSteerQueueText(item).trim();
+  const hasInputs = Boolean(item.payload?.inputItems?.length || item.payload?.uploadedFiles?.length);
+  if (!text && !hasInputs) {
+    throw new Error('This queued prompt is empty. Edit it or remove it from the queue.');
+  }
+
+  setSteerQueueItemText(item, text || item.payload.displayText || 'Please inspect the attached file(s).');
+  item.forceSending = true;
+  item.error = '';
+  renderComposerTurnNotice();
+
+  try {
+    await interruptActiveTurn();
+    await waitForActiveTurnToClear(session);
+    await sendInputToSession(session, item.payload.text, {
+      ...item.payload,
+      skipActiveTurnBlocker: true,
+    });
+    setActiveDraftForSession(session, item.payload);
+
+    removeSteerQueueItem(item.id);
+    state.codexControls.steerNotice = {
+      title: 'Fresh turn started',
+      message: 'The previous turn was interrupted and this prompt was sent as a new Codex turn.',
+    };
+    window.setTimeout(() => {
+      if (state.codexControls.steerNotice?.title === 'Fresh turn started') {
+        state.codexControls.steerNotice = null;
+        renderComposerTurnNotice();
+      }
+    }, 5000);
+  } catch (error) {
+    const latest = findSteerQueueItem(item.id);
+    if (latest) {
+      latest.forceSending = false;
+      latest.status = 'failed';
+      latest.error = error.message || 'Failed to interrupt and send this prompt.';
+    }
+    throw error;
+  } finally {
+    const latest = findSteerQueueItem(item.id);
+    if (latest) {
+      latest.forceSending = false;
+    }
+    renderComposerTurnNotice();
+  }
+}
+
+async function interruptAndSendPendingPrompt() {
+  const first = getSelectedSteerQueue()[0];
+  if (!first) {
+    renderComposerTurnNotice();
+    return;
+  }
+  await interruptAndSendQueuedPrompt(first.id);
+}
+
 function isModelOptionsLoading(session) {
   return state.codexControls.modelOptionsLoadingKeys.has(modelCacheKey(session));
 }
@@ -5962,7 +8467,7 @@ function requestModelOptionsForSession(session) {
     return;
   }
   loadModelOptionsForSession(session).catch((error) => {
-    if (!/model listing/i.test(error.message || '')) {
+    if (!/model listing|session is not live|no live session|not live on this host-agent/i.test(error.message || '')) {
       reportError(error);
     }
   });
@@ -6056,8 +8561,7 @@ function reportError(error) {
   log.appendChild(empty);
 }
 
-el('import-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
+async function submitHostImport() {
   const input = el('import-host-id');
   const hostId = input.value.trim();
   if (!hostId) {
@@ -6070,6 +8574,23 @@ el('import-form').addEventListener('submit', async (event) => {
   } catch (error) {
     reportError(error);
   }
+}
+
+el('import-form')?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  await submitHostImport();
+});
+
+el('import-host-button')?.addEventListener('click', async () => {
+  await submitHostImport();
+});
+
+el('import-host-id')?.addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter') {
+    return;
+  }
+  event.preventDefault();
+  await submitHostImport();
 });
 
 el('auth-form').addEventListener('submit', async (event) => {
@@ -6150,6 +8671,130 @@ el('logout-button').addEventListener('click', async () => {
   } catch (error) {
     reportError(error);
   }
+});
+
+el('toggle-language-button').addEventListener('click', () => {
+  state.ui.locale = currentLocale() === 'zh-CN' ? 'en' : 'zh-CN';
+  persistUiSettings();
+  renderAll();
+});
+
+el('open-settings-button').addEventListener('click', () => {
+  openSettingsDialog();
+});
+
+el('close-settings-button').addEventListener('click', () => {
+  closeSettingsDialog();
+});
+
+el('settings-dialog').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) {
+    closeSettingsDialog();
+  }
+});
+
+el('clear-api-key-button').addEventListener('click', () => {
+  const profile = getSelectedApiProfile();
+  if (!profile) {
+    return;
+  }
+  const hasKey = Boolean(profile.apiKey || el('settings-api-key').value);
+  if (hasKey && !window.confirm(formatUiText('settings.clearKeyConfirm', {
+    profile: profile.label || profile.provider || profile.profileId,
+  }))) {
+    return;
+  }
+  profile.apiKey = '';
+  profile.rememberApiKey = false;
+  el('settings-api-key').value = '';
+  el('settings-api-key-remember').checked = false;
+  persistUiSettings();
+});
+
+el('settings-api-profile-select').addEventListener('change', (event) => {
+  saveActiveApiProfileFromSettingsForm();
+  state.ui.selectedApiProfileId = event.target.value;
+  populateSettingsForm();
+});
+
+el('settings-add-api-profile-button').addEventListener('click', () => {
+  saveActiveApiProfileFromSettingsForm();
+  const next = normalizeApiProfile({
+    profileId: makeApiProfileId(),
+    label: `API Profile ${getApiProfiles().length + 1}`,
+    provider: 'OpenAI',
+  }, getApiProfiles().length);
+  state.ui.apiProfiles.push(next);
+  state.ui.selectedApiProfileId = next.profileId;
+  populateSettingsForm();
+});
+
+el('settings-delete-api-profile-button').addEventListener('click', () => {
+  const profiles = getApiProfiles();
+  if (profiles.length <= 1) {
+    return;
+  }
+  const deletedId = state.ui.selectedApiProfileId;
+  const deletedProfile = getApiProfile(deletedId);
+  const affectedHosts = Object.entries(state.ui.hostApiProfiles || {})
+    .filter(([, profileId]) => profileId === deletedId)
+    .map(([hostId]) => getHost(hostId)?.label || hostId);
+  const confirmKey = affectedHosts.length
+    ? 'settings.deleteProfileConfirmWithHosts'
+    : 'settings.deleteProfileConfirm';
+  const confirmed = window.confirm(formatUiText(confirmKey, {
+    profile: deletedProfile?.label || deletedProfile?.provider || deletedId,
+    hosts: affectedHosts.join(', '),
+  }));
+  if (!confirmed) {
+    return;
+  }
+  state.ui.apiProfiles = profiles.filter((profile) => profile.profileId !== deletedId);
+  if (state.ui.defaultApiProfileId === deletedId) {
+    state.ui.defaultApiProfileId = state.ui.apiProfiles[0]?.profileId || 'default';
+  }
+  for (const [hostId, profileId] of Object.entries(state.ui.hostApiProfiles || {})) {
+    if (profileId === deletedId) {
+      delete state.ui.hostApiProfiles[hostId];
+    }
+  }
+  state.ui.selectedApiProfileId = state.ui.defaultApiProfileId;
+  populateSettingsForm();
+});
+
+el('settings-default-api-profile').addEventListener('change', (event) => {
+  state.ui.defaultApiProfileId = event.target.value || getApiProfiles()[0]?.profileId || 'default';
+});
+
+el('settings-host-api-list').addEventListener('change', (event) => {
+  const select = event.target.closest('[data-host-api-profile-host]');
+  if (!select) {
+    return;
+  }
+  const hostId = select.dataset.hostApiProfileHost;
+  if (!select.value) {
+    delete state.ui.hostApiProfiles[hostId];
+    return;
+  }
+  state.ui.hostApiProfiles[hostId] = select.value;
+});
+
+el('settings-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  state.ui.locale = el('settings-language-select').value === 'en' ? 'en' : 'zh-CN';
+  saveActiveApiProfileFromSettingsForm();
+  state.ui.defaultApiProfileId = el('settings-default-api-profile').value || getApiProfiles()[0]?.profileId || 'default';
+  for (const select of el('settings-host-api-list').querySelectorAll('[data-host-api-profile-host]')) {
+    const hostId = select.dataset.hostApiProfileHost;
+    if (select.value) {
+      state.ui.hostApiProfiles[hostId] = select.value;
+    } else {
+      delete state.ui.hostApiProfiles[hostId];
+    }
+  }
+  persistUiSettings();
+  closeSettingsDialog();
+  renderAll();
 });
 
 el('open-connector-manager-button').addEventListener('click', () => {
@@ -6267,7 +8912,12 @@ el('join-session-button').addEventListener('click', async () => {
 
 el('resume-session-button').addEventListener('click', async () => {
   try {
-    await resumeFromHistory();
+    const session = getSelectedSession();
+    if (session?.live) {
+      await endCurrentSession();
+    } else {
+      await resumeFromHistory();
+    }
   } catch (error) {
     reportError(error);
   }
@@ -6289,12 +8939,59 @@ el('toggle-status-button').addEventListener('click', () => {
   toggleStatusWindow();
 });
 
-el('runtime-open-status-button').addEventListener('click', () => {
+el('session-details-button').addEventListener('click', () => {
+  if (!getSelectedSession()) {
+    return;
+  }
+  state.sessionDetailsOpen = true;
+  renderSessionDetails();
+});
+
+el('session-detail-panel').addEventListener('click', (event) => {
+  if (event.target.closest('button')) {
+    return;
+  }
+  if (!getSelectedSession()) {
+    return;
+  }
+  state.sessionDetailsOpen = true;
+  renderSessionDetails();
+});
+
+el('session-details-close-button').addEventListener('click', () => {
+  state.sessionDetailsOpen = false;
+  renderSessionDetails();
+});
+
+el('session-details-overlay').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) {
+    state.sessionDetailsOpen = false;
+    renderSessionDetails();
+  }
+});
+
+el('runtime-modal-open-status-button').addEventListener('click', () => {
+  state.sessionDetailsOpen = false;
   setStatusWindowOpen(true);
+  renderSessionDetails();
+  renderRuntimePanel();
 });
 
 el('close-alerts-button').addEventListener('click', () => {
   setAlertWindowOpen(false);
+});
+
+el('session-log').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-copy-text]');
+  if (!button) {
+    return;
+  }
+  try {
+    await copyTextToClipboard(button.dataset.copyText || '');
+    flashCopyButton(button);
+  } catch (error) {
+    reportError(error);
+  }
 });
 
 el('alerts-fab').addEventListener('click', () => {
@@ -6322,29 +9019,29 @@ el('refresh-status-button').addEventListener('click', async () => {
 
 el('interrupt-turn-button').addEventListener('click', async () => {
   try {
-    await interruptActiveTurn();
+    await interruptActiveTurn({ restoreDraft: true });
   } catch (error) {
     reportError(error);
   }
 });
 
-el('runtime-interrupt-button').addEventListener('click', async () => {
+el('end-session-button').addEventListener('click', async () => {
   try {
-    await interruptActiveTurn();
+    await endCurrentSession();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('end-session-status-button').addEventListener('click', async () => {
+  try {
+    await endCurrentSession();
   } catch (error) {
     reportError(error);
   }
 });
 
 el('compact-thread-button').addEventListener('click', async () => {
-  try {
-    await compactCurrentThread();
-  } catch (error) {
-    reportError(error);
-  }
-});
-
-el('runtime-compact-button').addEventListener('click', async () => {
   try {
     await compactCurrentThread();
   } catch (error) {
@@ -6425,7 +9122,7 @@ el('new-session-form').addEventListener('submit', async (event) => {
   }
 });
 
-el('toggle-overview-button').addEventListener('click', () => {
+el('toggle-overview-button')?.addEventListener('click', () => {
   state.overviewCollapsed = !state.overviewCollapsed;
   renderAll();
 });
@@ -6435,15 +9132,24 @@ el('toggle-new-session-button').addEventListener('click', () => {
   renderAll();
 });
 
+el('toggle-navigator-button').addEventListener('click', () => {
+  state.navigatorCollapsed = !state.navigatorCollapsed;
+  writeLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, state.navigatorCollapsed);
+  renderAll();
+});
+
+el('close-sidebar-navigator-button')?.addEventListener('click', () => {
+  state.navigatorCollapsed = true;
+  writeLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, state.navigatorCollapsed);
+  renderAll();
+});
+
 el('session-search-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  setSessionSearchQuery(el('session-search-input').value);
 });
 
 el('session-search-input').addEventListener('input', (event) => {
-  if (!event.target.value.trim() && state.sessionSearchQuery) {
-    setSessionSearchQuery('');
-  }
+  setSessionSearchQuery(event.target.value);
 });
 
 el('session-search-mode').addEventListener('change', (event) => {
@@ -6455,8 +9161,26 @@ el('clear-session-search-button').addEventListener('click', () => {
   setSessionSearchQuery('');
 });
 
-el('collection-create-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
+el('session-collection-select')?.addEventListener('change', (event) => {
+  state.selectedCollectionId = event.target.value || 'default';
+  renderAll();
+});
+
+el('collection-menu-button')?.addEventListener('click', () => {
+  el('session-collection-select')?.focus();
+});
+
+el('collection-settings-button')?.addEventListener('click', () => {
+  state.collectionManagerOpen = !state.collectionManagerOpen;
+  renderAll();
+});
+
+el('close-collection-manager-button')?.addEventListener('click', () => {
+  state.collectionManagerOpen = false;
+  renderAll();
+});
+
+async function submitCollectionCreate() {
   const input = el('collection-name-input');
   const name = input.value.trim();
   if (!name) {
@@ -6468,6 +9192,18 @@ el('collection-create-form').addEventListener('submit', async (event) => {
   } catch (error) {
     reportError(error);
   }
+}
+
+el('create-collection-button')?.addEventListener('click', async () => {
+  await submitCollectionCreate();
+});
+
+el('collection-name-input')?.addEventListener('keydown', async (event) => {
+  if (event.key !== 'Enter') {
+    return;
+  }
+  event.preventDefault();
+  await submitCollectionCreate();
 });
 
 el('use-selected-path-button').addEventListener('click', () => {
@@ -6543,12 +9279,31 @@ el('codex-model-select').addEventListener('change', () => {
     input.value = select.value;
     input.dispatchEvent(new Event('input', { bubbles: true }));
   }
+  saveComposerOptionsFromControls();
 });
 
 el('codex-model-input').addEventListener('input', () => {
   const session = getSelectedSession();
   syncModelSelectFromInput(session);
   renderReasoningEffortOptions(session);
+  saveComposerOptionsFromControls(session);
+});
+
+[
+  'codex-effort-select',
+  'codex-summary-select',
+  'codex-mode-select',
+  'codex-approval-policy-select',
+  'codex-reviewer-select',
+  'codex-sandbox-mode-select',
+  'codex-personality-select',
+].forEach((id) => {
+  el(id).addEventListener('change', () => {
+    saveComposerOptionsFromControls();
+    if (id === 'codex-effort-select' || id === 'codex-reviewer-select') {
+      renderComposerTurnNotice();
+    }
+  });
 });
 
 el('codex-file-picker-button').addEventListener('click', () => {
@@ -6596,9 +9351,7 @@ el('codex-plan-button').addEventListener('click', async () => {
     if (!payload.text && !payload.inputItems.length) {
       return;
     }
-    await sendInput(payload.text, payload);
-    input.value = '';
-    clearComposerFileAttachments();
+    await submitComposerPayload(payload, input);
   } catch (error) {
     reportError(error);
   }
@@ -6607,6 +9360,60 @@ el('codex-plan-button').addEventListener('click', async () => {
 el('codex-review-button').addEventListener('click', async () => {
   try {
     await startReviewForCurrentSession();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('codex-interrupt-button').addEventListener('click', async () => {
+  try {
+    await interruptActiveTurn({ restoreDraft: true });
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('composer-force-send-button').addEventListener('click', async () => {
+  try {
+    await interruptAndSendPendingPrompt();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('composer-turn-notice').addEventListener('input', (event) => {
+  const textarea = event.target.closest('[data-steer-queue-text]');
+  if (!textarea) {
+    return;
+  }
+  const item = findSteerQueueItem(textarea.dataset.steerQueueText);
+  setSteerQueueItemText(item, textarea.value);
+});
+
+el('composer-turn-notice').addEventListener('click', async (event) => {
+  const removeButton = event.target.closest('[data-remove-steer-queue-id]');
+  if (removeButton) {
+    removeSteerQueueItem(removeButton.dataset.removeSteerQueueId);
+    renderComposerTurnNotice();
+    return;
+  }
+
+  const forceButton = event.target.closest('[data-force-steer-queue-id]');
+  if (forceButton) {
+    try {
+      await interruptAndSendQueuedPrompt(forceButton.dataset.forceSteerQueueId);
+    } catch (error) {
+      reportError(error);
+    }
+    return;
+  }
+
+  const guideButton = event.target.closest('[data-guide-steer-queue-id]');
+  if (!guideButton) {
+    return;
+  }
+  try {
+    await guideQueuedPrompt(guideButton.dataset.guideSteerQueueId);
   } catch (error) {
     reportError(error);
   }
@@ -6710,6 +9517,15 @@ document.addEventListener('keydown', (event) => {
     setStatusWindowOpen(false);
   }
 
+  if (state.sessionDetailsOpen) {
+    state.sessionDetailsOpen = false;
+    renderSessionDetails();
+  }
+
+  if (state.settingsOpen) {
+    closeSettingsDialog();
+  }
+
   if (state.auth.accountOpen) {
     state.auth.accountOpen = false;
     renderAccountDialog();
@@ -6724,9 +9540,7 @@ el('input-form').addEventListener('submit', async (event) => {
     if (!payload.text && !payload.inputItems.length) {
       return;
     }
-    await sendInput(payload.text, payload);
-    input.value = '';
-    clearComposerFileAttachments();
+    await submitComposerPayload(payload, input);
   } catch (error) {
     reportError(error);
   }
@@ -6743,6 +9557,7 @@ async function boot() {
   }
 }
 
+initializePersistentUiState();
 boot();
 
 setInterval(() => {

@@ -19,6 +19,7 @@ const AUTO_START_SESSION = String(process.env.AUTO_START_SESSION || 'true') !== 
 const MANAGED_COMMAND = process.env.MANAGED_COMMAND || 'codex-app-server';
 const MANAGED_ARGS = normalizeArgs(process.env.MANAGED_ARGS_JSON || '[]');
 const MANAGED_CWD = process.env.MANAGED_CWD || process.cwd();
+const WORKSPACE_ROOTS = parseWorkspaceRoots(process.env.WORKSPACE_ROOTS || '');
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_FILE_TRANSFER_BYTES || 24 * 1024 * 1024);
 
 const liveSessions = new Map();
@@ -34,6 +35,39 @@ function loadRelayAuthToken() {
   } catch (_) {
     return '';
   }
+}
+
+function normalizeApiConfig(input = {}) {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const provider = String(input.provider || '').trim().slice(0, 80);
+  const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
+  const apiKey = String(input.apiKey || '').trim();
+  if (!baseUrl && !apiKey) {
+    return null;
+  }
+  return {
+    provider: provider || 'OpenAI',
+    baseUrl,
+    apiKey,
+  };
+}
+
+function buildApiEnvironment(apiConfig) {
+  const config = normalizeApiConfig(apiConfig);
+  if (!config) {
+    return {};
+  }
+  const env = {};
+  if (config.apiKey) {
+    env.OPENAI_API_KEY = config.apiKey;
+  }
+  if (config.baseUrl) {
+    env.OPENAI_BASE_URL = config.baseUrl;
+    env.OPENAI_API_BASE = config.baseUrl;
+  }
+  return env;
 }
 
 function getCapabilities() {
@@ -189,27 +223,60 @@ async function sendDiscovery() {
   });
 }
 
+function parseWorkspaceRoots(value) {
+  return String(value || '')
+    .split(/[\r\n;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function browseRootKey(rootPath) {
+  const resolved = path.resolve(rootPath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function pushBrowseRoot(roots, seen, name, rawPath) {
+  let resolved = null;
+  try {
+    resolved = normalizeBrowsePath(rawPath);
+    if (!resolved || !fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  const key = browseRootKey(resolved);
+  if (seen.has(key)) {
+    return;
+  }
+  seen.add(key);
+  roots.push({
+    name: name || rawPath || resolved,
+    path: resolved,
+  });
+}
+
 function listBrowseRoots() {
+  const roots = [];
+  const seen = new Set();
+  for (const rawRoot of WORKSPACE_ROOTS) {
+    pushBrowseRoot(roots, seen, rawRoot, rawRoot);
+  }
+
   if (process.platform === 'win32') {
-    const roots = [];
     for (let code = 67; code <= 90; code += 1) {
       const drive = `${String.fromCharCode(code)}:\\`;
-      if (fs.existsSync(drive)) {
-        roots.push({
-          name: drive,
-          path: drive,
-        });
-      }
+      pushBrowseRoot(roots, seen, drive, drive);
     }
     return roots.length ? roots : [{ name: MANAGED_CWD, path: MANAGED_CWD }];
   }
 
   const home = os.homedir();
-  const roots = [];
   if (home && fs.existsSync(home)) {
-    roots.push({ name: '~', path: home });
+    pushBrowseRoot(roots, seen, '~', home);
   }
-  roots.push({ name: '/', path: '/' });
+  pushBrowseRoot(roots, seen, '/', '/');
   return roots;
 }
 
@@ -325,8 +392,64 @@ function getRunnerForSession(sessionId) {
   return liveSessions.get(sessionId) || null;
 }
 
+function getRunnerIdentityValues(runner) {
+  const values = new Set();
+  const add = (value) => {
+    if (value) {
+      values.add(String(value));
+    }
+  };
+  add(runner?.sessionId);
+  add(runner?.bridgeSessionId);
+  add(runner?.nativeThreadId);
+  add(runner?.threadId);
+  add(runner?.originSessionId);
+  add(runner?.sourceSessionId);
+  add(runner?.conversationKey);
+  if (runner && typeof runner.currentSessionId === 'function') {
+    add(runner.currentSessionId());
+  }
+  return values;
+}
+
+function getCommandSessionCandidates(command = {}) {
+  return [
+    command.sessionId,
+    command.bridgeSessionId,
+    command.nativeThreadId,
+    command.originSessionId,
+    command.sourceSessionId,
+    command.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+}
+
+function getRunnerForCommand(command = {}) {
+  for (const candidate of getCommandSessionCandidates(command)) {
+    const direct = liveSessions.get(candidate);
+    if (direct) {
+      return direct;
+    }
+  }
+
+  const candidates = new Set(getCommandSessionCandidates(command));
+  const seenRunners = new Set();
+  for (const runner of liveSessions.values()) {
+    if (!runner || seenRunners.has(runner)) {
+      continue;
+    }
+    seenRunners.add(runner);
+    const identities = getRunnerIdentityValues(runner);
+    for (const candidate of candidates) {
+      if (identities.has(candidate)) {
+        return runner;
+      }
+    }
+  }
+  return null;
+}
+
 function resolveCommandCwd(command = {}) {
-  const runner = getRunnerForSession(command.sessionId);
+  const runner = getRunnerForCommand(command);
   const cwd = String(command.cwd || command.targetDirectory || runner?.cwd || MANAGED_CWD || '').trim();
   return resolveManagedCwd(cwd || MANAGED_CWD);
 }
@@ -580,13 +703,14 @@ async function failManagedSession(sessionId, cwd, message, state = 'failed') {
   });
 }
 
-function startProcessManagedSession({ sessionId, cwd, command, args, label, originSessionId, sourceSessionId, conversationKey, launchMode, bootstrap }) {
+function startProcessManagedSession({ sessionId, cwd, command, args, label, originSessionId, sourceSessionId, conversationKey, launchMode, apiConfig, bootstrap }) {
   const spawnOptions = {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: false,
     env: {
       ...process.env,
+      ...buildApiEnvironment(apiConfig),
       DEMO_BOOTSTRAP_JSON: JSON.stringify(bootstrap),
       DEMO_SESSION_LABEL: String(label || cwd || sessionId),
     },
@@ -678,6 +802,7 @@ async function startManagedSession(command) {
   const args = command.args && command.args.length ? normalizeArgs(command.args) : resolved.args;
   const bootstrap = buildResumeBootstrap(command);
   const title = command.label || command.cwd || bridgeSessionId;
+  const apiConfig = normalizeApiConfig(command.apiConfig);
   let announcedSessionId = bridgeSessionId;
 
   if (!fs.existsSync(cwd)) {
@@ -711,6 +836,7 @@ async function startManagedSession(command) {
         launchMode: command.launchMode || null,
         nativeThreadId: command.nativeThreadId || null,
         codexHome: CODEX_HOME,
+        apiConfig,
         bootstrap,
         postEvent,
         onTerminated: () => {
@@ -732,6 +858,7 @@ async function startManagedSession(command) {
         sourceSessionId: command.sourceSessionId || null,
         conversationKey: command.conversationKey || command.originSessionId || bridgeSessionId,
         launchMode: command.launchMode || null,
+        apiConfig,
         bootstrap,
       });
     }
@@ -807,8 +934,32 @@ async function handleCommand(command) {
     return;
   }
 
-  const runner = liveSessions.get(command.sessionId);
+  const runner = getRunnerForCommand(command);
   if (!runner) {
+    if (command.type === 'session.model_list' && command.requestId) {
+      await postEvent({
+        type: 'session.model_listed',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        requestId: command.requestId,
+        error: 'session is not live on this host-agent; resume or restart the session before listing models',
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
+    if (command.type === 'session.stop') {
+      await postEvent({
+        type: 'session.state_changed',
+        hostId: HOST_ID,
+        sessionId: command.requestedSessionId || command.sessionId,
+        state: 'history-only',
+        live: false,
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
     await postEvent({
       type: 'session.error',
       hostId: HOST_ID,
@@ -833,6 +984,7 @@ async function handleCommand(command) {
         sandboxMode: command.sandboxMode || null,
         serviceTier: command.serviceTier || null,
         personality: command.personality || null,
+        apiConfig: normalizeApiConfig(command.apiConfig),
       });
     } catch (error) {
       await postEvent({
@@ -1005,6 +1157,14 @@ async function handleCommand(command) {
 
   if (command.type === 'session.stop') {
     await runner.stop();
+    await postEvent({
+      type: 'session.state_changed',
+      hostId: HOST_ID,
+      sessionId: command.requestedSessionId || command.sessionId,
+      state: 'history-only',
+      live: false,
+      timestamp: nowIso(),
+    });
     return;
   }
 }

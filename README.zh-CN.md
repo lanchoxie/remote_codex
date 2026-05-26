@@ -2,7 +2,7 @@
 
 `Mobile Codex Remote` 是一个用手机或浏览器控制多台电脑 / HPC 上 Codex 会话的轻量控制面板。
 
-当前版本：`v2.0.1`，也就是“基础多平台版本 + 登录保护 + 文件传输版本”。
+当前版本：`v2.1.0`，也就是“多平台手机控制 + Tailscale/HPC 使用说明 + 移动端 UI 优化版本”。
 
 ## 这个项目能做什么
 
@@ -17,6 +17,7 @@
 - 使用 Codex app-server 能力：切换模型、推理强度、summary、审批策略、审批 reviewer、沙盒模式、plan-only、review、interrupt、steer、compact、shell command。
 - 支持真实文件上行/下行：拖拽文件会先上传到选中 host 的工作目录，图片会作为远端 `localImage` 交给 Codex，聊天里识别出的远端图片/文件路径可以直接打开或保存。
 - 支持 HPC connector：保存 SSH/gateway/MFA/bootstrap 配置，并通过 tmux 在 HPC 上启动 host-agent。
+- 移动端导航改为抽屉式布局，状态详情合并进会话详情，收藏夹支持下拉选择、改名和删除。
 
 ## 重要安全提醒
 
@@ -63,7 +64,7 @@ node --version
 ```bash
 git clone https://github.com/lanchoxie/remote_codex.git
 cd remote_codex
-git checkout v0.2.0-basic-multiplatform
+git checkout v2.1.0
 ```
 
 启动 relay 和本地 host-agent：
@@ -145,6 +146,12 @@ http://192.168.1.20:8797
 - 如果要给朋友体验，优先让他 clone 仓库自己跑；不要把你的 Tailscale 设备、网页登录密码或 recovery token 给出去。
 - 如果你想临时关闭登录保护，仅限本机调试时设置 `RELAY_AUTH_DISABLED=1` 再启动 relay。
 
+更完整的手机 + Tailscale + HPC 操作说明见：
+
+```text
+docs/phone-tailscale-hpc-guide.md
+```
+
 ## 本地 host 怎么用
 
 启动后，左侧会出现本机 host。
@@ -156,12 +163,10 @@ http://192.168.1.20:8797
 - 在 `Path on selected host` 输入目录，然后点 `New In Directory`。
 - 选择 live session 后直接在底部输入框继续对话。
 
-底部 composer 支持：
+聊天输入区支持：
 
 - 输入普通 prompt。
-- `Models` 拉取模型列表。
-- 手动填写模型 id。
-- 切换 effort / summary / approval / sandbox。
+- 点 `+` 添加文件，点 `×` 清空当前附件。
 - 点 `Plan` 只让 Codex 给计划，不直接改文件。
 - 点 `Review` 审查当前工作区改动。
 - 拖任意常见文件进去，文件会上传到当前 host 的 `.codex-remote-files/uploads/...` 目录。
@@ -169,14 +174,16 @@ http://192.168.1.20:8797
 - 如果 Codex 回复里出现远端图片或文件路径，聊天气泡会显示文件卡片，可以 `Open` 预览或 `Save` 下载到本机/手机。
 - 在输入框里输入 `/` 会弹出命令菜单，支持计划模式、状态、模型、推理强度、个性、代码审查、压缩、fork、上传、MCP/IDE/memory 模板，以及常见 skills 提示。
 
+模型、effort、summary、approval、reviewer、sandbox、personality 等会话参数在右上角 `设置 -> 会话默认参数` 中配置。它们会按当前 session 单独记忆，切换 session 时会恢复对应 session 自己的设置。
+
 ## HPC host 怎么用
 
 推荐流程是：手机 / 浏览器只连 relay，HPC 上跑 host-agent，让 HPC 主动连回 relay。
 
-在网页左侧点：
+在网页右上角点：
 
 ```text
-Manage HPC
+设置 -> Host 与连接器 -> Manage HPC
 ```
 
 新建一个 connector，常用字段：
@@ -209,6 +216,8 @@ Manage HPC
 - `Restart Agent`：杀掉远端 tmux 里的旧 host-agent，并用当前代码重新启动。更新功能后如果看到“host agent needs to be restarted”，用这个按钮。
 - `Copy Login` / `Copy Bootstrap`：复制命令，必要时手动在终端执行。
 
+我们的 HPC 不建议把真实内网 IP、用户名、密码、OTP 写进公开 README。正确做法是在本机网页的 connector 表单里保存两个或多个本地 profile，例如 `hkl`、`dm`；这些配置会写到 ignored 的 `tmp/connectors.json` / `tmp/connector-secrets.json`，不会上传到 GitHub。填写原则见 [手机、Tailscale 与 HPC 快速使用指南](docs/phone-tailscale-hpc-guide.md)。
+
 ## OTP / 验证码说明
 
 很多 HPC 会要求：
@@ -231,22 +240,24 @@ Manage HPC
 
 ## 会话管理
 
-左侧 session 区域支持：
+左侧导航 session 区域支持：
 
 - 按 host 查看会话。
 - 搜索关键词。
 - 搜索路径。
 - 搜索标题类信息。
 - Default 收藏夹。
-- 自定义收藏夹。
+- 自定义收藏夹下拉选择。
+- 收藏夹设置里新建、改名和删除收藏夹。
 - 把某个会话保存到收藏夹。
 - 跨 host 记录收藏项。
 
 收藏夹只记录会话元信息，不会保存你的 SSH 密码或 OTP。
+删除收藏夹不会删除 session；被收藏的会话仍然会留在 Default。
 
 ## Codex 控制项说明
 
-底部控制栏里常见选项：
+右上角 `设置 -> 会话默认参数` 里常见选项：
 
 - `Model`：本轮和后续轮使用的模型。
 - `Effort`：推理强度，例如 low / medium / high / xhigh。
@@ -257,6 +268,9 @@ Manage HPC
 - `Reviewer`：审批由用户还是 auto_review 处理。
 - `Sandbox mode`：workspace write / read only / danger full access。
 - `Review`：启动 Codex review。
+
+会话详情里常见 live 控制：
+
 - `Interrupt`：打断当前 turn。
 - `Steer`：给正在运行的 turn 增加方向。
 - `Compact`：压缩上下文。
@@ -272,7 +286,7 @@ https://github.com/lanchoxie/remote_codex
 或者指定版本：
 
 ```text
-https://github.com/lanchoxie/remote_codex/tree/v0.2.0-basic-multiplatform
+https://github.com/lanchoxie/remote_codex/tree/v2.1.0
 ```
 
 不要发：

@@ -26,6 +26,7 @@ const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_DIR = path.join(__dirname, '..', 'mobile-web', 'public');
 const SESSION_COLLECTIONS_PATH = path.join(process.cwd(), 'tmp', 'session-collections.json');
+const SESSION_LOGS_PATH = path.join(process.cwd(), 'tmp', 'session-logs.json');
 const RECEIVED_FILES_ROOT = path.join(process.cwd(), 'tmp', 'received-files');
 const RECEIVED_FILES_MANIFEST_PATH = path.join(RECEIVED_FILES_ROOT, 'manifest.json');
 const RELAY_AUTH_TOKEN_PATH = process.env.RELAY_AUTH_TOKEN_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-token.txt');
@@ -41,6 +42,40 @@ let relayAuthAccount = loadRelayAuthAccount();
 
 function truthyEnv(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+}
+
+function normalizeApiConfig(input = {}) {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const provider = String(input.provider || '').trim().slice(0, 80);
+  const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
+  const apiKey = String(input.apiKey || '').trim();
+  const profileId = String(input.profileId || '').trim().slice(0, 120);
+  const label = String(input.label || '').trim().slice(0, 120);
+  if (!baseUrl && !apiKey) {
+    return null;
+  }
+  return {
+    provider: provider || 'OpenAI',
+    baseUrl,
+    apiKey,
+    profileId,
+    label,
+  };
+}
+
+function summarizeApiConfig(apiConfig) {
+  const config = normalizeApiConfig(apiConfig);
+  if (!config) {
+    return null;
+  }
+  return {
+    profileId: config.profileId || null,
+    label: config.label || config.provider || 'API profile',
+    provider: config.provider || null,
+    baseUrl: config.baseUrl || null,
+  };
 }
 
 function loadRelayAuthToken() {
@@ -288,13 +323,69 @@ function saveReceivedFiles() {
   }, null, 2), 'utf8');
 }
 
+function normalizeStoredTranscriptEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const text = String(entry.text || '').trim();
+  const files = normalizeFileTransferRefs(entry.files || entry.attachments || []);
+  if (!text && !files.length) {
+    return null;
+  }
+  return {
+    timestamp: entry.timestamp || nowIso(),
+    speaker: entry.speaker || 'system',
+    text,
+    stream: entry.stream || null,
+    files,
+  };
+}
+
+function loadSessionLogs() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSION_LOGS_PATH, 'utf8'));
+    const rawLogs = parsed && typeof parsed.logs === 'object' ? parsed.logs : {};
+    const logs = new Map();
+    for (const [key, entries] of Object.entries(rawLogs)) {
+      const normalized = (Array.isArray(entries) ? entries : [])
+        .map(normalizeStoredTranscriptEntry)
+        .filter(Boolean)
+        .slice(-200);
+      if (normalized.length) {
+        logs.set(key, normalized);
+      }
+    }
+    return logs;
+  } catch {
+    return new Map();
+  }
+}
+
+function saveSessionLogs() {
+  const logs = {};
+  for (const [key, entries] of state.sessionLogs.entries()) {
+    const normalized = (Array.isArray(entries) ? entries : [])
+      .map(normalizeStoredTranscriptEntry)
+      .filter(Boolean)
+      .slice(-200);
+    if (normalized.length) {
+      logs[key] = normalized;
+    }
+  }
+  fs.mkdirSync(path.dirname(SESSION_LOGS_PATH), { recursive: true });
+  fs.writeFileSync(SESSION_LOGS_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    logs,
+  }, null, 2), 'utf8');
+}
+
 const state = {
   hosts: new Map(),
   sessions: new Map(),
   commandQueues: new Map(),
   subscribers: new Map(),
   dismissedHosts: new Set(),
-  sessionLogs: new Map(),
+  sessionLogs: loadSessionLogs(),
   sessionAlerts: new Map(),
   sessionRuntime: new Map(),
   sessionDiagnostics: new Map(),
@@ -628,6 +719,14 @@ function safeFileDisplayName(value, fallback = 'download') {
   return leaf.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 180) || fallback;
 }
 
+function isAmbiguousBareDownloadPath(value) {
+  const text = String(value || '').trim();
+  return Boolean(text)
+    && !/[\\/]/.test(text)
+    && !/^[A-Za-z]:/.test(text)
+    && !text.startsWith('~');
+}
+
 function normalizeFileTransferRefs(rawFiles) {
   const files = [];
   for (const rawFile of Array.isArray(rawFiles) ? rawFiles.slice(0, 16) : []) {
@@ -654,9 +753,21 @@ function normalizeFileTransferRefs(rawFiles) {
   return files;
 }
 
-function setSessionLog(hostId, sessionId, entries) {
+function transcriptFingerprint(entry) {
+  return `${entry.speaker || 'system'}|${entry.timestamp || ''}|${entry.text || ''}|${(entry.files || []).map((file) => file.path || file.name || '').join(',')}`;
+}
+
+function setSessionLog(hostId, sessionId, entries, options = {}) {
   const key = sessionKey(hostId, sessionId);
-  state.sessionLogs.set(key, Array.isArray(entries) ? entries.slice(-200) : []);
+  const normalized = (Array.isArray(entries) ? entries : [])
+    .map(normalizeStoredTranscriptEntry)
+    .filter(Boolean);
+  const existing = options.merge ? state.sessionLogs.get(key) || [] : [];
+  state.sessionLogs.set(
+    key,
+    mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, 200)
+  );
+  saveSessionLogs();
 }
 
 function mergeByFingerprint(entries, fingerprint, limit) {
@@ -833,7 +944,8 @@ function appendSessionLog(hostId, sessionId, entry) {
     files: normalizeFileTransferRefs(entry.files || entry.attachments || []),
   };
   existing.push(nextEntry);
-  state.sessionLogs.set(key, existing.slice(-200));
+  state.sessionLogs.set(key, mergeByFingerprint(existing, transcriptFingerprint, 200));
+  saveSessionLogs();
   return nextEntry;
 }
 
@@ -979,9 +1091,10 @@ function moveSessionArtifacts(hostId, fromSessionId, toSessionId) {
   if (fromLogs.length || toLogs.length) {
     state.sessionLogs.set(
       toKey,
-      mergeByFingerprint([...toLogs, ...fromLogs], (entry) => `${entry.speaker || 'system'}|${entry.timestamp || ''}|${entry.text || ''}`, 200)
+      mergeByFingerprint([...toLogs, ...fromLogs], transcriptFingerprint, 200)
     );
     state.sessionLogs.delete(fromKey);
+    saveSessionLogs();
   }
 
   const fromAlerts = state.sessionAlerts.get(fromKey) || [];
@@ -2223,10 +2336,30 @@ function buildRemoteNodeProbeCommand(connector) {
 
 function buildRemoteCodexProbeCommand(connector) {
   const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
+  const codexHome = remoteShellPath(connector.codexHome || '~/.codex');
   return [
-    `CODEX_BIN="$(command -v codex || test -x ${remoteDir}/.runtime/codex/codex && printf '%s\\n' ${remoteDir}/.runtime/codex/codex || true)"`,
+    `REMOTE_CODEX_DIR=${remoteDir}`,
+    `CODEX_HOME_DIR=${codexHome}`,
+    'CODEX_BIN="$(command -v codex 2>/dev/null || true)"',
+    'if [ -z "$CODEX_BIN" ]; then',
+    '  for p in "$REMOTE_CODEX_DIR/.runtime/codex/codex" "$CODEX_HOME_DIR/bin/codex" "$CODEX_HOME_DIR/codex" "$CODEX_HOME_DIR/node_modules/.bin/codex"; do',
+    '    if [ -x "$p" ]; then CODEX_BIN="$p"; break; fi',
+    '  done',
+    'fi',
+    'if [ -z "$CODEX_BIN" ] && [ -d "$CODEX_HOME_DIR" ]; then',
+    '  CODEX_BIN="$(find "$CODEX_HOME_DIR" -maxdepth 5 -type f \\( -name codex -o -name codex.exe -o -name "codex-*" \\) -perm -111 2>/dev/null | head -n 1 || true)"',
+    'fi',
+    'if [ -z "$CODEX_BIN" ]; then',
+    '  for root in "$HOME/.local/bin" "$HOME/bin" "$HOME/.npm-global/bin" "$HOME/.conda/envs" "$HOME/miniconda3/envs" "$HOME/anaconda3/envs" "$HOME/mambaforge/envs" "$HOME/.micromamba/envs" "$HOME/.nvm/versions/node"; do',
+    '    if [ -x "$root/codex" ]; then CODEX_BIN="$root/codex"; break; fi',
+    '    if [ -d "$root" ]; then',
+    '      CODEX_BIN="$(find "$root" -maxdepth 5 -type f \\( -name codex -o -name codex.exe -o -name "codex-*" \\) -perm -111 2>/dev/null | head -n 1 || true)"',
+    '      if [ -n "$CODEX_BIN" ]; then break; fi',
+    '    fi',
+    '  done',
+    'fi',
     'test -n "$CODEX_BIN" && echo CODEX_REMOTE_CODEX_PRESENT=$CODEX_BIN || echo CODEX_REMOTE_CODEX_MISSING',
-  ].join('; ');
+  ].join('\n');
 }
 
 function buildRemoteRuntimePrepareCommand(connector) {
@@ -2277,6 +2410,15 @@ function buildRemoteCodexResolutionScript(connector, codexRuntimeIncluded) {
     'fi',
     'if [ -z "$CODEX_BIN" ] && [ -d "$CODEX_HOME_DIR" ]; then',
     '  CODEX_BIN="$(find "$CODEX_HOME_DIR" -maxdepth 5 -type f \\( -name codex -o -name "codex-*" -o -name codex.exe \\) -perm -111 2>/dev/null | head -n 1 || true)"',
+    'fi',
+    'if [ -z "$CODEX_BIN" ]; then',
+    '  for root in "$HOME/.local/bin" "$HOME/bin" "$HOME/.npm-global/bin" "$HOME/.conda/envs" "$HOME/miniconda3/envs" "$HOME/anaconda3/envs" "$HOME/mambaforge/envs" "$HOME/.micromamba/envs" "$HOME/.nvm/versions/node"; do',
+    '    if [ -x "$root/codex" ]; then CODEX_BIN="$root/codex"; break; fi',
+    '    if [ -d "$root" ]; then',
+    '      CODEX_BIN="$(find "$root" -maxdepth 5 -type f \\( -name codex -o -name codex.exe -o -name "codex-*" \\) -perm -111 2>/dev/null | head -n 1 || true)"',
+    '      if [ -n "$CODEX_BIN" ]; then break; fi',
+    '    fi',
+    '  done',
     'fi',
   ];
 
@@ -2361,7 +2503,7 @@ function classifyOneShotBootstrapFailure(action, step) {
     return { status: 'node_runtime_missing', message: 'No usable Node runtime was found or uploaded for the remote host.' };
   }
   if (/CODEX_REMOTE_CHECK_CODEX=missing/.test(text)) {
-    return { status: 'codex_runtime_missing', message: 'No usable Codex CLI was found in PATH, CODEX_HOME, or the uploaded runtime.' };
+    return { status: 'codex_runtime_missing', message: 'No usable Codex CLI was found in PATH, CODEX_HOME, common conda/nvm locations, or the uploaded runtime.' };
   }
   if (/CODEX_REMOTE_CHECK_TMUX=missing/.test(text)) {
     return { status: 'tmux_missing', message: 'tmux is required to keep the remote host-agent alive, but it was not found.' };
@@ -2763,7 +2905,7 @@ async function ensureRemoteCodexRuntime(connector, secret, remoteDirectory, make
     return {
       ok: false,
       status: 'codex_runtime_missing',
-      message: 'No remote Codex CLI was found, and no local linux-x86_64 Codex runtime is available to deploy.',
+      message: 'No remote Codex CLI was found in PATH, CODEX_HOME, or common conda/nvm locations, and no local linux-x86_64 Codex runtime is available to deploy.',
       steps,
     };
   }
@@ -3136,7 +3278,7 @@ function awaitModelListRequest(requestId, timeoutMs = 15000) {
   });
 }
 
-function awaitFileRequest(requestId, timeoutMs = 120000) {
+function awaitFileRequest(requestId, timeoutMs = 120000, options = {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       state.pendingFileRequests.delete(requestId);
@@ -3144,6 +3286,8 @@ function awaitFileRequest(requestId, timeoutMs = 120000) {
     }, timeoutMs);
 
     state.pendingFileRequests.set(requestId, {
+      suppressAlert: options.suppressAlert === true,
+      source: options.source || null,
       resolve: (payload) => {
         clearTimeout(timer);
         state.pendingFileRequests.delete(requestId);
@@ -3496,6 +3640,45 @@ function enqueueCommand(hostId, command) {
   queue.push(next);
   state.commandQueues.set(hostId, queue);
   return next;
+}
+
+function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
+  const next = upsertSession(hostId, {
+    sessionId,
+    state: stateName,
+    live: false,
+    lastUpdatedAt: nowIso(),
+  });
+  const runtime = setSessionRuntime(hostId, sessionId, {
+    phase: 'closed',
+    connection: 'closed',
+    busy: false,
+    activeTurnId: null,
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+    updatedAt: nowIso(),
+  });
+  broadcastSessionEvent(hostId, sessionId, 'session.runtime_updated', {
+    hostId,
+    sessionId,
+    patch: runtime,
+    timestamp: nowIso(),
+  });
+  broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
+  return next;
+}
+
+function scheduleStopFallback(hostId, sessionId, delayMs = 4000) {
+  const timer = setTimeout(() => {
+    const session = getSession(hostId, sessionId);
+    const runtime = state.sessionRuntime.get(sessionKey(hostId, sessionId)) || null;
+    if (session?.live && (session.state === 'ending' || runtime?.phase === 'ending')) {
+      markSessionClosed(hostId, sessionId);
+    }
+  }, delayMs);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
 }
 
 function getCommands(hostId, afterId = 0) {
@@ -4204,6 +4387,12 @@ async function handleRequest(req, res) {
       sendJson(res, 400, { error: 'path is required' });
       return;
     }
+    if (isAmbiguousBareDownloadPath(remotePath)) {
+      sendJson(res, 400, {
+        error: 'remote file path must include a directory or be absolute; bare file names are ambiguous',
+      });
+      return;
+    }
 
     const cached = !refresh ? findReceivedFile(hostId, sessionId || '', remotePath) : null;
     if (cached) {
@@ -4222,7 +4411,10 @@ async function handleRequest(req, res) {
     }
 
     const requestId = makeId();
-    const pending = awaitFileRequest(requestId);
+    const pending = awaitFileRequest(requestId, 120000, {
+      suppressAlert: inline,
+      source: inline ? 'inline-preview' : 'download',
+    });
     enqueueCommand(hostId, {
       type: 'host.file_download',
       requestId,
@@ -4323,6 +4515,7 @@ async function handleRequest(req, res) {
         state.sessionRequests.delete(key);
       }
     }
+    saveSessionLogs();
     sendJson(res, 200, { ok: true, hostId });
     return;
   }
@@ -4427,6 +4620,9 @@ async function handleRequest(req, res) {
     const resolvedConversationKey = body.conversationKey || originSessionId || sessionId;
     const resumeTranscript = sourceDetail ? buildResumeTranscript(sourceDetail.transcript) : [];
 
+    const apiConfig = normalizeApiConfig(body.apiConfig);
+    const apiProfile = summarizeApiConfig(apiConfig);
+
     upsertSession(hostId, {
       sessionId,
       cwd,
@@ -4440,6 +4636,7 @@ async function handleRequest(req, res) {
       launchMode,
       bridgeSessionId,
       nativeThreadId: nativeThreadId || sessionId,
+      apiProfile,
     });
 
     if (sourceDetail && Array.isArray(sourceDetail.transcript)) {
@@ -4460,6 +4657,7 @@ async function handleRequest(req, res) {
       launchMode,
       resumeTranscript,
       nativeThreadId,
+      apiConfig,
     });
     sendJson(res, 200, { ok: true, sessionId, command });
     return;
@@ -4509,7 +4707,8 @@ async function handleRequest(req, res) {
       const payload = await pending;
       sendJson(res, 200, payload);
     } catch (error) {
-      sendJson(res, 504, { error: error.message });
+      const statusCode = /not live|no live session/i.test(error.message || '') ? 409 : 504;
+      sendJson(res, statusCode, { error: error.message });
     }
     return;
   }
@@ -4576,9 +4775,23 @@ async function handleRequest(req, res) {
       files: uploadedFiles,
       timestamp: nowIso(),
     });
+    const apiConfig = normalizeApiConfig(body.apiConfig);
+    const apiProfile = summarizeApiConfig(apiConfig);
     const next = upsertSession(hostId, {
       sessionId,
       latestUserMessage: transcriptText,
+      apiProfile: apiProfile || session.apiProfile || null,
+      codexOptions: {
+        model: String(body.model || '').trim() || null,
+        effort: String(body.effort || '').trim() || null,
+        summary: String(body.summary || '').trim() || null,
+        mode: String(body.mode || '').trim() || null,
+        approvalPolicy: typeof body.approvalPolicy === 'object' ? body.approvalPolicy : String(body.approvalPolicy || '').trim() || null,
+        approvalsReviewer: String(body.approvalsReviewer || '').trim() || null,
+        sandboxMode: String(body.sandboxMode || '').trim() || null,
+        serviceTier: String(body.serviceTier || '').trim() || null,
+        personality: String(body.personality || '').trim() || null,
+      },
       lastUpdatedAt: nowIso(),
     });
     broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
@@ -4597,6 +4810,7 @@ async function handleRequest(req, res) {
       sandboxMode: String(body.sandboxMode || '').trim() || null,
       serviceTier: String(body.serviceTier || '').trim() || null,
       personality: String(body.personality || '').trim() || null,
+      apiConfig,
     });
     sendJson(res, 200, { ok: true, command });
     return;
@@ -4676,11 +4890,52 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const command = enqueueCommand(hostId, {
-      type: 'session.stop',
+    const session = getSession(hostId, sessionId);
+    if (session) {
+      const next = upsertSession(hostId, {
+        sessionId,
+        state: 'ending',
+        live: true,
+        lastUpdatedAt: nowIso(),
+      });
+      setSessionRuntime(hostId, sessionId, {
+        phase: 'ending',
+        connection: 'closing',
+        busy: false,
+        activeTurnId: null,
+        updatedAt: nowIso(),
+      });
+      broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
+      broadcastSessionEvent(hostId, sessionId, 'session.runtime_updated', {
+        hostId,
+        sessionId,
+        patch: {
+          phase: 'ending',
+          connection: 'closing',
+          busy: false,
+          activeTurnId: null,
+        },
+        timestamp: nowIso(),
+      });
+    }
+
+    const stopCandidates = Array.from(new Set([
+      session?.bridgeSessionId,
       sessionId,
-    });
-    sendJson(res, 200, { ok: true, command });
+      session?.nativeThreadId,
+    ].map((value) => String(value || '').trim()).filter(Boolean)));
+    const commands = stopCandidates.map((candidateSessionId) => enqueueCommand(hostId, {
+      type: 'session.stop',
+      sessionId: candidateSessionId,
+      requestedSessionId: sessionId,
+      bridgeSessionId: session?.bridgeSessionId || null,
+      nativeThreadId: session?.nativeThreadId || null,
+      originSessionId: session?.originSessionId || null,
+      sourceSessionId: session?.sourceSessionId || null,
+      conversationKey: session?.conversationKey || null,
+    }));
+    scheduleStopFallback(hostId, sessionId);
+    sendJson(res, 200, { ok: true, command: commands[0] || null, commands });
     return;
   }
 
@@ -4901,7 +5156,7 @@ function applyAgentEvent(event) {
         nativeThreadId: existing?.nativeThreadId || session.nativeThreadId || session.sessionId,
       });
       if (!preserveManagedState && !next.live && Array.isArray(session.transcriptPreview)) {
-        setSessionLog(event.hostId, next.sessionId, session.transcriptPreview);
+        setSessionLog(event.hostId, next.sessionId, session.transcriptPreview, { merge: true });
       }
       broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
     }
@@ -4988,9 +5243,10 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'file.error' && event.requestId) {
+    const pendingFileRequest = state.pendingFileRequests.get(event.requestId) || null;
     removeQueuedFileCommand(event.hostId, event.requestId);
     rejectPendingFileRequest(event.requestId, event.message || 'file transfer failed');
-    if (event.sessionId) {
+    if (event.sessionId && !pendingFileRequest?.suppressAlert) {
       emitSessionAlert(event.hostId, event.sessionId, {
         severity: 'error',
         source: 'file-transfer',
@@ -5021,6 +5277,7 @@ function applyAgentEvent(event) {
         conversationKey: event.conversationKey || event.originSessionId || effectiveSessionId,
         launchMode: event.launchMode || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
+        apiProfile: existing?.apiProfile || null,
       })
       : upsertSession(event.hostId, {
         sessionId: effectiveSessionId,
@@ -5036,6 +5293,7 @@ function applyAgentEvent(event) {
         launchMode: event.launchMode || null,
         bridgeSessionId: event.bridgeSessionId || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
+        apiProfile: getSession(event.hostId, effectiveSessionId)?.apiProfile || null,
         lastUpdatedAt: nowIso(),
       });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.started', next);
@@ -5092,6 +5350,9 @@ function applyAgentEvent(event) {
 
   if (event.type === 'session.state_changed') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const existingSession = getSession(event.hostId, effectiveSessionId);
+    const existingRuntime = state.sessionRuntime.get(sessionKey(event.hostId, effectiveSessionId)) || null;
+    const wasEnding = existingSession?.state === 'ending' || existingRuntime?.phase === 'ending';
     const next = upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
       state: event.state || 'unknown',
@@ -5099,7 +5360,25 @@ function applyAgentEvent(event) {
       lastUpdatedAt: nowIso(),
     });
 
-    if (/^failed:/i.test(next.state) || /^exited:(?!0:)/i.test(next.state)) {
+    if (event.live === false) {
+      const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
+        phase: 'closed',
+        connection: 'closed',
+        busy: false,
+        activeTurnId: null,
+        waitingOnApproval: false,
+        waitingOnUserInput: false,
+        updatedAt: event.timestamp || nowIso(),
+      });
+      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.runtime_updated', {
+        hostId: event.hostId,
+        sessionId: effectiveSessionId,
+        patch: runtime,
+        timestamp: event.timestamp || nowIso(),
+      });
+    }
+
+    if (/^failed:/i.test(next.state) || (/^exited:(?!0:)/i.test(next.state) && !wasEnding)) {
       emitSessionAlert(event.hostId, effectiveSessionId, {
         severity: 'error',
         source: 'runtime',
@@ -5203,10 +5482,16 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.error') {
+    const message = event.message || 'session error';
+    if (/no live session for command session\.(model_list|stop)/i.test(message)) {
+      markSessionClosed(event.hostId, sessionId);
+      return;
+    }
+
     emitSessionAlert(event.hostId, sessionId, {
       severity: 'error',
       source: 'runtime',
-      message: event.message || 'session error',
+      message,
       timestamp: event.timestamp || nowIso(),
     });
     broadcastSessionEvent(event.hostId, sessionId, 'session.error', {

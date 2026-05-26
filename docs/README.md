@@ -7,6 +7,7 @@ This directory separates product architecture, implementation modules, validatio
 - [Module Map](module-map.md): how the project is decomposed and which files own each module.
 - [Validation Status](validation-status.md): what has been verified, what is partially verified, and what is still unbuilt.
 - [Developer Guide](developer-guide.md): local workflow, APIs, events, and development conventions.
+- [Phone, Tailscale And HPC Guide](phone-tailscale-hpc-guide.md): phone access, Tailscale setup, and HPC connector onboarding.
 
 ## Existing design docs
 

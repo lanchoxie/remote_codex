@@ -21,7 +21,7 @@ Reading `~/.codex` is useful for discovery, but it is not enough for control.
 To let Codex continue running on another machine, we need a host-side agent that
 owns the live Codex process and streams input/output over a secure channel.
 
-## Version 2.0.1: 基础多平台版本
+## Version 2.1.0: mobile + HPC control baseline
 
 This release is the first usable multi-platform baseline. It is still a local
 tooling project, but it can now control local and remote Codex hosts from the
@@ -58,6 +58,9 @@ What this version does:
 - adds a Codex-like `/` command menu in the composer for plan mode, status,
   model controls, reasoning effort, personality, review, compact, fork, upload,
   and skill-oriented prompt templates.
+- improves the phone layout with a drawer-style navigator, compact session
+  status chips, a unified session details/status modal, session-scoped model
+  settings, and collection management with rename/delete safeguards.
 
 Current limitations:
 
@@ -101,6 +104,9 @@ For phone access away from the same Wi-Fi, the recommended path is Tailscale:
 install Tailscale on the relay machine and on the phone, sign in to the same
 tailnet, then open `http://<relay-machine-tailscale-ip>:8787` or `:8797`.
 Do not port-forward the relay directly from your router.
+
+For the full phone, Tailscale, and HPC connector workflow, see
+[Phone, Tailscale And HPC Guide](docs/phone-tailscale-hpc-guide.md).
 
 Useful scripts:
 
@@ -182,6 +188,7 @@ Useful environment variables for the agent:
 - [Remodex Comparison](docs/remodex-comparison.md)
 - [Architecture](docs/mobile-codex-remote-architecture.md)
 - [HPC Connectors](docs/hpc-connectors.md)
+- [Phone, Tailscale And HPC Guide](docs/phone-tailscale-hpc-guide.md)
 - [Host Onboarding](docs/host-onboarding.md)
 - [Session Discovery And Control](docs/session-discovery-and-control.md)
 - [MVP Plan](docs/mvp-plan.md)

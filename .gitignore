@@ -10,6 +10,7 @@ logs/
 tmp/connectors.json
 tmp/connector-secrets.json
 tmp/session-collections.json
+tmp/session-logs.json
 tmp/remote-codex-askpass.cmd
 tmp/remote-codex-askpass.ps1
 tmp/askpass-state-*.txt

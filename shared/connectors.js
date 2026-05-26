@@ -250,6 +250,9 @@ function buildAgentLaunchCommand(connector) {
   if (connector.codexHome) {
     exports.push(`CODEX_HOME=${shellEnvValue(connector.codexHome, { allowHome: true })}`);
   }
+  if (Array.isArray(connector.workspaceRoots) && connector.workspaceRoots.length > 0) {
+    exports.push(`WORKSPACE_ROOTS=${shellEnvValue(connector.workspaceRoots.join(';'))}`);
+  }
   exports.push('AUTO_START_SESSION=false');
 
   const envBlock = exports.length ? `${exports.join(' ')} ` : '';

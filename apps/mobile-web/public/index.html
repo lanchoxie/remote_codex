@@ -47,29 +47,40 @@
         <div id="account-error" class="auth-error"></div>
       </form>
     </div>
-    <div class="shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="eyebrow">Mobile Codex Remote</div>
-          <h1>Navigator</h1>
+    <div id="settings-dialog" class="settings-overlay hidden" aria-hidden="true">
+      <form id="settings-form" class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="settings-header">
+          <div>
+            <div class="eyebrow" data-i18n-key="settings.eyebrow">Remote Settings</div>
+            <h1 id="settings-title" data-i18n-key="settings.title">Language, API, and Session</h1>
+            <p id="settings-subtitle" data-i18n-key="settings.subtitle">These preferences are stored in this browser only.</p>
+          </div>
+          <button id="close-settings-button" type="button" class="secondary-button" data-i18n-key="common.close">Close</button>
         </div>
 
-        <section class="nav-section overview-section">
-          <div class="section-header">
-            <div>
-              <div class="eyebrow">Overview</div>
-              <h2>Hosts</h2>
-            </div>
-            <button id="toggle-overview-button" type="button" class="section-toggle secondary-button">Hide</button>
+        <section class="settings-section">
+          <div>
+            <div class="settings-section-title" data-i18n-key="settings.languageTitle">Interface language</div>
+            <div class="settings-section-copy" data-i18n-key="settings.languageCopy">Switch the browser UI between Chinese and English.</div>
           </div>
+          <select id="settings-language-select">
+            <option value="zh-CN">中文</option>
+            <option value="en">English</option>
+          </select>
+        </section>
 
-          <div id="overview-body" class="collapsible-body">
+        <section class="settings-section host-settings-section">
+          <div>
+            <div class="settings-section-title" data-i18n-key="settings.hostsTitle">Hosts and connectors</div>
+            <div class="settings-section-copy" data-i18n-key="settings.hostsCopy">Manage connected hosts, import a host id, or open HPC connector profiles.</div>
+          </div>
+          <div id="overview-body" class="settings-host-management">
             <div id="overview-stats" class="mini-stats"></div>
 
-            <form id="import-form" class="import-form">
+            <div id="import-form" class="import-form">
               <input id="import-host-id" placeholder="Import host id, e.g. hpc-login-01" />
-              <button type="submit">Import Host</button>
-            </form>
+              <button id="import-host-button" type="button">Import Host</button>
+            </div>
 
             <div class="connector-cta">
               <div>
@@ -84,13 +95,145 @@
           </div>
         </section>
 
+        <section class="settings-section session-defaults-section">
+          <div>
+            <div class="settings-section-title" data-i18n-key="settings.sessionDefaultsTitle">Session defaults</div>
+            <div class="settings-section-copy" data-i18n-key="settings.sessionDefaultsCopy">These controls are remembered per selected session. Switching sessions restores that session's model, effort, reviewer, sandbox, and personality choices.</div>
+          </div>
+          <div class="composer-control-grid settings-control-grid">
+            <input id="codex-model-input" type="hidden" autocomplete="off" />
+            <datalist id="codex-model-options"></datalist>
+            <select id="codex-model-select" aria-label="Supported model">
+              <option value="">Model: auto/default</option>
+            </select>
+            <button id="codex-model-refresh-button" type="button" class="secondary-button">Models</button>
+            <select id="codex-effort-select" aria-label="Reasoning effort">
+              <option value="">Effort: default</option>
+              <option value="minimal">Minimal</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh">XHigh</option>
+            </select>
+            <select id="codex-summary-select" aria-label="Reasoning summary">
+              <option value="">Summary: default</option>
+              <option value="auto">Auto summary</option>
+              <option value="concise">Concise</option>
+              <option value="detailed">Detailed</option>
+              <option value="none">No summary</option>
+            </select>
+            <select id="codex-mode-select" aria-label="Send mode">
+              <option value="default">Default mode</option>
+              <option value="plan">Plan only</option>
+            </select>
+            <select id="codex-approval-policy-select" aria-label="Approval policy">
+              <option value="on-request">Approval: on request</option>
+              <option value="on-failure">On failure</option>
+              <option value="untrusted">Untrusted</option>
+              <option value="never">Never</option>
+            </select>
+            <select id="codex-reviewer-select" aria-label="Approval reviewer">
+              <option value="auto_review">Auto review</option>
+              <option value="user">Reviewer: user</option>
+            </select>
+            <select id="codex-sandbox-mode-select" aria-label="Sandbox mode">
+              <option value="workspaceWrite">Workspace write</option>
+              <option value="readOnly">Read only</option>
+              <option value="dangerFullAccess">Danger full access</option>
+            </select>
+            <select id="codex-personality-select" aria-label="Personality">
+              <option value="">Personality: default</option>
+              <option value="friendly">Friendly</option>
+              <option value="pragmatic">Pragmatic</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+        </section>
+
+        <section class="settings-section api-settings-section">
+          <div>
+            <div class="settings-section-title" data-i18n-key="settings.apiTitle">API profiles</div>
+            <div class="settings-section-copy" data-i18n-key="settings.apiCopy">Create multiple API profiles and choose which host uses which key. Changes apply to newly started Codex app-server sessions.</div>
+          </div>
+          <div class="settings-profile-toolbar">
+            <label>
+              <span data-i18n-key="settings.profileSelect">Editing profile</span>
+              <select id="settings-api-profile-select"></select>
+            </label>
+            <button id="settings-add-api-profile-button" type="button" class="secondary-button" data-i18n-key="settings.addProfile">New profile</button>
+            <button id="settings-delete-api-profile-button" type="button" class="danger-button" data-i18n-key="settings.deleteProfile">Delete profile</button>
+          </div>
+          <div class="settings-field-grid">
+            <label>
+              <span data-i18n-key="settings.profileName">Profile name</span>
+              <input id="settings-api-profile-label" placeholder="OpenAI main, HPC proxy, lab key..." autocomplete="off" />
+            </label>
+            <label>
+              <span data-i18n-key="settings.apiProvider">Provider label</span>
+              <input id="settings-api-provider" placeholder="OpenAI or compatible provider" autocomplete="off" />
+            </label>
+            <label>
+              <span data-i18n-key="settings.api-base-url">Base URL</span>
+              <input id="settings-api-base-url" placeholder="https://api.openai.com/v1 or compatible endpoint" autocomplete="off" />
+            </label>
+            <label>
+              <span data-i18n-key="settings.api-key">API key</span>
+              <input id="settings-api-key" type="password" placeholder="sk-... stored locally if enabled" autocomplete="off" />
+            </label>
+            <label class="settings-checkbox">
+              <input id="settings-api-key-remember" type="checkbox" />
+              <span data-i18n-key="settings.rememberKey">Remember API key in this browser</span>
+            </label>
+          </div>
+          <div class="settings-profile-toolbar">
+            <label>
+              <span data-i18n-key="settings.defaultProfile">Default API profile</span>
+              <select id="settings-default-api-profile"></select>
+            </label>
+          </div>
+          <div>
+            <div class="settings-section-title" data-i18n-key="settings.hostMappingTitle">Host API mapping</div>
+            <div class="settings-section-copy" data-i18n-key="settings.hostMappingCopy">A host can use the default profile or a dedicated profile.</div>
+            <div id="settings-host-api-list" class="settings-host-api-list"></div>
+          </div>
+          <div class="settings-warning" data-i18n-key="settings.apiWarning">Do not use this on an untrusted relay or shared browser. The key is sent through your relay when starting a session.</div>
+        </section>
+
+        <section id="account-settings-section" class="settings-section account-settings-section">
+          <div>
+            <div class="settings-section-title" data-i18n-key="settings.accountTitle">Account security</div>
+            <div class="settings-section-copy" data-i18n-key="settings.accountCopy">Change the relay web login or lock this browser session.</div>
+          </div>
+          <div class="settings-inline-actions">
+            <button id="account-button" type="button" class="secondary-button" hidden>Account</button>
+            <button id="logout-button" type="button" class="secondary-button" hidden>Lock</button>
+          </div>
+        </section>
+
+        <div class="settings-actions">
+          <button id="clear-api-key-button" type="button" class="secondary-button" data-i18n-key="settings.clearKey">Clear API key</button>
+          <button type="submit" data-i18n-key="common.save">Save settings</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="shell navigator-collapsed">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="eyebrow">Mobile Codex Remote</div>
+          <div class="brand-row">
+            <h1>Navigator</h1>
+            <button id="close-sidebar-navigator-button" type="button" class="secondary-button sidebar-close-button">Close</button>
+          </div>
+        </div>
+
         <section class="nav-section selected-host-section">
           <div class="section-header">
-            <div>
+            <div class="selected-host-heading">
               <div class="eyebrow">Selected Host</div>
               <h2 id="selected-host-title">No host selected</h2>
+              <div id="selected-host-meta" class="meta"></div>
             </div>
-            <div id="selected-host-meta" class="meta"></div>
             <button id="toggle-new-session-button" type="button" class="section-toggle secondary-button">Hide New</button>
           </div>
 
@@ -113,20 +256,32 @@
             </form>
           </div>
 
-          <div id="session-collection-tabs" class="collection-tabs"></div>
-          <form id="collection-create-form" class="collection-create-form">
-            <input id="collection-name-input" placeholder="New collection name" />
-            <button type="submit" class="secondary-button">Add</button>
-          </form>
+          <div class="collection-toolbar">
+            <button id="collection-menu-button" type="button" class="secondary-button collection-icon-button" aria-label="Collections" title="Collections">&#128218;</button>
+            <select id="session-collection-select" aria-label="Collection"></select>
+            <button id="collection-settings-button" type="button" class="secondary-button collection-icon-button" aria-label="Collection settings" title="Collection settings">&#9881;</button>
+          </div>
+          <div id="collection-manager-popover" class="collection-popover hidden">
+            <div class="collection-popover-header">
+              <strong>Collection settings</strong>
+              <button id="close-collection-manager-button" type="button" class="secondary-button">Close</button>
+            </div>
+            <div class="collection-create-row">
+              <input id="collection-name-input" placeholder="New collection name" />
+              <button id="create-collection-button" type="button" class="secondary-button">Add</button>
+            </div>
+            <div id="collection-manager-list" class="collection-manager-list"></div>
+          </div>
           <form id="session-search-form" class="session-search-form">
             <select id="session-search-mode" aria-label="Search mode">
               <option value="keyword">Keyword</option>
               <option value="path">Path</option>
               <option value="title">Title</option>
             </select>
-            <input id="session-search-input" placeholder="Search conversations..." autocomplete="off" />
-            <button type="submit" class="secondary-button">Search</button>
-            <button id="clear-session-search-button" type="button" class="secondary-button">Clear</button>
+            <div class="search-input-wrap">
+              <input id="session-search-input" placeholder="Search conversations..." autocomplete="off" />
+              <button id="clear-session-search-button" type="button" class="secondary-button search-clear-button" aria-label="Clear search">×</button>
+            </div>
           </form>
           <div id="session-search-summary" class="session-search-summary"></div>
           <div id="session-list" class="list conversation-list"></div>
@@ -141,10 +296,12 @@
             <div id="session-meta" class="meta"></div>
           </div>
           <div class="detail-actions">
-            <button id="toggle-status-button" type="button" class="secondary-button">Status</button>
-            <button id="account-button" type="button" class="secondary-button" hidden>Account</button>
-            <button id="logout-button" type="button" class="secondary-button" hidden>Lock</button>
-            <button id="import-selected-host-button" type="button" class="secondary-button">Import Host</button>
+            <button id="toggle-navigator-button" type="button" class="secondary-button navigator-toggle-button">Navigator</button>
+            <button id="toggle-language-button" type="button" class="secondary-button">中文</button>
+            <button id="open-settings-button" type="button" class="secondary-button">Settings</button>
+            <button id="toggle-status-button" type="button" class="secondary-button hidden" hidden aria-hidden="true">Status</button>
+            <button id="end-session-button" type="button" class="danger-button hidden">End Session</button>
+            <button id="import-selected-host-button" type="button" class="secondary-button hidden" hidden aria-hidden="true">Import Host</button>
             <button id="toggle-alerts-button" type="button" class="secondary-button">Alerts</button>
             <button id="join-session-button" type="button" class="secondary-button">Join Running Session</button>
             <button id="resume-session-button" type="button" class="secondary-button">Resume From History</button>
@@ -152,130 +309,116 @@
           </div>
         </header>
 
-        <section class="panel detail-panel">
-          <div class="detail-grid">
-            <div class="detail-card">
-              <div class="eyebrow">Path</div>
-              <div id="session-path" class="detail-path">(unknown path)</div>
+        <section id="session-detail-panel" class="panel detail-panel compact-detail-panel unified-session-panel">
+          <div class="compact-detail-main unified-session-main" aria-hidden="true">
+            <div class="unified-session-copy">
+              <div class="eyebrow">Session</div>
+              <div id="session-detail-summary-title" class="compact-detail-title">No session selected</div>
+              <div id="session-detail-summary-path" class="compact-detail-subtitle">Select a conversation to inspect path, status, runtime, messages, and variants.</div>
             </div>
-            <div class="detail-card">
-              <div class="eyebrow">Status</div>
-              <div id="session-status" class="detail-value">No session selected</div>
-            </div>
-            <div class="detail-card">
-              <div class="eyebrow">Runner</div>
-              <div id="session-runner" class="detail-value">Unknown</div>
-            </div>
-            <div class="detail-card detail-card-wide">
-              <div class="eyebrow">Latest User Message</div>
-              <div id="latest-user-message" class="detail-copy">Select a conversation to inspect it.</div>
-            </div>
-            <div class="detail-card detail-card-wide">
-              <div class="eyebrow">Latest Agent Message</div>
-              <div id="latest-agent-message" class="detail-copy">A managed session can continue work from this workspace.</div>
-            </div>
-            <div class="detail-card detail-card-wide">
-              <div class="eyebrow">Session Variants</div>
-              <div id="session-variants" class="variant-strip"></div>
-            </div>
-            <div id="session-warning-card" class="detail-card detail-card-wide warning-card hidden">
-              <div class="eyebrow">Runner Notes</div>
-              <div id="session-warning" class="detail-copy">No warning.</div>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel runtime-panel">
-          <div class="runtime-panel-header">
-            <div>
-              <div class="eyebrow">Live Runtime</div>
+            <div class="unified-runtime-copy">
+              <div class="eyebrow">Runtime</div>
               <div id="runtime-panel-title" class="runtime-panel-title">No live session attached</div>
               <div id="runtime-panel-subtitle" class="runtime-panel-subtitle">Select or start a managed session to see live status, timers, and commands.</div>
             </div>
-            <div class="runtime-panel-actions">
-              <button id="runtime-open-status-button" type="button" class="secondary-button">Full Status</button>
-              <button id="runtime-interrupt-button" type="button" class="danger-button">Interrupt</button>
-              <button id="runtime-compact-button" type="button" class="secondary-button">/compact</button>
+            <div class="compact-detail-status">
+              <span id="session-detail-summary-status" class="runtime-chip info">No session</span>
+              <button id="session-details-button" type="button" class="secondary-button hidden">Details</button>
             </div>
           </div>
           <div id="runtime-chip-row" class="runtime-chip-row"></div>
-          <div class="runtime-inline-grid">
-            <section class="runtime-command-card">
-              <div class="runtime-command-title">Steer Current Turn</div>
-              <form id="inline-steer-form" class="status-inline-form">
-                <textarea id="inline-steer-input" rows="3" placeholder="Guide the active turn without starting a new one..."></textarea>
-                <button id="inline-steer-submit-button" type="submit" class="secondary-button">Steer Turn</button>
-              </form>
-            </section>
-            <section class="runtime-command-card">
-              <div class="runtime-command-title">Shell Command</div>
-              <form id="inline-shell-command-form" class="status-inline-form">
-                <input id="inline-shell-command-input" placeholder="Run a host shell command through thread/shellCommand" />
-                <button id="inline-shell-command-submit-button" type="submit" class="danger-button">Run Command</button>
-              </form>
-              <div class="runtime-command-note">Runs through `thread/shellCommand` on the selected host.</div>
-            </section>
-          </div>
         </section>
+
+        <div id="session-details-overlay" class="runtime-details-overlay hidden">
+          <div id="session-details-modal" class="runtime-details-modal session-details-modal">
+            <div class="runtime-details-header">
+              <div>
+                <div class="eyebrow">Session Detail</div>
+                <div id="session-detail-modal-title" class="runtime-panel-title">No session selected</div>
+                <div id="session-detail-modal-subtitle" class="runtime-panel-subtitle">Path, runner, runtime, latest messages, and variants.</div>
+              </div>
+              <div class="runtime-panel-actions">
+                <button id="runtime-modal-open-status-button" type="button" class="secondary-button hidden" hidden aria-hidden="true">Full Status</button>
+                <button id="session-details-close-button" type="button" class="secondary-button">Close</button>
+              </div>
+            </div>
+            <div class="detail-grid">
+              <div class="detail-card">
+                <div class="eyebrow">Path</div>
+                <div id="session-path" class="detail-path">(unknown path)</div>
+              </div>
+              <div class="detail-card">
+                <div class="eyebrow">Status</div>
+                <div id="session-status" class="detail-value">No session selected</div>
+              </div>
+              <div class="detail-card">
+                <div class="eyebrow">Runner</div>
+                <div id="session-runner" class="detail-value">Unknown</div>
+              </div>
+              <div class="detail-card detail-card-wide">
+                <div class="eyebrow">Latest User Message</div>
+                <div id="latest-user-message" class="detail-copy">Select a conversation to inspect it.</div>
+              </div>
+              <div class="detail-card detail-card-wide">
+                <div class="eyebrow">Latest Agent Message</div>
+                <div id="latest-agent-message" class="detail-copy">A managed session can continue work from this workspace.</div>
+              </div>
+              <div class="detail-card detail-card-wide">
+                <div class="eyebrow">Session Variants</div>
+                <div id="session-variants" class="variant-strip"></div>
+              </div>
+              <div id="session-warning-card" class="detail-card detail-card-wide warning-card hidden">
+                <div class="eyebrow">Runner Notes</div>
+                <div id="session-warning" class="detail-copy">No warning.</div>
+              </div>
+            </div>
+            <div class="runtime-detail-section">
+              <div>
+                <div class="eyebrow">Live Runtime</div>
+                <div id="runtime-detail-title" class="runtime-panel-title">No live session attached</div>
+                <div id="runtime-detail-subtitle" class="runtime-panel-subtitle">Advanced live controls.</div>
+              </div>
+            </div>
+            <div id="runtime-detail-chip-row" class="runtime-chip-row"></div>
+            <div class="runtime-inline-grid">
+              <section class="runtime-command-card">
+                <div class="runtime-command-title">Steer Current Turn</div>
+                <form id="inline-steer-form" class="status-inline-form">
+                  <textarea id="inline-steer-input" rows="3" placeholder="Guide the active turn without starting a new one..."></textarea>
+                  <button id="inline-steer-submit-button" type="submit" class="secondary-button">Steer Turn</button>
+                </form>
+              </section>
+              <section class="runtime-command-card">
+                <div class="runtime-command-title">Shell Command</div>
+                <form id="inline-shell-command-form" class="status-inline-form">
+                  <input id="inline-shell-command-input" placeholder="Run a host shell command through thread/shellCommand" />
+                  <button id="inline-shell-command-submit-button" type="submit" class="danger-button">Run Command</button>
+                </form>
+                <div class="runtime-command-note">Runs through `thread/shellCommand` on the selected host.</div>
+              </section>
+            </div>
+            <div id="session-status-panel-slot" class="session-status-panel-slot"></div>
+          </div>
+        </div>
 
         <section class="panel transcript-panel">
           <div id="session-log" class="log"></div>
           <form id="input-form" class="composer">
-            <div class="composer-control-grid">
-              <input id="codex-model-input" type="hidden" autocomplete="off" />
-              <datalist id="codex-model-options"></datalist>
-              <select id="codex-model-select" aria-label="Supported model">
-                <option value="">Model: auto/default</option>
-              </select>
-              <button id="codex-model-refresh-button" type="button" class="secondary-button">Models</button>
-              <select id="codex-effort-select" aria-label="Reasoning effort">
-                <option value="">Effort: default</option>
-                <option value="minimal">Minimal</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="xhigh">XHigh</option>
-              </select>
-              <select id="codex-summary-select" aria-label="Reasoning summary">
-                <option value="">Summary: default</option>
-                <option value="auto">Auto summary</option>
-                <option value="concise">Concise</option>
-                <option value="detailed">Detailed</option>
-                <option value="none">No summary</option>
-              </select>
-              <select id="codex-mode-select" aria-label="Send mode">
-                <option value="default">Default mode</option>
-                <option value="plan">Plan only</option>
-              </select>
-              <select id="codex-approval-policy-select" aria-label="Approval policy">
-                <option value="on-request">Approval: on request</option>
-                <option value="on-failure">On failure</option>
-                <option value="untrusted">Untrusted</option>
-                <option value="never">Never</option>
-              </select>
-              <select id="codex-reviewer-select" aria-label="Approval reviewer">
-                <option value="user">Reviewer: user</option>
-                <option value="auto_review">Auto review</option>
-              </select>
-              <select id="codex-sandbox-mode-select" aria-label="Sandbox mode">
-                <option value="workspaceWrite">Workspace write</option>
-                <option value="readOnly">Read only</option>
-                <option value="dangerFullAccess">Danger full access</option>
-              </select>
-              <select id="codex-personality-select" aria-label="Personality">
-                <option value="">Personality: default</option>
-                <option value="friendly">Friendly</option>
-                <option value="pragmatic">Pragmatic</option>
-                <option value="none">None</option>
-              </select>
-            </div>
             <div class="composer-attachment-grid">
               <input id="codex-image-files" class="file-picker-input" type="file" multiple />
-              <button id="codex-file-picker-button" type="button" class="secondary-button">Attach Files</button>
-              <input id="codex-local-image-path" placeholder="Image path on selected host, e.g. ~/shot.png" autocomplete="off" />
-              <button id="codex-clear-attachments-button" type="button" class="secondary-button">Clear Files</button>
+              <button id="codex-file-picker-button" type="button" class="secondary-button attachment-icon-button" aria-label="Attach files" title="Attach files">+</button>
+              <input id="codex-local-image-path" class="hidden" placeholder="Image path on selected host, e.g. ~/shot.png" autocomplete="off" />
+              <button id="codex-clear-attachments-button" type="button" class="secondary-button attachment-icon-button" aria-label="Clear files" title="Clear files">×</button>
             </div>
             <div id="codex-attachment-chips" class="attachment-chip-list hidden" aria-live="polite"></div>
+            <div id="composer-turn-notice" class="composer-turn-notice hidden" aria-live="polite">
+              <div>
+                <strong id="composer-turn-notice-title">Active turn updated</strong>
+                <div id="composer-turn-notice-copy">Your message was added to the current Codex turn.</div>
+              </div>
+              <button id="composer-force-send-button" type="button" class="secondary-button">Interrupt & Send</button>
+              <div id="composer-steer-queue-list" class="steer-queue-list"></div>
+            </div>
             <div class="composer-main-row">
               <div class="composer-input-wrap">
                 <textarea id="input-text" rows="3" placeholder="Send a follow-up prompt to the live managed session..."></textarea>
@@ -284,6 +427,7 @@
               <div class="composer-action-stack">
                 <button id="codex-plan-button" type="button" class="secondary-button">Plan</button>
                 <button id="codex-review-button" type="button" class="secondary-button">Review</button>
+                <button id="codex-interrupt-button" type="button" class="danger-button hidden">Interrupt</button>
                 <button id="codex-send-button" type="submit">Send</button>
               </div>
             </div>
@@ -317,10 +461,11 @@
             <div id="status-window-title" class="status-window-title">No session selected</div>
             <div id="status-window-subtitle" class="status-window-subtitle">Status details will appear here.</div>
           </div>
-          <button id="close-status-window-button" type="button" class="secondary-button">Close</button>
+          <button id="close-status-window-button" type="button" class="secondary-button hidden" hidden aria-hidden="true">Close</button>
         </div>
         <div class="status-window-actions">
           <button id="interrupt-turn-button" type="button" class="danger-button">Interrupt Turn</button>
+          <button id="end-session-status-button" type="button" class="danger-button">End Live Session</button>
           <button id="compact-thread-button" type="button" class="secondary-button">Compact Context</button>
           <button id="refresh-status-button" type="button" class="secondary-button">Refresh</button>
         </div>

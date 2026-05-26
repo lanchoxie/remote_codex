@@ -57,9 +57,26 @@ function shouldSurfaceStderrLine(text) {
 
 function isRuntimeDiagnosticStderrLine(text) {
   return /codex_app_server: failed to initialize sqlite state db/i.test(text)
+    || /failed to initialize sqlite state runtime/i.test(text)
+    || /file is not a database/i.test(text)
     || /Codex could not find bubblewrap on PATH/i.test(text)
     || /sandbox prerequisites/i.test(text)
     || /concepts\/sandboxing#prerequisites/i.test(text);
+}
+
+function isCodexStateDatabaseError(text) {
+  return /codex_app_server: failed to initialize sqlite state db/i.test(text)
+    || /failed to initialize sqlite state runtime/i.test(text)
+    || /file is not a database/i.test(text);
+}
+
+function codexStateDatabaseHint(text) {
+  return [
+    'Codex could not start because the SQLite state under CODEX_HOME is not a valid database.',
+    'Do not delete the whole ~/.codex directory.',
+    'Inspect and move only the broken sqlite state file, then restart this host-agent.',
+    `Raw stderr: ${limitText(text, 420)}`,
+  ].join(' ');
 }
 
 const CODEX_SCAN_SKIP_DIRS = new Set([
@@ -302,6 +319,57 @@ function limitText(value, max = 240) {
     return text;
   }
   return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function codexCliInstallHint() {
+  return [
+    'Codex CLI was not found on this host.',
+    'Install options:',
+    'conda create -n codex-node -c conda-forge nodejs=20 -y && conda activate codex-node && npm install -g @openai/codex',
+    'or: curl -fsSL https://fnm.vercel.app/install | bash && source ~/.bashrc && fnm install 20 && fnm use 20 && npm install -g @openai/codex',
+    'Then restart this host-agent.',
+  ].join(' ');
+}
+
+function formatCodexStartError(error) {
+  const message = error?.message || String(error || 'unknown error');
+  if (error?.code === 'ENOENT' || /not found|enoent|spawn codex/i.test(message)) {
+    return `${message}. ${codexCliInstallHint()}`;
+  }
+  return message;
+}
+
+function normalizeApiConfig(input = {}) {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const provider = String(input.provider || '').trim().slice(0, 80);
+  const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
+  const apiKey = String(input.apiKey || '').trim();
+  if (!baseUrl && !apiKey) {
+    return null;
+  }
+  return {
+    provider: provider || 'OpenAI',
+    baseUrl,
+    apiKey,
+  };
+}
+
+function buildApiEnvironment(apiConfig) {
+  const config = normalizeApiConfig(apiConfig);
+  if (!config) {
+    return {};
+  }
+  const env = {};
+  if (config.apiKey) {
+    env.OPENAI_API_KEY = config.apiKey;
+  }
+  if (config.baseUrl) {
+    env.OPENAI_BASE_URL = config.baseUrl;
+    env.OPENAI_API_BASE = config.baseUrl;
+  }
+  return env;
 }
 
 function summarizeValue(value, depth = 0) {
@@ -797,6 +865,7 @@ class CodexAppServerRunner {
     this.onTerminated = options.onTerminated || null;
     this.codexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     this.codexBin = options.codexBin || resolveDefaultCodexBin(this.codexHome);
+    this.apiConfig = normalizeApiConfig(options.apiConfig);
     this.child = null;
     this.rpc = null;
     this.threadId = null;
@@ -815,6 +884,8 @@ class CodexAppServerRunner {
       cwd: this.cwd,
       nativeThreadId: null,
       launchMode: this.launchMode,
+      apiProvider: this.apiConfig?.provider || null,
+      apiBaseUrl: this.apiConfig?.baseUrl || null,
       resumeStrategy: 'fresh',
       connection: 'starting',
       phase: 'starting',
@@ -833,6 +904,7 @@ class CodexAppServerRunner {
       windowsHide: true,
       env: {
         ...process.env,
+        ...buildApiEnvironment(this.apiConfig),
         CODEX_HOME: this.codexHome,
         PATH: buildCodexProcessPath(this.codexBin),
         HOME: path.dirname(this.codexHome),
@@ -848,7 +920,7 @@ class CodexAppServerRunner {
       this.emitAlert({
         severity: 'error',
         source: 'runtime',
-        message: `codex app-server failed to start: ${error.message}`,
+        message: `codex app-server failed to start: ${formatCodexStartError(error)}`,
       }).catch(() => {});
     };
     this.child.once('error', onEarlyError);
@@ -856,7 +928,7 @@ class CodexAppServerRunner {
     await this.emitRuntime({ connection: 'connecting', phase: 'booting' });
     if (spawnError) {
       this.child.off('error', onEarlyError);
-      throw spawnError;
+      throw new Error(formatCodexStartError(spawnError));
     }
 
     const stderr = readline.createInterface({
@@ -867,6 +939,22 @@ class CodexAppServerRunner {
     stderr.on('line', async (line) => {
       const text = stripAnsi(line);
       const summary = text.length > 420 ? `${text.slice(0, 417)}...` : text;
+      if (isCodexStateDatabaseError(text)) {
+        const hint = codexStateDatabaseHint(text);
+        await this.emitDiagnostic({
+          severity: 'error',
+          source: 'stderr',
+          kind: 'runtime-startup',
+          message: 'Codex state database is not readable.',
+          detail: hint,
+        }).catch(() => {});
+        await this.emitAlert({
+          severity: 'error',
+          source: 'runtime',
+          message: hint,
+        }).catch(() => {});
+        return;
+      }
       if (isRuntimeDiagnosticStderrLine(text)) {
         await this.emitDiagnostic({
           severity: 'warning',
@@ -894,7 +982,7 @@ class CodexAppServerRunner {
         this.emitAlert({
           severity: 'error',
           source: 'runtime',
-          message: `codex app-server failed to start: ${error.message}`,
+          message: `codex app-server failed to start: ${formatCodexStartError(error)}`,
         }).catch(() => {});
       },
       onExit: (code, signal) => {
@@ -1036,6 +1124,12 @@ class CodexAppServerRunner {
         busy: true,
         phase: mode === 'plan' ? 'planning' : 'thinking',
         currentTurnStatus: 'inProgress',
+        model: params.model || null,
+        effort: params.effort || null,
+        summary: params.summary || null,
+        approvalPolicy: params.approvalPolicy || null,
+        approvalsReviewer: params.approvalsReviewer || null,
+        sandboxPolicy: params.sandboxPolicy || null,
         reasoningSummary: null,
         planSummary: null,
       });
