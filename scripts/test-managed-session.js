@@ -97,6 +97,8 @@ async function main() {
       throw new Error('cached received file content did not match uploaded content');
     }
 
+    const migration = await verifyBridgeSessionMigration();
+
     const stats = await getJson('/api/stats');
 
     console.log(JSON.stringify({
@@ -110,6 +112,7 @@ async function main() {
         downloadedBytes: downloaded.length,
         receivedFileId: receivedFile.fileId,
       },
+      bridgeMigration: migration,
       stats: {
         totalHosts: stats.summary.totalHosts,
         liveSessions: stats.summary.liveSessions,
@@ -123,6 +126,69 @@ async function main() {
     await stopProcess(agent);
     await stopProcess(relay);
   }
+}
+
+async function verifyBridgeSessionMigration() {
+  const fakeHostId = `${HOST_ID}-native-migration`;
+  const nativeSessionId = `native-thread-${Date.now()}`;
+  await postJson('/api/agent/register', {
+    hostId: fakeHostId,
+    label: 'Native Migration Test Host',
+    platform: process.platform,
+    capabilities: { managedSessions: true },
+  });
+
+  const start = await postJson(`/api/hosts/${encodeURIComponent(fakeHostId)}/sessions/start`, {
+    cwd: ROOT,
+    label: 'native migration smoke',
+    launchMode: 'fresh',
+    apiConfig: {
+      label: 'Migration API',
+      provider: 'test',
+      baseUrl: 'http://example.invalid/v1',
+      apiKey: 'test-key-not-used',
+      profileId: 'migration-api',
+    },
+  });
+  if (!start.sessionId) {
+    throw new Error('start response did not include bridge session id');
+  }
+
+  await postJson('/api/agent/events', {
+    event: {
+      type: 'session.started',
+      hostId: fakeHostId,
+      sessionId: nativeSessionId,
+      bridgeSessionId: start.sessionId,
+      nativeThreadId: nativeSessionId,
+      title: 'native migration smoke',
+      cwd: ROOT,
+      source: 'managed',
+      launchMode: 'fresh',
+      runtime: {
+        kind: 'codex-app-server',
+        threadId: nativeSessionId,
+        phase: 'idle',
+      },
+    },
+  });
+
+  const sessions = await getJson(`/api/hosts/${encodeURIComponent(fakeHostId)}/sessions`);
+  const migrated = (sessions.sessions || []).find((item) => item.sessionId === nativeSessionId);
+  if (!migrated?.live) {
+    throw new Error('bridge session did not migrate to a live native session');
+  }
+  if (migrated.bridgeSessionId !== start.sessionId) {
+    throw new Error('migrated session did not keep its bridgeSessionId');
+  }
+  if (migrated.apiProfile?.label !== 'Migration API') {
+    throw new Error('migrated session did not preserve its API profile summary');
+  }
+  return {
+    bridgeSessionId: start.sessionId,
+    nativeSessionId,
+    apiProfile: migrated.apiProfile.label,
+  };
 }
 
 function spawnNode(scriptPath, env) {

@@ -5264,6 +5264,11 @@ function applyAgentEvent(event) {
 
   if (event.type === 'session.started') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const bridgeSession = event.bridgeSessionId && event.bridgeSessionId !== effectiveSessionId
+      ? getSession(event.hostId, event.bridgeSessionId)
+      : null;
+    const currentSession = getSession(event.hostId, effectiveSessionId);
+    const apiProfile = bridgeSession?.apiProfile || currentSession?.apiProfile || null;
     const next = event.bridgeSessionId && event.bridgeSessionId !== effectiveSessionId
       ? migrateSessionIdentity(event.hostId, event.bridgeSessionId, effectiveSessionId, {
         title: event.title || effectiveSessionId,
@@ -5277,7 +5282,7 @@ function applyAgentEvent(event) {
         conversationKey: event.conversationKey || event.originSessionId || effectiveSessionId,
         launchMode: event.launchMode || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
-        apiProfile: existing?.apiProfile || null,
+        apiProfile,
       })
       : upsertSession(event.hostId, {
         sessionId: effectiveSessionId,
@@ -5293,7 +5298,7 @@ function applyAgentEvent(event) {
         launchMode: event.launchMode || null,
         bridgeSessionId: event.bridgeSessionId || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
-        apiProfile: getSession(event.hostId, effectiveSessionId)?.apiProfile || null,
+        apiProfile,
         lastUpdatedAt: nowIso(),
       });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.started', next);
