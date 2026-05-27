@@ -4,6 +4,10 @@ const path = require('path');
 const { readJsonLines } = require('./jsonl');
 const { pick } = require('./protocol');
 
+const TRANSCRIPT_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_READ_LIMIT || 12000);
+const TRANSCRIPT_PREVIEW_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_PREVIEW_LIMIT || 80);
+const TRANSCRIPT_ENTRY_CHAR_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_ENTRY_CHAR_LIMIT || 3000);
+
 function getDefaultCodexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 }
@@ -39,22 +43,27 @@ function discoverCodexSessions(options = {}) {
       return;
     }
 
-    const rows = readJsonLines(filePath, 20);
-    const metaRow = rows.find((row) => row && row.type === 'session_meta' && row.payload && row.payload.id);
-    if (!metaRow) {
+    const rows = readJsonLines(filePath, 250);
+    const meta = getSessionMeta(filePath, rows);
+    if (!meta || !meta.id) {
       return;
     }
 
-    const meta = metaRow.payload;
     const preview = extractSessionPreview(filePath);
+    const stats = safeStat(filePath);
     const existing = discovered.get(meta.id) || {};
     discovered.set(meta.id, {
       ...existing,
       sessionId: meta.id,
       nativeThreadId: existing.nativeThreadId || meta.id,
       title: existing.title || meta.thread_name || meta.id,
-      cwd: meta.cwd || existing.cwd || null,
-      updatedAt: meta.timestamp || existing.updatedAt || null,
+      cwd: meta.cwd || existing.cwd || preview.cwd || null,
+      updatedAt: latestTimestamp(
+        preview.lastTimestamp,
+        stats?.mtime?.toISOString(),
+        existing.updatedAt,
+        meta.timestamp
+      ),
       source: meta.source || existing.source || 'rollout',
       originator: meta.originator || existing.originator || null,
       cliVersion: meta.cli_version || existing.cliVersion || null,
@@ -82,13 +91,18 @@ function extractSessionPreview(filePath) {
     latestUserMessage: null,
     latestAgentMessage: null,
     transcriptPreview: [],
+    cwd: null,
+    lastTimestamp: null,
   };
 
-  const rows = readJsonLines(filePath, 5000);
+  const rows = readJsonLines(filePath, TRANSCRIPT_READ_LIMIT);
   for (const row of rows) {
-    if (!row || row.type !== 'event_msg' || !row.payload) {
+    if (!row) {
       continue;
     }
+
+    preview.lastTimestamp = latestTimestamp(preview.lastTimestamp, row.timestamp);
+    preview.cwd = preview.cwd || getCwdFromRow(row);
 
     const entry = makeTranscriptEntry(row);
     if (!entry) {
@@ -104,13 +118,70 @@ function extractSessionPreview(filePath) {
     }
   }
 
-  preview.transcriptPreview = dedupeTranscriptEntries(preview.transcriptPreview).slice(-24);
+  preview.transcriptPreview = dedupeTranscriptEntries(preview.transcriptPreview).slice(-TRANSCRIPT_PREVIEW_LIMIT);
   return preview;
+}
+
+function getSessionMeta(filePath, rows) {
+  const metaRow = rows.find((row) => row && row.type === 'session_meta' && row.payload && row.payload.id);
+  if (metaRow) {
+    return metaRow.payload;
+  }
+
+  const id = parseSessionIdFromFilePath(filePath);
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    cwd: firstNonEmpty(rows.map(getCwdFromRow)),
+    timestamp: firstNonEmpty(rows.map((row) => row && row.timestamp)),
+    source: 'rollout',
+  };
+}
+
+function parseSessionIdFromFilePath(filePath) {
+  const matches = String(path.basename(filePath)).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig);
+  return matches && matches.length ? matches[matches.length - 1] : null;
+}
+
+function getCwdFromRow(row) {
+  if (!row || !row.payload) {
+    return null;
+  }
+  if (row.payload.cwd) {
+    return row.payload.cwd;
+  }
+  if (row.type === 'turn_context' && row.payload.cwd) {
+    return row.payload.cwd;
+  }
+
+  const text = extractPayloadText(row.payload);
+  const match = text.match(/<cwd>([^<]+)<\/cwd>/);
+  return match ? match[1].trim() : null;
 }
 
 function makeTranscriptEntry(row) {
   const payload = row.payload || {};
   const timestamp = row.timestamp || null;
+
+  if (row.type === 'response_item' && payload.type === 'message') {
+    const text = cleanTranscriptText(extractPayloadText(payload));
+    if (!text) {
+      return null;
+    }
+    if (payload.role === 'user') {
+      return { speaker: 'user', text, timestamp };
+    }
+    if (payload.role === 'assistant' || payload.role === 'agent') {
+      return { speaker: 'agent', text, timestamp };
+    }
+  }
+
+  if (row.type !== 'event_msg' || !payload) {
+    return null;
+  }
 
   if (payload.type === 'user_message' && payload.message) {
     return {
@@ -139,6 +210,42 @@ function makeTranscriptEntry(row) {
   return null;
 }
 
+function extractPayloadText(payload) {
+  if (!payload) {
+    return '';
+  }
+  if (typeof payload === 'string') {
+    return payload;
+  }
+  if (typeof payload.text === 'string') {
+    return payload.text;
+  }
+  if (typeof payload.message === 'string') {
+    return payload.message;
+  }
+
+  const content = payload.content;
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return '';
+  }
+
+  return content
+    .map((part) => {
+      if (typeof part === 'string') {
+        return part;
+      }
+      if (!part || typeof part !== 'object') {
+        return '';
+      }
+      return part.text || part.content || part.input_text || part.output_text || '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
 function dedupeTranscriptEntries(entries) {
   const deduped = [];
   for (const entry of entries) {
@@ -164,7 +271,41 @@ function cleanTranscriptText(value) {
     .replace(/\r\n?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
-    .slice(0, 1600);
+    .slice(0, TRANSCRIPT_ENTRY_CHAR_LIMIT);
+}
+
+function firstNonEmpty(values) {
+  for (const value of values) {
+    if (value) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function latestTimestamp(...values) {
+  let latest = null;
+  let latestTime = 0;
+  for (const value of values.flat()) {
+    if (!value) {
+      continue;
+    }
+    const time = Date.parse(value);
+    if (!Number.isFinite(time) || time <= latestTime) {
+      continue;
+    }
+    latest = new Date(time).toISOString();
+    latestTime = time;
+  }
+  return latest;
+}
+
+function safeStat(filePath) {
+  try {
+    return fs.statSync(filePath);
+  } catch (_) {
+    return null;
+  }
 }
 
 function walkFiles(rootDir, visit) {

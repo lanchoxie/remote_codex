@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const { discoverCodexSessions } = require('../shared/codex-discovery');
 
 const ROOT = path.join(__dirname, '..');
 const PORT = 8792;
@@ -12,6 +13,8 @@ const HOST_ID = 'managed-test-host';
 const HOST_LABEL = 'Managed Test Host';
 
 async function main() {
+  verifyCodexDiscoveryFormats();
+
   const relay = spawnNode(path.join(ROOT, 'apps', 'relay', 'server.js'), {
     ...process.env,
     PORT: String(PORT),
@@ -125,6 +128,57 @@ async function main() {
     }
     await stopProcess(agent);
     await stopProcess(relay);
+  }
+}
+
+function verifyCodexDiscoveryFormats() {
+  const sessionId = '019efeed-1234-7abc-8def-0123456789ab';
+  const codexHome = path.join(ROOT, 'tmp', 'runtime', `discovery-smoke-${process.pid}`);
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '27');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-05-27T12-30-00-${sessionId}.jsonl`);
+  fs.writeFileSync(rolloutPath, [
+    JSON.stringify({
+      timestamp: '2026-05-27T04:30:00.000Z',
+      type: 'turn_context',
+      payload: {
+        cwd: '/hpc/project/discovery-smoke',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-27T04:31:00.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'find my missing hpc conversation' }],
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-27T04:32:00.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'found from fallback rollout parsing' }],
+      },
+    }),
+    '',
+  ].join('\n'));
+
+  const sessions = discoverCodexSessions({ codexHome });
+  const session = sessions.find((item) => item.sessionId === sessionId);
+  if (!session) {
+    throw new Error('discovery did not import rollout without session_meta');
+  }
+  if (session.cwd !== '/hpc/project/discovery-smoke') {
+    throw new Error('discovery did not infer cwd from turn_context');
+  }
+  if (session.latestUserMessage !== 'find my missing hpc conversation') {
+    throw new Error('discovery did not parse response_item user message');
+  }
+  if (session.latestAgentMessage !== 'found from fallback rollout parsing') {
+    throw new Error('discovery did not parse response_item assistant message');
   }
 }
 

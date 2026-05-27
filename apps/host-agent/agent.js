@@ -653,10 +653,10 @@ function buildResumeBootstrap(command) {
   const transcript = Array.isArray(command.resumeTranscript) ? command.resumeTranscript : [];
   const lines = transcript
     .filter((entry) => entry && entry.text)
-    .slice(-10)
+    .slice(-80)
     .map((entry) => {
       const speaker = entry.speaker === 'user' ? 'user' : entry.speaker === 'agent' ? 'assistant' : 'system';
-      const text = String(entry.text || '').replace(/\r\n?/g, '\n').trim().slice(0, 280);
+      const text = String(entry.text || '').replace(/\r\n?/g, '\n').trim().slice(0, 3000);
       return { speaker, text };
     });
 

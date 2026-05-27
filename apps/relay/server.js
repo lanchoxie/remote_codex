@@ -988,7 +988,7 @@ function emitSessionAlert(hostId, sessionId, entry) {
   return payload;
 }
 
-function buildResumeTranscript(entries, maxEntries = 12) {
+function buildResumeTranscript(entries, maxEntries = 80) {
   if (!Array.isArray(entries)) {
     return [];
   }
@@ -998,7 +998,7 @@ function buildResumeTranscript(entries, maxEntries = 12) {
     .slice(-maxEntries)
     .map((entry) => ({
       speaker: entry.speaker || 'system',
-      text: String(entry.text || '').slice(0, 320),
+      text: String(entry.text || '').slice(0, 3000),
       timestamp: entry.timestamp || null,
     }));
 }

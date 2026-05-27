@@ -42,6 +42,12 @@ const state = {
   sessionCollections: [],
   selectedCollectionId: 'default',
   collectionManagerOpen: false,
+  mobileMenus: {
+    hostSwitcher: false,
+    collection: false,
+    searchMode: false,
+    collectionMoveKey: null,
+  },
   sessionSearchQuery: '',
   sessionSearchMode: 'keyword',
   overviewCollapsed: false,
@@ -1859,6 +1865,104 @@ function getSelectedCollection() {
     || { collectionId: 'default', name: 'Default', system: true, items: [] };
 }
 
+const SESSION_SEARCH_MODE_LABELS = {
+  keyword: 'Keyword',
+  path: 'Path',
+  title: 'Title',
+};
+
+function getSessionSearchModeLabel(mode) {
+  return SESSION_SEARCH_MODE_LABELS[mode] || SESSION_SEARCH_MODE_LABELS.keyword;
+}
+
+function closeMobileSelectMenus() {
+  state.mobileMenus.hostSwitcher = false;
+  state.mobileMenus.collection = false;
+  state.mobileMenus.searchMode = false;
+  state.mobileMenus.collectionMoveKey = null;
+}
+
+function hasOpenMobileSelectMenu() {
+  return Boolean(
+    state.mobileMenus.hostSwitcher
+    || state.mobileMenus.collection
+    || state.mobileMenus.searchMode
+    || state.mobileMenus.collectionMoveKey
+  );
+}
+
+function toggleMobileSelectMenu(name, value = true) {
+  const wasOpen = name === 'collectionMoveKey'
+    ? state.mobileMenus.collectionMoveKey === value
+    : Boolean(state.mobileMenus[name]);
+  closeMobileSelectMenus();
+
+  if (!wasOpen) {
+    if (name === 'collectionMoveKey') {
+      state.mobileMenus.collectionMoveKey = value;
+    } else {
+      state.mobileMenus[name] = true;
+    }
+  }
+
+  renderAll();
+}
+
+function renderMobileSelectMenu({
+  button,
+  menu,
+  label,
+  options,
+  selectedValue,
+  open,
+  disabled = false,
+  onSelect,
+}) {
+  if (!button || !menu) {
+    return;
+  }
+
+  button.textContent = label || 'Select';
+  button.disabled = Boolean(disabled);
+  button.setAttribute('aria-expanded', open ? 'true' : 'false');
+  menu.classList.toggle('hidden', !open);
+  menu.innerHTML = '';
+
+  const optionList = Array.isArray(options) ? options : [];
+  if (!optionList.length) {
+    const empty = document.createElement('button');
+    empty.type = 'button';
+    empty.className = 'mobile-select-option';
+    empty.disabled = true;
+    empty.textContent = 'No options available';
+    menu.appendChild(empty);
+    return;
+  }
+
+  for (const option of optionList) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `mobile-select-option ${option.value === selectedValue ? 'active' : ''}`.trim();
+    item.disabled = Boolean(option.disabled);
+    item.textContent = option.label || option.value || 'Option';
+    item.onclick = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (item.disabled) {
+        return;
+      }
+      closeMobileSelectMenus();
+      renderAll();
+      try {
+        await onSelect?.(option.value, option);
+      } catch (error) {
+        reportError(error);
+      }
+    };
+    menu.appendChild(item);
+  }
+}
+
 function getConversationGroupsForCollection(collection = getSelectedCollection()) {
   if (!collection || collection.collectionId === 'default') {
     return state.selectedHostId ? getConversationGroups(state.selectedHostId) : [];
@@ -2964,6 +3068,8 @@ function renderHostNav() {
 
 function renderHostSwitcher() {
   const switcher = el('host-switcher');
+  const button = el('host-switcher-button');
+  const menu = el('host-switcher-menu');
   const selectedHostId = state.selectedHostId || '';
   switcher.innerHTML = '';
 
@@ -2973,18 +3079,53 @@ function renderHostSwitcher() {
     option.textContent = 'No hosts available';
     switcher.appendChild(option);
     switcher.disabled = true;
+    renderMobileSelectMenu({
+      button,
+      menu,
+      label: 'No hosts available',
+      options: [],
+      selectedValue: '',
+      open: false,
+      disabled: true,
+    });
     return;
   }
 
+  const mobileOptions = [];
   for (const host of state.hosts) {
     const option = document.createElement('option');
     option.value = host.hostId;
     option.textContent = `${host.label} (${host.online ? 'online' : 'offline'})`;
     switcher.appendChild(option);
+    mobileOptions.push({
+      value: host.hostId,
+      label: option.textContent,
+      disabled: Boolean(state.hostSwitchBusyId),
+    });
   }
 
   switcher.disabled = Boolean(state.hostSwitchBusyId);
   switcher.value = selectedHostId;
+  const selectedHost = getHost(selectedHostId) || state.hosts[0];
+  const buttonLabel = state.hostSwitchBusyId
+    ? 'Checking host...'
+    : selectedHost
+      ? `${selectedHost.label} (${selectedHost.online ? 'online' : 'offline'})`
+      : 'Select host';
+  renderMobileSelectMenu({
+    button,
+    menu,
+    label: buttonLabel,
+    options: mobileOptions,
+    selectedValue: selectedHostId,
+    open: state.mobileMenus.hostSwitcher,
+    disabled: Boolean(state.hostSwitchBusyId),
+    onSelect: async (hostId) => {
+      if (hostId) {
+        await setSelectedHost(hostId);
+      }
+    },
+  });
 }
 
 function getVariantLabels(sessions) {
@@ -3077,6 +3218,8 @@ function renderVariantButtons(container, conversation, selectedSessionId) {
 
 function renderCollectionTabs() {
   const select = el('session-collection-select');
+  const button = el('session-collection-button');
+  const menu = el('session-collection-menu');
   const popover = el('collection-manager-popover');
   const list = el('collection-manager-list');
   if (!select) {
@@ -3084,13 +3227,33 @@ function renderCollectionTabs() {
   }
 
   select.innerHTML = '';
+  const mobileOptions = [];
   for (const collection of state.sessionCollections) {
     const option = document.createElement('option');
     option.value = collection.collectionId;
     option.textContent = `${collection.name || 'Collection'} (${collection.itemCount || 0})`;
     select.appendChild(option);
+    mobileOptions.push({
+      value: collection.collectionId,
+      label: option.textContent,
+    });
   }
   select.value = state.selectedCollectionId;
+  const selectedCollection = getSelectedCollection();
+  renderMobileSelectMenu({
+    button,
+    menu,
+    label: selectedCollection
+      ? `${selectedCollection.name || 'Collection'} (${selectedCollection.itemCount || 0})`
+      : 'Default',
+    options: mobileOptions,
+    selectedValue: state.selectedCollectionId,
+    open: state.mobileMenus.collection,
+    onSelect: async (collectionId) => {
+      state.selectedCollectionId = collectionId || 'default';
+      renderAll();
+    },
+  });
 
   if (popover) {
     popover.classList.toggle('hidden', !state.collectionManagerOpen);
@@ -3173,6 +3336,8 @@ function renderConversationNav() {
   const visibleGroups = filterConversationGroups(groups);
   const searchInput = el('session-search-input');
   const searchMode = el('session-search-mode');
+  const searchModeButton = el('session-search-mode-button');
+  const searchModeMenu = el('session-search-mode-menu');
   const searchSummary = el('session-search-summary');
   const clearSearchButton = el('clear-session-search-button');
   if (searchInput && document.activeElement !== searchInput) {
@@ -3181,6 +3346,17 @@ function renderConversationNav() {
   if (searchMode) {
     searchMode.value = state.sessionSearchMode;
   }
+  renderMobileSelectMenu({
+    button: searchModeButton,
+    menu: searchModeMenu,
+    label: getSessionSearchModeLabel(state.sessionSearchMode),
+    options: Object.entries(SESSION_SEARCH_MODE_LABELS).map(([value, label]) => ({ value, label })),
+    selectedValue: state.sessionSearchMode,
+    open: state.mobileMenus.searchMode,
+    onSelect: async (mode) => {
+      setSessionSearchMode(mode);
+    },
+  });
   if (searchSummary) {
     const query = state.sessionSearchQuery.trim();
     const scope = collection.collectionId === 'default'
@@ -3255,10 +3431,14 @@ function renderConversationNav() {
 
     const actions = document.createElement('div');
     actions.className = 'conversation-card-actions';
+    const moveKey = `${group.hostId}::${group.conversationKey}`;
+    const moveAnchor = document.createElement('div');
+    moveAnchor.className = 'mobile-select-anchor collection-move-anchor';
     const collectionSelect = document.createElement('select');
-    collectionSelect.className = 'collection-move-select';
+    collectionSelect.className = 'collection-move-select native-select-control mobile-replaced-select';
     collectionSelect.innerHTML = '<option value="">Save to collection...</option>';
-    for (const target of state.sessionCollections.filter((entry) => entry.collectionId !== 'default')) {
+    const collectionTargets = state.sessionCollections.filter((entry) => entry.collectionId !== 'default');
+    for (const target of collectionTargets) {
       const option = document.createElement('option');
       option.value = target.collectionId;
       option.textContent = target.name;
@@ -3279,7 +3459,41 @@ function renderConversationNav() {
         reportError(error);
       }
     };
-    actions.appendChild(collectionSelect);
+    const moveButton = document.createElement('button');
+    moveButton.type = 'button';
+    moveButton.className = 'secondary-button mobile-select-button collection-move-button';
+    moveButton.textContent = 'Save to collection...';
+    moveButton.disabled = collectionSelect.disabled;
+    moveButton.setAttribute('aria-expanded', state.mobileMenus.collectionMoveKey === moveKey ? 'true' : 'false');
+    moveButton.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!moveButton.disabled) {
+        toggleMobileSelectMenu('collectionMoveKey', moveKey);
+      }
+    };
+    const moveMenu = document.createElement('div');
+    moveMenu.className = `mobile-select-menu collection-move-menu ${state.mobileMenus.collectionMoveKey === moveKey ? '' : 'hidden'}`.trim();
+    moveMenu.setAttribute('role', 'menu');
+    renderMobileSelectMenu({
+      button: moveButton,
+      menu: moveMenu,
+      label: 'Save to collection...',
+      options: collectionTargets.map((target) => ({
+        value: target.collectionId,
+        label: target.name || 'Collection',
+      })),
+      selectedValue: '',
+      open: state.mobileMenus.collectionMoveKey === moveKey,
+      disabled: collectionSelect.disabled,
+      onSelect: async (targetCollectionId) => {
+        if (targetCollectionId) {
+          await addConversationToCollection(targetCollectionId, group);
+        }
+      },
+    });
+    moveAnchor.append(collectionSelect, moveButton, moveMenu);
+    actions.appendChild(moveAnchor);
     if (collection.collectionId !== 'default') {
       const removeButton = document.createElement('button');
       removeButton.type = 'button';
@@ -9133,12 +9347,14 @@ el('toggle-new-session-button').addEventListener('click', () => {
 });
 
 el('toggle-navigator-button').addEventListener('click', () => {
+  closeMobileSelectMenus();
   state.navigatorCollapsed = !state.navigatorCollapsed;
   writeLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, state.navigatorCollapsed);
   renderAll();
 });
 
 el('close-sidebar-navigator-button')?.addEventListener('click', () => {
+  closeMobileSelectMenus();
   state.navigatorCollapsed = true;
   writeLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, state.navigatorCollapsed);
   renderAll();
@@ -9153,7 +9369,14 @@ el('session-search-input').addEventListener('input', (event) => {
 });
 
 el('session-search-mode').addEventListener('change', (event) => {
+  closeMobileSelectMenus();
   setSessionSearchMode(event.target.value);
+});
+
+el('session-search-mode-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  toggleMobileSelectMenu('searchMode');
 });
 
 el('clear-session-search-button').addEventListener('click', () => {
@@ -9162,11 +9385,24 @@ el('clear-session-search-button').addEventListener('click', () => {
 });
 
 el('session-collection-select')?.addEventListener('change', (event) => {
+  closeMobileSelectMenus();
   state.selectedCollectionId = event.target.value || 'default';
   renderAll();
 });
 
-el('collection-menu-button')?.addEventListener('click', () => {
+el('session-collection-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  toggleMobileSelectMenu('collection');
+});
+
+el('collection-menu-button')?.addEventListener('click', (event) => {
+  if (window.matchMedia('(max-width: 980px)').matches) {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleMobileSelectMenu('collection');
+    return;
+  }
   el('session-collection-select')?.focus();
 });
 
@@ -9214,12 +9450,19 @@ el('host-switcher').addEventListener('change', async (event) => {
   const hostId = event.target.value;
   if (hostId) {
     try {
+      closeMobileSelectMenus();
       await setSelectedHost(hostId);
     } catch (error) {
       event.target.value = state.selectedHostId || '';
       reportError(error);
     }
   }
+});
+
+el('host-switcher-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  toggleMobileSelectMenu('hostSwitcher');
 });
 
 el('browse-directory-button').addEventListener('click', async () => {
@@ -9496,9 +9739,25 @@ el('input-form').addEventListener('dragleave', (event) => {
 
 el('input-form').addEventListener('drop', handleComposerDrop);
 
+document.addEventListener('click', (event) => {
+  if (!hasOpenMobileSelectMenu()) {
+    return;
+  }
+  if (event.target.closest('.mobile-select-anchor')) {
+    return;
+  }
+  closeMobileSelectMenus();
+  renderAll();
+});
+
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') {
     return;
+  }
+
+  if (hasOpenMobileSelectMenu()) {
+    closeMobileSelectMenus();
+    renderAll();
   }
 
   if (state.slashMenu.open) {

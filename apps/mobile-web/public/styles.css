@@ -362,6 +362,72 @@ textarea {
   font-size: 18px;
 }
 
+.mobile-select-anchor {
+  position: relative;
+  min-width: 0;
+}
+
+.native-select-control {
+  width: 100%;
+}
+
+.mobile-select-button {
+  display: none;
+  width: 100%;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+}
+
+.mobile-select-button::after {
+  content: "⌄";
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.mobile-select-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 7px);
+  right: 0;
+  left: 0;
+  z-index: 80;
+  max-height: min(48dvh, 320px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  border: 1px solid rgba(134, 167, 255, 0.24);
+  border-radius: 16px;
+  background: rgba(8, 16, 31, 0.98);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.46);
+}
+
+.mobile-select-option {
+  width: 100%;
+  justify-content: flex-start;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.mobile-select-option:hover,
+.mobile-select-option.active {
+  background: rgba(125, 231, 203, 0.14);
+  color: var(--text);
+}
+
+.mobile-select-option:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .collection-popover {
   display: grid;
   gap: 10px;
@@ -2863,6 +2929,20 @@ input[type="hidden"] {
   input,
   button {
     min-height: 44px;
+    touch-action: manipulation;
+  }
+
+  .mobile-replaced-select {
+    display: none;
+  }
+
+  .mobile-select-button {
+    display: flex;
+  }
+
+  .mobile-select-menu:not(.hidden) {
+    display: grid;
+    gap: 3px;
   }
 
   .selected-host-section .conversation-list {

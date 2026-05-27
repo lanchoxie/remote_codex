@@ -239,7 +239,11 @@
 
           <div class="host-switcher-row">
             <label for="host-switcher">Active host</label>
-            <select id="host-switcher" aria-label="Switch active host"></select>
+            <div class="mobile-select-anchor">
+              <select id="host-switcher" class="native-select-control mobile-replaced-select" aria-label="Switch active host"></select>
+              <button id="host-switcher-button" type="button" class="secondary-button mobile-select-button" aria-expanded="false">No hosts available</button>
+              <div id="host-switcher-menu" class="mobile-select-menu hidden" role="menu"></div>
+            </div>
           </div>
 
           <div id="new-session-body" class="collapsible-body">
@@ -258,7 +262,11 @@
 
           <div class="collection-toolbar">
             <button id="collection-menu-button" type="button" class="secondary-button collection-icon-button" aria-label="Collections" title="Collections">&#128218;</button>
-            <select id="session-collection-select" aria-label="Collection"></select>
+            <div class="mobile-select-anchor collection-select-anchor">
+              <select id="session-collection-select" class="native-select-control mobile-replaced-select" aria-label="Collection"></select>
+              <button id="session-collection-button" type="button" class="secondary-button mobile-select-button" aria-expanded="false">Default</button>
+              <div id="session-collection-menu" class="mobile-select-menu hidden" role="menu"></div>
+            </div>
             <button id="collection-settings-button" type="button" class="secondary-button collection-icon-button" aria-label="Collection settings" title="Collection settings">&#9881;</button>
           </div>
           <div id="collection-manager-popover" class="collection-popover hidden">
@@ -273,11 +281,15 @@
             <div id="collection-manager-list" class="collection-manager-list"></div>
           </div>
           <form id="session-search-form" class="session-search-form">
-            <select id="session-search-mode" aria-label="Search mode">
-              <option value="keyword">Keyword</option>
-              <option value="path">Path</option>
-              <option value="title">Title</option>
-            </select>
+            <div class="mobile-select-anchor search-mode-anchor">
+              <select id="session-search-mode" class="native-select-control mobile-replaced-select" aria-label="Search mode">
+                <option value="keyword">Keyword</option>
+                <option value="path">Path</option>
+                <option value="title">Title</option>
+              </select>
+              <button id="session-search-mode-button" type="button" class="secondary-button mobile-select-button" aria-expanded="false">Keyword</button>
+              <div id="session-search-mode-menu" class="mobile-select-menu hidden" role="menu"></div>
+            </div>
             <div class="search-input-wrap">
               <input id="session-search-input" placeholder="Search conversations..." autocomplete="off" />
               <button id="clear-session-search-button" type="button" class="secondary-button search-clear-button" aria-label="Clear search">×</button>
