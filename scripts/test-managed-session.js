@@ -22,23 +22,24 @@ async function main() {
     RELAY_AUTH_ACCOUNT_PATH,
   });
 
-  const agent = spawnNode(path.join(ROOT, 'apps', 'host-agent', 'agent.js'), {
-    ...process.env,
-    RELAY_URL,
-    RELAY_AUTH_TOKEN,
-    HOST_ID,
-    HOST_LABEL,
-    AUTO_START_SESSION: 'true',
-    MANAGED_COMMAND: 'demo',
-    MANAGED_CWD: ROOT,
-    DISCOVERY_INTERVAL_MS: '60000',
-    POLL_INTERVAL_MS: '500',
-  });
-
+  let agent = null;
   let sseRequest = null;
 
   try {
     await waitForHealth();
+    agent = spawnNode(path.join(ROOT, 'apps', 'host-agent', 'agent.js'), {
+      ...process.env,
+      RELAY_URL,
+      RELAY_AUTH_TOKEN,
+      HOST_ID,
+      HOST_LABEL,
+      AUTO_START_SESSION: 'true',
+      MANAGED_COMMAND: 'demo',
+      MANAGED_CWD: ROOT,
+      DISCOVERY_INTERVAL_MS: '60000',
+      POLL_INTERVAL_MS: '500',
+    });
+
     const setupState = await getJsonNoAuth('/api/auth/config');
     if (!setupState.setupRequired) {
       throw new Error('relay auth account setup should be required in isolated test');

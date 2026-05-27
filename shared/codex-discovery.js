@@ -1,10 +1,11 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { readJsonLines } = require('./jsonl');
+const { readJsonLines, readJsonLinesTail } = require('./jsonl');
 const { pick } = require('./protocol');
 
 const TRANSCRIPT_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_READ_LIMIT || 12000);
+const TRANSCRIPT_HEAD_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_HEAD_READ_LIMIT || 500);
 const TRANSCRIPT_PREVIEW_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_PREVIEW_LIMIT || 80);
 const TRANSCRIPT_ENTRY_CHAR_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_ENTRY_CHAR_LIMIT || 3000);
 
@@ -106,7 +107,10 @@ function extractSessionPreview(filePath) {
     messageCount: 0,
   };
 
-  const rows = readJsonLines(filePath, TRANSCRIPT_READ_LIMIT);
+  const rows = mergeRowsByTimestampAndType([
+    ...readJsonLines(filePath, TRANSCRIPT_HEAD_READ_LIMIT),
+    ...readJsonLinesTail(filePath, TRANSCRIPT_READ_LIMIT),
+  ]);
   for (const row of rows) {
     if (!row) {
       continue;
@@ -133,6 +137,23 @@ function extractSessionPreview(filePath) {
 
   preview.transcriptPreview = dedupeTranscriptEntries(preview.transcriptPreview).slice(-TRANSCRIPT_PREVIEW_LIMIT);
   return preview;
+}
+
+function mergeRowsByTimestampAndType(rows) {
+  const seen = new Set();
+  const merged = [];
+  for (const row of rows || []) {
+    if (!row) {
+      continue;
+    }
+    const key = `${row.timestamp || ''}|${row.type || ''}|${JSON.stringify(row.payload || {})}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(row);
+  }
+  return merged;
 }
 
 function getSessionMeta(filePath, rows) {
@@ -188,14 +209,18 @@ function makeTranscriptEntry(row) {
   const timestamp = row.timestamp || null;
 
   if (row.type === 'response_item' && payload.type === 'message') {
-    const text = cleanTranscriptText(extractPayloadText(payload));
-    if (!text) {
-      return null;
-    }
     if (payload.role === 'user') {
+      const text = cleanTranscriptText(extractPayloadText(payload), 'user');
+      if (!text) {
+        return null;
+      }
       return { speaker: 'user', text, timestamp };
     }
     if (payload.role === 'assistant' || payload.role === 'agent') {
+      const text = cleanTranscriptText(extractPayloadText(payload), 'agent');
+      if (!text) {
+        return null;
+      }
       return { speaker: 'agent', text, timestamp };
     }
   }
@@ -205,25 +230,37 @@ function makeTranscriptEntry(row) {
   }
 
   if (payload.type === 'user_message' && payload.message) {
+    const text = cleanTranscriptText(payload.message, 'user');
+    if (!text) {
+      return null;
+    }
     return {
       speaker: 'user',
-      text: cleanTranscriptText(payload.message),
+      text,
       timestamp,
     };
   }
 
   if (payload.type === 'agent_message' && payload.message) {
+    const text = cleanTranscriptText(payload.message, 'agent');
+    if (!text) {
+      return null;
+    }
     return {
       speaker: 'agent',
-      text: cleanTranscriptText(payload.message),
+      text,
       timestamp,
     };
   }
 
   if (payload.type === 'task_complete' && payload.last_agent_message) {
+    const text = cleanTranscriptText(payload.last_agent_message, 'agent');
+    if (!text) {
+      return null;
+    }
     return {
       speaker: 'agent',
-      text: cleanTranscriptText(payload.last_agent_message),
+      text,
       timestamp,
     };
   }
@@ -287,12 +324,31 @@ function cleanPreviewText(value) {
   return String(value).replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
-function cleanTranscriptText(value) {
-  return String(value)
+function cleanTranscriptText(value, speaker = '') {
+  const text = String(value)
     .replace(/\r\n?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
-    .trim()
-    .slice(0, TRANSCRIPT_ENTRY_CHAR_LIMIT);
+    .trim();
+  const stripped = stripResumeBootstrapText(text, speaker);
+  return stripped.slice(0, TRANSCRIPT_ENTRY_CHAR_LIMIT);
+}
+
+function stripResumeBootstrapText(value, speaker = '') {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  const hasPrelude = /Continue this conversation with the following prior context in mind:/i.test(text);
+  const requestMatch = text.match(/(?:^|\n)New user request:\s*([\s\S]*)$/i);
+  if (!hasPrelude && !requestMatch) {
+    return text;
+  }
+
+  if (speaker === 'user') {
+    return requestMatch ? requestMatch[1].trim() : '';
+  }
+  return '';
 }
 
 function firstNonEmpty(values) {

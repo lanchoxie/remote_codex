@@ -1223,6 +1223,7 @@ class CodexAppServerRunner {
       return false;
     }
 
+    const interruptedTurnId = this.activeTurnId;
     await this.emitRuntime({
       busy: true,
       phase: 'interrupting',
@@ -1230,14 +1231,32 @@ class CodexAppServerRunner {
     });
     await this.rpc.request('turn/interrupt', {
       threadId: this.threadId,
-      turnId: this.activeTurnId,
+      turnId: interruptedTurnId,
     });
+    if (this.activeTurnId === interruptedTurnId) {
+      this.activeTurnId = null;
+      this.turnBuffers.delete(interruptedTurnId);
+      this.planBuffers.delete(interruptedTurnId);
+      this.reasoningBuffers.delete(interruptedTurnId);
+    }
     await this.emitDiagnostic({
       severity: 'warning',
       source: 'codex',
       kind: 'control',
       method: 'turn/interrupt',
       message: 'Interrupt requested for the active turn.',
+    });
+    await this.resolvePendingRequestsForClosedTurn(
+      'interrupted',
+      'Request closed because the Codex turn was interrupted.'
+    );
+    await this.emitRuntime({
+      activeTurnId: null,
+      busy: false,
+      waitingOnApproval: false,
+      waitingOnUserInput: false,
+      phase: 'interrupted',
+      currentTurnStatus: 'interrupted',
     });
     return true;
   }

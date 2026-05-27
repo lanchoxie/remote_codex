@@ -29,6 +29,7 @@ const SESSION_COLLECTIONS_PATH = path.join(process.cwd(), 'tmp', 'session-collec
 const SESSION_LOGS_PATH = path.join(process.cwd(), 'tmp', 'session-logs.json');
 const RECEIVED_FILES_ROOT = path.join(process.cwd(), 'tmp', 'received-files');
 const RECEIVED_FILES_MANIFEST_PATH = path.join(RECEIVED_FILES_ROOT, 'manifest.json');
+const LOCAL_AGENT_LOG_ROOT = path.join(process.cwd(), 'tmp', 'local-agents');
 const RELAY_AUTH_TOKEN_PATH = process.env.RELAY_AUTH_TOKEN_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-token.txt');
 const RELAY_AUTH_ACCOUNT_PATH = process.env.RELAY_AUTH_ACCOUNT_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-account.json');
 const RELAY_AUTH_COOKIE_NAME = 'remote_codex_auth';
@@ -331,18 +332,56 @@ function normalizeStoredTranscriptEntry(entry) {
   if (!entry || typeof entry !== 'object') {
     return null;
   }
-  const text = String(entry.text || '').trim();
+  const speaker = entry.speaker || 'system';
+  const text = stripResumeBootstrapText(entry.text || '', speaker);
   const files = normalizeFileTransferRefs(entry.files || entry.attachments || []);
   if (!text && !files.length) {
     return null;
   }
   return {
     timestamp: entry.timestamp || nowIso(),
-    speaker: entry.speaker || 'system',
+    speaker,
     text,
     stream: entry.stream || null,
     files,
   };
+}
+
+function stripResumeBootstrapText(value, speaker = '') {
+  const text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text) {
+    return '';
+  }
+
+  const hasPrelude = /Continue this conversation with the following prior context in mind:/i.test(text);
+  const requestMatch = text.match(/(?:^|\n)New user request:\s*([\s\S]*)$/i);
+  if (!hasPrelude && !requestMatch) {
+    return text;
+  }
+
+  if (speaker === 'user') {
+    return requestMatch ? requestMatch[1].trim() : '';
+  }
+  return '';
+}
+
+function sortTranscriptEntries(entries) {
+  return (entries || [])
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => compareTranscriptEntries(a.entry, b.entry) || a.index - b.index)
+    .map((item) => item.entry);
+}
+
+function compareTranscriptEntries(a, b) {
+  const left = Date.parse(a?.timestamp || '');
+  const right = Date.parse(b?.timestamp || '');
+  if (Number.isFinite(left) && Number.isFinite(right) && left !== right) {
+    return left - right;
+  }
+  if (Number.isFinite(left) !== Number.isFinite(right)) {
+    return Number.isFinite(left) ? -1 : 1;
+  }
+  return 0;
 }
 
 function loadSessionLogs() {
@@ -354,6 +393,7 @@ function loadSessionLogs() {
       const normalized = (Array.isArray(entries) ? entries : [])
         .map(normalizeStoredTranscriptEntry)
         .filter(Boolean)
+        .sort(compareTranscriptEntries)
         .slice(-200);
       if (normalized.length) {
         logs.set(key, normalized);
@@ -371,6 +411,7 @@ function saveSessionLogs() {
     const normalized = (Array.isArray(entries) ? entries : [])
       .map(normalizeStoredTranscriptEntry)
       .filter(Boolean)
+      .sort(compareTranscriptEntries)
       .slice(-200);
     if (normalized.length) {
       logs[key] = normalized;
@@ -398,6 +439,8 @@ const state = {
   pendingHostProbes: new Map(),
   pendingModelRequests: new Map(),
   pendingFileRequests: new Map(),
+  sessionDiscoveryRequests: new Map(),
+  localAgents: new Map(),
   askpassActions: new Map(),
   sshMultiplexDisabled: new Map(),
   connectors: new Map(),
@@ -681,6 +724,7 @@ function getHostList() {
   return Array.from(state.hosts.values()).map((host) => ({
     ...host,
     online: hostOnline(host),
+    localAgent: publicLocalAgentRecord(state.localAgents.get(host.hostId)),
     sessionCount: Array.from(state.sessions.values()).filter((session) => session.hostId === host.hostId).length,
   })).sort((a, b) => a.label.localeCompare(b.label));
 }
@@ -689,6 +733,202 @@ function getSessionsForHost(hostId) {
   return Array.from(state.sessions.values())
     .filter((session) => session.hostId === hostId)
     .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
+}
+
+function requestHostSessionDiscovery(hostId) {
+  const host = state.hosts.get(hostId);
+  if (!host || !hostOnline(host)) {
+    return false;
+  }
+
+  const now = Date.now();
+  const lastRequested = state.sessionDiscoveryRequests.get(hostId) || 0;
+  if (now - lastRequested < 20000) {
+    return false;
+  }
+
+  state.sessionDiscoveryRequests.set(hostId, now);
+  enqueueCommand(hostId, { type: 'host.import' });
+  return true;
+}
+
+function safeLocalAgentId(value) {
+  return String(value || 'local')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'local';
+}
+
+function getLocalRelayUrl() {
+  return `http://127.0.0.1:${PORT}`;
+}
+
+function publicLocalAgentRecord(record) {
+  if (!record) {
+    return null;
+  }
+  return {
+    hostId: record.hostId,
+    label: record.label,
+    status: record.status,
+    startedAt: record.startedAt,
+    updatedAt: record.updatedAt,
+    exitedAt: record.exitedAt || null,
+    exitCode: record.exitCode ?? null,
+    signal: record.signal || null,
+    pid: record.process?.pid || record.pid || null,
+    relayUrl: record.relayUrl || getLocalRelayUrl(),
+    logPath: record.logPath || null,
+    errorLogPath: record.errorLogPath || null,
+    message: record.message || '',
+  };
+}
+
+function markLocalAgentExited(hostId, code, signal) {
+  const record = state.localAgents.get(hostId);
+  if (!record) {
+    return;
+  }
+  record.process = null;
+  record.pid = null;
+  record.status = record.status === 'stopping' ? 'stopped' : 'exited';
+  record.exitCode = code;
+  record.signal = signal || null;
+  record.exitedAt = nowIso();
+  record.updatedAt = record.exitedAt;
+  record.message = signal ? `local agent exited with signal ${signal}` : `local agent exited with code ${code}`;
+}
+
+function stopLocalAgent(hostId) {
+  const record = state.localAgents.get(hostId);
+  if (!record?.process || record.process.killed) {
+    if (record) {
+      record.status = 'stopped';
+      record.updatedAt = nowIso();
+      record.message = 'local agent is not running under this relay';
+    }
+    return {
+      ok: true,
+      hostId,
+      status: 'stopped',
+      message: 'No relay-managed local agent process is running for this host.',
+      localAgent: publicLocalAgentRecord(record),
+    };
+  }
+
+  record.status = 'stopping';
+  record.updatedAt = nowIso();
+  record.message = 'stopping local agent';
+  record.process.kill();
+  return {
+    ok: true,
+    hostId,
+    status: 'stopping',
+    message: 'Local host-agent stop signal sent.',
+    localAgent: publicLocalAgentRecord(record),
+  };
+}
+
+function startLocalAgent({ hostId, label, restart = false } = {}) {
+  const normalizedHostId = String(hostId || os.hostname() || 'local').trim();
+  if (!normalizedHostId) {
+    return { ok: false, status: 'invalid_host', message: 'hostId is required' };
+  }
+
+  const existing = state.localAgents.get(normalizedHostId);
+  if (existing?.process && !existing.process.killed) {
+    if (!restart) {
+      return {
+        ok: true,
+        hostId: normalizedHostId,
+        status: 'already_running',
+        message: 'Local host-agent is already managed by this relay.',
+        localAgent: publicLocalAgentRecord(existing),
+      };
+    }
+    stopLocalAgent(normalizedHostId);
+  }
+
+  fs.mkdirSync(LOCAL_AGENT_LOG_ROOT, { recursive: true });
+  const safeId = safeLocalAgentId(normalizedHostId);
+  const logPath = path.join(LOCAL_AGENT_LOG_ROOT, `${safeId}.out.log`);
+  const errorLogPath = path.join(LOCAL_AGENT_LOG_ROOT, `${safeId}.err.log`);
+  const stdout = fs.createWriteStream(logPath, { flags: 'a' });
+  const stderr = fs.createWriteStream(errorLogPath, { flags: 'a' });
+  const relayUrl = getLocalRelayUrl();
+  const child = spawn(process.execPath, [path.join(__dirname, '..', 'host-agent', 'agent.js')], {
+    cwd: process.cwd(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      RELAY_URL: relayUrl,
+      ...(RELAY_AUTH_TOKEN ? { RELAY_AUTH_TOKEN } : {}),
+      HOST_ID: normalizedHostId,
+      HOST_LABEL: String(label || normalizedHostId).trim() || normalizedHostId,
+      CODEX_HOME: process.env.LOCAL_CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
+      AUTO_START_SESSION: process.env.LOCAL_AGENT_AUTO_START_SESSION || process.env.AUTO_START_SESSION || 'true',
+      MANAGED_COMMAND: process.env.LOCAL_AGENT_MANAGED_COMMAND || process.env.MANAGED_COMMAND || 'codex-app-server',
+    },
+  });
+
+  child.stdout.pipe(stdout);
+  child.stderr.pipe(stderr);
+
+  const record = {
+    hostId: normalizedHostId,
+    label: String(label || normalizedHostId).trim() || normalizedHostId,
+    status: 'starting',
+    startedAt: nowIso(),
+    updatedAt: nowIso(),
+    process: child,
+    pid: child.pid,
+    relayUrl,
+    logPath,
+    errorLogPath,
+    message: 'local host-agent is starting',
+  };
+  state.localAgents.set(normalizedHostId, record);
+
+  child.on('spawn', () => {
+    record.status = 'running';
+    record.updatedAt = nowIso();
+    record.message = 'local host-agent is running';
+  });
+  child.on('error', (error) => {
+    record.status = 'error';
+    record.updatedAt = nowIso();
+    record.message = error.message || 'failed to start local host-agent';
+  });
+  child.on('exit', (code, signal) => {
+    stdout.end();
+    stderr.end();
+    if (state.localAgents.get(normalizedHostId) !== record) {
+      return;
+    }
+    markLocalAgentExited(normalizedHostId, code, signal);
+  });
+
+  const host = state.hosts.get(normalizedHostId) || {
+    hostId: normalizedHostId,
+    label: record.label,
+    platform: process.platform,
+    capabilities: {},
+    registeredAt: nowIso(),
+    lastSeenAt: null,
+  };
+  host.label = record.label || host.label;
+  host.platform = host.platform || process.platform;
+  state.dismissedHosts.delete(normalizedHostId);
+  state.hosts.set(normalizedHostId, host);
+
+  return {
+    ok: true,
+    hostId: normalizedHostId,
+    status: 'starting',
+    message: `Starting local host-agent for ${normalizedHostId}.`,
+    localAgent: publicLocalAgentRecord(record),
+  };
 }
 
 function getSession(hostId, sessionId) {
@@ -788,7 +1028,7 @@ function mergeByFingerprint(entries, fingerprint, limit) {
     seen.add(key);
     merged.push(entry);
   }
-  return merged.slice(-limit);
+  return sortTranscriptEntries(merged).slice(-limit);
 }
 
 function setSessionAlerts(hostId, sessionId, entries) {
@@ -3200,6 +3440,12 @@ function getStats() {
   }
 
   return {
+    relay: {
+      platform: process.platform,
+      hostname: os.hostname(),
+      localAgentSupported: true,
+      localRelayUrl: getLocalRelayUrl(),
+    },
     summary: {
       totalHosts: hosts.length,
       onlineHosts: hosts.filter((host) => host.online).length,
@@ -4268,7 +4514,12 @@ async function handleRequest(req, res) {
 
   if (req.method === 'GET' && url.pathname.match(/^\/api\/hosts\/[^/]+\/sessions$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
-    sendJson(res, 200, { sessions: getSessionsForHost(hostId) });
+    const refreshRequested = url.searchParams.get('refresh') === '1';
+    const discoveryRequested = refreshRequested ? requestHostSessionDiscovery(hostId) : false;
+    sendJson(res, 200, {
+      sessions: getSessionsForHost(hostId),
+      discoveryRequested,
+    });
     return;
   }
 
@@ -4526,6 +4777,34 @@ async function handleRequest(req, res) {
     }
 
     sendJson(res, 200, detail);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/local-agent$/)) {
+    const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const action = String(body.action || '').trim().toLowerCase();
+    const existingHost = state.hosts.get(hostId);
+    const label = String(body.label || existingHost?.label || hostId).trim() || hostId;
+    if (!['start', 'restart', 'stop', 'status'].includes(action)) {
+      sendJson(res, 400, { error: 'action must be start, restart, stop, or status' });
+      return;
+    }
+
+    if (action === 'status') {
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        host: state.hosts.get(hostId) || null,
+        localAgent: publicLocalAgentRecord(state.localAgents.get(hostId)),
+      });
+      return;
+    }
+
+    const result = action === 'stop'
+      ? stopLocalAgent(hostId)
+      : startLocalAgent({ hostId, label, restart: action === 'restart' });
+    sendJson(res, result.ok === false ? 400 : 200, result);
     return;
   }
 
@@ -5025,9 +5304,15 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const session = getSession(hostId, sessionId);
     const command = enqueueCommand(hostId, {
       type: 'session.interrupt',
       sessionId,
+      bridgeSessionId: session?.bridgeSessionId || null,
+      nativeThreadId: session?.nativeThreadId || null,
+      originSessionId: session?.originSessionId || null,
+      sourceSessionId: session?.sourceSessionId || null,
+      conversationKey: session?.conversationKey || null,
     });
     sendJson(res, 200, { ok: true, command });
     return;
@@ -5053,9 +5338,15 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const session = getSession(hostId, sessionId);
     const command = enqueueCommand(hostId, {
       type: 'session.steer',
       sessionId,
+      bridgeSessionId: session?.bridgeSessionId || null,
+      nativeThreadId: session?.nativeThreadId || null,
+      originSessionId: session?.originSessionId || null,
+      sourceSessionId: session?.sourceSessionId || null,
+      conversationKey: session?.conversationKey || null,
       text,
     });
     sendJson(res, 200, { ok: true, command });
@@ -5076,9 +5367,15 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const session = getSession(hostId, sessionId);
     const command = enqueueCommand(hostId, {
       type: 'session.compact',
       sessionId,
+      bridgeSessionId: session?.bridgeSessionId || null,
+      nativeThreadId: session?.nativeThreadId || null,
+      originSessionId: session?.originSessionId || null,
+      sourceSessionId: session?.sourceSessionId || null,
+      conversationKey: session?.conversationKey || null,
     });
     sendJson(res, 200, { ok: true, command });
     return;
@@ -5204,6 +5501,10 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.discovery') {
+    if (host) {
+      host.lastDiscoveryAt = nowIso();
+      state.hosts.set(event.hostId, host);
+    }
     const sessions = Array.isArray(event.sessions) ? event.sessions : [];
     for (const session of sessions) {
       const existing = getSession(event.hostId, session.sessionId);

@@ -1227,8 +1227,8 @@ async function main() {
   console.log(`[agent] host ${HOST_ID} connecting to ${RELAY_URL}`);
   console.log(`[agent] codex home ${CODEX_HOME}`);
 
-  await registerHost();
-  await sendDiscovery();
+  await retryStartupStep('register host', registerHost);
+  await retryStartupStep('send initial discovery', sendDiscovery);
 
   if (AUTO_START_SESSION) {
     try {
@@ -1244,6 +1244,22 @@ async function main() {
   }
 
   await Promise.all([pollCommandsLoop(), discoveryLoop(), heartbeatLoop()]);
+}
+
+async function retryStartupStep(label, task, attempts = 8) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await task();
+      return;
+    } catch (error) {
+      lastError = error;
+      const delay = Math.min(5000, 300 * attempt * attempt);
+      console.error(`[agent] ${label} failed (${attempt}/${attempts}): ${error.message}`);
+      await sleep(delay);
+    }
+  }
+  throw lastError;
 }
 
 main().catch((error) => {

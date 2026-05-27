@@ -29,6 +29,36 @@ function readJsonLines(filePath, maxEntries = Infinity) {
   return entries;
 }
 
+function readJsonLinesTail(filePath, maxEntries = Infinity) {
+  if (!fs.existsSync(filePath)) {
+    return [];
+  }
+
+  const text = fs.readFileSync(filePath, 'utf8');
+  const lines = text.split(/\r?\n/);
+  const entries = [];
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (entries.length >= maxEntries) {
+      break;
+    }
+
+    const trimmed = lines[index].trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    try {
+      entries.push(JSON.parse(trimmed));
+    } catch (_) {
+      // Skip malformed lines.
+    }
+  }
+
+  return entries.reverse();
+}
+
 module.exports = {
   readJsonLines,
+  readJsonLinesTail,
 };

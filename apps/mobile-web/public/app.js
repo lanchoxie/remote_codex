@@ -57,8 +57,10 @@ const state = {
   newSessionCollapsed: true,
   navigatorCollapsed: true,
   settingsOpen: false,
+  localAgentActionBusyId: null,
   ui: {
     locale: 'zh-CN',
+    theme: 'minimal-light',
     apiProfiles: [],
     selectedApiProfileId: 'default',
     defaultApiProfileId: 'default',
@@ -117,6 +119,7 @@ const DEFAULT_COMPOSER_OPTIONS = {
 };
 const DEFAULT_UI_SETTINGS = {
   locale: 'zh-CN',
+  theme: 'minimal-light',
   selectedApiProfileId: 'default',
   defaultApiProfileId: 'default',
   hostApiProfiles: {},
@@ -655,6 +658,7 @@ function normalizeHostApiProfiles(value = {}, profiles = []) {
 
 function normalizeUiSettings(input = {}) {
   const locale = input.locale === 'en' ? 'en' : 'zh-CN';
+  const theme = input.theme === 'dark-tech' ? 'dark-tech' : 'minimal-light';
   const apiProfiles = normalizeApiProfiles(input);
   const profileIds = new Set(apiProfiles.map((profile) => profile.profileId));
   const fallbackProfileId = apiProfiles[0]?.profileId || 'default';
@@ -662,6 +666,7 @@ function normalizeUiSettings(input = {}) {
   const selectedApiProfileId = profileIds.has(input.selectedApiProfileId) ? input.selectedApiProfileId : defaultApiProfileId;
   return {
     locale,
+    theme,
     apiProfiles,
     selectedApiProfileId,
     defaultApiProfileId,
@@ -673,6 +678,7 @@ function initializePersistentUiState() {
   state.navigatorCollapsed = readLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, true) !== false;
   const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
   state.ui.locale = storedUi.locale;
+  state.ui.theme = storedUi.theme;
   state.ui.apiProfiles = storedUi.apiProfiles;
   state.ui.selectedApiProfileId = storedUi.selectedApiProfileId;
   state.ui.defaultApiProfileId = storedUi.defaultApiProfileId;
@@ -694,6 +700,7 @@ function persistUiSettings() {
   }));
   writeLocalStorageJson(UI_SETTINGS_STORAGE_KEY, {
     locale: normalized.locale,
+    theme: normalized.theme,
     apiProfiles,
     selectedApiProfileId: normalized.selectedApiProfileId,
     defaultApiProfileId: normalized.defaultApiProfileId,
@@ -703,6 +710,14 @@ function persistUiSettings() {
 
 function currentLocale() {
   return state.ui.locale === 'en' ? 'en' : 'zh-CN';
+}
+
+function currentTheme() {
+  return state.ui.theme === 'dark-tech' ? 'dark-tech' : 'minimal-light';
+}
+
+function applyUiTheme() {
+  document.documentElement.dataset.theme = currentTheme();
 }
 
 function t(key) {
@@ -1656,11 +1671,14 @@ function dedupeTranscript(entries) {
 
     const normalized = {
       speaker: entry.speaker || 'system',
-      text: String(entry.text || ''),
+      text: stripResumeBootstrapText(entry.text || '', entry.speaker || 'system'),
       timestamp: entry.timestamp || null,
       stream: entry.stream || null,
       files,
     };
+    if (!normalized.text && !files.length) {
+      continue;
+    }
     const key = `${normalized.speaker}|${normalized.timestamp || ''}|${normalized.text}|${files.map((file) => file.path || file.name).join(',')}`;
     if (seen.has(key)) {
       continue;
@@ -1669,7 +1687,21 @@ function dedupeTranscript(entries) {
     deduped.push(normalized);
   }
 
-  return deduped.slice(-200);
+  return deduped
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => {
+      const left = Date.parse(a.entry.timestamp || '');
+      const right = Date.parse(b.entry.timestamp || '');
+      if (Number.isFinite(left) && Number.isFinite(right) && left !== right) {
+        return left - right;
+      }
+      if (Number.isFinite(left) !== Number.isFinite(right)) {
+        return Number.isFinite(left) ? -1 : 1;
+      }
+      return a.index - b.index;
+    })
+    .map((item) => item.entry)
+    .slice(-200);
 }
 
 function getRunnerSummary(session) {
@@ -2050,6 +2082,26 @@ function renderMobileSelectMenu({
       }
     };
     menu.appendChild(item);
+  }
+}
+
+function openNativeSelect(select) {
+  if (!select || select.disabled) {
+    return;
+  }
+  select.focus();
+  try {
+    if (typeof select.showPicker === 'function') {
+      select.showPicker();
+      return;
+    }
+  } catch {
+    // Some mobile browsers expose showPicker but block synthetic opens.
+  }
+  try {
+    select.click();
+  } catch {
+    // Focusing still leaves the native control ready for the next tap.
   }
 }
 
@@ -2449,6 +2501,102 @@ function restoreTranscriptScroll(log, options = {}) {
   }
   const bottomOffset = Number.isFinite(options.bottomOffset) ? options.bottomOffset : 0;
   log.scrollTop = Math.max(0, log.scrollHeight - log.clientHeight - bottomOffset);
+}
+
+function scrollTranscriptTo(position) {
+  const log = el('session-log');
+  const main = document.querySelector('.main');
+  if (!log && !main) {
+    return;
+  }
+  const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+  const scrollNode = (node, top) => {
+    if (!node) {
+      return;
+    }
+    if (typeof node.scrollTo === 'function') {
+      node.scrollTo({ top, behavior });
+    } else {
+      node.scrollTop = top;
+    }
+  };
+  const maxScrollTop = (node) => Math.max(0, (node?.scrollHeight || 0) - (node?.clientHeight || 0));
+  const scrollElement = (node) => {
+    if (!node) {
+      return;
+    }
+    scrollNode(node, position === 'top' ? 0 : maxScrollTop(node));
+  };
+  const collectScrollableTargets = () => {
+    const targets = [];
+    const seen = new Set();
+    const add = (node) => {
+      if (!node || seen.has(node)) {
+        return;
+      }
+      seen.add(node);
+      targets.push(node);
+    };
+
+    add(log);
+    add(main);
+    let node = log?.parentElement;
+    while (node && node !== document.body) {
+      const style = window.getComputedStyle(node);
+      const canScroll = /(auto|scroll|overlay)/.test(style.overflowY)
+        || maxScrollTop(node) > 4;
+      if (canScroll) {
+        add(node);
+      }
+      node = node.parentElement;
+    }
+    add(document.scrollingElement);
+    add(document.documentElement);
+    add(document.body);
+    return targets;
+  };
+  const applyScroll = () => {
+    for (const target of collectScrollableTargets()) {
+      scrollElement(target);
+    }
+    if (typeof window.scrollTo === 'function') {
+      const top = position === 'top'
+        ? 0
+        : Math.max(
+          document.body?.scrollHeight || 0,
+          document.documentElement?.scrollHeight || 0,
+          main?.scrollHeight || 0,
+          log?.scrollHeight || 0
+        );
+      window.scrollTo({ top, behavior });
+    }
+  };
+
+  applyScroll();
+  window.requestAnimationFrame(applyScroll);
+  window.setTimeout(applyScroll, 180);
+}
+
+function stripResumeBootstrapText(value, speaker = '') {
+  const text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text) {
+    return '';
+  }
+
+  const hasPrelude = /Continue this conversation with the following prior context in mind:/i.test(text);
+  const requestMatch = text.match(/(?:^|\n)New user request:\s*([\s\S]*)$/i);
+  if (!hasPrelude && !requestMatch) {
+    return text;
+  }
+
+  const requestText = requestMatch ? requestMatch[1].trim() : '';
+  if (speaker === 'user') {
+    return requestText;
+  }
+
+  // App-server fallback resume can make Codex echo the synthetic context
+  // prompt. It is transport glue, not useful chat content.
+  return '';
 }
 
 function setRuntimeForSession(hostId, sessionId, runtime) {
@@ -3105,6 +3253,40 @@ function createActionButton(label, className) {
   return button;
 }
 
+function isLocalAgentCandidate(host) {
+  if (!host?.hostId) {
+    return false;
+  }
+  if (host.localAgent) {
+    return true;
+  }
+  const relayPlatform = state.stats?.relay?.platform || '';
+  return Boolean(relayPlatform && host.platform === relayPlatform && !host.online);
+}
+
+async function runLocalAgentAction(host, action) {
+  if (!host?.hostId || state.localAgentActionBusyId) {
+    return;
+  }
+  state.localAgentActionBusyId = host.hostId;
+  renderAll();
+  try {
+    await fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/local-agent`, {
+      method: 'POST',
+      body: JSON.stringify({
+        action,
+        label: host.label || host.hostId,
+      }),
+    });
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  } finally {
+    state.localAgentActionBusyId = null;
+    renderAll();
+  }
+}
+
 function renderHostNav() {
   const hostList = el('host-overview-list');
   hostList.innerHTML = '';
@@ -3112,13 +3294,16 @@ function renderHostNav() {
   for (const host of state.hosts) {
     const item = document.createElement('div');
     item.className = `host-card ${host.hostId === state.selectedHostId ? 'active' : ''}`;
+    const localAgentLabel = host.localAgent?.status
+      ? ` | local ${host.localAgent.status}`
+      : '';
 
     const top = document.createElement('div');
     top.className = 'host-card-top';
     top.innerHTML = `
       <div>
         <div class="title">${host.label}</div>
-        <div class="sub">${host.platform} | ${host.online ? 'online' : 'offline'} | ${host.sessionCount || 0} dialogs</div>
+        <div class="sub">${host.platform} | ${host.online ? 'online' : 'offline'}${localAgentLabel} | ${host.sessionCount || 0} dialogs</div>
       </div>
     `;
 
@@ -3142,6 +3327,33 @@ function renderHostNav() {
       event.stopPropagation();
       await importHost(host.hostId);
     };
+
+    if (isLocalAgentCandidate(host)) {
+      const localAgent = host.localAgent || null;
+      const localBusy = state.localAgentActionBusyId === host.hostId;
+      const localAction = localAgent?.status === 'running' || localAgent?.status === 'starting' ? 'restart' : 'start';
+      const localButton = createActionButton(localBusy
+        ? 'Working...'
+        : localAction === 'restart'
+          ? 'Restart Local'
+          : 'Start Local', localAction === 'restart' ? 'secondary-button' : '');
+      localButton.disabled = localBusy;
+      localButton.title = localAgent?.message || 'Manage the host-agent running on this relay machine.';
+      localButton.onclick = async (event) => {
+        event.stopPropagation();
+        await runLocalAgentAction(host, localAction);
+      };
+      actions.appendChild(localButton);
+      if (localAgent?.status === 'running' || localAgent?.status === 'starting') {
+        const stopButton = createActionButton('Stop Local', 'danger-button');
+        stopButton.disabled = localBusy;
+        stopButton.onclick = async (event) => {
+          event.stopPropagation();
+          await runLocalAgentAction(host, 'stop');
+        };
+        actions.appendChild(stopButton);
+      }
+    }
 
     const deleteButton = createActionButton('Delete', 'danger-button');
     deleteButton.onclick = async (event) => {
@@ -3554,6 +3766,8 @@ function renderConversationNav() {
     const actions = document.createElement('div');
     actions.className = 'conversation-card-actions';
     const moveKey = `${group.hostId}::${group.conversationKey}`;
+    const moveOpen = state.mobileMenus.collectionMoveKey === moveKey;
+    item.classList.toggle('collection-menu-open', moveOpen);
     const moveAnchor = document.createElement('div');
     moveAnchor.className = 'mobile-select-anchor collection-move-anchor';
     const collectionSelect = document.createElement('select');
@@ -3586,7 +3800,7 @@ function renderConversationNav() {
     moveButton.className = 'secondary-button mobile-select-button collection-move-button';
     moveButton.textContent = 'Save to collection...';
     moveButton.disabled = collectionSelect.disabled;
-    moveButton.setAttribute('aria-expanded', state.mobileMenus.collectionMoveKey === moveKey ? 'true' : 'false');
+    moveButton.setAttribute('aria-expanded', moveOpen ? 'true' : 'false');
     moveButton.onclick = (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -3595,7 +3809,7 @@ function renderConversationNav() {
       }
     };
     const moveMenu = document.createElement('div');
-    moveMenu.className = `mobile-select-menu collection-move-menu ${state.mobileMenus.collectionMoveKey === moveKey ? '' : 'hidden'}`.trim();
+    moveMenu.className = `mobile-select-menu collection-move-menu ${moveOpen ? '' : 'hidden'}`.trim();
     moveMenu.setAttribute('role', 'menu');
     renderMobileSelectMenu({
       button: moveButton,
@@ -3606,7 +3820,7 @@ function renderConversationNav() {
         label: target.name || 'Collection',
       })),
       selectedValue: '',
-      open: state.mobileMenus.collectionMoveKey === moveKey,
+      open: moveOpen,
       disabled: collectionSelect.disabled,
       onSelect: async (targetCollectionId) => {
         if (targetCollectionId) {
@@ -7122,6 +7336,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
 
 function renderLocaleLabels() {
   document.documentElement.lang = currentLocale();
+  applyUiTheme();
   for (const node of document.querySelectorAll('[data-i18n-key]')) {
     node.textContent = t(node.dataset.i18nKey);
   }
@@ -7246,11 +7461,13 @@ function renderHostApiProfileList() {
 function populateSettingsForm() {
   const settings = normalizeUiSettings(state.ui);
   state.ui.locale = settings.locale;
+  state.ui.theme = settings.theme;
   state.ui.apiProfiles = settings.apiProfiles;
   state.ui.selectedApiProfileId = settings.selectedApiProfileId;
   state.ui.defaultApiProfileId = settings.defaultApiProfileId;
   state.ui.hostApiProfiles = settings.hostApiProfiles;
   el('settings-language-select').value = settings.locale;
+  el('settings-theme-select').value = settings.theme;
   appendApiProfileOptions(el('settings-api-profile-select'));
   appendApiProfileOptions(el('settings-default-api-profile'));
   el('settings-default-api-profile').value = settings.defaultApiProfileId;
@@ -7643,10 +7860,39 @@ async function recoverHostForSwitch(hostId, cause) {
   return true;
 }
 
+async function recoverLocalAgentForSwitch(hostId) {
+  const host = getHost(hostId);
+  if (!isLocalAgentCandidate(host)) {
+    return false;
+  }
+
+  state.localAgentActionBusyId = hostId;
+  renderAll();
+  try {
+    await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/local-agent`, {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'start',
+        label: host?.label || hostId,
+      }),
+    });
+    await waitForRecoveredHost(hostId, 60000);
+    await refresh();
+    return true;
+  } finally {
+    state.localAgentActionBusyId = null;
+    renderAll();
+  }
+}
+
 async function ensureHostAvailable(hostId) {
   try {
     return await verifyHostAvailable(hostId);
   } catch (error) {
+    const localRecovered = await recoverLocalAgentForSwitch(hostId);
+    if (localRecovered) {
+      return { ok: true, mode: 'local-agent-recovered' };
+    }
     const recovered = await recoverHostForSwitch(hostId, error);
     if (recovered) {
       return { ok: true, mode: 'connector-recovered' };
@@ -7752,7 +7998,7 @@ async function refresh() {
   }
 
   const sessionResponses = await Promise.all(
-    state.hosts.map((host) => fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/sessions`))
+    state.hosts.map((host) => fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/sessions?refresh=1`))
   );
 
   state.sessions = [];
@@ -9204,6 +9450,11 @@ el('settings-api-profile-select').addEventListener('change', (event) => {
   populateSettingsForm();
 });
 
+el('settings-theme-select').addEventListener('change', (event) => {
+  state.ui.theme = event.target.value === 'dark-tech' ? 'dark-tech' : 'minimal-light';
+  applyUiTheme();
+});
+
 el('settings-add-api-profile-button').addEventListener('click', () => {
   saveActiveApiProfileFromSettingsForm();
   const next = normalizeApiProfile({
@@ -9269,6 +9520,7 @@ el('settings-host-api-list').addEventListener('change', (event) => {
 el('settings-form').addEventListener('submit', (event) => {
   event.preventDefault();
   state.ui.locale = el('settings-language-select').value === 'en' ? 'en' : 'zh-CN';
+  state.ui.theme = el('settings-theme-select').value === 'dark-tech' ? 'dark-tech' : 'minimal-light';
   saveActiveApiProfileFromSettingsForm();
   state.ui.defaultApiProfileId = el('settings-default-api-profile').value || getApiProfiles()[0]?.profileId || 'default';
   for (const select of el('settings-host-api-list').querySelectorAll('[data-host-api-profile-host]')) {
@@ -9285,7 +9537,9 @@ el('settings-form').addEventListener('submit', (event) => {
 });
 
 el('open-connector-manager-button').addEventListener('click', () => {
+  state.settingsOpen = false;
   openConnectorManager();
+  renderSettingsDialog();
 });
 
 el('close-connector-manager-button').addEventListener('click', () => {
@@ -9626,6 +9880,18 @@ el('toggle-navigator-button').addEventListener('click', () => {
   renderAll();
 });
 
+el('scroll-transcript-top-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  scrollTranscriptTo('top');
+});
+
+el('scroll-transcript-bottom-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  scrollTranscriptTo('bottom');
+});
+
 el('close-sidebar-navigator-button')?.addEventListener('click', () => {
   closeMobileSelectMenus();
   state.navigatorCollapsed = true;
@@ -9689,7 +9955,8 @@ el('collection-menu-button')?.addEventListener('click', (event) => {
   if (window.matchMedia('(max-width: 980px)').matches) {
     event.preventDefault();
     event.stopPropagation();
-    toggleMobileSelectMenu('collection');
+    closeMobileSelectMenus();
+    openNativeSelect(el('session-collection-select'));
     return;
   }
   el('session-collection-select')?.focus();
@@ -10106,6 +10373,7 @@ async function boot() {
 }
 
 initializePersistentUiState();
+applyUiTheme();
 boot();
 
 setInterval(() => {

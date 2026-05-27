@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="minimal-light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -74,10 +74,22 @@
             <div class="settings-section-title" data-i18n-key="settings.languageTitle">Interface language</div>
             <div class="settings-section-copy" data-i18n-key="settings.languageCopy">Switch the browser UI between Chinese and English.</div>
           </div>
-          <select id="settings-language-select">
-            <option value="zh-CN">中文</option>
-            <option value="en">English</option>
-          </select>
+          <div class="settings-compact-controls">
+            <label>
+              <span>Language</span>
+              <select id="settings-language-select">
+                <option value="zh-CN">中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+            <label>
+              <span>Theme</span>
+              <select id="settings-theme-select">
+                <option value="minimal-light">Minimal light</option>
+                <option value="dark-tech">Dark tech</option>
+              </select>
+            </label>
+          </div>
         </section>
 
         <section class="settings-section host-settings-section">
@@ -437,6 +449,10 @@
         </div>
 
         <section class="panel transcript-panel">
+          <div class="transcript-scroll-controls" aria-label="Transcript scroll controls">
+            <button id="scroll-transcript-top-button" type="button" class="secondary-button scroll-jump-button">Top</button>
+            <button id="scroll-transcript-bottom-button" type="button" class="secondary-button scroll-jump-button">Bottom</button>
+          </div>
           <div id="session-log" class="log"></div>
           <form id="input-form" class="composer">
             <div class="composer-attachment-grid">
