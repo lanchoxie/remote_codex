@@ -176,7 +176,9 @@ async function sendDiscovery() {
     cwd: session.cwd,
     source: session.source || 'imported',
     live: false,
+    createdAt: session.createdAt || null,
     updatedAt: session.updatedAt,
+    messageCount: session.messageCount || 0,
     latestUserMessage: session.latestUserMessage || null,
     latestAgentMessage: session.latestAgentMessage || null,
     transcriptPreview: session.transcriptPreview || [],
@@ -202,7 +204,9 @@ async function sendDiscovery() {
       cwd: runner.cwd || runner.runtime?.cwd || MANAGED_CWD,
       source: 'managed',
       live: true,
+      createdAt: runner.createdAt || runner.startedAt || nowIso(),
       updatedAt: nowIso(),
+      messageCount: 0,
       latestUserMessage: null,
       latestAgentMessage: null,
       transcriptPreview: [],
@@ -653,12 +657,12 @@ function buildResumeBootstrap(command) {
   const transcript = Array.isArray(command.resumeTranscript) ? command.resumeTranscript : [];
   const lines = transcript
     .filter((entry) => entry && entry.text)
-    .slice(-80)
     .map((entry) => {
       const speaker = entry.speaker === 'user' ? 'user' : entry.speaker === 'agent' ? 'assistant' : 'system';
-      const text = String(entry.text || '').replace(/\r\n?/g, '\n').trim().slice(0, 3000);
+      const text = String(entry.text || '').replace(/\r\n?/g, '\n').trim();
       return { speaker, text };
-    });
+    })
+    .filter((entry) => entry.text);
 
   return {
     launchMode: command.launchMode || 'fresh',
@@ -704,6 +708,7 @@ async function failManagedSession(sessionId, cwd, message, state = 'failed') {
 }
 
 function startProcessManagedSession({ sessionId, cwd, command, args, label, originSessionId, sourceSessionId, conversationKey, launchMode, apiConfig, bootstrap }) {
+  const createdAt = nowIso();
   const spawnOptions = {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -722,6 +727,7 @@ function startProcessManagedSession({ sessionId, cwd, command, args, label, orig
     sessionId,
     title: label || cwd || sessionId,
     cwd,
+    createdAt,
     originSessionId: originSessionId || null,
     sourceSessionId: sourceSessionId || null,
     conversationKey: conversationKey || originSessionId || sessionId,
@@ -797,6 +803,7 @@ function startProcessManagedSession({ sessionId, cwd, command, args, label, orig
 
 async function startManagedSession(command) {
   const bridgeSessionId = command.sessionId || makeId();
+  const createdAt = command.createdAt || nowIso();
   const cwd = resolveManagedCwd(command.cwd || MANAGED_CWD);
   const resolved = resolveManagedCommand(command.command || MANAGED_COMMAND);
   const args = command.args && command.args.length ? normalizeArgs(command.args) : resolved.args;
@@ -844,6 +851,7 @@ async function startManagedSession(command) {
           liveSessions.delete(announcedSessionId);
         },
       });
+      runner.createdAt = runner.createdAt || createdAt;
       announcedSessionId = runner.sessionId || bridgeSessionId;
       liveSessions.set(bridgeSessionId, runner);
       liveSessions.set(announcedSessionId, runner);
@@ -872,6 +880,7 @@ async function startManagedSession(command) {
       title,
       cwd,
       source: 'managed',
+      createdAt: runner?.createdAt || createdAt,
       originSessionId: command.originSessionId || null,
       sourceSessionId: command.sourceSessionId || null,
       conversationKey: command.conversationKey || command.originSessionId || bridgeSessionId,

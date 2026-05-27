@@ -1,194 +1,264 @@
-# Mobile Codex Remote Notes
+# Mobile Codex Remote 使用指南
 
-[中文说明 / Chinese README](README.zh-CN.md)
+`Mobile Codex Remote` 是一个用网页或手机控制多台电脑、远程服务器和 HPC 上 Codex 会话的轻量工具。你可以在一个界面里切换本地电脑、Linux 主机和 HPC，继续历史会话，启动新的 Codex 会话，上传文件/图片，并把远端生成的文件下载回来。
 
-This workspace captures an MVP design for controlling Codex sessions on a PC
-and on HPC hosts from a phone.
+旧版开发说明已归档到 [README_v2.01.md](README_v2.01.md)。本文只保留安装、启动、导入和安全使用方式。
 
-## Goal
+## 功能概览
 
-Build a system where:
+- 多 host：本地电脑、远程 Linux、HPC 都可以接入同一个 relay。
+- 会话管理：查看历史、按关键词/路径/标题搜索，按创建时间、更新时间、消息数排序。
+- Live 控制：新建、Resume、Fork、Stop、Interrupt、Steer、Plan、Review。
+- 文件传输：拖拽或选择文件上传到选中 host；远端回复里的图片/文件路径可打开或保存。
+- 手机适配：左侧导航可折叠，适合通过手机浏览器或 Tailscale 访问。
+- HPC 连接器：支持 SSH key、密码、keyboard-interactive、OTP/MFA、gateway/jump host、tmux bootstrap。
+- API profiles：可以保存多个 API profile，并为不同 host 选择不同 API key/base URL。
 
-- a phone can see available Codex sessions on different hosts;
-- a phone can continue chatting with a Codex session that is already running;
-- a host can keep Codex running even when the phone disconnects;
-- HPC and office PCs can both be supported without exposing dangerous local
-  files directly to the phone.
+## 安全提醒
 
-## Key conclusion
+不要把 relay 直接暴露到公网。推荐用 Tailscale 这种私有网络访问。
 
-Reading `~/.codex` is useful for discovery, but it is not enough for control.
-To let Codex continue running on another machine, we need a host-side agent that
-owns the live Codex process and streams input/output over a secure channel.
+不会提交到 GitHub 的本地敏感文件包括：
 
-## Version 2.1.0: mobile + HPC control baseline
+- `tmp/connectors.json`
+- `tmp/connector-secrets.json`
+- `tmp/session-collections.json`
+- `tmp/session-logs.json`
+- `tmp/relay-auth-token.txt`
+- `tmp/relay-auth-account.json`
+- `.env`
+- `.env.local`
+- `tmp/.codex-remote-files/`
+- `tmp/received-files/`
 
-This release is the first usable multi-platform baseline. It is still a local
-tooling project, but it can now control local and remote Codex hosts from the
-same browser/mobile UI.
+给朋友体验时，发 GitHub 仓库链接即可。不要发你的 live relay 地址、SSH key、HPC 密码、OTP、`.env` 或 `tmp/` 目录。
 
-The repository contains a no-dependency Node implementation with three parts:
+## 安装
 
-- `apps/relay`: in-memory relay and API server;
-- `apps/host-agent`: host agent that discovers `~/.codex` sessions and starts
-  managed Codex app-server sessions;
-- `apps/mobile-web`: mobile-first web UI served by the relay.
+推荐环境：
 
-What this version does:
+- Node.js 22 或更新版本。
+- Git。
+- 本地或远端已安装 Codex CLI。
+- 如果要连接 HPC，本机需要可用的 OpenSSH。
 
-- discovers Codex history from local and HPC `~/.codex` directories;
-- connects multiple hosts through outbound agents, including SSH/HPC bootstrap
-  flows with gateway/jump-host support;
-- supports switching between local PC and HPC hosts from the same UI;
-- starts, resumes, and forks managed Codex sessions from selected directories;
-- streams live output, status, diagnostics, approval requests, and alerts over
-  Server-Sent Events;
-- provides host health checks before switching or sending commands;
-- supports session search by keyword, path, and title-like metadata;
-- supports cross-host session collections/favorites;
-- supports directory browsing on remote hosts, including `~` and `/` roots;
-- supports Codex app-server controls: model selection, reasoning effort,
-  reasoning summaries, approval policy, approval reviewer, sandbox mode,
-  plan-only turns, review turns, interrupt, steer, compact, and shell-command
-  control;
-- supports real file transfer through the relay/host-agent channel: dropped
-  files are uploaded into the selected host workspace, uploaded images are sent
-  to Codex as host-local `localImage` inputs, and remote file paths in chat can
-  be opened or saved from the browser.
-- adds a Codex-like `/` command menu in the composer for plan mode, status,
-  model controls, reasoning effort, personality, review, compact, fork, upload,
-  and skill-oriented prompt templates.
-- improves the phone layout with a drawer-style navigator, compact session
-  status chips, a unified session details/status modal, session-scoped model
-  settings, and collection management with rename/delete safeguards.
+克隆仓库：
 
-Current limitations:
+```bash
+git clone https://github.com/lanchoxie/remote_codex.git
+cd remote_codex
+```
 
-- the relay is intentionally lightweight and still keeps most runtime state in
-  memory;
-- imported historical sessions are readable, but need resume/fork to become
-  interactive;
-- remote hosts must run the matching host-agent version before new controls
-  such as model listing, review, and image input are available;
-- relay authentication is a single shared token, not a multi-user permission
-  system; keep using a private network such as Tailscale instead of exposing a
-  running relay to the public internet.
+本项目当前没有第三方 npm 依赖，通常可以直接运行。如果你后续添加依赖，再执行：
 
-## Quick start
+```bash
+npm install
+```
 
-Requirements:
+## 启动本地 relay 和本地 host
 
-- Node.js 22 or newer is recommended;
-- a local `~/.codex` directory is optional but useful for discovery.
-
-Run the relay and one local agent:
+在电脑上运行：
 
 ```bash
 npm run dev
 ```
 
-Then open:
+默认打开：
 
 ```text
 http://127.0.0.1:8787
 ```
 
-The web UI uses a local username/password login. On first run, the browser asks
-you to create the account; the password is stored only as a local scrypt hash in
-`tmp/relay-auth-account.json`. Host-agents still use a separate machine token at
-`tmp/relay-auth-token.txt` so HPC agents can connect back without a browser. To
-disable auth only for local debugging, start the relay with
-`RELAY_AUTH_DISABLED=1`.
+如果你用自定义端口，例如 `8797`，启动 relay 前设置 `PORT=8797`，然后打开：
 
-For phone access away from the same Wi-Fi, the recommended path is Tailscale:
-install Tailscale on the relay machine and on the phone, sign in to the same
-tailnet, then open `http://<relay-machine-tailscale-ip>:8787` or `:8797`.
-Do not port-forward the relay directly from your router.
+```text
+http://127.0.0.1:8797
+```
 
-For the full phone, Tailscale, and HPC connector workflow, see
-[Phone, Tailscale And HPC Guide](docs/phone-tailscale-hpc-guide.md).
+第一次打开网页会要求创建 relay 登录账号。这个账号只保护网页入口，密码以 scrypt hash 存在本机 `tmp/relay-auth-account.json`，不是明文。
 
-Useful scripts:
+常用脚本：
 
 ```bash
+npm run dev
 npm run relay
 npm run agent
 npm run test:managed
 ```
 
-`npm run test:managed` boots a relay plus one agent, waits for a live managed
-session, sends one prompt, verifies streamed output, and checks a real
-upload/download round trip through the host-agent file channel.
+- `npm run dev`：同时启动 relay 和本地 host-agent。
+- `npm run relay`：只启动网页/API relay。
+- `npm run agent`：只启动当前机器的 host-agent。
+- `npm run test:managed`：跑基础 managed session 和文件传输测试。
 
-## Sharing with a friend
+## 在电脑上使用
 
-The safest way to let someone else try this project is to send the GitHub
-repository link or a release/tag link, not your running relay URL and not a zip
-of your working directory.
+启动后，左侧会显示当前 host。常见操作：
 
-Safe to share:
+- `New In Directory`：输入选中 host 上的工作目录，新建 Codex 会话。
+- `Resume From History`：把历史会话恢复成 live 会话。
+- `Fork New Branch`：从当前历史或 live 会话 fork 出一个新分支。
+- `Stop Session`：结束当前 live session，但保留历史。
+- `Interrupt`：打断正在运行的 turn。
+- `Plan`：只让 Codex 规划，不直接改文件。
+- `Review`：让 Codex 审查当前工作区改动。
 
-- the GitHub repository URL;
-- a clean checkout of the source code;
-- public docs and screenshots.
+聊天输入：
 
-Do not share:
+- `Enter` 发送。
+- `Shift+Enter` 换行。
+- 输入 `/` 打开快捷菜单。
+- 点 `+` 添加文件或图片。
+- 拖拽文件到输入区也可以上传。
+- 如果 Codex 回复里出现远端图片或文件路径，聊天框会尝试生成 `Open` / `Save` 卡片。
 
-- `tmp/connectors.json`;
-- `tmp/connector-secrets.json`;
-- `tmp/relay-auth-token.txt`;
-- `tmp/relay-auth-account.json`;
-- `.env` or `.env.local`;
-- your running `http://<your-ip>:8797` relay URL unless you intentionally want
-  that person to see and control the sessions currently attached to your relay.
+## 连接手机
 
-Friend experience:
+如果手机和电脑在同一个局域网，先查电脑局域网 IP，例如 `192.168.1.20`，然后手机浏览器打开：
 
-- after cloning the repo, your friend will not have your PC/HPC credentials;
-- they will not be able to log in to your host or HPC from the repo alone;
-- they need to configure their own hosts, SSH keys, passwords, OTP prompts, and
-  Codex account/session state;
-- if you expose your live relay on a LAN or private network, anyone who can
-  reach it and has the login password or recovery token may be able to control
-  attached sessions.
+```text
+http://192.168.1.20:8787
+```
 
-## Android-friendly groundwork
+如果你使用自定义端口：
 
-The current mobile web UI includes:
+```text
+http://192.168.1.20:8797
+```
 
-- a narrow-screen layout intended for phones;
-- a web app manifest for Android installation experiments;
-- a theme color and standalone-capable metadata for PWA-style wrapping.
+如果打不开，通常检查三件事：
 
-This is still a browser-first UI, but it gives us a clean bridge into either:
+- 手机和电脑是否在同一个网络。
+- Windows 防火墙是否允许 Node.js 监听局域网。
+- relay 是否真的在对应端口运行。
 
-- a PWA for Android;
-- a native Android app with a WebView shell at the very beginning;
-- or a later fully native client that reuses the same relay APIs.
+## 使用 Tailscale 安全内网穿透
 
-Useful environment variables for the agent:
+Tailscale 官方下载地址：
 
-- `RELAY_URL`: relay base URL, default `http://127.0.0.1:8787`
-- `RELAY_AUTH_TOKEN`: shared relay machine token; remote host-agents need this
-  when relay auth is enabled
-- `HOST_ID`: stable host identifier
-- `HOST_LABEL`: display name for the host
-- `CODEX_HOME`: override the local `.codex` directory
-- `AUTO_START_SESSION`: set to `false` to disable the default managed session
-- `MANAGED_COMMAND`: set to `demo` or a real command later
-- `MANAGED_ARGS_JSON`: JSON array of command arguments
-- `MANAGED_CWD`: working directory for the managed session
+```text
+https://tailscale.com/download
+```
 
-## Docs
+推荐流程：
 
-- [Docs Index](docs/README.md)
-- [Module Map](docs/module-map.md)
-- [Validation Status](docs/validation-status.md)
-- [Developer Guide](docs/developer-guide.md)
-- [Remodex Comparison](docs/remodex-comparison.md)
-- [Architecture](docs/mobile-codex-remote-architecture.md)
-- [HPC Connectors](docs/hpc-connectors.md)
-- [Phone, Tailscale And HPC Guide](docs/phone-tailscale-hpc-guide.md)
-- [Host Onboarding](docs/host-onboarding.md)
-- [Session Discovery And Control](docs/session-discovery-and-control.md)
-- [MVP Plan](docs/mvp-plan.md)
+1. 在电脑和手机上都安装 Tailscale。
+2. 两台设备登录同一个 tailnet。
+3. 在电脑上启动 `npm run dev` 或你的 relay/agent。
+4. 在电脑上查看 Tailscale IP，通常是 `100.x.y.z`。
+5. 手机连上 Tailscale 后访问：
+
+```text
+http://100.x.y.z:8787
+```
+
+如果你的 relay 端口是 `8797`：
+
+```text
+http://100.x.y.z:8797
+```
+
+安全建议：
+
+- Tailscale 账号开启 MFA。
+- 不要在路由器上做公网端口转发。
+- 不要把 relay 登录密码、recovery token 或 Tailscale 设备权限给不可信的人。
+- 只在本机临时调试时才考虑 `RELAY_AUTH_DISABLED=1`。
+
+## 导入和管理 host
+
+本地 host-agent 启动后会自动注册到 relay，一般不需要手动导入。
+
+如果 host 已经存在但被隐藏，或者你知道一个 host id，可以到：
+
+```text
+设置 -> Hosts and connectors
+```
+
+使用 `Import Host` 输入 host id。
+
+如果要连接 HPC 或远程 Linux，使用：
+
+```text
+设置 -> Hosts and connectors -> Manage HPC
+```
+
+新建 connector 时常用字段：
+
+- `Label`：显示名，例如 `dm`、`hkl`、`lab-gpu`。
+- `Relay URL`：远端 host-agent 能访问到的 relay 地址，例如 `http://100.x.y.z:8787`。
+- `Target host`：HPC 登录节点或远程服务器地址。
+- `Target port`：SSH 端口。
+- `Login username`：远端用户名。
+- `CODEX_HOME`：通常是 `~/.codex`。
+- `Workspace roots`：可浏览的工作目录，一行一个。
+- `Remote agent directory`：远端放置本项目的目录，例如 `~/mobile-codex-remote`。
+- `tmux session name`：推荐 `codex-remote`。
+
+如果不需要 gateway，保持 `Gateway Disabled`。如果需要跳板机，打开 Gateway 并填写 gateway host、port、username 和认证方式。
+
+保存 connector 后：
+
+1. 点 `Run Test` 检查 SSH 是否能登录。
+2. 点 `Start Agent` 上传/启动远端 host-agent。
+3. 如果更新了项目代码，点 `Restart Agent` 让远端使用新版本。
+4. 如果 OTP 过期，页面会重新提示输入验证码或密码。
+
+## 远端安装 Codex CLI
+
+如果 HPC 上没有 Codex CLI，先在远端安装 Node.js 和 Codex。
+
+HPC/conda 推荐：
+
+```bash
+conda create -n codex-node -c conda-forge nodejs=20 -y
+conda activate codex-node
+npm install -g @openai/codex
+codex --help
+```
+
+个人 Linux 服务器也可以用 `fnm`：
+
+```bash
+curl -fsSL https://fnm.vercel.app/install | bash
+source ~/.bashrc
+fnm install 20
+fnm use 20
+npm install -g @openai/codex
+codex --help
+```
+
+安装完成后，回到网页 connector 里点 `Start Agent` 或 `Restart Agent`。
+
+## API profile
+
+在右上角：
+
+```text
+设置 -> API profiles
+```
+
+可以添加多个 API profile，例如 OpenAI 官方 key、sub2api 反代 key、实验室代理 key。每个 host 可以绑定不同 profile。
+
+注意：
+
+- API key 只在你选择“记住”时保存在当前浏览器本地。
+- API key 不会提交到 GitHub。
+- API profile 变更通常作用于新启动或重新 Resume/Fork 的 session；已经运行中的 Codex app-server 需要 Stop/Resume 或 Restart host-agent 才能完全换环境。
+
+## 分享给朋友
+
+推荐发送：
+
+```text
+https://github.com/lanchoxie/remote_codex
+```
+
+朋友 clone 后只能看到他自己机器上的 host、Codex 历史和配置。除非你把正在运行的 relay 地址和登录凭据给他，否则他不会自动进入你的电脑或 HPC。
+
+## 当前限制
+
+- relay 仍是轻量实现，部分 live runtime 状态在内存里，重启后需要 host-agent 重新上报。
+- 不同 HPC 的 SSH/MFA/OTP 策略差异很大，可能需要按集群微调 connector。
+- 超大数据集不建议通过手机上传，最好让 Codex 在远端直接读路径。
+- 远端 host-agent 必须更新到当前版本后，才能使用最新的图片输入、文件下载、模型列表和排序元数据能力。

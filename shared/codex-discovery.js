@@ -27,7 +27,9 @@ function discoverCodexSessions(options = {}) {
       nativeThreadId: row.id,
       title: row.thread_name || row.id,
       cwd: null,
+      createdAt: row.created_at || row.timestamp || row.updated_at || null,
       updatedAt: row.updated_at || null,
+      messageCount: 0,
       source: 'index',
       live: false,
       imported: true,
@@ -58,12 +60,19 @@ function discoverCodexSessions(options = {}) {
       nativeThreadId: existing.nativeThreadId || meta.id,
       title: existing.title || meta.thread_name || meta.id,
       cwd: meta.cwd || existing.cwd || preview.cwd || null,
+      createdAt: earliestTimestamp(
+        existing.createdAt,
+        meta.timestamp,
+        preview.firstTimestamp,
+        parseTimestampFromFilePath(filePath)
+      ),
       updatedAt: latestTimestamp(
         preview.lastTimestamp,
         stats?.mtime?.toISOString(),
         existing.updatedAt,
         meta.timestamp
       ),
+      messageCount: Math.max(Number(existing.messageCount || 0), preview.messageCount || 0),
       source: meta.source || existing.source || 'rollout',
       originator: meta.originator || existing.originator || null,
       cliVersion: meta.cli_version || existing.cliVersion || null,
@@ -92,7 +101,9 @@ function extractSessionPreview(filePath) {
     latestAgentMessage: null,
     transcriptPreview: [],
     cwd: null,
+    firstTimestamp: null,
     lastTimestamp: null,
+    messageCount: 0,
   };
 
   const rows = readJsonLines(filePath, TRANSCRIPT_READ_LIMIT);
@@ -101,6 +112,7 @@ function extractSessionPreview(filePath) {
       continue;
     }
 
+    preview.firstTimestamp = earliestTimestamp(preview.firstTimestamp, row.timestamp);
     preview.lastTimestamp = latestTimestamp(preview.lastTimestamp, row.timestamp);
     preview.cwd = preview.cwd || getCwdFromRow(row);
 
@@ -110,6 +122,7 @@ function extractSessionPreview(filePath) {
     }
 
     preview.transcriptPreview.push(entry);
+    preview.messageCount += 1;
     if (entry.speaker === 'user') {
       preview.latestUserMessage = cleanPreviewText(entry.text);
     }
@@ -144,6 +157,14 @@ function getSessionMeta(filePath, rows) {
 function parseSessionIdFromFilePath(filePath) {
   const matches = String(path.basename(filePath)).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig);
   return matches && matches.length ? matches[matches.length - 1] : null;
+}
+
+function parseTimestampFromFilePath(filePath) {
+  const match = String(path.basename(filePath)).match(/rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})/);
+  if (!match) {
+    return null;
+  }
+  return `${match[1].replace(/T(\d{2})-(\d{2})-(\d{2})$/, 'T$1:$2:$3')}.000Z`;
 }
 
 function getCwdFromRow(row) {
@@ -298,6 +319,23 @@ function latestTimestamp(...values) {
     latestTime = time;
   }
   return latest;
+}
+
+function earliestTimestamp(...values) {
+  let earliest = null;
+  let earliestTime = Infinity;
+  for (const value of values.flat()) {
+    if (!value) {
+      continue;
+    }
+    const time = Date.parse(value);
+    if (!Number.isFinite(time) || time >= earliestTime) {
+      continue;
+    }
+    earliest = new Date(time).toISOString();
+    earliestTime = time;
+  }
+  return earliest;
 }
 
 function safeStat(filePath) {

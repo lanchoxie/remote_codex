@@ -255,6 +255,7 @@ textarea {
 .selected-host-section > .collection-toolbar,
 .selected-host-section > .collection-popover,
 .selected-host-section > .session-search-form,
+.selected-host-section > .session-sort-form,
 .selected-host-section > .session-search-summary {
   flex: 0 0 auto;
   min-width: 0;
@@ -524,6 +525,25 @@ textarea {
   min-height: 38px;
   padding: 9px 10px;
   line-height: 1.15;
+}
+
+.session-sort-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin: -2px 0 8px;
+}
+
+.session-sort-form button,
+.session-sort-form select {
+  min-width: 0;
+  min-height: 38px;
+  padding: 9px 10px;
+  line-height: 1.15;
+}
+
+.session-sort-dir-button {
+  width: 78px;
 }
 
 .session-search-summary {
@@ -1557,6 +1577,34 @@ select:disabled {
   margin-top: 8px;
 }
 
+.conversation-time-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.conversation-time-grid span {
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid rgba(150, 177, 218, 0.14);
+  border-radius: 10px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-time-grid strong {
+  display: block;
+  color: rgba(235, 241, 255, 0.86);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .api-profile-chip {
   display: inline-flex;
   max-width: 100%;
@@ -2346,6 +2394,53 @@ select:disabled {
   color: rgba(226, 235, 255, 0.76);
 }
 
+.markdown-table-wrap {
+  margin: 10px 0;
+  overflow-x: auto;
+  border: 1px solid rgba(134, 167, 255, 0.18);
+  border-radius: 14px;
+}
+
+.markdown-body table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  font-size: 0.94em;
+}
+
+.markdown-body th,
+.markdown-body td {
+  padding: 9px 10px;
+  border-bottom: 1px solid rgba(134, 167, 255, 0.14);
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-body th {
+  color: var(--text);
+  background: rgba(134, 167, 255, 0.09);
+}
+
+.markdown-body tr:last-child td {
+  border-bottom: 0;
+}
+
+.markdown-math-inline,
+.markdown-math-block {
+  color: #dff7ff;
+  font-family: "Cambria Math", "STIX Two Math", "Times New Roman", serif;
+}
+
+.markdown-math-block {
+  margin: 12px 0;
+  padding: 12px;
+  overflow-x: auto;
+  border: 1px solid rgba(125, 231, 203, 0.18);
+  border-radius: 14px;
+  background: rgba(125, 231, 203, 0.055);
+  text-align: center;
+}
+
 .markdown-body code {
   padding: 2px 5px;
   border-radius: 6px;
@@ -3006,6 +3101,14 @@ input[type="hidden"] {
   .session-search-form select,
   .session-search-form button {
     grid-column: span 1;
+  }
+
+  .session-sort-form {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .conversation-time-grid {
+    grid-template-columns: 1fr;
   }
 
   .conversation-card-actions {

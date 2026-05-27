@@ -37,6 +37,10 @@ const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
 const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 40 * 1024 * 1024);
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES || 24 * 1024 * 1024);
 const RECEIVED_FILE_TTL_MS = Number(process.env.RELAY_RECEIVED_FILE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const SESSION_LOG_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_LOG_ENTRY_LIMIT || 1000);
+const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRIES || 1000);
+const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
+const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
 let relayAuthAccount = loadRelayAuthAccount();
 
@@ -765,7 +769,7 @@ function setSessionLog(hostId, sessionId, entries, options = {}) {
   const existing = options.merge ? state.sessionLogs.get(key) || [] : [];
   state.sessionLogs.set(
     key,
-    mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, 200)
+    mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT)
   );
   saveSessionLogs();
 }
@@ -944,7 +948,13 @@ function appendSessionLog(hostId, sessionId, entry) {
     files: normalizeFileTransferRefs(entry.files || entry.attachments || []),
   };
   existing.push(nextEntry);
-  state.sessionLogs.set(key, mergeByFingerprint(existing, transcriptFingerprint, 200));
+  state.sessionLogs.set(key, mergeByFingerprint(existing, transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT));
+  const session = getSession(hostId, sessionId);
+  if (session) {
+    session.messageCount = Math.max(Number(session.messageCount || 0), state.sessionLogs.get(key)?.length || 0);
+    session.lastUpdatedAt = nextEntry.timestamp || nowIso();
+    state.sessions.set(key, session);
+  }
   saveSessionLogs();
   return nextEntry;
 }
@@ -988,19 +998,51 @@ function emitSessionAlert(hostId, sessionId, entry) {
   return payload;
 }
 
-function buildResumeTranscript(entries, maxEntries = 80) {
+function buildResumeTranscript(entries, options = {}) {
   if (!Array.isArray(entries)) {
     return [];
   }
 
-  return entries
+  const maxEntries = Number(options.maxEntries ?? RESUME_TRANSCRIPT_MAX_ENTRIES);
+  const maxEntryChars = Number(options.maxEntryChars ?? RESUME_TRANSCRIPT_MAX_ENTRY_CHARS);
+  const maxTotalChars = Number(options.maxTotalChars ?? RESUME_TRANSCRIPT_MAX_TOTAL_CHARS);
+  const filtered = entries
     .filter((entry) => entry && entry.text)
-    .slice(-maxEntries)
     .map((entry) => ({
       speaker: entry.speaker || 'system',
-      text: String(entry.text || '').slice(0, 3000),
+      text: String(entry.text || ''),
       timestamp: entry.timestamp || null,
     }));
+
+  const source = maxEntries > 0 ? filtered.slice(-maxEntries) : filtered;
+  const result = [];
+  let totalChars = 0;
+
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    const entry = source[index];
+    let text = String(entry.text || '').trim();
+    if (!text) {
+      continue;
+    }
+    if (maxEntryChars > 0 && text.length > maxEntryChars) {
+      text = text.slice(0, maxEntryChars);
+    }
+    if (maxTotalChars > 0 && totalChars + text.length > maxTotalChars) {
+      const remaining = maxTotalChars - totalChars;
+      if (remaining <= 0) {
+        break;
+      }
+      text = text.slice(Math.max(0, text.length - remaining));
+    }
+    result.unshift({
+      speaker: entry.speaker,
+      text,
+      timestamp: entry.timestamp,
+    });
+    totalChars += text.length;
+  }
+
+  return result;
 }
 
 function describeLaunchMode(hostId, event) {
@@ -1091,7 +1133,7 @@ function moveSessionArtifacts(hostId, fromSessionId, toSessionId) {
   if (fromLogs.length || toLogs.length) {
     state.sessionLogs.set(
       toKey,
-      mergeByFingerprint([...toLogs, ...fromLogs], transcriptFingerprint, 200)
+      mergeByFingerprint([...toLogs, ...fromLogs], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT)
     );
     state.sessionLogs.delete(fromKey);
     saveSessionLogs();
@@ -3593,6 +3635,20 @@ function normalizeReviewTarget(input = {}) {
   return { type: 'uncommittedChanges' };
 }
 
+function earliestIso(...values) {
+  let best = null;
+  let bestTime = Infinity;
+  for (const value of values) {
+    const time = Date.parse(value || '');
+    if (!Number.isFinite(time) || time >= bestTime) {
+      continue;
+    }
+    bestTime = time;
+    best = value;
+  }
+  return best;
+}
+
 function upsertSession(hostId, patch) {
   const key = sessionKey(hostId, patch.sessionId);
   const existing = state.sessions.get(key) || {
@@ -3600,6 +3656,7 @@ function upsertSession(hostId, patch) {
     sessionId: patch.sessionId,
     title: patch.title || patch.sessionId,
     cwd: patch.cwd || null,
+    createdAt: patch.createdAt || nowIso(),
     source: patch.source || 'imported',
     state: patch.state || 'unknown',
     live: Boolean(patch.live),
@@ -3611,6 +3668,7 @@ function upsertSession(hostId, patch) {
     ...patch,
     hostId,
     sessionId: patch.sessionId,
+    createdAt: earliestIso(existing.createdAt, patch.createdAt, patch.updatedAt, patch.lastUpdatedAt, nowIso()) || existing.createdAt || patch.createdAt || nowIso(),
     lastUpdatedAt: patch.lastUpdatedAt || nowIso(),
   };
 
@@ -4617,6 +4675,7 @@ async function handleRequest(req, res) {
       ? sourceSessionId
       : (body.sessionId || makeId());
     const bridgeSessionId = sessionId;
+    const createdAt = nowIso();
     const resolvedConversationKey = body.conversationKey || originSessionId || sessionId;
     const resumeTranscript = sourceDetail ? buildResumeTranscript(sourceDetail.transcript) : [];
 
@@ -4630,12 +4689,14 @@ async function handleRequest(req, res) {
       source: 'managed',
       state: 'starting',
       live: false,
+      createdAt,
       originSessionId,
       sourceSessionId,
       conversationKey: resolvedConversationKey,
       launchMode,
       bridgeSessionId,
       nativeThreadId: nativeThreadId || sessionId,
+      messageCount: sourceDetail?.transcript?.length || 0,
       apiProfile,
     });
 
@@ -4651,6 +4712,7 @@ async function handleRequest(req, res) {
       label: body.label || cwd || sessionId,
       command: body.command || null,
       args: body.args || [],
+      createdAt,
       originSessionId,
       sourceSessionId,
       conversationKey: resolvedConversationKey,
@@ -5143,7 +5205,9 @@ function applyAgentEvent(event) {
         source: preserveManagedState ? existing.source : (session.source || 'imported'),
         state: preserveManagedState ? existing.state : (session.live ? 'running' : 'imported'),
         live: preserveManagedState ? existing.live : Boolean(session.live),
+        createdAt: session.createdAt || existing?.createdAt || session.updatedAt || nowIso(),
         lastUpdatedAt: session.updatedAt || nowIso(),
+        messageCount: Math.max(Number(existing?.messageCount || 0), Number(session.messageCount || 0), Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0),
         latestUserMessage: session.latestUserMessage || null,
         latestAgentMessage: session.latestAgentMessage || null,
         transcriptPreview: session.transcriptPreview || [],
@@ -5276,6 +5340,8 @@ function applyAgentEvent(event) {
         source: event.source || 'managed',
         state: 'running',
         live: true,
+        createdAt: event.createdAt || bridgeSession?.createdAt || currentSession?.createdAt || nowIso(),
+        messageCount: bridgeSession?.messageCount || currentSession?.messageCount || 0,
         runtime: event.runtime || null,
         originSessionId: event.originSessionId || null,
         sourceSessionId: event.sourceSessionId || null,
@@ -5291,6 +5357,8 @@ function applyAgentEvent(event) {
         source: event.source || 'managed',
         state: 'running',
         live: true,
+        createdAt: event.createdAt || currentSession?.createdAt || nowIso(),
+        messageCount: currentSession?.messageCount || 0,
         runtime: event.runtime || null,
         originSessionId: event.originSessionId || null,
         sourceSessionId: event.sourceSessionId || null,

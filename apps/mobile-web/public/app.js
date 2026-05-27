@@ -46,10 +46,13 @@ const state = {
     hostSwitcher: false,
     collection: false,
     searchMode: false,
+    sortBy: false,
     collectionMoveKey: null,
   },
   sessionSearchQuery: '',
   sessionSearchMode: 'keyword',
+  sessionSortBy: 'updatedAt',
+  sessionSortDir: 'desc',
   overviewCollapsed: false,
   newSessionCollapsed: true,
   navigatorCollapsed: true,
@@ -1040,6 +1043,21 @@ function parseSessionTime(session) {
   return Number.isFinite(value) ? value : 0;
 }
 
+function parseCreatedTime(session) {
+  const value = Date.parse(session?.createdAt || session?.summary?.timestamp || session?.updatedAt || session?.lastUpdatedAt || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function getSessionMessageCount(session) {
+  const explicit = Number(session?.messageCount || 0);
+  if (explicit > 0) {
+    return explicit;
+  }
+  const previewCount = Array.isArray(session?.transcriptPreview) ? session.transcriptPreview.length : 0;
+  const liveCount = state.transcripts.get(makeSessionKey(session?.hostId, session?.sessionId))?.length || 0;
+  return Math.max(previewCount, liveCount);
+}
+
 function compareSessions(a, b) {
   if (a.live !== b.live) {
     return a.live ? -1 : 1;
@@ -1784,7 +1802,9 @@ function getConversationGroups(hostId) {
       group.preferredSession = group.sessions.find((session) => session.live) || group.sessions[0] || null;
       group.cwd = group.preferredSession?.cwd || group.sessions.find((session) => session.cwd)?.cwd || null;
       group.title = group.preferredSession?.title || group.sessions[0]?.title || group.conversationKey;
-      group.lastUpdatedAt = group.sessions[0]?.lastUpdatedAt || null;
+      group.createdAt = earliestSessionIso(group.sessions);
+      group.lastUpdatedAt = latestSessionIso(group.sessions);
+      group.messageCount = group.sessions.reduce((total, session) => total + getSessionMessageCount(session), 0);
       group.latestUserMessage = firstNonEmpty(group.sessions.map((session) => session.latestUserMessage));
       group.latestAgentMessage = firstNonEmpty(group.sessions.map((session) => session.latestAgentMessage));
       group.apiProfile = group.preferredSession?.apiProfile || group.sessions.find((session) => session.apiProfile)?.apiProfile || null;
@@ -1797,6 +1817,56 @@ function getConversationGroups(hostId) {
       }
       return String(a.title || a.conversationKey).localeCompare(String(b.title || b.conversationKey));
     });
+}
+
+function earliestSessionIso(sessions) {
+  let best = null;
+  let bestTime = Infinity;
+  for (const session of sessions || []) {
+    const time = parseCreatedTime(session);
+    if (!time || time >= bestTime) {
+      continue;
+    }
+    bestTime = time;
+    best = new Date(time).toISOString();
+  }
+  return best;
+}
+
+function latestSessionIso(sessions) {
+  let best = null;
+  let bestTime = 0;
+  for (const session of sessions || []) {
+    const time = parseSessionTime(session);
+    if (!time || time <= bestTime) {
+      continue;
+    }
+    bestTime = time;
+    best = new Date(time).toISOString();
+  }
+  return best;
+}
+
+function sortConversationGroups(groups) {
+  const sortBy = state.sessionSortBy;
+  const direction = state.sessionSortDir === 'asc' ? 1 : -1;
+  const sorted = [...(groups || [])];
+  sorted.sort((a, b) => {
+    let delta = 0;
+    if (sortBy === 'createdAt') {
+      delta = (Date.parse(a.createdAt || 0) || 0) - (Date.parse(b.createdAt || 0) || 0);
+    } else if (sortBy === 'messageCount') {
+      delta = Number(a.messageCount || 0) - Number(b.messageCount || 0);
+    } else {
+      delta = (Date.parse(a.lastUpdatedAt || 0) || 0) - (Date.parse(b.lastUpdatedAt || 0) || 0);
+    }
+
+    if (delta !== 0) {
+      return delta * direction;
+    }
+    return String(a.title || a.conversationKey).localeCompare(String(b.title || b.conversationKey));
+  });
+  return sorted;
 }
 
 function getAllConversationGroups() {
@@ -1871,14 +1941,25 @@ const SESSION_SEARCH_MODE_LABELS = {
   title: 'Title',
 };
 
+const SESSION_SORT_LABELS = {
+  updatedAt: 'Recently updated',
+  createdAt: 'Created time',
+  messageCount: 'Message count',
+};
+
 function getSessionSearchModeLabel(mode) {
   return SESSION_SEARCH_MODE_LABELS[mode] || SESSION_SEARCH_MODE_LABELS.keyword;
+}
+
+function getSessionSortLabel(mode) {
+  return SESSION_SORT_LABELS[mode] || SESSION_SORT_LABELS.updatedAt;
 }
 
 function closeMobileSelectMenus() {
   state.mobileMenus.hostSwitcher = false;
   state.mobileMenus.collection = false;
   state.mobileMenus.searchMode = false;
+  state.mobileMenus.sortBy = false;
   state.mobileMenus.collectionMoveKey = null;
 }
 
@@ -1887,6 +1968,7 @@ function hasOpenMobileSelectMenu() {
     state.mobileMenus.hostSwitcher
     || state.mobileMenus.collection
     || state.mobileMenus.searchMode
+    || state.mobileMenus.sortBy
     || state.mobileMenus.collectionMoveKey
   );
 }
@@ -1991,7 +2073,9 @@ function getConversationGroupsForCollection(collection = getSelectedCollection()
         preferredSession: null,
         cwd: item.cwd || null,
         title: item.title || item.conversationKey,
+        createdAt: item.createdAt || item.addedAt || null,
         lastUpdatedAt: item.updatedAt || item.addedAt || null,
+        messageCount: Number(item.messageCount || 0),
         latestUserMessage: null,
         latestAgentMessage: null,
         collectionOnly: true,
@@ -3333,11 +3417,15 @@ function renderConversationNav() {
 
   const collection = getSelectedCollection();
   const groups = getConversationGroupsForCollection(collection);
-  const visibleGroups = filterConversationGroups(groups);
+  const visibleGroups = sortConversationGroups(filterConversationGroups(groups));
   const searchInput = el('session-search-input');
   const searchMode = el('session-search-mode');
   const searchModeButton = el('session-search-mode-button');
   const searchModeMenu = el('session-search-mode-menu');
+  const sortMode = el('session-sort-mode');
+  const sortModeButton = el('session-sort-mode-button');
+  const sortModeMenu = el('session-sort-mode-menu');
+  const sortDirButton = el('session-sort-dir-button');
   const searchSummary = el('session-search-summary');
   const clearSearchButton = el('clear-session-search-button');
   if (searchInput && document.activeElement !== searchInput) {
@@ -3357,6 +3445,24 @@ function renderConversationNav() {
       setSessionSearchMode(mode);
     },
   });
+  if (sortMode) {
+    sortMode.value = state.sessionSortBy;
+  }
+  renderMobileSelectMenu({
+    button: sortModeButton,
+    menu: sortModeMenu,
+    label: getSessionSortLabel(state.sessionSortBy),
+    options: Object.entries(SESSION_SORT_LABELS).map(([value, label]) => ({ value, label })),
+    selectedValue: state.sessionSortBy,
+    open: state.mobileMenus.sortBy,
+    onSelect: async (mode) => {
+      setSessionSortBy(mode);
+    },
+  });
+  if (sortDirButton) {
+    sortDirButton.textContent = state.sessionSortDir === 'asc' ? 'Asc' : 'Desc';
+    sortDirButton.title = state.sessionSortDir === 'asc' ? 'Oldest or smallest first' : 'Newest or largest first';
+  }
   if (searchSummary) {
     const query = state.sessionSearchQuery.trim();
     const scope = collection.collectionId === 'default'
@@ -3402,6 +3508,9 @@ function renderConversationNav() {
 
     const item = document.createElement('div');
     item.className = `conversation-card ${group.conversationKey === state.selectedConversationKey ? 'active' : ''}`;
+    const createdLabel = formatTime(group.createdAt) || 'Unknown';
+    const updatedLabel = formatTime(group.lastUpdatedAt) || 'Unknown';
+    const messageCount = Number(group.messageCount || 0);
     item.innerHTML = `
       <div class="conversation-card-top">
         <div>
@@ -3416,6 +3525,11 @@ function renderConversationNav() {
       <div class="path">${escapeHtml(group.cwd || '(unknown path)')}</div>
       <div class="conversation-tag-row">
         <span class="api-profile-chip ${apiSummary.source === 'recorded' ? 'recorded' : 'fallback'}" title="${escapeHtml(apiSummary.title)}">${escapeHtml(apiSummary.label)}</span>
+      </div>
+      <div class="conversation-time-grid">
+        <span><strong>Created</strong>${escapeHtml(createdLabel)}</span>
+        <span><strong>Updated</strong>${escapeHtml(updatedLabel)}</span>
+        <span><strong>Messages</strong>${messageCount}</span>
       </div>
       <div class="conversation-summary">
         <span>${escapeHtml(formatTime(group.lastUpdatedAt) || 'No recent activity')}</span>
@@ -5243,6 +5357,8 @@ function renderSessionDetails() {
     if (session) {
       const metaLine = [
         session.hostId,
+        `session ${shortId(session.sessionId)}`,
+        conversation?.conversationKey && conversation.conversationKey !== session.sessionId ? `group ${shortId(conversation.conversationKey)}` : '',
         `${conversation?.totalCount || 1} variants`,
         session.state || 'unknown',
         apiSummary.label,
@@ -6380,9 +6496,99 @@ function renderFileChangeDetails(fileChanges = []) {
   return wrapper;
 }
 
+function isMarkdownMathToken(token) {
+  return /^\$\$[\s\S]*\$\$$/.test(token)
+    || /^\$[\s\S]*\$$/.test(token)
+    || /^\\\([\s\S]*\\\)$/.test(token)
+    || /^\\\[[\s\S]*\\\]$/.test(token);
+}
+
+function appendMathBlock(container, mathText, delimiter = '$$') {
+  const block = document.createElement('div');
+  block.className = 'markdown-math-block';
+  if (delimiter === '\\[') {
+    block.textContent = `\\[\n${mathText}\n\\]`;
+  } else {
+    block.textContent = `$$\n${mathText}\n$$`;
+  }
+  container.appendChild(block);
+}
+
+function parseMarkdownTableRow(line) {
+  return String(line || '')
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim());
+}
+
+function isMarkdownTableSeparator(line) {
+  const cells = parseMarkdownTableRow(line);
+  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function readMarkdownTable(lines, startIndex) {
+  if (!String(lines[startIndex] || '').includes('|') || !isMarkdownTableSeparator(lines[startIndex + 1] || '')) {
+    return null;
+  }
+
+  const headers = parseMarkdownTableRow(lines[startIndex]);
+  const rows = [];
+  let nextIndex = startIndex + 2;
+  while (nextIndex < lines.length) {
+    const line = lines[nextIndex];
+    if (!String(line || '').trim() || !String(line || '').includes('|')) {
+      break;
+    }
+    rows.push(parseMarkdownTableRow(line));
+    nextIndex += 1;
+  }
+
+  return headers.length > 1 ? { headers, rows, nextIndex } : null;
+}
+
+function appendMarkdownTable(container, table) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'markdown-table-wrap';
+  const node = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const header of table.headers) {
+    const th = document.createElement('th');
+    renderInlineMarkdown(th, header);
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  node.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const row of table.rows) {
+    const tr = document.createElement('tr');
+    for (let index = 0; index < table.headers.length; index += 1) {
+      const td = document.createElement('td');
+      renderInlineMarkdown(td, row[index] || '');
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  node.appendChild(tbody);
+  wrapper.appendChild(node);
+  container.appendChild(wrapper);
+}
+
+function scheduleMathTypeset(container) {
+  const run = () => window.MathJax?.typesetPromise?.([container]).catch(() => {});
+  if (!window.MathJax?.typesetPromise) {
+    window.setTimeout(run, 1200);
+    return;
+  }
+  run();
+}
+
 function renderInlineMarkdown(parent, text) {
   const source = String(text || '');
-  const tokenPattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
+  const tokenPattern = /(`[^`]+`|\$\$[^$]+\$\$|\\\([^]*?\\\)|\\\[[^]*?\\\]|\$[^\s$](?:\\.|[^$])*?\$|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
   let lastIndex = 0;
   let match = tokenPattern.exec(source);
   while (match) {
@@ -6394,6 +6600,11 @@ function renderInlineMarkdown(parent, text) {
       const code = document.createElement('code');
       code.textContent = token.slice(1, -1);
       parent.appendChild(code);
+    } else if (isMarkdownMathToken(token)) {
+      const math = document.createElement('span');
+      math.className = 'markdown-math-inline';
+      math.textContent = token;
+      parent.appendChild(math);
     } else if (token.startsWith('**') && token.endsWith('**')) {
       const strong = document.createElement('strong');
       strong.textContent = token.slice(2, -2);
@@ -6506,7 +6717,8 @@ function renderMarkdown(container, text) {
     codeLanguage = '';
   }
 
-  for (const line of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
     const fence = line.match(/^```([A-Za-z0-9_-]+)?\s*$/);
     if (fence) {
       if (inCode) {
@@ -6528,10 +6740,44 @@ function renderMarkdown(container, text) {
       continue;
     }
 
+    const mathDelimiter = line.trim() === '$$' ? '$$' : line.trim() === '\\[' ? '\\[' : '';
+    if (mathDelimiter) {
+      flushParagraph();
+      flushLists();
+      flushBlockquote();
+      const closeDelimiter = mathDelimiter === '$$' ? '$$' : '\\]';
+      const mathLines = [];
+      let closed = false;
+      for (let mathIndex = lineIndex + 1; mathIndex < lines.length; mathIndex += 1) {
+        if (lines[mathIndex].trim() === closeDelimiter) {
+          lineIndex = mathIndex;
+          closed = true;
+          break;
+        }
+        mathLines.push(lines[mathIndex]);
+      }
+      if (closed) {
+        appendMathBlock(container, mathLines.join('\n'), mathDelimiter);
+        continue;
+      }
+      paragraph.push(line, ...mathLines);
+      break;
+    }
+
     if (!line.trim()) {
       flushParagraph();
       flushLists();
       flushBlockquote();
+      continue;
+    }
+
+    const table = readMarkdownTable(lines, lineIndex);
+    if (table) {
+      flushParagraph();
+      flushLists();
+      flushBlockquote();
+      appendMarkdownTable(container, table);
+      lineIndex = table.nextIndex - 1;
       continue;
     }
 
@@ -6590,6 +6836,7 @@ function renderMarkdown(container, text) {
   flushParagraph();
   flushLists();
   flushBlockquote();
+  scheduleMathTypeset(container);
 }
 
 async function copyTextToClipboard(text) {
@@ -7419,6 +7666,16 @@ function setSessionSearchQuery(query) {
 
 function setSessionSearchMode(mode) {
   state.sessionSearchMode = ['keyword', 'path', 'title'].includes(mode) ? mode : 'keyword';
+  renderAll();
+}
+
+function setSessionSortBy(mode) {
+  state.sessionSortBy = ['updatedAt', 'createdAt', 'messageCount'].includes(mode) ? mode : 'updatedAt';
+  renderAll();
+}
+
+function toggleSessionSortDirection() {
+  state.sessionSortDir = state.sessionSortDir === 'asc' ? 'desc' : 'asc';
   renderAll();
 }
 
@@ -9379,6 +9636,22 @@ el('session-search-mode-button')?.addEventListener('click', (event) => {
   toggleMobileSelectMenu('searchMode');
 });
 
+el('session-sort-mode')?.addEventListener('change', (event) => {
+  closeMobileSelectMenus();
+  setSessionSortBy(event.target.value);
+});
+
+el('session-sort-mode-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  toggleMobileSelectMenu('sortBy');
+});
+
+el('session-sort-dir-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  toggleSessionSortDirection();
+});
+
 el('clear-session-search-button').addEventListener('click', () => {
   el('session-search-input').value = '';
   setSessionSearchQuery('');
@@ -9695,7 +9968,7 @@ el('input-text').addEventListener('keydown', (event) => {
     }
   }
 
-  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     el('input-form').requestSubmit();
   }

@@ -8,6 +8,17 @@
     <title>Mobile Codex Remote</title>
     <link rel="manifest" href="/manifest.json" />
     <link rel="stylesheet" href="/styles.css" />
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [['$', '$'], ['\\(', '\\)']],
+          displayMath: [['$$', '$$'], ['\\[', '\\]']],
+          processEscapes: true
+        },
+        startup: { typeset: false }
+      };
+    </script>
+    <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
   </head>
   <body>
     <div id="auth-gate" class="auth-gate hidden" aria-hidden="true">
@@ -295,6 +306,18 @@
               <button id="clear-session-search-button" type="button" class="secondary-button search-clear-button" aria-label="Clear search">×</button>
             </div>
           </form>
+          <div class="session-sort-form">
+            <div class="mobile-select-anchor sort-mode-anchor">
+              <select id="session-sort-mode" class="native-select-control mobile-replaced-select" aria-label="Sort conversations">
+                <option value="updatedAt">Recently updated</option>
+                <option value="createdAt">Created time</option>
+                <option value="messageCount">Message count</option>
+              </select>
+              <button id="session-sort-mode-button" type="button" class="secondary-button mobile-select-button" aria-expanded="false">Recently updated</button>
+              <div id="session-sort-mode-menu" class="mobile-select-menu hidden" role="menu"></div>
+            </div>
+            <button id="session-sort-dir-button" type="button" class="secondary-button session-sort-dir-button" aria-label="Toggle sort direction">Desc</button>
+          </div>
           <div id="session-search-summary" class="session-search-summary"></div>
           <div id="session-list" class="list conversation-list"></div>
         </section>
