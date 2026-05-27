@@ -81,6 +81,7 @@ const state = {
     open: false,
     query: '',
     selectedIndex: 0,
+    match: null,
   },
   directoryPicker: {
     open: false,
@@ -1044,7 +1045,7 @@ function parseSessionTime(session) {
 }
 
 function parseCreatedTime(session) {
-  const value = Date.parse(session?.createdAt || session?.summary?.timestamp || session?.updatedAt || session?.lastUpdatedAt || 0);
+  const value = Date.parse(session?.createdAt || session?.summary?.timestamp || '');
   return Number.isFinite(value) ? value : 0;
 }
 
@@ -1851,14 +1852,21 @@ function sortConversationGroups(groups) {
   const sortBy = state.sessionSortBy;
   const direction = state.sessionSortDir === 'asc' ? 1 : -1;
   const sorted = [...(groups || [])];
+  const sortableTime = (value) => {
+    const time = Date.parse(value || '');
+    if (Number.isFinite(time)) {
+      return time;
+    }
+    return direction === 1 ? Infinity : -Infinity;
+  };
   sorted.sort((a, b) => {
     let delta = 0;
     if (sortBy === 'createdAt') {
-      delta = (Date.parse(a.createdAt || 0) || 0) - (Date.parse(b.createdAt || 0) || 0);
+      delta = sortableTime(a.createdAt) - sortableTime(b.createdAt);
     } else if (sortBy === 'messageCount') {
       delta = Number(a.messageCount || 0) - Number(b.messageCount || 0);
     } else {
-      delta = (Date.parse(a.lastUpdatedAt || 0) || 0) - (Date.parse(b.lastUpdatedAt || 0) || 0);
+      delta = sortableTime(a.lastUpdatedAt) - sortableTime(b.lastUpdatedAt);
     }
 
     if (delta !== 0) {
@@ -4914,6 +4922,7 @@ function hideSlashMenu() {
   state.slashMenu.open = false;
   state.slashMenu.query = '';
   state.slashMenu.selectedIndex = 0;
+  state.slashMenu.match = null;
   renderSlashMenu();
 }
 
@@ -4929,6 +4938,7 @@ function updateSlashMenuFromInput() {
 
   state.slashMenu.open = true;
   state.slashMenu.query = match.query;
+  state.slashMenu.match = match;
   const commands = getFilteredSlashCommands();
   state.slashMenu.selectedIndex = Math.min(state.slashMenu.selectedIndex, Math.max(0, commands.length - 1));
   renderSlashMenu();
@@ -4936,7 +4946,7 @@ function updateSlashMenuFromInput() {
 
 function replaceSlashToken(replacement = '') {
   const input = el('input-text');
-  const match = getSlashTokenMatch(input);
+  const match = getSlashTokenMatch(input) || state.slashMenu.match;
   if (!input || !match) {
     return;
   }
@@ -5015,12 +5025,18 @@ function renderSlashMenu() {
     button.onmousedown = (event) => {
       event.preventDefault();
     };
-    button.onclick = async () => {
+    button.onpointerdown = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       try {
         await executeSlashCommand(command);
       } catch (error) {
         reportError(error);
       }
+    };
+    button.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
     };
     menu.appendChild(button);
   });

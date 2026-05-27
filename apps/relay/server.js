@@ -3649,6 +3649,16 @@ function earliestIso(...values) {
   return best;
 }
 
+function resolveSessionCreatedAt(existing, patch) {
+  if (!Object.prototype.hasOwnProperty.call(patch || {}, 'createdAt')) {
+    return existing?.createdAt || null;
+  }
+  if (!patch.createdAt) {
+    return existing?.source === 'managed' ? existing.createdAt || null : null;
+  }
+  return earliestIso(existing?.createdAt, patch.createdAt) || patch.createdAt;
+}
+
 function upsertSession(hostId, patch) {
   const key = sessionKey(hostId, patch.sessionId);
   const existing = state.sessions.get(key) || {
@@ -3656,7 +3666,7 @@ function upsertSession(hostId, patch) {
     sessionId: patch.sessionId,
     title: patch.title || patch.sessionId,
     cwd: patch.cwd || null,
-    createdAt: patch.createdAt || nowIso(),
+    createdAt: patch.createdAt || null,
     source: patch.source || 'imported',
     state: patch.state || 'unknown',
     live: Boolean(patch.live),
@@ -3668,7 +3678,7 @@ function upsertSession(hostId, patch) {
     ...patch,
     hostId,
     sessionId: patch.sessionId,
-    createdAt: earliestIso(existing.createdAt, patch.createdAt, patch.updatedAt, patch.lastUpdatedAt, nowIso()) || existing.createdAt || patch.createdAt || nowIso(),
+    createdAt: resolveSessionCreatedAt(existing, patch),
     lastUpdatedAt: patch.lastUpdatedAt || nowIso(),
   };
 
@@ -5198,6 +5208,7 @@ function applyAgentEvent(event) {
     for (const session of sessions) {
       const existing = getSession(event.hostId, session.sessionId);
       const preserveManagedState = existing && existing.source === 'managed' && (existing.live || existing.state === 'starting');
+      const discoveredCreatedAt = session.createdAt || null;
       const next = upsertSession(event.hostId, {
         sessionId: session.sessionId,
         title: session.title || session.sessionId,
@@ -5205,7 +5216,7 @@ function applyAgentEvent(event) {
         source: preserveManagedState ? existing.source : (session.source || 'imported'),
         state: preserveManagedState ? existing.state : (session.live ? 'running' : 'imported'),
         live: preserveManagedState ? existing.live : Boolean(session.live),
-        createdAt: session.createdAt || existing?.createdAt || session.updatedAt || nowIso(),
+        createdAt: preserveManagedState ? existing.createdAt || discoveredCreatedAt : discoveredCreatedAt,
         lastUpdatedAt: session.updatedAt || nowIso(),
         messageCount: Math.max(Number(existing?.messageCount || 0), Number(session.messageCount || 0), Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0),
         latestUserMessage: session.latestUserMessage || null,

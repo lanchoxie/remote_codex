@@ -27,7 +27,7 @@ function discoverCodexSessions(options = {}) {
       nativeThreadId: row.id,
       title: row.thread_name || row.id,
       cwd: null,
-      createdAt: row.created_at || row.timestamp || row.updated_at || null,
+      createdAt: row.created_at || row.timestamp || null,
       updatedAt: row.updated_at || null,
       messageCount: 0,
       source: 'index',
