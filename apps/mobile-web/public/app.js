@@ -2928,6 +2928,12 @@ function renderOverview() {
   }
 }
 
+function getRelayManagedLiveSessionCount() {
+  return Array.from(state.sessions.values())
+    .filter((session) => session.live && session.source === 'managed')
+    .length;
+}
+
 function setConnectorManagerOpen(open) {
   state.connectorManagerOpen = Boolean(open);
   renderConnectorManager();
@@ -5557,6 +5563,7 @@ function renderSessionDetails() {
   const alertsButton = el('toggle-alerts-button');
   const statusButton = el('toggle-status-button');
   const endSessionButton = el('end-session-button');
+  const endAllSessionsButton = el('end-all-sessions-button');
   const composer = el('input-form');
   const input = el('input-text');
   const runner = getRunnerSummary(session);
@@ -5657,6 +5664,14 @@ function renderSessionDetails() {
     endSessionButton.textContent = runtime?.phase === 'ending' || runtime?.connection === 'closing'
       ? 'Ending Session...'
       : 'End Session';
+  }
+  if (endAllSessionsButton) {
+    const relayLiveCount = getRelayManagedLiveSessionCount();
+    endAllSessionsButton.hidden = relayLiveCount <= 0;
+    endAllSessionsButton.classList.toggle('hidden', relayLiveCount <= 0);
+    endAllSessionsButton.disabled = relayLiveCount <= 0;
+    endAllSessionsButton.textContent = relayLiveCount > 0 ? `Stop All (${relayLiveCount})` : 'Stop All';
+    endAllSessionsButton.title = 'Stop every live managed Codex session attached to this relay only.';
   }
 
   renderVariantButtons(el('session-variants'), conversation, state.selectedSessionId);
@@ -6222,6 +6237,35 @@ async function endCurrentSession() {
   }
   await delay(600);
   await refresh();
+}
+
+async function endAllRelaySessions() {
+  const liveCount = getRelayManagedLiveSessionCount();
+  if (!liveCount) {
+    throw new Error('No live managed Codex sessions are attached to this relay.');
+  }
+
+  const message = currentLocale() === 'zh-CN'
+    ? `停止当前 relay 正在管理的 ${liveCount} 个 live Codex 会话？\n\n只会停止连接到这个 relay 的 managed sessions，不会扫描或杀掉其他 Codex 进程。历史仍然保留。`
+    : `Stop ${liveCount} live Codex session(s) managed by this relay?\n\nThis only stops managed sessions attached to this relay. It does not scan for or kill unrelated Codex processes. History stays available.`;
+  if (!window.confirm(message)) {
+    return;
+  }
+
+  const response = await fetchJson('/api/sessions/stop-all', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  await delay(900);
+  await refresh();
+
+  if (response.skipped > 0) {
+    const skipped = response.results
+      .filter((entry) => entry.skipped)
+      .map((entry) => `${entry.hostId}/${shortId(entry.sessionId)}: ${entry.error}`)
+      .join('\n');
+    window.alert(`Stopped ${response.stopped}; skipped ${response.skipped} offline/unavailable session(s):\n${skipped}`);
+  }
 }
 
 async function runThreadShellCommand(command) {
@@ -9769,6 +9813,14 @@ el('interrupt-turn-button').addEventListener('click', async () => {
 el('end-session-button').addEventListener('click', async () => {
   try {
     await endCurrentSession();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('end-all-sessions-button')?.addEventListener('click', async () => {
+  try {
+    await endAllRelaySessions();
   } catch (error) {
     reportError(error);
   }

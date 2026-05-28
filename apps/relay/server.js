@@ -3995,6 +3995,68 @@ function scheduleStopFallback(hostId, sessionId, delayMs = 4000) {
   }
 }
 
+function beginSessionStop(hostId, sessionId) {
+  const session = getSession(hostId, sessionId);
+  const effectiveSessionId = session?.sessionId || sessionId;
+  if (session) {
+    const next = upsertSession(hostId, {
+      sessionId: effectiveSessionId,
+      state: 'ending',
+      live: true,
+      lastUpdatedAt: nowIso(),
+    });
+    setSessionRuntime(hostId, effectiveSessionId, {
+      phase: 'ending',
+      connection: 'closing',
+      busy: false,
+      activeTurnId: null,
+      updatedAt: nowIso(),
+    });
+    broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', next);
+    broadcastSessionEvent(hostId, effectiveSessionId, 'session.runtime_updated', {
+      hostId,
+      sessionId: effectiveSessionId,
+      patch: {
+        phase: 'ending',
+        connection: 'closing',
+        busy: false,
+        activeTurnId: null,
+      },
+      timestamp: nowIso(),
+    });
+  }
+
+  const stopCandidates = Array.from(new Set([
+    session?.bridgeSessionId,
+    effectiveSessionId,
+    session?.nativeThreadId,
+  ].map((value) => String(value || '').trim()).filter(Boolean)));
+  const commands = stopCandidates.map((candidateSessionId) => enqueueCommand(hostId, {
+    type: 'session.stop',
+    sessionId: candidateSessionId,
+    requestedSessionId: effectiveSessionId,
+    bridgeSessionId: session?.bridgeSessionId || null,
+    nativeThreadId: session?.nativeThreadId || null,
+    originSessionId: session?.originSessionId || null,
+    sourceSessionId: session?.sourceSessionId || null,
+    conversationKey: session?.conversationKey || null,
+  }));
+  scheduleStopFallback(hostId, effectiveSessionId);
+  return {
+    hostId,
+    sessionId: effectiveSessionId,
+    command: commands[0] || null,
+    commands,
+  };
+}
+
+function getRelayManagedLiveSessions(hostId = '') {
+  const normalizedHostId = String(hostId || '').trim();
+  return Array.from(state.sessions.values())
+    .filter((session) => session.live && session.source === 'managed')
+    .filter((session) => !normalizedHostId || session.hostId === normalizedHostId);
+}
+
 function getCommands(hostId, afterId = 0) {
   const queue = state.commandQueues.get(hostId) || [];
   return queue.filter((command) => command.id > afterId);
@@ -5227,6 +5289,45 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/sessions/stop-all') {
+    const body = await readBody(req);
+    const hostId = String(body.hostId || '').trim();
+    const candidates = getRelayManagedLiveSessions(hostId);
+    const results = [];
+
+    for (const session of candidates) {
+      const hostError = getHostUnavailableError(session.hostId);
+      if (hostError) {
+        results.push({
+          hostId: session.hostId,
+          sessionId: session.sessionId,
+          skipped: true,
+          error: hostError.error,
+        });
+        continue;
+      }
+
+      const stop = beginSessionStop(session.hostId, session.sessionId);
+      results.push({
+        hostId: session.hostId,
+        sessionId: session.sessionId,
+        skipped: false,
+        commandCount: stop.commands.length,
+        commands: stop.commands,
+      });
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      hostId: hostId || null,
+      requested: candidates.length,
+      stopped: results.filter((entry) => !entry.skipped).length,
+      skipped: results.filter((entry) => entry.skipped).length,
+      results,
+    });
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/stop$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const body = await readBody(req);
@@ -5241,52 +5342,8 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const session = getSession(hostId, sessionId);
-    if (session) {
-      const next = upsertSession(hostId, {
-        sessionId,
-        state: 'ending',
-        live: true,
-        lastUpdatedAt: nowIso(),
-      });
-      setSessionRuntime(hostId, sessionId, {
-        phase: 'ending',
-        connection: 'closing',
-        busy: false,
-        activeTurnId: null,
-        updatedAt: nowIso(),
-      });
-      broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
-      broadcastSessionEvent(hostId, sessionId, 'session.runtime_updated', {
-        hostId,
-        sessionId,
-        patch: {
-          phase: 'ending',
-          connection: 'closing',
-          busy: false,
-          activeTurnId: null,
-        },
-        timestamp: nowIso(),
-      });
-    }
-
-    const stopCandidates = Array.from(new Set([
-      session?.bridgeSessionId,
-      sessionId,
-      session?.nativeThreadId,
-    ].map((value) => String(value || '').trim()).filter(Boolean)));
-    const commands = stopCandidates.map((candidateSessionId) => enqueueCommand(hostId, {
-      type: 'session.stop',
-      sessionId: candidateSessionId,
-      requestedSessionId: sessionId,
-      bridgeSessionId: session?.bridgeSessionId || null,
-      nativeThreadId: session?.nativeThreadId || null,
-      originSessionId: session?.originSessionId || null,
-      sourceSessionId: session?.sourceSessionId || null,
-      conversationKey: session?.conversationKey || null,
-    }));
-    scheduleStopFallback(hostId, sessionId);
-    sendJson(res, 200, { ok: true, command: commands[0] || null, commands });
+    const stop = beginSessionStop(hostId, sessionId);
+    sendJson(res, 200, { ok: true, command: stop.command, commands: stop.commands });
     return;
   }
 
