@@ -35,8 +35,11 @@ const RELAY_AUTH_ACCOUNT_PATH = process.env.RELAY_AUTH_ACCOUNT_PATH || path.join
 const RELAY_AUTH_COOKIE_NAME = 'remote_codex_auth';
 const DEFAULT_COLLECTION_ID = 'default';
 const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
-const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 40 * 1024 * 1024);
-const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES || 24 * 1024 * 1024);
+const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 192 * 1024 * 1024);
+const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
+const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
+const FILE_TRANSFER_CHUNK_BYTES = Number(process.env.RELAY_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
+const CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES = Number(process.env.RELAY_CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES || 16 * 1024 * 1024);
 const RECEIVED_FILE_TTL_MS = Number(process.env.RELAY_RECEIVED_FILE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const SESSION_LOG_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_LOG_ENTRY_LIMIT || 1000);
 const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRIES || 1000);
@@ -439,6 +442,7 @@ const state = {
   pendingHostProbes: new Map(),
   pendingModelRequests: new Map(),
   pendingFileRequests: new Map(),
+  chunkedUploads: new Map(),
   sessionDiscoveryRequests: new Map(),
   localAgents: new Map(),
   askpassActions: new Map(),
@@ -477,6 +481,15 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end(body);
+}
+
+function isClientAbortError(error) {
+  return error && (
+    error.code === 'ECONNRESET'
+    || error.code === 'EPIPE'
+    || error.message === 'aborted'
+    || error.message === 'socket hang up'
+  );
 }
 
 function readBody(req) {
@@ -718,6 +731,10 @@ function getHostCapabilityError(hostId, capability, message) {
     };
   }
   return null;
+}
+
+function hostSupportsCapability(hostId, capability) {
+  return Boolean(state.hosts.get(hostId)?.capabilities?.[capability]);
 }
 
 function getHostList() {
@@ -3649,6 +3666,139 @@ function validateUploadFiles(rawFiles) {
   return files;
 }
 
+function validateChunkedUploadMetadata(body = {}) {
+  const size = Number(body.size || 0) || 0;
+  if (size < 0 || size > MAX_CHUNKED_FILE_TRANSFER_BYTES) {
+    throw new Error(`file is too large for chunked transfer (${size} bytes); limit is ${MAX_CHUNKED_FILE_TRANSFER_BYTES} bytes`);
+  }
+  const name = safeFileDisplayName(body.name || 'upload');
+  return {
+    fileId: String(body.fileId || body.id || makeId()).trim(),
+    name,
+    mime: String(body.mime || body.type || 'application/octet-stream').trim() || 'application/octet-stream',
+    size,
+  };
+}
+
+function getChunkedUpload(hostId, uploadId) {
+  const upload = state.chunkedUploads.get(uploadId);
+  if (!upload || upload.hostId !== hostId) {
+    return null;
+  }
+  return upload;
+}
+
+function validateChunkPayload(body = {}) {
+  const dataBase64 = String(body.dataBase64 || '').replace(/^data:[^,]+,/, '').trim();
+  const estimatedBytes = Math.floor(dataBase64.length * 0.75);
+  if (estimatedBytes > FILE_TRANSFER_CHUNK_BYTES + 3) {
+    throw new Error(`file chunk is too large; limit is ${FILE_TRANSFER_CHUNK_BYTES} bytes`);
+  }
+  return {
+    index: Number(body.index || 0) || 0,
+    offset: Number(body.offset || 0) || 0,
+    dataBase64,
+  };
+}
+
+function waitForStreamDrain(stream) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      stream.off('drain', onDrain);
+      stream.off('error', onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    stream.once('drain', onDrain);
+    stream.once('error', onError);
+  });
+}
+
+async function requestHostFileDownloadInfo(hostId, sessionId, remotePath, cwd, inline) {
+  const requestId = makeId();
+  const pending = awaitFileRequest(requestId, 120000, {
+    suppressAlert: inline,
+    source: 'download-info',
+  });
+  enqueueCommand(hostId, {
+    type: 'host.file_download_info',
+    requestId,
+    sessionId,
+    path: remotePath,
+    cwd,
+  });
+  return pending;
+}
+
+async function streamHostFileDownload(res, {
+  hostId,
+  sessionId,
+  remotePath,
+  cwd,
+  inline,
+  info,
+}) {
+  const filename = safeFileDisplayName(info.name || info.path || remotePath);
+  const size = Number(info.size || 0) || 0;
+  if (size > MAX_CHUNKED_FILE_TRANSFER_BYTES) {
+    throw new Error(`file is too large to stream (${size} bytes); limit is ${MAX_CHUNKED_FILE_TRANSFER_BYTES} bytes`);
+  }
+
+  res.writeHead(200, {
+    'Content-Type': info.mime || 'application/octet-stream',
+    'Content-Length': size,
+    'Content-Disposition': contentDispositionValue(inline ? 'inline' : 'attachment', filename),
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': 'sandbox',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Codex-Remote-Path': encodeURIComponent(remotePath || ''),
+    'X-Codex-Transfer-Mode': 'chunked',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  let offset = 0;
+  while (offset < size) {
+    if (res.destroyed || res.writableEnded) {
+      return;
+    }
+    const length = Math.min(FILE_TRANSFER_CHUNK_BYTES, size - offset);
+    const requestId = makeId();
+    const pending = awaitFileRequest(requestId, 120000, {
+      suppressAlert: true,
+      source: 'download-chunk',
+    });
+    enqueueCommand(hostId, {
+      type: 'host.file_download_chunk',
+      requestId,
+      sessionId,
+      path: remotePath,
+      cwd,
+      offset,
+      length,
+    });
+    const chunk = await pending;
+    const chunkOffset = Number(chunk.offset || 0) || 0;
+    const buffer = Buffer.from(String(chunk.dataBase64 || ''), 'base64');
+    if (chunkOffset !== offset) {
+      throw new Error(`download chunk offset mismatch: expected ${offset}, got ${chunkOffset}`);
+    }
+    if (!buffer.length && length > 0) {
+      throw new Error('download chunk was empty before the file ended');
+    }
+    offset += buffer.length;
+    if (!res.write(buffer)) {
+      await waitForStreamDrain(res);
+    }
+  }
+  res.end();
+}
+
 function contentDispositionValue(disposition, filename) {
   const name = safeFileDisplayName(filename || 'download');
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'download';
@@ -4667,6 +4817,194 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/uploads$/)) {
+    const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    const capabilityError = getHostCapabilityError(
+      hostId,
+      'chunkedFileTransfer',
+      'this host agent needs to be restarted before it can upload large files'
+    );
+    if (capabilityError) {
+      sendJson(res, capabilityError.statusCode, { error: capabilityError.error });
+      return;
+    }
+
+    const body = await readBody(req);
+    let file = null;
+    try {
+      file = validateChunkedUploadMetadata(body);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return;
+    }
+
+    const uploadId = makeId();
+    const requestId = makeId();
+    const sessionId = String(body.sessionId || '').trim() || null;
+    const targetDirectory = String(body.targetDirectory || body.cwd || '').trim() || null;
+    const chunkSize = Math.max(1, Math.min(Number(body.chunkSize || FILE_TRANSFER_CHUNK_BYTES) || FILE_TRANSFER_CHUNK_BYTES, FILE_TRANSFER_CHUNK_BYTES));
+    const upload = {
+      uploadId,
+      hostId,
+      sessionId,
+      targetDirectory,
+      file,
+      chunkSize,
+      receivedBytes: 0,
+      createdAt: nowIso(),
+    };
+    state.chunkedUploads.set(uploadId, upload);
+
+    const pending = awaitFileRequest(requestId, 120000, {
+      suppressAlert: false,
+      source: 'upload-begin',
+    });
+    enqueueCommand(hostId, {
+      type: 'host.file_upload_begin',
+      requestId,
+      uploadId,
+      fileId: file.fileId,
+      sessionId,
+      targetDirectory,
+      name: file.name,
+      mime: file.mime,
+      size: file.size,
+    });
+
+    try {
+      const ready = await pending;
+      upload.remotePath = ready.path || null;
+      upload.remoteName = ready.name || file.name;
+      upload.targetDirectory = ready.targetDirectory || targetDirectory;
+      state.chunkedUploads.set(uploadId, upload);
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        uploadId,
+        fileId: file.fileId,
+        name: upload.remoteName,
+        path: upload.remotePath,
+        size: file.size,
+        mime: file.mime,
+        chunkSize,
+      });
+    } catch (error) {
+      state.chunkedUploads.delete(uploadId);
+      sendJson(res, 504, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/uploads\/[^/]+\/chunks$/)) {
+    const parts = url.pathname.split('/');
+    const hostId = decodeURIComponent(parts[3]);
+    const uploadId = decodeURIComponent(parts[6] || '');
+    const upload = getChunkedUpload(hostId, uploadId);
+    if (!upload) {
+      sendJson(res, 404, { error: 'upload not found or expired' });
+      return;
+    }
+
+    const body = await readBody(req);
+    let chunk = null;
+    try {
+      chunk = validateChunkPayload(body);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return;
+    }
+    if (chunk.offset !== upload.receivedBytes) {
+      sendJson(res, 409, { error: `upload offset mismatch: expected ${upload.receivedBytes}, got ${chunk.offset}` });
+      return;
+    }
+
+    const requestId = makeId();
+    const pending = awaitFileRequest(requestId, 120000, {
+      suppressAlert: true,
+      source: 'upload-chunk',
+    });
+    enqueueCommand(hostId, {
+      type: 'host.file_upload_chunk',
+      requestId,
+      uploadId,
+      sessionId: upload.sessionId,
+      index: chunk.index,
+      offset: chunk.offset,
+      dataBase64: chunk.dataBase64,
+    });
+
+    try {
+      const result = await pending;
+      upload.receivedBytes = Number(result.receivedBytes || 0) || upload.receivedBytes;
+      state.chunkedUploads.set(uploadId, upload);
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        uploadId,
+        receivedBytes: upload.receivedBytes,
+        size: upload.file.size,
+      });
+    } catch (error) {
+      sendJson(res, 504, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/uploads\/[^/]+\/complete$/)) {
+    const parts = url.pathname.split('/');
+    const hostId = decodeURIComponent(parts[3]);
+    const uploadId = decodeURIComponent(parts[6] || '');
+    const upload = getChunkedUpload(hostId, uploadId);
+    if (!upload) {
+      sendJson(res, 404, { error: 'upload not found or expired' });
+      return;
+    }
+
+    const requestId = makeId();
+    const pending = awaitFileRequest(requestId, 120000, {
+      suppressAlert: false,
+      source: 'upload-complete',
+    });
+    enqueueCommand(hostId, {
+      type: 'host.file_upload_complete',
+      requestId,
+      uploadId,
+      sessionId: upload.sessionId,
+    });
+
+    try {
+      const result = await pending;
+      state.chunkedUploads.delete(uploadId);
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        uploadId,
+        files: normalizeFileTransferRefs(result.files || []),
+      });
+    } catch (error) {
+      sendJson(res, 504, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'DELETE' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/uploads\/[^/]+$/)) {
+    const parts = url.pathname.split('/');
+    const hostId = decodeURIComponent(parts[3]);
+    const uploadId = decodeURIComponent(parts[6] || '');
+    const upload = getChunkedUpload(hostId, uploadId);
+    if (upload) {
+      state.chunkedUploads.delete(uploadId);
+      enqueueCommand(hostId, {
+        type: 'host.file_upload_abort',
+        requestId: makeId(),
+        uploadId,
+        sessionId: upload.sessionId,
+      });
+    }
+    sendJson(res, 200, { ok: true, hostId, uploadId });
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/upload$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
     const capabilityError = getHostCapabilityError(
@@ -4791,20 +5129,44 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const requestId = makeId();
-    const pending = awaitFileRequest(requestId, 120000, {
-      suppressAlert: inline,
-      source: inline ? 'inline-preview' : 'download',
-    });
-    enqueueCommand(hostId, {
-      type: 'host.file_download',
-      requestId,
-      sessionId,
-      path: remotePath,
-      cwd: String(url.searchParams.get('cwd') || '').trim() || null,
-    });
-
     try {
+      const cwd = String(url.searchParams.get('cwd') || '').trim() || null;
+      const forcedChunked = url.searchParams.get('chunked') === '1'
+        || url.searchParams.get('chunked') === 'true';
+      const supportsChunked = hostSupportsCapability(hostId, 'chunkedFileTransfer');
+      if (forcedChunked && !supportsChunked) {
+        throw new Error('this host agent needs to be restarted before it can stream large file downloads');
+      }
+
+      if (supportsChunked) {
+        const info = await requestHostFileDownloadInfo(hostId, sessionId, remotePath, cwd, inline);
+        const chunked = forcedChunked || (Number(info.size || 0) || 0) > CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES;
+        if (chunked) {
+          await streamHostFileDownload(res, {
+            hostId,
+            sessionId,
+            remotePath,
+            cwd,
+            inline,
+            info,
+          });
+          return;
+        }
+      }
+
+      const requestId = makeId();
+      const pending = awaitFileRequest(requestId, 120000, {
+        suppressAlert: inline,
+        source: inline ? 'inline-preview' : 'download',
+      });
+      enqueueCommand(hostId, {
+        type: 'host.file_download',
+        requestId,
+        sessionId,
+        path: remotePath,
+        cwd,
+      });
+
       const result = await pending;
       const dataBase64 = String(result.dataBase64 || '');
       const buffer = Buffer.from(dataBase64, 'base64');
@@ -4819,6 +5181,10 @@ async function handleRequest(req, res) {
       });
       serveReceivedFile(res, received, inline);
     } catch (error) {
+      if (res.headersSent) {
+        res.destroy(error);
+        return;
+      }
       sendJson(res, 504, { error: error.message });
     }
     return;
@@ -5649,12 +6015,71 @@ function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'file.upload.ready' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    resolvePendingFileRequest(event.requestId, {
+      hostId: event.hostId,
+      sessionId: event.sessionId || null,
+      uploadId: event.uploadId || null,
+      fileId: event.fileId || null,
+      targetDirectory: event.targetDirectory || null,
+      name: event.name || null,
+      path: event.path || null,
+      size: event.size || 0,
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'file.upload.chunk' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    resolvePendingFileRequest(event.requestId, {
+      hostId: event.hostId,
+      sessionId: event.sessionId || null,
+      uploadId: event.uploadId || null,
+      offset: event.offset || 0,
+      length: event.length || 0,
+      receivedBytes: event.receivedBytes || 0,
+      size: event.size || 0,
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'file.upload.aborted' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    resolvePendingFileRequest(event.requestId, {
+      hostId: event.hostId,
+      sessionId: event.sessionId || null,
+      uploadId: event.uploadId || null,
+      aborted: true,
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
   if (event.type === 'file.uploaded' && event.requestId) {
     removeQueuedFileCommand(event.hostId, event.requestId);
     resolvePendingFileRequest(event.requestId, {
       hostId: event.hostId,
       sessionId: event.sessionId || null,
       files: Array.isArray(event.files) ? event.files : [],
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'file.download.info' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    resolvePendingFileRequest(event.requestId, {
+      hostId: event.hostId,
+      sessionId: event.sessionId || null,
+      name: event.name || null,
+      path: event.path || null,
+      size: event.size || 0,
+      mime: event.mime || 'application/octet-stream',
+      isImage: Boolean(event.isImage),
+      mtimeMs: event.mtimeMs || 0,
       timestamp: event.timestamp || nowIso(),
     });
     return;
@@ -5669,6 +6094,21 @@ function applyAgentEvent(event) {
       path: event.path || null,
       size: event.size || 0,
       mime: event.mime || 'application/octet-stream',
+      dataBase64: event.dataBase64 || '',
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'file.download.chunk' && event.requestId) {
+    removeQueuedFileCommand(event.hostId, event.requestId);
+    resolvePendingFileRequest(event.requestId, {
+      hostId: event.hostId,
+      sessionId: event.sessionId || null,
+      path: event.path || null,
+      offset: event.offset || 0,
+      length: event.length || 0,
+      size: event.size || 0,
       dataBase64: event.dataBase64 || '',
       timestamp: event.timestamp || nowIso(),
     });
@@ -5955,7 +6395,15 @@ function applyAgentEvent(event) {
 }
 
 const server = http.createServer((req, res) => {
+  req.on('error', (error) => {
+    if (!isClientAbortError(error)) {
+      console.error(error);
+    }
+  });
   handleRequest(req, res).catch((error) => {
+    if (isClientAbortError(error) || req.destroyed || res.destroyed) {
+      return;
+    }
     console.error(error);
     if (!res.headersSent) {
       sendJson(res, 500, { error: error.message || 'internal error' });

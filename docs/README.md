@@ -18,6 +18,7 @@ This directory separates product architecture, implementation modules, validatio
 - [HPC Connectors](hpc-connectors.md): saved HPC/gateway/MFA connector model.
 - [Codex Capability Inventory](codex-capability-inventory.md): known Codex app-server and CLI capabilities.
 - [MVP Plan](mvp-plan.md): first milestone scope and success criteria.
+- [Large File Transfer Design](large-file-transfer-design.md): chunked upload and download design for files that should not travel through JSON/base64.
 
 ## Module developer docs
 

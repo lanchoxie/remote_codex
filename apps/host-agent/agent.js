@@ -20,9 +20,12 @@ const MANAGED_COMMAND = process.env.MANAGED_COMMAND || 'codex-app-server';
 const MANAGED_ARGS = normalizeArgs(process.env.MANAGED_ARGS_JSON || '[]');
 const MANAGED_CWD = process.env.MANAGED_CWD || process.cwd();
 const WORKSPACE_ROOTS = parseWorkspaceRoots(process.env.WORKSPACE_ROOTS || '');
-const MAX_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_FILE_TRANSFER_BYTES || 24 * 1024 * 1024);
+const MAX_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
+const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
+const MAX_FILE_CHUNK_BYTES = Number(process.env.AGENT_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
 
 const liveSessions = new Map();
+const activeFileUploads = new Map();
 let lastCommandId = 0;
 
 function loadRelayAuthToken() {
@@ -84,6 +87,7 @@ function getCapabilities() {
     review: true,
     imageInput: true,
     fileTransfer: true,
+    chunkedFileTransfer: true,
     demoMode: MANAGED_COMMAND === 'demo',
   };
 }
@@ -96,6 +100,14 @@ function fetchJson(targetUrl, options = {}) {
     : {};
 
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      fn(value);
+    };
     const req = client.request(
       {
         method: options.method || 'GET',
@@ -117,19 +129,20 @@ function fetchJson(targetUrl, options = {}) {
           try {
             body = raw ? JSON.parse(raw) : null;
           } catch (error) {
-            reject(new Error(`invalid JSON from ${targetUrl}: ${error.message}`));
+            settle(reject, new Error(`invalid JSON from ${targetUrl}: ${error.message}`));
             return;
           }
           if ((res.statusCode || 0) >= 400) {
-            reject(new Error((body && body.error) || `relay request failed with ${res.statusCode}`));
+            settle(reject, new Error((body && body.error) || `relay request failed with ${res.statusCode}`));
             return;
           }
-          resolve({ statusCode: res.statusCode || 0, body });
+          settle(resolve, { statusCode: res.statusCode || 0, body });
         });
+        res.on('error', (error) => settle(reject, error));
       }
     );
 
-    req.on('error', reject);
+    req.on('error', (error) => settle(reject, error));
     if (options.body) {
       req.write(JSON.stringify(options.body));
     }
@@ -543,6 +556,199 @@ async function handleFileUpload(command) {
   }
 }
 
+async function handleChunkedFileUploadBegin(command) {
+  const requestId = command.requestId || makeId();
+  const uploadId = String(command.uploadId || requestId || makeId()).trim();
+  const sessionId = command.sessionId || null;
+
+  try {
+    const expectedSize = Number(command.size || 0) || 0;
+    if (expectedSize < 0 || expectedSize > MAX_CHUNKED_FILE_TRANSFER_BYTES) {
+      throw new Error(`file is too large to upload (${expectedSize} bytes); limit is ${MAX_CHUNKED_FILE_TRANSFER_BYTES} bytes`);
+    }
+
+    const baseCwd = resolveCommandCwd(command);
+    if (!fs.existsSync(baseCwd) || !fs.statSync(baseCwd).isDirectory()) {
+      throw new Error(`upload target directory does not exist: ${baseCwd}`);
+    }
+
+    const sessionSegment = sessionId ? safeFileName(sessionId, 'session') : 'sessionless';
+    const uploadRoot = path.join(baseCwd, '.codex-remote-files', 'uploads', sessionSegment, uploadId);
+    fs.mkdirSync(uploadRoot, { recursive: true });
+
+    const originalName = safeFileName(command.name || 'upload');
+    const targetPath = uniqueFilePath(uploadRoot, originalName);
+    const tempPath = `${targetPath}.part`;
+    if (!pathInside(uploadRoot, targetPath) || !pathInside(uploadRoot, tempPath)) {
+      throw new Error(`refusing to write outside upload directory: ${originalName}`);
+    }
+
+    fs.writeFileSync(tempPath, Buffer.alloc(0), { flag: 'wx' });
+    activeFileUploads.set(uploadId, {
+      uploadId,
+      fileId: String(command.fileId || uploadId),
+      sessionId,
+      uploadRoot,
+      targetPath,
+      tempPath,
+      originalName,
+      mime: String(command.mime || command.type || mimeFromPath(targetPath)).trim() || mimeFromPath(targetPath),
+      expectedSize,
+      receivedBytes: 0,
+    });
+
+    await postEvent({
+      type: 'file.upload.ready',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      uploadId,
+      fileId: String(command.fileId || uploadId),
+      targetDirectory: uploadRoot,
+      name: path.basename(targetPath),
+      path: targetPath,
+      size: expectedSize,
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    activeFileUploads.delete(uploadId);
+    await postEvent({
+      type: 'file.error',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      uploadId,
+      message: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleChunkedFileUploadChunk(command) {
+  const requestId = command.requestId || makeId();
+  const uploadId = String(command.uploadId || '').trim();
+  const upload = activeFileUploads.get(uploadId);
+  const sessionId = command.sessionId || upload?.sessionId || null;
+
+  try {
+    if (!upload) {
+      throw new Error(`upload ${uploadId || '(missing)'} is not active`);
+    }
+
+    const offset = Number(command.offset || 0) || 0;
+    if (offset !== upload.receivedBytes) {
+      throw new Error(`upload chunk offset mismatch: expected ${upload.receivedBytes}, got ${offset}`);
+    }
+
+    const dataBase64 = String(command.dataBase64 || '').replace(/^data:[^,]+,/, '').trim();
+    const data = dataBase64 ? Buffer.from(dataBase64, 'base64') : Buffer.alloc(0);
+    if (data.length > MAX_FILE_CHUNK_BYTES) {
+      throw new Error(`upload chunk is too large (${data.length} bytes); limit is ${MAX_FILE_CHUNK_BYTES} bytes`);
+    }
+    if (upload.receivedBytes + data.length > upload.expectedSize) {
+      throw new Error('upload chunk exceeds declared file size');
+    }
+
+    fs.appendFileSync(upload.tempPath, data);
+    upload.receivedBytes += data.length;
+    activeFileUploads.set(uploadId, upload);
+
+    await postEvent({
+      type: 'file.upload.chunk',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      uploadId,
+      offset,
+      length: data.length,
+      receivedBytes: upload.receivedBytes,
+      size: upload.expectedSize,
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'file.error',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      uploadId,
+      message: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleChunkedFileUploadComplete(command) {
+  const requestId = command.requestId || makeId();
+  const uploadId = String(command.uploadId || '').trim();
+  const upload = activeFileUploads.get(uploadId);
+  const sessionId = command.sessionId || upload?.sessionId || null;
+
+  try {
+    if (!upload) {
+      throw new Error(`upload ${uploadId || '(missing)'} is not active`);
+    }
+    if (upload.receivedBytes !== upload.expectedSize) {
+      throw new Error(`upload is incomplete: received ${upload.receivedBytes} of ${upload.expectedSize} bytes`);
+    }
+
+    fs.renameSync(upload.tempPath, upload.targetPath);
+    activeFileUploads.delete(uploadId);
+
+    await postEvent({
+      type: 'file.uploaded',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      uploadId,
+      targetDirectory: upload.uploadRoot,
+      files: [{
+        fileId: upload.fileId,
+        name: path.basename(upload.targetPath),
+        originalName: upload.originalName,
+        path: upload.targetPath,
+        size: upload.receivedBytes,
+        mime: upload.mime,
+        isImage: isImageMime(upload.mime, upload.targetPath),
+        uploadedAt: nowIso(),
+      }],
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'file.error',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      uploadId,
+      message: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleChunkedFileUploadAbort(command) {
+  const requestId = command.requestId || makeId();
+  const uploadId = String(command.uploadId || '').trim();
+  const upload = activeFileUploads.get(uploadId);
+  if (upload?.tempPath && fs.existsSync(upload.tempPath)) {
+    try {
+      fs.unlinkSync(upload.tempPath);
+    } catch (_) {
+      // Best effort cleanup; the stale .part file can be removed manually.
+    }
+  }
+  activeFileUploads.delete(uploadId);
+  await postEvent({
+    type: 'file.upload.aborted',
+    hostId: HOST_ID,
+    sessionId: command.sessionId || upload?.sessionId || null,
+    requestId,
+    uploadId,
+    timestamp: nowIso(),
+  });
+}
+
 async function handleFileDownload(command) {
   const requestId = command.requestId || makeId();
   const sessionId = command.sessionId || null;
@@ -574,6 +780,106 @@ async function handleFileDownload(command) {
       mime,
       isImage: isImageMime(mime, targetPath),
       dataBase64: fs.readFileSync(targetPath).toString('base64'),
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'file.error',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      message: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleFileDownloadInfo(command) {
+  const requestId = command.requestId || makeId();
+  const sessionId = command.sessionId || null;
+
+  try {
+    const baseCwd = resolveCommandCwd(command);
+    const targetPath = resolveRemoteFilePath(command.path, baseCwd);
+    if (!fs.existsSync(targetPath)) {
+      throw new Error(`file does not exist: ${targetPath}`);
+    }
+
+    const stats = fs.statSync(targetPath);
+    if (!stats.isFile()) {
+      throw new Error(`path is not a regular file: ${targetPath}`);
+    }
+    if (stats.size > MAX_CHUNKED_FILE_TRANSFER_BYTES) {
+      throw new Error(`file is too large to transfer (${stats.size} bytes); limit is ${MAX_CHUNKED_FILE_TRANSFER_BYTES} bytes`);
+    }
+
+    const mime = mimeFromPath(targetPath);
+    await postEvent({
+      type: 'file.download.info',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      name: path.basename(targetPath),
+      path: targetPath,
+      size: stats.size,
+      mime,
+      isImage: isImageMime(mime, targetPath),
+      mtimeMs: stats.mtimeMs,
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'file.error',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      message: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleFileDownloadChunk(command) {
+  const requestId = command.requestId || makeId();
+  const sessionId = command.sessionId || null;
+
+  try {
+    const baseCwd = resolveCommandCwd(command);
+    const targetPath = resolveRemoteFilePath(command.path, baseCwd);
+    if (!fs.existsSync(targetPath)) {
+      throw new Error(`file does not exist: ${targetPath}`);
+    }
+
+    const stats = fs.statSync(targetPath);
+    if (!stats.isFile()) {
+      throw new Error(`path is not a regular file: ${targetPath}`);
+    }
+
+    const offset = Number(command.offset || 0) || 0;
+    const requestedLength = Number(command.length || 0) || 0;
+    if (offset < 0 || offset > stats.size) {
+      throw new Error(`download chunk offset is outside the file: ${offset}`);
+    }
+    const length = Math.min(requestedLength, MAX_FILE_CHUNK_BYTES, Math.max(0, stats.size - offset));
+    const buffer = Buffer.alloc(length);
+    const fd = fs.openSync(targetPath, 'r');
+    let bytesRead = 0;
+    try {
+      bytesRead = fs.readSync(fd, buffer, 0, length, offset);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    await postEvent({
+      type: 'file.download.chunk',
+      hostId: HOST_ID,
+      sessionId,
+      requestId,
+      path: targetPath,
+      offset,
+      length: bytesRead,
+      size: stats.size,
+      dataBase64: buffer.subarray(0, bytesRead).toString('base64'),
       timestamp: nowIso(),
     });
   } catch (error) {
@@ -938,8 +1244,38 @@ async function handleCommand(command) {
     return;
   }
 
+  if (command.type === 'host.file_upload_begin') {
+    await handleChunkedFileUploadBegin(command);
+    return;
+  }
+
+  if (command.type === 'host.file_upload_chunk') {
+    await handleChunkedFileUploadChunk(command);
+    return;
+  }
+
+  if (command.type === 'host.file_upload_complete') {
+    await handleChunkedFileUploadComplete(command);
+    return;
+  }
+
+  if (command.type === 'host.file_upload_abort') {
+    await handleChunkedFileUploadAbort(command);
+    return;
+  }
+
   if (command.type === 'host.file_download') {
     await handleFileDownload(command);
+    return;
+  }
+
+  if (command.type === 'host.file_download_info') {
+    await handleFileDownloadInfo(command);
+    return;
+  }
+
+  if (command.type === 'host.file_download_chunk') {
+    await handleFileDownloadChunk(command);
     return;
   }
 

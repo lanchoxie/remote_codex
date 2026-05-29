@@ -102,8 +102,9 @@ const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_COMPOSER_TEXT_FILES = 4;
 const MAX_COMPOSER_TEXT_FILE_BYTES = 768 * 1024;
 const MAX_COMPOSER_UPLOAD_FILES = 8;
-const MAX_COMPOSER_UPLOAD_FILE_BYTES = 16 * 1024 * 1024;
-const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 24 * 1024 * 1024;
+const MAX_COMPOSER_UPLOAD_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
 const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
@@ -4383,7 +4384,10 @@ function renderAttachmentChips() {
       : attachment.type === 'image'
         ? 'Image'
         : 'File';
-    const note = attachment.remotePath ? ` -> ${attachment.remotePath}` : '';
+    const progress = typeof attachment.uploadProgress === 'number' && !attachment.remotePath
+      ? ` uploading ${Math.round(Math.max(0, Math.min(1, attachment.uploadProgress)) * 100)}%`
+      : '';
+    const note = attachment.remotePath ? ` -> ${attachment.remotePath}` : progress;
     chip.innerHTML = `
       <span>${escapeHtml(label)}: ${escapeHtml(attachment.name || 'attached file')}${attachment.size ? ` (${escapeHtml(formatBytes(attachment.size))})` : ''}${escapeHtml(note)}</span>
       <button class="attachment-chip-remove" type="button" data-attachment-index="${index}" aria-label="Remove ${escapeHtml(attachment.name || 'attachment')}">x</button>
@@ -5277,6 +5281,9 @@ async function uploadComposerFiles(session) {
   if (!host?.capabilities?.fileTransfer) {
     throw new Error(`${formatHostCapabilityName(host)} has not enabled file transfer yet. Restart the relay and this host-agent, then refresh the page. For HPC hosts, use Manage HPC -> Restart Agent.`);
   }
+  if (!host?.capabilities?.chunkedFileTransfer) {
+    throw new Error(`${formatHostCapabilityName(host)} has not enabled chunked file transfer yet. Restart the relay and this host-agent, then refresh the page. For HPC hosts, use Manage HPC -> Restart Agent.`);
+  }
 
   const reusable = [];
   const pending = [];
@@ -5301,29 +5308,12 @@ async function uploadComposerFiles(session) {
 
   let uploaded = [];
   if (pending.length) {
-    let response = null;
-    try {
-      response = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/upload`, {
-        method: 'POST',
-        body: JSON.stringify({
-          sessionId: session.sessionId,
-          targetDirectory: session.cwd || '',
-          files: pending.map((attachment) => ({
-            fileId: attachment.fileId,
-            name: attachment.name,
-            mime: attachment.mime || 'application/octet-stream',
-            size: attachment.size || 0,
-            dataBase64: attachment.dataBase64,
-          })),
-        }),
-      });
-    } catch (error) {
-      if (error.status === 404 && /\/files\/upload/.test(String(error.url || ''))) {
-        throw new Error('The running relay does not have the file upload API yet. Restart the relay/server process, restart the selected host-agent, then refresh the browser.');
+    for (const attachment of pending) {
+      const file = await uploadComposerFileInChunks(session, attachment);
+      if (file) {
+        uploaded.push(file);
       }
-      throw error;
     }
-    uploaded = normalizeTranscriptFiles(response.files || []);
     for (const [index, file] of uploaded.entries()) {
       const attachment = pending[index];
       if (!attachment) {
@@ -5340,6 +5330,85 @@ async function uploadComposerFiles(session) {
   }
 
   return [...reusable, ...uploaded];
+}
+
+async function uploadComposerFileInChunks(session, attachment) {
+  if (!attachment.fileObject && attachment.dataBase64) {
+    const response = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/upload`, {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        targetDirectory: session.cwd || '',
+        files: [{
+          fileId: attachment.fileId,
+          name: attachment.name,
+          mime: attachment.mime || 'application/octet-stream',
+          size: attachment.size || 0,
+          dataBase64: attachment.dataBase64,
+        }],
+      }),
+    });
+    return normalizeTranscriptFiles(response.files || [])[0] || null;
+  }
+
+  const fileObject = attachment.fileObject;
+  if (!fileObject) {
+    throw new Error(`${attachment.name || 'file'} is no longer available in the browser. Select it again, then resend.`);
+  }
+
+  let uploadId = '';
+  try {
+    const begin = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads`, {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        targetDirectory: session.cwd || '',
+        fileId: attachment.fileId,
+        name: attachment.name,
+        mime: attachment.mime || 'application/octet-stream',
+        size: attachment.size || 0,
+        chunkSize: COMPOSER_UPLOAD_CHUNK_BYTES,
+      }),
+    });
+    uploadId = begin.uploadId;
+    const chunkSize = Math.max(1, Number(begin.chunkSize || COMPOSER_UPLOAD_CHUNK_BYTES) || COMPOSER_UPLOAD_CHUNK_BYTES);
+    let offset = 0;
+    let index = 0;
+
+    while (offset < fileObject.size) {
+      const end = Math.min(offset + chunkSize, fileObject.size);
+      const dataBase64 = await readBlobAsBase64(fileObject.slice(offset, end));
+      const chunk = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads/${encodeURIComponent(uploadId)}/chunks`, {
+        method: 'POST',
+        body: JSON.stringify({
+          index,
+          offset,
+          dataBase64,
+        }),
+      });
+      offset = Number(chunk.receivedBytes || end) || end;
+      index += 1;
+      attachment.uploadProgress = fileObject.size ? offset / fileObject.size : 1;
+      renderAttachmentChips();
+    }
+
+    const complete = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads/${encodeURIComponent(uploadId)}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    attachment.uploadProgress = 1;
+    return normalizeTranscriptFiles(complete.files || [])[0] || null;
+  } catch (error) {
+    if (error.status === 404 && /\/files\/uploads/.test(String(error.url || ''))) {
+      throw new Error('The running relay or host-agent does not have chunked file upload yet. Restart the relay/server process, restart the selected host-agent, then refresh the browser.');
+    }
+    if (uploadId) {
+      fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads/${encodeURIComponent(uploadId)}`, {
+        method: 'DELETE',
+      }).catch(() => {});
+    }
+    throw error;
+  }
 }
 
 async function buildComposerPayload(rawText, overrides = {}) {
@@ -5428,6 +5497,11 @@ function dataUrlToBase64(dataUrl) {
   return comma === -1 ? text : text.slice(comma + 1);
 }
 
+async function readBlobAsBase64(blob) {
+  const dataUrl = await readFileAsDataUrl(blob);
+  return dataUrlToBase64(dataUrl);
+}
+
 async function addComposerImageFiles(files) {
   const incoming = Array.from(files || []).filter((file) => file && String(file.type || '').startsWith('image/'));
   if (!incoming.length) {
@@ -5506,11 +5580,10 @@ async function addComposerFiles(files) {
     if (file.size > MAX_COMPOSER_UPLOAD_FILE_BYTES) {
       throw new Error(`${file.name} is too large for remote upload; limit is ${formatBytes(MAX_COMPOSER_UPLOAD_FILE_BYTES)} per file.`);
     }
-    const dataUrl = await readFileAsDataUrl(file);
     state.codexControls.attachments.push({
       type: 'uploadFile',
       fileId: makeClientId(),
-      dataBase64: dataUrlToBase64(dataUrl),
+      fileObject: file,
       name: file.name || 'upload',
       mime: file.type || 'application/octet-stream',
       size: file.size,
@@ -7245,7 +7318,7 @@ function renderFileCards(container, session, entry) {
     const meta = [
       file.mime || (isImageFileRef(file) ? 'image' : 'file'),
       file.size ? formatBytes(file.size) : '',
-      'received on first open/save',
+      'streams on open/save',
     ].filter(Boolean).join(' | ');
 
     if (isImageFileRef(file)) {

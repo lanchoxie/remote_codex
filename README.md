@@ -222,4 +222,4 @@ npm run test:managed
 - Runtime state is lightweight and mostly relay-local; host-agents rehydrate live state after reconnecting.
 - Imported history sessions become interactive only after resume or fork.
 - HPC SSH/MFA policies vary by cluster, so connector profiles may need cluster-specific tuning.
-- Large datasets should stay on the host filesystem instead of being uploaded through the browser.
+- Browser small-file transfer defaults to 128 MiB per request. Larger browser uploads/downloads use chunked relay-to-agent transfer, but large datasets should still stay on the host filesystem when possible; see [large file transfer design](docs/large-file-transfer-design.md).

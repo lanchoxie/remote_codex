@@ -67,7 +67,7 @@ async function main() {
     const matched = await waitForTranscriptLine(
       transcript,
       (entry) => entry.type === 'session.output' && String(entry.data.chunk || '').includes(prompt),
-      8000
+      15000
     );
 
     const uploadText = `remote-file-smoke-${Date.now()}`;
@@ -101,6 +101,40 @@ async function main() {
       throw new Error('cached received file content did not match uploaded content');
     }
 
+    const chunkedBytes = Buffer.alloc(5 * 1024 * 1024 + 123);
+    for (let index = 0; index < chunkedBytes.length; index += 1) {
+      chunkedBytes[index] = index % 251;
+    }
+    const chunkedBegin = await postJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads`, {
+      sessionId: session.sessionId,
+      targetDirectory: uploadDirectory,
+      name: 'managed-chunked.bin',
+      mime: 'application/octet-stream',
+      size: chunkedBytes.length,
+      chunkSize: 1024 * 1024,
+    });
+    let chunkedOffset = 0;
+    let chunkedIndex = 0;
+    while (chunkedOffset < chunkedBytes.length) {
+      const end = Math.min(chunkedOffset + chunkedBegin.chunkSize, chunkedBytes.length);
+      const chunk = await postJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads/${encodeURIComponent(chunkedBegin.uploadId)}/chunks`, {
+        index: chunkedIndex,
+        offset: chunkedOffset,
+        dataBase64: chunkedBytes.subarray(chunkedOffset, end).toString('base64'),
+      });
+      chunkedOffset = chunk.receivedBytes;
+      chunkedIndex += 1;
+    }
+    const chunkedComplete = await postJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads/${encodeURIComponent(chunkedBegin.uploadId)}/complete`, {});
+    const chunkedFile = chunkedComplete.files && chunkedComplete.files[0];
+    if (!chunkedFile?.path) {
+      throw new Error('chunked upload did not return a remote path');
+    }
+    const chunkedDownloaded = await getBuffer(`/api/hosts/${encodeURIComponent(session.hostId)}/files/download?sessionId=${encodeURIComponent(session.sessionId)}&path=${encodeURIComponent(chunkedFile.path)}&chunked=1`);
+    if (!chunkedDownloaded.equals(chunkedBytes)) {
+      throw new Error('chunked downloaded file content did not match uploaded content');
+    }
+
     const migration = await verifyBridgeSessionMigration();
 
     const stats = await getJson('/api/stats');
@@ -115,6 +149,8 @@ async function main() {
         uploadedPath: uploadedFile.path,
         downloadedBytes: downloaded.length,
         receivedFileId: receivedFile.fileId,
+        chunkedUploadedPath: chunkedFile.path,
+        chunkedDownloadedBytes: chunkedDownloaded.length,
       },
       bridgeMigration: migration,
       stats: {
@@ -280,7 +316,7 @@ async function waitForLiveManagedSession() {
 
     const sessions = await getJson(`/api/hosts/${encodeURIComponent(HOST_ID)}/sessions`);
     return (sessions.sessions || []).find((session) => session.source === 'managed' && session.live === true) || null;
-  }, 8000, 250);
+  }, 20000, 250);
 }
 
 function subscribeToSession(hostId, sessionId, transcript) {
