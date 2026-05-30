@@ -257,7 +257,7 @@ function buildAgentLaunchCommand(connector) {
 
   const envBlock = exports.length ? `${exports.join(' ')} ` : '';
   return connector.bootstrap.launchCommand
-    || `NODE_BIN="$(command -v node || command -v nodejs || test -x .runtime/node/bin/node && printf '%s\\n' "$PWD/.runtime/node/bin/node" || true)" && test -n "$NODE_BIN" && ${envBlock}"$NODE_BIN" apps/host-agent/agent.js`;
+    || `NODE_BIN="$(command -v node || command -v nodejs || test -x .runtime/node/bin/node && printf '%s\\n' "$PWD/.runtime/node/bin/node" || true)" && CODEX_BIN="$(command -v codex || test -x .runtime/codex/codex && printf '%s\\n' "$PWD/.runtime/codex/codex" || true)" && test -n "$NODE_BIN" && ${envBlock}CODEX_BIN="$CODEX_BIN" "$NODE_BIN" apps/host-agent/agent.js`;
 }
 
 function tmuxShellCommand(command) {
@@ -301,9 +301,15 @@ function buildDetachedBootstrapCommand(connector, options = {}) {
     const tmuxCommand = options.restart
       ? `(tmux kill-session -t ${shellQuote(tmuxSession)} 2>/dev/null || true) && ${startCommand}`
       : `(tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null || ${startCommand})`;
+    const pidFile = 'codex-remote.agent.pid';
+    const pidCheck = `test -f ${pidFile} && kill -0 "$(cat ${pidFile})" 2>/dev/null`;
+    const nohupStart = `nohup sh -lc ${shellQuote(agentLogCommand(launchCommand))} >/dev/null 2>&1 < /dev/null & echo $! > ${pidFile}`;
+    const nohupCommand = options.restart
+      ? `(${pidCheck} && kill "$(cat ${pidFile})" 2>/dev/null || true); ${nohupStart}`
+      : `(${pidCheck} || ${nohupStart})`;
     return [
       `cd ${shellPathArg(remoteDir)}`,
-      tmuxCommand,
+      `if command -v tmux >/dev/null 2>&1; then ${tmuxCommand}; echo CODEX_REMOTE_AGENT_TMUX_BOOTSTRAPPED; else ${nohupCommand}; echo CODEX_REMOTE_AGENT_NOHUP_BOOTSTRAPPED; fi`,
       'echo CODEX_REMOTE_AGENT_BOOTSTRAPPED',
     ].join(' && ');
   }
@@ -325,8 +331,14 @@ function buildDetachedBootstrapCommand(connector, options = {}) {
 
 function buildRemoteStatusCommand(connector) {
   if (connector.bootstrap?.mode === 'manual_tmux') {
+    const remoteDir = connector.bootstrap.remoteDirectory || '~/mobile-codex-remote';
     const tmuxSession = connector.bootstrap.tmuxSession || 'codex-remote';
-    return `tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null && echo CODEX_REMOTE_AGENT_TMUX_RUNNING || echo CODEX_REMOTE_AGENT_TMUX_MISSING`;
+    return [
+      `cd ${shellPathArg(remoteDir)} 2>/dev/null || true;`,
+      `if command -v tmux >/dev/null 2>&1 && tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null; then echo CODEX_REMOTE_AGENT_TMUX_RUNNING; exit 0; fi;`,
+      'if test -f codex-remote.agent.pid && kill -0 "$(cat codex-remote.agent.pid)" 2>/dev/null; then echo CODEX_REMOTE_AGENT_PROCESS_RUNNING; exit 0; fi;',
+      'echo CODEX_REMOTE_AGENT_TMUX_MISSING',
+    ].join(' ');
   }
 
   return 'echo CODEX_REMOTE_AGENT_STATUS_UNKNOWN';

@@ -45,6 +45,7 @@ const SESSION_LOG_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_LOG_ENTRY_LIMIT
 const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRIES || 1000);
 const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
 const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
+const STALE_MANAGED_SESSION_GRACE_MS = Number(process.env.RELAY_STALE_MANAGED_SESSION_GRACE_MS || 30000);
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
 let relayAuthAccount = loadRelayAuthAccount();
 
@@ -2612,7 +2613,8 @@ function buildRemoteDeploymentCheckCommand(connector) {
     'test -n "$CODEX_BIN" && echo CODEX_REMOTE_CHECK_CODEX=$CODEX_BIN || echo CODEX_REMOTE_CHECK_CODEX=missing',
     'command -v tmux >/dev/null && echo CODEX_REMOTE_CHECK_TMUX=$(command -v tmux) || echo CODEX_REMOTE_CHECK_TMUX=missing',
     'tmux -V 2>/dev/null || true',
-    `test -f ${remoteDir}/apps/host-agent/agent.js && test -f ${remoteDir}/shared/protocol.js && test -n "$NODE_BIN" && test -n "$CODEX_BIN" && command -v tmux >/dev/null && echo CODEX_REMOTE_AGENT_DEPLOYED`,
+    'command -v tmux >/dev/null && echo CODEX_REMOTE_CHECK_KEEPALIVE=tmux || echo CODEX_REMOTE_CHECK_KEEPALIVE=nohup',
+    `test -f ${remoteDir}/apps/host-agent/agent.js && test -f ${remoteDir}/shared/protocol.js && test -n "$NODE_BIN" && test -n "$CODEX_BIN" && echo CODEX_REMOTE_AGENT_DEPLOYED`,
   ].join('; ');
 }
 
@@ -2760,7 +2762,7 @@ function buildRemoteOneShotBootstrapCommand(connector, action, payload = {}) {
     buildRemoteCodexResolutionScript(connector, Boolean(payload.codexRuntimeIncluded)),
     'test -n "$CODEX_BIN" && echo "CODEX_REMOTE_CHECK_CODEX=$CODEX_BIN" || { echo CODEX_REMOTE_CHECK_CODEX=missing; exit 73; }',
     '"$CODEX_BIN" --help >/dev/null 2>&1 && echo CODEX_REMOTE_CODEX_HELP_OK || echo CODEX_REMOTE_CODEX_HELP_WARNING',
-    'command -v tmux >/dev/null && echo CODEX_REMOTE_CHECK_TMUX=$(command -v tmux) || { echo CODEX_REMOTE_CHECK_TMUX=missing; exit 74; }',
+    'command -v tmux >/dev/null && echo CODEX_REMOTE_CHECK_TMUX=$(command -v tmux) || echo CODEX_REMOTE_CHECK_TMUX=missing',
     bootstrapCommand,
     'echo CODEX_REMOTE_ONESHOT_BOOTSTRAP_DONE',
   ].filter(Boolean).join('\n');
@@ -2804,8 +2806,8 @@ function classifyOneShotBootstrapFailure(action, step) {
   if (/CODEX_REMOTE_CHECK_CODEX=missing/.test(text)) {
     return { status: 'codex_runtime_missing', message: 'No usable Codex CLI was found in PATH, CODEX_HOME, common conda/nvm locations, or the uploaded runtime.' };
   }
-  if (/CODEX_REMOTE_CHECK_TMUX=missing/.test(text)) {
-    return { status: 'tmux_missing', message: 'tmux is required to keep the remote host-agent alive, but it was not found.' };
+  if (/CODEX_REMOTE_CHECK_TMUX=missing/.test(text) && !/CODEX_REMOTE_AGENT_(TMUX|NOHUP)_BOOTSTRAPPED|CODEX_REMOTE_AGENT_BOOTSTRAPPED/.test(text)) {
+    return { status: 'launcher_failed', message: 'tmux is missing and the nohup fallback did not confirm that the remote host-agent started.' };
   }
   if (/permission denied/i.test(text)) {
     return { status: 'ssh_failed', message: 'SSH authentication or remote permissions failed during one-shot bootstrap.' };
@@ -3264,6 +3266,9 @@ function classifyConnectorAction(action, run) {
     }
     if (stdout.includes('CODEX_REMOTE_AGENT_TMUX_RUNNING')) {
       return { ok: true, status: 'remote_agent_running', message: 'Remote tmux agent session is running.' };
+    }
+    if (stdout.includes('CODEX_REMOTE_AGENT_PROCESS_RUNNING')) {
+      return { ok: true, status: 'remote_agent_running', message: 'Remote host-agent process is running without tmux.' };
     }
     if (stdout.includes('CODEX_REMOTE_AGENT_TMUX_MISSING')) {
       return { ok: true, status: 'remote_agent_missing', message: 'Remote tmux agent session is not running yet.' };
@@ -4132,6 +4137,31 @@ function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
   return next;
 }
 
+function sessionAgeMs(session) {
+  const timestamp = Date.parse(session?.lastUpdatedAt || session?.createdAt || '');
+  return Number.isFinite(timestamp) ? Date.now() - timestamp : Infinity;
+}
+
+function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds) {
+  let closedCount = 0;
+  for (const session of Array.from(state.sessions.values())) {
+    if (session.hostId !== hostId || session.source !== 'managed' || !session.live) {
+      continue;
+    }
+    if (liveSessionIds.has(session.sessionId)) {
+      continue;
+    }
+    if (session.state === 'starting' && sessionAgeMs(session) < STALE_MANAGED_SESSION_GRACE_MS) {
+      continue;
+    }
+    markSessionClosed(hostId, session.sessionId);
+    closedCount += 1;
+  }
+  if (closedCount > 0) {
+    console.warn(`[relay] closed ${closedCount} stale managed session(s) for ${hostId} after discovery`);
+  }
+}
+
 function scheduleStopFallback(hostId, sessionId, delayMs = 4000) {
   const timer = setTimeout(() => {
     const session = getSession(hostId, sessionId);
@@ -4213,18 +4243,40 @@ function getCommands(hostId, afterId = 0) {
 }
 
 function sendSse(res, eventName, payload) {
-  res.write(`event: ${eventName}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  if (!res || res.destroyed || res.writableEnded) {
+    return false;
+  }
+  try {
+    res.write(`event: ${eventName}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    return true;
+  } catch (error) {
+    if (!isClientAbortError(error)) {
+      console.error(error);
+    }
+    return false;
+  }
 }
 
 function broadcastSessionEvent(hostId, sessionId, eventName, payload) {
-  const subscribers = state.subscribers.get(sessionKey(hostId, sessionId));
+  const key = sessionKey(hostId, sessionId);
+  const subscribers = state.subscribers.get(key);
   if (!subscribers) {
     return;
   }
 
+  const staleSubscribers = [];
   for (const res of subscribers) {
-    sendSse(res, eventName, payload);
+    if (!sendSse(res, eventName, payload)) {
+      staleSubscribers.push(res);
+    }
+  }
+
+  for (const res of staleSubscribers) {
+    subscribers.delete(res);
+  }
+  if (subscribers.size === 0) {
+    state.subscribers.delete(key);
   }
 }
 
@@ -4233,6 +4285,12 @@ function addSessionSubscriber(hostId, sessionId, res) {
   const subscribers = state.subscribers.get(key) || new Set();
   subscribers.add(res);
   state.subscribers.set(key, subscribers);
+  res.once('error', () => {
+    removeSessionSubscriber(hostId, sessionId, res);
+  });
+  res.once('close', () => {
+    removeSessionSubscriber(hostId, sessionId, res);
+  });
 }
 
 function removeSessionSubscriber(hostId, sessionId, res) {
@@ -5929,9 +5987,21 @@ function applyAgentEvent(event) {
       state.hosts.set(event.hostId, host);
     }
     const sessions = Array.isArray(event.sessions) ? event.sessions : [];
+    const liveSessionIds = new Set(
+      sessions
+        .filter((session) => session && session.sessionId && session.live)
+        .map((session) => String(session.sessionId))
+    );
     for (const session of sessions) {
+      if (!session || !session.sessionId) {
+        continue;
+      }
       const existing = getSession(event.hostId, session.sessionId);
-      const preserveManagedState = existing && existing.source === 'managed' && (existing.live || existing.state === 'starting');
+      const isCurrentlyLive = liveSessionIds.has(String(session.sessionId));
+      const preserveManagedState = existing
+        && existing.source === 'managed'
+        && isCurrentlyLive
+        && (existing.live || existing.state === 'starting');
       const discoveredCreatedAt = session.createdAt || null;
       const next = upsertSession(event.hostId, {
         sessionId: session.sessionId,
@@ -5959,6 +6029,7 @@ function applyAgentEvent(event) {
       }
       broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
     }
+    closeManagedSessionsMissingFromDiscovery(event.hostId, liveSessionIds);
     return;
   }
 

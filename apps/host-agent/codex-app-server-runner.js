@@ -1,4 +1,5 @@
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -346,6 +347,8 @@ function normalizeApiConfig(input = {}) {
   const provider = String(input.provider || '').trim().slice(0, 80);
   const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
   const apiKey = String(input.apiKey || '').trim();
+  const profileId = String(input.profileId || '').trim().slice(0, 120);
+  const label = String(input.label || '').trim().slice(0, 120);
   if (!baseUrl && !apiKey) {
     return null;
   }
@@ -353,6 +356,8 @@ function normalizeApiConfig(input = {}) {
     provider: provider || 'OpenAI',
     baseUrl,
     apiKey,
+    profileId,
+    label,
   };
 }
 
@@ -370,6 +375,134 @@ function buildApiEnvironment(apiConfig) {
     env.OPENAI_API_BASE = config.baseUrl;
   }
   return env;
+}
+
+function safeProfileSegment(value) {
+  const cleaned = String(value || '')
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return cleaned || 'profile';
+}
+
+function hashApiConfig(config) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({
+      provider: config.provider || '',
+      baseUrl: config.baseUrl || '',
+      apiKey: config.apiKey || '',
+      profileId: config.profileId || '',
+    }))
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function tomlString(value) {
+  return JSON.stringify(String(value || ''));
+}
+
+function copyFileIfExists(source, target) {
+  if (!fs.existsSync(source)) {
+    return;
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(source, target);
+}
+
+function linkSharedCodexHomeEntry(baseHome, overlayHome, name) {
+  const source = path.join(baseHome, name);
+  const target = path.join(overlayHome, name);
+  if (!fs.existsSync(source) || fs.existsSync(target)) {
+    return;
+  }
+  const stats = fs.statSync(source);
+  try {
+    const linkType = stats.isDirectory()
+      ? (process.platform === 'win32' ? 'junction' : 'dir')
+      : 'file';
+    fs.symlinkSync(source, target, linkType);
+    return;
+  } catch {
+    // Symlinks can be disabled on Windows/HPC; fall back to copying only small files.
+  }
+  if (stats.isFile() && stats.size <= 1024 * 1024) {
+    fs.copyFileSync(source, target);
+  }
+}
+
+function rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) {
+  const begin = '# BEGIN remote-codex-api-profile';
+  const end = '# END remote-codex-api-profile';
+  const blockPattern = new RegExp(`\\n?${begin}[\\s\\S]*?${end}\\n?`, 'g');
+  let next = String(baseConfig || '').replace(blockPattern, '\n').trim();
+  const providerName = config.label || config.provider || 'API profile';
+  const baseUrl = config.baseUrl || 'https://api.openai.com/v1';
+  const profileBlock = [
+    '',
+    begin,
+    `[model_providers.${providerKey}]`,
+    `name = ${tomlString(providerName)}`,
+    `base_url = ${tomlString(baseUrl)}`,
+    config.apiKey ? `api_key = ${tomlString(config.apiKey)}` : '',
+    'wire_api = "responses"',
+    'requires_openai_auth = true',
+    end,
+    '',
+  ].filter((line) => line !== '').join('\n');
+
+  if (/^model_provider\s*=.*$/m.test(next)) {
+    next = next.replace(/^model_provider\s*=.*$/m, `model_provider = ${tomlString(providerKey)}`);
+  } else {
+    next = `model_provider = ${tomlString(providerKey)}\n${next}`;
+  }
+  return `${next.trim()}\n${profileBlock}`;
+}
+
+function prepareApiProfileCodexHome(baseHome, apiConfig) {
+  const config = normalizeApiConfig(apiConfig);
+  if (!config) {
+    return { codexHome: baseHome, profileHome: false };
+  }
+
+  const hash = hashApiConfig(config);
+  const segment = safeProfileSegment(config.profileId || config.label || config.provider);
+  const overlayHome = path.join(baseHome, '.remote-codex-api-profiles', `${segment}-${hash}`);
+  fs.mkdirSync(overlayHome, { recursive: true });
+
+  const baseAuthPath = path.join(baseHome, 'auth.json');
+  const overlayAuthPath = path.join(overlayHome, 'auth.json');
+  let auth = {};
+  try {
+    auth = JSON.parse(fs.readFileSync(baseAuthPath, 'utf8'));
+  } catch {
+    auth = {};
+  }
+  if (config.apiKey) {
+    auth.OPENAI_API_KEY = config.apiKey;
+  }
+  fs.writeFileSync(overlayAuthPath, `${JSON.stringify(auth, null, 2)}\n`, 'utf8');
+
+  const baseConfigPath = path.join(baseHome, 'config.toml');
+  const overlayConfigPath = path.join(overlayHome, 'config.toml');
+  let baseConfig = '';
+  try {
+    baseConfig = fs.readFileSync(baseConfigPath, 'utf8');
+  } catch {
+    baseConfig = '';
+  }
+  const providerKey = `remote_codex_${hash}`;
+  fs.writeFileSync(overlayConfigPath, rewriteConfigTomlForApiProfile(baseConfig, config, providerKey), 'utf8');
+
+  for (const name of ['installation_id', 'cap_sid', 'session_index.jsonl', '.personality_migration']) {
+    copyFileIfExists(path.join(baseHome, name), path.join(overlayHome, name));
+  }
+  for (const name of ['sessions', 'skills', 'rules', 'memories', 'generated_images']) {
+    linkSharedCodexHomeEntry(baseHome, overlayHome, name);
+  }
+
+  return { codexHome: overlayHome, profileHome: true, providerKey };
 }
 
 function summarizeValue(value, depth = 0) {
@@ -863,9 +996,13 @@ class CodexAppServerRunner {
     this.bootstrap = options.bootstrap || null;
     this.postEvent = options.postEvent;
     this.onTerminated = options.onTerminated || null;
-    this.codexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-    this.codexBin = options.codexBin || resolveDefaultCodexBin(this.codexHome);
     this.apiConfig = normalizeApiConfig(options.apiConfig);
+    this.baseCodexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    const preparedCodexHome = prepareApiProfileCodexHome(this.baseCodexHome, this.apiConfig);
+    this.codexHome = preparedCodexHome.codexHome;
+    this.apiProfileHome = preparedCodexHome.profileHome;
+    this.apiProviderKey = preparedCodexHome.providerKey || null;
+    this.codexBin = options.codexBin || resolveDefaultCodexBin(this.baseCodexHome);
     this.child = null;
     this.rpc = null;
     this.threadId = null;
@@ -884,8 +1021,12 @@ class CodexAppServerRunner {
       cwd: this.cwd,
       nativeThreadId: null,
       launchMode: this.launchMode,
+      codexHomeProfile: this.apiProfileHome ? 'api-profile' : 'default',
+      apiProfileId: this.apiConfig?.profileId || null,
+      apiProfileLabel: this.apiConfig?.label || null,
       apiProvider: this.apiConfig?.provider || null,
       apiBaseUrl: this.apiConfig?.baseUrl || null,
+      apiProviderKey: this.apiProviderKey,
       resumeStrategy: 'fresh',
       connection: 'starting',
       phase: 'starting',
@@ -907,10 +1048,10 @@ class CodexAppServerRunner {
         ...buildApiEnvironment(this.apiConfig),
         CODEX_HOME: this.codexHome,
         PATH: buildCodexProcessPath(this.codexBin),
-        HOME: path.dirname(this.codexHome),
-        USERPROFILE: path.dirname(this.codexHome),
-        HOMEDRIVE: (path.parse(path.dirname(this.codexHome)).root || process.env.HOMEDRIVE || '').replace(/\\$/, ''),
-        HOMEPATH: path.dirname(this.codexHome).replace(/^[A-Za-z]:/, '') || process.env.HOMEPATH || '',
+        HOME: path.dirname(this.baseCodexHome),
+        USERPROFILE: path.dirname(this.baseCodexHome),
+        HOMEDRIVE: (path.parse(path.dirname(this.baseCodexHome)).root || process.env.HOMEDRIVE || '').replace(/\\$/, ''),
+        HOMEPATH: path.dirname(this.baseCodexHome).replace(/^[A-Za-z]:/, '') || process.env.HOMEPATH || '',
       },
     });
 
@@ -2027,6 +2168,7 @@ async function startCodexAppServerSession(options) {
 }
 
 module.exports = {
+  prepareApiProfileCodexHome,
   resolveDefaultCodexBin,
   startCodexAppServerSession,
 };

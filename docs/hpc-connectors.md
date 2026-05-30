@@ -90,4 +90,5 @@ For `Start Agent` to work, the relay machine must have:
 - or a saved local password secret for password / keyboard-interactive auth;
 - any configured gateway reachable through `ProxyJump`;
 - the project already present at the connector's remote directory;
-- `node` and `tmux` available on the remote host for the default `manual_tmux` mode.
+- `node` available on the remote host, or a local Node runtime archive in `tmp/` for upload;
+- `tmux` is preferred for the default `manual_tmux` mode, but the one-shot bootstrap falls back to a detached `nohup` agent process with `codex-remote.agent.pid` when `tmux` is unavailable.

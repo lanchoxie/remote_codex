@@ -15,7 +15,7 @@ v2.01 notes archive: [README_v2.01.md](README_v2.01.md)
 - File and image upload from the browser to the selected host.
 - Remote file cards for opening or saving files generated on the selected host.
 - Mobile-friendly drawer navigation and compact runtime status chips.
-- HPC connector profiles with SSH key, password, keyboard-interactive, OTP/MFA, gateway, and tmux bootstrap support.
+- HPC connector profiles with SSH key, password, keyboard-interactive, OTP/MFA, gateway, tmux-first bootstrap, and nohup fallback when tmux is unavailable.
 - Per-host API profiles for OpenAI-compatible API keys and base URLs.
 
 ## Architecture
@@ -162,14 +162,14 @@ Create a connector profile with:
 - `CODEX_HOME`: usually `~/.codex`.
 - `Workspace roots`: browseable root directories, one per line.
 - `Remote agent directory`: for example `~/mobile-codex-remote`.
-- `tmux session name`: for example `codex-remote`.
+- `tmux session name`: for example `codex-remote`; if `tmux` is missing, `Start Agent` falls back to a detached `nohup` process with a pid file.
 
 Then use:
 
 - `Run Test` to validate SSH login.
 - `Start Agent` to deploy and start the remote host-agent.
 - `Restart Agent` after updating this repository.
-- `Check Status` to inspect the remote tmux/agent state.
+- `Check Status` to inspect the remote tmux session or detached agent process.
 
 If the cluster uses OTP/MFA, the connector flow will prompt for fresh interactive values when SSH asks for them.
 
@@ -205,7 +205,7 @@ Open:
 Settings -> API profiles
 ```
 
-You can create multiple OpenAI-compatible API profiles and map different hosts to different profiles. Profile changes apply to newly started, resumed, or forked Codex app-server sessions.
+You can create multiple OpenAI-compatible API profiles and map different hosts to different profiles. Profile changes apply to newly started, resumed, or forked Codex app-server sessions. The host-agent starts those sessions with an isolated `CODEX_HOME` profile overlay so `auth.json` and `config.toml` changes do not overwrite the host's default Codex configuration.
 
 ## Development Checks
 

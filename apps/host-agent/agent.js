@@ -23,6 +23,9 @@ const WORKSPACE_ROOTS = parseWorkspaceRoots(process.env.WORKSPACE_ROOTS || '');
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
 const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
 const MAX_FILE_CHUNK_BYTES = Number(process.env.AGENT_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
+const FETCH_RETRY_ATTEMPTS = Math.max(1, Number(process.env.AGENT_FETCH_RETRY_ATTEMPTS || 3));
+const FETCH_RETRY_BASE_MS = Math.max(50, Number(process.env.AGENT_FETCH_RETRY_BASE_MS || 150));
+const FETCH_REQUEST_TIMEOUT_MS = Number(process.env.AGENT_FETCH_TIMEOUT_MS || 30000);
 
 const liveSessions = new Map();
 const activeFileUploads = new Map();
@@ -47,6 +50,8 @@ function normalizeApiConfig(input = {}) {
   const provider = String(input.provider || '').trim().slice(0, 80);
   const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
   const apiKey = String(input.apiKey || '').trim();
+  const profileId = String(input.profileId || '').trim().slice(0, 120);
+  const label = String(input.label || '').trim().slice(0, 120);
   if (!baseUrl && !apiKey) {
     return null;
   }
@@ -54,6 +59,8 @@ function normalizeApiConfig(input = {}) {
     provider: provider || 'OpenAI',
     baseUrl,
     apiKey,
+    profileId,
+    label,
   };
 }
 
@@ -92,12 +99,47 @@ function getCapabilities() {
   };
 }
 
-function fetchJson(targetUrl, options = {}) {
+function logAgentError(...args) {
+  console.error(`[${nowIso()}]`, ...args);
+}
+
+function isTransientFetchError(error) {
+  if (!error) {
+    return false;
+  }
+  return error.code === 'ECONNRESET'
+    || error.code === 'EPIPE'
+    || error.code === 'ETIMEDOUT'
+    || error.code === 'ECONNABORTED'
+    || error.message === 'socket hang up'
+    || error.message === 'aborted'
+    || error.message === 'response aborted';
+}
+
+async function fetchJson(targetUrl, options = {}) {
+  const attempts = options.retryOnTransient ? FETCH_RETRY_ATTEMPTS : 1;
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fetchJsonOnce(targetUrl, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !isTransientFetchError(error)) {
+        throw error;
+      }
+      await sleep(FETCH_RETRY_BASE_MS * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function fetchJsonOnce(targetUrl, options = {}) {
   const parsed = new URL(targetUrl);
   const client = parsed.protocol === 'https:' ? https : http;
   const authHeaders = RELAY_AUTH_TOKEN
     ? { Authorization: `Bearer ${RELAY_AUTH_TOKEN}` }
     : {};
+  const serializedBody = options.body ? JSON.stringify(options.body) : '';
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -116,6 +158,7 @@ function fetchJson(targetUrl, options = {}) {
         path: `${parsed.pathname}${parsed.search}`,
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
+          ...(serializedBody ? { 'Content-Length': Buffer.byteLength(serializedBody) } : {}),
           ...authHeaders,
           ...(options.headers || {}),
         },
@@ -139,27 +182,41 @@ function fetchJson(targetUrl, options = {}) {
           settle(resolve, { statusCode: res.statusCode || 0, body });
         });
         res.on('error', (error) => settle(reject, error));
+        res.on('aborted', () => {
+          const error = new Error('response aborted');
+          error.code = 'ECONNRESET';
+          settle(reject, error);
+        });
       }
     );
 
     req.on('error', (error) => settle(reject, error));
-    if (options.body) {
-      req.write(JSON.stringify(options.body));
+    if (FETCH_REQUEST_TIMEOUT_MS > 0) {
+      req.setTimeout(FETCH_REQUEST_TIMEOUT_MS, () => {
+        const error = new Error('relay request timed out');
+        error.code = 'ETIMEDOUT';
+        req.destroy(error);
+      });
+    }
+    if (serializedBody) {
+      req.write(serializedBody);
     }
     req.end();
   });
 }
 
-async function postEvent(event) {
+async function postEvent(event, options = {}) {
   await fetchJson(`${RELAY_URL}/api/agent/events`, {
     method: 'POST',
     body: { event },
+    retryOnTransient: Boolean(options.retryOnTransient),
   });
 }
 
 async function registerHost() {
   await fetchJson(`${RELAY_URL}/api/agent/register`, {
     method: 'POST',
+    retryOnTransient: true,
     body: {
       hostId: HOST_ID,
       label: HOST_LABEL,
@@ -172,6 +229,7 @@ async function registerHost() {
 async function heartbeat() {
   await fetchJson(`${RELAY_URL}/api/agent/heartbeat`, {
     method: 'POST',
+    retryOnTransient: true,
     body: {
       hostId: HOST_ID,
       label: HOST_LABEL,
@@ -237,7 +295,7 @@ async function sendDiscovery() {
     type: 'session.discovery',
     hostId: HOST_ID,
     sessions,
-  });
+  }, { retryOnTransient: true });
 }
 
 function parseWorkspaceRoots(value) {
@@ -1517,7 +1575,9 @@ async function handleCommand(command) {
 async function pollCommandsLoop() {
   while (true) {
     try {
-      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}`);
+      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}`, {
+        retryOnTransient: true,
+      });
       const commands = Array.isArray(result.body && result.body.commands) ? result.body.commands : [];
       for (const command of commands) {
         lastCommandId = Math.max(lastCommandId, Number(command.id || 0));
@@ -1525,7 +1585,7 @@ async function pollCommandsLoop() {
       }
       await sleep(POLL_INTERVAL_MS);
     } catch (error) {
-      console.error('[agent] command poll failed:', error.message);
+      logAgentError('[agent] command poll failed:', error.message);
       await sleep(Math.max(POLL_INTERVAL_MS, 3000));
     }
   }
@@ -1537,7 +1597,7 @@ async function discoveryLoop() {
       await sendDiscovery();
       await sleep(DISCOVERY_INTERVAL_MS);
     } catch (error) {
-      console.error('[agent] discovery failed:', error.message);
+      logAgentError('[agent] discovery failed:', error.message);
       await sleep(Math.max(DISCOVERY_INTERVAL_MS, 3000));
     }
   }
@@ -1549,7 +1609,7 @@ async function heartbeatLoop() {
       await heartbeat();
       await sleep(5000);
     } catch (error) {
-      console.error('[agent] heartbeat failed:', error.message);
+      logAgentError('[agent] heartbeat failed:', error.message);
       await sleep(5000);
     }
   }
@@ -1591,7 +1651,7 @@ async function retryStartupStep(label, task, attempts = 8) {
     } catch (error) {
       lastError = error;
       const delay = Math.min(5000, 300 * attempt * attempt);
-      console.error(`[agent] ${label} failed (${attempt}/${attempts}): ${error.message}`);
+      logAgentError(`[agent] ${label} failed (${attempt}/${attempts}): ${error.message}`);
       await sleep(delay);
     }
   }
