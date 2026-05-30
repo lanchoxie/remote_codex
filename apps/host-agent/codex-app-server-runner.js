@@ -33,6 +33,15 @@ function shouldSurfaceStderrLine(text) {
     return false;
   }
 
+  if (/\bWARN\s+codex_core::shell_snapshot\b/.test(text) && /PowerShell|snapshot not supported/i.test(text)) {
+    return false;
+  }
+
+  if (/\bWARN\s+codex_core_plugins::/.test(text)
+    && /(remote plugin|plugin bundle|featured plugin|chatgpt authentication|Unauthorized|api key auth is not supported)/i.test(text)) {
+    return false;
+  }
+
   if (/^error: unable to write file plugins\//.test(text)) {
     return false;
   }
@@ -1116,7 +1125,11 @@ class CodexAppServerRunner {
     });
 
     this.rpc = new JsonRpcSession(this.child, {
-      onNotification: (message) => this.handleNotification(message),
+      onNotification: (message) => {
+        this.handleNotification(message).catch((error) => {
+          console.error(`[codex-runner] notification failed: ${error.message || error}`);
+        });
+      },
       onServerRequest: (message) => this.handleServerRequest(message),
       onRawStdout: () => {},
       onError: (error) => {

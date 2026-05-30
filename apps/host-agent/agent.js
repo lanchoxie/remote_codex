@@ -5,6 +5,7 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const { discoverCodexSessions, getDefaultCodexHome } = require('../../shared/codex-discovery');
+const { CodexSessionTailer } = require('../../shared/codex-tail');
 const { makeId, nowIso, normalizeArgs } = require('../../shared/protocol');
 const { startCodexAppServerSession } = require('./codex-app-server-runner');
 
@@ -15,6 +16,8 @@ const HOST_LABEL = process.env.HOST_LABEL || HOST_ID;
 const CODEX_HOME = process.env.CODEX_HOME || getDefaultCodexHome();
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1500);
 const DISCOVERY_INTERVAL_MS = Number(process.env.DISCOVERY_INTERVAL_MS || 15000);
+const CODEX_TAIL_ENABLED = String(process.env.CODEX_TAIL_ENABLED || 'true') !== 'false';
+const CODEX_TAIL_INTERVAL_MS = Number(process.env.CODEX_TAIL_INTERVAL_MS || 1000);
 const AUTO_START_SESSION = String(process.env.AUTO_START_SESSION || 'true') !== 'false';
 const MANAGED_COMMAND = process.env.MANAGED_COMMAND || 'codex-app-server';
 const MANAGED_ARGS = normalizeArgs(process.env.MANAGED_ARGS_JSON || '[]');
@@ -29,6 +32,14 @@ const FETCH_REQUEST_TIMEOUT_MS = Number(process.env.AGENT_FETCH_TIMEOUT_MS || 30
 
 const liveSessions = new Map();
 const activeFileUploads = new Map();
+const codexTailer = CODEX_TAIL_ENABLED
+  ? new CodexSessionTailer({
+    codexHome: CODEX_HOME,
+    hostId: HOST_ID,
+    postEvent,
+    log: logAgentError,
+  })
+  : null;
 let lastCommandId = 0;
 
 function loadRelayAuthToken() {
@@ -95,6 +106,8 @@ function getCapabilities() {
     imageInput: true,
     fileTransfer: true,
     chunkedFileTransfer: true,
+    realtimeSessionSync: CODEX_TAIL_ENABLED,
+    codexJsonlTail: CODEX_TAIL_ENABLED,
     demoMode: MANAGED_COMMAND === 'demo',
   };
 }
@@ -206,11 +219,19 @@ function fetchJsonOnce(targetUrl, options = {}) {
 }
 
 async function postEvent(event, options = {}) {
-  await fetchJson(`${RELAY_URL}/api/agent/events`, {
-    method: 'POST',
-    body: { event },
-    retryOnTransient: Boolean(options.retryOnTransient),
-  });
+  try {
+    await fetchJson(`${RELAY_URL}/api/agent/events`, {
+      method: 'POST',
+      body: { event },
+      retryOnTransient: options.retryOnTransient !== false,
+    });
+  } catch (error) {
+    if (options.bestEffort || isTransientFetchError(error)) {
+      logAgentError(`[agent] failed to post ${event?.type || 'event'}:`, error.message);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function registerHost() {
@@ -1603,6 +1624,25 @@ async function discoveryLoop() {
   }
 }
 
+async function codexTailLoop() {
+  if (!codexTailer) {
+    return;
+  }
+
+  while (true) {
+    try {
+      const result = await codexTailer.poll();
+      if (result.newSessionCount > 0) {
+        await sendDiscovery();
+      }
+      await sleep(CODEX_TAIL_INTERVAL_MS);
+    } catch (error) {
+      logAgentError('[agent] codex tail failed:', error.message);
+      await sleep(Math.max(CODEX_TAIL_INTERVAL_MS, 3000));
+    }
+  }
+}
+
 async function heartbeatLoop() {
   while (true) {
     try {
@@ -1625,6 +1665,14 @@ async function main() {
 
   await retryStartupStep('register host', registerHost);
   await retryStartupStep('send initial discovery', sendDiscovery);
+  if (codexTailer) {
+    try {
+      const result = codexTailer.prime();
+      console.log(`[agent] codex tail primed ${result.sessionCount} session(s)`);
+    } catch (error) {
+      logAgentError('[agent] codex tail prime failed:', error.message);
+    }
+  }
 
   if (AUTO_START_SESSION) {
     try {
@@ -1639,7 +1687,7 @@ async function main() {
     }
   }
 
-  await Promise.all([pollCommandsLoop(), discoveryLoop(), heartbeatLoop()]);
+  await Promise.all([pollCommandsLoop(), discoveryLoop(), heartbeatLoop(), codexTailLoop()]);
 }
 
 async function retryStartupStep(label, task, attempts = 8) {

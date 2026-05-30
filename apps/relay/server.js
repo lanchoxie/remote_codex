@@ -46,6 +46,11 @@ const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT
 const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
 const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
 const STALE_MANAGED_SESSION_GRACE_MS = Number(process.env.RELAY_STALE_MANAGED_SESSION_GRACE_MS || 30000);
+const LOCAL_AGENT_WATCHDOG_ENABLED = String(process.env.RELAY_LOCAL_AGENT_WATCHDOG_ENABLED || 'true').trim().toLowerCase() !== 'false';
+const LOCAL_AGENT_WATCHDOG_INTERVAL_MS = Number(process.env.RELAY_LOCAL_AGENT_WATCHDOG_INTERVAL_MS || 5000);
+const LOCAL_AGENT_OFFLINE_RESTART_MS = Number(process.env.RELAY_LOCAL_AGENT_OFFLINE_RESTART_MS || 45000);
+const LOCAL_AGENT_RESTART_COOLDOWN_MS = Number(process.env.RELAY_LOCAL_AGENT_RESTART_COOLDOWN_MS || 10000);
+const LOCAL_AGENT_EXIT_RESTART_DELAY_MS = Number(process.env.RELAY_LOCAL_AGENT_EXIT_RESTART_DELAY_MS || 2000);
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
 let relayAuthAccount = loadRelayAuthAccount();
 
@@ -739,6 +744,7 @@ function hostSupportsCapability(hostId, capability) {
 }
 
 function getHostList() {
+  ensureLocalRelayHost();
   return Array.from(state.hosts.values()).map((host) => ({
     ...host,
     online: hostOnline(host),
@@ -770,6 +776,53 @@ function requestHostSessionDiscovery(hostId) {
   return true;
 }
 
+function getLocalRelayHostId() {
+  return safeLocalAgentId(process.env.RELAY_LOCAL_HOST_ID || process.env.HOST_ID || os.hostname() || 'local')
+    .toLowerCase();
+}
+
+function getLocalRelayHostLabel() {
+  const configured = String(process.env.RELAY_LOCAL_HOST_LABEL || process.env.HOST_LABEL || '').trim();
+  if (configured) {
+    return configured;
+  }
+  const platformLabel = process.platform === 'win32' ? 'Windows' : process.platform;
+  return `${os.hostname() || 'local'} ${platformLabel}`.trim();
+}
+
+function ensureLocalRelayHost() {
+  if (String(process.env.RELAY_LOCAL_HOST_STUB || 'true').trim().toLowerCase() === 'false') {
+    return null;
+  }
+
+  const hostId = getLocalRelayHostId();
+  if (!hostId || state.dismissedHosts.has(hostId)) {
+    return null;
+  }
+
+  const existing = state.hosts.get(hostId);
+  if (existing) {
+    existing.relayLocal = true;
+    existing.platform = existing.platform || process.platform;
+    existing.label = existing.label || getLocalRelayHostLabel();
+    state.hosts.set(hostId, existing);
+    return existing;
+  }
+
+  const localAgent = state.localAgents.get(hostId);
+  const host = {
+    hostId,
+    label: localAgent?.label || getLocalRelayHostLabel(),
+    platform: process.platform,
+    capabilities: {},
+    registeredAt: nowIso(),
+    lastSeenAt: null,
+    relayLocal: true,
+  };
+  state.hosts.set(hostId, host);
+  return host;
+}
+
 function safeLocalAgentId(value) {
   return String(value || 'local')
     .replace(/[^A-Za-z0-9._-]+/g, '-')
@@ -779,6 +832,39 @@ function safeLocalAgentId(value) {
 
 function getLocalRelayUrl() {
   return `http://127.0.0.1:${PORT}`;
+}
+
+function clearLocalAgentRestartTimer(record) {
+  if (!record?.restartTimer) {
+    return;
+  }
+  clearTimeout(record.restartTimer);
+  record.restartTimer = null;
+  record.nextRestartAt = null;
+}
+
+function localAgentTimestampMs(value) {
+  const parsed = Date.parse(value || '');
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function shouldAutoRestartLocalAgent(record) {
+  return Boolean(
+    LOCAL_AGENT_WATCHDOG_ENABLED
+      && record
+      && record.autoRestart !== false
+      && record.desiredState !== 'stopped'
+  );
+}
+
+function getLocalAgentRestartDelay(record, requestedDelayMs = 0) {
+  const requested = Number(requestedDelayMs) || 0;
+  const lastRestartMs = localAgentTimestampMs(record?.lastRestartAt);
+  if (!lastRestartMs) {
+    return Math.max(0, requested);
+  }
+  const cooldownLeft = LOCAL_AGENT_RESTART_COOLDOWN_MS - (Date.now() - lastRestartMs);
+  return Math.max(0, requested, cooldownLeft);
 }
 
 function publicLocalAgentRecord(record) {
@@ -799,6 +885,12 @@ function publicLocalAgentRecord(record) {
     logPath: record.logPath || null,
     errorLogPath: record.errorLogPath || null,
     message: record.message || '',
+    desiredState: record.desiredState || 'running',
+    autoRestart: record.autoRestart !== false,
+    restartCount: record.restartCount || 0,
+    lastRestartAt: record.lastRestartAt || null,
+    nextRestartAt: record.nextRestartAt || null,
+    restartReason: record.restartReason || null,
   };
 }
 
@@ -809,7 +901,7 @@ function markLocalAgentExited(hostId, code, signal) {
   }
   record.process = null;
   record.pid = null;
-  record.status = record.status === 'stopping' ? 'stopped' : 'exited';
+  record.status = record.status === 'stopping' || record.desiredState === 'stopped' ? 'stopped' : 'exited';
   record.exitCode = code;
   record.signal = signal || null;
   record.exitedAt = nowIso();
@@ -817,8 +909,45 @@ function markLocalAgentExited(hostId, code, signal) {
   record.message = signal ? `local agent exited with signal ${signal}` : `local agent exited with code ${code}`;
 }
 
-function stopLocalAgent(hostId) {
+function scheduleLocalAgentRestart(hostId, reason, delayMs = 0) {
   const record = state.localAgents.get(hostId);
+  if (!shouldAutoRestartLocalAgent(record) || record.restartTimer) {
+    return false;
+  }
+
+  const delay = getLocalAgentRestartDelay(record, delayMs);
+  record.status = 'restarting';
+  record.restartReason = reason || 'watchdog';
+  record.updatedAt = nowIso();
+  record.nextRestartAt = new Date(Date.now() + delay).toISOString();
+  record.message = `local agent restart scheduled: ${record.restartReason}`;
+  record.restartTimer = setTimeout(() => {
+    const latest = state.localAgents.get(hostId);
+    if (!shouldAutoRestartLocalAgent(latest)) {
+      return;
+    }
+    clearLocalAgentRestartTimer(latest);
+    startLocalAgent({
+      hostId: latest.hostId,
+      label: latest.label,
+      restart: true,
+      reason: latest.restartReason || reason || 'watchdog',
+    });
+  }, delay);
+  record.restartTimer.unref?.();
+  return true;
+}
+
+function stopLocalAgent(hostId, options = {}) {
+  const record = state.localAgents.get(hostId);
+  const disableAutoRestart = options.disableAutoRestart !== false;
+  if (record) {
+    clearLocalAgentRestartTimer(record);
+    if (disableAutoRestart) {
+      record.desiredState = 'stopped';
+      record.autoRestart = false;
+    }
+  }
   if (!record?.process || record.process.killed) {
     if (record) {
       record.status = 'stopped';
@@ -847,13 +976,16 @@ function stopLocalAgent(hostId) {
   };
 }
 
-function startLocalAgent({ hostId, label, restart = false } = {}) {
+function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
   const normalizedHostId = String(hostId || os.hostname() || 'local').trim();
   if (!normalizedHostId) {
     return { ok: false, status: 'invalid_host', message: 'hostId is required' };
   }
 
   const existing = state.localAgents.get(normalizedHostId);
+  if (existing) {
+    clearLocalAgentRestartTimer(existing);
+  }
   if (existing?.process && !existing.process.killed) {
     if (!restart) {
       return {
@@ -864,7 +996,7 @@ function startLocalAgent({ hostId, label, restart = false } = {}) {
         localAgent: publicLocalAgentRecord(existing),
       };
     }
-    stopLocalAgent(normalizedHostId);
+    stopLocalAgent(normalizedHostId, { disableAutoRestart: false });
   }
 
   fs.mkdirSync(LOCAL_AGENT_LOG_ROOT, { recursive: true });
@@ -893,6 +1025,7 @@ function startLocalAgent({ hostId, label, restart = false } = {}) {
   child.stdout.pipe(stdout);
   child.stderr.pipe(stderr);
 
+  const previousRestartCount = existing?.restartCount || 0;
   const record = {
     hostId: normalizedHostId,
     label: String(label || normalizedHostId).trim() || normalizedHostId,
@@ -904,7 +1037,14 @@ function startLocalAgent({ hostId, label, restart = false } = {}) {
     relayUrl,
     logPath,
     errorLogPath,
-    message: 'local host-agent is starting',
+    message: restart ? `local host-agent is restarting${reason ? `: ${reason}` : ''}` : 'local host-agent is starting',
+    desiredState: 'running',
+    autoRestart: true,
+    restartCount: restart ? previousRestartCount + 1 : previousRestartCount,
+    lastRestartAt: restart ? nowIso() : existing?.lastRestartAt || null,
+    nextRestartAt: null,
+    restartReason: restart ? reason || 'manual restart' : existing?.restartReason || null,
+    restartTimer: null,
   };
   state.localAgents.set(normalizedHostId, record);
 
@@ -917,6 +1057,7 @@ function startLocalAgent({ hostId, label, restart = false } = {}) {
     record.status = 'error';
     record.updatedAt = nowIso();
     record.message = error.message || 'failed to start local host-agent';
+    scheduleLocalAgentRestart(normalizedHostId, `process error: ${record.message}`, LOCAL_AGENT_EXIT_RESTART_DELAY_MS);
   });
   child.on('exit', (code, signal) => {
     stdout.end();
@@ -924,7 +1065,11 @@ function startLocalAgent({ hostId, label, restart = false } = {}) {
     if (state.localAgents.get(normalizedHostId) !== record) {
       return;
     }
+    const shouldRestart = shouldAutoRestartLocalAgent(record) && record.status !== 'stopping';
     markLocalAgentExited(normalizedHostId, code, signal);
+    if (shouldRestart) {
+      scheduleLocalAgentRestart(normalizedHostId, record.message, LOCAL_AGENT_EXIT_RESTART_DELAY_MS);
+    }
   });
 
   const host = state.hosts.get(normalizedHostId) || {
@@ -947,6 +1092,32 @@ function startLocalAgent({ hostId, label, restart = false } = {}) {
     message: `Starting local host-agent for ${normalizedHostId}.`,
     localAgent: publicLocalAgentRecord(record),
   };
+}
+
+function localAgentWatchdogTick() {
+  if (!LOCAL_AGENT_WATCHDOG_ENABLED) {
+    return;
+  }
+  for (const record of state.localAgents.values()) {
+    if (!shouldAutoRestartLocalAgent(record) || record.restartTimer) {
+      continue;
+    }
+    const processDead = !record.process || record.process.killed || ['exited', 'error', 'stopped'].includes(record.status);
+    if (processDead) {
+      scheduleLocalAgentRestart(record.hostId, `watchdog saw ${record.status || 'missing process'}`);
+      continue;
+    }
+    const startedAtMs = localAgentTimestampMs(record.startedAt);
+    const startedAgeMs = startedAtMs ? Date.now() - startedAtMs : Number.POSITIVE_INFINITY;
+    if (startedAgeMs < LOCAL_AGENT_OFFLINE_RESTART_MS) {
+      continue;
+    }
+    const host = state.hosts.get(record.hostId);
+    const heartbeatAgeMs = hostHeartbeatAgeMs(host);
+    if (heartbeatAgeMs > LOCAL_AGENT_OFFLINE_RESTART_MS) {
+      scheduleLocalAgentRestart(record.hostId, `heartbeat stale for ${Math.round(heartbeatAgeMs / 1000)}s`);
+    }
+  }
 }
 
 function getSession(hostId, sessionId) {
@@ -6301,6 +6472,31 @@ function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'session.transcript') {
+    const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const speaker = event.speaker || 'system';
+    const existing = getSession(event.hostId, effectiveSessionId);
+    const next = upsertSession(event.hostId, {
+      sessionId: effectiveSessionId,
+      source: existing?.source || (event.source === 'codex-jsonl' ? 'imported' : 'managed'),
+      state: existing?.state || 'imported',
+      live: existing?.live || false,
+      latestUserMessage: speaker === 'user' ? event.text || null : existing?.latestUserMessage || null,
+      latestAgentMessage: (speaker === 'agent' || speaker === 'assistant') ? event.text || null : existing?.latestAgentMessage || null,
+      nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
+      lastUpdatedAt: event.timestamp || nowIso(),
+    });
+    emitTranscriptEntry(event.hostId, effectiveSessionId, {
+      speaker,
+      text: event.text || '',
+      stream: event.stream || null,
+      files: event.files || event.attachments || [],
+      timestamp: event.timestamp || nowIso(),
+    });
+    broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.snapshot', getSession(event.hostId, effectiveSessionId) || next);
+    return;
+  }
+
   if (event.type === 'session.state_changed') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
     const existingSession = getSession(event.hostId, effectiveSessionId);
@@ -6346,6 +6542,16 @@ function applyAgentEvent(event) {
 
   if (event.type === 'session.runtime_updated') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const existing = getSession(event.hostId, effectiveSessionId);
+    upsertSession(event.hostId, {
+      sessionId: effectiveSessionId,
+      title: existing?.title || effectiveSessionId,
+      source: existing?.source || (event.source === 'codex-jsonl' ? 'imported' : 'managed'),
+      state: existing?.state || (event.patch?.phase || 'imported'),
+      live: Boolean(existing?.live),
+      lastUpdatedAt: event.timestamp || nowIso(),
+      nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
+    });
     const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
       ...(event.patch || {}),
       updatedAt: event.timestamp || nowIso(),
@@ -6392,6 +6598,16 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.diagnostic') {
+    const existing = getSession(event.hostId, sessionId);
+    upsertSession(event.hostId, {
+      sessionId,
+      title: existing?.title || sessionId,
+      source: existing?.source || (event.source === 'codex-jsonl' ? 'imported' : 'managed'),
+      state: existing?.state || 'imported',
+      live: Boolean(existing?.live),
+      lastUpdatedAt: event.timestamp || nowIso(),
+      nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || sessionId,
+    });
     emitSessionDiagnostic(event.hostId, sessionId, {
       severity: event.severity || 'info',
       source: event.source || 'codex',
@@ -6486,6 +6702,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`relay listening on http://127.0.0.1:${PORT}`);
+  if (LOCAL_AGENT_WATCHDOG_ENABLED) {
+    console.log(`local agent watchdog enabled; restart after ${Math.round(LOCAL_AGENT_OFFLINE_RESTART_MS / 1000)}s stale heartbeat`);
+  }
   if (RELAY_AUTH_TOKEN) {
     console.log(`relay auth enabled; token file: ${RELAY_AUTH_TOKEN_PATH}`);
     console.log(relayAuthAccount?.username
@@ -6495,3 +6714,8 @@ server.listen(PORT, () => {
     console.warn('relay auth disabled by RELAY_AUTH_DISABLED');
   }
 });
+
+if (LOCAL_AGENT_WATCHDOG_ENABLED) {
+  const localAgentWatchdogTimer = setInterval(localAgentWatchdogTick, LOCAL_AGENT_WATCHDOG_INTERVAL_MS);
+  localAgentWatchdogTimer.unref?.();
+}

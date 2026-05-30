@@ -2,18 +2,21 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
-const { discoverCodexSessions } = require('../shared/codex-discovery');
+const { discoverCodexSessions, makeCodexRowEvents } = require('../shared/codex-discovery');
+const { CodexSessionTailer } = require('../shared/codex-tail');
 
 const ROOT = path.join(__dirname, '..');
 const PORT = 8792;
 const RELAY_URL = `http://127.0.0.1:${PORT}`;
 const RELAY_AUTH_TOKEN = 'managed-test-relay-token';
 const RELAY_AUTH_ACCOUNT_PATH = path.join(ROOT, 'tmp', 'runtime', `managed-test-auth-account-${process.pid}.json`);
+const TEST_CODEX_HOME = path.join(ROOT, 'tmp', 'runtime', `managed-test-codex-home-${process.pid}`);
 const HOST_ID = 'managed-test-host';
 const HOST_LABEL = 'Managed Test Host';
 
 async function main() {
   verifyCodexDiscoveryFormats();
+  await verifyCodexTailer();
 
   const relay = spawnNode(path.join(ROOT, 'apps', 'relay', 'server.js'), {
     ...process.env,
@@ -33,6 +36,7 @@ async function main() {
       RELAY_AUTH_TOKEN,
       HOST_ID,
       HOST_LABEL,
+      CODEX_HOME: TEST_CODEX_HOME,
       AUTO_START_SESSION: 'true',
       MANAGED_COMMAND: 'demo',
       MANAGED_CWD: ROOT,
@@ -135,6 +139,7 @@ async function main() {
       throw new Error('chunked downloaded file content did not match uploaded content');
     }
 
+    const jsonlTail = await verifyAgentJsonlTail();
     const migration = await verifyBridgeSessionMigration();
 
     const stats = await getJson('/api/stats');
@@ -152,6 +157,7 @@ async function main() {
         chunkedUploadedPath: chunkedFile.path,
         chunkedDownloadedBytes: chunkedDownloaded.length,
       },
+      jsonlTail,
       bridgeMigration: migration,
       stats: {
         totalHosts: stats.summary.totalHosts,
@@ -165,6 +171,119 @@ async function main() {
     }
     await stopProcess(agent);
     await stopProcess(relay);
+  }
+}
+
+async function verifyAgentJsonlTail() {
+  const tailSessionId = '019efeed-8888-7abc-8def-0123456789ac';
+  const sessionDir = path.join(TEST_CODEX_HOME, 'sessions', '2026', '05', '27');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-05-27T12-35-00-${tailSessionId}.jsonl`);
+  const prompt = `jsonl-tail-smoke-${Date.now()}`;
+  fs.writeFileSync(rolloutPath, [
+    JSON.stringify({
+      timestamp: '2026-05-27T04:35:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: tailSessionId,
+        cwd: ROOT,
+        source: 'rollout',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-27T04:35:01.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        message: prompt,
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-27T04:35:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_started',
+        turn_id: 'jsonl-tail-turn',
+        model_context_window: 258400,
+      },
+    }),
+    '',
+  ].join('\n'));
+
+  await waitFor(async () => {
+    const sessions = await getJson(`/api/hosts/${encodeURIComponent(HOST_ID)}/sessions`);
+    return (sessions.sessions || []).find((item) => item.sessionId === tailSessionId) || null;
+  }, 10000, 250);
+
+  const detail = await waitFor(async () => {
+    const response = await getJson(`/api/sessions/${encodeURIComponent(tailSessionId)}/detail?hostId=${encodeURIComponent(HOST_ID)}`);
+    const hasPrompt = (response.transcript || []).some((entry) => entry.text === prompt);
+    const hasRuntime = response.runtime?.activeTurnId === 'jsonl-tail-turn';
+    return hasPrompt && hasRuntime ? response : null;
+  }, 10000, 250);
+
+  return {
+    sessionId: tailSessionId,
+    transcriptEntries: detail.transcript.length,
+    activeTurnId: detail.runtime.activeTurnId,
+  };
+}
+
+async function verifyCodexTailer() {
+  const sessionId = '019efeed-7777-7abc-8def-0123456789ab';
+  const codexHome = path.join(ROOT, 'tmp', 'runtime', `tail-smoke-${process.pid}`);
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '27');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-05-27T12-30-00-${sessionId}.jsonl`);
+  fs.writeFileSync(rolloutPath, [
+    JSON.stringify({
+      timestamp: '2026-05-27T04:30:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: sessionId,
+        cwd: ROOT,
+      },
+    }),
+    '',
+  ].join('\n'));
+
+  const events = [];
+  const tailer = new CodexSessionTailer({
+    codexHome,
+    hostId: 'tail-smoke-host',
+    postEvent: async (event) => {
+      events.push(event);
+    },
+  });
+  tailer.prime();
+  fs.appendFileSync(rolloutPath, [
+    JSON.stringify({
+      timestamp: '2026-05-27T04:31:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        message: 'tail smoke prompt',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-27T04:31:01.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_started',
+        turn_id: 'tail-turn',
+      },
+    }),
+    '',
+  ].join('\n'));
+  const result = await tailer.poll();
+  if (result.emittedEvents < 2) {
+    throw new Error('codex tailer did not emit appended JSONL events');
+  }
+  if (!events.find((event) => event.type === 'session.transcript' && event.text === 'tail smoke prompt')) {
+    throw new Error('codex tailer did not emit transcript event');
+  }
+  if (!events.find((event) => event.type === 'session.runtime_updated' && event.patch?.activeTurnId === 'tail-turn')) {
+    throw new Error('codex tailer did not emit runtime event');
   }
 }
 
@@ -216,6 +335,31 @@ function verifyCodexDiscoveryFormats() {
   }
   if (session.latestAgentMessage !== 'found from fallback rollout parsing') {
     throw new Error('discovery did not parse response_item assistant message');
+  }
+
+  const taskEvents = makeCodexRowEvents({
+    timestamp: '2026-05-27T04:32:30.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'task_started',
+      turn_id: 'turn-smoke',
+      model_context_window: 258400,
+    },
+  });
+  if (!taskEvents.find((event) => event.type === 'session.runtime_updated' && event.patch?.phase === 'thinking' && event.patch?.activeTurnId === 'turn-smoke')) {
+    throw new Error('codex row parser did not emit task_started runtime state');
+  }
+
+  const reasoningEvents = makeCodexRowEvents({
+    timestamp: '2026-05-27T04:32:40.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: 'checked the live tail parser' }],
+    },
+  });
+  if (!reasoningEvents.find((event) => event.type === 'session.diagnostic' && event.entry?.kind === 'reasoning')) {
+    throw new Error('codex row parser did not emit reasoning diagnostics');
   }
 }
 

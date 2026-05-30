@@ -268,6 +268,304 @@ function makeTranscriptEntry(row) {
   return null;
 }
 
+function makeCodexRowEvents(row) {
+  const events = [];
+  if (!row || typeof row !== 'object') {
+    return events;
+  }
+
+  const transcript = makeTranscriptEntry(row);
+  if (transcript) {
+    events.push({
+      type: 'session.transcript',
+      entry: transcript,
+    });
+  }
+
+  const runtime = makeRuntimePatch(row);
+  if (runtime) {
+    events.push({
+      type: 'session.runtime_updated',
+      patch: runtime,
+    });
+  }
+
+  const diagnostic = makeDiagnosticEntry(row);
+  if (diagnostic) {
+    events.push({
+      type: 'session.diagnostic',
+      entry: diagnostic,
+    });
+  }
+
+  return events;
+}
+
+function makeRuntimePatch(row) {
+  const payload = row.payload || {};
+  const timestamp = row.timestamp || null;
+
+  if (row.type === 'event_msg' && payload.type === 'task_started') {
+    return {
+      connection: 'tailing',
+      phase: 'thinking',
+      busy: true,
+      activeTurnId: payload.turn_id || null,
+      currentTurnStatus: 'inProgress',
+      modelContextWindow: payload.model_context_window || null,
+      updatedAt: timestamp,
+    };
+  }
+
+  if (row.type === 'event_msg' && payload.type === 'task_complete') {
+    return {
+      connection: 'tailing',
+      phase: 'idle',
+      busy: false,
+      activeTurnId: null,
+      waitingOnApproval: false,
+      waitingOnUserInput: false,
+      currentTurnStatus: 'completed',
+      lastTurnDurationMs: payload.duration_ms || null,
+      timeToFirstTokenMs: payload.time_to_first_token_ms || null,
+      updatedAt: timestamp,
+    };
+  }
+
+  if (row.type === 'event_msg' && payload.type === 'turn_aborted') {
+    return {
+      connection: 'tailing',
+      phase: 'interrupted',
+      busy: false,
+      activeTurnId: null,
+      waitingOnApproval: false,
+      waitingOnUserInput: false,
+      currentTurnStatus: 'interrupted',
+      lastTurnDurationMs: payload.duration_ms || null,
+      updatedAt: timestamp,
+    };
+  }
+
+  if (row.type === 'event_msg' && payload.type === 'token_count') {
+    const patch = {
+      connection: 'tailing',
+      updatedAt: timestamp,
+    };
+    const tokenUsage = normalizeTokenUsage(payload.info || {});
+    const rateLimits = normalizeRateLimits(payload.rate_limits);
+    if (tokenUsage) {
+      patch.tokenUsage = tokenUsage;
+    }
+    if (rateLimits) {
+      patch.rateLimits = rateLimits;
+    }
+    return Object.keys(patch).length > 2 ? patch : null;
+  }
+
+  if (row.type === 'response_item' && payload.type === 'function_call') {
+    return {
+      connection: 'tailing',
+      phase: 'thinking',
+      busy: true,
+      updatedAt: timestamp,
+    };
+  }
+
+  return null;
+}
+
+function makeDiagnosticEntry(row) {
+  const payload = row.payload || {};
+  const timestamp = row.timestamp || null;
+
+  if (row.type === 'response_item' && payload.type === 'reasoning') {
+    const text = extractReasoningText(payload);
+    if (!text) {
+      return null;
+    }
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: 'reasoning',
+      method: 'response_item/reasoning',
+      message: limitText(text, 300),
+      data: {
+        text,
+      },
+    };
+  }
+
+  if (row.type === 'response_item' && payload.type === 'function_call') {
+    const call = summarizeFunctionCall(payload);
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: call.kind,
+      method: `response_item/function_call/${call.name || 'tool'}`,
+      message: call.message,
+      data: call.data,
+    };
+  }
+
+  if (row.type === 'response_item' && payload.type === 'function_call_output') {
+    const output = cleanDiagnosticText(payload.output || '');
+    if (!output) {
+      return null;
+    }
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: 'command-output',
+      method: 'response_item/function_call_output',
+      message: limitText(output, 300),
+      data: {
+        callId: payload.call_id || null,
+        output: limitText(output, 2000),
+      },
+    };
+  }
+
+  if (row.type !== 'event_msg' || !payload.type) {
+    return null;
+  }
+
+  if (payload.type === 'task_started') {
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: 'turn',
+      method: 'event_msg/task_started',
+      message: `Turn started${payload.turn_id ? `: ${payload.turn_id}` : ''}`,
+      turnId: payload.turn_id || null,
+      data: {
+        turnId: payload.turn_id || null,
+        startedAt: payload.started_at || timestamp,
+        modelContextWindow: payload.model_context_window || null,
+        collaborationMode: payload.collaboration_mode_kind || null,
+      },
+    };
+  }
+
+  if (payload.type === 'task_complete') {
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: 'turn',
+      method: 'event_msg/task_complete',
+      message: `Turn completed${payload.duration_ms ? ` in ${payload.duration_ms}ms` : ''}`,
+      turnId: payload.turn_id || null,
+      data: {
+        turnId: payload.turn_id || null,
+        completedAt: payload.completed_at || timestamp,
+        durationMs: payload.duration_ms || null,
+        timeToFirstTokenMs: payload.time_to_first_token_ms || null,
+      },
+    };
+  }
+
+  if (payload.type === 'turn_aborted') {
+    return {
+      timestamp,
+      severity: 'warning',
+      source: 'codex-jsonl',
+      kind: 'turn',
+      method: 'event_msg/turn_aborted',
+      message: payload.reason ? `Turn aborted: ${payload.reason}` : 'Turn aborted',
+      turnId: payload.turn_id || null,
+      data: {
+        turnId: payload.turn_id || null,
+        reason: payload.reason || null,
+        completedAt: payload.completed_at || timestamp,
+        durationMs: payload.duration_ms || null,
+      },
+    };
+  }
+
+  if (payload.type === 'patch_apply_end') {
+    const changes = normalizePatchChanges(payload.changes);
+    return {
+      timestamp,
+      severity: payload.success === false ? 'error' : 'info',
+      source: 'codex-jsonl',
+      kind: 'file-change',
+      method: 'event_msg/patch_apply_end',
+      message: payload.success === false ? 'Patch apply failed' : `Patch applied${changes.length ? `: ${changes.length} file(s)` : ''}`,
+      turnId: payload.turn_id || null,
+      data: {
+        callId: payload.call_id || null,
+        turnId: payload.turn_id || null,
+        status: payload.status || null,
+        success: typeof payload.success === 'boolean' ? payload.success : null,
+        stdout: limitText(payload.stdout || '', 2000),
+        stderr: limitText(payload.stderr || '', 2000),
+        changes,
+      },
+    };
+  }
+
+  if (payload.type === 'web_search_end') {
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: 'web-search',
+      method: 'event_msg/web_search_end',
+      message: payload.query ? `Web search: ${limitText(payload.query, 220)}` : 'Web search finished',
+      data: {
+        callId: payload.call_id || null,
+        query: payload.query || null,
+        action: payload.action || null,
+      },
+    };
+  }
+
+  if (payload.type === 'context_compacted') {
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: 'thread',
+      method: 'event_msg/context_compacted',
+      message: 'Context compacted',
+      data: payload,
+    };
+  }
+
+  if (payload.type === 'thread_rolled_back') {
+    return {
+      timestamp,
+      severity: 'warning',
+      source: 'codex-jsonl',
+      kind: 'thread',
+      method: 'event_msg/thread_rolled_back',
+      message: `Thread rolled back${payload.num_turns ? ` by ${payload.num_turns} turn(s)` : ''}`,
+      data: payload,
+    };
+  }
+
+  if (payload.type === 'token_count') {
+    return {
+      timestamp,
+      severity: 'info',
+      source: 'codex-jsonl',
+      kind: 'token-usage',
+      method: 'event_msg/token_count',
+      message: 'Token usage updated',
+      data: {
+        tokenUsage: normalizeTokenUsage(payload.info || {}),
+        rateLimits: normalizeRateLimits(payload.rate_limits),
+      },
+    };
+  }
+
+  return null;
+}
+
 function extractPayloadText(payload) {
   if (!payload) {
     return '';
@@ -302,6 +600,167 @@ function extractPayloadText(payload) {
     })
     .filter(Boolean)
     .join('\n');
+}
+
+function extractReasoningText(payload) {
+  const candidates = [
+    payload.summary,
+    payload.content,
+    payload.text,
+  ];
+  for (const candidate of candidates) {
+    const text = extractStructuredText(candidate);
+    if (text) {
+      return cleanDiagnosticText(text);
+    }
+  }
+  return '';
+}
+
+function extractStructuredText(value) {
+  if (!value) {
+    return '';
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map(extractStructuredText)
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof value !== 'object') {
+    return String(value);
+  }
+  return value.text
+    || value.content
+    || value.summary
+    || value.delta
+    || value.output_text
+    || value.input_text
+    || '';
+}
+
+function parseJsonObject(value) {
+  if (!value) {
+    return null;
+  }
+  if (typeof value === 'object') {
+    return value;
+  }
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function summarizeFunctionCall(payload) {
+  const name = String(payload.name || 'tool').trim();
+  const args = parseJsonObject(payload.arguments) || {};
+  const command = cleanDiagnosticText(args.command || args.cmd || args.text || '');
+  const workdir = cleanDiagnosticText(args.workdir || args.cwd || '');
+  const summary = command || cleanDiagnosticText(args.path || args.file || args.target || '');
+  const isPatch = /patch|apply_patch|file|edit|write/i.test(name);
+  return {
+    name,
+    kind: isPatch ? 'file-change' : 'tool-call',
+    message: `${name}${summary ? `: ${limitText(summary, 220)}` : ''}`,
+    data: {
+      name,
+      callId: payload.call_id || null,
+      arguments: args,
+      command: command || null,
+      cwd: workdir || null,
+    },
+  };
+}
+
+function normalizePatchChanges(changes) {
+  if (!Array.isArray(changes)) {
+    return [];
+  }
+  return changes
+    .map((change) => {
+      if (!change || typeof change !== 'object') {
+        return null;
+      }
+      return {
+        path: change.path || change.file || change.file_path || change.name || 'workspace change',
+        additions: Number(change.additions || change.added || change.lines_added || 0) || 0,
+        deletions: Number(change.deletions || change.deleted || change.lines_deleted || 0) || 0,
+        diff: change.diff || change.patch || change.unified_diff || '',
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeTokenUsage(info) {
+  const total = normalizeTokenUsageRecord(info.total_token_usage || info.totalTokenUsage || info.total);
+  const last = normalizeTokenUsageRecord(info.last_token_usage || info.lastTokenUsage || info.last);
+  if (!total && !last) {
+    return null;
+  }
+  return {
+    total: total || last,
+    last: last || total,
+    modelContextWindow: info.model_context_window || info.modelContextWindow || null,
+  };
+}
+
+function normalizeTokenUsageRecord(record) {
+  if (!record || typeof record !== 'object') {
+    return null;
+  }
+  return {
+    inputTokens: Number(record.input_tokens ?? record.inputTokens ?? 0) || 0,
+    cachedInputTokens: Number(record.cached_input_tokens ?? record.cachedInputTokens ?? 0) || 0,
+    outputTokens: Number(record.output_tokens ?? record.outputTokens ?? 0) || 0,
+    reasoningOutputTokens: Number(record.reasoning_output_tokens ?? record.reasoningOutputTokens ?? 0) || 0,
+    totalTokens: Number(record.total_tokens ?? record.totalTokens ?? 0) || 0,
+  };
+}
+
+function normalizeRateLimits(rateLimits) {
+  const first = Array.isArray(rateLimits) ? rateLimits[0] : rateLimits;
+  if (!first || typeof first !== 'object') {
+    return null;
+  }
+  return {
+    planType: first.plan_type || first.planType || null,
+    primary: normalizeRateLimitWindow(first.primary),
+    secondary: normalizeRateLimitWindow(first.secondary),
+    credits: first.credits || null,
+    rateLimitReachedType: first.rate_limit_reached_type || first.rateLimitReachedType || null,
+  };
+}
+
+function normalizeRateLimitWindow(value) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  return {
+    usedPercent: Number(value.used_percent ?? value.usedPercent ?? 0) || 0,
+    windowDurationMins: Number(value.window_duration_mins ?? value.windowDurationMins ?? 0) || null,
+    resetsAt: value.resets_at || value.resetsAt || null,
+  };
+}
+
+function cleanDiagnosticText(value) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .trim();
+}
+
+function limitText(value, max = 500) {
+  const text = cleanDiagnosticText(value);
+  if (!text || text.length <= max) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, max - 3))}...`;
 }
 
 function dedupeTranscriptEntries(entries) {
@@ -421,4 +880,6 @@ function walkFiles(rootDir, visit) {
 module.exports = {
   discoverCodexSessions,
   getDefaultCodexHome,
+  makeCodexRowEvents,
+  makeTranscriptEntry,
 };

@@ -37,6 +37,24 @@ So the system needs both:
 - a metadata scanner;
 - a live process bridge.
 
+## Passive real-time tailing
+
+The host-agent can also tail appended rows from
+`~/.codex/sessions/**/*.jsonl` after its initial discovery pass.
+
+This is useful for:
+
+- showing newly appended user and assistant transcript entries;
+- reflecting passive runtime state such as task started, task completed, and
+  aborted turns;
+- surfacing token usage, patch, tool-call, and reasoning diagnostics when the
+  JSONL contains those fields.
+
+This is still passive observation. It does not make an imported external Codex
+process controllable by itself. Stop, interrupt, prompt queueing, steering, and
+request responses still need a managed app-server session that the host-agent
+owns.
+
 ## Recommended host-agent responsibilities
 
 The host agent should provide four services.

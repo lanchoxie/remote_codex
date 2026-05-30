@@ -515,6 +515,9 @@ const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
   'cs',
   'css',
   'csv',
+  'cmp',
+  'dat',
+  'data',
   'doc',
   'docx',
   'go',
@@ -531,6 +534,7 @@ const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
   'rs',
   'sh',
   'sql',
+  'tsv',
   'toml',
   'ts',
   'tsx',
@@ -1319,6 +1323,22 @@ function normalizeThinkingMessage(entry) {
     return '';
   }
 
+  const kind = String(entry.kind || '').toLowerCase();
+  if (kind === 'token-usage') {
+    const usage = entry.data?.tokenUsage || entry.data || null;
+    const text = usage ? formatTokenUsage({ tokenUsage: usage }) : '';
+    if (text && !/No token usage/i.test(text)) {
+      return text;
+    }
+  }
+  if (kind === 'rate-limits') {
+    const limits = entry.data?.rateLimits || entry.data || null;
+    const text = limits ? formatRateLimits({ rateLimits: limits }) : '';
+    if (text && !/No rate limit/i.test(text)) {
+      return text;
+    }
+  }
+
   const candidates = [
     entry.message,
     entry.detail,
@@ -1328,6 +1348,13 @@ function normalizeThinkingMessage(entry) {
     entry.data?.plan,
     entry.data?.delta,
     entry.data?.rawPlan,
+    entry.data?.command,
+    entry.data?.query,
+    entry.data?.output,
+    entry.data?.stdin,
+    entry.data?.arguments?.command,
+    entry.data?.arguments?.path,
+    entry.data?.arguments?.target,
   ];
 
   for (const candidate of candidates) {
@@ -1338,6 +1365,148 @@ function normalizeThinkingMessage(entry) {
   }
 
   return '';
+}
+
+function isThinkingActivityDiagnostic(entry) {
+  if (!entry) {
+    return false;
+  }
+  if (isFileChangeDiagnostic(entry)) {
+    return true;
+  }
+
+  const kind = String(entry.kind || '').toLowerCase();
+  const method = String(entry.method || '').toLowerCase();
+  return [
+    'reasoning',
+    'plan',
+    'tool-call',
+    'command-output',
+    'terminal',
+    'web-search',
+    'turn',
+    'thread',
+    'thread-status',
+    'token-usage',
+    'rate-limits',
+    'approval',
+    'permissions',
+    'user-input',
+    'warning',
+    'error',
+    'control',
+    'runtime-startup',
+    'native-thread-fallback',
+  ].includes(kind)
+    || method.startsWith('turn/')
+    || method.startsWith('thread/')
+    || method.includes('commandexecution')
+    || method.includes('tool')
+    || method.includes('web_search');
+}
+
+function requestToThinkingDiagnostic(request) {
+  if (!request) {
+    return null;
+  }
+  const method = request.method || '';
+  let kind = request.kind || 'request';
+  if (isFileChangeDiagnostic({ kind, method, message: request.summary || request.message || '' })) {
+    kind = 'file-change';
+  } else if (kind === 'request') {
+    kind = method.includes('requestUserInput') ? 'user-input' : 'approval';
+  }
+  return {
+    timestamp: request.createdAt || request.updatedAt || new Date().toISOString(),
+    severity: request.status === 'pending' ? 'warning' : 'info',
+    source: 'codex',
+    kind,
+    method: method || 'request',
+    message: request.summary || request.message || request.title || 'Codex requested user action',
+    data: request.payload || null,
+    turnId: request.payload?.turnId || null,
+  };
+}
+
+function getThinkingDiagnosticsForSession(session) {
+  if (!session) {
+    return [];
+  }
+  const diagnostics = getDiagnosticsForSession(session)
+    .filter(isThinkingActivityDiagnostic);
+  const requestDiagnostics = getRequestsForSession(session)
+    .map(requestToThinkingDiagnostic)
+    .filter(Boolean)
+    .filter(isThinkingActivityDiagnostic);
+  return [...diagnostics, ...requestDiagnostics];
+}
+
+function buildThinkingActivityEntries(diagnostics) {
+  const merged = [];
+  for (const diag of diagnostics || []) {
+    const text = normalizeThinkingMessage(diag);
+    const fileChanges = normalizeFileChanges(diag);
+    if (!text && !fileChanges.length) {
+      continue;
+    }
+    if (text && !isUserSuitableThinkingText(text, diag)) {
+      continue;
+    }
+    const normalizedKind = isFileChangeDiagnostic(diag) ? 'file-change' : (diag.kind || 'thinking');
+    const previous = merged[merged.length - 1];
+    if (previous && previous.kind === normalizedKind && previous.text === text && !fileChanges.length) {
+      continue;
+    }
+    merged.push({
+      kind: normalizedKind,
+      method: diag.method || null,
+      text: text || 'File changes updated',
+      timestamp: diag.timestamp || null,
+      fileChanges,
+    });
+  }
+  return merged;
+}
+
+function isUserSuitableThinkingText(text, entry = {}) {
+  const value = String(text || '').trim();
+  if (!value) {
+    return false;
+  }
+  if (String(entry.kind || '').toLowerCase() === 'notification') {
+    return false;
+  }
+  if (/^\{\s*item:\s*\{/.test(value) || /^\{\s*threadId:/.test(value)) {
+    return false;
+  }
+  if (/^\[object Object\]$/.test(value)) {
+    return false;
+  }
+  return true;
+}
+
+function buildLiveActivitySegment(session, latestUserEntry = null) {
+  const startTime = Date.parse(latestUserEntry?.timestamp || '');
+  const startGraceMs = 5000;
+  const entries = getThinkingDiagnosticsForSession(session)
+    .filter((diag) => {
+      if (!Number.isFinite(startTime)) {
+        return true;
+      }
+      const diagTime = Date.parse(diag.timestamp || '');
+      return Number.isFinite(diagTime) && diagTime >= startTime - startGraceMs;
+    })
+    .sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
+  const activity = buildThinkingActivityEntries(entries).slice(-12);
+  if (!activity.length) {
+    return null;
+  }
+  return {
+    userTimestamp: latestUserEntry?.timestamp || 'live',
+    userText: latestUserEntry?.text || '',
+    entries: activity,
+    live: true,
+  };
 }
 
 function getLatestFormalAgentMessage(session) {
@@ -1362,28 +1531,11 @@ function buildThinkingEntriesForSession(session) {
 
   const transcript = getTranscriptForSession(session)
     .filter((entry) => entry && (entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant'));
-  const diagnostics = getDiagnosticsForSession(session)
-    .filter((entry) => entry && (
-      entry.kind === 'reasoning'
-      || entry.kind === 'plan'
-      || isFileChangeDiagnostic(entry)
-    ));
-  const requestDiagnostics = getRequestsForSession(session)
-    .filter((request) => request && isFileChangeDiagnostic(request))
-    .map((request) => ({
-      timestamp: request.createdAt || request.updatedAt || new Date().toISOString(),
-      severity: request.status === 'pending' ? 'warning' : 'info',
-      source: 'codex',
-      kind: 'file-change',
-      method: request.method || 'item/fileChange/requestApproval',
-      message: request.summary || request.message || 'File change approval requested',
-      data: request.payload || null,
-      turnId: request.payload?.turnId || null,
-    }));
-  const thinkingDiagnostics = [...diagnostics, ...requestDiagnostics];
+  const thinkingDiagnostics = getThinkingDiagnosticsForSession(session);
 
   const transcriptTimes = transcript.map((entry) => Date.parse(entry.timestamp || '')).map((value) => (Number.isFinite(value) ? value : null));
   const segments = [];
+  const startGraceMs = 5000;
 
   for (let index = 0; index < transcript.length; index += 1) {
     const entry = transcript[index];
@@ -1418,30 +1570,11 @@ function buildThinkingEntriesForSession(session) {
     const windowEntries = thinkingDiagnostics
       .filter((diag) => {
         const diagTime = Date.parse(diag.timestamp || '');
-        return Number.isFinite(diagTime) && diagTime >= startTime && diagTime <= replyTime;
+        return Number.isFinite(diagTime) && diagTime >= startTime - startGraceMs && diagTime <= replyTime;
       })
       .sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
 
-    const merged = [];
-    for (const diag of windowEntries) {
-      const text = normalizeThinkingMessage(diag);
-      const fileChanges = normalizeFileChanges(diag);
-      if (!text && !fileChanges.length) {
-        continue;
-      }
-      const normalizedKind = isFileChangeDiagnostic(diag) ? 'file-change' : (diag.kind || 'thinking');
-      const previous = merged[merged.length - 1];
-      if (previous && previous.kind === normalizedKind && previous.text === text && !fileChanges.length) {
-        continue;
-      }
-      merged.push({
-        kind: normalizedKind,
-        method: diag.method || null,
-        text: text || 'File changes updated',
-        timestamp: diag.timestamp || null,
-        fileChanges,
-      });
-    }
+    const merged = buildThinkingActivityEntries(windowEntries.slice(-80));
 
     if (merged.length) {
       segments.push({
@@ -1714,9 +1847,12 @@ function getRunnerSummary(session) {
   }
 
   if (session.source !== 'managed') {
+    const runtime = getRuntimeForSession(session) || session.runtime || {};
     return {
-      label: 'Imported History',
-      warning: 'This session is imported from .codex history only. It does not have a live process until you resume or fork it.',
+      label: runtime.connection === 'tailing' ? 'Imported History + Live Tail' : 'Imported History',
+      warning: runtime.connection === 'tailing'
+        ? 'This session is being tailed from .codex history in real time. Control actions still require a managed Codex app-server session.'
+        : 'This session is imported from .codex history only. It does not have a live process until you resume or fork it.',
     };
   }
 
@@ -3881,6 +4017,11 @@ function formatBytes(value) {
   return `${bytes} B`;
 }
 
+function formatTokenNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) && number > 0 ? number.toLocaleString() : '';
+}
+
 function fileExtension(name) {
   const text = String(name || '').trim().toLowerCase();
   const index = text.lastIndexOf('.');
@@ -5947,6 +6088,10 @@ function renderRuntimePanel() {
       : `Last update ${formatElapsedSince(runtime.updatedAt) || 'just now'} ago`,
     runtime.busy ? 'active' : 'info'
   );
+  const contextWindowText = formatContextWindow(runtime, { empty: '' });
+  if (contextWindowText) {
+    appendRuntimeChip('Context', contextWindowText, contextWindowTone(runtime));
+  }
   if (pingSince) {
     appendRuntimeChip('Heartbeat', `${pingSince} ago`, 'info');
   }
@@ -6047,6 +6192,60 @@ function describeThreadStatus(runtime) {
   return status.type || 'Unknown';
 }
 
+function getContextWindowStats(runtime = {}) {
+  const usage = runtime?.tokenUsage || {};
+  const windowSize = Number(
+    usage.modelContextWindow
+    || runtime.modelContextWindow
+    || runtime.contextWindow
+    || runtime.contextWindowTokens
+    || 0
+  ) || 0;
+  const usedTokens = Number(
+    runtime.contextUsedTokens
+    || runtime.contextInputTokens
+    || usage.last?.inputTokens
+    || usage.last?.totalTokens
+    || 0
+  ) || 0;
+  const percent = windowSize > 0 && usedTokens > 0
+    ? Math.min(999, Math.round((usedTokens / windowSize) * 1000) / 10)
+    : null;
+  return {
+    windowSize,
+    usedTokens,
+    percent,
+  };
+}
+
+function formatContextWindow(runtime = {}, options = {}) {
+  const stats = getContextWindowStats(runtime);
+  if (!stats.windowSize) {
+    return options.empty || 'No context window reported yet.';
+  }
+  const windowText = formatTokenNumber(stats.windowSize);
+  const usedText = formatTokenNumber(stats.usedTokens);
+  if (!stats.usedTokens) {
+    return `${windowText} tokens`;
+  }
+  const percentText = stats.percent != null ? ` | ${stats.percent}%` : '';
+  return `${usedText} / ${windowText}${percentText}`;
+}
+
+function contextWindowTone(runtime = {}) {
+  const percent = getContextWindowStats(runtime).percent;
+  if (percent == null) {
+    return 'info';
+  }
+  if (percent >= 95) {
+    return 'error';
+  }
+  if (percent >= 80) {
+    return 'warning';
+  }
+  return 'info';
+}
+
 function formatTokenUsage(runtime) {
   const usage = runtime?.tokenUsage;
   if (!usage?.last || !usage?.total) {
@@ -6059,8 +6258,9 @@ function formatTokenUsage(runtime) {
     `Session total: ${usage.total.totalTokens}`,
   ];
 
-  if (usage.modelContextWindow) {
-    lines.push(`Context window: ${usage.modelContextWindow}`);
+  const contextWindow = formatContextWindow(runtime, { empty: '' });
+  if (contextWindow) {
+    lines.push(`Context window: ${contextWindow}`);
   }
 
   return lines.join('\n');
@@ -6435,6 +6635,14 @@ function renderStatusWindow() {
     runtime.activeTurnId
       ? `${prettyStatusLabel(runtime.currentTurnStatus || 'inProgress')} | ${formatElapsedSince(runtime.turnStartedAt || runtime.updatedAt) || '0s'}`
       : prettyStatusLabel(runtime.currentTurnStatus || 'idle')
+  );
+  renderStatusSummaryCard(
+    summaryGrid,
+    'Context',
+    formatContextWindow(runtime),
+    getContextWindowStats(runtime).windowSize
+      ? 'Latest input / window | current estimate'
+      : 'Waiting for token usage or task metadata'
   );
   renderStatusSummaryCard(summaryGrid, 'Runner', getRunnerSummary(session).label, runtime.lastCodexError || '');
 
@@ -7244,8 +7452,8 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
         <div class="thinking-title">Thinking</div>
         <div class="thinking-phase">${entries.length ? `${entries.length} step${entries.length === 1 ? '' : 's'}` : 'Live'}</div>
       </div>
-      <div class="thinking-preview">${limitText(preview, 180)}</div>
-      <div class="thinking-note">${meta}</div>
+      <div class="thinking-preview">${escapeHtml(limitText(preview, 180))}</div>
+      <div class="thinking-note">${escapeHtml(meta)}</div>
     </summary>
   `;
 
@@ -7263,7 +7471,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
           <span class="thinking-history-kind">${prettyStatusLabel(entry.kind || 'thinking')}</span>
           <span>${formatTime(entry.timestamp)}</span>
         </div>
-        <div class="thinking-history-text">${entry.text}</div>
+        <div class="thinking-history-text">${escapeHtml(entry.text || '')}</div>
       `;
       if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
         item.appendChild(renderFileChangeDetails(entry.fileChanges));
@@ -7395,6 +7603,11 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       ? 'Waiting for the managed session transcript...'
       : 'No transcript preview was captured for this imported session.';
     log.appendChild(empty);
+    const liveSegment = buildLiveActivitySegment(session, null);
+    const showLiveActivity = liveSegment || (session.live && runtimeIsActive(runtime));
+    if (showLiveActivity) {
+      log.appendChild(buildThinkingMessageElement(session, liveSegment, runtime, stream, !liveSegment));
+    }
     restoreTranscriptScroll(log, { forceScroll: options.forceScroll || previousKey !== key });
     return;
   }
@@ -7439,7 +7652,10 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       );
 
       if (segment || shouldShowLivePlaceholder) {
-        log.appendChild(buildThinkingMessageElement(session, segment, runtime, stream, shouldShowLivePlaceholder && !segment));
+        const liveSegment = shouldShowLivePlaceholder && !segment
+          ? buildLiveActivitySegment(session, latestUserEntry)
+          : null;
+        log.appendChild(buildThinkingMessageElement(session, segment || liveSegment, runtime, stream, shouldShowLivePlaceholder && !segment && !liveSegment));
       }
     }
   }
@@ -7777,19 +7993,26 @@ function subscribeSession(session) {
     renderAlertsWindow();
   });
 
-  state.eventSource.addEventListener('session.runtime', (event) => {
-    const payload = JSON.parse(event.data);
-    patchRuntimeForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
-    const runtimeStopped = !runtimeIsActive(payload);
-    const status = String(payload.currentTurnStatus || payload.phase || '').toLowerCase();
-    if (runtimeStopped && status && status !== 'interrupted') {
-      clearActiveDraftForSession({
+  const handleRuntimePayload = (payload) => {
+    const runtimePayload = payload.patch && typeof payload.patch === 'object'
+      ? {
+        ...payload.patch,
         hostId: payload.hostId || session.hostId,
         sessionId: payload.sessionId || session.sessionId,
+        updatedAt: payload.timestamp || payload.patch.updatedAt || new Date().toISOString(),
+      }
+      : payload;
+    patchRuntimeForSession(runtimePayload.hostId || session.hostId, runtimePayload.sessionId || session.sessionId, runtimePayload);
+    const runtimeStopped = !runtimeIsActive(runtimePayload);
+    const status = String(runtimePayload.currentTurnStatus || runtimePayload.phase || '').toLowerCase();
+    if (runtimeStopped && status && status !== 'interrupted') {
+      clearActiveDraftForSession({
+        hostId: runtimePayload.hostId || session.hostId,
+        sessionId: runtimePayload.sessionId || session.sessionId,
       });
     }
     const selected = getSelectedSession();
-    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+    if (selected && getSessionKey(selected) === makeSessionKey(runtimePayload.hostId || session.hostId, runtimePayload.sessionId || session.sessionId)) {
       maybeScheduleQueuedPromptSend(selected);
       refreshInferredComposerOptionsForSession(selected);
     }
@@ -7797,6 +8020,14 @@ function subscribeSession(session) {
     renderRuntimePanel();
     renderThinkingPanel();
     renderStatusWindow();
+  };
+
+  state.eventSource.addEventListener('session.runtime', (event) => {
+    handleRuntimePayload(JSON.parse(event.data));
+  });
+
+  state.eventSource.addEventListener('session.runtime_updated', (event) => {
+    handleRuntimePayload(JSON.parse(event.data));
   });
 
   state.eventSource.addEventListener('session.diagnostic', (event) => {
@@ -7852,11 +8083,7 @@ async function showSession(session = getSelectedSession()) {
     return;
   }
 
-  if (session.live || session.source === 'managed') {
-    subscribeSession(session);
-  } else {
-    closeStream();
-  }
+  subscribeSession(session);
 
   try {
     const detail = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/detail?hostId=${encodeURIComponent(session.hostId)}`);

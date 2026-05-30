@@ -9,6 +9,7 @@ v2.01 notes archive: [README_v2.01.md](README_v2.01.md)
 
 - Multi-host control for local PCs, remote Linux machines, and HPC login nodes.
 - Session discovery from each host's Codex home, usually `~/.codex`.
+- Real-time tailing of Codex rollout JSONL for imported history transcripts, runtime status, token usage, and structured diagnostics when available.
 - New, resume, fork, stop, interrupt, steer, plan, and review controls.
 - Conversation search by keyword, path, or title-like metadata.
 - Conversation sorting by created time, recently updated time, or message count.
@@ -221,5 +222,6 @@ npm run test:managed
 
 - Runtime state is lightweight and mostly relay-local; host-agents rehydrate live state after reconnecting.
 - Imported history sessions become interactive only after resume or fork.
+- Imported history sessions can be tailed in real time from `.codex/sessions/**/*.jsonl`, but active controls such as stop, interrupt, and queued prompts still require a managed Codex app-server session.
 - HPC SSH/MFA policies vary by cluster, so connector profiles may need cluster-specific tuning.
 - Browser small-file transfer defaults to 128 MiB per request. Larger browser uploads/downloads use chunked relay-to-agent transfer, but large datasets should still stay on the host filesystem when possible; see [large file transfer design](docs/large-file-transfer-design.md).
