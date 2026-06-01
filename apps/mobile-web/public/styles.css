@@ -1031,6 +1031,16 @@ textarea {
   letter-spacing: 0.12em;
 }
 
+.connector-tip {
+  padding: 9px 11px;
+  border: 1px solid rgba(255, 216, 133, 0.2);
+  border-radius: 13px;
+  color: #ffe0a0;
+  background: rgba(255, 216, 133, 0.075);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .connector-field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1830,6 +1840,32 @@ select:disabled {
   justify-content: flex-end;
 }
 
+.export-thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.045);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  user-select: none;
+}
+
+.export-thinking-toggle input {
+  width: auto;
+  margin: 0;
+}
+
+.export-thinking-toggle:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2187,6 +2223,18 @@ select:disabled {
   justify-content: space-between;
   gap: 12px;
   align-items: center;
+}
+
+.alerts-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.alerts-actions button {
+  min-height: 36px;
+  padding: 8px 12px;
 }
 
 .alerts-title {
@@ -2567,6 +2615,7 @@ select:disabled {
 }
 
 .thinking-card {
+  position: relative;
   border: 1px solid rgba(125, 231, 203, 0.22);
   border-radius: 18px;
   background: rgba(125, 231, 203, 0.08);
@@ -2583,6 +2632,10 @@ select:disabled {
   padding: 12px 14px;
   display: grid;
   gap: 6px;
+}
+
+.thinking-card[open] .thinking-summary {
+  padding-right: 48px;
 }
 
 .thinking-summary::-webkit-details-marker {
@@ -2619,6 +2672,53 @@ select:disabled {
   padding: 0 14px 14px;
   display: grid;
   gap: 10px;
+}
+
+.thinking-card[open] .thinking-content {
+  max-height: min(56vh, 680px);
+  overflow: auto;
+  padding-right: 48px;
+  scrollbar-width: thin;
+}
+
+.thinking-collapse-rail {
+  display: none;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 34px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid rgba(125, 231, 203, 0.16);
+  border-radius: 0;
+  color: rgba(125, 231, 203, 0.72);
+  background: rgba(125, 231, 203, 0.045);
+  box-shadow: none;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.thinking-card[open] .thinking-collapse-rail {
+  display: block;
+}
+
+.thinking-collapse-rail::before {
+  content: "<";
+  display: grid;
+  place-items: center;
+  height: 100%;
+  font-size: 18px;
+  font-weight: 900;
+  opacity: 0.65;
+}
+
+.thinking-collapse-rail:hover:not(:disabled) {
+  transform: none;
+  border-color: rgba(125, 231, 203, 0.36);
+  background: rgba(125, 231, 203, 0.12);
+  box-shadow: none;
 }
 
 .thinking-block {

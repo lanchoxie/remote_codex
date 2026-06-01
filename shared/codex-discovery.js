@@ -207,6 +207,7 @@ function getCwdFromRow(row) {
 function makeTranscriptEntry(row) {
   const payload = row.payload || {};
   const timestamp = row.timestamp || null;
+  const phase = String(payload.phase || '').trim().toLowerCase();
 
   if (row.type === 'response_item' && payload.type === 'message') {
     if (payload.role === 'user') {
@@ -217,6 +218,9 @@ function makeTranscriptEntry(row) {
       return { speaker: 'user', text, timestamp };
     }
     if (payload.role === 'assistant' || payload.role === 'agent') {
+      if (phase === 'commentary') {
+        return null;
+      }
       const text = cleanTranscriptText(extractPayloadText(payload), 'agent');
       if (!text) {
         return null;
@@ -242,6 +246,9 @@ function makeTranscriptEntry(row) {
   }
 
   if (payload.type === 'agent_message' && payload.message) {
+    if (phase === 'commentary') {
+      return null;
+    }
     const text = cleanTranscriptText(payload.message, 'agent');
     if (!text) {
       return null;
@@ -377,6 +384,33 @@ function makeRuntimePatch(row) {
 function makeDiagnosticEntry(row) {
   const payload = row.payload || {};
   const timestamp = row.timestamp || null;
+  const phase = String(payload.phase || '').trim().toLowerCase();
+
+  if (phase === 'commentary') {
+    let text = '';
+    let method = '';
+    if (row.type === 'response_item' && payload.type === 'message' && (payload.role === 'assistant' || payload.role === 'agent')) {
+      text = cleanDiagnosticText(extractPayloadText(payload));
+      method = 'response_item/message/commentary';
+    } else if (row.type === 'event_msg' && payload.type === 'agent_message') {
+      text = cleanDiagnosticText(payload.message || '');
+      method = 'event_msg/agent_message/commentary';
+    }
+    if (text) {
+      return {
+        timestamp,
+        severity: 'info',
+        source: 'codex-jsonl',
+        kind: 'commentary',
+        method,
+        message: limitText(text, 300),
+        data: {
+          text,
+          phase,
+        },
+      };
+    }
+  }
 
   if (row.type === 'response_item' && payload.type === 'reasoning') {
     const text = extractReasoningText(payload);
@@ -765,13 +799,20 @@ function limitText(value, max = 500) {
 
 function dedupeTranscriptEntries(entries) {
   const deduped = [];
+  const seen = new Set();
   for (const entry of entries) {
     if (!entry || !entry.text) {
       continue;
     }
 
+    const key = `${entry.speaker || 'system'}|${entry.timestamp || ''}|${canonicalTranscriptText(entry.text)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+
     const previous = deduped[deduped.length - 1];
-    if (previous && previous.speaker === entry.speaker && previous.text === entry.text) {
+    if (previous && previous.speaker === entry.speaker && canonicalTranscriptText(previous.text) === canonicalTranscriptText(entry.text)) {
       continue;
     }
     deduped.push(entry);
@@ -780,7 +821,7 @@ function dedupeTranscriptEntries(entries) {
 }
 
 function cleanPreviewText(value) {
-  return String(value).replace(/\s+/g, ' ').trim().slice(0, 240);
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
 function cleanTranscriptText(value, speaker = '') {
@@ -788,8 +829,58 @@ function cleanTranscriptText(value, speaker = '') {
     .replace(/\r\n?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  const stripped = stripResumeBootstrapText(text, speaker);
+  const stripped = cleanUserFacingTranscriptText(stripResumeBootstrapText(text, speaker), speaker);
   return stripped.slice(0, TRANSCRIPT_ENTRY_CHAR_LIMIT);
+}
+
+function cleanUserFacingTranscriptText(value, speaker = '') {
+  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
+  text = stripEnvironmentContextText(text).trim();
+  if (String(speaker || '').toLowerCase() === 'user') {
+    text = stripIdeContextText(text).trim();
+  }
+
+  return isInternalTranscriptText(text) ? '' : text;
+}
+
+function stripEnvironmentContextText(value) {
+  return String(value || '')
+    .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, '')
+    .trim();
+}
+
+function stripIdeContextText(value) {
+  const text = String(value || '').trim();
+  const requestMatch = text.match(/(?:^|\n)## My request for Codex:\s*([\s\S]*)$/i);
+  return requestMatch ? requestMatch[1].trim() : text;
+}
+
+function isInternalTranscriptText(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return true;
+  }
+  if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
+    return true;
+  }
+  if (/^The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b/i.test(text)) {
+    return true;
+  }
+  if (/^>>>\s+TRANSCRIPT(?:\s+DELTA)?\s+START\b/im.test(text)) {
+    return true;
+  }
+  if (/^\{\s*"(?:risk_level|outcome|user_authorization)"\s*:/.test(text) && /"outcome"\s*:\s*"(?:allow|deny)"/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function canonicalTranscriptText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
 function stripResumeBootstrapText(value, speaker = '') {

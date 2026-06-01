@@ -377,7 +377,7 @@ function listBrowseRoots() {
 }
 
 function normalizeBrowsePath(inputPath) {
-  const raw = String(inputPath || '').trim();
+  const raw = normalizeRemoteFilePath(inputPath);
   if (!raw) {
     return null;
   }
@@ -388,6 +388,12 @@ function normalizeBrowsePath(inputPath) {
     return path.join(os.homedir(), raw.slice(2));
   }
   return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(MANAGED_CWD, raw);
+}
+
+function normalizeRemoteFilePath(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^[\\/]+([A-Za-z]:[\\/])/, '$1');
 }
 
 function listDirectoriesAt(targetPath) {
@@ -551,7 +557,7 @@ function resolveCommandCwd(command = {}) {
 }
 
 function resolveRemoteFilePath(inputPath, baseCwd) {
-  const raw = String(inputPath || '').trim();
+  const raw = normalizeRemoteFilePath(inputPath);
   if (!raw) {
     throw new Error('file path is required');
   }
@@ -1065,7 +1071,7 @@ function buildResumeBootstrap(command) {
 }
 
 function resolveManagedCwd(cwd) {
-  const target = String(cwd || '').trim();
+  const target = normalizeRemoteFilePath(cwd);
   if (!target) {
     return MANAGED_CWD;
   }

@@ -24,6 +24,7 @@ const state = {
   eventSourceKey: null,
   transcripts: new Map(),
   alerts: new Map(),
+  dismissedAlerts: new Map(),
   runtime: new Map(),
   diagnostics: new Map(),
   requests: new Map(),
@@ -108,6 +109,7 @@ const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
 const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
+const DISMISSED_ALERTS_STORAGE_KEY = 'mobile-codex-remote.dismissed-alerts.v1';
 const DEFAULT_COMPOSER_OPTIONS = {
   model: '',
   effort: 'xhigh',
@@ -679,8 +681,45 @@ function normalizeUiSettings(input = {}) {
   };
 }
 
+function normalizeDismissedAlerts(input = {}) {
+  const result = new Map();
+  if (!input || typeof input !== 'object') {
+    return result;
+  }
+  for (const [key, values] of Object.entries(input)) {
+    const sessionKey = String(key || '').trim();
+    if (!sessionKey || !Array.isArray(values)) {
+      continue;
+    }
+    const fingerprints = values
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+      .slice(-300);
+    if (fingerprints.length) {
+      result.set(sessionKey, new Set(fingerprints));
+    }
+  }
+  return result;
+}
+
+function serializeDismissedAlerts() {
+  const serialized = {};
+  for (const [key, values] of state.dismissedAlerts.entries()) {
+    const fingerprints = Array.from(values || []).filter(Boolean).slice(-300);
+    if (fingerprints.length) {
+      serialized[key] = fingerprints;
+    }
+  }
+  return serialized;
+}
+
+function persistDismissedAlerts() {
+  writeLocalStorageJson(DISMISSED_ALERTS_STORAGE_KEY, serializeDismissedAlerts());
+}
+
 function initializePersistentUiState() {
   state.navigatorCollapsed = readLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, true) !== false;
+  state.dismissedAlerts = normalizeDismissedAlerts(readLocalStorageJson(DISMISSED_ALERTS_STORAGE_KEY, {}));
   const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
   state.ui.locale = storedUi.locale;
   state.ui.theme = storedUi.theme;
@@ -1395,6 +1434,7 @@ function isThinkingActivityDiagnostic(entry) {
     'warning',
     'error',
     'control',
+    'commentary',
     'runtime-startup',
     'native-thread-fallback',
   ].includes(kind)
@@ -1770,7 +1810,7 @@ function normalizeTranscriptFiles(rawFiles) {
     if (!rawFile || typeof rawFile !== 'object') {
       continue;
     }
-    const pathValue = String(rawFile.path || rawFile.remotePath || '').trim();
+    const pathValue = normalizeRemoteFilePath(rawFile.path || rawFile.remotePath || '');
     const name = String(rawFile.name || basename(pathValue) || 'file').trim();
     if (!pathValue && !name) {
       continue;
@@ -1805,7 +1845,7 @@ function dedupeTranscript(entries) {
 
     const normalized = {
       speaker: entry.speaker || 'system',
-      text: stripResumeBootstrapText(entry.text || '', entry.speaker || 'system'),
+      text: cleanTranscriptTextForDisplay(entry.text || '', entry.speaker || 'system'),
       timestamp: entry.timestamp || null,
       stream: entry.stream || null,
       files,
@@ -1813,7 +1853,7 @@ function dedupeTranscript(entries) {
     if (!normalized.text && !files.length) {
       continue;
     }
-    const key = `${normalized.speaker}|${normalized.timestamp || ''}|${normalized.text}|${files.map((file) => file.path || file.name).join(',')}`;
+    const key = `${normalized.speaker}|${normalized.timestamp || ''}|${canonicalTranscriptText(normalized.text)}|${files.map((file) => file.path || file.name).join(',')}`;
     if (seen.has(key)) {
       continue;
     }
@@ -1821,7 +1861,7 @@ function dedupeTranscript(entries) {
     deduped.push(normalized);
   }
 
-  return deduped
+  const sorted = deduped
     .map((entry, index) => ({ entry, index }))
     .sort((a, b) => {
       const left = Date.parse(a.entry.timestamp || '');
@@ -1834,7 +1874,29 @@ function dedupeTranscript(entries) {
       }
       return a.index - b.index;
     })
-    .map((item) => item.entry)
+    .map((item) => item.entry);
+
+  const compacted = [];
+  for (const entry of sorted) {
+    const previous = compacted[compacted.length - 1];
+    const entryFiles = entry.files.map((file) => file.path || file.name).join(',');
+    const previousFiles = previous?.files?.map((file) => file.path || file.name).join(',') || '';
+    const entryTime = Date.parse(entry.timestamp || '');
+    const previousTime = Date.parse(previous?.timestamp || '');
+    const nearDuplicate = previous
+      && previous.speaker === entry.speaker
+      && canonicalTranscriptText(previous.text) === canonicalTranscriptText(entry.text)
+      && previousFiles === entryFiles
+      && Number.isFinite(entryTime)
+      && Number.isFinite(previousTime)
+      && Math.abs(entryTime - previousTime) <= 2000;
+    if (nearDuplicate) {
+      continue;
+    }
+    compacted.push(entry);
+  }
+
+  return compacted
     .slice(-200);
 }
 
@@ -2315,19 +2377,25 @@ function findCollectionConversationGroup(groups, item) {
   }
 
   const itemTitle = normalizeConversationTitle(item.title);
-  return candidates.find((group) => {
-    if (normalizeConversationPath(group.cwd) !== itemPath) {
-      return false;
-    }
-    if (!itemTitle) {
-      return true;
-    }
+  const pathMatches = candidates.filter((group) => normalizeConversationPath(group.cwd) === itemPath);
+  if (!pathMatches.length) {
+    return null;
+  }
+  if (!itemTitle) {
+    return pathMatches.length === 1 ? pathMatches[0] : null;
+  }
+
+  const titleMatch = pathMatches.find((group) => {
     const groupTitles = [
       group.title,
       ...(group.sessions || []).map((session) => session.title),
     ].map(normalizeConversationTitle).filter(Boolean);
     return groupTitles.includes(itemTitle);
-  }) || candidates.find((group) => normalizeConversationPath(group.cwd) === itemPath) || null;
+  });
+  if (titleMatch) {
+    return titleMatch;
+  }
+  return pathMatches.length === 1 ? pathMatches[0] : null;
 }
 
 function getConversationIdentityValues(group) {
@@ -2580,6 +2648,15 @@ function appendAlertForSession(hostId, sessionId, alert) {
   state.alerts.set(key, dedupeAlerts([...existing, alert]));
 }
 
+function alertFingerprint(entry) {
+  return [
+    entry?.severity || 'warning',
+    entry?.source || 'runtime',
+    entry?.timestamp || '',
+    String(entry?.message || '').trim(),
+  ].join('\u0000');
+}
+
 function shouldDisplayAlert(entry) {
   const message = String(entry?.message || '');
   return !(
@@ -2608,11 +2685,35 @@ function isStaleStartupFailureAlert(entry, session) {
 
 function getAlertsForSession(session) {
   const key = getSessionKey(session);
+  const dismissed = key ? state.dismissedAlerts.get(key) : null;
   return key
     ? (state.alerts.get(key) || [])
       .filter(shouldDisplayAlert)
       .filter((entry) => !isStaleStartupFailureAlert(entry, session))
+      .filter((entry) => !dismissed?.has(alertFingerprint(entry)))
     : [];
+}
+
+function clearAlertsForSelectedSession() {
+  const session = getSelectedSession();
+  const key = getSessionKey(session);
+  if (!session || !key) {
+    return;
+  }
+  const visibleAlerts = getAlertsForSession(session);
+  if (!visibleAlerts.length) {
+    return;
+  }
+
+  const dismissed = state.dismissedAlerts.get(key) || new Set();
+  for (const alert of visibleAlerts) {
+    dismissed.add(alertFingerprint(alert));
+  }
+  state.dismissedAlerts.set(key, new Set(Array.from(dismissed).slice(-300)));
+  persistDismissedAlerts();
+  renderSessionDetails();
+  renderAlertsWindow();
+  renderStatusWindow();
 }
 
 function getTranscriptForSession(session) {
@@ -2734,6 +2835,61 @@ function stripResumeBootstrapText(value, speaker = '') {
   // App-server fallback resume can make Codex echo the synthetic context
   // prompt. It is transport glue, not useful chat content.
   return '';
+}
+
+function cleanTranscriptTextForDisplay(value, speaker = '') {
+  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
+  text = stripResumeBootstrapText(text, speaker).trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
+  text = stripEnvironmentContextText(text).trim();
+  if (String(speaker || '').toLowerCase() === 'user') {
+    text = stripIdeContextText(text).trim();
+  }
+
+  return isInternalTranscriptText(text) ? '' : text;
+}
+
+function stripEnvironmentContextText(value) {
+  return String(value || '')
+    .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, '')
+    .trim();
+}
+
+function stripIdeContextText(value) {
+  const text = String(value || '').trim();
+  const requestMatch = text.match(/(?:^|\n)## My request for Codex:\s*([\s\S]*)$/i);
+  return requestMatch ? requestMatch[1].trim() : text;
+}
+
+function isInternalTranscriptText(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return true;
+  }
+  if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
+    return true;
+  }
+  if (/^The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b/i.test(text)) {
+    return true;
+  }
+  if (/^>>>\s+TRANSCRIPT(?:\s+DELTA)?\s+START\b/im.test(text)) {
+    return true;
+  }
+  if (/^\{\s*"(?:risk_level|outcome|user_authorization)"\s*:/.test(text) && /"outcome"\s*:\s*"(?:allow|deny)"/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function canonicalTranscriptText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
 function setRuntimeForSession(hostId, sessionId, runtime) {
@@ -4066,18 +4222,28 @@ function isBareDownloadableFilename(value) {
 }
 
 function stripPathPunctuation(value) {
-  return String(value || '')
+  let text = String(value || '')
     .trim()
     .replace(/^["'`]+|["'`]+$/g, '')
-    .replace(/[)\].,;:!?]+$/g, '');
+    .trim();
+  if (text.startsWith('<') && text.endsWith('>')) {
+    text = text.slice(1, -1).trim();
+  }
+  return text.replace(/[>)\].,;:!?]+$/g, '');
+}
+
+function normalizeRemoteFilePath(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^[\\/]+([A-Za-z]:[\\/])/, '$1');
 }
 
 function decodePathCandidate(value) {
   const cleaned = stripPathPunctuation(value);
   try {
-    return decodeURIComponent(cleaned);
+    return normalizeRemoteFilePath(decodeURIComponent(cleaned));
   } catch {
-    return cleaned;
+    return normalizeRemoteFilePath(cleaned);
   }
 }
 
@@ -4158,7 +4324,7 @@ function getTranscriptFileRefs(entry) {
 
 function buildHostFileUrl(session, file, inline = false) {
   const params = new URLSearchParams({
-    path: file.path || '',
+    path: normalizeRemoteFilePath(file.path || ''),
     sessionId: session?.sessionId || '',
   });
   if (session?.cwd) {
@@ -5775,6 +5941,10 @@ function renderSessionDetails() {
   const resumeButton = el('resume-session-button');
   const forkButton = el('fork-session-button');
   const alertsButton = el('toggle-alerts-button');
+  const exportButton = el('export-session-button');
+  const exportBundleButton = el('export-session-bundle-button');
+  const exportThinkingCheckbox = el('export-thinking-checkbox');
+  const renameButton = el('rename-session-button');
   const statusButton = el('toggle-status-button');
   const endSessionButton = el('end-session-button');
   const endAllSessionsButton = el('end-all-sessions-button');
@@ -5829,8 +5999,8 @@ function renderSessionDetails() {
     ? `${session.live ? 'Live' : 'History only'} | ${session.state || 'unknown'}`
     : 'No session selected';
   el('session-runner').textContent = runner.label;
-  el('latest-user-message').textContent = session?.latestUserMessage || 'No recent user prompt captured.';
-  el('latest-agent-message').textContent = getLatestFormalAgentMessage(session);
+  el('latest-user-message').textContent = cleanTranscriptTextForDisplay(session?.latestUserMessage || '', 'user') || 'No recent user prompt captured.';
+  el('latest-agent-message').textContent = cleanTranscriptTextForDisplay(getLatestFormalAgentMessage(session), 'agent') || 'No recent agent reply captured.';
   if (summaryTitle) {
     summaryTitle.textContent = session ? session.title || session.sessionId : 'No session selected';
   }
@@ -5866,6 +6036,31 @@ function renderSessionDetails() {
   }
   alertsButton.disabled = !session;
   alertsButton.textContent = alerts.length ? `Alerts (${alerts.length})` : 'Alerts';
+  if (exportButton) {
+    exportButton.disabled = !session;
+    exportButton.textContent = 'Export History';
+    exportButton.title = session
+      ? 'Download this conversation history as Markdown.'
+      : 'Select a conversation to export its history.';
+  }
+  if (exportBundleButton) {
+    exportBundleButton.disabled = !session;
+    exportBundleButton.textContent = 'Export Bundle';
+    exportBundleButton.title = session
+      ? 'Download Markdown, JSON, manifest, and cached files as a zip bundle.'
+      : 'Select a conversation to export its bundle.';
+  }
+  if (exportThinkingCheckbox) {
+    exportThinkingCheckbox.disabled = !session;
+    exportThinkingCheckbox.title = session
+      ? 'Include thinking/activity diagnostics in Markdown, JSON, and zip exports.'
+      : 'Select a conversation before exporting thinking/activity diagnostics.';
+  }
+  if (renameButton) {
+    renameButton.disabled = !session;
+    renameButton.classList.toggle('hidden', !session);
+    renameButton.title = session ? 'Rename this conversation.' : 'Select a conversation to rename it.';
+  }
   statusButton.disabled = !session;
   statusButton.textContent = pendingRequests.length
     ? `Status (${pendingRequests.length})`
@@ -6144,10 +6339,14 @@ function renderAlertsWindow() {
   const titleEl = el('alerts-title');
   const fabEl = el('alerts-fab');
   const fabCountEl = el('alerts-fab-count');
+  const clearButton = el('clear-alerts-button');
 
   if (!session) {
     windowEl.classList.add('hidden');
     fabEl.classList.add('hidden');
+    if (clearButton) {
+      clearButton.disabled = true;
+    }
     return;
   }
 
@@ -6155,6 +6354,10 @@ function renderAlertsWindow() {
   fabCountEl.textContent = String(alerts.length);
   fabEl.classList.toggle('hidden', state.alertWindowOpen || alerts.length === 0);
   windowEl.classList.toggle('hidden', !state.alertWindowOpen);
+  if (clearButton) {
+    clearButton.disabled = alerts.length === 0;
+    clearButton.title = alerts.length ? 'Hide current alerts for this session.' : 'No visible alerts to clear.';
+  }
 
   listEl.innerHTML = '';
   if (!alerts.length) {
@@ -7476,6 +7679,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
       if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
         item.appendChild(renderFileChangeDetails(entry.fileChanges));
       }
+      renderFileCards(item, session, entry);
       history.appendChild(item);
     }
     content.appendChild(history);
@@ -7494,6 +7698,18 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   }
 
   details.appendChild(content);
+  const collapseRail = document.createElement('button');
+  collapseRail.type = 'button';
+  collapseRail.className = 'thinking-collapse-rail';
+  collapseRail.title = 'Collapse thinking';
+  collapseRail.setAttribute('aria-label', 'Collapse thinking');
+  collapseRail.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    details.open = false;
+    state.thinkingPanels.set(stateKey, false);
+  });
+  details.appendChild(collapseRail);
 
   const wrapper = document.createElement('div');
   wrapper.className = 'message thinking';
@@ -8124,6 +8340,72 @@ async function showSession(session = getSelectedSession()) {
   }
 }
 
+function buildSessionExportUrl(session, format = 'markdown', options = {}) {
+  if (!session?.hostId || !session?.sessionId) {
+    return '';
+  }
+  const params = new URLSearchParams({
+    hostId: session.hostId,
+    format,
+  });
+  if (options.includeThinking) {
+    params.set('includeThinking', '1');
+  }
+  return `/api/sessions/${encodeURIComponent(session.sessionId)}/export?${params.toString()}`;
+}
+
+function exportSelectedSessionHistory(format = 'markdown') {
+  const session = getSelectedSession();
+  const includeThinking = Boolean(el('export-thinking-checkbox')?.checked);
+  const url = buildSessionExportUrl(session, format, { includeThinking });
+  if (!url) {
+    reportError(new Error('Select a conversation before exporting history.'));
+    return;
+  }
+  const link = document.createElement('a');
+  link.href = url;
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+async function renameSelectedSession() {
+  const session = getSelectedSession();
+  if (!session) {
+    reportError(new Error('Select a conversation before renaming it.'));
+    return;
+  }
+
+  const currentTitle = session.title || session.sessionId || '';
+  const nextTitle = window.prompt('Rename conversation', currentTitle);
+  if (nextTitle === null) {
+    return;
+  }
+  const title = nextTitle.trim();
+  if (!title) {
+    reportError(new Error('Conversation title cannot be empty.'));
+    return;
+  }
+  if (title === currentTitle) {
+    return;
+  }
+
+  const result = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/title`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      hostId: session.hostId,
+      title,
+    }),
+  });
+  if (result?.session) {
+    mergeSession(result.session);
+  }
+  await refreshSessionCollections().catch(() => null);
+  renderAll();
+}
+
 function applySelectedHost(hostId) {
   if (state.selectedHostId === hostId) {
     return;
@@ -8449,6 +8731,12 @@ async function deleteHost(hostId) {
       state.alerts.delete(key);
     }
   }
+  for (const key of Array.from(state.dismissedAlerts.keys())) {
+    if (key.startsWith(`${hostId}::`)) {
+      state.dismissedAlerts.delete(key);
+    }
+  }
+  persistDismissedAlerts();
 
   for (const key of Array.from(state.runtime.keys())) {
     if (key.startsWith(`${hostId}::`)) {
@@ -10020,6 +10308,22 @@ el('toggle-alerts-button').addEventListener('click', () => {
   toggleAlertWindow();
 });
 
+el('export-session-button')?.addEventListener('click', () => {
+  exportSelectedSessionHistory('markdown');
+});
+
+el('export-session-bundle-button')?.addEventListener('click', () => {
+  exportSelectedSessionHistory('zip');
+});
+
+el('rename-session-button')?.addEventListener('click', async () => {
+  try {
+    await renameSelectedSession();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
 el('toggle-status-button').addEventListener('click', () => {
   toggleStatusWindow();
 });
@@ -10064,6 +10368,10 @@ el('runtime-modal-open-status-button').addEventListener('click', () => {
 
 el('close-alerts-button').addEventListener('click', () => {
   setAlertWindowOpen(false);
+});
+
+el('clear-alerts-button')?.addEventListener('click', () => {
+  clearAlertsForSelectedSession();
 });
 
 el('session-log').addEventListener('click', async (event) => {

@@ -613,6 +613,27 @@ function mergeThinkingBuffer(previous, chunk) {
   return `${left}\n${right}`.trim();
 }
 
+function notificationPhase(params = {}) {
+  return String(
+    params.phase
+      || params.item?.phase
+      || params.message?.phase
+      || params.payload?.phase
+      || ''
+  ).trim().toLowerCase();
+}
+
+function notificationDeltaText(params = {}) {
+  return normalizeThinkingText(
+    params.delta
+      || params.text
+      || params.message
+      || params.item?.text
+      || params.item?.message
+      || ''
+  );
+}
+
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const REASONING_SUMMARIES = new Set(['auto', 'concise', 'detailed', 'none']);
 const APPROVAL_POLICIES = new Set(['untrusted', 'on-failure', 'on-request', 'never']);
@@ -1669,6 +1690,26 @@ class CodexAppServerRunner {
     if (method === 'item/agentMessage/delta') {
       const turnId = params.turnId || this.activeTurnId;
       if (!turnId) {
+        return;
+      }
+      const text = notificationDeltaText(params);
+      if (notificationPhase(params) === 'commentary') {
+        if (text) {
+          await this.emitDiagnostic({
+            severity: 'info',
+            source: 'codex',
+            kind: 'commentary',
+            method,
+            message: limitText(text, 300),
+            turnId,
+            data: {
+              itemId: params.itemId || null,
+              turnId,
+              text,
+              phase: 'commentary',
+            },
+          });
+        }
         return;
       }
       const previous = this.turnBuffers.get(turnId) || '';

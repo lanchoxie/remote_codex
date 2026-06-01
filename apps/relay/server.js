@@ -21,12 +21,14 @@ const {
   normalizeConnectorSecretsInput,
   saveConnectorSecrets,
 } = require('../../shared/connector-secrets');
+const { makeCodexRowEvents } = require('../../shared/codex-discovery');
 const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_DIR = path.join(__dirname, '..', 'mobile-web', 'public');
-const SESSION_COLLECTIONS_PATH = path.join(process.cwd(), 'tmp', 'session-collections.json');
-const SESSION_LOGS_PATH = path.join(process.cwd(), 'tmp', 'session-logs.json');
+const SESSION_COLLECTIONS_PATH = process.env.SESSION_COLLECTIONS_PATH || path.join(process.cwd(), 'tmp', 'session-collections.json');
+const SESSION_METADATA_PATH = process.env.SESSION_METADATA_PATH || path.join(process.cwd(), 'tmp', 'session-metadata.json');
+const SESSION_LOGS_PATH = process.env.SESSION_LOGS_PATH || path.join(process.cwd(), 'tmp', 'session-logs.json');
 const RECEIVED_FILES_ROOT = path.join(process.cwd(), 'tmp', 'received-files');
 const RECEIVED_FILES_MANIFEST_PATH = path.join(RECEIVED_FILES_ROOT, 'manifest.json');
 const LOCAL_AGENT_LOG_ROOT = path.join(process.cwd(), 'tmp', 'local-agents');
@@ -46,6 +48,8 @@ const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT
 const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
 const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
 const STALE_MANAGED_SESSION_GRACE_MS = Number(process.env.RELAY_STALE_MANAGED_SESSION_GRACE_MS || 30000);
+const JSONL_DIAGNOSTIC_MAX_BYTES = Number(process.env.RELAY_JSONL_DIAGNOSTIC_MAX_BYTES || 16 * 1024 * 1024);
+const JSONL_DIAGNOSTIC_HEAD_BYTES = Number(process.env.RELAY_JSONL_DIAGNOSTIC_HEAD_BYTES || 2 * 1024 * 1024);
 const LOCAL_AGENT_WATCHDOG_ENABLED = String(process.env.RELAY_LOCAL_AGENT_WATCHDOG_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const LOCAL_AGENT_WATCHDOG_INTERVAL_MS = Number(process.env.RELAY_LOCAL_AGENT_WATCHDOG_INTERVAL_MS || 5000);
 const LOCAL_AGENT_OFFLINE_RESTART_MS = Number(process.env.RELAY_LOCAL_AGENT_OFFLINE_RESTART_MS || 45000);
@@ -252,6 +256,46 @@ function collectionItemKey(item) {
   return `${item.hostId}::${item.conversationKey}`;
 }
 
+function looksLikeSessionId(value) {
+  const text = String(value || '').trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text);
+}
+
+function normalizeSessionTitle(value) {
+  const title = String(value || '').replace(/\s+/g, ' ').trim();
+  return title.slice(0, 180);
+}
+
+function isMeaningfulSessionTitle(title, identities = []) {
+  const value = normalizeSessionTitle(title);
+  if (!value || looksLikeSessionId(value)) {
+    return false;
+  }
+  return !(identities || []).filter(Boolean).some((identity) => value === String(identity || '').trim());
+}
+
+function sessionMetadataKey(hostId, identity) {
+  const key = String(identity || '').trim();
+  return key ? `${hostId}::${key}` : '';
+}
+
+function normalizeSessionMetadataEntry(input = {}) {
+  const hostId = String(input.hostId || '').trim();
+  const identity = String(input.identity || input.sessionId || input.conversationKey || '').trim();
+  const title = normalizeSessionTitle(input.title || '');
+  if (!hostId || !identity || !isMeaningfulSessionTitle(title, [identity])) {
+    return null;
+  }
+  return {
+    hostId,
+    identity,
+    title,
+    cwd: String(input.cwd || '').trim(),
+    source: String(input.source || 'metadata').trim() || 'metadata',
+    updatedAt: input.updatedAt || nowIso(),
+  };
+}
+
 function normalizeSessionCollection(input = {}) {
   const collectionId = String(input.collectionId || input.id || makeId()).trim();
   const name = String(input.name || '').trim() || 'Untitled';
@@ -302,6 +346,31 @@ function saveSessionCollections(collections) {
   }, null, 2), 'utf8');
 }
 
+function loadSessionMetadata() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSION_METADATA_PATH, 'utf8'));
+    const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+    return new Map(entries
+      .map(normalizeSessionMetadataEntry)
+      .filter(Boolean)
+      .map((entry) => [sessionMetadataKey(entry.hostId, entry.identity), entry]));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveSessionMetadata() {
+  fs.mkdirSync(path.dirname(SESSION_METADATA_PATH), { recursive: true });
+  const entries = Array.from(state.sessionMetadata.values())
+    .map(normalizeSessionMetadataEntry)
+    .filter(Boolean)
+    .sort((a, b) => `${a.hostId}::${a.identity}`.localeCompare(`${b.hostId}::${b.identity}`));
+  fs.writeFileSync(SESSION_METADATA_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    entries,
+  }, null, 2), 'utf8');
+}
+
 function safePathSegment(value, fallback = 'item') {
   const text = String(value || '').trim()
     .replace(/[^A-Za-z0-9._-]+/g, '_')
@@ -313,6 +382,12 @@ function safePathSegment(value, fallback = 'item') {
 function pathInside(parent, candidate) {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
   return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function normalizeRemoteFilePath(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^[\\/]+([A-Za-z]:[\\/])/, '$1');
 }
 
 function loadReceivedFiles() {
@@ -342,7 +417,7 @@ function normalizeStoredTranscriptEntry(entry) {
     return null;
   }
   const speaker = entry.speaker || 'system';
-  const text = stripResumeBootstrapText(entry.text || '', speaker);
+  const text = cleanStoredTranscriptText(entry.text || '', speaker);
   const files = normalizeFileTransferRefs(entry.files || entry.attachments || []);
   if (!text && !files.length) {
     return null;
@@ -374,6 +449,97 @@ function stripResumeBootstrapText(value, speaker = '') {
   return '';
 }
 
+function cleanStoredTranscriptText(value, speaker = '') {
+  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
+  text = stripResumeBootstrapText(text, speaker).trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
+  text = stripEnvironmentContextText(text).trim();
+  if (String(speaker || '').toLowerCase() === 'user') {
+    text = stripIdeContextText(text).trim();
+  }
+
+  return isInternalTranscriptText(text) ? '' : text;
+}
+
+function stripEnvironmentContextText(value) {
+  return String(value || '')
+    .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, '')
+    .trim();
+}
+
+function stripIdeContextText(value) {
+  const text = String(value || '').trim();
+  const requestMatch = text.match(/(?:^|\n)## My request for Codex:\s*([\s\S]*)$/i);
+  return requestMatch ? requestMatch[1].trim() : text;
+}
+
+function isInternalTranscriptText(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return true;
+  }
+  if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
+    return true;
+  }
+  if (/^The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b/i.test(text)) {
+    return true;
+  }
+  if (/^>>>\s+TRANSCRIPT(?:\s+DELTA)?\s+START\b/im.test(text)) {
+    return true;
+  }
+  if (/^\{\s*"(?:risk_level|outcome|user_authorization)"\s*:/.test(text) && /"outcome"\s*:\s*"(?:allow|deny)"/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function canonicalTranscriptText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function compactTranscriptEntries(entries) {
+  const compacted = [];
+  for (const entry of sortTranscriptEntries(entries || [])) {
+    const previous = compacted[compacted.length - 1];
+    if (!previous || previous.speaker !== entry.speaker) {
+      compacted.push(entry);
+      continue;
+    }
+
+    const previousText = canonicalTranscriptText(previous.text);
+    const entryText = canonicalTranscriptText(entry.text);
+    const previousFiles = (previous.files || []).map((file) => file.path || file.name || '').join(',');
+    const entryFiles = (entry.files || []).map((file) => file.path || file.name || '').join(',');
+    if (previousFiles !== entryFiles) {
+      compacted.push(entry);
+      continue;
+    }
+    if (previousText && entryText && previousText === entryText) {
+      continue;
+    }
+
+    const previousTime = Date.parse(previous.timestamp || '');
+    const entryTime = Date.parse(entry.timestamp || '');
+    const near = Number.isFinite(previousTime) && Number.isFinite(entryTime) && Math.abs(entryTime - previousTime) <= 30000;
+    if (near && previousText.length >= 80 && entryText.includes(previousText)) {
+      continue;
+    }
+    if (near && entryText.length >= 80 && previousText.includes(entryText)) {
+      continue;
+    }
+
+    compacted.push(entry);
+  }
+  return compacted;
+}
+
 function sortTranscriptEntries(entries) {
   return (entries || [])
     .map((entry, index) => ({ entry, index }))
@@ -401,11 +567,11 @@ function loadSessionLogs() {
     for (const [key, entries] of Object.entries(rawLogs)) {
       const normalized = (Array.isArray(entries) ? entries : [])
         .map(normalizeStoredTranscriptEntry)
-        .filter(Boolean)
-        .sort(compareTranscriptEntries)
-        .slice(-200);
-      if (normalized.length) {
-        logs.set(key, normalized);
+        .filter(Boolean);
+      const compacted = compactTranscriptEntries(normalized)
+        .slice(-SESSION_LOG_ENTRY_LIMIT);
+      if (compacted.length) {
+        logs.set(key, compacted);
       }
     }
     return logs;
@@ -419,11 +585,11 @@ function saveSessionLogs() {
   for (const [key, entries] of state.sessionLogs.entries()) {
     const normalized = (Array.isArray(entries) ? entries : [])
       .map(normalizeStoredTranscriptEntry)
-      .filter(Boolean)
-      .sort(compareTranscriptEntries)
-      .slice(-200);
-    if (normalized.length) {
-      logs[key] = normalized;
+      .filter(Boolean);
+    const compacted = compactTranscriptEntries(normalized)
+      .slice(-SESSION_LOG_ENTRY_LIMIT);
+    if (compacted.length) {
+      logs[key] = compacted;
     }
   }
   fs.mkdirSync(path.dirname(SESSION_LOGS_PATH), { recursive: true });
@@ -456,6 +622,7 @@ const state = {
   connectors: new Map(),
   connectorSecrets: loadConnectorSecrets(),
   sessionCollections: new Map(),
+  sessionMetadata: loadSessionMetadata(),
   receivedFiles: loadReceivedFiles(),
   // Agents keep their last command id in memory across relay restarts, so use
   // a monotonic-ish epoch instead of restarting command ids at 1.
@@ -477,6 +644,7 @@ if (!state.sessionCollections.has(DEFAULT_COLLECTION_ID)) {
     items: [],
   }));
 }
+seedSessionMetadataFromCollections();
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload, null, 2);
@@ -1017,7 +1185,7 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
       HOST_ID: normalizedHostId,
       HOST_LABEL: String(label || normalizedHostId).trim() || normalizedHostId,
       CODEX_HOME: process.env.LOCAL_CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
-      AUTO_START_SESSION: process.env.LOCAL_AGENT_AUTO_START_SESSION || process.env.AUTO_START_SESSION || 'true',
+      AUTO_START_SESSION: process.env.LOCAL_AGENT_AUTO_START_SESSION || process.env.AUTO_START_SESSION || 'false',
       MANAGED_COMMAND: process.env.LOCAL_AGENT_MANAGED_COMMAND || process.env.MANAGED_COMMAND || 'codex-app-server',
     },
   });
@@ -1124,18 +1292,215 @@ function getSession(hostId, sessionId) {
   return state.sessions.get(sessionKey(hostId, sessionId)) || null;
 }
 
+function walkLocalFiles(rootDir, visit) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(rootDir, { withFileTypes: true });
+  } catch (_) {
+    return;
+  }
+
+  for (const entry of entries) {
+    const filePath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      walkLocalFiles(filePath, visit);
+    } else if (entry.isFile()) {
+      visit(filePath);
+    }
+  }
+}
+
+function resolveSessionRolloutPath(session) {
+  if (!session) {
+    return null;
+  }
+  const existing = String(session.rolloutPath || '').trim();
+  if (existing && fs.existsSync(existing)) {
+    return existing;
+  }
+
+  const candidates = [];
+  if (session.nativeThreadId) {
+    candidates.push(String(session.nativeThreadId));
+  }
+  if (session.sessionId) {
+    candidates.push(String(session.sessionId));
+  }
+
+  const codexHome = process.env.LOCAL_CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  const sessionsRoot = path.join(codexHome, 'sessions');
+  const seen = new Set();
+  let found = null;
+
+  walkLocalFiles(sessionsRoot, (filePath) => {
+    if (found || !filePath.endsWith('.jsonl') || seen.has(filePath)) {
+      return;
+    }
+    seen.add(filePath);
+    const base = path.basename(filePath);
+    if (candidates.some((candidate) => candidate && base.includes(candidate))) {
+      found = filePath;
+    }
+  });
+
+  return found;
+}
+
+function loadSessionDiagnosticsFromRollout(session) {
+  const rolloutPath = resolveSessionRolloutPath(session);
+  if (!rolloutPath) {
+    return [];
+  }
+
+  let stats = null;
+  try {
+    stats = fs.statSync(rolloutPath);
+  } catch (_) {
+    return [];
+  }
+
+  let raw = '';
+  try {
+    if (stats.size <= JSONL_DIAGNOSTIC_MAX_BYTES) {
+      raw = fs.readFileSync(rolloutPath, 'utf8');
+    } else {
+      const headBytes = Math.min(JSONL_DIAGNOSTIC_HEAD_BYTES, stats.size);
+      const tailBytes = Math.max(0, JSONL_DIAGNOSTIC_MAX_BYTES - headBytes);
+      const headBuffer = Buffer.alloc(headBytes);
+      const tailBuffer = Buffer.alloc(tailBytes);
+      const fd = fs.openSync(rolloutPath, 'r');
+      try {
+        fs.readSync(fd, headBuffer, 0, headBytes, 0);
+        if (tailBytes > 0) {
+          fs.readSync(fd, tailBuffer, 0, tailBytes, Math.max(0, stats.size - tailBytes));
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+      raw = `${headBuffer.toString('utf8')}\n${tailBuffer.toString('utf8')}`;
+    }
+  } catch (_) {
+    return [];
+  }
+
+  const diagnostics = [];
+  const seen = new Set();
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let row = null;
+    try {
+      row = JSON.parse(trimmed);
+    } catch (_) {
+      continue;
+    }
+    const events = makeCodexRowEvents(row);
+    for (const event of events) {
+      if (event.type !== 'session.diagnostic') {
+        continue;
+      }
+      const entry = {
+        ...(event.entry || {}),
+        timestamp: event.entry?.timestamp || row.timestamp || nowIso(),
+      };
+      const key = `${entry.kind || ''}|${entry.method || ''}|${entry.timestamp || ''}|${entry.message || ''}|${entry.turnId || ''}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      diagnostics.push(entry);
+    }
+  }
+
+  return compactSessionDiagnostics(diagnostics);
+}
+
+function compactSessionDiagnostics(entries) {
+  const normalized = [];
+  const seen = new Set();
+  const sorted = (Array.isArray(entries) ? entries : [])
+    .filter(Boolean)
+    .sort((a, b) => compareTranscriptEntries(a, b));
+
+  for (const entry of sorted) {
+    if (!entry || !entry.message) {
+      continue;
+    }
+    const message = canonicalTranscriptText(entry.message);
+    const key = `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${message}|${entry.turnId || ''}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    const previous = normalized[normalized.length - 1];
+    const previousTime = Date.parse(previous?.timestamp || '');
+    const entryTime = Date.parse(entry.timestamp || '');
+    const near = Number.isFinite(previousTime) && Number.isFinite(entryTime) && Math.abs(entryTime - previousTime) <= 2000;
+    if (
+      previous
+      && near
+      && String(previous.kind || '') === String(entry.kind || '')
+      && canonicalTranscriptText(previous.message) === message
+    ) {
+      continue;
+    }
+
+    seen.add(key);
+    normalized.push(entry);
+  }
+  return normalized.slice(-400);
+}
+
 function getSessionDetail(hostId, sessionId) {
-  const session = getSession(hostId, sessionId);
+  let session = getSession(hostId, sessionId);
   if (!session) {
     return null;
   }
 
   const key = sessionKey(hostId, sessionId);
-  const transcript = state.sessionLogs.get(key) || session.transcriptPreview || [];
+  const rawTranscript = state.sessionLogs.get(key) || session.transcriptPreview || [];
+  const transcript = compactTranscriptEntries(mergeByFingerprint(
+    (Array.isArray(rawTranscript) ? rawTranscript : [])
+      .map(normalizeStoredTranscriptEntry)
+      .filter(Boolean),
+    transcriptFingerprint,
+    SESSION_LOG_ENTRY_LIMIT
+  )).slice(-SESSION_LOG_ENTRY_LIMIT);
+  if (state.sessionLogs.has(key) && transcript.length !== rawTranscript.length) {
+    state.sessionLogs.set(key, transcript);
+    saveSessionLogs();
+  }
+  session = refreshSessionMessageSummaries(hostId, sessionId, transcript) || session;
+  session = maybeInferAndPersistSessionTitle(hostId, sessionId, transcript) || session;
   const alerts = state.sessionAlerts.get(key) || [];
   const runtime = state.sessionRuntime.get(key) || null;
-  const diagnostics = state.sessionDiagnostics.get(key) || [];
+  const diagnostics = compactSessionDiagnostics([
+    ...loadSessionDiagnosticsFromRollout(session),
+    ...(state.sessionDiagnostics.get(key) || []),
+  ]);
+  if (diagnostics.length) {
+    state.sessionDiagnostics.set(key, diagnostics);
+  }
   const requests = state.sessionRequests.get(key) || [];
+  pruneReceivedFiles();
+  const receivedFiles = Array.from(state.receivedFiles.values())
+    .filter((file) => file.hostId === hostId && file.sessionId === sessionId)
+    .sort((a, b) => String(b.receivedAt || '').localeCompare(String(a.receivedAt || '')))
+    .map((file) => ({
+      fileId: file.fileId,
+      hostId: file.hostId,
+      sessionId: file.sessionId,
+      remotePath: file.remotePath,
+      name: file.name,
+      mime: file.mime,
+      size: file.size,
+      receivedAt: file.receivedAt,
+      lastAccessedAt: file.lastAccessedAt,
+      expiresAt: file.expiresAt,
+      url: `/api/received-files/${encodeURIComponent(file.fileId)}`,
+    }));
   return {
     session,
     transcript,
@@ -1143,7 +1508,550 @@ function getSessionDetail(hostId, sessionId) {
     runtime,
     diagnostics,
     requests,
+    receivedFiles,
   };
+}
+
+function exportTimestamp(value) {
+  const parsed = value ? new Date(value) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) {
+    return '';
+  }
+  return parsed.toISOString();
+}
+
+function exportLineValue(value, fallback = '') {
+  const text = String(value ?? '').replace(/[\r\n]+/g, ' ').trim();
+  return text || fallback;
+}
+
+function sessionExportBaseName(session) {
+  const cwdLeaf = String(session?.cwd || '')
+    .replace(/[\\/]+$/, '')
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop() || 'session';
+  const title = exportLineValue(cwdLeaf, 'session');
+  const safeTitle = title
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'session';
+  const sessionId = String(session?.sessionId || '').replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 36);
+  return sessionId ? `${safeTitle}-${sessionId}` : safeTitle;
+}
+
+function sessionExportTitle(session) {
+  const cwd = exportLineValue(session?.cwd || '(unknown path)', '(unknown path)');
+  const sessionId = exportLineValue(session?.sessionId || 'unknown-session', 'unknown-session');
+  return `${cwd} | ${sessionId}`;
+}
+
+function formatExportEntry(entry) {
+  const speaker = exportLineValue(entry?.speaker || 'message', 'message');
+  const timestamp = exportTimestamp(entry?.timestamp);
+  const heading = timestamp ? `### ${speaker} | ${timestamp}` : `### ${speaker}`;
+  const text = String(entry?.text || '').trim() || '(empty)';
+  const files = Array.isArray(entry?.files) ? entry.files : [];
+  const lines = [heading, '', text];
+  if (files.length > 0) {
+    lines.push('', 'Files:');
+    for (const file of files) {
+      const name = exportLineValue(file?.name || file?.path || 'file', 'file');
+      const remotePath = exportLineValue(file?.path || file?.remotePath || '');
+      const size = Number(file?.size || 0) || 0;
+      lines.push(`- ${name}${remotePath && remotePath !== name ? ` (${remotePath})` : ''}${size ? `, ${size} bytes` : ''}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function collectTranscriptFiles(transcript) {
+  const files = [];
+  const seen = new Set();
+  for (const entry of Array.isArray(transcript) ? transcript : []) {
+    for (const file of Array.isArray(entry?.files) ? entry.files : []) {
+      const key = [
+        file.fileId || '',
+        file.path || file.remotePath || '',
+        file.name || '',
+        file.mime || '',
+      ].join('\u0000');
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      files.push({
+        ...file,
+        speaker: entry.speaker || '',
+        timestamp: entry.timestamp || '',
+      });
+    }
+  }
+  return files;
+}
+
+function formatExportFileLine(file, options = {}) {
+  const name = exportLineValue(file?.name || file?.path || file?.remotePath || 'file', 'file');
+  const remotePath = exportLineValue(file?.path || file?.remotePath || '');
+  const mime = exportLineValue(file?.mime || file?.type || '');
+  const size = Number(file?.size || 0) || 0;
+  const url = exportLineValue(file?.url || '');
+  const pieces = [name];
+  if (remotePath && remotePath !== name) {
+    pieces.push(`path: ${remotePath}`);
+  }
+  if (mime) {
+    pieces.push(`mime: ${mime}`);
+  }
+  if (size) {
+    pieces.push(`size: ${size} bytes`);
+  }
+  if (options.includeTimestamp && file?.timestamp) {
+    pieces.push(`message: ${exportTimestamp(file.timestamp) || file.timestamp}`);
+  }
+  if (url) {
+    pieces.push(`url: ${url}`);
+  }
+  return `- ${pieces.join(' | ')}`;
+}
+
+function parseExportBoolean(value, fallback = false) {
+  if (value === null || value === undefined || value === '') {
+    return fallback;
+  }
+  const text = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on', 'include'].includes(text)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off', 'omit'].includes(text)) {
+    return false;
+  }
+  return fallback;
+}
+
+function normalizeSessionExportOptions(options = {}) {
+  return {
+    includeThinking: Boolean(options.includeThinking),
+  };
+}
+
+function formatExportDiagnosticEntry(entry) {
+  const kind = exportLineValue(entry?.kind || 'event', 'event');
+  const method = exportLineValue(entry?.method || '');
+  const timestamp = exportTimestamp(entry?.timestamp);
+  const headingParts = [kind];
+  if (method) {
+    headingParts.push(method);
+  }
+  if (timestamp) {
+    headingParts.push(timestamp);
+  }
+
+  const message = String(entry?.message || '').trim() || '(empty)';
+  const lines = [`### ${headingParts.join(' | ')}`, '', message];
+  const detail = String(entry?.detail || '').trim();
+  if (detail) {
+    lines.push('', '```text', detail, '```');
+  }
+  return lines.join('\n');
+}
+
+function buildSessionMarkdownExport(detail, options = {}) {
+  const exportOptions = normalizeSessionExportOptions(options);
+  const { session, transcript, runtime, alerts, diagnostics, requests, receivedFiles } = detail;
+  const visibleTranscript = (Array.isArray(transcript) ? transcript : [])
+    .filter((entry) => entry && ['user', 'agent', 'assistant', 'system'].includes(entry.speaker || ''));
+  const transcriptFiles = collectTranscriptFiles(visibleTranscript);
+  const cachedFiles = Array.isArray(receivedFiles) ? receivedFiles : [];
+  const lines = [
+    `# ${sessionExportTitle(session)}`,
+    '',
+    '## Metadata',
+    '',
+    `- Host: ${exportLineValue(session.hostId)}`,
+    `- Session: ${exportLineValue(session.sessionId)}`,
+    `- Conversation ID: ${exportLineValue(session.conversationKey || session.sessionId)}`,
+    `- Title: ${exportLineValue(session.title || '(untitled)')}`,
+    `- State: ${exportLineValue(session.state || 'unknown')}`,
+    `- Source: ${exportLineValue(session.source || 'unknown')}`,
+    `- Live: ${session.live ? 'yes' : 'no'}`,
+    `- CWD: ${exportLineValue(session.cwd || '(unknown)')}`,
+    `- Created: ${exportTimestamp(session.createdAt) || '(unknown)'}`,
+    `- Updated: ${exportTimestamp(session.lastUpdatedAt || session.updatedAt) || '(unknown)'}`,
+    `- Exported: ${new Date().toISOString()}`,
+    '',
+    '## Conversation',
+    '',
+  ];
+
+  if (visibleTranscript.length > 0) {
+    lines.push(...visibleTranscript.map(formatExportEntry).join('\n\n').split('\n'));
+  } else {
+    lines.push('No transcript entries were captured for this session.');
+  }
+
+  lines.push('', '## Images and Files', '');
+  if (!transcriptFiles.length && !cachedFiles.length) {
+    lines.push('No image or file references were captured for this session.');
+  } else {
+    if (transcriptFiles.length > 0) {
+      lines.push('### Referenced by Messages', '');
+      for (const file of transcriptFiles) {
+        lines.push(formatExportFileLine(file, { includeTimestamp: true }));
+      }
+      lines.push('');
+    }
+    if (cachedFiles.length > 0) {
+      lines.push('### Cached Downloads', '');
+      for (const file of cachedFiles) {
+        lines.push(formatExportFileLine(file));
+      }
+    }
+  }
+
+  lines.push('', '## Runtime Summary', '');
+  if (runtime) {
+    lines.push(`- Phase: ${exportLineValue(runtime.phase || 'unknown')}`);
+    lines.push(`- Connection: ${exportLineValue(runtime.connection || 'unknown')}`);
+    lines.push(`- Active turn: ${exportLineValue(runtime.activeTurnId || runtime.turnId || '') || '(none)'}`);
+    if (runtime.usage?.last) {
+      lines.push(`- Last input tokens: ${Number(runtime.usage.last.inputTokens || 0) || 0}`);
+      lines.push(`- Last output tokens: ${Number(runtime.usage.last.outputTokens || 0) || 0}`);
+      lines.push(`- Last reasoning tokens: ${Number(runtime.usage.last.reasoningTokens || 0) || 0}`);
+    }
+  } else {
+    lines.push('No runtime snapshot was captured.');
+  }
+
+  const importantAlerts = (Array.isArray(alerts) ? alerts : []).filter((alert) => alert?.message);
+  if (importantAlerts.length > 0) {
+    lines.push('', '## Alerts', '');
+    for (const alert of importantAlerts) {
+      lines.push(`- ${exportTimestamp(alert.timestamp) || '(unknown time)'} ${exportLineValue(alert.severity || 'info')}: ${exportLineValue(alert.message)}`);
+    }
+  }
+
+  const pendingRequests = (Array.isArray(requests) ? requests : []).filter((request) => request?.status === 'pending');
+  if (pendingRequests.length > 0) {
+    lines.push('', '## Pending Requests', '');
+    for (const request of pendingRequests) {
+      lines.push(`- ${exportLineValue(request.kind || request.method || 'request')}: ${exportLineValue(request.message || request.status || '')}`);
+    }
+  }
+
+  const diagnosticEntries = Array.isArray(diagnostics) ? diagnostics : [];
+  const diagnosticCount = diagnosticEntries.length;
+  lines.push('', '## Thinking / Activity', '');
+  if (exportOptions.includeThinking) {
+    if (diagnosticEntries.length > 0) {
+      lines.push(...diagnosticEntries.map(formatExportDiagnosticEntry).join('\n\n').split('\n'));
+    } else {
+      lines.push('No thinking/activity events were captured for this session.');
+    }
+  } else {
+    lines.push(`${diagnosticCount} thinking/activity event(s) captured but omitted from this export. Re-export with includeThinking=1 to include the full structured timeline.`);
+  }
+  return `${lines.join('\n').replace(/\n{3,}/g, '\n\n')}\n`;
+}
+
+function buildSessionJsonExport(detail, options = {}) {
+  const exportOptions = normalizeSessionExportOptions(options);
+  return {
+    exportedAt: nowIso(),
+    version: 1,
+    exportOptions,
+    ...detail,
+    diagnostics: exportOptions.includeThinking ? detail.diagnostics : [],
+  };
+}
+
+function makeCrc32Table() {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+}
+
+const ZIP_CRC32_TABLE = makeCrc32Table();
+
+function crc32Update(crc, chunk) {
+  let value = crc >>> 0;
+  for (const byte of chunk) {
+    value = ZIP_CRC32_TABLE[(value ^ byte) & 0xff] ^ (value >>> 8);
+  }
+  return value >>> 0;
+}
+
+function crc32Buffer(buffer) {
+  return (crc32Update(0xffffffff, buffer) ^ 0xffffffff) >>> 0;
+}
+
+function zipDosDateTime(value = new Date()) {
+  const date = value instanceof Date && !Number.isNaN(value.getTime()) ? value : new Date();
+  const year = Math.max(1980, Math.min(2107, date.getFullYear()));
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+  };
+}
+
+function writeZipUInt32(buffer, value, offset) {
+  if (value > 0xffffffff) {
+    throw new Error('zip export does not support files larger than 4 GiB');
+  }
+  buffer.writeUInt32LE(value >>> 0, offset);
+}
+
+function safeZipEntryName(value, fallback = 'file') {
+  return safeFileDisplayName(value || fallback, fallback)
+    .replace(/[\\/]+/g, '_')
+    .replace(/^\.+$/, fallback)
+    .slice(0, 160) || fallback;
+}
+
+function uniqueZipPath(usedPaths, directory, filename) {
+  const safeDirectory = String(directory || '').replace(/^\/+|\/+$/g, '');
+  const safeName = safeZipEntryName(filename, 'file');
+  const dotIndex = safeName.lastIndexOf('.');
+  const base = dotIndex > 0 ? safeName.slice(0, dotIndex) : safeName;
+  const ext = dotIndex > 0 ? safeName.slice(dotIndex) : '';
+  let candidate = safeDirectory ? `${safeDirectory}/${safeName}` : safeName;
+  let counter = 2;
+  while (usedPaths.has(candidate)) {
+    candidate = safeDirectory ? `${safeDirectory}/${base}-${counter}${ext}` : `${base}-${counter}${ext}`;
+    counter += 1;
+  }
+  usedPaths.add(candidate);
+  return candidate;
+}
+
+class ZipStreamWriter {
+  constructor(stream) {
+    this.stream = stream;
+    this.offset = 0;
+    this.entries = [];
+  }
+
+  async write(buffer) {
+    if (!buffer.length) {
+      return;
+    }
+    this.offset += buffer.length;
+    if (!this.stream.write(buffer)) {
+      await waitForStreamDrain(this.stream);
+    }
+  }
+
+  async writeLocalHeader(name, options) {
+    const filename = Buffer.from(name, 'utf8');
+    const header = Buffer.alloc(30);
+    const { time, date } = zipDosDateTime(options.modifiedAt);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(options.flags, 6);
+    header.writeUInt16LE(0, 8);
+    header.writeUInt16LE(time, 10);
+    header.writeUInt16LE(date, 12);
+    writeZipUInt32(header, options.crc || 0, 14);
+    writeZipUInt32(header, options.compressedSize || 0, 18);
+    writeZipUInt32(header, options.uncompressedSize || 0, 22);
+    header.writeUInt16LE(filename.length, 26);
+    header.writeUInt16LE(0, 28);
+    await this.write(header);
+    await this.write(filename);
+  }
+
+  async addBuffer(name, buffer, modifiedAt = new Date()) {
+    const entryName = String(name || 'file');
+    const crc = crc32Buffer(buffer);
+    const offset = this.offset;
+    const flags = 0x0800;
+    await this.writeLocalHeader(entryName, {
+      flags,
+      crc,
+      compressedSize: buffer.length,
+      uncompressedSize: buffer.length,
+      modifiedAt,
+    });
+    await this.write(buffer);
+    this.entries.push({
+      name: entryName,
+      flags,
+      crc,
+      compressedSize: buffer.length,
+      uncompressedSize: buffer.length,
+      offset,
+      modifiedAt,
+    });
+  }
+
+  async addFile(name, filePath, modifiedAt = new Date()) {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      return;
+    }
+    if (stat.size > 0xffffffff) {
+      throw new Error(`file is too large for zip export: ${filePath}`);
+    }
+    const entryName = String(name || safeFileDisplayName(filePath));
+    const offset = this.offset;
+    const flags = 0x0808;
+    await this.writeLocalHeader(entryName, {
+      flags,
+      crc: 0,
+      compressedSize: 0,
+      uncompressedSize: 0,
+      modifiedAt,
+    });
+
+    let crc = 0xffffffff;
+    let size = 0;
+    for await (const chunk of fs.createReadStream(filePath)) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      crc = crc32Update(crc, buffer);
+      size += buffer.length;
+      await this.write(buffer);
+    }
+    const finalCrc = (crc ^ 0xffffffff) >>> 0;
+    const descriptor = Buffer.alloc(16);
+    descriptor.writeUInt32LE(0x08074b50, 0);
+    writeZipUInt32(descriptor, finalCrc, 4);
+    writeZipUInt32(descriptor, size, 8);
+    writeZipUInt32(descriptor, size, 12);
+    await this.write(descriptor);
+    this.entries.push({
+      name: entryName,
+      flags,
+      crc: finalCrc,
+      compressedSize: size,
+      uncompressedSize: size,
+      offset,
+      modifiedAt,
+    });
+  }
+
+  async finalize() {
+    const centralDirectoryOffset = this.offset;
+    for (const entry of this.entries) {
+      const filename = Buffer.from(entry.name, 'utf8');
+      const header = Buffer.alloc(46);
+      const { time, date } = zipDosDateTime(entry.modifiedAt);
+      header.writeUInt32LE(0x02014b50, 0);
+      header.writeUInt16LE(20, 4);
+      header.writeUInt16LE(20, 6);
+      header.writeUInt16LE(entry.flags, 8);
+      header.writeUInt16LE(0, 10);
+      header.writeUInt16LE(time, 12);
+      header.writeUInt16LE(date, 14);
+      writeZipUInt32(header, entry.crc, 16);
+      writeZipUInt32(header, entry.compressedSize, 20);
+      writeZipUInt32(header, entry.uncompressedSize, 24);
+      header.writeUInt16LE(filename.length, 28);
+      header.writeUInt16LE(0, 30);
+      header.writeUInt16LE(0, 32);
+      header.writeUInt16LE(0, 34);
+      header.writeUInt16LE(0, 36);
+      header.writeUInt32LE(0, 38);
+      writeZipUInt32(header, entry.offset, 42);
+      await this.write(header);
+      await this.write(filename);
+    }
+
+    const centralDirectorySize = this.offset - centralDirectoryOffset;
+    const footer = Buffer.alloc(22);
+    footer.writeUInt32LE(0x06054b50, 0);
+    footer.writeUInt16LE(0, 4);
+    footer.writeUInt16LE(0, 6);
+    footer.writeUInt16LE(this.entries.length, 8);
+    footer.writeUInt16LE(this.entries.length, 10);
+    writeZipUInt32(footer, centralDirectorySize, 12);
+    writeZipUInt32(footer, centralDirectoryOffset, 16);
+    footer.writeUInt16LE(0, 20);
+    await this.write(footer);
+  }
+}
+
+function getSessionCachedFileRecords(session) {
+  pruneReceivedFiles();
+  const hostId = String(session?.hostId || '');
+  const sessionId = String(session?.sessionId || '');
+  return Array.from(state.receivedFiles.values())
+    .filter((file) => file.hostId === hostId && file.sessionId === sessionId && file.localPath && fs.existsSync(file.localPath))
+    .sort((a, b) => String(a.receivedAt || '').localeCompare(String(b.receivedAt || '')));
+}
+
+function prepareSessionBundleFiles(detail) {
+  const usedPaths = new Set(['session.md', 'session.json', 'manifest.json']);
+  return getSessionCachedFileRecords(detail.session).map((file) => ({
+    ...file,
+    zipPath: uniqueZipPath(usedPaths, 'files', file.name || file.remotePath || file.fileId),
+  }));
+}
+
+function buildSessionBundleManifest(detail, bundleFiles, options = {}) {
+  const exportOptions = normalizeSessionExportOptions(options);
+  const referencedFiles = collectTranscriptFiles(detail.transcript || []);
+  return {
+    exportedAt: nowIso(),
+    version: 1,
+    exportOptions,
+    title: sessionExportTitle(detail.session),
+    session: detail.session,
+    referencedFiles,
+    cachedFiles: bundleFiles.map((file) => ({
+      fileId: file.fileId,
+      name: file.name,
+      remotePath: file.remotePath,
+      mime: file.mime,
+      size: file.size,
+      receivedAt: file.receivedAt,
+      expiresAt: file.expiresAt,
+      zipPath: file.zipPath,
+    })),
+    notes: [
+      'The files/ directory contains only files already cached by the relay.',
+      'Referenced remote files that were not cached are listed in referencedFiles but are not embedded in this zip.',
+    ],
+  };
+}
+
+async function streamSessionZipExport(res, detail, options = {}) {
+  const exportOptions = normalizeSessionExportOptions(options);
+  const bundleFiles = prepareSessionBundleFiles(detail);
+  const manifest = buildSessionBundleManifest(detail, bundleFiles, exportOptions);
+  const jsonExport = {
+    ...buildSessionJsonExport(detail, exportOptions),
+    bundle: {
+      manifest,
+      cachedFileCount: bundleFiles.length,
+    },
+  };
+  const markdown = buildSessionMarkdownExport(detail, exportOptions);
+  const filename = `${sessionExportBaseName(detail.session)}.zip`;
+
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Disposition': contentDispositionValue('attachment', filename),
+    'Cache-Control': 'no-store',
+  });
+
+  const writer = new ZipStreamWriter(res);
+  const exportedAt = new Date();
+  await writer.addBuffer('session.md', Buffer.from(markdown, 'utf8'), exportedAt);
+  await writer.addBuffer('session.json', Buffer.from(JSON.stringify(jsonExport, null, 2), 'utf8'), exportedAt);
+  await writer.addBuffer('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'), exportedAt);
+  for (const file of bundleFiles) {
+    await writer.addFile(file.zipPath, file.localPath, file.receivedAt ? new Date(file.receivedAt) : exportedAt);
+  }
+  await writer.finalize();
+  res.end();
 }
 
 function safeFileDisplayName(value, fallback = 'download') {
@@ -1167,7 +2075,7 @@ function normalizeFileTransferRefs(rawFiles) {
       continue;
     }
 
-    const remotePath = String(rawFile.path || rawFile.remotePath || '').trim();
+    const remotePath = normalizeRemoteFilePath(rawFile.path || rawFile.remotePath || '');
     const name = safeFileDisplayName(rawFile.name || remotePath || 'file');
     if (!remotePath && !rawFile.dataBase64) {
       continue;
@@ -1187,7 +2095,7 @@ function normalizeFileTransferRefs(rawFiles) {
 }
 
 function transcriptFingerprint(entry) {
-  return `${entry.speaker || 'system'}|${entry.timestamp || ''}|${entry.text || ''}|${(entry.files || []).map((file) => file.path || file.name || '').join(',')}`;
+  return `${entry.speaker || 'system'}|${entry.timestamp || ''}|${canonicalTranscriptText(entry.text || '')}|${(entry.files || []).map((file) => file.path || file.name || '').join(',')}`;
 }
 
 function setSessionLog(hostId, sessionId, entries, options = {}) {
@@ -1198,7 +2106,8 @@ function setSessionLog(hostId, sessionId, entries, options = {}) {
   const existing = options.merge ? state.sessionLogs.get(key) || [] : [];
   state.sessionLogs.set(
     key,
-    mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT)
+    compactTranscriptEntries(mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT))
+      .slice(-SESSION_LOG_ENTRY_LIMIT)
   );
   saveSessionLogs();
 }
@@ -1260,11 +2169,11 @@ function appendSessionDiagnostic(hostId, sessionId, entry) {
   existing.push(nextEntry);
   state.sessionDiagnostics.set(
     key,
-    mergeByFingerprint(
+    compactSessionDiagnostics(mergeByFingerprint(
       existing,
       (item) => `${item.timestamp || ''}|${item.kind || ''}|${item.method || ''}|${item.message || ''}|${item.detail || ''}|${item.turnId || ''}`,
       200
-    )
+    ))
   );
   return nextEntry;
 }
@@ -1369,15 +2278,16 @@ function resolvePendingSessionRequests(hostId, sessionId, patch = {}) {
 function appendSessionLog(hostId, sessionId, entry) {
   const key = sessionKey(hostId, sessionId);
   const existing = state.sessionLogs.get(key) || [];
-  const nextEntry = {
-    timestamp: entry.timestamp || nowIso(),
-    speaker: entry.speaker || 'system',
-    text: entry.text || '',
-    stream: entry.stream || null,
-    files: normalizeFileTransferRefs(entry.files || entry.attachments || []),
-  };
+  const nextEntry = normalizeStoredTranscriptEntry(entry);
+  if (!nextEntry) {
+    return null;
+  }
   existing.push(nextEntry);
-  state.sessionLogs.set(key, mergeByFingerprint(existing, transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT));
+  state.sessionLogs.set(
+    key,
+    compactTranscriptEntries(mergeByFingerprint(existing, transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT))
+      .slice(-SESSION_LOG_ENTRY_LIMIT)
+  );
   const session = getSession(hostId, sessionId);
   if (session) {
     session.messageCount = Math.max(Number(session.messageCount || 0), state.sessionLogs.get(key)?.length || 0);
@@ -1407,6 +2317,9 @@ function appendSessionAlert(hostId, sessionId, entry) {
 
 function emitTranscriptEntry(hostId, sessionId, entry) {
   const nextEntry = appendSessionLog(hostId, sessionId, entry);
+  if (!nextEntry) {
+    return null;
+  }
   const payload = {
     ...nextEntry,
     hostId,
@@ -1654,6 +2567,25 @@ function migrateSessionIdentity(hostId, fromSessionId, toSessionId, patch = {}) 
   state.sessions.set(toKey, next);
   state.sessions.delete(fromKey);
   moveSessionArtifacts(hostId, fromSessionId, toSessionId);
+  const identities = getSessionTitleIdentities(fromSession || toSession, {
+    ...patch,
+    sessionId: toSessionId,
+    bridgeSessionId: fromSessionId,
+    nativeThreadId: patch.nativeThreadId || toSessionId,
+  });
+  const title = resolveSessionTitle(hostId, fromSession || toSession, {
+    ...patch,
+    sessionId: toSessionId,
+    bridgeSessionId: fromSessionId,
+    nativeThreadId: patch.nativeThreadId || toSessionId,
+  });
+  next.title = title || next.title;
+  state.sessions.set(toKey, next);
+  rememberSessionTitle(hostId, identities, title, {
+    cwd: patch.cwd || fromSession?.cwd || toSession?.cwd || '',
+    source: patch.source || fromSession?.source || toSession?.source || 'migration',
+  });
+  migrateSessionCollectionItems(hostId, fromSessionId, toSessionId, patch);
   return next;
 }
 
@@ -1667,6 +2599,369 @@ function persistConnectorSecrets() {
 
 function persistSessionCollections() {
   saveSessionCollections(Array.from(state.sessionCollections.values()));
+}
+
+function getSessionTitleIdentities(existing, patch = {}) {
+  const values = [
+    patch.sessionId,
+    patch.conversationKey,
+    patch.originSessionId,
+    patch.sourceSessionId,
+    patch.bridgeSessionId,
+    patch.nativeThreadId,
+    existing?.sessionId,
+    existing?.conversationKey,
+    existing?.originSessionId,
+    existing?.sourceSessionId,
+    existing?.bridgeSessionId,
+    existing?.nativeThreadId,
+  ];
+  return Array.from(new Set(values
+    .filter(Boolean)
+    .map((value) => String(value).trim())
+    .filter(Boolean)));
+}
+
+function findSessionMetadataTitle(hostId, identities = []) {
+  for (const identity of identities) {
+    const entry = state.sessionMetadata.get(sessionMetadataKey(hostId, identity));
+    if (entry?.title && isMeaningfulSessionTitle(entry.title, identities)) {
+      return entry.title;
+    }
+  }
+  return '';
+}
+
+function rememberSessionTitle(hostId, identities = [], title, options = {}) {
+  const normalizedTitle = normalizeSessionTitle(title);
+  const uniqueIdentities = Array.from(new Set((identities || [])
+    .filter(Boolean)
+    .map((value) => String(value).trim())
+    .filter(Boolean)));
+  if (!hostId || !uniqueIdentities.length || !isMeaningfulSessionTitle(normalizedTitle, uniqueIdentities)) {
+    return false;
+  }
+
+  let changed = false;
+  for (const identity of uniqueIdentities) {
+    const key = sessionMetadataKey(hostId, identity);
+    const existing = state.sessionMetadata.get(key);
+    if (existing?.title === normalizedTitle && existing?.cwd === (options.cwd || existing.cwd || '')) {
+      continue;
+    }
+    state.sessionMetadata.set(key, {
+      hostId,
+      identity,
+      title: normalizedTitle,
+      cwd: String(options.cwd || existing?.cwd || '').trim(),
+      source: String(options.source || existing?.source || 'metadata').trim() || 'metadata',
+      updatedAt: nowIso(),
+    });
+    changed = true;
+  }
+  if (changed && options.persist !== false) {
+    saveSessionMetadata();
+  }
+  return changed;
+}
+
+function resolveSessionTitle(hostId, existing, patch = {}) {
+  const identities = getSessionTitleIdentities(existing, patch);
+  const explicitTitle = normalizeSessionTitle(patch.title || '');
+  if (isMeaningfulSessionTitle(explicitTitle, identities)) {
+    rememberSessionTitle(hostId, identities, explicitTitle, {
+      cwd: patch.cwd || existing?.cwd || '',
+      source: patch.source || existing?.source || 'session',
+    });
+    return explicitTitle;
+  }
+
+  const storedTitle = findSessionMetadataTitle(hostId, identities);
+  if (storedTitle) {
+    return storedTitle;
+  }
+
+  const existingTitle = normalizeSessionTitle(existing?.title || '');
+  if (isMeaningfulSessionTitle(existingTitle, identities)) {
+    rememberSessionTitle(hostId, identities, existingTitle, {
+      cwd: patch.cwd || existing?.cwd || '',
+      source: existing?.source || patch.source || 'session',
+    });
+    return existingTitle;
+  }
+
+  return explicitTitle || existingTitle || patch.sessionId || existing?.sessionId || '';
+}
+
+function updateSessionCollectionTitles(hostId, identities = [], title) {
+  const normalizedTitle = normalizeSessionTitle(title);
+  const identitySet = new Set((identities || [])
+    .filter(Boolean)
+    .map((value) => String(value).trim())
+    .filter(Boolean));
+  if (!hostId || !identitySet.size || !normalizedTitle) {
+    return false;
+  }
+
+  let changed = false;
+  for (const collection of state.sessionCollections.values()) {
+    if (!collection || !Array.isArray(collection.items)) {
+      continue;
+    }
+    let collectionChanged = false;
+    for (const item of collection.items) {
+      if (item.hostId !== hostId) {
+        continue;
+      }
+      if (!identitySet.has(item.sessionId) && !identitySet.has(item.conversationKey)) {
+        continue;
+      }
+      if (item.title === normalizedTitle) {
+        continue;
+      }
+      item.title = normalizedTitle;
+      item.updatedAt = nowIso();
+      collectionChanged = true;
+    }
+    if (collectionChanged) {
+      collection.updatedAt = nowIso();
+      changed = true;
+    }
+  }
+  if (changed) {
+    persistSessionCollections();
+  }
+  return changed;
+}
+
+function updateSessionTitle(hostId, sessionId, title, options = {}) {
+  const session = getSession(hostId, sessionId);
+  const normalizedTitle = normalizeSessionTitle(title);
+  if (!session || !normalizedTitle) {
+    return null;
+  }
+
+  const identities = getSessionTitleIdentities(session, {
+    sessionId,
+    title: normalizedTitle,
+  });
+  const next = {
+    ...session,
+    title: normalizedTitle,
+    lastUpdatedAt: options.touch === false ? session.lastUpdatedAt : nowIso(),
+  };
+  state.sessions.set(sessionKey(hostId, sessionId), next);
+  rememberSessionTitle(hostId, identities, normalizedTitle, {
+    cwd: session.cwd || '',
+    source: options.source || 'manual',
+  });
+  updateSessionCollectionTitles(hostId, identities, normalizedTitle);
+  return next;
+}
+
+function refreshSessionMessageSummaries(hostId, sessionId, transcript = []) {
+  const session = getSession(hostId, sessionId);
+  if (!session) {
+    return null;
+  }
+  const latestUser = [...transcript].reverse().find((entry) => entry.speaker === 'user' && entry.text);
+  const latestAgent = [...transcript].reverse().find((entry) => (entry.speaker === 'agent' || entry.speaker === 'assistant') && entry.text);
+  const latestUserMessage = latestUser?.text || null;
+  const latestAgentMessage = latestAgent?.text || null;
+  const messageCount = Array.isArray(transcript) ? transcript.length : Number(session.messageCount || 0);
+  if (
+    session.latestUserMessage === latestUserMessage
+    && session.latestAgentMessage === latestAgentMessage
+    && Number(session.messageCount || 0) === messageCount
+  ) {
+    return session;
+  }
+
+  const next = {
+    ...session,
+    latestUserMessage,
+    latestAgentMessage,
+    messageCount,
+  };
+  state.sessions.set(sessionKey(hostId, sessionId), next);
+  return next;
+}
+
+function maybeInferAndPersistSessionTitle(hostId, sessionId, transcript = []) {
+  const session = getSession(hostId, sessionId);
+  if (!session) {
+    return null;
+  }
+  const identities = getSessionTitleIdentities(session, { sessionId });
+  if (isMeaningfulSessionTitle(session.title, identities)) {
+    return session;
+  }
+
+  const inferredTitle = inferSessionTitleFromTranscript(session, transcript);
+  if (!inferredTitle || !isMeaningfulSessionTitle(inferredTitle, identities)) {
+    return session;
+  }
+
+  return updateSessionTitle(hostId, sessionId, inferredTitle, {
+    source: 'inferred',
+    touch: false,
+  }) || session;
+}
+
+function inferSessionTitleFromTranscript(session, transcript = []) {
+  const candidates = [];
+  for (const entry of Array.isArray(transcript) ? transcript : []) {
+    if (!entry || entry.speaker !== 'user') {
+      continue;
+    }
+    const text = cleanStoredTranscriptText(entry.text || '', 'user');
+    if (text && !isWeakTitleSource(text)) {
+      candidates.push(text);
+    }
+  }
+
+  const latestUser = cleanStoredTranscriptText(session?.latestUserMessage || '', 'user');
+  if (latestUser && !isWeakTitleSource(latestUser)) {
+    candidates.push(latestUser);
+  }
+
+  for (const candidate of candidates) {
+    const title = summarizeSessionTitle(candidate);
+    if (title && !isWeakTitleSource(title)) {
+      return title;
+    }
+  }
+
+  if (session?.source?.subagent || session?.originator === 'subagent') {
+    return 'Approval review';
+  }
+
+  const cwdLeaf = path.basename(String(session?.cwd || '').replace(/[\\/]+$/, ''));
+  return normalizeSessionTitle(cwdLeaf || '');
+}
+
+function isWeakTitleSource(value) {
+  const text = canonicalTranscriptText(value).toLowerCase();
+  return !text
+    || text.length < 3
+    || ['ok', 'okay', 'yes', 'no', 'continue', 'please continue'].includes(text)
+    || /^(ok|okay|thanks?|thank you)[.!?]*$/i.test(text)
+    || /^(please\s+)?continue[.!?]*$/i.test(text);
+}
+
+function summarizeSessionTitle(value) {
+  let text = cleanStoredTranscriptText(value, 'user')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[#>*_\[\](){}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) {
+    return '';
+  }
+
+  const firstSentence = text.split(/[.!?\u3002\uff01\uff1f\n]/)[0]?.trim();
+  if (firstSentence && firstSentence.length >= 4) {
+    text = firstSentence;
+  }
+  const firstClause = text.split(/[,;\u3001\uff0c\uff1b]/)[0]?.trim();
+  if (firstClause && firstClause.length >= 4 && firstClause.length <= 36) {
+    text = firstClause;
+  }
+
+  const hasCjk = /[\u4e00-\u9fff]/.test(text);
+  if (hasCjk) {
+    return normalizeSessionTitle(text.slice(0, 24).replace(/[.?!,;:\u3002\uff01\uff1f\u3001\uff0c\uff1b\uff1a]+$/g, ''));
+  }
+
+  const words = text.split(/\s+/).filter(Boolean);
+  return normalizeSessionTitle(words.slice(0, 8).join(' ').replace(/[.?!,;:]+$/g, ''));
+}
+
+function seedSessionMetadataFromCollections() {
+  let changed = false;
+  for (const collection of state.sessionCollections.values()) {
+    if (!collection || collection.collectionId === DEFAULT_COLLECTION_ID || !Array.isArray(collection.items)) {
+      continue;
+    }
+    for (const item of collection.items) {
+      changed = rememberSessionTitle(
+        item.hostId,
+        [item.conversationKey, item.sessionId],
+        item.title,
+        {
+          cwd: item.cwd || '',
+          source: `collection:${collection.collectionId}`,
+          persist: false,
+        }
+      ) || changed;
+    }
+  }
+  if (changed) {
+    saveSessionMetadata();
+  }
+}
+
+function migrateSessionCollectionItems(hostId, fromSessionId, toSessionId, patch = {}) {
+  const from = String(fromSessionId || '');
+  const to = String(toSessionId || '');
+  if (!hostId || !from || !to || from === to) {
+    return false;
+  }
+
+  const nextConversationKey = patch.conversationKey && patch.conversationKey !== from
+    ? String(patch.conversationKey)
+    : to;
+  let changed = false;
+  for (const collection of state.sessionCollections.values()) {
+    if (!collection || collection.collectionId === DEFAULT_COLLECTION_ID || !Array.isArray(collection.items)) {
+      continue;
+    }
+
+    let collectionChanged = false;
+    const nextItems = [];
+    for (const item of collection.items) {
+      const shouldMigrate = item?.hostId === hostId
+        && (item.sessionId === from || item.conversationKey === from);
+      if (!shouldMigrate) {
+        nextItems.push(item);
+        continue;
+      }
+
+      changed = true;
+      collectionChanged = true;
+      rememberSessionTitle(hostId, [from, to, item.conversationKey, item.sessionId], item.title, {
+        cwd: item.cwd || patch.cwd || '',
+        source: `collection:${collection.collectionId}`,
+      });
+      nextItems.push({
+        ...item,
+        conversationKey: item.conversationKey === from ? nextConversationKey : item.conversationKey,
+        sessionId: item.sessionId === from || !item.sessionId ? to : item.sessionId,
+        updatedAt: nowIso(),
+      });
+    }
+
+    if (!collectionChanged) {
+      continue;
+    }
+
+    const deduped = new Map();
+    for (const item of nextItems) {
+      deduped.set(collectionItemKey(item), item);
+    }
+    state.sessionCollections.set(collection.collectionId, {
+      ...collection,
+      items: Array.from(deduped.values()),
+      updatedAt: nowIso(),
+    });
+  }
+
+  if (changed) {
+    persistSessionCollections();
+  }
+  return changed;
 }
 
 function getSessionCollectionList() {
@@ -4015,12 +5310,12 @@ function findReceivedFile(hostId, sessionId, remotePath) {
   pruneReceivedFiles();
   const normalizedHost = String(hostId || '');
   const normalizedSession = String(sessionId || '');
-  const normalizedRemotePath = String(remotePath || '');
+  const normalizedRemotePath = normalizeRemoteFilePath(remotePath);
   for (const record of state.receivedFiles.values()) {
     if (
       record.hostId === normalizedHost
       && record.sessionId === normalizedSession
-      && record.remotePath === normalizedRemotePath
+      && normalizeRemoteFilePath(record.remotePath) === normalizedRemotePath
       && record.localPath
       && fs.existsSync(record.localPath)
     ) {
@@ -4033,7 +5328,8 @@ function findReceivedFile(hostId, sessionId, remotePath) {
 function storeReceivedFile({ hostId, sessionId, remotePath, name, mime, buffer }) {
   pruneReceivedFiles();
   const fileId = makeId();
-  const filename = safeFileDisplayName(name || remotePath || 'download');
+  const normalizedRemotePath = normalizeRemoteFilePath(remotePath);
+  const filename = safeFileDisplayName(name || normalizedRemotePath || 'download');
   const hostSegment = safePathSegment(hostId, 'host');
   const sessionSegment = safePathSegment(sessionId, 'session');
   const targetDirectory = path.join(RECEIVED_FILES_ROOT, hostSegment, sessionSegment);
@@ -4046,7 +5342,7 @@ function storeReceivedFile({ hostId, sessionId, remotePath, name, mime, buffer }
   fs.writeFileSync(localPath, buffer);
 
   const expiresAt = new Date(Date.now() + RECEIVED_FILE_TTL_MS).toISOString();
-  const existing = findReceivedFile(hostId, sessionId, remotePath);
+  const existing = findReceivedFile(hostId, sessionId, normalizedRemotePath);
   if (existing?.localPath && pathInside(RECEIVED_FILES_ROOT, existing.localPath) && fs.existsSync(existing.localPath)) {
     try {
       fs.unlinkSync(existing.localPath);
@@ -4060,7 +5356,7 @@ function storeReceivedFile({ hostId, sessionId, remotePath, name, mime, buffer }
     fileId,
     hostId: String(hostId || ''),
     sessionId: String(sessionId || ''),
-    remotePath: String(remotePath || ''),
+    remotePath: normalizedRemotePath,
     name: filename,
     mime: String(mime || 'application/octet-stream'),
     size: buffer.length,
@@ -4250,6 +5546,7 @@ function upsertSession(hostId, patch) {
     ...patch,
     hostId,
     sessionId: patch.sessionId,
+    title: resolveSessionTitle(hostId, existing, patch),
     createdAt: resolveSessionCreatedAt(existing, patch),
     lastUpdatedAt: patch.lastUpdatedAt || nowIso(),
   };
@@ -4759,6 +6056,10 @@ async function handleRequest(req, res) {
       items: [...existingItems, item],
       updatedAt: nowIso(),
     };
+    rememberSessionTitle(item.hostId, [item.conversationKey, item.sessionId], item.title, {
+      cwd: item.cwd || '',
+      source: `collection:${collectionId}`,
+    });
     state.sessionCollections.set(collectionId, next);
     persistSessionCollections();
     sendJson(res, 200, { ok: true, collection: next, item });
@@ -5328,7 +6629,7 @@ async function handleRequest(req, res) {
   if (req.method === 'GET' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/download$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
     const sessionId = String(url.searchParams.get('sessionId') || '').trim() || null;
-    const remotePath = String(url.searchParams.get('path') || '').trim();
+    const remotePath = normalizeRemoteFilePath(url.searchParams.get('path') || '');
     const inline = url.searchParams.get('inline') === '1' || url.searchParams.get('inline') === 'true';
     const refresh = url.searchParams.get('refresh') === '1' || url.searchParams.get('refresh') === 'true';
     if (!remotePath) {
@@ -5437,12 +6738,90 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'PATCH' && url.pathname.match(/^\/api\/sessions\/[^/]+\/title$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = String(body.hostId || url.searchParams.get('hostId') || '').trim();
+    const title = normalizeSessionTitle(body.title || '');
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    if (!title) {
+      sendJson(res, 400, { error: 'title is required' });
+      return;
+    }
+
+    const session = updateSessionTitle(hostId, sessionId, title, {
+      source: 'manual',
+    });
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+
+    broadcastSessionEvent(hostId, sessionId, 'session.snapshot', session);
+    sendJson(res, 200, { ok: true, session });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/export$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = url.searchParams.get('hostId');
+    const format = String(url.searchParams.get('format') || 'markdown').trim().toLowerCase();
+    const exportOptions = {
+      includeThinking: parseExportBoolean(url.searchParams.get('includeThinking'), false),
+    };
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+
+    const detail = getSessionDetail(hostId, sessionId);
+    if (!detail) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+
+    if (format === 'json') {
+      const body = JSON.stringify(buildSessionJsonExport(detail, exportOptions), null, 2);
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'Content-Disposition': contentDispositionValue('attachment', `${sessionExportBaseName(detail.session)}.json`),
+      });
+      res.end(body);
+      return;
+    }
+
+    if (format === 'zip' || format === 'bundle') {
+      await streamSessionZipExport(res, detail, exportOptions);
+      return;
+    }
+
+    if (!['md', 'markdown'].includes(format)) {
+      sendJson(res, 400, { error: 'format must be markdown, json, or zip' });
+      return;
+    }
+
+    const body = buildSessionMarkdownExport(detail, exportOptions);
+    res.writeHead(200, {
+      'Content-Type': 'text/markdown; charset=utf-8',
+      'Content-Length': Buffer.byteLength(body),
+      'Content-Disposition': contentDispositionValue('attachment', `${sessionExportBaseName(detail.session)}.md`),
+    });
+    res.end(body);
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/local-agent$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
     const body = await readBody(req);
     const action = String(body.action || '').trim().toLowerCase();
     const existingHost = state.hosts.get(hostId);
-    const label = String(body.label || existingHost?.label || hostId).trim() || hostId;
+    const localDefaultLabel = hostId === getLocalRelayHostId() ? getLocalRelayHostLabel() : hostId;
+    const existingLabel = String(existingHost?.label || '').trim();
+    const label = String(body.label || (existingLabel && existingLabel !== hostId ? existingLabel : '') || localDefaultLabel).trim() || localDefaultLabel;
     if (!['start', 'restart', 'stop', 'status'].includes(action)) {
       sendJson(res, 400, { error: 'action must be start, restart, stop, or status' });
       return;
@@ -6187,6 +7566,7 @@ function applyAgentEvent(event) {
         latestUserMessage: session.latestUserMessage || null,
         latestAgentMessage: session.latestAgentMessage || null,
         transcriptPreview: session.transcriptPreview || [],
+        rolloutPath: session.rolloutPath || existing?.rolloutPath || null,
         originSessionId: session.originSessionId || null,
         sourceSessionId: session.sourceSessionId || null,
         conversationKey: session.conversationKey || session.originSessionId || session.sessionId,
@@ -6443,6 +7823,24 @@ function applyAgentEvent(event) {
       return;
     }
 
+    if (String(event.phase || event.kind || '').trim().toLowerCase() === 'commentary') {
+      emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+        timestamp: event.timestamp || nowIso(),
+        severity: 'info',
+        source: event.source || 'codex',
+        kind: 'commentary',
+        method: event.method || 'session.output/commentary',
+        message: event.chunk || '',
+        data: {
+          stream: event.stream || 'stdout',
+          text: event.chunk || '',
+          phase: 'commentary',
+        },
+      });
+      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.snapshot', next);
+      return;
+    }
+
     const speaker = classifyOutputSpeaker(event.chunk || '', event.stream || 'stdout');
     if (speaker === 'agent') {
       const snapshot = upsertSession(event.hostId, {
@@ -6474,25 +7872,29 @@ function applyAgentEvent(event) {
 
   if (event.type === 'session.transcript') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
-    const speaker = event.speaker || 'system';
+    const normalizedTranscript = normalizeStoredTranscriptEntry({
+      speaker: event.speaker || 'system',
+      text: event.text || '',
+      stream: event.stream || null,
+      files: event.files || event.attachments || [],
+      timestamp: event.timestamp || nowIso(),
+    });
+    if (!normalizedTranscript) {
+      return;
+    }
+    const speaker = normalizedTranscript.speaker || 'system';
     const existing = getSession(event.hostId, effectiveSessionId);
     const next = upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
       source: existing?.source || (event.source === 'codex-jsonl' ? 'imported' : 'managed'),
       state: existing?.state || 'imported',
       live: existing?.live || false,
-      latestUserMessage: speaker === 'user' ? event.text || null : existing?.latestUserMessage || null,
-      latestAgentMessage: (speaker === 'agent' || speaker === 'assistant') ? event.text || null : existing?.latestAgentMessage || null,
+      latestUserMessage: speaker === 'user' ? normalizedTranscript.text || null : existing?.latestUserMessage || null,
+      latestAgentMessage: (speaker === 'agent' || speaker === 'assistant') ? normalizedTranscript.text || null : existing?.latestAgentMessage || null,
       nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
-      lastUpdatedAt: event.timestamp || nowIso(),
+      lastUpdatedAt: normalizedTranscript.timestamp || nowIso(),
     });
-    emitTranscriptEntry(event.hostId, effectiveSessionId, {
-      speaker,
-      text: event.text || '',
-      stream: event.stream || null,
-      files: event.files || event.attachments || [],
-      timestamp: event.timestamp || nowIso(),
-    });
+    emitTranscriptEntry(event.hostId, effectiveSessionId, normalizedTranscript);
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.snapshot', getSession(event.hostId, effectiveSessionId) || next);
     return;
   }

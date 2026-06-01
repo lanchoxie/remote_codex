@@ -351,6 +351,13 @@
             <button id="end-all-sessions-button" type="button" class="danger-button hidden">Stop All</button>
             <button id="import-selected-host-button" type="button" class="secondary-button hidden" hidden aria-hidden="true">Import Host</button>
             <button id="toggle-alerts-button" type="button" class="secondary-button">Alerts</button>
+            <button id="rename-session-button" type="button" class="secondary-button">Rename</button>
+            <label class="export-thinking-toggle" title="Include thinking/activity diagnostics in exports">
+              <input id="export-thinking-checkbox" type="checkbox">
+              <span>Include Thinking</span>
+            </label>
+            <button id="export-session-button" type="button" class="secondary-button">Export History</button>
+            <button id="export-session-bundle-button" type="button" class="secondary-button">Export Bundle</button>
             <button id="join-session-button" type="button" class="secondary-button">Join Running Session</button>
             <button id="resume-session-button" type="button" class="secondary-button">Resume From History</button>
             <button id="fork-session-button" type="button">Fork New Branch</button>
@@ -499,7 +506,10 @@
           <div class="eyebrow">Session Alerts</div>
           <div id="alerts-title" class="alerts-title">No session selected</div>
         </div>
-        <button id="close-alerts-button" type="button" class="secondary-button">Minimize</button>
+        <div class="alerts-actions">
+          <button id="clear-alerts-button" type="button" class="secondary-button">Clear</button>
+          <button id="close-alerts-button" type="button" class="secondary-button">Minimize</button>
+        </div>
       </div>
       <div id="alerts-empty" class="empty-state">No important warnings or errors for this session.</div>
       <div id="alerts-list" class="alerts-list"></div>
@@ -714,6 +724,7 @@
 
               <div class="connector-group">
                 <div class="connector-group-title">Target Auth</div>
+                <div class="connector-tip">Tip: Google Authenticator / 验证码登录时，请把这里设为 Keyboard-Interactive（手动键盘交互），然后在提示出现时输入验证码。</div>
                 <div class="connector-field-grid">
                   <select id="connector-auth-method">
                     <option value="ssh_key">SSH Key</option>

@@ -11,6 +11,8 @@ tmp/connectors.json
 tmp/connector-secrets.json
 tmp/session-collections.json
 tmp/session-logs.json
+tmp/session-metadata.json
+tmp/downloads/
 tmp/remote-codex-askpass.cmd
 tmp/remote-codex-askpass.ps1
 tmp/askpass-state-*.txt
@@ -21,3 +23,4 @@ tmp/.codex-remote-files/
 tmp/received-files/
 tmp/codex-linux-x86_64/
 tmp/node-*.tar.*
+docs/researches_and_papers/*.pdf
