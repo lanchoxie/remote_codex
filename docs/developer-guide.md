@@ -127,6 +127,39 @@ Important event names:
 - Do not store passwords, OTP codes, captcha answers, or private keys in connector profiles.
 - Treat imported Codex history as read-only metadata unless a live runtime owns the process.
 
+## Managed Codex State Safety
+
+Managed Codex app-server sessions must not write directly into the host user's
+primary `CODEX_HOME` state databases. This is especially important on HPC
+systems, where the same user may already have an interactive Codex TUI running
+inside tmux and where shared filesystems can make SQLite locking fragile.
+
+The Codex app-server runner therefore creates one isolated Codex home per
+managed session under:
+
+```text
+<base CODEX_HOME>/.remote-codex-managed/<session-profile>/.codex
+```
+
+The isolated home copies small identity/config files such as `auth.json`,
+`config.toml`, `installation_id`, and `cap_sid`, and links shared read-mostly
+directories such as `sessions`, `skills`, `rules`, `memories`, and
+`generated_images`. It intentionally does not share Codex runtime SQLite files
+such as `state_*.sqlite` or `logs_*.sqlite`; those are rebuilt per managed
+session.
+
+If app-server startup reports a corrupted Codex state database, the runner may
+move only `state_*.sqlite*` and `logs_*.sqlite*` from the isolated home into a
+`broken-sqlite-backup-*` directory and retry once. Never delete the whole
+primary `~/.codex` directory as a recovery step. The durable conversation
+history is expected to remain in `sessions/` and `session_index.jsonl`.
+
+API profile switching follows the same isolation rule. The runner writes the
+selected profile into the isolated home and passes the generated
+`modelProvider` explicitly when starting, resuming, or forking a thread.
+Changing an API profile affects newly started managed sessions; an already
+running Codex app-server process keeps the API settings it started with.
+
 ## Adding a new runtime
 
 A runtime should expose these behaviors to `agent.js`:

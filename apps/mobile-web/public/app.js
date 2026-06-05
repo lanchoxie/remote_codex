@@ -32,6 +32,13 @@ const state = {
   receivedFilesLoadingKeys: new Set(),
   streamStatus: new Map(),
   thinkingPanels: new Map(),
+  thinkingScrollPositions: new Map(),
+  thinkingEntryCounts: new Map(),
+  thinkingUnread: new Set(),
+  transcriptEntryCounts: new Map(),
+  transcriptUnread: new Set(),
+  transcriptUserDetached: new Set(),
+  manualSessionTitles: new Map(),
   alertWindowOpen: false,
   statusWindowOpen: false,
   sessionDetailsOpen: false,
@@ -58,7 +65,49 @@ const state = {
   newSessionCollapsed: true,
   navigatorCollapsed: true,
   settingsOpen: false,
+  settingsApiSnapshot: {},
   localAgentActionBusyId: null,
+  hostRestartBusyId: null,
+  imagePreview: {
+    open: false,
+    src: '',
+    title: '',
+    subtitle: '',
+    downloadUrl: '',
+  },
+  sessionActionDialog: {
+    open: false,
+    mode: '',
+    title: '',
+    subtitle: '',
+    actionLabel: '',
+    sessions: [],
+    selectedKeys: new Set(),
+    busy: false,
+  },
+  exportDialog: {
+    open: false,
+    includeThinking: false,
+    includeImages: true,
+    includeFiles: true,
+    includeAllFiles: true,
+    format: 'markdown',
+    fromDate: '',
+    toDate: '',
+    selectedExtensions: new Set(),
+    selectedFileIds: new Set(),
+    timelineKey: '',
+    timelineLoading: false,
+    timelineError: '',
+    timeline: null,
+  },
+  historyImportDialog: {
+    open: false,
+    busy: false,
+    sessions: [],
+    selectedKeys: new Set(),
+    optionsByKey: new Map(),
+  },
   ui: {
     locale: 'zh-CN',
     theme: 'minimal-light',
@@ -71,6 +120,10 @@ const state = {
   codexControls: {
     modelOptionsBySession: new Map(),
     modelOptionsLoadingKeys: new Set(),
+    modelOptionsRetryAfterBySession: new Map(),
+    skillOptionsBySession: new Map(),
+    skillOptionsLoadingKeys: new Set(),
+    skillOptionsRetryAfterBySession: new Map(),
     sessionOptionsByKey: new Map(),
     persistedSessionOptionKeys: new Set(),
     attachments: [],
@@ -78,6 +131,10 @@ const state = {
     steerQueue: [],
     queueAutoSendScheduled: false,
     activeDraftsBySession: new Map(),
+    pendingComposerDraftsBySession: new Map(),
+    composerSubmissionsBySession: new Map(),
+    inputAnswersByRequest: new Map(),
+    recentSubmissions: new Map(),
     steerNotice: null,
   },
   slashMenu: {
@@ -110,6 +167,7 @@ const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed
 const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
 const DISMISSED_ALERTS_STORAGE_KEY = 'mobile-codex-remote.dismissed-alerts.v1';
+const MANUAL_SESSION_TITLES_STORAGE_KEY = 'mobile-codex-remote.manual-session-titles.v1';
 const DEFAULT_COMPOSER_OPTIONS = {
   model: '',
   effort: 'xhigh',
@@ -153,7 +211,7 @@ const UI_TEXT = {
     'settings.sessionDefaultsTitle': 'Session defaults',
     'settings.sessionDefaultsCopy': 'These controls are remembered per selected session. Switching sessions restores that session\'s model, effort, reviewer, sandbox, and personality choices.',
     'settings.apiTitle': 'API profiles',
-    'settings.apiCopy': 'Create multiple API profiles and choose which host uses which key. Changes apply to newly started Codex app-server sessions.',
+    'settings.apiCopy': 'Create multiple API profiles and choose which host uses which key. Changes apply when starting or restarting Codex app-server sessions.',
     'settings.profileSelect': 'Editing profile',
     'settings.addProfile': 'New profile',
     'settings.deleteProfile': 'Delete profile',
@@ -165,6 +223,7 @@ const UI_TEXT = {
     'settings.hostMappingTitle': 'Host API mapping',
     'settings.hostMappingCopy': 'A host can use the default profile or a dedicated profile.',
     'settings.rememberKey': 'Remember API key in this browser',
+    'settings.apiRestartTip': 'After changing an API key or Base URL, restart the affected conversation/managed session. Running Codex app-server processes keep the API environment they started with.',
     'settings.apiWarning': 'Do not use this on an untrusted relay or shared browser. The key is sent through your relay when starting a session.',
     'settings.clearKey': 'Clear API key',
     'settings.clearKeyConfirm': 'Clear the API key for "{profile}"? This removes it from this browser only. Already running sessions keep their current environment.',
@@ -197,7 +256,7 @@ const UI_TEXT = {
     'settings.sessionDefaultsTitle': '会话默认参数',
     'settings.sessionDefaultsCopy': '这些控件按当前选中的 session 单独记忆。切换 session 时，会恢复那个 session 自己的模型、推理强度、审查者、沙盒和个性选择。',
     'settings.apiTitle': 'API 配置',
-    'settings.apiCopy': 'Base URL 和 API Key 会作用于新启动的 Codex app-server 会话。已经 live 的会话需要重启才会生效。',
+    'settings.apiCopy': 'Base URL 和 API Key 会在新建或重启 Codex app-server 会话时生效。',
     'settings.apiProvider': '提供方标签',
     'settings.api-base-url': 'Base URL',
     'settings.api-key': 'API Key',
@@ -209,6 +268,7 @@ const UI_TEXT = {
     'settings.hostMappingTitle': 'Host API 映射',
     'settings.hostMappingCopy': '每个 host 可以使用默认配置，也可以指定专用配置。',
     'settings.rememberKey': '在当前浏览器记住 API Key',
+    'settings.apiRestartTip': '更换 API Key 或 Base URL 后，需要重启对应对话/managed session。已经运行的 Codex app-server 会继续使用启动时的 API 环境。',
     'settings.apiWarning': '不要在不可信 relay 或共享浏览器上使用。启动会话时，这个 key 会经过你的 relay 发送到对应 host。',
     'settings.clearKey': '清除 API Key',
     'settings.clearKeyConfirm': '确定清除“{profile}”的 API Key 吗？这只会从当前浏览器移除。已经运行中的 session 会继续使用当前环境。',
@@ -371,7 +431,8 @@ const ZH_STATIC_TEXT = {
   'Select a conversation to inspect it.': '选择一个对话以查看详情。',
   'A managed session can continue work from this workspace.': 'Managed session 可以从这个工作区继续。',
   'API profiles': 'API 配置组',
-  'Create multiple API profiles and choose which host uses which key. Changes apply to newly started Codex app-server sessions.': '可以创建多个 API 配置，并指定每个 host 使用哪个 key。改动会作用于新启动的 Codex app-server 会话。',
+  'Create multiple API profiles and choose which host uses which key. Changes apply when starting or restarting Codex app-server sessions.': '可以创建多个 API 配置，并指定每个 host 使用哪个 key。改动会在新建或重启 Codex app-server 会话时生效。',
+  'After changing an API key or Base URL, restart the affected conversation/managed session. Running Codex app-server processes keep the API environment they started with.': '更换 API Key 或 Base URL 后，需要重启对应对话/managed session。已经运行的 Codex app-server 会继续使用启动时的 API 环境。',
   'Editing profile': '正在编辑',
   'New profile': '新建配置',
   'Delete profile': '删除配置',
@@ -510,6 +571,11 @@ const TEXT_FILE_EXTENSIONS = new Set([
   'yml',
 ]);
 const IMAGE_FILE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'jpeg', 'jpg', 'png', 'svg', 'tif', 'tiff', 'webp']);
+const MAX_TRANSCRIPT_FILE_CARDS = 48;
+const MAX_INLINE_IMAGE_PREVIEWS = 12;
+const COMPOSER_RECENT_SUBMISSION_TTL_MS = 2 * 60 * 1000;
+const COMPOSER_PENDING_SUBMISSION_TTL_MS = 90 * 1000;
+const OPTION_AUTO_RETRY_COOLDOWN_MS = 60 * 1000;
 const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
   ...IMAGE_FILE_EXTENSIONS,
   'c',
@@ -555,6 +621,10 @@ const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
   'parquet',
   'pdf',
   'pkl',
+  'pps',
+  'ppsx',
+  'ppt',
+  'pptx',
   'tar',
   'tgz',
   'txt',
@@ -717,9 +787,58 @@ function persistDismissedAlerts() {
   writeLocalStorageJson(DISMISSED_ALERTS_STORAGE_KEY, serializeDismissedAlerts());
 }
 
+function normalizeManualSessionTitles(input = {}) {
+  const result = new Map();
+  if (!input || typeof input !== 'object') {
+    return result;
+  }
+  for (const [key, value] of Object.entries(input)) {
+    const sessionKey = String(key || '').trim();
+    const title = String(value || '').replace(/\s+/g, ' ').trim();
+    if (sessionKey && title) {
+      result.set(sessionKey, title.slice(0, 180));
+    }
+  }
+  return result;
+}
+
+function serializeManualSessionTitles() {
+  const serialized = {};
+  for (const [key, value] of state.manualSessionTitles.entries()) {
+    const title = String(value || '').replace(/\s+/g, ' ').trim();
+    if (key && title) {
+      serialized[key] = title.slice(0, 180);
+    }
+  }
+  return serialized;
+}
+
+function persistManualSessionTitles() {
+  writeLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, serializeManualSessionTitles());
+}
+
+function rememberManualSessionTitle(session, title) {
+  const key = getSessionKey(session);
+  const normalized = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+  if (!key || !normalized) {
+    return;
+  }
+  state.manualSessionTitles.set(key, normalized);
+  persistManualSessionTitles();
+}
+
+function applyManualSessionTitle(session) {
+  if (!session) {
+    return session;
+  }
+  const title = state.manualSessionTitles.get(getSessionKey(session));
+  return title ? { ...session, title, manualTitle: true } : session;
+}
+
 function initializePersistentUiState() {
   state.navigatorCollapsed = readLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, true) !== false;
   state.dismissedAlerts = normalizeDismissedAlerts(readLocalStorageJson(DISMISSED_ALERTS_STORAGE_KEY, {}));
+  state.manualSessionTitles = normalizeManualSessionTitles(readLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, {}));
   const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
   state.ui.locale = storedUi.locale;
   state.ui.theme = storedUi.theme;
@@ -1716,7 +1835,7 @@ function normalizeFileChangeRecord(raw, fallbackPath = '') {
   ).trim();
   const additions = toCount(raw.additions ?? raw.added ?? raw.insertions ?? raw.linesAdded ?? raw.addedLines) ?? counts.additions;
   const deletions = toCount(raw.deletions ?? raw.deleted ?? raw.removed ?? raw.linesDeleted ?? raw.deletedLines) ?? counts.deletions;
-  if (!pathValue && !diff && !additions && !deletions) {
+  if (!diff && !additions && !deletions) {
     return null;
   }
   return {
@@ -1828,6 +1947,7 @@ function normalizeTranscriptFiles(rawFiles) {
       size: Number(rawFile.size || 0) || 0,
       mime,
       isImage: Boolean(rawFile.isImage) || /^image\//i.test(mime) || IMAGE_FILE_EXTENSIONS.has(fileExtension(name || pathValue)),
+      cached: Boolean(rawFile.cached),
     });
   }
   return files;
@@ -1881,15 +2001,25 @@ function dedupeTranscript(entries) {
     const previous = compacted[compacted.length - 1];
     const entryFiles = entry.files.map((file) => file.path || file.name).join(',');
     const previousFiles = previous?.files?.map((file) => file.path || file.name).join(',') || '';
+    const sameSpeakerAndFiles = previous
+      && previous.speaker === entry.speaker
+      && previousFiles === entryFiles;
+    const previousText = canonicalTranscriptText(previous?.text || '');
+    const entryText = canonicalTranscriptText(entry.text || '');
+    if (sameSpeakerAndFiles && previousText && entryText && previousText === entryText) {
+      continue;
+    }
+
     const entryTime = Date.parse(entry.timestamp || '');
     const previousTime = Date.parse(previous?.timestamp || '');
     const nearDuplicate = previous
-      && previous.speaker === entry.speaker
-      && canonicalTranscriptText(previous.text) === canonicalTranscriptText(entry.text)
-      && previousFiles === entryFiles
+      && sameSpeakerAndFiles
+      && previousText
+      && entryText
       && Number.isFinite(entryTime)
       && Number.isFinite(previousTime)
-      && Math.abs(entryTime - previousTime) <= 2000;
+      && Math.abs(entryTime - previousTime) <= 30000
+      && (previousText.includes(entryText) || entryText.includes(previousText));
     if (nearDuplicate) {
       continue;
     }
@@ -2457,6 +2587,21 @@ function buildCollectionItemFromConversation(group) {
   };
 }
 
+function buildCollectionItemFromSession(session) {
+  if (!session) {
+    return null;
+  }
+  const conversationKey = session.conversationKey || session.originSessionId || session.sourceSessionId || session.sessionId;
+  return {
+    hostId: session.hostId,
+    conversationKey,
+    sessionId: session.sessionId || '',
+    title: session.title || conversationKey,
+    cwd: session.cwd || '',
+    ...getHostSnapshotForCollection(session.hostId),
+  };
+}
+
 async function refreshSessionCollections() {
   const response = await fetchJson('/api/session-collections');
   state.sessionCollections = response.collections || [];
@@ -2512,6 +2657,21 @@ async function addConversationToCollection(collectionId, group) {
   });
   await refreshSessionCollections();
   renderAll();
+}
+
+async function addSessionToCollection(collectionId, session) {
+  if (!collectionId || collectionId === 'default' || !session) {
+    return;
+  }
+  const item = buildCollectionItemFromSession(session);
+  if (!item) {
+    return;
+  }
+  await fetchJson(`/api/session-collections/${encodeURIComponent(collectionId)}/items`, {
+    method: 'POST',
+    body: JSON.stringify({ item }),
+  });
+  await refreshSessionCollections();
 }
 
 async function removeConversationFromCollection(collectionId, group) {
@@ -2584,16 +2744,17 @@ function mergeSession(session) {
     return null;
   }
 
+  const nextSession = applyManualSessionTitle(session);
   const key = makeSessionKey(session.hostId, session.sessionId);
   const index = state.sessions.findIndex((item) => makeSessionKey(item.hostId, item.sessionId) === key);
   if (index === -1) {
-    state.sessions.push(session);
-    return session;
+    state.sessions.push(nextSession);
+    return nextSession;
   }
 
   state.sessions[index] = {
     ...state.sessions[index],
-    ...session,
+    ...nextSession,
   };
   return state.sessions[index];
 }
@@ -2737,8 +2898,46 @@ function restoreTranscriptScroll(log, options = {}) {
     log.scrollTop = log.scrollHeight;
     return;
   }
+  if (Number.isFinite(options.scrollTop)) {
+    const maxScrollTop = Math.max(0, log.scrollHeight - log.clientHeight);
+    log.scrollTop = Math.min(Math.max(0, options.scrollTop), maxScrollTop);
+    return;
+  }
   const bottomOffset = Number.isFinite(options.bottomOffset) ? options.bottomOffset : 0;
   log.scrollTop = Math.max(0, log.scrollHeight - log.clientHeight - bottomOffset);
+}
+
+function updateTranscriptUnreadButton(key = getSessionKey(getSelectedSession()) || '') {
+  const button = el('scroll-transcript-bottom-button');
+  if (!button) {
+    return;
+  }
+  const hasUnread = Boolean(key && state.transcriptUnread.has(key));
+  button.classList.toggle('has-new', hasUnread);
+  button.textContent = hasUnread ? 'Bottom *' : 'Bottom';
+  button.title = hasUnread ? 'New transcript updates below. Jump to latest.' : 'Jump to latest transcript update.';
+}
+
+function clearTranscriptUnread(key = getSessionKey(getSelectedSession()) || '') {
+  if (key) {
+    state.transcriptUnread.delete(key);
+  }
+  updateTranscriptUnreadButton(key);
+}
+
+function setTranscriptUserDetached(key = getSessionKey(getSelectedSession()) || '', detached = false) {
+  if (!key) {
+    return;
+  }
+  if (detached) {
+    state.transcriptUserDetached.add(key);
+  } else {
+    state.transcriptUserDetached.delete(key);
+  }
+}
+
+function isTranscriptUserDetached(key = getSessionKey(getSelectedSession()) || '') {
+  return Boolean(key && state.transcriptUserDetached.has(key));
 }
 
 function scrollTranscriptTo(position) {
@@ -2794,8 +2993,15 @@ function scrollTranscriptTo(position) {
     return targets;
   };
   const applyScroll = () => {
+    const key = getSessionKey(getSelectedSession()) || '';
     for (const target of collectScrollableTargets()) {
       scrollElement(target);
+    }
+    if (position === 'bottom') {
+      setTranscriptUserDetached(key, false);
+      clearTranscriptUnread();
+    } else if (position === 'top') {
+      setTranscriptUserDetached(key, true);
     }
     if (typeof window.scrollTo === 'function') {
       const top = position === 'top'
@@ -2871,6 +3077,9 @@ function stripIdeContextText(value) {
 function isInternalTranscriptText(value) {
   const text = String(value || '').trim();
   if (!text) {
+    return true;
+  }
+  if (/^<user_action\b[\s\S]*<\/user_action>$/i.test(text)) {
     return true;
   }
   if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
@@ -3014,6 +3223,16 @@ function setRequestsForSession(hostId, sessionId, requests) {
   const key = makeSessionKey(hostId, sessionId);
   const normalized = Array.isArray(requests) ? requests.slice(-40) : [];
   state.requests.set(key, normalized);
+  const pendingRequestIds = new Set(normalized
+    .filter((request) => request?.status === 'pending')
+    .map((request) => String(request.requestId || ''))
+    .filter(Boolean));
+  for (const draftKey of state.codexControls.inputAnswersByRequest.keys()) {
+    const prefix = `${key}::`;
+    if (draftKey.startsWith(prefix) && !pendingRequestIds.has(draftKey.slice(prefix.length))) {
+      state.codexControls.inputAnswersByRequest.delete(draftKey);
+    }
+  }
 }
 
 function upsertRequestForSession(hostId, sessionId, request) {
@@ -3037,6 +3256,7 @@ function upsertRequestForSession(hostId, sessionId, request) {
 }
 
 function resolveRequestForSession(hostId, sessionId, request) {
+  clearInputAnswerDraft(hostId, sessionId, request?.requestId);
   upsertRequestForSession(hostId, sessionId, request);
 }
 
@@ -3114,6 +3334,10 @@ function syncModalBodyState() {
     || state.statusWindowOpen
     || state.sessionDetailsOpen
     || state.settingsOpen
+    || state.imagePreview.open
+    || state.sessionActionDialog.open
+    || state.exportDialog.open
+    || state.historyImportDialog.open
   );
   document.body.classList.toggle('modal-open', open);
 }
@@ -3225,6 +3449,59 @@ function getRelayManagedLiveSessionCount() {
   return Array.from(state.sessions.values())
     .filter((session) => session.live && session.source === 'managed')
     .length;
+}
+
+function getRelayManagedLiveSessions(hostIds = null) {
+  const hostSet = Array.isArray(hostIds) && hostIds.length ? new Set(hostIds) : null;
+  return Array.from(state.sessions.values())
+    .filter((session) => session.live && session.source === 'managed')
+    .filter((session) => !hostSet || hostSet.has(session.hostId))
+    .sort((a, b) => String(a.hostId || '').localeCompare(String(b.hostId || ''))
+      || String(b.lastUpdatedAt || b.updatedAt || '').localeCompare(String(a.lastUpdatedAt || a.updatedAt || '')));
+}
+
+function sessionDisplayTitle(session) {
+  return session?.title || pathLeaf(session?.cwd || '') || shortId(session?.sessionId || '') || 'Untitled session';
+}
+
+function sessionPlatformLabel(session) {
+  const host = getHost(session?.hostId);
+  const hostLabel = host?.label || session?.hostId || 'unknown host';
+  const platform = host?.platform || session?.platform || 'unknown';
+  return `${hostLabel} | ${platform}`;
+}
+
+function apiConfigFingerprint(config) {
+  if (!config) {
+    return '';
+  }
+  return JSON.stringify({
+    provider: String(config.provider || ''),
+    baseUrl: String(config.baseUrl || '').replace(/\/+$/, ''),
+    apiKey: String(config.apiKey || ''),
+    profileId: String(config.profileId || ''),
+    label: String(config.label || ''),
+  });
+}
+
+function snapshotHostApiFingerprints() {
+  const snapshots = {};
+  for (const host of state.hosts) {
+    snapshots[host.hostId] = apiConfigFingerprint(getApiRequestConfig(host.hostId));
+  }
+  return snapshots;
+}
+
+function getApiChangedLiveSessions(previousSnapshot = {}) {
+  const changedHosts = [];
+  for (const host of state.hosts) {
+    const before = previousSnapshot?.[host.hostId] || '';
+    const after = apiConfigFingerprint(getApiRequestConfig(host.hostId));
+    if (before !== after) {
+      changedHosts.push(host.hostId);
+    }
+  }
+  return getRelayManagedLiveSessions(changedHosts);
 }
 
 function setConnectorManagerOpen(open) {
@@ -3560,7 +3837,7 @@ function isLocalAgentCandidate(host) {
     return true;
   }
   const relayPlatform = state.stats?.relay?.platform || '';
-  return Boolean(relayPlatform && host.platform === relayPlatform && !host.online);
+  return Boolean(!host.online && (host.relayLocal || (relayPlatform && host.platform === relayPlatform)));
 }
 
 async function runLocalAgentAction(host, action) {
@@ -3577,12 +3854,114 @@ async function runLocalAgentAction(host, action) {
         label: host.label || host.hostId,
       }),
     });
-    await refresh();
+    if (action === 'stop') {
+      await refresh();
+    } else {
+      await waitForRecoveredHost(host.hostId, 60000);
+      await refresh();
+    }
   } catch (error) {
     reportError(error);
   } finally {
     state.localAgentActionBusyId = null;
     renderAll();
+  }
+}
+
+function getHostLifecycleAction(host) {
+  const base = {
+    label: 'Restart',
+    className: 'secondary-button',
+    disabled: true,
+    title: 'No saved connector or relay-managed local agent can restart this host yet.',
+    kind: 'none',
+  };
+  if (!host?.hostId) {
+    return base;
+  }
+
+  if (isLocalAgentCandidate(host)) {
+    const localAgent = host.localAgent || null;
+    const localBusy = state.localAgentActionBusyId === host.hostId;
+    const localAction = localAgent?.status === 'running' || localAgent?.status === 'starting' ? 'restart' : 'start';
+    return {
+      ...base,
+      kind: 'local',
+      action: localAction,
+      label: localBusy
+        ? 'Working...'
+        : localAction === 'restart'
+          ? 'Restart Local'
+          : 'Start Local',
+      className: localAction === 'restart' ? 'secondary-button' : '',
+      disabled: localBusy,
+      title: localAgent?.message || 'Manage the host-agent running on this relay machine.',
+    };
+  }
+
+  const connector = getConnectorForHost(host.hostId);
+  if (connector?.connectorId) {
+    const busy = state.hostRestartBusyId === host.hostId
+      || state.connectorActionBusy?.connectorId === connector.connectorId;
+    return {
+      ...base,
+      kind: 'connector',
+      connector,
+      label: busy ? 'Restarting...' : 'Restart',
+      disabled: busy,
+      title: `Restart through saved connector: ${connector.label || connector.connectorId}.`,
+    };
+  }
+
+  if (host.relayLocal) {
+    return {
+      ...base,
+      title: 'This local host is connected, but it was not started by the relay. Restart its launcher or start a relay-managed local agent first.',
+    };
+  }
+
+  return base;
+}
+
+async function runHostConnectorRestart(host, connector) {
+  if (!host?.hostId || !connector?.connectorId || state.hostRestartBusyId) {
+    return;
+  }
+  state.hostRestartBusyId = host.hostId;
+  renderAll();
+  try {
+    const result = await executeConnectorAction(connector, 'restart', connector, {
+      refreshAfter: false,
+      selectEditor: false,
+    });
+    if (result?.ok) {
+      await waitForRecoveredHost(host.hostId, 90000);
+      await refresh();
+      return;
+    }
+    await refresh();
+    if (result) {
+      reportError(new Error(`Restart failed for ${host.label || host.hostId}:\n${connectorActionResultSummary(result)}`));
+    }
+  } catch (error) {
+    reportError(error);
+  } finally {
+    state.hostRestartBusyId = null;
+    renderAll();
+  }
+}
+
+async function runHostLifecycleAction(host) {
+  const action = getHostLifecycleAction(host);
+  if (action.disabled) {
+    return;
+  }
+  if (action.kind === 'local') {
+    await runLocalAgentAction(host, action.action);
+    return;
+  }
+  if (action.kind === 'connector') {
+    await runHostConnectorRestart(host, action.connector);
   }
 }
 
@@ -3621,37 +4000,28 @@ function renderHostNav() {
       }
     };
 
-    const importButton = createActionButton('Import', 'secondary-button');
-    importButton.onclick = async (event) => {
+    const restartButton = createActionButton('Restart', 'secondary-button');
+    const lifecycleAction = getHostLifecycleAction(host);
+    restartButton.textContent = lifecycleAction.label;
+    restartButton.className = `action-button ${lifecycleAction.className}`;
+    restartButton.disabled = lifecycleAction.disabled;
+    restartButton.title = lifecycleAction.title;
+    restartButton.onclick = async (event) => {
       event.stopPropagation();
-      await importHost(host.hostId);
+      await runHostLifecycleAction(host);
     };
 
-    if (isLocalAgentCandidate(host)) {
+    let stopLocalButton = null;
+    if (host.localAgent?.status === 'running' || host.localAgent?.status === 'starting') {
       const localAgent = host.localAgent || null;
       const localBusy = state.localAgentActionBusyId === host.hostId;
-      const localAction = localAgent?.status === 'running' || localAgent?.status === 'starting' ? 'restart' : 'start';
-      const localButton = createActionButton(localBusy
-        ? 'Working...'
-        : localAction === 'restart'
-          ? 'Restart Local'
-          : 'Start Local', localAction === 'restart' ? 'secondary-button' : '');
-      localButton.disabled = localBusy;
-      localButton.title = localAgent?.message || 'Manage the host-agent running on this relay machine.';
-      localButton.onclick = async (event) => {
+      stopLocalButton = createActionButton('Stop Local', 'danger-button');
+      stopLocalButton.disabled = localBusy;
+      stopLocalButton.title = localAgent?.message || 'Stop the relay-managed local host-agent.';
+      stopLocalButton.onclick = async (event) => {
         event.stopPropagation();
-        await runLocalAgentAction(host, localAction);
+        await runLocalAgentAction(host, 'stop');
       };
-      actions.appendChild(localButton);
-      if (localAgent?.status === 'running' || localAgent?.status === 'starting') {
-        const stopButton = createActionButton('Stop Local', 'danger-button');
-        stopButton.disabled = localBusy;
-        stopButton.onclick = async (event) => {
-          event.stopPropagation();
-          await runLocalAgentAction(host, 'stop');
-        };
-        actions.appendChild(stopButton);
-      }
     }
 
     const deleteButton = createActionButton('Delete', 'danger-button');
@@ -3660,7 +4030,11 @@ function renderHostNav() {
       await deleteHost(host.hostId);
     };
 
-    actions.append(switchButton, importButton, deleteButton);
+    actions.append(switchButton, restartButton);
+    if (stopLocalButton) {
+      actions.appendChild(stopLocalButton);
+    }
+    actions.appendChild(deleteButton);
     item.append(top, actions);
     item.onclick = () => {
       setSelectedHost(host.hostId).catch(reportError);
@@ -4173,6 +4547,14 @@ function formatBytes(value) {
   return `${bytes} B`;
 }
 
+function textByteLength(value) {
+  const text = String(value || '');
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(text).length;
+  }
+  return unescape(encodeURIComponent(text)).length;
+}
+
 function formatTokenNumber(value) {
   const number = Number(value || 0);
   return Number.isFinite(number) && number > 0 ? number.toLocaleString() : '';
@@ -4306,12 +4688,77 @@ function extractFileRefsFromText(text) {
   return refs;
 }
 
-function getTranscriptFileRefs(entry) {
+function extractDirectoryRefsFromText(text) {
+  const source = String(text || '');
+  const refs = [];
+  const addRef = (candidate) => {
+    const pathValue = decodePathCandidate(candidate);
+    if (!pathValue || isDownloadablePath(pathValue) || !/[\\/]/.test(pathValue)) {
+      return;
+    }
+    const normalized = normalizeRemoteFilePath(pathValue).replace(/[\\/]+$/, '');
+    if (normalized && !refs.includes(normalized)) {
+      refs.push(normalized);
+    }
+  };
+  const markdownLinkPattern = /!?\[[^\]]*\]\(([^)]+)\)/g;
+  let match = null;
+  while ((match = markdownLinkPattern.exec(source))) {
+    addRef(match[1]);
+  }
+  return refs;
+}
+
+function receivedFileToTranscriptRef(file) {
+  const pathValue = normalizeRemoteFilePath(file?.remotePath || file?.path || '');
+  if (!pathValue || !isDownloadablePath(pathValue)) {
+    return null;
+  }
+  return {
+    fileId: file.fileId || '',
+    name: file.name || basename(pathValue) || pathValue,
+    path: pathValue,
+    mime: file.mime || '',
+    size: Number(file.size || 0) || 0,
+    isImage: Boolean(file.isImage) || isImageFileRef({ name: file.name, path: pathValue, mime: file.mime }),
+    cached: true,
+  };
+}
+
+function getCachedFileRefsForMentionedDirectories(session, entry) {
+  const directories = extractDirectoryRefsFromText(entry?.text || '');
+  if (!directories.length) {
+    return [];
+  }
+  const receivedFiles = getReceivedFilesForSession(session);
+  if (!receivedFiles.length) {
+    return [];
+  }
+  const refs = [];
+  for (const file of receivedFiles) {
+    const pathValue = normalizeRemoteFilePath(file?.remotePath || file?.path || '');
+    if (!pathValue) {
+      continue;
+    }
+    const matched = directories.some((directory) => pathValue === directory || pathValue.startsWith(`${directory}/`));
+    if (!matched) {
+      continue;
+    }
+    const ref = receivedFileToTranscriptRef(file);
+    if (ref) {
+      refs.push(ref);
+    }
+  }
+  return refs;
+}
+
+function getTranscriptFileRefs(session, entry) {
   const explicit = normalizeTranscriptFiles(entry?.files || entry?.attachments || []);
   const extracted = extractFileRefsFromText(entry?.text || '');
+  const cachedFromDirectories = getCachedFileRefsForMentionedDirectories(session, entry);
   const seen = new Set();
   const merged = [];
-  for (const file of [...explicit, ...extracted]) {
+  for (const file of [...explicit, ...extracted, ...cachedFromDirectories]) {
     const key = file.path || file.name;
     if (!key || seen.has(key) || isBareDownloadableFilename(file.path || '')) {
       continue;
@@ -4676,6 +5123,121 @@ function saveComposerOptionsFromControls(session = getSelectedSession()) {
   persistComposerSessionOptions();
 }
 
+function makeObjectPreviewUrl(file) {
+  if (!file || !isImageFileRef(file) || !window.URL?.createObjectURL) {
+    return '';
+  }
+  try {
+    return window.URL.createObjectURL(file);
+  } catch (_) {
+    return '';
+  }
+}
+
+function revokeComposerAttachmentPreview(attachment) {
+  if (attachment?.previewObjectUrl && attachment.previewUrl && window.URL?.revokeObjectURL) {
+    window.URL.revokeObjectURL(attachment.previewUrl);
+  }
+}
+
+function getComposerAttachmentPreviewUrl(attachment) {
+  if (!attachment) {
+    return '';
+  }
+  if (attachment.type === 'image') {
+    return attachment.url || '';
+  }
+  if (attachment.previewUrl && isImageFileRef(attachment)) {
+    return attachment.previewUrl;
+  }
+  return '';
+}
+
+function openImagePreview({ src, title = 'Image preview', subtitle = '', downloadUrl = '' } = {}) {
+  if (!src) {
+    return;
+  }
+  state.imagePreview = {
+    open: true,
+    src,
+    title,
+    subtitle,
+    downloadUrl: downloadUrl || src,
+  };
+  renderImagePreview();
+}
+
+function closeImagePreview() {
+  state.imagePreview = {
+    open: false,
+    src: '',
+    title: '',
+    subtitle: '',
+    downloadUrl: '',
+  };
+  renderImagePreview();
+}
+
+function renderImagePreview() {
+  const overlay = el('image-preview-overlay');
+  if (!overlay) {
+    return;
+  }
+  const preview = state.imagePreview || {};
+  const isOpen = Boolean(preview.open && preview.src);
+  overlay.classList.toggle('hidden', !isOpen);
+  overlay.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+
+  const image = el('image-preview-img');
+  if (image) {
+    image.src = isOpen ? preview.src : '';
+    image.alt = preview.title || 'Image preview';
+  }
+  const title = el('image-preview-title');
+  if (title) {
+    title.textContent = preview.title || 'Image preview';
+  }
+  const subtitle = el('image-preview-subtitle');
+  if (subtitle) {
+    subtitle.textContent = preview.subtitle || '';
+  }
+  const openLink = el('image-preview-open-link');
+  if (openLink) {
+    openLink.href = preview.src || '#';
+    openLink.classList.toggle('hidden', !isOpen);
+  }
+  const saveLink = el('image-preview-save-link');
+  if (saveLink) {
+    saveLink.href = preview.downloadUrl || preview.src || '#';
+    saveLink.download = preview.title || 'image';
+    saveLink.classList.toggle('hidden', !isOpen);
+  }
+  syncModalBodyState();
+}
+
+function shouldMountTranscriptControlsGlobally() {
+  return Boolean(window.matchMedia?.('(max-width: 980px), (pointer: coarse), (hover: none)').matches);
+}
+
+function ensureTranscriptScrollControlsMounted() {
+  const controls = document.querySelector('.transcript-scroll-controls');
+  const panel = document.querySelector('.transcript-panel');
+  if (!controls || !panel) {
+    return;
+  }
+
+  if (shouldMountTranscriptControlsGlobally()) {
+    if (controls.parentElement !== document.body) {
+      document.body.appendChild(controls);
+    }
+    return;
+  }
+
+  if (controls.parentElement !== panel) {
+    panel.insertBefore(controls, panel.firstChild);
+  }
+}
+
 function renderAttachmentChips() {
   const container = el('codex-attachment-chips');
   if (!container) {
@@ -4685,20 +5247,66 @@ function renderAttachmentChips() {
   container.innerHTML = '';
   for (const [index, attachment] of state.codexControls.attachments.entries()) {
     const chip = document.createElement('div');
-    chip.className = `attachment-chip ${attachment.type === 'uploadFile' || attachment.type === 'textFile' ? 'file' : ''}`.trim();
+    chip.className = `attachment-chip ${['uploadFile', 'textFile', 'skill', 'promptCard'].includes(attachment.type) ? 'file' : ''}`.trim();
+    const previewUrl = getComposerAttachmentPreviewUrl(attachment);
+    if (previewUrl) {
+      chip.classList.add('image');
+    }
     const label = attachment.remotePath
       ? 'Uploaded'
-      : attachment.type === 'image'
-        ? 'Image'
-        : 'File';
+      : attachment.type === 'skill'
+        ? 'Skill'
+        : attachment.type === 'promptCard'
+          ? 'Prompt'
+          : attachment.type === 'image'
+            ? 'Image'
+            : 'File';
     const progress = typeof attachment.uploadProgress === 'number' && !attachment.remotePath
       ? ` uploading ${Math.round(Math.max(0, Math.min(1, attachment.uploadProgress)) * 100)}%`
       : '';
     const note = attachment.remotePath ? ` -> ${attachment.remotePath}` : progress;
-    chip.innerHTML = `
-      <span>${escapeHtml(label)}: ${escapeHtml(attachment.name || 'attached file')}${attachment.size ? ` (${escapeHtml(formatBytes(attachment.size))})` : ''}${escapeHtml(note)}</span>
-      <button class="attachment-chip-remove" type="button" data-attachment-index="${index}" aria-label="Remove ${escapeHtml(attachment.name || 'attachment')}">x</button>
-    `;
+    const text = attachment.type === 'skill'
+      ? `${label}: ${attachment.displayName || attachment.name}${attachment.scope ? ` (${formatSkillScopeLabel(attachment.scope)})` : ''}`
+      : attachment.type === 'promptCard'
+        ? `${label}: ${attachment.title || 'Prompt card'}`
+        : `${label}: ${attachment.name || 'attached file'}${attachment.size ? ` (${formatBytes(attachment.size)})` : ''}${note}`;
+    if (previewUrl) {
+      const previewButton = document.createElement('button');
+      previewButton.type = 'button';
+      previewButton.className = 'attachment-chip-preview';
+      previewButton.title = 'Preview image';
+      previewButton.innerHTML = `
+        <img class="attachment-chip-thumbnail" src="${escapeHtml(previewUrl)}" alt="${escapeHtml(attachment.name || 'attached image')}" />
+        <span>${escapeHtml(text)}</span>
+      `;
+      previewButton.onclick = (event) => {
+        event.stopPropagation();
+        openImagePreview({
+          src: previewUrl,
+          title: attachment.name || 'attached image',
+          subtitle: attachment.size ? formatBytes(attachment.size) : 'Composer attachment',
+          downloadUrl: previewUrl,
+        });
+      };
+      chip.appendChild(previewButton);
+    } else {
+      const span = document.createElement('span');
+      span.textContent = text;
+      if (attachment.type === 'skill' && attachment.path) {
+        span.title = attachment.path;
+      }
+      if (attachment.type === 'promptCard' && attachment.text) {
+        span.title = attachment.text;
+      }
+      chip.appendChild(span);
+    }
+    const remove = document.createElement('button');
+    remove.className = 'attachment-chip-remove';
+    remove.type = 'button';
+    remove.dataset.attachmentIndex = String(index);
+    remove.setAttribute('aria-label', `Remove ${attachment.name || 'attachment'}`);
+    remove.textContent = 'x';
+    chip.appendChild(remove);
     container.appendChild(chip);
   }
 
@@ -4716,14 +5324,162 @@ function renderAttachmentChips() {
   container.classList.toggle('hidden', container.childElementCount === 0);
 }
 
+function isComposerPlanMode() {
+  return (el('codex-mode-select')?.value || 'default') === 'plan';
+}
+
+function getComposerSubmission(session = getSelectedSession()) {
+  const key = typeof session === 'string' ? session : getSessionKey(session);
+  return key ? state.codexControls.composerSubmissionsBySession.get(key) || null : null;
+}
+
+function pruneComposerSubmissions() {
+  const now = Date.now();
+  for (const [key, submission] of state.codexControls.composerSubmissionsBySession.entries()) {
+    const startedAtMs = Date.parse(submission?.startedAt || '');
+    if (!Number.isFinite(startedAtMs) || now - startedAtMs > COMPOSER_PENDING_SUBMISSION_TTL_MS) {
+      state.codexControls.composerSubmissionsBySession.delete(key);
+    }
+  }
+}
+
+function isComposerSubmitting(session = getSelectedSession()) {
+  pruneComposerSubmissions();
+  return Boolean(getComposerSubmission(session));
+}
+
+function setComposerSubmission(submission, session = getSelectedSession()) {
+  const key = submission?.sessionKey || (typeof session === 'string' ? session : getSessionKey(session));
+  if (key) {
+    if (submission) {
+      state.codexControls.composerSubmissionsBySession.set(key, submission);
+    } else {
+      state.codexControls.composerSubmissionsBySession.delete(key);
+    }
+  }
+  renderSessionDetails();
+  renderComposerModeBanner();
+  renderComposerTurnNotice();
+}
+
+function clearComposerSubmissionForSession(sessionOrKey, submissionId = '') {
+  const key = typeof sessionOrKey === 'string' ? sessionOrKey : getSessionKey(sessionOrKey);
+  if (!key) {
+    return false;
+  }
+  const current = state.codexControls.composerSubmissionsBySession.get(key);
+  if (submissionId && current?.id !== submissionId) {
+    return false;
+  }
+  state.codexControls.composerSubmissionsBySession.delete(key);
+  renderSessionDetails();
+  renderComposerModeBanner();
+  renderComposerTurnNotice();
+  return true;
+}
+
+function pruneRecentComposerSubmissions() {
+  const now = Date.now();
+  for (const [key, entry] of state.codexControls.recentSubmissions.entries()) {
+    if (!entry?.createdAtMs || now - entry.createdAtMs > COMPOSER_RECENT_SUBMISSION_TTL_MS) {
+      state.codexControls.recentSubmissions.delete(key);
+    }
+  }
+}
+
+function composerSubmissionSignature(session, draft) {
+  const attachmentKeys = (Array.isArray(draft?.attachments) ? draft.attachments : [])
+    .map(composerAttachmentKey)
+    .filter(Boolean)
+    .sort();
+  return JSON.stringify({
+    sessionKey: getSessionKey(session) || '',
+    text: canonicalTranscriptText(draft?.text || ''),
+    localImagePath: String(draft?.localImagePath || '').trim(),
+    attachments: attachmentKeys,
+    options: getComposerOptions(),
+  });
+}
+
+function getOrCreateComposerSubmissionId(signature) {
+  pruneRecentComposerSubmissions();
+  const existing = state.codexControls.recentSubmissions.get(signature);
+  if (existing?.id) {
+    existing.createdAtMs = Date.now();
+    return existing.id;
+  }
+  const id = `composer-${makeClientId()}`;
+  state.codexControls.recentSubmissions.set(signature, {
+    id,
+    createdAtMs: Date.now(),
+  });
+  return id;
+}
+
+function setComposerPlanMode(enabled) {
+  setSelectValue('codex-mode-select', enabled ? 'plan' : 'default');
+  renderComposerModeBanner();
+}
+
+function toggleComposerPlanMode() {
+  setComposerPlanMode(!isComposerPlanMode());
+}
+
+function pressComposerPlanModeButton() {
+  const button = el('codex-plan-button');
+  if (button) {
+    if (!button.disabled) {
+      button.click();
+    }
+    return;
+  }
+  toggleComposerPlanMode();
+  focusComposerInput();
+}
+
+function renderComposerModeBanner() {
+  const banner = el('composer-plan-mode-banner');
+  const sendButton = el('codex-send-button');
+  const planButton = el('codex-plan-button');
+  const session = getSelectedSession();
+  const runtime = getRuntimeForSession(session) || session?.runtime || {};
+  const activeTurn = Boolean(session?.live && runtimeIsActive(runtime));
+  const planMode = isComposerPlanMode();
+  const submitting = isComposerSubmitting(session);
+
+  if (banner) {
+    banner.classList.toggle('hidden', !planMode);
+  }
+  if (sendButton) {
+    sendButton.textContent = submitting
+      ? 'Sending...'
+      : planMode
+      ? activeTurn ? 'Queue Plan' : 'Send Plan'
+      : activeTurn ? 'Queue' : 'Send';
+    sendButton.title = submitting
+      ? 'Sending this prompt. The composer is locked to prevent duplicates.'
+      : planMode
+      ? 'Plan mode is on. Prompts will ask Codex to plan only until you exit plan mode.'
+      : '';
+  }
+  if (planButton) {
+    planButton.textContent = planMode ? 'Exit Plan' : 'Plan';
+    planButton.title = planMode ? 'Exit plan mode' : 'Enter plan mode';
+    planButton.setAttribute('aria-pressed', planMode ? 'true' : 'false');
+  }
+}
+
 function renderComposerControls(session, disabled) {
+  const submitting = isComposerSubmitting(session);
   refreshInferredComposerOptionsForSession(session);
   renderComposerModelOptions(session);
   applyComposerOptionsToControls(session);
   renderReasoningEffortOptions(session);
   applyComposerOptionsToControls(session);
   renderAttachmentChips();
+  renderComposerModeBanner();
   requestModelOptionsForSession(session);
+  requestSkillOptionsForSession(session);
   renderComposerTurnNotice();
 
   const controlIds = [
@@ -4736,30 +5492,32 @@ function renderComposerControls(session, disabled) {
     'codex-reviewer-select',
     'codex-sandbox-mode-select',
     'codex-personality-select',
+    'input-text',
     'codex-file-picker-button',
     'codex-image-files',
     'codex-local-image-path',
     'codex-clear-attachments-button',
     'codex-plan-button',
+    'composer-exit-plan-mode-button',
     'codex-send-button',
   ];
   for (const id of controlIds) {
     const node = el(id);
     if (node) {
-      node.disabled = disabled;
+      node.disabled = disabled || submitting;
     }
   }
 
   const modelButton = el('codex-model-refresh-button');
   if (modelButton) {
     const loadingModels = isModelOptionsLoading(session);
-    modelButton.disabled = disabled || !session?.live || loadingModels;
+    modelButton.disabled = disabled || submitting || !session?.live || loadingModels;
     modelButton.textContent = loadingModels ? 'Loading...' : 'Refresh';
   }
 
   const reviewButton = el('codex-review-button');
   if (reviewButton) {
-    reviewButton.disabled = disabled || !session?.live;
+    reviewButton.disabled = disabled || submitting || !session?.live;
   }
 
   const runtime = getRuntimeForSession(session) || session?.runtime || {};
@@ -4767,11 +5525,11 @@ function renderComposerControls(session, disabled) {
   const interruptButton = el('codex-interrupt-button');
   if (interruptButton) {
     interruptButton.classList.toggle('hidden', !activeTurn);
-    interruptButton.disabled = disabled || !activeTurn;
+    interruptButton.disabled = disabled || submitting || !activeTurn;
   }
   const sendButton = el('codex-send-button');
   if (sendButton) {
-    sendButton.textContent = activeTurn ? 'Queue' : 'Send';
+    renderComposerModeBanner();
   }
   maybeScheduleQueuedPromptSend(session);
 }
@@ -4999,8 +5757,13 @@ function renderComposerTurnNotice() {
   }
 }
 
-function getComposerInputItems(uploadedFiles = []) {
-  const inputItems = state.codexControls.attachments
+function getComposerDraftAttachments(draft = null) {
+  return Array.isArray(draft?.attachments) ? draft.attachments : state.codexControls.attachments;
+}
+
+function getComposerInputItems(uploadedFiles = [], draft = null) {
+  const attachments = getComposerDraftAttachments(draft);
+  const inputItems = attachments
     .filter((attachment) => attachment.type === 'image')
     .map((attachment) => ({
       type: 'image',
@@ -5017,7 +5780,7 @@ function getComposerInputItems(uploadedFiles = []) {
       name: file.name || basename(file.path),
     });
   }
-  const localImagePath = el('codex-local-image-path')?.value.trim();
+  const localImagePath = String(draft ? draft.localImagePath || '' : el('codex-local-image-path')?.value || '').trim();
   if (localImagePath) {
     inputItems.push({
       type: 'localImage',
@@ -5025,17 +5788,60 @@ function getComposerInputItems(uploadedFiles = []) {
       name: basename(localImagePath),
     });
   }
+  for (const attachment of attachments.filter((item) => item.type === 'skill')) {
+    if (!attachment.name || !attachment.path) {
+      continue;
+    }
+    inputItems.push({
+      type: 'skill',
+      name: attachment.name,
+      path: attachment.path,
+    });
+  }
   return inputItems;
 }
 
-function getComposerTextFileSections() {
-  return state.codexControls.attachments
+function getDefaultTextForInputItems(inputItems = []) {
+  const hasSkill = inputItems.some((item) => item.type === 'skill');
+  if (hasSkill) {
+    return 'Use the selected skill(s).';
+  }
+  const hasImage = inputItems.some((item) => item.type === 'image' || item.type === 'localImage');
+  if (hasImage) {
+    return 'Please inspect the attached image(s).';
+  }
+  return 'Please inspect the attached file(s).';
+}
+
+function getComposerTextFileSections(draft = null) {
+  return getComposerDraftAttachments(draft)
     .filter((attachment) => attachment.type === 'textFile')
     .map((attachment) => [
       `Attached file: ${attachment.name || 'untitled'}`,
       '```text',
       String(attachment.text || '').replace(/```/g, '` ` `'),
       '```',
+    ].join('\n'));
+}
+
+function getComposerInlineFiles(draft = null) {
+  return getComposerDraftAttachments(draft)
+    .filter((attachment) => attachment.type === 'textFile')
+    .map((attachment) => ({
+      name: attachment.name || 'attachment.txt',
+      size: Number(attachment.size || 0) || textByteLength(attachment.text || ''),
+      mime: 'text/plain; charset=utf-8',
+      text: String(attachment.text || ''),
+    }))
+    .filter((file) => file.text || file.name);
+}
+
+function getComposerPromptCardSections(draft = null) {
+  return getComposerDraftAttachments(draft)
+    .filter((attachment) => attachment.type === 'promptCard' && String(attachment.text || '').trim())
+    .map((attachment) => [
+      `Prompt card: ${attachment.title || 'Prompt card'}`,
+      String(attachment.text || '').trim(),
     ].join('\n'));
 }
 
@@ -5077,6 +5883,7 @@ function snapshotComposerDraft(rawText) {
     text: String(rawText || ''),
     attachments: state.codexControls.attachments.map(cloneComposerAttachment),
     localImagePath: el('codex-local-image-path')?.value || '',
+    options: getComposerOptions(),
     createdAt: new Date().toISOString(),
   };
 }
@@ -5100,6 +5907,17 @@ function clearActiveDraftForSession(session) {
   }
 }
 
+function stashPendingComposerDraftForSession(sessionOrKey, draft) {
+  const key = typeof sessionOrKey === 'string' ? sessionOrKey : getSessionKey(sessionOrKey);
+  if (!key || !draft) {
+    return;
+  }
+  state.codexControls.pendingComposerDraftsBySession.set(key, {
+    ...draft,
+    text: String(draft.text || ''),
+  });
+}
+
 function restoreComposerDraft(draft, options = {}) {
   if (!draft) {
     return false;
@@ -5119,11 +5937,13 @@ function restoreComposerDraft(draft, options = {}) {
     ? draft.attachments.map(cloneComposerAttachment)
     : [];
   if (nextAttachments.length) {
-    const existingKeys = new Set(state.codexControls.attachments.map((attachment) => (
-      attachment.fileId || `${attachment.type}|${attachment.name}|${attachment.size}|${attachment.remotePath || ''}`
-    )));
+    const existingKeys = new Set(state.codexControls.attachments.map(composerAttachmentKey));
     for (const attachment of nextAttachments) {
-      const key = attachment.fileId || `${attachment.type}|${attachment.name}|${attachment.size}|${attachment.remotePath || ''}`;
+      if (attachment.type === 'uploadFile' && attachment.fileObject && isImageFileRef(attachment) && (attachment.previewObjectUrl || !attachment.previewUrl)) {
+        attachment.previewUrl = makeObjectPreviewUrl(attachment.fileObject);
+        attachment.previewObjectUrl = Boolean(attachment.previewUrl);
+      }
+      const key = composerAttachmentKey(attachment);
       if (!existingKeys.has(key)) {
         state.codexControls.attachments.push(attachment);
         existingKeys.add(key);
@@ -5137,6 +5957,26 @@ function restoreComposerDraft(draft, options = {}) {
     localImageInput.dispatchEvent(new Event('input', { bubbles: true }));
   }
   renderAttachmentChips();
+  return true;
+}
+
+function restorePendingComposerDraftForSession(session) {
+  const key = getSessionKey(session);
+  if (!key) {
+    return false;
+  }
+  const draft = state.codexControls.pendingComposerDraftsBySession.get(key);
+  if (!draft) {
+    return false;
+  }
+  const input = el('input-text');
+  if (input?.value.trim() || state.codexControls.attachments.length || el('codex-local-image-path')?.value.trim()) {
+    return false;
+  }
+  if (!restoreComposerDraft(draft, { replace: true })) {
+    return false;
+  }
+  state.codexControls.pendingComposerDraftsBySession.delete(key);
   return true;
 }
 
@@ -5170,11 +6010,10 @@ const SLASH_COMMANDS = [
     command: '/plan',
     title: 'Plan Mode',
     category: 'Codex',
-    description: 'Turn on plan-only mode for the next message.',
+    description: 'Toggle persistent plan-only mode.',
     keywords: ['计划', 'plan mode'],
     run: async () => {
-      setSelectValue('codex-mode-select', 'plan');
-      focusComposerInput();
+      pressComposerPlanModeButton();
     },
   },
   {
@@ -5342,52 +6181,175 @@ const SLASH_COMMANDS = [
     keywords: ['记忆', 'memory.md'],
     insert: 'Please generate durable project memory for future sessions: summarize stable facts, host setup notes, commands, gotchas, and next steps. If a MEMORY.md or project notes file exists, propose a safe update before editing.',
   },
-  {
-    id: 'skill-imagegen',
-    command: '/imagegen',
-    title: 'Skill: Image Gen',
-    category: 'Skills',
-    description: 'Ask Codex to use Image Gen when available.',
-    keywords: ['skill', '图片生成', 'image gen'],
-    insert: 'Use the Image Gen skill if it is available in this Codex environment. Generate or edit the requested image, then save the output file in the current workspace and reply with its full path.',
-  },
-  {
-    id: 'skill-openai-docs',
-    command: '/openai-docs',
-    title: 'Skill: OpenAI Docs',
-    category: 'Skills',
-    description: 'Use official OpenAI docs when available.',
-    keywords: ['skill', 'openai docs', '文档'],
-    insert: 'Use the OpenAI Docs skill if it is available. Check official OpenAI documentation before answering, and cite the specific docs used.',
-  },
-  {
-    id: 'skill-plugin-creator',
-    command: '/plugin-creator',
-    title: 'Skill: Plugin Creator',
-    category: 'Skills',
-    description: 'Scaffold or update a Codex plugin.',
-    keywords: ['skill', 'plugin'],
-    insert: 'Use the Plugin Creator skill if it is available. Scaffold or update the requested Codex plugin and list the files changed.',
-  },
-  {
-    id: 'skill-creator',
-    command: '/skill-creator',
-    title: 'Skill: Skill Creator',
-    category: 'Skills',
-    description: 'Create or update a Codex skill.',
-    keywords: ['skill', '创建 skill'],
-    insert: 'Use the Skill Creator skill if it is available. Create or update the requested skill and explain how to test it.',
-  },
-  {
-    id: 'skill-installer',
-    command: '/skill-installer',
-    title: 'Skill: Skill Installer',
-    category: 'Skills',
-    description: 'Install curated or repo-hosted Codex skills.',
-    keywords: ['skill', 'install', '安装'],
-    insert: 'Use the Skill Installer skill if it is available. Install the requested skill source and summarize where it was installed.',
-  },
 ];
+
+function skillCacheKey(session) {
+  return modelCacheKey(session);
+}
+
+function formatSkillScopeLabel(scope) {
+  const normalized = String(scope || '').trim().toLowerCase();
+  if (normalized === 'user') {
+    return 'Personal';
+  }
+  if (normalized === 'repo') {
+    return 'Project';
+  }
+  if (normalized === 'system') {
+    return 'System';
+  }
+  if (normalized === 'admin') {
+    return 'Admin';
+  }
+  return 'Skills';
+}
+
+function humanizeSkillName(name) {
+  return String(name || '')
+    .trim()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\b([a-z])/g, (match) => match.toUpperCase());
+}
+
+function formatSkillDisplayName(skill) {
+  const explicit = String(skill?.interface?.displayName || skill?.displayName || '').trim();
+  if (explicit) {
+    return explicit;
+  }
+  return humanizeSkillName(skill?.name);
+}
+
+function formatSkillDescription(skill) {
+  return String(
+    skill?.interface?.shortDescription
+    || skill?.shortDescription
+    || skill?.description
+    || 'Use this Codex skill.'
+  ).trim();
+}
+
+function slashCommandForSkillName(name) {
+  const slug = String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w.-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `/${slug || 'skill'}`;
+}
+
+function normalizeSkillMetadata(skill, cwd = '') {
+  if (!skill || typeof skill !== 'object') {
+    return null;
+  }
+  const name = String(skill.name || '').trim();
+  const path = String(skill.path || '').trim();
+  if (!name || !path || skill.enabled === false) {
+    return null;
+  }
+  return {
+    ...skill,
+    name,
+    path,
+    cwd: String(cwd || '').trim(),
+    displayName: formatSkillDisplayName(skill) || name,
+    description: formatSkillDescription(skill),
+    scope: String(skill.scope || '').trim() || 'user',
+  };
+}
+
+function flattenSkillListResponse(response) {
+  const data = Array.isArray(response?.data) ? response.data : [];
+  const seen = new Set();
+  const skills = [];
+  for (const entry of data) {
+    const cwd = String(entry?.cwd || '').trim();
+    for (const rawSkill of Array.isArray(entry?.skills) ? entry.skills : []) {
+      const skill = normalizeSkillMetadata(rawSkill, cwd);
+      if (!skill) {
+        continue;
+      }
+      const key = skill.path || `${skill.scope}:${skill.name}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      skills.push(skill);
+    }
+  }
+  return skills;
+}
+
+function getSessionSkills(session = getSelectedSession()) {
+  if (!session) {
+    return [];
+  }
+  return state.codexControls.skillOptionsBySession.get(skillCacheKey(session)) || [];
+}
+
+function buildSkillSlashCommand(skill) {
+  return {
+    id: `skill-${skill.path || skill.name}`,
+    command: slashCommandForSkillName(skill.name),
+    title: skill.displayName || skill.name,
+    category: formatSkillScopeLabel(skill.scope),
+    description: skill.description || 'Use this Codex skill.',
+    keywords: ['skill', skill.name, skill.displayName, skill.scope, skill.path].filter(Boolean),
+    skill,
+  };
+}
+
+function normalizeSlashCommand(command) {
+  if (command?.id === 'feedback') {
+    return {
+      ...command,
+      description: 'Attach a feedback note template for this remote-control app.',
+      promptCard: {
+        title: command.title || 'Feedback',
+        text: command.insert || '',
+      },
+      insert: null,
+    };
+  }
+  if (command?.id === 'memory') {
+    return {
+      ...command,
+      description: 'Attach durable project memory instructions.',
+      promptCard: {
+        title: command.title || 'Memory',
+        text: command.insert || '',
+      },
+      insert: null,
+    };
+  }
+  return command;
+}
+
+function getAvailableSlashCommands() {
+  return [
+    ...SLASH_COMMANDS
+      .filter((command) => !['mcp', 'ide-context'].includes(command.id))
+      .map(normalizeSlashCommand),
+    ...getSessionSkills().map(buildSkillSlashCommand),
+  ];
+}
+
+function getSlashSkillStatusMessage(session = getSelectedSession()) {
+  if (!session?.live) {
+    return 'Skills appear after selecting a live session.';
+  }
+  const host = getHost(session.hostId);
+  if (!host?.capabilities?.skillList) {
+    return `Skills are not available from ${host?.label || session.hostId} yet. Restart or upgrade that host-agent to enable skill listing.`;
+  }
+  if (isSkillOptionsLoading(session)) {
+    return 'Loading skills from the selected Codex session...';
+  }
+  if (state.codexControls.skillOptionsBySession.has(skillCacheKey(session)) && !getSessionSkills(session).length) {
+    return 'No enabled skills were reported by this Codex session.';
+  }
+  return '';
+}
 
 function setInputValue(id, value) {
   const node = el(id);
@@ -5433,11 +6395,12 @@ function getSlashTokenMatch(input = el('input-text')) {
 
 function getFilteredSlashCommands() {
   const query = String(state.slashMenu.query || '').trim().toLowerCase();
+  const commands = getAvailableSlashCommands();
   if (!query) {
-    return SLASH_COMMANDS;
+    return commands;
   }
   const terms = query.split(/\s+/).filter(Boolean);
-  return SLASH_COMMANDS.filter((command) => {
+  return commands.filter((command) => {
     const haystack = [
       command.command,
       command.title,
@@ -5470,6 +6433,7 @@ function updateSlashMenuFromInput() {
   state.slashMenu.open = true;
   state.slashMenu.query = match.query;
   state.slashMenu.match = match;
+  requestSkillOptionsForSession(getSelectedSession());
   const commands = getFilteredSlashCommands();
   state.slashMenu.selectedIndex = Math.min(state.slashMenu.selectedIndex, Math.max(0, commands.length - 1));
   renderSlashMenu();
@@ -5493,8 +6457,83 @@ function replaceSlashToken(replacement = '') {
   input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
+function composerAttachmentKey(attachment) {
+  if (!attachment) {
+    return '';
+  }
+  if (attachment.type === 'skill') {
+    return `skill|${attachment.path || attachment.name}`;
+  }
+  if (attachment.type === 'promptCard') {
+    return `promptCard|${attachment.cardId || attachment.title || attachment.text}`;
+  }
+  return attachment.fileId || `${attachment.type}|${attachment.name}|${attachment.size}|${attachment.remotePath || ''}`;
+}
+
+function addComposerPromptCardAttachment(card = {}) {
+  const text = String(card.text || '').trim();
+  if (!text) {
+    throw new Error('This prompt card is empty.');
+  }
+  const next = {
+    type: 'promptCard',
+    cardId: String(card.id || card.title || text.slice(0, 60)).trim(),
+    title: String(card.title || 'Prompt card').trim(),
+    text,
+  };
+  const key = composerAttachmentKey(next);
+  const exists = state.codexControls.attachments.some((attachment) => composerAttachmentKey(attachment) === key);
+  if (!exists) {
+    state.codexControls.attachments.push(next);
+  }
+  renderAttachmentChips();
+}
+
+function addComposerSkillAttachment(skill) {
+  const normalized = normalizeSkillMetadata(skill);
+  if (!normalized) {
+    throw new Error('This skill is missing a usable name or path.');
+  }
+
+  const next = {
+    type: 'skill',
+    skillId: normalized.path || normalized.name,
+    name: normalized.name,
+    displayName: normalized.displayName || normalized.name,
+    description: normalized.description || '',
+    scope: normalized.scope || 'user',
+    path: normalized.path,
+    cwd: normalized.cwd || '',
+  };
+  const key = composerAttachmentKey(next);
+  const exists = state.codexControls.attachments.some((attachment) => composerAttachmentKey(attachment) === key);
+  if (!exists) {
+    state.codexControls.attachments.push(next);
+  }
+  renderAttachmentChips();
+}
+
 async function executeSlashCommand(command) {
   if (!command) {
+    return;
+  }
+
+  if (command.skill) {
+    replaceSlashToken('');
+    addComposerSkillAttachment(command.skill);
+    hideSlashMenu();
+    focusComposerInput();
+    return;
+  }
+
+  if (command.promptCard) {
+    replaceSlashToken('');
+    addComposerPromptCardAttachment({
+      id: command.id,
+      ...command.promptCard,
+    });
+    hideSlashMenu();
+    focusComposerInput();
     return;
   }
 
@@ -5530,6 +6569,13 @@ function renderSlashMenu() {
     empty.className = 'slash-command-empty';
     empty.textContent = 'No slash commands match this search.';
     menu.appendChild(empty);
+    const skillStatus = getSlashSkillStatusMessage();
+    if (skillStatus) {
+      const note = document.createElement('div');
+      note.className = 'slash-command-empty slash-command-note';
+      note.textContent = skillStatus;
+      menu.appendChild(note);
+    }
     return;
   }
 
@@ -5550,13 +6596,19 @@ function renderSlashMenu() {
       </div>
     `;
     button.onmouseenter = () => {
+      if (state.slashMenu.selectedIndex === index) {
+        return;
+      }
       state.slashMenu.selectedIndex = index;
-      renderSlashMenu();
+      for (const [itemIndex, item] of Array.from(menu.querySelectorAll('.slash-command-item')).entries()) {
+        const active = itemIndex === index;
+        item.classList.toggle('active', active);
+        item.setAttribute('aria-selected', active ? 'true' : 'false');
+      }
     };
-    button.onmousedown = (event) => {
-      event.preventDefault();
-    };
-    button.onpointerdown = async (event) => {
+    let pointerStart = null;
+    let pointerHandled = false;
+    const runCommand = async (event) => {
       event.preventDefault();
       event.stopPropagation();
       try {
@@ -5565,12 +6617,58 @@ function renderSlashMenu() {
         reportError(error);
       }
     };
-    button.onclick = (event) => {
-      event.preventDefault();
+    button.onmousedown = (event) => {
+      if (event.button === 0 && !window.matchMedia?.('(pointer: coarse)').matches) {
+        event.preventDefault();
+      }
       event.stopPropagation();
+    };
+    button.onpointerdown = (event) => {
+      pointerStart = {
+        pointerId: event.pointerId,
+        pointerType: event.pointerType || '',
+        x: event.clientX,
+        y: event.clientY,
+      };
+      pointerHandled = false;
+      event.stopPropagation();
+    };
+    button.onpointerup = async (event) => {
+      event.stopPropagation();
+      if (!pointerStart || pointerStart.pointerId !== event.pointerId || pointerStart.pointerType === 'mouse') {
+        pointerStart = null;
+        return;
+      }
+      const dx = Math.abs(event.clientX - pointerStart.x);
+      const dy = Math.abs(event.clientY - pointerStart.y);
+      pointerStart = null;
+      if (dx > 12 || dy > 12) {
+        return;
+      }
+      pointerHandled = true;
+      await runCommand(event);
+      window.setTimeout(() => {
+        pointerHandled = false;
+      }, 350);
+    };
+    button.onclick = async (event) => {
+      if (pointerHandled) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      await runCommand(event);
     };
     menu.appendChild(button);
   });
+
+  const skillStatus = getSlashSkillStatusMessage();
+  if (skillStatus) {
+    const note = document.createElement('div');
+    note.className = 'slash-command-empty slash-command-note';
+    note.textContent = skillStatus;
+    menu.appendChild(note);
+  }
 }
 
 async function uploadComposerFiles(session) {
@@ -5718,12 +6816,13 @@ async function uploadComposerFileInChunks(session, attachment) {
   }
 }
 
-async function buildComposerPayload(rawText, overrides = {}) {
-  const session = getSelectedSession();
+async function buildComposerPayload(session, rawText, overrides = {}) {
   const composerDraft = snapshotComposerDraft(rawText);
   const uploadedFiles = await uploadComposerFiles(session);
   const inputItems = getComposerInputItems(uploadedFiles);
+  const promptCardSections = getComposerPromptCardSections();
   const textFileSections = getComposerTextFileSections();
+  const inlineFiles = getComposerInlineFiles();
   const uploadedFileSections = getComposerUploadedFileSections(uploadedFiles);
   const options = {
     ...getComposerOptions(),
@@ -5731,35 +6830,43 @@ async function buildComposerPayload(rawText, overrides = {}) {
   };
   const userVisibleText = String(rawText || '').trim();
   let text = userVisibleText;
-  const hasOriginalContent = Boolean(text || inputItems.length || textFileSections.length || uploadedFileSections.length);
-  if (uploadedFileSections.length || textFileSections.length) {
+  const hasOriginalContent = Boolean(text || inputItems.length || promptCardSections.length || textFileSections.length || uploadedFileSections.length);
+  if (promptCardSections.length || uploadedFileSections.length || textFileSections.length) {
     text = [
       text,
+      ...promptCardSections,
       ...uploadedFileSections,
       textFileSections.length ? 'Attached text file contents:' : '',
       ...textFileSections,
     ].filter(Boolean).join('\n\n');
   }
   if (!text && inputItems.length) {
-    text = 'Please inspect the attached image(s).';
+    text = getDefaultTextForInputItems(inputItems);
   }
   if (options.mode === 'plan' && hasOriginalContent) {
     text = buildPlanPrompt(text, inputItems.length > 0);
     options.approvalPolicy = 'never';
     options.sandboxMode = 'readOnly';
   }
+  const fallbackDisplayText = promptCardSections.length
+    ? promptCardSections.map((section) => section.split('\n')[0]).join(', ')
+    : (hasOriginalContent ? getDefaultTextForInputItems(inputItems) : '');
 
   return {
     ...options,
     text,
-    displayText: userVisibleText || (hasOriginalContent ? 'Please inspect the attached file(s).' : ''),
+    displayText: userVisibleText || fallbackDisplayText,
     inputItems,
     uploadedFiles,
+    inlineFiles,
     composerDraft,
   };
 }
 
 function clearComposerFileAttachments() {
+  for (const attachment of state.codexControls.attachments) {
+    revokeComposerAttachmentPreview(attachment);
+  }
   state.codexControls.attachments = [];
   const fileInput = el('codex-image-files');
   if (fileInput) {
@@ -5772,7 +6879,8 @@ function removeComposerAttachment(index) {
   if (!Number.isInteger(index) || index < 0 || index >= state.codexControls.attachments.length) {
     return;
   }
-  state.codexControls.attachments.splice(index, 1);
+  const [removed] = state.codexControls.attachments.splice(index, 1);
+  revokeComposerAttachmentPreview(removed);
   const fileInput = el('codex-image-files');
   if (fileInput && !state.codexControls.attachments.length) {
     fileInput.value = '';
@@ -5809,6 +6917,122 @@ async function readBlobAsBase64(blob) {
   return dataUrlToBase64(dataUrl);
 }
 
+function imageExtensionFromMime(mime) {
+  const normalized = String(mime || '').toLowerCase();
+  if (normalized.includes('jpeg') || normalized.includes('jpg')) {
+    return 'jpg';
+  }
+  if (normalized.includes('webp')) {
+    return 'webp';
+  }
+  if (normalized.includes('gif')) {
+    return 'gif';
+  }
+  if (normalized.includes('bmp')) {
+    return 'bmp';
+  }
+  return 'png';
+}
+
+function makePastedImageName(index = 0, mime = 'image/png') {
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[-:]/g, '')
+    .replace(/\..+$/, '')
+    .replace('T', '-');
+  const suffix = index > 0 ? `-${index + 1}` : '';
+  return `clipboard-image-${stamp}${suffix}.${imageExtensionFromMime(mime)}`;
+}
+
+function normalizePastedImageFile(file, index = 0) {
+  if (!file) {
+    return null;
+  }
+  const name = String(file.name || '').trim() || makePastedImageName(index, file.type);
+  if (file.name) {
+    return file;
+  }
+  try {
+    return new File([file], name, {
+      type: file.type || 'image/png',
+      lastModified: Date.now(),
+    });
+  } catch (_) {
+    return file;
+  }
+}
+
+function getClipboardImageFiles(event) {
+  const clipboard = event.clipboardData;
+  if (!clipboard) {
+    return [];
+  }
+
+  const files = [];
+  const seen = new Set();
+  for (const item of Array.from(clipboard.items || [])) {
+    if (item?.kind !== 'file' || !String(item.type || '').startsWith('image/')) {
+      continue;
+    }
+    const file = item.getAsFile?.();
+    if (!file) {
+      continue;
+    }
+    const key = `${file.name}|${file.type}|${file.size}|${file.lastModified}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      files.push(file);
+    }
+  }
+
+  if (!files.length) {
+    for (const file of Array.from(clipboard.files || [])) {
+      if (!file || !String(file.type || '').startsWith('image/')) {
+        continue;
+      }
+      const key = `${file.name}|${file.type}|${file.size}|${file.lastModified}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        files.push(file);
+      }
+    }
+  }
+
+  return files.map((file, index) => normalizePastedImageFile(file, index)).filter(Boolean);
+}
+
+function insertTextAtCursor(input, text) {
+  if (!input || !text) {
+    return;
+  }
+  const start = Number.isInteger(input.selectionStart) ? input.selectionStart : input.value.length;
+  const end = Number.isInteger(input.selectionEnd) ? input.selectionEnd : start;
+  input.value = `${input.value.slice(0, start)}${text}${input.value.slice(end)}`;
+  const cursor = start + text.length;
+  input.selectionStart = cursor;
+  input.selectionEnd = cursor;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+async function handleComposerPaste(event) {
+  const images = getClipboardImageFiles(event);
+  if (!images.length) {
+    return;
+  }
+
+  event.preventDefault();
+  const composer = el('input-form');
+  if (composer?.classList.contains('disabled')) {
+    throw new Error('Select or start a live session before pasting images.');
+  }
+
+  const pastedText = event.clipboardData?.getData('text/plain') || '';
+  if (pastedText && event.target === el('input-text')) {
+    insertTextAtCursor(event.target, pastedText);
+  }
+  await addComposerImageFiles(images);
+}
+
 async function addComposerImageFiles(files) {
   const incoming = Array.from(files || []).filter((file) => file && String(file.type || '').startsWith('image/'));
   if (!incoming.length) {
@@ -5821,7 +7045,7 @@ async function addComposerImageFiles(files) {
   }
 
   const selected = incoming.slice(0, available);
-  for (const file of selected) {
+  for (const [index, file] of selected.entries()) {
     if (file.size > MAX_COMPOSER_IMAGE_BYTES) {
       throw new Error(`${file.name} is too large for inline upload; limit is ${formatBytes(MAX_COMPOSER_IMAGE_BYTES)} per image.`);
     }
@@ -5829,7 +7053,7 @@ async function addComposerImageFiles(files) {
     state.codexControls.attachments.push({
       type: 'image',
       url,
-      name: file.name,
+      name: file.name || makePastedImageName(index, file.type),
       size: file.size,
     });
   }
@@ -5887,6 +7111,7 @@ async function addComposerFiles(files) {
     if (file.size > MAX_COMPOSER_UPLOAD_FILE_BYTES) {
       throw new Error(`${file.name} is too large for remote upload; limit is ${formatBytes(MAX_COMPOSER_UPLOAD_FILE_BYTES)} per file.`);
     }
+    const previewUrl = makeObjectPreviewUrl(file);
     state.codexControls.attachments.push({
       type: 'uploadFile',
       fileId: makeClientId(),
@@ -5894,6 +7119,9 @@ async function addComposerFiles(files) {
       name: file.name || 'upload',
       mime: file.type || 'application/octet-stream',
       size: file.size,
+      isImage: Boolean(previewUrl),
+      previewUrl,
+      previewObjectUrl: Boolean(previewUrl),
     });
   }
   renderAttachmentChips();
@@ -5942,8 +7170,6 @@ function renderSessionDetails() {
   const forkButton = el('fork-session-button');
   const alertsButton = el('toggle-alerts-button');
   const exportButton = el('export-session-button');
-  const exportBundleButton = el('export-session-bundle-button');
-  const exportThinkingCheckbox = el('export-thinking-checkbox');
   const renameButton = el('rename-session-button');
   const statusButton = el('toggle-status-button');
   const endSessionButton = el('end-session-button');
@@ -6038,23 +7264,10 @@ function renderSessionDetails() {
   alertsButton.textContent = alerts.length ? `Alerts (${alerts.length})` : 'Alerts';
   if (exportButton) {
     exportButton.disabled = !session;
-    exportButton.textContent = 'Export History';
+    exportButton.textContent = 'Export';
     exportButton.title = session
-      ? 'Download this conversation history as Markdown.'
-      : 'Select a conversation to export its history.';
-  }
-  if (exportBundleButton) {
-    exportBundleButton.disabled = !session;
-    exportBundleButton.textContent = 'Export Bundle';
-    exportBundleButton.title = session
-      ? 'Download Markdown, JSON, manifest, and cached files as a zip bundle.'
-      : 'Select a conversation to export its bundle.';
-  }
-  if (exportThinkingCheckbox) {
-    exportThinkingCheckbox.disabled = !session;
-    exportThinkingCheckbox.title = session
-      ? 'Include thinking/activity diagnostics in Markdown, JSON, and zip exports.'
-      : 'Select a conversation before exporting thinking/activity diagnostics.';
+      ? 'Choose range, thinking, images, files, and export format.'
+      : 'Select a conversation to export it.';
   }
   if (renameButton) {
     renameButton.disabled = !session;
@@ -6525,6 +7738,264 @@ function buildToolAnswerResponse(questionId, answerLabel) {
   };
 }
 
+function buildToolAnswersResponse(answersByQuestion) {
+  const answers = {};
+  for (const [questionId, values] of Object.entries(answersByQuestion || {})) {
+    const cleanValues = (Array.isArray(values) ? values : [values])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    if (questionId && cleanValues.length) {
+      answers[questionId] = {
+        answers: cleanValues,
+      };
+    }
+  }
+  return { answers };
+}
+
+function getInputAnswerDraftKey(session, request) {
+  const sessionKey = getSessionKey(session);
+  const requestId = String(request?.requestId || '');
+  return sessionKey && requestId ? `${sessionKey}::${requestId}` : '';
+}
+
+function clearInputAnswerDraft(hostId, sessionId, requestId) {
+  const cleanRequestId = String(requestId || '');
+  if (!hostId || !sessionId || !cleanRequestId) {
+    return;
+  }
+  state.codexControls.inputAnswersByRequest.delete(`${makeSessionKey(hostId, sessionId)}::${cleanRequestId}`);
+}
+
+function getInputAnswerDraft(session, request) {
+  const key = getInputAnswerDraftKey(session, request);
+  if (!key) {
+    return {};
+  }
+  const draft = state.codexControls.inputAnswersByRequest.get(key);
+  return draft && typeof draft === 'object' ? draft : {};
+}
+
+function updateInputAnswerDraft(session, request, questionId, patch) {
+  const key = getInputAnswerDraftKey(session, request);
+  if (!key || !questionId) {
+    return;
+  }
+  const draft = {
+    ...getInputAnswerDraft(session, request),
+  };
+  draft[questionId] = {
+    ...(draft[questionId] || {}),
+    ...(patch || {}),
+  };
+  state.codexControls.inputAnswersByRequest.set(key, draft);
+}
+
+function normalizeInputQuestion(rawQuestion, index) {
+  const question = rawQuestion && typeof rawQuestion === 'object' ? rawQuestion : {};
+  const id = String(question.id || `question_${index + 1}`).trim();
+  const options = (Array.isArray(question.options) ? question.options : [])
+    .map((option, optionIndex) => {
+      const value = option && typeof option === 'object' ? option : { label: option };
+      const label = String(value.label || value.value || `Option ${optionIndex + 1}`).trim();
+      return label ? {
+        label,
+        description: String(value.description || '').trim(),
+      } : null;
+    })
+    .filter(Boolean)
+    .slice(0, 6);
+  return {
+    id,
+    header: String(question.header || question.label || `Question ${index + 1}`).trim(),
+    question: String(question.question || question.prompt || '').trim(),
+    options,
+  };
+}
+
+function getUserInputQuestions(request) {
+  return (Array.isArray(request?.payload?.questions) ? request.payload.questions : [])
+    .map(normalizeInputQuestion)
+    .filter((question) => question.id)
+    .slice(0, 3);
+}
+
+function userInputOptionName(draftKey, questionId) {
+  return `input-choice-${draftKey}-${questionId}`.replace(/[^A-Za-z0-9_-]+/g, '-');
+}
+
+function renderUserInputRequestForm(container, session, request, options = {}) {
+  const questions = getUserInputQuestions(request);
+  if (!container || !session || !request || !questions.length) {
+    return null;
+  }
+
+  const draftKey = getInputAnswerDraftKey(session, request);
+  const draft = getInputAnswerDraft(session, request);
+  const form = document.createElement('form');
+  form.className = `user-input-request-form ${options.compact ? 'compact' : ''}`.trim();
+  form.dataset.userInputRequestKey = draftKey;
+
+  const error = document.createElement('div');
+  error.className = 'user-input-request-error hidden';
+  form.appendChild(error);
+
+  questions.forEach((question, questionIndex) => {
+    const field = document.createElement('fieldset');
+    field.className = 'user-input-question';
+
+    const legend = document.createElement('legend');
+    legend.textContent = question.header || `Question ${questionIndex + 1}`;
+    field.appendChild(legend);
+
+    if (question.question) {
+      const prompt = document.createElement('div');
+      prompt.className = 'user-input-question-prompt';
+      prompt.textContent = question.question;
+      field.appendChild(prompt);
+    }
+
+    const optionList = document.createElement('div');
+    optionList.className = 'user-input-option-list';
+    const selectedValue = String(draft[question.id]?.selected || '');
+    const otherValue = String(draft[question.id]?.other || '');
+    const optionName = userInputOptionName(draftKey, question.id);
+
+    question.options.forEach((option, optionIndex) => {
+      const optionId = `${optionName}-${optionIndex}`;
+      const label = document.createElement('label');
+      label.className = 'user-input-option';
+
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = optionName;
+      radio.value = option.label;
+      radio.checked = selectedValue === option.label;
+      radio.addEventListener('change', () => {
+        if (radio.checked) {
+          updateInputAnswerDraft(session, request, question.id, { selected: option.label });
+        }
+      });
+      radio.id = optionId;
+      label.appendChild(radio);
+
+      const copy = document.createElement('span');
+      copy.className = 'user-input-option-copy';
+      const title = document.createElement('strong');
+      title.textContent = option.label;
+      copy.appendChild(title);
+      if (option.description) {
+        const description = document.createElement('small');
+        description.textContent = option.description;
+        copy.appendChild(description);
+      }
+      label.appendChild(copy);
+      optionList.appendChild(label);
+    });
+
+    const otherId = `${optionName}-other`;
+    const otherLabel = document.createElement('label');
+    otherLabel.className = 'user-input-option other';
+
+    const otherRadio = document.createElement('input');
+    otherRadio.type = 'radio';
+    otherRadio.name = optionName;
+    otherRadio.value = '__other__';
+    otherRadio.checked = selectedValue === '__other__' || Boolean(otherValue && !selectedValue);
+    otherRadio.id = otherId;
+    otherRadio.addEventListener('change', () => {
+      if (otherRadio.checked) {
+        updateInputAnswerDraft(session, request, question.id, { selected: '__other__' });
+      }
+    });
+    otherLabel.appendChild(otherRadio);
+
+    const otherWrap = document.createElement('span');
+    otherWrap.className = 'user-input-option-copy';
+    const otherTitle = document.createElement('strong');
+    otherTitle.textContent = 'Other';
+    otherWrap.appendChild(otherTitle);
+    const otherInput = document.createElement('input');
+    otherInput.type = 'text';
+    otherInput.className = 'user-input-other-input';
+    otherInput.dataset.userInputOther = optionName;
+    otherInput.placeholder = 'Type a custom answer';
+    otherInput.value = otherValue;
+    otherInput.addEventListener('focus', () => {
+      otherRadio.checked = true;
+      updateInputAnswerDraft(session, request, question.id, { selected: '__other__' });
+    });
+    otherInput.addEventListener('input', () => {
+      if (otherInput.value.trim()) {
+        otherRadio.checked = true;
+      }
+      updateInputAnswerDraft(session, request, question.id, {
+        selected: otherRadio.checked ? '__other__' : selectedValue,
+        other: otherInput.value,
+      });
+    });
+    otherWrap.appendChild(otherInput);
+    otherLabel.appendChild(otherWrap);
+    optionList.appendChild(otherLabel);
+
+    field.appendChild(optionList);
+    form.appendChild(field);
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'user-input-request-actions';
+  const submit = document.createElement('button');
+  submit.type = 'submit';
+  submit.textContent = questions.length === 1 ? 'Submit Answer' : 'Submit Answers';
+  actions.appendChild(submit);
+  form.appendChild(actions);
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const answersByQuestion = {};
+    const missing = [];
+    questions.forEach((question) => {
+      const optionName = userInputOptionName(draftKey, question.id);
+      const selected = form.elements[optionName]?.value || '';
+      const other = form.querySelector(`[data-user-input-other="${optionName}"]`)?.value?.trim() || '';
+      const answer = selected === '__other__' || (!selected && other)
+        ? other
+        : selected;
+      if (!answer) {
+        missing.push(question.header || question.id);
+      } else {
+        answersByQuestion[question.id] = [answer];
+      }
+    });
+
+    if (missing.length) {
+      error.textContent = `Answer ${missing.join(', ')} before submitting.`;
+      error.classList.remove('hidden');
+      return;
+    }
+
+    error.classList.add('hidden');
+    submit.textContent = 'Submitting...';
+    const controls = Array.from(form.querySelectorAll('button, input'));
+    controls.forEach((control) => {
+      control.disabled = true;
+    });
+    try {
+      await respondToSessionRequest(session, request, buildToolAnswersResponse(answersByQuestion));
+      state.codexControls.inputAnswersByRequest.delete(draftKey);
+    } catch (submitError) {
+      controls.forEach((control) => {
+        control.disabled = false;
+      });
+      submit.textContent = questions.length === 1 ? 'Submit Answer' : 'Submit Answers';
+      reportError(submitError);
+    }
+  });
+
+  container.appendChild(form);
+  return form;
+}
+
 function buildPermissionsDeclineResponse() {
   return {
     permissions: {
@@ -6583,12 +8054,24 @@ function renderApprovalPopup() {
       ? summarizeData(request.payload)
       : '';
   const actions = el('approval-popup-actions');
+  const requestDraftKey = getInputAnswerDraftKey(session, request);
+  const existingInputForm = actions?.querySelector('.user-input-request-form') || null;
+  const keepFocusedInputForm = Boolean(
+    request.method === 'item/tool/requestUserInput'
+    && existingInputForm
+    && existingInputForm.dataset.userInputRequestKey === requestDraftKey
+    && existingInputForm.contains(document.activeElement)
+  );
 
   el('approval-popup-title').textContent = title;
   el('approval-popup-message').textContent = message;
   const detail = el('approval-popup-detail');
   detail.textContent = detailText;
   detail.classList.toggle('hidden', !detailText);
+  if (keepFocusedInputForm) {
+    popup.classList.remove('hidden');
+    return;
+  }
   actions.innerHTML = '';
 
   if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
@@ -6606,13 +8089,11 @@ function renderApprovalPopup() {
       await respondToSessionRequest(session, request, buildPermissionsDeclineResponse());
     });
   } else if (request.method === 'item/tool/requestUserInput') {
-    const questions = Array.isArray(request.payload?.questions) ? request.payload.questions : [];
-    if (questions.length === 1 && Array.isArray(questions[0].options) && questions[0].options.length <= 3) {
-      for (const option of questions[0].options) {
-        appendApprovalPopupButton(actions, option.label, 'secondary-button', async () => {
-          await respondToSessionRequest(session, request, buildToolAnswerResponse(questions[0].id, option.label));
-        });
-      }
+    if (!renderUserInputRequestForm(actions, session, request, { compact: true })) {
+      const note = document.createElement('div');
+      note.className = 'status-request-note';
+      note.textContent = 'Codex requested input, but no questions were included in the payload.';
+      actions.appendChild(note);
     }
   }
 
@@ -6716,31 +8197,142 @@ async function endCurrentSession() {
 }
 
 async function endAllRelaySessions() {
-  const liveCount = getRelayManagedLiveSessionCount();
-  if (!liveCount) {
+  const sessions = getRelayManagedLiveSessions();
+  if (!sessions.length) {
     throw new Error('No live managed Codex sessions are attached to this relay.');
   }
 
-  const message = currentLocale() === 'zh-CN'
-    ? `停止当前 relay 正在管理的 ${liveCount} 个 live Codex 会话？\n\n只会停止连接到这个 relay 的 managed sessions，不会扫描或杀掉其他 Codex 进程。历史仍然保留。`
-    : `Stop ${liveCount} live Codex session(s) managed by this relay?\n\nThis only stops managed sessions attached to this relay. It does not scan for or kill unrelated Codex processes. History stays available.`;
-  if (!window.confirm(message)) {
+  openSessionActionDialog({
+    mode: 'stop',
+    title: 'Stop live managed sessions',
+    subtitle: 'Choose which relay-managed Codex sessions to stop. History stays available and unrelated Codex processes are not scanned.',
+    actionLabel: 'Stop selected',
+    sessions,
+  });
+}
+
+function closeSessionActionDialog() {
+  state.sessionActionDialog.open = false;
+  state.sessionActionDialog.busy = false;
+  state.sessionActionDialog.sessions = [];
+  state.sessionActionDialog.selectedKeys = new Set();
+  renderSessionActionDialog();
+}
+
+function openSessionActionDialog(options = {}) {
+  const sessions = Array.isArray(options.sessions) ? options.sessions.filter(Boolean) : [];
+  state.sessionActionDialog.open = true;
+  state.sessionActionDialog.mode = options.mode || 'stop';
+  state.sessionActionDialog.title = options.title || 'Select sessions';
+  state.sessionActionDialog.subtitle = options.subtitle || '';
+  state.sessionActionDialog.actionLabel = options.actionLabel || 'Apply';
+  state.sessionActionDialog.sessions = sessions;
+  state.sessionActionDialog.selectedKeys = new Set(sessions.map(getSessionKey).filter(Boolean));
+  state.sessionActionDialog.busy = false;
+  renderSessionActionDialog();
+}
+
+function renderSessionActionDialog() {
+  const dialog = state.sessionActionDialog;
+  const overlay = el('session-action-dialog');
+  if (!overlay) {
+    return;
+  }
+  overlay.classList.toggle('hidden', !dialog.open);
+  overlay.setAttribute('aria-hidden', dialog.open ? 'false' : 'true');
+
+  el('session-action-dialog-title').textContent = dialog.title || 'Select sessions';
+  el('session-action-dialog-subtitle').textContent = dialog.subtitle || '';
+  const list = el('session-action-dialog-list');
+  const empty = el('session-action-dialog-empty');
+  const confirm = el('session-action-dialog-confirm-button');
+  const selectAll = el('session-action-select-all-checkbox');
+  list.innerHTML = '';
+
+  const sessions = dialog.sessions || [];
+  empty.classList.toggle('hidden', sessions.length > 0);
+  const selectedCount = sessions.filter((session) => dialog.selectedKeys.has(getSessionKey(session))).length;
+  selectAll.checked = sessions.length > 0 && selectedCount === sessions.length;
+  selectAll.indeterminate = selectedCount > 0 && selectedCount < sessions.length;
+  selectAll.disabled = dialog.busy || sessions.length === 0;
+  confirm.disabled = dialog.busy || selectedCount === 0;
+  confirm.textContent = dialog.busy ? 'Working...' : `${dialog.actionLabel || 'Apply'} (${selectedCount})`;
+
+  for (const session of sessions) {
+    const key = getSessionKey(session);
+    const host = getHost(session.hostId);
+    const row = document.createElement('label');
+    row.className = 'choice-session-row';
+    row.innerHTML = `
+      <input type="checkbox" data-session-action-key="${escapeHtml(key)}" ${dialog.selectedKeys.has(key) ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
+      <div class="choice-session-copy">
+        <strong>${escapeHtml(sessionDisplayTitle(session))}</strong>
+        <span>${escapeHtml(sessionPlatformLabel(session))} | ${escapeHtml(shortId(session.sessionId))}</span>
+        <span title="${escapeHtml(session.cwd || '')}">${escapeHtml(session.cwd || '(no path)')}</span>
+        <span>${escapeHtml(session.live ? 'live' : (session.state || 'history'))}${host?.online === false ? ' | host offline' : ''}</span>
+      </div>
+    `;
+    list.appendChild(row);
+  }
+  syncModalBodyState();
+}
+
+async function stopManagedSession(session) {
+  patchRuntimeForSession(session.hostId, session.sessionId, {
+    phase: 'ending',
+    connection: 'closing',
+    busy: false,
+    activeTurnId: null,
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+  });
+  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/stop`, {
+    method: 'POST',
+    body: JSON.stringify({ hostId: session.hostId }),
+  });
+}
+
+async function restartManagedSession(session) {
+  await stopManagedSession(session);
+  await delay(900);
+  await startManagedSession({
+    session: {
+      ...session,
+      live: false,
+      state: 'stopped',
+    },
+    launchMode: 'resume',
+    collectionId: '',
+    selectAfterStart: false,
+  });
+}
+
+async function runSessionActionDialog() {
+  const dialog = state.sessionActionDialog;
+  const selected = (dialog.sessions || []).filter((session) => dialog.selectedKeys.has(getSessionKey(session)));
+  if (!selected.length || dialog.busy) {
     return;
   }
 
-  const response = await fetchJson('/api/sessions/stop-all', {
-    method: 'POST',
-    body: JSON.stringify({}),
-  });
-  await delay(900);
+  dialog.busy = true;
+  renderSessionActionDialog();
+  const failures = [];
+  for (const session of selected) {
+    try {
+      if (dialog.mode === 'restart') {
+        await restartManagedSession(session);
+      } else {
+        await stopManagedSession(session);
+      }
+    } catch (error) {
+      failures.push(`${sessionDisplayTitle(session)} (${sessionPlatformLabel(session)}): ${error.message}`);
+    }
+  }
+  await delay(700);
   await refresh();
-
-  if (response.skipped > 0) {
-    const skipped = response.results
-      .filter((entry) => entry.skipped)
-      .map((entry) => `${entry.hostId}/${shortId(entry.sessionId)}: ${entry.error}`)
-      .join('\n');
-    window.alert(`Stopped ${response.stopped}; skipped ${response.skipped} offline/unavailable session(s):\n${skipped}`);
+  closeSessionActionDialog();
+  if (failures.length) {
+    window.alert(`Some session actions failed:\n${failures.join('\n')}`);
   }
 }
 
@@ -6883,104 +8475,101 @@ function renderStatusWindow() {
     : 'No live Codex thread is attached';
 
   const requestList = el('status-requests');
-  requestList.innerHTML = '';
-  if (!requests.length) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    empty.textContent = 'No pending or recent Codex requests for this session.';
-    requestList.appendChild(empty);
-  } else {
-    for (const request of [...requests].reverse()) {
-      const item = document.createElement('div');
-      item.className = `status-request-card ${request.status === 'pending' ? 'pending' : 'resolved'}`;
+  const focusedRequestForm = requestList?.querySelector('.user-input-request-form') || null;
+  const pendingInputRequestKeys = new Set(requests
+    .filter((request) => request.status === 'pending' && request.method === 'item/tool/requestUserInput')
+    .map((request) => getInputAnswerDraftKey(session, request))
+    .filter(Boolean));
+  const keepFocusedRequestList = Boolean(
+    focusedRequestForm
+    && focusedRequestForm.contains(document.activeElement)
+    && pendingInputRequestKeys.has(focusedRequestForm.dataset.userInputRequestKey || '')
+  );
 
-      const title = request.title || request.method || request.kind || 'Request';
-      const summary = request.summary || request.message || '';
-      item.innerHTML = `
-        <div class="status-request-top">
-          <div class="status-request-title">${title}</div>
-          <div class="status-request-badge">${request.status || 'pending'}</div>
-        </div>
-        <div class="status-request-copy">${summary || 'No summary provided.'}</div>
-        <div class="status-request-meta">${request.method || request.kind || 'request'} | ${formatTime(request.updatedAt || request.createdAt)}</div>
-      `;
+  if (!keepFocusedRequestList) {
+    requestList.innerHTML = '';
+    if (!requests.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.textContent = 'No pending or recent Codex requests for this session.';
+      requestList.appendChild(empty);
+    } else {
+      for (const request of [...requests].reverse()) {
+        const item = document.createElement('div');
+        item.className = `status-request-card ${request.status === 'pending' ? 'pending' : 'resolved'}`;
 
-      if (request.payload) {
-        const detail = document.createElement('div');
-        detail.className = 'status-request-detail';
-        detail.textContent = summarizeData(request.payload);
-        item.appendChild(detail);
-      }
+        const title = request.title || request.method || request.kind || 'Request';
+        const summary = request.summary || request.message || '';
+        item.innerHTML = `
+          <div class="status-request-top">
+            <div class="status-request-title">${title}</div>
+            <div class="status-request-badge">${request.status || 'pending'}</div>
+          </div>
+          <div class="status-request-copy">${summary || 'No summary provided.'}</div>
+          <div class="status-request-meta">${request.method || request.kind || 'request'} | ${formatTime(request.updatedAt || request.createdAt)}</div>
+        `;
 
-      if (request.status === 'pending') {
-        const actions = document.createElement('div');
-        actions.className = 'status-request-actions';
+        if (request.payload) {
+          const detail = document.createElement('div');
+          detail.className = 'status-request-detail';
+          detail.textContent = summarizeData(request.payload);
+          item.appendChild(detail);
+        }
 
-        if (request.method === 'item/tool/requestUserInput') {
-          const questions = Array.isArray(request.payload?.questions) ? request.payload.questions : [];
-          if (questions.length === 1 && Array.isArray(questions[0].options) && questions[0].options.length) {
-            for (const option of questions[0].options) {
+        if (request.status === 'pending') {
+          const actions = document.createElement('div');
+          actions.className = 'status-request-actions';
+
+          if (request.method === 'item/tool/requestUserInput') {
+            if (!renderUserInputRequestForm(actions, session, request)) {
+              const note = document.createElement('div');
+              note.className = 'status-request-note';
+              note.textContent = 'Codex requested input, but no questions were included in the payload.';
+              item.appendChild(note);
+            }
+          } else if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
+            const options = [
+              ['Accept', { decision: 'accept' }],
+              ['Allow This Session', { decision: 'acceptForSession' }],
+              ['Decline', { decision: 'decline' }],
+              ['Cancel Turn', { decision: 'cancel' }],
+            ];
+            for (const [label, response] of options) {
               const button = document.createElement('button');
               button.type = 'button';
-              button.className = 'secondary-button';
-              button.textContent = option.label;
+              button.className = label === 'Decline' || label === 'Cancel Turn' ? 'secondary-button' : '';
+              button.textContent = label;
               button.onclick = async () => {
                 try {
-                  await respondToSessionRequest(session, request, buildToolAnswerResponse(questions[0].id, option.label));
+                  await respondToSessionRequest(session, request, response);
                 } catch (error) {
                   reportError(error);
                 }
               };
               actions.appendChild(button);
             }
-          } else {
-            const note = document.createElement('div');
-            note.className = 'status-request-note';
-            note.textContent = 'This request needs a richer input form. The protocol payload is captured and can be wired next.';
-            item.appendChild(note);
-          }
-        } else if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
-          const options = [
-            ['Accept', { decision: 'accept' }],
-            ['Allow This Session', { decision: 'acceptForSession' }],
-            ['Decline', { decision: 'decline' }],
-            ['Cancel Turn', { decision: 'cancel' }],
-          ];
-          for (const [label, response] of options) {
+          } else if (request.method === 'item/permissions/requestApproval') {
             const button = document.createElement('button');
             button.type = 'button';
-            button.className = label === 'Decline' || label === 'Cancel Turn' ? 'secondary-button' : '';
-            button.textContent = label;
+            button.className = 'secondary-button';
+            button.textContent = 'Decline Permissions';
             button.onclick = async () => {
               try {
-                await respondToSessionRequest(session, request, response);
+                await respondToSessionRequest(session, request, buildPermissionsDeclineResponse());
               } catch (error) {
                 reportError(error);
               }
             };
             actions.appendChild(button);
           }
-        } else if (request.method === 'item/permissions/requestApproval') {
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.className = 'secondary-button';
-          button.textContent = 'Decline Permissions';
-          button.onclick = async () => {
-            try {
-              await respondToSessionRequest(session, request, buildPermissionsDeclineResponse());
-            } catch (error) {
-              reportError(error);
-            }
-          };
-          actions.appendChild(button);
+
+          if (actions.childElementCount > 0) {
+            item.appendChild(actions);
+          }
         }
 
-        if (actions.childElementCount > 0) {
-          item.appendChild(actions);
-        }
+        requestList.appendChild(item);
       }
-
-      requestList.appendChild(item);
     }
   }
 
@@ -7252,6 +8841,117 @@ function renderFileChangeDetails(fileChanges = []) {
     wrapper.appendChild(details);
   }
   return wrapper;
+}
+
+function isThinkingContentPinnedToBottom(scroller) {
+  if (!scroller) {
+    return true;
+  }
+  return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+}
+
+function updateThinkingScrollState(stateKey, scroller) {
+  if (!stateKey || !scroller) {
+    return;
+  }
+  const atBottom = isThinkingContentPinnedToBottom(scroller);
+  state.thinkingScrollPositions.set(stateKey, {
+    scrollTop: scroller.scrollTop,
+    bottomOffset: Math.max(0, scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight),
+    atBottom,
+  });
+  if (atBottom) {
+    state.thinkingUnread.delete(stateKey);
+  }
+  refreshThinkingUnreadButtons(scroller.closest('.thinking-card'), stateKey);
+}
+
+function refreshThinkingUnreadButtons(details, stateKey) {
+  if (!details || !stateKey) {
+    return;
+  }
+  const hasUnread = state.thinkingUnread.has(stateKey);
+  details.querySelectorAll('.thinking-scroll-button[data-scroll-target="bottom"]')
+    .forEach((button) => {
+      button.classList.toggle('has-new', hasUnread);
+      button.textContent = hasUnread ? 'Bottom *' : 'Bottom';
+      button.title = hasUnread
+        ? 'New thinking updates below. Jump to latest.'
+        : 'Jump to latest thinking update.';
+    });
+}
+
+function restoreThinkingScrollState(stateKey, scroller) {
+  if (!stateKey || !scroller) {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    const saved = state.thinkingScrollPositions.get(stateKey);
+    if (saved) {
+      if (saved.atBottom) {
+        scroller.scrollTop = scroller.scrollHeight;
+      } else {
+        scroller.scrollTop = Math.min(saved.scrollTop || 0, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
+      }
+    }
+    updateThinkingScrollState(stateKey, scroller);
+  });
+}
+
+function captureThinkingScrollStates(container) {
+  if (!container) {
+    return;
+  }
+  container.querySelectorAll('.thinking-content[data-thinking-state-key]')
+    .forEach((scroller) => updateThinkingScrollState(scroller.dataset.thinkingStateKey || '', scroller));
+}
+
+function createThinkingScrollActions(details, target, position = 'top', stateKey = '') {
+  const row = document.createElement('div');
+  row.className = `thinking-scroll-actions ${position}`;
+
+  const makeButton = (label, block) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'secondary-button thinking-scroll-button';
+    const isBottom = block === 'end';
+    button.dataset.scrollTarget = isBottom ? 'bottom' : 'top';
+    if (isBottom && state.thinkingUnread.has(stateKey)) {
+      button.classList.add('has-new');
+      button.textContent = 'Bottom *';
+    } else {
+      button.textContent = label;
+    }
+    if (isBottom) {
+      button.title = state.thinkingUnread.has(stateKey)
+        ? 'New thinking updates below. Jump to latest.'
+        : 'Jump to latest thinking update.';
+    }
+    button.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const scroller = details.querySelector('.thinking-content');
+      if (scroller) {
+        scroller.scrollTo({
+          top: block === 'end' ? scroller.scrollHeight : 0,
+          behavior: 'smooth',
+        });
+        if (isBottom) {
+          state.thinkingUnread.delete(stateKey);
+          refreshThinkingUnreadButtons(details, stateKey);
+          window.setTimeout(() => updateThinkingScrollState(stateKey, scroller), 250);
+        }
+      }
+      (block === 'end' ? target : details).scrollIntoView({
+        behavior: 'smooth',
+        block,
+      });
+    };
+    return button;
+  };
+
+  row.append(makeButton('Top', 'start'), makeButton('Bottom', 'end'));
+  return row;
 }
 
 function isMarkdownMathToken(token) {
@@ -7632,6 +9332,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   const stateKey = `${keyBase}::thinking::${segment?.userTimestamp || 'live'}`;
   const details = document.createElement('details');
   details.className = 'thinking-card';
+  details.dataset.thinkingStateKey = stateKey;
   const defaultOpen = isLivePlaceholder || !segment?.entries?.length;
   if (state.thinkingPanels.has(stateKey) ? state.thinkingPanels.get(stateKey) : defaultOpen) {
     details.open = true;
@@ -7639,9 +9340,21 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
 
   details.addEventListener('toggle', () => {
     state.thinkingPanels.set(stateKey, details.open);
+    if (details.open) {
+      const scroller = details.querySelector('.thinking-content');
+      if (scroller) {
+        restoreThinkingScrollState(stateKey, scroller);
+      }
+    }
   });
 
   const entries = Array.isArray(segment?.entries) ? segment.entries : [];
+  const previousEntryCount = state.thinkingEntryCounts.get(stateKey) || 0;
+  const savedScroll = state.thinkingScrollPositions.get(stateKey);
+  if (entries.length > previousEntryCount && savedScroll && !savedScroll.atBottom && details.open) {
+    state.thinkingUnread.add(stateKey);
+  }
+  state.thinkingEntryCounts.set(stateKey, entries.length);
   const preview = entries.length
     ? entries[entries.length - 1].text
     : `Codex is ${prettyStatusLabel(runtime.phase || 'thinking').toLowerCase()}...`;
@@ -7662,6 +9375,10 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
 
   const content = document.createElement('div');
   content.className = 'thinking-content';
+  content.dataset.thinkingStateKey = stateKey;
+  const contentBottomAnchor = document.createElement('div');
+  contentBottomAnchor.className = 'thinking-bottom-anchor';
+  content.appendChild(createThinkingScrollActions(details, contentBottomAnchor, 'top', stateKey));
 
   if (entries.length) {
     const history = document.createElement('div');
@@ -7697,7 +9414,13 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
     content.appendChild(block);
   }
 
+  content.appendChild(createThinkingScrollActions(details, contentBottomAnchor, 'bottom', stateKey));
+  content.appendChild(contentBottomAnchor);
+  content.addEventListener('scroll', () => {
+    updateThinkingScrollState(stateKey, content);
+  }, { passive: true });
   details.appendChild(content);
+  restoreThinkingScrollState(stateKey, content);
   const collapseRail = document.createElement('button');
   collapseRail.type = 'button';
   collapseRail.className = 'thinking-collapse-rail';
@@ -7723,35 +9446,57 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
 }
 
 function renderFileCards(container, session, entry) {
-  const files = getTranscriptFileRefs(entry);
+  const files = getTranscriptFileRefs(session, entry);
   if (!session || !files.length) {
     return;
   }
 
   const list = document.createElement('div');
   list.className = 'message-file-list';
-  for (const file of files.slice(0, 8)) {
+  let imagePreviewCount = 0;
+  const visibleFiles = files.slice(0, MAX_TRANSCRIPT_FILE_CARDS);
+  for (const file of visibleFiles) {
     if (!file.path || isBareDownloadableFilename(file.path)) {
       continue;
     }
     const card = document.createElement('div');
     card.className = `message-file-card ${isImageFileRef(file) ? 'image' : ''}`.trim();
-    const inlineUrl = buildHostFileUrl(session, file, true);
-    const downloadUrl = buildHostFileUrl(session, file, false);
+    const inlineUrl = file.cached && file.fileId ? buildReceivedFileUrl(file, true) : buildHostFileUrl(session, file, true);
+    const downloadUrl = file.cached && file.fileId ? buildReceivedFileUrl(file, false) : buildHostFileUrl(session, file, false);
     const name = file.name || basename(file.path) || 'remote file';
     const meta = [
       file.mime || (isImageFileRef(file) ? 'image' : 'file'),
       file.size ? formatBytes(file.size) : '',
-      'streams on open/save',
+      file.cached ? 'cached by relay' : 'streams on open/save',
     ].filter(Boolean).join(' | ');
 
-    if (isImageFileRef(file)) {
+    const isImage = isImageFileRef(file);
+    const showInlinePreview = isImage && imagePreviewCount < MAX_INLINE_IMAGE_PREVIEWS;
+    if (isImage) {
+      imagePreviewCount += 1;
+    }
+    if (showInlinePreview) {
+      const previewButton = document.createElement('button');
+      previewButton.type = 'button';
+      previewButton.className = 'message-file-preview-button';
+      previewButton.title = 'Preview image';
       const preview = document.createElement('img');
       preview.className = 'message-file-preview';
       preview.loading = 'lazy';
       preview.alt = name;
       preview.src = inlineUrl;
-      card.appendChild(preview);
+      previewButton.appendChild(preview);
+      previewButton.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openImagePreview({
+          src: inlineUrl,
+          title: name,
+          subtitle: file.path,
+          downloadUrl,
+        });
+      };
+      card.appendChild(previewButton);
     }
 
     const body = document.createElement('div');
@@ -7770,6 +9515,22 @@ function renderFileCards(container, session, entry) {
     openLink.target = '_blank';
     openLink.rel = 'noopener';
     openLink.textContent = 'Open';
+    if (isImage) {
+      const previewButton = document.createElement('button');
+      previewButton.type = 'button';
+      previewButton.className = 'secondary-button';
+      previewButton.textContent = 'Preview';
+      previewButton.onclick = (event) => {
+        event.preventDefault();
+        openImagePreview({
+          src: inlineUrl,
+          title: name,
+          subtitle: file.path,
+          downloadUrl,
+        });
+      };
+      actions.appendChild(previewButton);
+    }
     const saveLink = document.createElement('a');
     saveLink.className = 'secondary-button';
     saveLink.href = downloadUrl;
@@ -7783,6 +9544,12 @@ function renderFileCards(container, session, entry) {
   }
 
   if (list.childElementCount) {
+    if (files.length > MAX_TRANSCRIPT_FILE_CARDS) {
+      const more = document.createElement('div');
+      more.className = 'message-file-meta';
+      more.textContent = `${files.length - MAX_TRANSCRIPT_FILE_CARDS} more referenced files are listed in the message text.`;
+      list.appendChild(more);
+    }
     container.appendChild(list);
   }
 }
@@ -7791,7 +9558,16 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   const log = el('session-log');
   const key = getSessionKey(session) || '';
   const previousKey = log.dataset.sessionKey || '';
-  const shouldStickToBottom = options.forceScroll || previousKey !== key || isTranscriptPinnedToBottom(log);
+  captureThinkingScrollStates(log);
+  const switchingSession = previousKey !== key;
+  const pinnedToBottom = isTranscriptPinnedToBottom(log);
+  const userDetached = !switchingSession && isTranscriptUserDetached(key);
+  const shouldForceScroll = Boolean(options.forceScroll && !userDetached);
+  const shouldStickToBottom = switchingSession || shouldForceScroll || (!userDetached && pinnedToBottom);
+  if (switchingSession && key) {
+    setTranscriptUserDetached(key, false);
+  }
+  const previousScrollTop = log.scrollTop;
   const bottomOffset = log.scrollHeight - log.scrollTop - log.clientHeight;
   log.innerHTML = '';
   log.dataset.sessionKey = key;
@@ -7802,12 +9578,25 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     empty.textContent = 'Select a conversation on the left to inspect it here.';
     log.appendChild(empty);
     restoreTranscriptScroll(log, { forceScroll: true });
+    updateTranscriptUnreadButton('');
     return;
   }
 
   const transcript = getTranscriptForSession(session);
   const visibleTranscript = transcript.filter((entry) => entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant');
   const thinkingSegments = buildThinkingEntriesForSession(session);
+  const renderedEntryCount = visibleTranscript.length
+    + thinkingSegments.reduce((total, segment) => total + (Array.isArray(segment.entries) ? segment.entries.length : 0), 0);
+  const previousRenderedEntryCount = state.transcriptEntryCounts.get(key) || 0;
+  if (key) {
+    if (previousKey === key && renderedEntryCount > previousRenderedEntryCount && !shouldStickToBottom) {
+      state.transcriptUnread.add(key);
+    }
+    if (shouldStickToBottom) {
+      state.transcriptUnread.delete(key);
+    }
+    state.transcriptEntryCounts.set(key, renderedEntryCount);
+  }
   const thinkingByUserTimestamp = new Map(thinkingSegments.map((segment) => [segment.userTimestamp || '', segment]));
   const runtime = getRuntimeForSession(session) || {};
   const stream = getStreamStatusForSession(session) || {};
@@ -7824,7 +9613,12 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     if (showLiveActivity) {
       log.appendChild(buildThinkingMessageElement(session, liveSegment, runtime, stream, !liveSegment));
     }
-    restoreTranscriptScroll(log, { forceScroll: options.forceScroll || previousKey !== key });
+    restoreTranscriptScroll(log, {
+      forceScroll: shouldStickToBottom,
+      scrollTop: previousScrollTop,
+      bottomOffset,
+    });
+    updateTranscriptUnreadButton(key);
     return;
   }
 
@@ -7877,10 +9671,12 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   }
 
   restoreTranscriptScroll(log, {
-    forceScroll: options.forceScroll,
+    forceScroll: shouldForceScroll,
     shouldStickToBottom,
+    scrollTop: previousScrollTop,
     bottomOffset,
   });
+  updateTranscriptUnreadButton(key);
 }
 
 function renderLocaleLabels() {
@@ -8036,6 +9832,7 @@ function renderSettingsDialog() {
 }
 
 function openSettingsDialog() {
+  state.settingsApiSnapshot = snapshotHostApiFingerprints();
   state.settingsOpen = true;
   populateSettingsForm();
   renderSettingsDialog();
@@ -8048,6 +9845,7 @@ function closeSettingsDialog() {
 }
 
 function renderAll() {
+  ensureTranscriptScrollControlsMounted();
   renderAuthGate();
   const shell = document.querySelector('.shell');
   shell?.classList.toggle('navigator-collapsed', state.navigatorCollapsed);
@@ -8072,8 +9870,11 @@ function renderAll() {
   renderAlertsWindow();
   renderStatusWindow();
   renderDirectoryPicker();
+  renderSessionActionDialog();
+  renderExportDialog();
   renderSlashMenu();
   renderSettingsDialog();
+  renderImagePreview();
   renderLocaleLabels();
 }
 
@@ -8102,6 +9903,8 @@ function updateSelectedViews(session) {
   renderThinkingPanel();
   renderAlertsWindow();
   renderStatusWindow();
+  renderSessionActionDialog();
+  renderExportDialog();
 }
 
 function subscribeSession(session) {
@@ -8261,30 +10064,41 @@ function subscribeSession(session) {
 
   state.eventSource.addEventListener('session.request', (event) => {
     const payload = JSON.parse(event.data);
-    upsertRequestForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
-    state.statusWindowOpen = false;
-    state.sessionDetailsOpen = true;
+    const eventHostId = payload.hostId || session.hostId;
+    const eventSessionId = payload.sessionId || session.sessionId;
+    const eventSessionKey = makeSessionKey(eventHostId, eventSessionId);
+    upsertRequestForSession(eventHostId, eventSessionId, payload);
     const selected = getSelectedSession();
-    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+    const isSelectedSession = Boolean(selected && getSessionKey(selected) === eventSessionKey);
+    if (isSelectedSession) {
+      state.statusWindowOpen = false;
+      state.sessionDetailsOpen = true;
       renderTranscript(selected);
       renderThinkingPanel();
+      renderSessionDetails();
+      renderApprovalPopup();
+      renderStatusWindow();
+    } else {
+      renderStatusWindow();
     }
-    renderSessionDetails();
-    renderApprovalPopup();
-    renderStatusWindow();
   });
 
   state.eventSource.addEventListener('session.request.resolved', (event) => {
     const payload = JSON.parse(event.data);
-    resolveRequestForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
+    const eventHostId = payload.hostId || session.hostId;
+    const eventSessionId = payload.sessionId || session.sessionId;
+    const eventSessionKey = makeSessionKey(eventHostId, eventSessionId);
+    resolveRequestForSession(eventHostId, eventSessionId, payload);
     const selected = getSelectedSession();
-    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+    if (selected && getSessionKey(selected) === eventSessionKey) {
       renderTranscript(selected);
       renderThinkingPanel();
+      renderSessionDetails();
+      renderApprovalPopup();
+      renderStatusWindow();
+    } else {
+      renderStatusWindow();
     }
-    renderSessionDetails();
-    renderApprovalPopup();
-    renderStatusWindow();
   });
 }
 
@@ -8310,6 +10124,16 @@ async function showSession(session = getSelectedSession()) {
     setRuntimeForSession(session.hostId, session.sessionId, detail.runtime || null);
     setDiagnosticsForSession(session.hostId, session.sessionId, detail.diagnostics || []);
     setRequestsForSession(session.hostId, session.sessionId, detail.requests || []);
+    loadReceivedFilesForSession(session).then((files) => {
+      if (!files.length) {
+        return;
+      }
+      const selected = getSelectedSession();
+      if (selected && getSessionKey(selected) === getSessionKey(session)) {
+        renderTranscript(selected);
+        renderStatusWindow();
+      }
+    }).catch(reportError);
 
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === getSessionKey(session)) {
@@ -8318,7 +10142,7 @@ async function showSession(session = getSelectedSession()) {
       renderThinkingPanel();
       renderAlertsWindow();
       renderStatusWindow();
-      renderTranscript(selected, { forceScroll: true });
+      renderTranscript(selected);
     }
   } catch (error) {
     appendAlertForSession(session.hostId, session.sessionId, {
@@ -8351,13 +10175,530 @@ function buildSessionExportUrl(session, format = 'markdown', options = {}) {
   if (options.includeThinking) {
     params.set('includeThinking', '1');
   }
+  if (options.includeImages === false) {
+    params.set('includeImages', '0');
+  }
+  if (options.includeFiles === false) {
+    params.set('includeFiles', '0');
+  }
+  if (options.includeAllFiles === false) {
+    params.set('includeAllFiles', '0');
+  }
+  if (options.fromDate) {
+    params.set('fromDate', options.fromDate);
+  }
+  if (options.toDate) {
+    params.set('toDate', options.toDate);
+  }
+  if (Number.isFinite(Number(options.startIndex))) {
+    params.set('startIndex', String(Math.max(1, Number(options.startIndex) || 1)));
+  }
+  if (Number.isFinite(Number(options.endIndex))) {
+    params.set('endIndex', String(Math.max(1, Number(options.endIndex) || 1)));
+  }
+  if (options.filterExtensions && Array.isArray(options.extensions)) {
+    params.set('filterExtensions', '1');
+    params.set('extensions', options.extensions.join(','));
+  }
+  if (Array.isArray(options.fileIds) && options.fileIds.length) {
+    params.set('fileIds', options.fileIds.join(','));
+  }
   return `/api/sessions/${encodeURIComponent(session.sessionId)}/export?${params.toString()}`;
 }
 
-function exportSelectedSessionHistory(format = 'markdown') {
+function getExportTranscriptEntries(session) {
+  return getTranscriptForSession(session).filter((entry) => entry && ['user', 'agent', 'assistant', 'system'].includes(entry.speaker || ''));
+}
+
+function exportFileIdentity(file) {
+  return String(file?.fileId || file?.path || file?.remotePath || file?.name || '').trim();
+}
+
+function exportFileExtension(file) {
+  return fileExtension(file?.name || file?.path || file?.remotePath || '') || 'no-ext';
+}
+
+function normalizeExportExtensionValue(value) {
+  return String(value || '').trim().toLowerCase().replace(/^\.+/, '');
+}
+
+function exportExtensionLabel(extension) {
+  return extension === 'no-ext' ? 'no extension' : `.${extension}`;
+}
+
+function exportDateInputToIso(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+
+function exportDateRangeLabel(dialog) {
+  const from = dialog?.fromDate ? formatTime(dialog.fromDate) : '';
+  const to = dialog?.toDate ? formatTime(dialog.toDate) : '';
+  if (from && to) {
+    return `${from} to ${to}`;
+  }
+  if (from) {
+    return `after ${from}`;
+  }
+  if (to) {
+    return `before ${to}`;
+  }
+  return 'all dates';
+}
+
+function exportDateKey(value) {
+  const raw = String(value || '').trim();
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (match) {
+    return match[1];
+  }
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) {
+    return '';
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+function exportDateInputForDay(day, endOfDay = false) {
+  const date = String(day || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return '';
+  }
+  return `${date}T${endOfDay ? '23:59' : '00:00'}`;
+}
+
+function exportAddDays(day, amount) {
+  const date = new Date(`${day}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
+function exportDaySpan(startDay, endDay) {
+  if (!startDay || !endDay) {
+    return [];
+  }
+  const start = Date.parse(`${startDay}T00:00:00.000Z`);
+  const end = Date.parse(`${endDay}T00:00:00.000Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) {
+    return [];
+  }
+  const days = [];
+  for (let day = startDay; day && Date.parse(`${day}T00:00:00.000Z`) <= end; day = exportAddDays(day, 1)) {
+    days.push(day);
+    if (days.length > 370) {
+      break;
+    }
+  }
+  return days;
+}
+
+function buildFallbackExportTimeline(session) {
+  const transcript = getExportTranscriptEntries(session);
+  const dayStats = new Map();
+  for (const entry of transcript) {
+    const day = exportDateKey(entry.timestamp);
+    if (!day) {
+      continue;
+    }
+    const stats = dayStats.get(day) || {
+      date: day,
+      messageCount: 0,
+      userCount: 0,
+      agentCount: 0,
+      firstTimestamp: entry.timestamp,
+      lastTimestamp: entry.timestamp,
+    };
+    stats.messageCount += 1;
+    if (entry.speaker === 'user') {
+      stats.userCount += 1;
+    }
+    if (entry.speaker === 'agent' || entry.speaker === 'assistant') {
+      stats.agentCount += 1;
+    }
+    stats.firstTimestamp = stats.firstTimestamp && Date.parse(stats.firstTimestamp) <= Date.parse(entry.timestamp || '')
+      ? stats.firstTimestamp
+      : entry.timestamp;
+    stats.lastTimestamp = stats.lastTimestamp && Date.parse(stats.lastTimestamp) >= Date.parse(entry.timestamp || '')
+      ? stats.lastTimestamp
+      : entry.timestamp;
+    dayStats.set(day, stats);
+  }
+  return {
+    session: {
+      createdAt: session?.createdAt || null,
+      updatedAt: session?.lastUpdatedAt || session?.updatedAt || null,
+      firstMessageAt: transcript[0]?.timestamp || null,
+      lastMessageAt: transcript[transcript.length - 1]?.timestamp || null,
+      messageCount: transcript.length,
+    },
+    days: Array.from(dayStats.values()).sort((a, b) => a.date.localeCompare(b.date)),
+    fallback: true,
+  };
+}
+
+function getExportTimeline(session) {
+  const key = getSessionKey(session);
+  const dialog = state.exportDialog;
+  if (dialog.timeline && dialog.timelineKey === key) {
+    return dialog.timeline;
+  }
+  return buildFallbackExportTimeline(session);
+}
+
+function getExportTimelineRows(timeline) {
+  const activeDays = new Map((Array.isArray(timeline?.days) ? timeline.days : [])
+    .map((day) => [day.date, day]));
+  const sessionInfo = timeline?.session || {};
+  const firstDay = exportDateKey(sessionInfo.firstMessageAt || sessionInfo.createdAt)
+    || activeDays.keys().next().value
+    || '';
+  const lastDay = exportDateKey(sessionInfo.lastMessageAt || sessionInfo.updatedAt)
+    || Array.from(activeDays.keys()).pop()
+    || firstDay;
+  const span = exportDaySpan(firstDay, lastDay);
+  const showEmptyDays = span.length > 0 && span.length <= 120;
+  const days = showEmptyDays ? span : Array.from(activeDays.keys()).sort();
+  return {
+    days: days.map((day) => ({
+      ...(activeDays.get(day) || { date: day, messageCount: 0, userCount: 0, agentCount: 0 }),
+      empty: !activeDays.has(day),
+    })),
+    showEmptyDays,
+    omittedEmptyDays: showEmptyDays ? 0 : Math.max(0, span.length - activeDays.size),
+  };
+}
+
+function getExportRangeMessageCount(timeline, dialog, fallbackCount = 0) {
+  const days = Array.isArray(timeline?.days) ? timeline.days : [];
+  if (!days.length) {
+    return fallbackCount;
+  }
+  const fromDay = exportDateKey(dialog?.fromDate || '');
+  const toDay = exportDateKey(dialog?.toDate || '');
+  return days
+    .filter((day) => {
+      if (fromDay && day.date < fromDay) {
+        return false;
+      }
+      if (toDay && day.date > toDay) {
+        return false;
+      }
+      return true;
+    })
+    .reduce((sum, day) => sum + (Number(day.messageCount || 0) || 0), 0);
+}
+
+function collectExportFiles(session) {
+  const entries = getExportTranscriptEntries(session);
+  const seen = new Set();
+  const files = [];
+  const addFile = (rawFile, source, timestamp = '') => {
+    const file = { ...rawFile };
+    const identity = exportFileIdentity(file);
+    if (!identity || seen.has(identity)) {
+      return;
+    }
+    seen.add(identity);
+    files.push({
+      ...file,
+      identity,
+      extension: exportFileExtension(file),
+      isImage: Boolean(file.isImage) || isImageFileRef(file),
+      source,
+      timestamp,
+      size: Number(file.size || 0) || 0,
+    });
+  };
+  for (const entry of entries) {
+    for (const file of getTranscriptFileRefs(session, entry)) {
+      addFile(file, 'referenced', entry.timestamp || '');
+    }
+  }
+  for (const file of getReceivedFilesForSession(session)) {
+    addFile(file, 'cached', file.receivedAt || '');
+  }
+  return files;
+}
+
+function getExportSelectedFileIds() {
+  const dialog = state.exportDialog;
+  if (dialog.includeAllFiles) {
+    return [];
+  }
+  return Array.from(dialog.selectedFileIds || []).filter(Boolean);
+}
+
+function getExportSelectedExtensions() {
+  return Array.from(state.exportDialog.selectedExtensions || []).filter(Boolean);
+}
+
+function getExportCandidateFiles(files, dialog = state.exportDialog) {
+  return (Array.isArray(files) ? files : []).filter((file) => {
+    if (!dialog.includeImages && file.isImage) {
+      return false;
+    }
+    if (!dialog.includeFiles && !file.isImage) {
+      return false;
+    }
+    if (files.length > 0 && !dialog.selectedExtensions.has(file.extension)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+async function loadExportTimeline(session) {
+  const key = getSessionKey(session);
+  if (!session?.hostId || !session?.sessionId || !key) {
+    return;
+  }
+  const dialog = state.exportDialog;
+  dialog.timelineKey = key;
+  dialog.timelineLoading = true;
+  dialog.timelineError = '';
+  dialog.timeline = null;
+  renderExportDialog();
+  try {
+    const timeline = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/export-summary?hostId=${encodeURIComponent(session.hostId)}`);
+    if (dialog.open && dialog.timelineKey === key) {
+      dialog.timeline = timeline;
+      dialog.timelineError = '';
+    }
+  } catch (error) {
+    if (dialog.open && dialog.timelineKey === key) {
+      dialog.timeline = buildFallbackExportTimeline(session);
+      dialog.timelineError = error.message || 'Unable to load full export timeline.';
+    }
+  } finally {
+    if (dialog.timelineKey === key) {
+      dialog.timelineLoading = false;
+      renderExportDialog();
+    }
+  }
+}
+
+function renderExportTimelinePanel(session, entries) {
+  const summaryEl = el('export-session-time-summary');
+  const dayList = el('export-day-list');
+  if (!summaryEl || !dayList) {
+    return;
+  }
+  if (!session) {
+    summaryEl.textContent = 'Select a conversation to inspect export dates.';
+    dayList.innerHTML = '';
+    return;
+  }
+
+  const timeline = getExportTimeline(session);
+  const sessionInfo = timeline?.session || {};
+  const pieces = [
+    `Created ${formatTime(sessionInfo.createdAt || session.createdAt) || 'unknown'}`,
+    `Updated ${formatTime(sessionInfo.updatedAt || session.lastUpdatedAt || session.updatedAt) || 'unknown'}`,
+  ];
+  if (sessionInfo.firstMessageAt || sessionInfo.lastMessageAt) {
+    pieces.push(`Messages ${formatTime(sessionInfo.firstMessageAt) || 'unknown'} to ${formatTime(sessionInfo.lastMessageAt) || 'unknown'}`);
+  }
+  const count = Number(sessionInfo.messageCount ?? entries.length) || 0;
+  pieces.push(`${count} message${count === 1 ? '' : 's'} found`);
+  if (state.exportDialog.timelineLoading) {
+    pieces.push('loading full timeline...');
+  } else if (state.exportDialog.timelineError) {
+    pieces.push('using loaded preview');
+  }
+  summaryEl.textContent = pieces.join(' | ');
+
+  const rows = getExportTimelineRows(timeline);
+  const fromDay = exportDateKey(state.exportDialog.fromDate || '');
+  const toDay = exportDateKey(state.exportDialog.toDate || '');
+  dayList.innerHTML = '';
+  if (!rows.days.length) {
+    dayList.textContent = 'No dated messages found for this session.';
+    return;
+  }
+  for (const day of rows.days) {
+    const button = document.createElement('button');
+    const selected = Boolean(fromDay || toDay)
+      && (!fromDay || day.date >= fromDay)
+      && (!toDay || day.date <= toDay)
+      && !day.empty;
+    button.type = 'button';
+    button.className = `export-day-chip ${day.empty ? 'empty' : 'active'}${selected ? ' selected' : ''}`;
+    button.dataset.exportDay = day.date;
+    button.disabled = day.empty;
+    button.title = day.empty
+      ? `${day.date}: no conversation`
+      : `${day.date}: ${day.messageCount} message(s), ${day.userCount || 0} user, ${day.agentCount || 0} agent`;
+    button.innerHTML = `
+      <span>${escapeHtml(day.date)}</span>
+      <strong>${day.empty ? 'no conversation' : `${day.messageCount} msg`}</strong>
+    `;
+    dayList.appendChild(button);
+  }
+  if (rows.omittedEmptyDays > 0) {
+    const note = document.createElement('div');
+    note.className = 'export-day-note';
+    note.textContent = `${rows.omittedEmptyDays} empty day(s) omitted because the session date span is long.`;
+    dayList.appendChild(note);
+  }
+}
+
+function openExportDialog() {
   const session = getSelectedSession();
-  const includeThinking = Boolean(el('export-thinking-checkbox')?.checked);
-  const url = buildSessionExportUrl(session, format, { includeThinking });
+  if (!session) {
+    reportError(new Error('Select a conversation before exporting history.'));
+    return;
+  }
+  const entries = getExportTranscriptEntries(session);
+  const files = collectExportFiles(session);
+  const extensions = new Set(files.map((file) => file.extension).filter(Boolean));
+  state.exportDialog.open = true;
+  state.exportDialog.includeThinking = false;
+  state.exportDialog.includeImages = true;
+  state.exportDialog.includeFiles = true;
+  state.exportDialog.includeAllFiles = files.length > 0;
+  state.exportDialog.format = 'markdown';
+  state.exportDialog.fromDate = '';
+  state.exportDialog.toDate = '';
+  state.exportDialog.selectedExtensions = extensions;
+  state.exportDialog.selectedFileIds = new Set(files.map((file) => file.identity).filter(Boolean));
+  renderExportDialog();
+  loadExportTimeline(session);
+}
+
+function closeExportDialog() {
+  state.exportDialog.open = false;
+  renderExportDialog();
+}
+
+function renderExportDialog() {
+  const overlay = el('export-dialog');
+  if (!overlay) {
+    return;
+  }
+  const dialog = state.exportDialog;
+  const session = getSelectedSession();
+  const entries = getExportTranscriptEntries(session);
+  const files = collectExportFiles(session);
+  const candidateFiles = getExportCandidateFiles(files, dialog);
+  if (dialog.includeAllFiles) {
+    for (const file of candidateFiles) {
+      if (file.identity) {
+        dialog.selectedFileIds.add(file.identity);
+      }
+    }
+  }
+  const selectedCandidateFiles = candidateFiles.filter((file) => dialog.selectedFileIds.has(file.identity));
+  const allCandidatesSelected = candidateFiles.length > 0
+    && candidateFiles.every((file) => dialog.selectedFileIds.has(file.identity));
+  const someCandidatesSelected = candidateFiles.some((file) => dialog.selectedFileIds.has(file.identity));
+  dialog.includeAllFiles = allCandidatesSelected;
+  const imageCount = selectedCandidateFiles.filter((file) => file.isImage).length;
+  const otherCount = selectedCandidateFiles.length - imageCount;
+  const totalBytes = selectedCandidateFiles.reduce((sum, file) => sum + (Number(file.size || 0) || 0), 0);
+  const fromTime = Date.parse(dialog.fromDate || '');
+  const toTime = Date.parse(dialog.toDate || '');
+  const timeline = getExportTimeline(session);
+  const rangedEntries = entries.filter((entry) => {
+    if (!Number.isFinite(fromTime) && !Number.isFinite(toTime)) {
+      return true;
+    }
+    const timestamp = Date.parse(entry.timestamp || '');
+    if (!Number.isFinite(timestamp)) {
+      return false;
+    }
+    if (Number.isFinite(fromTime) && timestamp < fromTime) {
+      return false;
+    }
+    if (Number.isFinite(toTime) && timestamp > toTime) {
+      return false;
+    }
+    return true;
+  });
+
+  overlay.classList.toggle('hidden', !dialog.open);
+  overlay.setAttribute('aria-hidden', dialog.open ? 'false' : 'true');
+  const rangeMessageCount = getExportRangeMessageCount(timeline, dialog, rangedEntries.length);
+  el('export-dialog-summary').textContent = session
+    ? `${sessionDisplayTitle(session)} | ${rangeMessageCount} message(s), ${exportDateRangeLabel(dialog)}, ${imageCount} image(s), ${otherCount} file(s), ${formatBytes(totalBytes) || 'unknown size'} selected.`
+    : 'Select a conversation to export.';
+  el('export-format-select').value = dialog.format;
+  el('export-start-date-input').value = dialog.fromDate || '';
+  el('export-end-date-input').value = dialog.toDate || '';
+  el('export-include-thinking-checkbox').checked = dialog.includeThinking;
+  el('export-include-images-checkbox').checked = dialog.includeImages;
+  el('export-include-files-checkbox').checked = dialog.includeFiles;
+  renderExportTimelinePanel(session, entries);
+  const includeAllCheckbox = el('export-include-all-files-checkbox');
+  includeAllCheckbox.checked = allCandidatesSelected;
+  includeAllCheckbox.indeterminate = someCandidatesSelected && !allCandidatesSelected;
+  includeAllCheckbox.disabled = !candidateFiles.length;
+  const selectAllButton = el('export-files-select-all-button');
+  const selectNoneButton = el('export-files-select-none-button');
+  if (selectAllButton) {
+    selectAllButton.disabled = !candidateFiles.length || allCandidatesSelected;
+  }
+  if (selectNoneButton) {
+    selectNoneButton.disabled = !candidateFiles.length || !someCandidatesSelected;
+  }
+
+  const extensionList = el('export-extension-list');
+  extensionList.innerHTML = '';
+  const extensionStats = new Map();
+  for (const file of files) {
+    const stats = extensionStats.get(file.extension) || { count: 0, bytes: 0 };
+    stats.count += 1;
+    stats.bytes += Number(file.size || 0) || 0;
+    extensionStats.set(file.extension, stats);
+  }
+  const extensionKeys = new Set([...extensionStats.keys(), ...dialog.selectedExtensions]);
+  for (const extension of [...extensionKeys].sort((a, b) => a.localeCompare(b))) {
+    const stats = extensionStats.get(extension) || { count: 0, bytes: 0 };
+    const chip = document.createElement('div');
+    chip.className = 'choice-chip';
+    chip.innerHTML = `
+      <label>
+        <input type="checkbox" data-export-extension="${escapeHtml(extension)}" ${dialog.selectedExtensions.has(extension) ? 'checked' : ''} />
+        <span>${escapeHtml(exportExtensionLabel(extension))} (${stats.count}${stats.bytes ? `, ${escapeHtml(formatBytes(stats.bytes))}` : ''})</span>
+      </label>
+      <button type="button" class="choice-chip-remove" data-export-extension-remove="${escapeHtml(extension)}" aria-label="Remove ${escapeHtml(exportExtensionLabel(extension))}">x</button>
+    `;
+    extensionList.appendChild(chip);
+  }
+  if (!extensionKeys.size) {
+    extensionList.textContent = 'No file extensions found in this conversation.';
+  }
+
+  const fileList = el('export-file-list');
+  fileList.innerHTML = '';
+  for (const file of candidateFiles) {
+    const row = document.createElement('label');
+    row.className = 'choice-file-row';
+    row.innerHTML = `
+      <input type="checkbox" data-export-file-id="${escapeHtml(file.identity)}" ${dialog.selectedFileIds.has(file.identity) ? 'checked' : ''} />
+      <div class="choice-file-copy">
+        <strong>${escapeHtml(file.name || basename(file.path || file.remotePath || '') || file.identity)}</strong>
+        <span>${escapeHtml(file.isImage ? 'image' : 'file')} | ${escapeHtml(exportExtensionLabel(file.extension))} | ${escapeHtml(file.source)}${file.size ? ` | ${escapeHtml(formatBytes(file.size))}` : ''}</span>
+        <span title="${escapeHtml(file.path || file.remotePath || '')}">${escapeHtml(file.path || file.remotePath || '(cached file)')}</span>
+      </div>
+    `;
+    fileList.appendChild(row);
+  }
+  if (!candidateFiles.length) {
+    fileList.textContent = files.length ? 'No files match the current filters.' : 'No cached or referenced files found.';
+  }
+  syncModalBodyState();
+}
+
+function exportSelectedSessionHistory(format = 'markdown', options = {}) {
+  const session = getSelectedSession();
+  const url = buildSessionExportUrl(session, format, options);
   if (!url) {
     reportError(new Error('Select a conversation before exporting history.'));
     return;
@@ -8369,6 +10710,300 @@ function exportSelectedSessionHistory(format = 'markdown') {
   document.body.appendChild(link);
   link.click();
   link.remove();
+}
+
+function exportFromDialog() {
+  const dialog = state.exportDialog;
+  const session = getSelectedSession();
+  const fromDateValue = el('export-start-date-input')?.value || '';
+  const toDateValue = el('export-end-date-input')?.value || '';
+  const fromTime = Date.parse(fromDateValue || '');
+  const toTime = Date.parse(toDateValue || '');
+  if (Number.isFinite(fromTime) && Number.isFinite(toTime) && fromTime > toTime) {
+    reportError(new Error('Export start date must be before the end date.'));
+    return;
+  }
+  dialog.fromDate = fromDateValue;
+  dialog.toDate = toDateValue;
+  const files = collectExportFiles(session);
+  const discoveredExtensions = new Set(files.map((file) => file.extension).filter(Boolean));
+  const selectedExtensions = getExportSelectedExtensions();
+  const filterExtensions = selectedExtensions.length !== discoveredExtensions.size
+    || selectedExtensions.some((extension) => !discoveredExtensions.has(extension));
+  exportSelectedSessionHistory(dialog.format || 'markdown', {
+    includeThinking: dialog.includeThinking,
+    includeImages: dialog.includeImages,
+    includeFiles: dialog.includeFiles,
+    includeAllFiles: dialog.includeAllFiles,
+    fromDate: exportDateInputToIso(fromDateValue),
+    toDate: exportDateInputToIso(toDateValue),
+    filterExtensions,
+    extensions: selectedExtensions,
+    fileIds: getExportSelectedFileIds(),
+  });
+  closeExportDialog();
+}
+
+function makeSafeAttachmentName(value, fallback = 'conversation-history') {
+  return String(value || fallback)
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120) || fallback;
+}
+
+function fileFromBlob(blob, name, type = '') {
+  if (typeof File === 'function') {
+    return new File([blob], name, { type: type || blob.type || 'application/octet-stream' });
+  }
+  blob.name = name;
+  blob.lastModified = Date.now();
+  return blob;
+}
+
+async function fetchSessionExportResponse(session, format, options = {}) {
+  const url = buildSessionExportUrl(session, format, options);
+  if (!url) {
+    throw new Error('Select a conversation before importing history.');
+  }
+  const response = await fetch(url, { headers: { Accept: format === 'zip' ? 'application/zip' : 'text/markdown' } });
+  if (!response.ok) {
+    let message = `history export failed: ${response.status}`;
+    try {
+      const body = await response.json();
+      message = body?.error || message;
+    } catch {
+      // Export endpoints may return plain text on proxy errors.
+    }
+    throw new Error(message);
+  }
+  return response;
+}
+
+async function attachHistoryMarkdown(session, options = {}) {
+  const response = await fetchSessionExportResponse(session, 'markdown', options);
+  const text = await response.text();
+  const title = makeSafeAttachmentName(sessionDisplayTitle(session), shortId(session?.sessionId || 'conversation'));
+  const name = `${title}.history.md`;
+  const size = textByteLength(text);
+  const textFileCount = state.codexControls.attachments.filter((attachment) => attachment.type === 'textFile').length;
+  if (size <= MAX_COMPOSER_TEXT_FILE_BYTES && textFileCount < MAX_COMPOSER_TEXT_FILES) {
+    state.codexControls.attachments.push({
+      type: 'textFile',
+      text,
+      name,
+      size,
+      source: 'historyImport',
+      sessionKey: getSessionKey(session),
+    });
+    return;
+  }
+  const blob = new Blob([text], { type: 'text/markdown; charset=utf-8' });
+  await addComposerFiles([fileFromBlob(blob, name, 'text/markdown')]);
+}
+
+async function attachHistoryBundle(session, options = {}) {
+  if (options.includeImages === false && options.includeFiles === false) {
+    return;
+  }
+  const response = await fetchSessionExportResponse(session, 'zip', options);
+  const blob = await response.blob();
+  if (!blob.size) {
+    return;
+  }
+  const title = makeSafeAttachmentName(sessionDisplayTitle(session), shortId(session?.sessionId || 'conversation'));
+  await addComposerFiles([fileFromBlob(blob, `${title}.history.zip`, 'application/zip')]);
+}
+
+async function attachSessionHistory(session, options = {}) {
+  const exportOptions = {
+    includeThinking: Boolean(options.includeThinking),
+    includeImages: options.includeImages !== false,
+    includeFiles: options.includeFiles !== false,
+    includeAllFiles: true,
+  };
+  await attachHistoryMarkdown(session, exportOptions);
+  if (exportOptions.includeImages || exportOptions.includeFiles) {
+    await attachHistoryBundle(session, exportOptions);
+  }
+}
+
+async function importCurrentSessionHistory() {
+  const session = getSelectedSession();
+  if (!session) {
+    throw new Error('Select a conversation before importing its history.');
+  }
+  await attachSessionHistory(session, {
+    includeThinking: true,
+    includeImages: true,
+    includeFiles: true,
+  });
+  renderAttachmentChips();
+  focusComposerInput();
+}
+
+function defaultHistoryImportOptions() {
+  return {
+    includeThinking: false,
+    includeImages: true,
+    includeFiles: true,
+  };
+}
+
+function getHistoryImportOptions(key) {
+  if (!state.historyImportDialog.optionsByKey.has(key)) {
+    state.historyImportDialog.optionsByKey.set(key, defaultHistoryImportOptions());
+  }
+  return state.historyImportDialog.optionsByKey.get(key);
+}
+
+function getHistoryImportSessions() {
+  const selectedKey = getSessionKey(getSelectedSession());
+  return state.sessions
+    .filter((session) => getSessionKey(session) && getSessionKey(session) !== selectedKey)
+    .sort((a, b) => parseSessionTime(b) - parseSessionTime(a));
+}
+
+function ensureHistoryImportUi() {
+  const grid = document.querySelector('.composer-attachment-grid');
+  const clearButton = el('codex-clear-attachments-button');
+  if (grid && !el('import-current-history-button')) {
+    const currentButton = document.createElement('button');
+    currentButton.id = 'import-current-history-button';
+    currentButton.type = 'button';
+    currentButton.className = 'secondary-button attachment-import-button';
+    currentButton.title = 'Attach the current conversation export';
+    currentButton.textContent = 'Current';
+    grid.insertBefore(currentButton, clearButton || null);
+
+    const othersButton = document.createElement('button');
+    othersButton.id = 'import-other-history-button';
+    othersButton.type = 'button';
+    othersButton.className = 'secondary-button attachment-import-button';
+    othersButton.title = 'Attach exports from other conversations';
+    othersButton.textContent = 'Others';
+    grid.insertBefore(othersButton, clearButton || null);
+  }
+
+  if (el('history-import-dialog')) {
+    return;
+  }
+  const wrapper = document.createElement('div');
+  wrapper.id = 'history-import-dialog';
+  wrapper.className = 'choice-dialog-overlay hidden';
+  wrapper.setAttribute('aria-hidden', 'true');
+  wrapper.innerHTML = `
+    <section class="choice-dialog-modal history-import-dialog-modal" role="dialog" aria-modal="true" aria-labelledby="history-import-dialog-title">
+      <div class="choice-dialog-header">
+        <div>
+          <div class="eyebrow">Import Conversation</div>
+          <h2 id="history-import-dialog-title">Attach history exports</h2>
+          <p id="history-import-dialog-subtitle">Choose conversations and what each export should include.</p>
+        </div>
+        <button id="history-import-dialog-close-button" type="button" class="secondary-button">Cancel</button>
+      </div>
+      <div id="history-import-dialog-summary" class="choice-summary">Select conversations to attach.</div>
+      <label class="choice-select-all">
+        <input id="history-import-select-all-checkbox" type="checkbox" />
+        <span>Select all visible conversations</span>
+      </label>
+      <div id="history-import-dialog-list" class="choice-session-list history-import-session-list"></div>
+      <div id="history-import-dialog-empty" class="empty-state hidden">No other conversations are available.</div>
+      <div class="choice-dialog-actions">
+        <button id="history-import-dialog-cancel-button" type="button" class="secondary-button">Cancel</button>
+        <button id="history-import-dialog-confirm-button" type="button">Attach selected</button>
+      </div>
+    </section>
+  `;
+  document.body.appendChild(wrapper);
+}
+
+function closeHistoryImportDialog() {
+  state.historyImportDialog.open = false;
+  state.historyImportDialog.busy = false;
+  renderHistoryImportDialog();
+}
+
+function openHistoryImportDialog() {
+  const sessions = getHistoryImportSessions();
+  state.historyImportDialog.open = true;
+  state.historyImportDialog.busy = false;
+  state.historyImportDialog.sessions = sessions;
+  state.historyImportDialog.selectedKeys = new Set();
+  state.historyImportDialog.optionsByKey = new Map(sessions.map((session) => [getSessionKey(session), defaultHistoryImportOptions()]));
+  renderHistoryImportDialog();
+}
+
+function renderHistoryImportDialog() {
+  ensureHistoryImportUi();
+  const dialog = state.historyImportDialog;
+  const overlay = el('history-import-dialog');
+  if (!overlay) {
+    return;
+  }
+  overlay.classList.toggle('hidden', !dialog.open);
+  overlay.setAttribute('aria-hidden', dialog.open ? 'false' : 'true');
+  const sessions = dialog.sessions || [];
+  const selectedCount = sessions.filter((session) => dialog.selectedKeys.has(getSessionKey(session))).length;
+  el('history-import-dialog-summary').textContent = `${selectedCount} conversation(s) selected. Markdown history is attached for each; images/files add a zip bundle.`;
+  const selectAll = el('history-import-select-all-checkbox');
+  selectAll.checked = sessions.length > 0 && selectedCount === sessions.length;
+  selectAll.indeterminate = selectedCount > 0 && selectedCount < sessions.length;
+  selectAll.disabled = dialog.busy || sessions.length === 0;
+  const confirm = el('history-import-dialog-confirm-button');
+  confirm.disabled = dialog.busy || selectedCount === 0;
+  confirm.textContent = dialog.busy ? 'Attaching...' : `Attach selected (${selectedCount})`;
+  el('history-import-dialog-empty').classList.toggle('hidden', sessions.length > 0);
+
+  const list = el('history-import-dialog-list');
+  list.innerHTML = '';
+  for (const session of sessions) {
+    const key = getSessionKey(session);
+    const options = getHistoryImportOptions(key);
+    const row = document.createElement('div');
+    row.className = 'choice-session-row history-import-session-row';
+    row.innerHTML = `
+      <label class="history-import-main-toggle">
+        <input type="checkbox" data-history-import-key="${escapeHtml(key)}" ${dialog.selectedKeys.has(key) ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
+      </label>
+      <div class="choice-session-copy">
+        <strong>${escapeHtml(sessionDisplayTitle(session))}</strong>
+        <span>${escapeHtml(sessionPlatformLabel(session))} | ${escapeHtml(shortId(session.sessionId))}</span>
+        <span title="${escapeHtml(session.cwd || '')}">${escapeHtml(session.cwd || '(no path)')}</span>
+        <div class="history-import-options">
+          <label><input type="checkbox" data-history-import-option="includeThinking" data-history-import-option-key="${escapeHtml(key)}" ${options.includeThinking ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} /> Thinking</label>
+          <label><input type="checkbox" data-history-import-option="includeImages" data-history-import-option-key="${escapeHtml(key)}" ${options.includeImages ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} /> Images</label>
+          <label><input type="checkbox" data-history-import-option="includeFiles" data-history-import-option-key="${escapeHtml(key)}" ${options.includeFiles ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} /> Files</label>
+        </div>
+      </div>
+    `;
+    list.appendChild(row);
+  }
+  syncModalBodyState();
+}
+
+async function importSelectedHistorySessions() {
+  const dialog = state.historyImportDialog;
+  const selected = (dialog.sessions || []).filter((session) => dialog.selectedKeys.has(getSessionKey(session)));
+  if (!selected.length || dialog.busy) {
+    return;
+  }
+  dialog.busy = true;
+  renderHistoryImportDialog();
+  const failures = [];
+  for (const session of selected) {
+    try {
+      await attachSessionHistory(session, getHistoryImportOptions(getSessionKey(session)));
+    } catch (error) {
+      failures.push(`${sessionDisplayTitle(session)}: ${error.message}`);
+    }
+  }
+  renderAttachmentChips();
+  closeHistoryImportDialog();
+  focusComposerInput();
+  if (failures.length) {
+    window.alert(`Some history imports failed:\n${failures.join('\n')}`);
+  }
 }
 
 async function renameSelectedSession() {
@@ -8391,6 +11026,14 @@ async function renameSelectedSession() {
   if (title === currentTitle) {
     return;
   }
+
+  rememberManualSessionTitle(session, title);
+  mergeSession({
+    ...session,
+    title,
+    manualTitle: true,
+  });
+  renderAll();
 
   const result = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/title`, {
     method: 'PATCH',
@@ -8629,7 +11272,7 @@ async function refresh() {
 
   state.sessions = [];
   sessionResponses.forEach((response) => {
-    (response.sessions || []).forEach((session) => state.sessions.push(session));
+    (response.sessions || []).forEach((session) => state.sessions.push(applyManualSessionTitle(session)));
   });
 
   if (state.connectorEditorId && !getConnector(state.connectorEditorId)) {
@@ -9254,6 +11897,9 @@ async function startManagedSession(options = {}) {
     ? options.session
     : getSelectedSession();
   const conversation = getSelectedConversation();
+  const inheritCollectionId = Object.prototype.hasOwnProperty.call(options, 'collectionId')
+    ? options.collectionId
+    : (state.selectedCollectionId !== 'default' ? state.selectedCollectionId : '');
   const launchMode = options.launchMode || (sourceSession ? 'resume' : 'fresh');
   const hostId = options.hostId || sourceSession?.hostId || state.selectedHostId;
   const cwd = String(options.cwd || sourceSession?.cwd || '').trim();
@@ -9292,7 +11938,10 @@ async function startManagedSession(options = {}) {
   if (sourceSession?.sessionId) {
     body.sourceSessionId = sourceSession.sessionId;
     body.originSessionId = getOriginSessionId(sourceSession);
-    body.conversationKey = conversation?.conversationKey || getOriginSessionId(sourceSession);
+    body.conversationKey = sourceSession.conversationKey
+      || sourceSession.originSessionId
+      || (conversation?.preferredSession?.sessionId === sourceSession.sessionId ? conversation.conversationKey : '')
+      || getOriginSessionId(sourceSession);
     body.nativeThreadId = sourceSession.nativeThreadId || sourceSession.sessionId;
   }
 
@@ -9314,7 +11963,10 @@ async function startManagedSession(options = {}) {
 
   await refresh();
   const next = state.sessions.find((item) => item.hostId === hostId && item.sessionId === startedSession.sessionId) || null;
-  if (next) {
+  if (next && inheritCollectionId) {
+    await addSessionToCollection(inheritCollectionId, next);
+  }
+  if (next && options.selectAfterStart !== false) {
     await selectSession(next);
   }
   if (next && (options.initialText || options.initialInputOptions?.inputItems?.length)) {
@@ -9467,25 +12119,33 @@ async function sendInputToSession(session, text, options = {}) {
   }
 
   await verifyHostAvailable(session.hostId);
+  const apiConfig = options.apiConfig || getApiRequestConfig(session.hostId);
+  const body = {
+    hostId: session.hostId,
+    clientRequestId: options.clientRequestId || null,
+    text,
+    displayText: options.displayText || text,
+    inputItems: Array.isArray(options.inputItems) ? options.inputItems : [],
+    uploadedFiles: Array.isArray(options.uploadedFiles) ? options.uploadedFiles : [],
+    inlineFiles: Array.isArray(options.inlineFiles) ? options.inlineFiles : [],
+    mode: options.mode || null,
+    model: options.model || null,
+    effort: options.effort || null,
+    summary: options.summary || null,
+    approvalPolicy: options.approvalPolicy || null,
+    approvalsReviewer: options.approvalsReviewer || null,
+    sandboxMode: options.sandboxMode || null,
+    serviceTier: options.serviceTier || null,
+    personality: options.personality || null,
+  };
+  if (apiConfig) {
+    body.apiConfig = apiConfig;
+  }
+
   try {
     await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
       method: 'POST',
-      body: JSON.stringify({
-        hostId: session.hostId,
-        text,
-        displayText: options.displayText || text,
-        inputItems: Array.isArray(options.inputItems) ? options.inputItems : [],
-        uploadedFiles: Array.isArray(options.uploadedFiles) ? options.uploadedFiles : [],
-        mode: options.mode || null,
-        model: options.model || null,
-        effort: options.effort || null,
-        summary: options.summary || null,
-        approvalPolicy: options.approvalPolicy || null,
-        approvalsReviewer: options.approvalsReviewer || null,
-        sandboxMode: options.sandboxMode || null,
-        serviceTier: options.serviceTier || null,
-        personality: options.personality || null,
-      }),
+      body: JSON.stringify(body),
     });
   } catch (error) {
     if (/still working on the previous turn/i.test(error.message || '')) {
@@ -9496,8 +12156,7 @@ async function sendInputToSession(session, text, options = {}) {
   }
 }
 
-async function sendInput(text, options = {}) {
-  const session = getSelectedSession();
+async function sendInput(session, text, options = {}) {
   if (!session) {
     return;
   }
@@ -9514,8 +12173,7 @@ async function sendInput(text, options = {}) {
   await sendInputToSession(session, text, options);
 }
 
-async function submitComposerPayload(payload, input) {
-  const session = getSelectedSession();
+async function submitComposerPayload(session, payload, input) {
   if (!session) {
     return;
   }
@@ -9537,7 +12195,7 @@ async function submitComposerPayload(payload, input) {
   }
 
   const wasLive = Boolean(session.live);
-  await sendInput(payload.text, payload);
+  await sendInput(session, payload.text, payload);
   if (wasLive) {
     setActiveDraftForSession(session, payload);
   }
@@ -9547,6 +12205,64 @@ async function submitComposerPayload(payload, input) {
   }
   clearComposerFileAttachments();
   renderComposerTurnNotice();
+}
+
+async function submitComposerInput(input = el('input-text')) {
+  const session = getSelectedSession();
+  if (isComposerSubmitting(session)) {
+    return;
+  }
+  if (!input || input.disabled) {
+    return;
+  }
+
+  if (!session) {
+    return;
+  }
+  const draft = snapshotComposerDraft(input.value);
+  const signature = composerSubmissionSignature(session, draft);
+  const submission = {
+    id: getOrCreateComposerSubmissionId(signature),
+    signature,
+    sessionKey: getSessionKey(session) || '',
+    draft,
+    startedAt: new Date().toISOString(),
+  };
+  setComposerSubmission(submission);
+
+  let payload = null;
+  let clearedText = false;
+  let clearedAttachments = false;
+  try {
+    if (input.value) {
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      clearedText = true;
+    }
+
+    payload = await buildComposerPayload(session, draft.text, { clientRequestId: submission.id });
+    if (!payload.text && !payload.inputItems.length) {
+      return;
+    }
+
+    clearComposerFileAttachments();
+    clearedAttachments = true;
+
+    await submitComposerPayload(session, payload, input);
+    state.codexControls.recentSubmissions.delete(submission.signature);
+  } catch (error) {
+    if (clearedText || clearedAttachments) {
+      const draftToRestore = payload?.composerDraft || submission.draft;
+      if (getSessionKey(getSelectedSession()) === submission.sessionKey) {
+        restoreComposerDraft(draftToRestore, { replace: true });
+      } else {
+        stashPendingComposerDraftForSession(submission.sessionKey, draftToRestore);
+      }
+    }
+    throw error;
+  } finally {
+    clearComposerSubmissionForSession(submission.sessionKey, submission.id);
+  }
 }
 
 async function waitForActiveTurnToClear(session, timeoutMs = 20000) {
@@ -9785,6 +12501,27 @@ function isModelOptionsLoading(session) {
   return state.codexControls.modelOptionsLoadingKeys.has(modelCacheKey(session));
 }
 
+function isSkillOptionsLoading(session) {
+  return state.codexControls.skillOptionsLoadingKeys.has(skillCacheKey(session));
+}
+
+function shouldAutoLoadOptions(retryMap, key) {
+  const retryAfter = retryMap.get(key) || 0;
+  if (retryAfter > Date.now()) {
+    return false;
+  }
+  if (retryAfter) {
+    retryMap.delete(key);
+  }
+  return true;
+}
+
+function deferAutoLoadOptions(retryMap, key) {
+  if (key) {
+    retryMap.set(key, Date.now() + OPTION_AUTO_RETRY_COOLDOWN_MS);
+  }
+}
+
 async function loadModelOptionsForSession(session, options = {}) {
   if (!session?.live) {
     throw new Error('Select a live managed session before loading models.');
@@ -9810,6 +12547,7 @@ async function loadModelOptionsForSession(session, options = {}) {
     const includeHidden = options.includeHidden === true ? '&includeHidden=true' : '';
     const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models?hostId=${encodeURIComponent(session.hostId)}&limit=100${includeHidden}`);
     state.codexControls.modelOptionsBySession.set(modelCacheKey(session), Array.isArray(response.models) ? response.models : []);
+    state.codexControls.modelOptionsRetryAfterBySession.delete(key);
     return state.codexControls.modelOptionsBySession.get(key) || [];
   } finally {
     state.codexControls.modelOptionsLoadingKeys.delete(key);
@@ -9828,18 +12566,73 @@ function requestModelOptionsForSession(session) {
     !host?.capabilities?.modelList
     || state.codexControls.modelOptionsBySession.has(key)
     || isModelOptionsLoading(session)
+    || !shouldAutoLoadOptions(state.codexControls.modelOptionsRetryAfterBySession, key)
   ) {
     return;
   }
   loadModelOptionsForSession(session).catch((error) => {
     if (!/model listing|session is not live|no live session|not live on this host-agent/i.test(error.message || '')) {
-      reportError(error);
+      deferAutoLoadOptions(state.codexControls.modelOptionsRetryAfterBySession, key);
     }
   });
 }
 
 async function loadModelOptionsForSelectedSession() {
   return loadModelOptionsForSession(getSelectedSession(), { force: true });
+}
+
+async function loadSkillOptionsForSession(session, options = {}) {
+  if (!session?.live) {
+    throw new Error('Select a live managed session before loading skills.');
+  }
+  const host = getHost(session.hostId);
+  if (!host?.capabilities?.skillList) {
+    throw new Error(`${host?.label || session.hostId} does not support skill listing yet. Restart its host-agent if needed.`);
+  }
+
+  const key = skillCacheKey(session);
+  if (!options.force && state.codexControls.skillOptionsBySession.has(key)) {
+    return state.codexControls.skillOptionsBySession.get(key) || [];
+  }
+  if (state.codexControls.skillOptionsLoadingKeys.has(key)) {
+    return state.codexControls.skillOptionsBySession.get(key) || [];
+  }
+
+  state.codexControls.skillOptionsLoadingKeys.add(key);
+  renderSlashMenu();
+  try {
+    await verifyHostAvailable(session.hostId);
+    const forceReload = options.force ? '&forceReload=true' : '';
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/skills?hostId=${encodeURIComponent(session.hostId)}${forceReload}`);
+    const skills = flattenSkillListResponse(response);
+    state.codexControls.skillOptionsBySession.set(key, skills);
+    state.codexControls.skillOptionsRetryAfterBySession.delete(key);
+    return skills;
+  } finally {
+    state.codexControls.skillOptionsLoadingKeys.delete(key);
+    renderSlashMenu();
+  }
+}
+
+function requestSkillOptionsForSession(session) {
+  if (!session?.live) {
+    return;
+  }
+  const host = getHost(session.hostId);
+  const key = skillCacheKey(session);
+  if (
+    !host?.capabilities?.skillList
+    || state.codexControls.skillOptionsBySession.has(key)
+    || isSkillOptionsLoading(session)
+    || !shouldAutoLoadOptions(state.codexControls.skillOptionsRetryAfterBySession, key)
+  ) {
+    return;
+  }
+  loadSkillOptionsForSession(session).catch((error) => {
+    if (!/skill listing|session is not live|no live session|not live on this host-agent/i.test(error.message || '')) {
+      deferAutoLoadOptions(state.codexControls.skillOptionsRetryAfterBySession, key);
+    }
+  });
 }
 
 async function loadReceivedFilesForSession(session, options = {}) {
@@ -10151,6 +12944,7 @@ el('settings-host-api-list').addEventListener('change', (event) => {
 
 el('settings-form').addEventListener('submit', (event) => {
   event.preventDefault();
+  const beforeApiSnapshot = { ...(state.settingsApiSnapshot || {}) };
   state.ui.locale = el('settings-language-select').value === 'en' ? 'en' : 'zh-CN';
   state.ui.theme = el('settings-theme-select').value === 'dark-tech' ? 'dark-tech' : 'minimal-light';
   saveActiveApiProfileFromSettingsForm();
@@ -10164,8 +12958,18 @@ el('settings-form').addEventListener('submit', (event) => {
     }
   }
   persistUiSettings();
+  const restartCandidates = getApiChangedLiveSessions(beforeApiSnapshot);
   closeSettingsDialog();
   renderAll();
+  if (restartCandidates.length) {
+    openSessionActionDialog({
+      mode: 'restart',
+      title: 'Restart sessions using changed API settings?',
+      subtitle: 'These live managed sessions are running on hosts whose API profile changed. Restarting means stop session + resume history with the new API environment.',
+      actionLabel: 'Restart selected',
+      sessions: restartCandidates,
+    });
+  }
 });
 
 el('open-connector-manager-button').addEventListener('click', () => {
@@ -10308,12 +13112,226 @@ el('toggle-alerts-button').addEventListener('click', () => {
   toggleAlertWindow();
 });
 
-el('export-session-button')?.addEventListener('click', () => {
-  exportSelectedSessionHistory('markdown');
+el('export-session-button')?.addEventListener('click', async () => {
+  const session = getSelectedSession();
+  try {
+    if (session) {
+      await loadReceivedFilesForSession(session, { force: true });
+    }
+  } catch (error) {
+    reportError(error);
+  }
+  openExportDialog();
 });
 
-el('export-session-bundle-button')?.addEventListener('click', () => {
-  exportSelectedSessionHistory('zip');
+el('session-action-dialog-close-button')?.addEventListener('click', () => {
+  closeSessionActionDialog();
+});
+
+el('session-action-dialog-cancel-button')?.addEventListener('click', () => {
+  closeSessionActionDialog();
+});
+
+el('session-action-dialog')?.addEventListener('click', (event) => {
+  if (event.target === event.currentTarget && !state.sessionActionDialog.busy) {
+    closeSessionActionDialog();
+  }
+});
+
+el('session-action-select-all-checkbox')?.addEventListener('change', (event) => {
+  const checked = Boolean(event.target.checked);
+  const next = new Set();
+  if (checked) {
+    for (const session of state.sessionActionDialog.sessions || []) {
+      const key = getSessionKey(session);
+      if (key) {
+        next.add(key);
+      }
+    }
+  }
+  state.sessionActionDialog.selectedKeys = next;
+  renderSessionActionDialog();
+});
+
+el('session-action-dialog-list')?.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-session-action-key]');
+  if (!checkbox) {
+    return;
+  }
+  const key = checkbox.dataset.sessionActionKey;
+  if (checkbox.checked) {
+    state.sessionActionDialog.selectedKeys.add(key);
+  } else {
+    state.sessionActionDialog.selectedKeys.delete(key);
+  }
+  renderSessionActionDialog();
+});
+
+el('session-action-dialog-confirm-button')?.addEventListener('click', async () => {
+  try {
+    await runSessionActionDialog();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('export-dialog-close-button')?.addEventListener('click', () => {
+  closeExportDialog();
+});
+
+el('export-dialog-cancel-button')?.addEventListener('click', () => {
+  closeExportDialog();
+});
+
+el('export-dialog')?.addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) {
+    closeExportDialog();
+  }
+});
+
+el('export-format-select')?.addEventListener('change', (event) => {
+  state.exportDialog.format = event.target.value || 'markdown';
+  renderExportDialog();
+});
+
+el('export-start-date-input')?.addEventListener('input', (event) => {
+  state.exportDialog.fromDate = event.target.value || '';
+  renderExportDialog();
+});
+
+el('export-end-date-input')?.addEventListener('input', (event) => {
+  state.exportDialog.toDate = event.target.value || '';
+  renderExportDialog();
+});
+
+el('export-day-list')?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-export-day]');
+  if (!button || button.disabled) {
+    return;
+  }
+  const day = button.dataset.exportDay || '';
+  state.exportDialog.fromDate = exportDateInputForDay(day, false);
+  state.exportDialog.toDate = exportDateInputForDay(day, true);
+  renderExportDialog();
+});
+
+el('export-include-thinking-checkbox')?.addEventListener('change', (event) => {
+  state.exportDialog.includeThinking = Boolean(event.target.checked);
+  renderExportDialog();
+});
+
+el('export-include-images-checkbox')?.addEventListener('change', (event) => {
+  state.exportDialog.includeImages = Boolean(event.target.checked);
+  renderExportDialog();
+});
+
+el('export-include-files-checkbox')?.addEventListener('change', (event) => {
+  state.exportDialog.includeFiles = Boolean(event.target.checked);
+  renderExportDialog();
+});
+
+el('export-include-all-files-checkbox')?.addEventListener('change', (event) => {
+  const session = getSelectedSession();
+  const files = getExportCandidateFiles(collectExportFiles(session), state.exportDialog);
+  state.exportDialog.includeAllFiles = Boolean(event.target.checked);
+  for (const file of files) {
+    if (!file.identity) {
+      continue;
+    }
+    if (state.exportDialog.includeAllFiles) {
+      state.exportDialog.selectedFileIds.add(file.identity);
+    } else {
+      state.exportDialog.selectedFileIds.delete(file.identity);
+    }
+  }
+  renderExportDialog();
+});
+
+el('export-files-select-all-button')?.addEventListener('click', () => {
+  const session = getSelectedSession();
+  const files = getExportCandidateFiles(collectExportFiles(session), state.exportDialog);
+  for (const file of files) {
+    if (file.identity) {
+      state.exportDialog.selectedFileIds.add(file.identity);
+    }
+  }
+  state.exportDialog.includeAllFiles = files.length > 0;
+  renderExportDialog();
+});
+
+el('export-files-select-none-button')?.addEventListener('click', () => {
+  const session = getSelectedSession();
+  const files = getExportCandidateFiles(collectExportFiles(session), state.exportDialog);
+  for (const file of files) {
+    if (file.identity) {
+      state.exportDialog.selectedFileIds.delete(file.identity);
+    }
+  }
+  state.exportDialog.includeAllFiles = false;
+  renderExportDialog();
+});
+
+el('export-extension-add-button')?.addEventListener('click', () => {
+  const input = el('export-extension-input');
+  const extension = normalizeExportExtensionValue(input?.value || '');
+  if (!extension) {
+    return;
+  }
+  state.exportDialog.selectedExtensions.add(extension);
+  if (input) {
+    input.value = '';
+  }
+  renderExportDialog();
+});
+
+el('export-extension-input')?.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    el('export-extension-add-button')?.click();
+  }
+});
+
+el('export-extension-list')?.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-export-extension]');
+  if (!checkbox) {
+    return;
+  }
+  const extension = checkbox.dataset.exportExtension;
+  if (checkbox.checked) {
+    state.exportDialog.selectedExtensions.add(extension);
+  } else {
+    state.exportDialog.selectedExtensions.delete(extension);
+  }
+  renderExportDialog();
+});
+
+el('export-extension-list')?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-export-extension-remove]');
+  if (!button) {
+    return;
+  }
+  const extension = button.dataset.exportExtensionRemove;
+  state.exportDialog.selectedExtensions.delete(extension);
+  renderExportDialog();
+});
+
+el('export-file-list')?.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-export-file-id]');
+  if (!checkbox) {
+    return;
+  }
+  const fileId = checkbox.dataset.exportFileId;
+  state.exportDialog.includeAllFiles = false;
+  if (checkbox.checked) {
+    state.exportDialog.selectedFileIds.add(fileId);
+  } else {
+    state.exportDialog.selectedFileIds.delete(fileId);
+  }
+  renderExportDialog();
+});
+
+el('export-dialog-confirm-button')?.addEventListener('click', () => {
+  exportFromDialog();
 });
 
 el('rename-session-button')?.addEventListener('click', async () => {
@@ -10552,6 +13570,16 @@ el('scroll-transcript-bottom-button')?.addEventListener('click', (event) => {
   scrollTranscriptTo('bottom');
 });
 
+el('session-log')?.addEventListener('scroll', () => {
+  const log = el('session-log');
+  if (isTranscriptPinnedToBottom(log)) {
+    setTranscriptUserDetached();
+    clearTranscriptUnread();
+  } else {
+    setTranscriptUserDetached(undefined, true);
+  }
+}, { passive: true });
+
 el('close-sidebar-navigator-button')?.addEventListener('click', () => {
   closeMobileSelectMenus();
   state.navigatorCollapsed = true;
@@ -10759,6 +13787,9 @@ el('codex-model-input').addEventListener('input', () => {
 ].forEach((id) => {
   el(id).addEventListener('change', () => {
     saveComposerOptionsFromControls();
+    if (id === 'codex-mode-select') {
+      renderComposerModeBanner();
+    }
     if (id === 'codex-effort-select' || id === 'codex-reviewer-select') {
       renderComposerTurnNotice();
     }
@@ -10767,6 +13798,87 @@ el('codex-model-input').addEventListener('input', () => {
 
 el('codex-file-picker-button').addEventListener('click', () => {
   el('codex-image-files')?.click();
+});
+
+ensureHistoryImportUi();
+
+el('import-current-history-button')?.addEventListener('click', async () => {
+  try {
+    await importCurrentSessionHistory();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('import-other-history-button')?.addEventListener('click', () => {
+  try {
+    openHistoryImportDialog();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('history-import-dialog-close-button')?.addEventListener('click', () => {
+  closeHistoryImportDialog();
+});
+
+el('history-import-dialog-cancel-button')?.addEventListener('click', () => {
+  closeHistoryImportDialog();
+});
+
+el('history-import-dialog')?.addEventListener('click', (event) => {
+  if (event.target === event.currentTarget && !state.historyImportDialog.busy) {
+    closeHistoryImportDialog();
+  }
+});
+
+el('history-import-select-all-checkbox')?.addEventListener('change', (event) => {
+  const checked = Boolean(event.target.checked);
+  const next = new Set();
+  if (checked) {
+    for (const session of state.historyImportDialog.sessions || []) {
+      const key = getSessionKey(session);
+      if (key) {
+        next.add(key);
+      }
+    }
+  }
+  state.historyImportDialog.selectedKeys = next;
+  renderHistoryImportDialog();
+});
+
+el('history-import-dialog-list')?.addEventListener('change', (event) => {
+  const option = event.target.closest('[data-history-import-option]');
+  if (option) {
+    const key = option.dataset.historyImportOptionKey;
+    const name = option.dataset.historyImportOption;
+    const options = getHistoryImportOptions(key);
+    options[name] = Boolean(option.checked);
+    renderHistoryImportDialog();
+    return;
+  }
+
+  const checkbox = event.target.closest('[data-history-import-key]');
+  if (!checkbox) {
+    return;
+  }
+  const key = checkbox.dataset.historyImportKey;
+  if (checkbox.checked) {
+    state.historyImportDialog.selectedKeys.add(key);
+  } else {
+    state.historyImportDialog.selectedKeys.delete(key);
+  }
+  renderHistoryImportDialog();
+});
+
+el('history-import-dialog-confirm-button')?.addEventListener('click', async () => {
+  try {
+    await importSelectedHistorySessions();
+  } catch (error) {
+    state.historyImportDialog.busy = false;
+    renderHistoryImportDialog();
+    reportError(error);
+  }
 });
 
 el('codex-image-files').addEventListener('change', async (event) => {
@@ -10803,17 +13915,14 @@ el('codex-clear-attachments-button').addEventListener('click', () => {
   clearComposerFileAttachments();
 });
 
-el('codex-plan-button').addEventListener('click', async () => {
-  const input = el('input-text');
-  try {
-    const payload = await buildComposerPayload(input.value, { mode: 'plan' });
-    if (!payload.text && !payload.inputItems.length) {
-      return;
-    }
-    await submitComposerPayload(payload, input);
-  } catch (error) {
-    reportError(error);
-  }
+el('codex-plan-button').addEventListener('click', () => {
+  toggleComposerPlanMode();
+  focusComposerInput();
+});
+
+el('composer-exit-plan-mode-button').addEventListener('click', () => {
+  setComposerPlanMode(false);
+  focusComposerInput();
 });
 
 el('codex-review-button').addEventListener('click', async () => {
@@ -10955,6 +14064,20 @@ el('input-form').addEventListener('dragleave', (event) => {
 
 el('input-form').addEventListener('drop', handleComposerDrop);
 
+el('input-form').addEventListener('paste', (event) => {
+  handleComposerPaste(event).catch(reportError);
+});
+
+el('image-preview-overlay')?.addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) {
+    closeImagePreview();
+  }
+});
+
+el('image-preview-close-button')?.addEventListener('click', () => {
+  closeImagePreview();
+});
+
 document.addEventListener('click', (event) => {
   if (!hasOpenMobileSelectMenu()) {
     return;
@@ -11001,6 +14124,14 @@ document.addEventListener('keydown', (event) => {
     closeSettingsDialog();
   }
 
+  if (state.imagePreview.open) {
+    closeImagePreview();
+  }
+
+  if (state.historyImportDialog.open && !state.historyImportDialog.busy) {
+    closeHistoryImportDialog();
+  }
+
   if (state.auth.accountOpen) {
     state.auth.accountOpen = false;
     renderAccountDialog();
@@ -11011,11 +14142,7 @@ el('input-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = el('input-text');
   try {
-    const payload = await buildComposerPayload(input.value);
-    if (!payload.text && !payload.inputItems.length) {
-      return;
-    }
-    await submitComposerPayload(payload, input);
+    await submitComposerInput(input);
   } catch (error) {
     reportError(error);
   }
@@ -11035,6 +14162,10 @@ async function boot() {
 initializePersistentUiState();
 applyUiTheme();
 boot();
+
+window.addEventListener('resize', () => {
+  ensureTranscriptScrollControlsMounted();
+});
 
 setInterval(() => {
   if (!authAllowsRequests()) {

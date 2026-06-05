@@ -5,8 +5,15 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { nowIso } = require('../../shared/protocol');
+const {
+  apiConfigsRuntimeEqual,
+  buildApiEnvironment,
+  describeApiConfig,
+  normalizeApiConfig,
+} = require('./runtime-utils');
 
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_REQUEST_TIMEOUT_MS || 15000);
+const LIST_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_LIST_REQUEST_TIMEOUT_MS || 30000);
 
 function stripAnsi(value) {
   return String(value || '').replace(/\x1b\[[0-9;]*m/g, '');
@@ -349,43 +356,6 @@ function formatCodexStartError(error) {
   return message;
 }
 
-function normalizeApiConfig(input = {}) {
-  if (!input || typeof input !== 'object') {
-    return null;
-  }
-  const provider = String(input.provider || '').trim().slice(0, 80);
-  const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
-  const apiKey = String(input.apiKey || '').trim();
-  const profileId = String(input.profileId || '').trim().slice(0, 120);
-  const label = String(input.label || '').trim().slice(0, 120);
-  if (!baseUrl && !apiKey) {
-    return null;
-  }
-  return {
-    provider: provider || 'OpenAI',
-    baseUrl,
-    apiKey,
-    profileId,
-    label,
-  };
-}
-
-function buildApiEnvironment(apiConfig) {
-  const config = normalizeApiConfig(apiConfig);
-  if (!config) {
-    return {};
-  }
-  const env = {};
-  if (config.apiKey) {
-    env.OPENAI_API_KEY = config.apiKey;
-  }
-  if (config.baseUrl) {
-    env.OPENAI_BASE_URL = config.baseUrl;
-    env.OPENAI_API_BASE = config.baseUrl;
-  }
-  return env;
-}
-
 function safeProfileSegment(value) {
   const cleaned = String(value || '')
     .trim()
@@ -454,9 +424,9 @@ function rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) {
     `[model_providers.${providerKey}]`,
     `name = ${tomlString(providerName)}`,
     `base_url = ${tomlString(baseUrl)}`,
-    config.apiKey ? `api_key = ${tomlString(config.apiKey)}` : '',
+    'env_key = "OPENAI_API_KEY"',
     'wire_api = "responses"',
-    'requires_openai_auth = true',
+    'requires_openai_auth = false',
     end,
     '',
   ].filter((line) => line !== '').join('\n');
@@ -469,15 +439,15 @@ function rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) {
   return `${next.trim()}\n${profileBlock}`;
 }
 
-function prepareApiProfileCodexHome(baseHome, apiConfig) {
+function prepareApiProfileCodexHome(baseHome, apiConfig, options = {}) {
   const config = normalizeApiConfig(apiConfig);
-  if (!config) {
-    return { codexHome: baseHome, profileHome: false };
-  }
-
-  const hash = hashApiConfig(config);
-  const segment = safeProfileSegment(config.profileId || config.label || config.provider);
-  const overlayHome = path.join(baseHome, '.remote-codex-api-profiles', `${segment}-${hash}`);
+  const hash = config ? hashApiConfig(config) : 'host-env';
+  const segment = safeProfileSegment(config?.profileId || config?.label || config?.provider || 'host-env');
+  const sessionSegment = safeProfileSegment(options.sessionId || options.bridgeSessionId || 'session');
+  const profileHomeDir = path.join(baseHome, '.remote-codex-managed', `${sessionSegment}-${segment}-${hash}`);
+  // Keep every managed session in its own HOME. This prevents our app-server
+  // from sharing Codex SQLite state with an interactive Codex running on HPC.
+  const overlayHome = path.join(profileHomeDir, '.codex');
   fs.mkdirSync(overlayHome, { recursive: true });
 
   const baseAuthPath = path.join(baseHome, 'auth.json');
@@ -488,7 +458,7 @@ function prepareApiProfileCodexHome(baseHome, apiConfig) {
   } catch {
     auth = {};
   }
-  if (config.apiKey) {
+  if (config?.apiKey) {
     auth.OPENAI_API_KEY = config.apiKey;
   }
   fs.writeFileSync(overlayAuthPath, `${JSON.stringify(auth, null, 2)}\n`, 'utf8');
@@ -501,8 +471,12 @@ function prepareApiProfileCodexHome(baseHome, apiConfig) {
   } catch {
     baseConfig = '';
   }
-  const providerKey = `remote_codex_${hash}`;
-  fs.writeFileSync(overlayConfigPath, rewriteConfigTomlForApiProfile(baseConfig, config, providerKey), 'utf8');
+  const providerKey = config ? `remote_codex_${hash}` : null;
+  fs.writeFileSync(
+    overlayConfigPath,
+    config ? rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) : baseConfig,
+    'utf8'
+  );
 
   for (const name of ['installation_id', 'cap_sid', 'session_index.jsonl', '.personality_migration']) {
     copyFileIfExists(path.join(baseHome, name), path.join(overlayHome, name));
@@ -511,7 +485,32 @@ function prepareApiProfileCodexHome(baseHome, apiConfig) {
     linkSharedCodexHomeEntry(baseHome, overlayHome, name);
   }
 
-  return { codexHome: overlayHome, profileHome: true, providerKey };
+  return { codexHome: overlayHome, profileHome: Boolean(config), isolatedHome: true, profileHomeDir, providerKey };
+}
+
+function quarantineCodexStateDatabases(codexHome, reason = 'startup') {
+  if (!codexHome || !fs.existsSync(codexHome)) {
+    return { backupDir: null, moved: [] };
+  }
+  const backupDir = path.join(codexHome, `broken-sqlite-backup-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}-${safeProfileSegment(reason)}`);
+  const moved = [];
+  fs.mkdirSync(backupDir, { recursive: true });
+
+  for (const entry of fs.readdirSync(codexHome)) {
+    if (!/^(logs|state)_\d+\.sqlite(?:-(?:wal|shm))?$/.test(entry)) {
+      continue;
+    }
+    const source = path.join(codexHome, entry);
+    const target = path.join(backupDir, entry);
+    try {
+      fs.renameSync(source, target);
+      moved.push(entry);
+    } catch {
+      // Best effort: another Codex process may still hold the file.
+    }
+  }
+
+  return { backupDir, moved };
 }
 
 function summarizeValue(value, depth = 0) {
@@ -1028,9 +1027,14 @@ class CodexAppServerRunner {
     this.onTerminated = options.onTerminated || null;
     this.apiConfig = normalizeApiConfig(options.apiConfig);
     this.baseCodexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-    const preparedCodexHome = prepareApiProfileCodexHome(this.baseCodexHome, this.apiConfig);
+    const preparedCodexHome = prepareApiProfileCodexHome(this.baseCodexHome, this.apiConfig, {
+      sessionId: this.sessionId,
+      bridgeSessionId: this.bridgeSessionId,
+    });
     this.codexHome = preparedCodexHome.codexHome;
     this.apiProfileHome = preparedCodexHome.profileHome;
+    this.isolatedCodexHome = preparedCodexHome.isolatedHome;
+    this.profileHomeDir = preparedCodexHome.profileHomeDir || null;
     this.apiProviderKey = preparedCodexHome.providerKey || null;
     this.codexBin = options.codexBin || resolveDefaultCodexBin(this.baseCodexHome);
     this.child = null;
@@ -1046,12 +1050,15 @@ class CodexAppServerRunner {
     this.resumePreludeUsed = !this.resumePrelude;
     this.runtime = {
       kind: 'codex_app_server',
+      adapterId: 'codex-app-server',
+      runtimeId: 'codex-app-server',
+      runtimeLabel: 'Codex app-server',
       command: this.codexBin,
       args: ['app-server'],
       cwd: this.cwd,
       nativeThreadId: null,
       launchMode: this.launchMode,
-      codexHomeProfile: this.apiProfileHome ? 'api-profile' : 'default',
+      codexHomeProfile: this.apiProfileHome ? 'api-profile-isolated' : 'managed-isolated',
       apiProfileId: this.apiConfig?.profileId || null,
       apiProfileLabel: this.apiConfig?.label || null,
       apiProvider: this.apiConfig?.provider || null,
@@ -1068,6 +1075,37 @@ class CodexAppServerRunner {
   }
 
   async start() {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      this.startupStateDbError = false;
+      try {
+        await this.startOnce();
+        return;
+      } catch (error) {
+        if (attempt === 0 && this.startupStateDbError) {
+          const repair = quarantineCodexStateDatabases(this.codexHome, 'startup');
+          await this.emitDiagnostic({
+            severity: repair.moved.length ? 'warning' : 'error',
+            source: 'runtime',
+            kind: 'sqlite-repair',
+            message: repair.moved.length
+              ? 'Moved corrupted Codex SQLite state files and retrying app-server startup.'
+              : 'Codex SQLite state looked corrupted, but no state files could be moved automatically.',
+            data: repair,
+          }).catch(() => {});
+          if (repair.moved.length) {
+            this.child = null;
+            this.rpc = null;
+            continue;
+          }
+        }
+        throw error;
+      }
+    }
+  }
+
+  async startOnce() {
+    const processHome = this.profileHomeDir || path.dirname(this.baseCodexHome);
+    const threadApiParams = this.apiProviderKey ? { modelProvider: this.apiProviderKey } : {};
     this.child = spawn(this.codexBin, ['app-server'], {
       cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -1078,10 +1116,10 @@ class CodexAppServerRunner {
         ...buildApiEnvironment(this.apiConfig),
         CODEX_HOME: this.codexHome,
         PATH: buildCodexProcessPath(this.codexBin),
-        HOME: path.dirname(this.baseCodexHome),
-        USERPROFILE: path.dirname(this.baseCodexHome),
-        HOMEDRIVE: (path.parse(path.dirname(this.baseCodexHome)).root || process.env.HOMEDRIVE || '').replace(/\\$/, ''),
-        HOMEPATH: path.dirname(this.baseCodexHome).replace(/^[A-Za-z]:/, '') || process.env.HOMEPATH || '',
+        HOME: processHome,
+        USERPROFILE: processHome,
+        HOMEDRIVE: (path.parse(processHome).root || process.env.HOMEDRIVE || '').replace(/\\$/, ''),
+        HOMEPATH: processHome.replace(/^[A-Za-z]:/, '') || process.env.HOMEPATH || '',
       },
     });
 
@@ -1111,6 +1149,7 @@ class CodexAppServerRunner {
       const text = stripAnsi(line);
       const summary = text.length > 420 ? `${text.slice(0, 417)}...` : text;
       if (isCodexStateDatabaseError(text)) {
+        this.startupStateDbError = true;
         const hint = codexStateDatabaseHint(text);
         await this.emitDiagnostic({
           severity: 'error',
@@ -1177,6 +1216,25 @@ class CodexAppServerRunner {
     });
 
     await this.emitRuntime({ connection: 'ready', phase: 'idle' });
+    await this.emitDiagnostic({
+      severity: 'info',
+      source: 'codex',
+      kind: 'api-profile',
+      message: this.apiConfig
+        ? `Using API profile ${describeApiConfig(this.apiConfig)}.`
+        : 'Using host environment API configuration.',
+      data: {
+        apiProfileId: this.apiConfig?.profileId || null,
+        apiProfileLabel: this.apiConfig?.label || null,
+        apiProvider: this.apiConfig?.provider || null,
+        apiBaseUrl: this.apiConfig?.baseUrl || null,
+        apiProviderKey: this.apiProviderKey || null,
+        baseCodexHome: this.baseCodexHome,
+        codexHome: this.codexHome,
+        isolatedCodexHome: this.isolatedCodexHome,
+        processHome,
+      },
+    });
 
     const startTranscriptFallbackThread = async (reason = null) => {
       if (reason) {
@@ -1193,6 +1251,7 @@ class CodexAppServerRunner {
         approvalPolicy: 'on-request',
         sandbox: 'workspace-write',
         personality: 'friendly',
+        ...threadApiParams,
       });
       this.runtime.resumeStrategy = this.launchMode === 'resume' || this.launchMode === 'fork'
         ? 'transcript_fallback'
@@ -1209,6 +1268,7 @@ class CodexAppServerRunner {
           approvalPolicy: 'on-request',
           sandbox: 'workspace-write',
           personality: 'friendly',
+          ...threadApiParams,
         });
         this.runtime.resumeStrategy = 'native_resume';
       } catch (error) {
@@ -1223,6 +1283,7 @@ class CodexAppServerRunner {
           sandbox: 'workspace-write',
           ephemeral: false,
           threadSource: 'user',
+          ...threadApiParams,
         });
         this.runtime.resumeStrategy = 'native_fork';
       } catch (error) {
@@ -1249,6 +1310,14 @@ class CodexAppServerRunner {
   async sendInput(text, options = {}) {
     if (!this.threadId) {
       throw new Error('codex thread is not ready yet');
+    }
+
+    const requestedApiConfig = normalizeApiConfig(options.apiConfig);
+    if (requestedApiConfig && !apiConfigsRuntimeEqual(this.apiConfig, requestedApiConfig)) {
+      throw new Error(
+        `API profile changed from ${describeApiConfig(this.apiConfig)} to ${describeApiConfig(requestedApiConfig)}. `
+        + 'Codex app-server reads API settings at process startup; restart this managed session to use the new host API mapping.'
+      );
     }
 
     if (this.activeTurnId) {
@@ -1281,6 +1350,9 @@ class CodexAppServerRunner {
         model: params.model || null,
         effort: params.effort || null,
         summary: params.summary || null,
+        apiBaseUrl: this.apiConfig?.baseUrl || null,
+        apiProviderKey: this.apiProviderKey || null,
+        codexHomeProfile: this.runtime.codexHomeProfile || null,
         approvalPolicy: params.approvalPolicy || null,
         approvalsReviewer: params.approvalsReviewer || null,
         sandboxPolicy: params.sandboxPolicy || null,
@@ -1317,7 +1389,7 @@ class CodexAppServerRunner {
       cursor: options.cursor || null,
       includeHidden: options.includeHidden === true ? true : null,
       limit: Number(options.limit || 80) || 80,
-    });
+    }, LIST_REQUEST_TIMEOUT_MS);
     await this.emitDiagnostic({
       severity: 'info',
       source: 'codex',
@@ -1329,6 +1401,27 @@ class CodexAppServerRunner {
       },
     });
     return response || { data: [], nextCursor: null };
+  }
+
+  async listSkills(options = {}) {
+    const cwd = String(options.cwd || this.cwd || '').trim();
+    const response = await this.rpc.request('skills/list', {
+      cwds: cwd ? [cwd] : undefined,
+      forceReload: options.forceReload === true,
+    }, LIST_REQUEST_TIMEOUT_MS);
+    const entries = Array.isArray(response?.data) ? response.data : [];
+    await this.emitDiagnostic({
+      severity: 'info',
+      source: 'codex',
+      kind: 'control',
+      method: 'skills/list',
+      message: `Loaded ${entries.reduce((sum, entry) => sum + (Array.isArray(entry?.skills) ? entry.skills.length : 0), 0)} skills.`,
+      data: {
+        cwd: cwd || null,
+        entries: entries.length,
+      },
+    });
+    return response || { data: [] };
   }
 
   async startReview(options = {}) {

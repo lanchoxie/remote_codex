@@ -139,6 +139,19 @@ function extractSessionPreview(filePath) {
   return preview;
 }
 
+function extractSessionTranscript(filePath, options = {}) {
+  const entries = [];
+  for (const row of readJsonLines(filePath, options.maxRows || Infinity)) {
+    const entry = makeTranscriptEntry(row, {
+      maxChars: Object.prototype.hasOwnProperty.call(options, 'maxChars') ? options.maxChars : Infinity,
+    });
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+  return dedupeTranscriptEntries(entries);
+}
+
 function mergeRowsByTimestampAndType(rows) {
   const seen = new Set();
   const merged = [];
@@ -204,14 +217,14 @@ function getCwdFromRow(row) {
   return match ? match[1].trim() : null;
 }
 
-function makeTranscriptEntry(row) {
+function makeTranscriptEntry(row, options = {}) {
   const payload = row.payload || {};
   const timestamp = row.timestamp || null;
   const phase = String(payload.phase || '').trim().toLowerCase();
 
   if (row.type === 'response_item' && payload.type === 'message') {
     if (payload.role === 'user') {
-      const text = cleanTranscriptText(extractPayloadText(payload), 'user');
+      const text = cleanTranscriptText(extractPayloadText(payload), 'user', options);
       if (!text) {
         return null;
       }
@@ -221,7 +234,7 @@ function makeTranscriptEntry(row) {
       if (phase === 'commentary') {
         return null;
       }
-      const text = cleanTranscriptText(extractPayloadText(payload), 'agent');
+      const text = cleanTranscriptText(extractPayloadText(payload), 'agent', options);
       if (!text) {
         return null;
       }
@@ -234,7 +247,7 @@ function makeTranscriptEntry(row) {
   }
 
   if (payload.type === 'user_message' && payload.message) {
-    const text = cleanTranscriptText(payload.message, 'user');
+    const text = cleanTranscriptText(payload.message, 'user', options);
     if (!text) {
       return null;
     }
@@ -249,7 +262,7 @@ function makeTranscriptEntry(row) {
     if (phase === 'commentary') {
       return null;
     }
-    const text = cleanTranscriptText(payload.message, 'agent');
+    const text = cleanTranscriptText(payload.message, 'agent', options);
     if (!text) {
       return null;
     }
@@ -261,7 +274,7 @@ function makeTranscriptEntry(row) {
   }
 
   if (payload.type === 'task_complete' && payload.last_agent_message) {
-    const text = cleanTranscriptText(payload.last_agent_message, 'agent');
+    const text = cleanTranscriptText(payload.last_agent_message, 'agent', options);
     if (!text) {
       return null;
     }
@@ -824,13 +837,19 @@ function cleanPreviewText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
-function cleanTranscriptText(value, speaker = '') {
+function cleanTranscriptText(value, speaker = '', options = {}) {
   const text = String(value)
     .replace(/\r\n?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
   const stripped = cleanUserFacingTranscriptText(stripResumeBootstrapText(text, speaker), speaker);
-  return stripped.slice(0, TRANSCRIPT_ENTRY_CHAR_LIMIT);
+  if (options.maxChars === Infinity) {
+    return stripped;
+  }
+  const maxChars = Number.isFinite(Number(options.maxChars))
+    ? Math.max(0, Number(options.maxChars))
+    : TRANSCRIPT_ENTRY_CHAR_LIMIT;
+  return stripped.slice(0, maxChars);
 }
 
 function cleanUserFacingTranscriptText(value, speaker = '') {
@@ -862,6 +881,9 @@ function stripIdeContextText(value) {
 function isInternalTranscriptText(value) {
   const text = String(value || '').trim();
   if (!text) {
+    return true;
+  }
+  if (/^<user_action\b[\s\S]*<\/user_action>$/i.test(text)) {
     return true;
   }
   if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
@@ -970,6 +992,7 @@ function walkFiles(rootDir, visit) {
 
 module.exports = {
   discoverCodexSessions,
+  extractSessionTranscript,
   getDefaultCodexHome,
   makeCodexRowEvents,
   makeTranscriptEntry,

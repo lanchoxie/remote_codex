@@ -20,6 +20,7 @@ tmp/relay-auth-token.txt
 tmp/relay-auth-account.json
 tmp/runtime/
 tmp/.codex-remote-files/
+.codex-remote-files/
 tmp/received-files/
 tmp/codex-linux-x86_64/
 tmp/node-*.tar.*

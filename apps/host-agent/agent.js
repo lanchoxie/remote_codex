@@ -1,4 +1,3 @@
-const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
@@ -7,7 +6,8 @@ const path = require('path');
 const { discoverCodexSessions, getDefaultCodexHome } = require('../../shared/codex-discovery');
 const { CodexSessionTailer } = require('../../shared/codex-tail');
 const { makeId, nowIso, normalizeArgs } = require('../../shared/protocol');
-const { startCodexAppServerSession } = require('./codex-app-server-runner');
+const { resolveManagedRuntime, startManagedRuntimeSession } = require('./runtime-adapters');
+const { normalizeApiConfig } = require('./runtime-utils');
 
 const RELAY_URL = process.env.RELAY_URL || 'http://127.0.0.1:8787';
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
@@ -19,6 +19,7 @@ const DISCOVERY_INTERVAL_MS = Number(process.env.DISCOVERY_INTERVAL_MS || 15000)
 const CODEX_TAIL_ENABLED = String(process.env.CODEX_TAIL_ENABLED || 'true') !== 'false';
 const CODEX_TAIL_INTERVAL_MS = Number(process.env.CODEX_TAIL_INTERVAL_MS || 1000);
 const AUTO_START_SESSION = String(process.env.AUTO_START_SESSION || 'true') !== 'false';
+const MANAGED_RUNTIME = process.env.MANAGED_RUNTIME || '';
 const MANAGED_COMMAND = process.env.MANAGED_COMMAND || 'codex-app-server';
 const MANAGED_ARGS = normalizeArgs(process.env.MANAGED_ARGS_JSON || '[]');
 const MANAGED_CWD = process.env.MANAGED_CWD || process.cwd();
@@ -54,43 +55,6 @@ function loadRelayAuthToken() {
   }
 }
 
-function normalizeApiConfig(input = {}) {
-  if (!input || typeof input !== 'object') {
-    return null;
-  }
-  const provider = String(input.provider || '').trim().slice(0, 80);
-  const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
-  const apiKey = String(input.apiKey || '').trim();
-  const profileId = String(input.profileId || '').trim().slice(0, 120);
-  const label = String(input.label || '').trim().slice(0, 120);
-  if (!baseUrl && !apiKey) {
-    return null;
-  }
-  return {
-    provider: provider || 'OpenAI',
-    baseUrl,
-    apiKey,
-    profileId,
-    label,
-  };
-}
-
-function buildApiEnvironment(apiConfig) {
-  const config = normalizeApiConfig(apiConfig);
-  if (!config) {
-    return {};
-  }
-  const env = {};
-  if (config.apiKey) {
-    env.OPENAI_API_KEY = config.apiKey;
-  }
-  if (config.baseUrl) {
-    env.OPENAI_BASE_URL = config.baseUrl;
-    env.OPENAI_API_BASE = config.baseUrl;
-  }
-  return env;
-}
-
 function getCapabilities() {
   return {
     discovery: true,
@@ -102,13 +66,15 @@ function getCapabilities() {
     hostProbe: true,
     turnControls: true,
     modelList: true,
+    skillList: true,
     review: true,
     imageInput: true,
     fileTransfer: true,
     chunkedFileTransfer: true,
+    agentRuntimes: true,
     realtimeSessionSync: CODEX_TAIL_ENABLED,
     codexJsonlTail: CODEX_TAIL_ENABLED,
-    demoMode: MANAGED_COMMAND === 'demo',
+    demoMode: MANAGED_RUNTIME === 'demo' || MANAGED_COMMAND === 'demo',
   };
 }
 
@@ -467,6 +433,10 @@ function mimeFromPath(filePath, fallback = 'application/octet-stream') {
     '.md': 'text/markdown; charset=utf-8',
     '.pdf': 'application/pdf',
     '.png': 'image/png',
+    '.pps': 'application/vnd.ms-powerpoint',
+    '.ppsx': 'application/vnd.openxmlformats-officedocument.presentationml.slideshow',
+    '.ppt': 'application/vnd.ms-powerpoint',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     '.ps1': 'text/plain; charset=utf-8',
     '.py': 'text/x-python; charset=utf-8',
     '.r': 'text/plain; charset=utf-8',
@@ -1020,30 +990,6 @@ async function handleDirectoryList(command) {
   }
 }
 
-function resolveManagedCommand(command) {
-  if (!command || command === 'demo') {
-    return {
-      kind: 'demo',
-      command: process.execPath,
-      args: [path.join(__dirname, 'demo-session.js')],
-    };
-  }
-
-  if (command === 'codex-app-server') {
-    return {
-      kind: 'codex-app-server',
-      command,
-      args: [],
-    };
-  }
-
-  return {
-    kind: 'process',
-    command,
-    args: MANAGED_ARGS,
-  };
-}
-
 function buildResumeBootstrap(command) {
   const transcript = Array.isArray(command.resumeTranscript) ? command.resumeTranscript : [];
   const lines = transcript
@@ -1098,106 +1044,15 @@ async function failManagedSession(sessionId, cwd, message, state = 'failed') {
   });
 }
 
-function startProcessManagedSession({ sessionId, cwd, command, args, label, originSessionId, sourceSessionId, conversationKey, launchMode, apiConfig, bootstrap }) {
-  const createdAt = nowIso();
-  const spawnOptions = {
-    cwd,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    shell: false,
-    env: {
-      ...process.env,
-      ...buildApiEnvironment(apiConfig),
-      DEMO_BOOTSTRAP_JSON: JSON.stringify(bootstrap),
-      DEMO_SESSION_LABEL: String(label || cwd || sessionId),
-    },
-  };
-
-  const child = spawn(command, args, spawnOptions);
-  const runner = {
-    kind: 'process',
-    sessionId,
-    title: label || cwd || sessionId,
-    cwd,
-    createdAt,
-    originSessionId: originSessionId || null,
-    sourceSessionId: sourceSessionId || null,
-    conversationKey: conversationKey || originSessionId || sessionId,
-    launchMode: launchMode || null,
-    runtime: {
-      kind: 'child_process',
-      command,
-      args,
-      cwd,
-    },
-    async sendInput(text) {
-      child.stdin.write(`${String(text || '')}\n`);
-    },
-    async stop() {
-      child.kill();
-    },
-  };
-
-  liveSessions.set(sessionId, runner);
-
-  const stdout = require('readline').createInterface({ input: child.stdout, crlfDelay: Infinity });
-  const stderr = require('readline').createInterface({ input: child.stderr, crlfDelay: Infinity });
-
-  stdout.on('line', (line) => {
-    postEvent({
-      type: 'session.output',
-      hostId: HOST_ID,
-      sessionId,
-      stream: 'stdout',
-      chunk: line,
-      timestamp: nowIso(),
-    }).catch((error) => {
-      console.error('[agent] failed to forward stdout', error.message);
-    });
-  });
-
-  stderr.on('line', (line) => {
-    postEvent({
-      type: 'session.output',
-      hostId: HOST_ID,
-      sessionId,
-      stream: 'stderr',
-      chunk: line,
-      timestamp: nowIso(),
-    }).catch((error) => {
-      console.error('[agent] failed to forward stderr', error.message);
-    });
-  });
-
-  child.on('error', (error) => {
-    liveSessions.delete(sessionId);
-    failManagedSession(sessionId, cwd, `managed session error: ${error.message}`, 'failed:runtime-error').catch((postError) => {
-      console.error('[agent] failed to forward runtime error', postError.message);
-    });
-  });
-
-  child.on('exit', (code, signal) => {
-    liveSessions.delete(sessionId);
-    postEvent({
-      type: 'session.state_changed',
-      hostId: HOST_ID,
-      sessionId,
-      state: `exited:${code ?? 'null'}:${signal ?? 'null'}`,
-      live: false,
-      timestamp: nowIso(),
-    }).catch((error) => {
-      console.error('[agent] failed to forward exit state', error.message);
-    });
-  });
-
-  return runner;
-}
-
 async function startManagedSession(command) {
   const bridgeSessionId = command.sessionId || makeId();
   const createdAt = command.createdAt || nowIso();
   const cwd = resolveManagedCwd(command.cwd || MANAGED_CWD);
-  const resolved = resolveManagedCommand(command.command || MANAGED_COMMAND);
-  const args = command.args && command.args.length ? normalizeArgs(command.args) : resolved.args;
+  const runtime = resolveManagedRuntime(command, {
+    defaultRuntime: MANAGED_RUNTIME,
+    defaultCommand: MANAGED_COMMAND,
+    defaultArgs: MANAGED_ARGS,
+  });
   const bootstrap = buildResumeBootstrap(command);
   const title = command.label || command.cwd || bridgeSessionId;
   const apiConfig = normalizeApiConfig(command.apiConfig);
@@ -1222,45 +1077,31 @@ async function startManagedSession(command) {
   }
 
   try {
-    let runner = null;
-
-    if (resolved.kind === 'codex-app-server') {
-      runner = await startCodexAppServerSession({
-        hostId: HOST_ID,
-        sessionId: bridgeSessionId,
-        bridgeSessionId,
-        title,
-        cwd,
-        launchMode: command.launchMode || null,
-        nativeThreadId: command.nativeThreadId || null,
-        codexHome: CODEX_HOME,
-        apiConfig,
-        bootstrap,
-        postEvent,
-        onTerminated: () => {
-          liveSessions.delete(bridgeSessionId);
-          liveSessions.delete(announcedSessionId);
-        },
-      });
-      runner.createdAt = runner.createdAt || createdAt;
-      announcedSessionId = runner.sessionId || bridgeSessionId;
-      liveSessions.set(bridgeSessionId, runner);
-      liveSessions.set(announcedSessionId, runner);
-    } else {
-      runner = startProcessManagedSession({
-        sessionId: bridgeSessionId,
-        cwd,
-        command: resolved.command,
-        args,
-        label: title,
-        originSessionId: command.originSessionId || null,
-        sourceSessionId: command.sourceSessionId || null,
-        conversationKey: command.conversationKey || command.originSessionId || bridgeSessionId,
-        launchMode: command.launchMode || null,
-        apiConfig,
-        bootstrap,
-      });
-    }
+    const runner = await startManagedRuntimeSession({
+      runtime,
+      hostId: HOST_ID,
+      sessionId: bridgeSessionId,
+      bridgeSessionId,
+      title,
+      cwd,
+      launchMode: command.launchMode || null,
+      nativeThreadId: command.nativeThreadId || null,
+      codexHome: CODEX_HOME,
+      apiConfig,
+      bootstrap,
+      originSessionId: command.originSessionId || null,
+      sourceSessionId: command.sourceSessionId || null,
+      conversationKey: command.conversationKey || command.originSessionId || bridgeSessionId,
+      postEvent,
+      onTerminated: () => {
+        liveSessions.delete(bridgeSessionId);
+        liveSessions.delete(announcedSessionId);
+      },
+    });
+    runner.createdAt = runner.createdAt || createdAt;
+    announcedSessionId = runner.sessionId || bridgeSessionId;
+    liveSessions.set(bridgeSessionId, runner);
+    liveSessions.set(announcedSessionId, runner);
 
     await postEvent({
       type: 'session.started',
@@ -1278,8 +1119,10 @@ async function startManagedSession(command) {
       launchMode: command.launchMode || null,
       runtime: runner.runtime || {
         kind: 'child_process',
-        command: resolved.command,
-        args,
+        adapterId: runtime.kind,
+        runtimeId: runtime.runtimeId,
+        command: runtime.command,
+        args: runtime.args,
         cwd,
       },
     });
@@ -1302,7 +1145,9 @@ async function handleCommand(command) {
   }
 
   if (command.type === 'host.import') {
-    await sendDiscovery();
+    sendDiscovery().catch((error) => {
+      logAgentError('[agent] discovery refresh failed:', error.message);
+    });
     return;
   }
 
@@ -1373,6 +1218,18 @@ async function handleCommand(command) {
         sessionId: command.sessionId,
         requestId: command.requestId,
         error: 'session is not live on this host-agent; resume or restart the session before listing models',
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
+    if (command.type === 'session.skills_list' && command.requestId) {
+      await postEvent({
+        type: 'session.skills_listed',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        requestId: command.requestId,
+        error: 'session is not live on this host-agent; resume or restart the session before listing skills',
         timestamp: nowIso(),
       });
       return;
@@ -1471,6 +1328,52 @@ async function handleCommand(command) {
       sessionId: command.sessionId,
       requestId: command.requestId || makeId(),
       error: 'This runner does not support model listing.',
+      timestamp: nowIso(),
+    });
+    return;
+  }
+
+  if (command.type === 'session.skills_list') {
+    if (typeof runner.listSkills === 'function') {
+      try {
+        const result = await runner.listSkills({
+          cwd: command.cwd || null,
+          forceReload: command.forceReload === true,
+        });
+        await postEvent({
+          type: 'session.skills_listed',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          requestId: command.requestId || makeId(),
+          data: Array.isArray(result?.data) ? result.data : [],
+          timestamp: nowIso(),
+        });
+      } catch (error) {
+        await postEvent({
+          type: 'session.skills_listed',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          requestId: command.requestId || makeId(),
+          error: error.message,
+          timestamp: nowIso(),
+        });
+        await postEvent({
+          type: 'session.error',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          message: `Unable to list Codex skills: ${error.message}`,
+          timestamp: nowIso(),
+        });
+      }
+      return;
+    }
+
+    await postEvent({
+      type: 'session.skills_listed',
+      hostId: HOST_ID,
+      sessionId: command.sessionId,
+      requestId: command.requestId || makeId(),
+      error: 'This runner does not support skill listing.',
       timestamp: nowIso(),
     });
     return;
@@ -1599,6 +1502,56 @@ async function handleCommand(command) {
   }
 }
 
+async function postCommandFailure(command, error) {
+  const message = String(error?.message || error || `failed to handle ${command?.type || 'command'}`);
+  logAgentError(`[agent] command ${command?.id || '(unknown)'} ${command?.type || '(unknown)'} failed:`, message);
+
+  if (command?.type === 'session.model_list' && command.requestId) {
+    await postEvent({
+      type: 'session.model_listed',
+      hostId: HOST_ID,
+      sessionId: command.sessionId,
+      requestId: command.requestId,
+      error: message,
+      timestamp: nowIso(),
+    }, { bestEffort: true });
+    return;
+  }
+
+  if (command?.type === 'session.skills_list' && command.requestId) {
+    await postEvent({
+      type: 'session.skills_listed',
+      hostId: HOST_ID,
+      sessionId: command.sessionId,
+      requestId: command.requestId,
+      error: message,
+      timestamp: nowIso(),
+    }, { bestEffort: true });
+    return;
+  }
+
+  if (command?.sessionId) {
+    await postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: command.sessionId,
+      message: `Unable to handle ${command.type || 'command'}: ${message}`,
+      timestamp: nowIso(),
+    }, { bestEffort: true });
+  }
+}
+
+async function processPolledCommand(command) {
+  const commandId = Number(command?.id || 0);
+  try {
+    await handleCommand(command);
+  } catch (error) {
+    await postCommandFailure(command, error);
+  } finally {
+    lastCommandId = Math.max(lastCommandId, commandId);
+  }
+}
+
 async function pollCommandsLoop() {
   while (true) {
     try {
@@ -1607,8 +1560,7 @@ async function pollCommandsLoop() {
       });
       const commands = Array.isArray(result.body && result.body.commands) ? result.body.commands : [];
       for (const command of commands) {
-        lastCommandId = Math.max(lastCommandId, Number(command.id || 0));
-        await handleCommand(command);
+        await processPolledCommand(command);
       }
       await sleep(POLL_INTERVAL_MS);
     } catch (error) {

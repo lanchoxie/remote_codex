@@ -1,23 +1,29 @@
 # Mobile Codex Remote
 
-Mobile Codex Remote is a lightweight web control plane for Codex sessions running on local computers, remote Linux hosts, and HPC clusters. It lets you switch between hosts, resume or fork Codex conversations, upload files and images, monitor runtime status, and control long-running Codex work from a desktop browser or phone.
+Mobile Codex Remote is a browser control plane for Codex sessions running on local computers, remote Linux hosts, and HPC clusters. It gives you one web UI for starting, resuming, forking, steering, interrupting, reviewing, exporting, importing, and monitoring Codex work from a desktop browser or phone.
 
-中文入口: [README.zh-CN.md](README.zh-CN.md)
+Chinese guide: [README.zh-CN.md](README.zh-CN.md)
+Release/update report: [docs/update-report-2026-06-05.md](docs/update-report-2026-06-05.md)
 v2.01 notes archive: [README_v2.01.md](README_v2.01.md)
 
 ## Features
 
 - Multi-host control for local PCs, remote Linux machines, and HPC login nodes.
 - Session discovery from each host's Codex home, usually `~/.codex`.
-- Real-time tailing of Codex rollout JSONL for imported history transcripts, runtime status, token usage, and structured diagnostics when available.
-- New, resume, fork, stop, interrupt, steer, plan, and review controls.
-- Conversation search by keyword, path, or title-like metadata.
+- Managed Codex app-server sessions with new, resume, fork, stop, interrupt, steer, compact, plan, and review controls.
+- Conversation search by keyword, path, title-like metadata, and message content.
 - Conversation sorting by created time, recently updated time, or message count.
-- File and image upload from the browser to the selected host.
-- Remote file cards for opening or saving files generated on the selected host.
-- Mobile-friendly drawer navigation and compact runtime status chips.
-- HPC connector profiles with SSH key, password, keyboard-interactive, OTP/MFA, gateway, tmux-first bootstrap, and nohup fallback when tmux is unavailable.
+- Real-time Codex rollout JSONL tailing for imported history, runtime status, token usage, diagnostics, requests, and transcript updates.
+- Composer attachments for local files, images, host image paths, prompt cards, skills, and imported conversation history.
+- Conversation export to Markdown, JSON, or Zip bundle, with filters for date range, thinking/activity, images, files, extensions, and selected files.
+- Conversation import from the current session or multiple other sessions, each with per-session thinking/images/files options.
+- Browser-to-host file transfer, chunked large uploads, cached inline image/text handling, and remote file cards for generated outputs.
+- Model and skill list controls with retry cooldowns to avoid repeated background timeout spam.
+- Request-user-input UI for plan-mode/model prompts that ask the user to choose options or enter custom text.
 - Per-host API profiles for OpenAI-compatible API keys and base URLs.
+- Isolated managed Codex homes to reduce conflicts with an interactive local Codex CLI.
+- Mobile-friendly navigator, transcript controls, image preview, status windows, alerts, and compact runtime chips.
+- HPC connector profiles with SSH key, password, keyboard-interactive, OTP/MFA, gateway/jump host, tmux bootstrap, and detached fallback.
 
 ## Architecture
 
@@ -26,19 +32,20 @@ phone/browser -> relay web/API server -> host-agent -> Codex app-server
                                       -> local files / HPC workspace
 ```
 
-- `apps/relay` serves the web UI, stores lightweight runtime state, and relays commands/events.
-- `apps/host-agent` runs on each controlled host and owns the Codex app-server process.
-- `apps/mobile-web` is the browser UI.
-- `shared` contains protocol, connector, discovery, and storage helpers.
+- `apps/relay` serves the web UI, stores lightweight state, relays commands/events, caches received files, and exports session bundles.
+- `apps/host-agent` runs on each controlled host and owns managed runtimes such as Codex app-server.
+- `apps/mobile-web` is the browser UI used by desktop and phone clients.
+- `shared` contains protocol, connector, discovery, transcript, and storage helpers.
 
-The relay is intended for trusted private networks. For phone access outside the same LAN, use a private network such as Tailscale instead of exposing the relay directly to the public internet.
+The relay is intended for trusted private networks. For phone access outside the same LAN, use a private network such as Tailscale rather than exposing the relay directly to the public internet.
 
 ## Requirements
 
 - Node.js 22 or newer is recommended.
 - Git.
 - Codex CLI installed on each host you want to control.
-- OpenSSH on the relay machine if you want to bootstrap remote/HPC hosts.
+- OpenSSH on the relay machine if you want to bootstrap remote or HPC hosts.
+- PowerShell on Windows if you use the one-click launcher.
 
 ## Install
 
@@ -47,13 +54,42 @@ git clone https://github.com/lanchoxie/remote_codex.git
 cd remote_codex
 ```
 
-The project currently uses only built-in Node.js modules, so there is usually no install step. If dependencies are added later, run:
+The project currently uses built-in Node.js modules only, so there is usually no install step. If dependencies are added later, run:
 
 ```bash
 npm install
 ```
 
-## Start Locally
+## Quick Start
+
+### Windows one-click launcher
+
+Double-click:
+
+```text
+start-windows.bat
+```
+
+The launcher runs `scripts/start-windows.ps1`. By default it:
+
+- uses port `8797` unless `PORT` or `-Port` is set;
+- starts the relay in one PowerShell window;
+- starts a local host-agent in another PowerShell window;
+- writes logs to `tmp/windows-start/`;
+- opens `http://127.0.0.1:8797` in the browser.
+
+Examples:
+
+```powershell
+.\start-windows.bat
+.\start-windows.bat -Port 8787
+.\start-windows.bat -Port 8797 -HostId my-pc -HostLabel "My PC" -NoBrowser
+.\scripts\start-windows.ps1 -DryRun
+```
+
+Keep the relay and host-agent windows open while using the app.
+
+### npm scripts
 
 Start the relay and one local host-agent:
 
@@ -81,16 +117,16 @@ npm run test:managed
 - `npm run agent` starts only the current machine's host-agent.
 - `npm run test:managed` runs a managed-session and file-transfer smoke test.
 
-To use a custom port:
+Custom port:
 
 ```bash
 PORT=8797 npm run relay
 ```
 
-On Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
-$env:PORT=8797
+$env:PORT = "8797"
 npm run relay
 ```
 
@@ -103,15 +139,45 @@ Common actions:
 - `Fork New Branch` starts a new branch from the selected conversation.
 - `Stop Session` stops the current live process while preserving history.
 - `Interrupt` interrupts the current Codex turn.
-- `Plan` sends the next request as a planning turn.
+- `Steer` adds guidance to the active turn when supported.
+- `Plan` toggles persistent plan-only sending until you exit plan mode.
 - `Review` starts Codex review for the current workspace.
+- `Compact Context` uses the Codex app-server native compact flow.
+- `Export` saves conversation history as Markdown, JSON, or Zip bundle.
+- `Current` / `Others` in the composer import conversation exports into the attachment bar.
 
 Composer shortcuts:
 
 - `Enter` sends the message.
 - `Shift+Enter` inserts a newline.
 - Type `/` to open the command menu.
-- Use `+` or drag-and-drop to attach files.
+- Use `+`, drag-and-drop, or paste to attach files/images.
+
+## History Export And Import
+
+Export supports:
+
+- Markdown, JSON, or Zip bundle.
+- Date range filtering.
+- Optional thinking/activity.
+- Optional images and non-image files.
+- File extension filters.
+- Specific file selection.
+
+Import supports:
+
+- `Current`: attach the selected conversation export to the current composer.
+- `Others`: select multiple other conversations and choose thinking/images/files per conversation.
+
+Each imported conversation adds a Markdown history attachment. If images or files are included, a Zip bundle is also attached. Small Markdown history files are inlined as text attachments; larger history files are uploaded as normal files.
+
+## File Transfer
+
+- Browser file uploads go to the selected host.
+- Large files use chunked relay-to-agent upload.
+- Inline images and text files are cached by the relay so they show as file cards in transcript/export views.
+- Generated or received remote files can be opened or saved from message cards.
+- Very large datasets should stay on the host filesystem; send Codex the path instead of uploading through the browser.
 
 ## Phone Access
 
@@ -163,7 +229,7 @@ Create a connector profile with:
 - `CODEX_HOME`: usually `~/.codex`.
 - `Workspace roots`: browseable root directories, one per line.
 - `Remote agent directory`: for example `~/mobile-codex-remote`.
-- `tmux session name`: for example `codex-remote`; if `tmux` is missing, `Start Agent` falls back to a detached `nohup` process with a pid file.
+- `tmux session name`: for example `codex-remote`; if `tmux` is missing, `Start Agent` falls back to a detached process with a pid file.
 
 Then use:
 
@@ -172,7 +238,7 @@ Then use:
 - `Restart Agent` after updating this repository.
 - `Check Status` to inspect the remote tmux session or detached agent process.
 
-If the cluster uses OTP/MFA, the connector flow will prompt for fresh interactive values when SSH asks for them.
+If the cluster uses OTP/MFA, the connector flow prompts for fresh interactive values when SSH asks for them.
 
 ## Install Codex CLI On Remote Hosts
 
@@ -206,7 +272,9 @@ Open:
 Settings -> API profiles
 ```
 
-You can create multiple OpenAI-compatible API profiles and map different hosts to different profiles. Profile changes apply to newly started, resumed, or forked Codex app-server sessions. The host-agent starts those sessions with an isolated `CODEX_HOME` profile overlay so `auth.json` and `config.toml` changes do not overwrite the host's default Codex configuration.
+You can create multiple OpenAI-compatible API profiles and map different hosts to different profiles. Profile changes apply when starting or restarting managed Codex app-server sessions. Already running sessions keep the API environment they started with.
+
+Managed sessions use isolated Codex homes so API profiles and app-server state do not overwrite the host's default interactive Codex configuration.
 
 ## Development Checks
 
@@ -218,10 +286,18 @@ node --check apps/mobile-web/public/app.js
 npm run test:managed
 ```
 
+## Troubleshooting
+
+- If model or skill lists time out, restart the selected managed session and host-agent, then use the manual refresh button.
+- If API key or base URL changes do not apply, restart the affected managed session.
+- If a Windows launcher window closes immediately, run `.\scripts\start-windows.ps1 -DryRun` or inspect `tmp/windows-start/*.log`.
+- If a remote connector starts stale code, use `Restart Agent` after pulling the repository update on the relay machine.
+- If a browser upload is too large, keep the file on the host and send Codex its path.
+
 ## Current Limitations
 
 - Runtime state is lightweight and mostly relay-local; host-agents rehydrate live state after reconnecting.
 - Imported history sessions become interactive only after resume or fork.
-- Imported history sessions can be tailed in real time from `.codex/sessions/**/*.jsonl`, but active controls such as stop, interrupt, and queued prompts still require a managed Codex app-server session.
+- Active controls such as stop, interrupt, and queued prompts require a managed Codex app-server session.
 - HPC SSH/MFA policies vary by cluster, so connector profiles may need cluster-specific tuning.
-- Browser small-file transfer defaults to 128 MiB per request. Larger browser uploads/downloads use chunked relay-to-agent transfer, but large datasets should still stay on the host filesystem when possible; see [large file transfer design](docs/large-file-transfer-design.md).
+- Browser transfer is convenient for working files, not a replacement for host-side datasets.

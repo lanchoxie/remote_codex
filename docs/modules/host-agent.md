@@ -42,6 +42,19 @@ Path: `apps/host-agent/codex-app-server-runner.js`
 
 Uses Codex `app-server` JSON-RPC style protocol and maps structured Codex events into relay events.
 
+Managed app-server sessions use an isolated Codex home under
+`<CODEX_HOME>/.remote-codex-managed/<session-profile>/.codex` instead of
+writing runtime state directly into the user's primary `CODEX_HOME`. This keeps
+remote-control sessions from corrupting or contending with an interactive Codex
+TUI running on the same HPC account. The runner copies small identity/config
+files, links read-mostly history/skill directories, and lets Codex rebuild
+`state_*.sqlite` and `logs_*.sqlite` per managed session.
+
+If an isolated app-server home reports a corrupted SQLite state database, the
+runner moves only `state_*.sqlite*` and `logs_*.sqlite*` into a
+`broken-sqlite-backup-*` directory and retries startup once. It must not delete
+the user's primary `.codex` directory or the `sessions/` history tree.
+
 Currently handles:
 
 - thread start/resume/fork style lifecycle;
@@ -69,4 +82,3 @@ Used by `npm run test:managed`. It proves the transport path without requiring a
 - No process registry that survives agent restart.
 - No attach-to-existing-PTY implementation.
 - Real Codex app-server path needs automated integration tests.
-

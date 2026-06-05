@@ -21,7 +21,7 @@ const {
   normalizeConnectorSecretsInput,
   saveConnectorSecrets,
 } = require('../../shared/connector-secrets');
-const { makeCodexRowEvents } = require('../../shared/codex-discovery');
+const { extractSessionTranscript, makeCodexRowEvents } = require('../../shared/codex-discovery');
 const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 
 const PORT = Number(process.env.PORT || 8787);
@@ -48,6 +48,8 @@ const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT
 const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
 const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
 const STALE_MANAGED_SESSION_GRACE_MS = Number(process.env.RELAY_STALE_MANAGED_SESSION_GRACE_MS || 30000);
+const INPUT_REQUEST_DEDUPE_TTL_MS = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_TTL_MS || 2 * 60 * 1000);
+const INPUT_REQUEST_DEDUPE_LIMIT = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_LIMIT || 500);
 const JSONL_DIAGNOSTIC_MAX_BYTES = Number(process.env.RELAY_JSONL_DIAGNOSTIC_MAX_BYTES || 16 * 1024 * 1024);
 const JSONL_DIAGNOSTIC_HEAD_BYTES = Number(process.env.RELAY_JSONL_DIAGNOSTIC_HEAD_BYTES || 2 * 1024 * 1024);
 const LOCAL_AGENT_WATCHDOG_ENABLED = String(process.env.RELAY_LOCAL_AGENT_WATCHDOG_ENABLED || 'true').trim().toLowerCase() !== 'false';
@@ -296,6 +298,30 @@ function normalizeSessionMetadataEntry(input = {}) {
   };
 }
 
+function sessionTitleSourcePriority(source = '') {
+  const value = String(source || '').trim().toLowerCase();
+  if (value === 'manual' || value === 'user') {
+    return 100;
+  }
+  if (value.startsWith('collection:')) {
+    return 80;
+  }
+  if (value === 'metadata' || value === 'migration') {
+    return 60;
+  }
+  if (value === 'summary' || value === 'generated') {
+    return 50;
+  }
+  return 20;
+}
+
+function shouldOverwriteSessionMetadata(existing, nextSource = '') {
+  if (!existing) {
+    return true;
+  }
+  return sessionTitleSourcePriority(nextSource) >= sessionTitleSourcePriority(existing.source);
+}
+
 function normalizeSessionCollection(input = {}) {
   const collectionId = String(input.collectionId || input.id || makeId()).trim();
   const name = String(input.name || '').trim() || 'Untitled';
@@ -485,6 +511,9 @@ function isInternalTranscriptText(value) {
   if (!text) {
     return true;
   }
+  if (/^<user_action\b[\s\S]*<\/user_action>$/i.test(text)) {
+    return true;
+  }
   if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
     return true;
   }
@@ -508,36 +537,42 @@ function compactTranscriptEntries(entries) {
   const compacted = [];
   for (const entry of sortTranscriptEntries(entries || [])) {
     const previous = compacted[compacted.length - 1];
-    if (!previous || previous.speaker !== entry.speaker) {
+    if (!isAdjacentTranscriptDuplicate(previous, entry)) {
       compacted.push(entry);
-      continue;
     }
-
-    const previousText = canonicalTranscriptText(previous.text);
-    const entryText = canonicalTranscriptText(entry.text);
-    const previousFiles = (previous.files || []).map((file) => file.path || file.name || '').join(',');
-    const entryFiles = (entry.files || []).map((file) => file.path || file.name || '').join(',');
-    if (previousFiles !== entryFiles) {
-      compacted.push(entry);
-      continue;
-    }
-    if (previousText && entryText && previousText === entryText) {
-      continue;
-    }
-
-    const previousTime = Date.parse(previous.timestamp || '');
-    const entryTime = Date.parse(entry.timestamp || '');
-    const near = Number.isFinite(previousTime) && Number.isFinite(entryTime) && Math.abs(entryTime - previousTime) <= 30000;
-    if (near && previousText.length >= 80 && entryText.includes(previousText)) {
-      continue;
-    }
-    if (near && entryText.length >= 80 && previousText.includes(entryText)) {
-      continue;
-    }
-
-    compacted.push(entry);
   }
   return compacted;
+}
+
+function isAdjacentTranscriptDuplicate(previous, entry) {
+  if (!previous || !entry || previous.speaker !== entry.speaker) {
+    return false;
+  }
+  const previousFiles = (previous.files || []).map((file) => file.path || file.name || '').join(',');
+  const entryFiles = (entry.files || []).map((file) => file.path || file.name || '').join(',');
+  if (previousFiles !== entryFiles) {
+    return false;
+  }
+
+  const previousText = canonicalTranscriptText(previous.text);
+  const entryText = canonicalTranscriptText(entry.text);
+  if (previousText && entryText && previousText === entryText) {
+    return true;
+  }
+
+  const previousTime = Date.parse(previous.timestamp || '');
+  const entryTime = Date.parse(entry.timestamp || '');
+  const near = Number.isFinite(previousTime) && Number.isFinite(entryTime) && Math.abs(entryTime - previousTime) <= 30000;
+  if (!near) {
+    return false;
+  }
+  if (previousText.length >= 80 && entryText.includes(previousText)) {
+    return true;
+  }
+  if (entryText.length >= 80 && previousText.includes(entryText)) {
+    return true;
+  }
+  return false;
 }
 
 function sortTranscriptEntries(entries) {
@@ -613,9 +648,11 @@ const state = {
   pendingDirectoryRequests: new Map(),
   pendingHostProbes: new Map(),
   pendingModelRequests: new Map(),
+  pendingSkillRequests: new Map(),
   pendingFileRequests: new Map(),
   chunkedUploads: new Map(),
   sessionDiscoveryRequests: new Map(),
+  inputRequestCache: new Map(),
   localAgents: new Map(),
   askpassActions: new Map(),
   sshMultiplexDisabled: new Map(),
@@ -890,6 +927,59 @@ function getHostUnavailableError(hostId) {
     return { statusCode: 409, error: `host ${host.label || hostId} is offline` };
   }
   return null;
+}
+
+function normalizeClientRequestId(value) {
+  const text = String(value || '').trim().slice(0, 160);
+  return /^[A-Za-z0-9._:-]+$/.test(text) ? text : '';
+}
+
+function inputRequestCacheKey(hostId, sessionId, clientRequestId) {
+  const requestId = normalizeClientRequestId(clientRequestId);
+  return requestId ? `${hostId}::${sessionId}::${requestId}` : '';
+}
+
+function pruneInputRequestCache() {
+  const now = Date.now();
+  for (const [key, entry] of state.inputRequestCache.entries()) {
+    if (!entry?.createdAtMs || now - entry.createdAtMs > INPUT_REQUEST_DEDUPE_TTL_MS) {
+      state.inputRequestCache.delete(key);
+    }
+  }
+  while (state.inputRequestCache.size > INPUT_REQUEST_DEDUPE_LIMIT) {
+    const oldestKey = state.inputRequestCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    state.inputRequestCache.delete(oldestKey);
+  }
+}
+
+function getCachedInputRequest(cacheKey) {
+  if (!cacheKey) {
+    return null;
+  }
+  pruneInputRequestCache();
+  const entry = state.inputRequestCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() - entry.createdAtMs > INPUT_REQUEST_DEDUPE_TTL_MS) {
+    state.inputRequestCache.delete(cacheKey);
+    return null;
+  }
+  return entry.payload || null;
+}
+
+function rememberInputRequest(cacheKey, payload) {
+  if (!cacheKey) {
+    return;
+  }
+  pruneInputRequestCache();
+  state.inputRequestCache.set(cacheKey, {
+    createdAtMs: Date.now(),
+    payload,
+  });
 }
 
 function getHostCapabilityError(hostId, capability, message) {
@@ -1453,22 +1543,99 @@ function compactSessionDiagnostics(entries) {
   return normalized.slice(-400);
 }
 
-function getSessionDetail(hostId, sessionId) {
+function loadSessionTranscriptFromRollout(session) {
+  const rolloutPath = resolveSessionRolloutPath(session);
+  if (!rolloutPath) {
+    return [];
+  }
+
+  try {
+    return extractSessionTranscript(rolloutPath, { maxChars: Infinity });
+  } catch (_) {
+    return [];
+  }
+}
+
+function mergeExportTranscriptFiles(previousFiles, nextFiles) {
+  const merged = [];
+  const seen = new Set();
+  for (const file of [...(Array.isArray(previousFiles) ? previousFiles : []), ...(Array.isArray(nextFiles) ? nextFiles : [])]) {
+    const key = [
+      file?.fileId || '',
+      file?.path || file?.remotePath || '',
+      file?.name || '',
+      file?.mime || '',
+    ].join('\u0000');
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(file);
+  }
+  return merged;
+}
+
+function mergeExportTranscriptEntries(entries) {
+  const merged = [];
+  for (const entry of sortTranscriptEntries(
+    (Array.isArray(entries) ? entries : [])
+      .map(normalizeStoredTranscriptEntry)
+      .filter(Boolean)
+  )) {
+    const previous = merged[merged.length - 1];
+    if (previous && previous.speaker === entry.speaker) {
+      const previousText = canonicalTranscriptText(previous.text);
+      const entryText = canonicalTranscriptText(entry.text);
+      const previousTime = Date.parse(previous.timestamp || '');
+      const entryTime = Date.parse(entry.timestamp || '');
+      const near = Number.isFinite(previousTime) && Number.isFinite(entryTime) && Math.abs(entryTime - previousTime) <= 30000;
+      if (
+        near
+        && previousText
+        && entryText
+        && (
+          previousText === entryText
+          || previousText.includes(entryText)
+          || entryText.includes(previousText)
+        )
+      ) {
+        if (entryText.length > previousText.length) {
+          previous.text = entry.text;
+        }
+        previous.files = mergeExportTranscriptFiles(previous.files, entry.files);
+        if (!previous.stream && entry.stream) {
+          previous.stream = entry.stream;
+        }
+        continue;
+      }
+    }
+    merged.push({
+      ...entry,
+      files: mergeExportTranscriptFiles([], entry.files),
+    });
+  }
+  return compactTranscriptEntries(merged);
+}
+
+function getSessionDetail(hostId, sessionId, options = {}) {
   let session = getSession(hostId, sessionId);
   if (!session) {
     return null;
   }
 
   const key = sessionKey(hostId, sessionId);
-  const rawTranscript = state.sessionLogs.get(key) || session.transcriptPreview || [];
-  const transcript = compactTranscriptEntries(mergeByFingerprint(
-    (Array.isArray(rawTranscript) ? rawTranscript : [])
-      .map(normalizeStoredTranscriptEntry)
-      .filter(Boolean),
-    transcriptFingerprint,
-    SESSION_LOG_ENTRY_LIMIT
-  )).slice(-SESSION_LOG_ENTRY_LIMIT);
-  if (state.sessionLogs.has(key) && transcript.length !== rawTranscript.length) {
+  const storedTranscript = state.sessionLogs.get(key) || session.transcriptPreview || [];
+  const rolloutTranscript = options.fullTranscript ? loadSessionTranscriptFromRollout(session) : [];
+  const transcript = options.fullTranscript
+    ? mergeExportTranscriptEntries([...storedTranscript, ...rolloutTranscript])
+    : compactTranscriptEntries(mergeByFingerprint(
+      (Array.isArray(storedTranscript) ? storedTranscript : [])
+        .map(normalizeStoredTranscriptEntry)
+        .filter(Boolean),
+      transcriptFingerprint,
+      SESSION_LOG_ENTRY_LIMIT
+    )).slice(-SESSION_LOG_ENTRY_LIMIT);
+  if (!options.fullTranscript && state.sessionLogs.has(key) && transcript.length !== storedTranscript.length) {
     state.sessionLogs.set(key, transcript);
     saveSessionLogs();
   }
@@ -1631,10 +1798,223 @@ function parseExportBoolean(value, fallback = false) {
   return fallback;
 }
 
+function exportFileExtension(value) {
+  const text = String(value || '').trim().toLowerCase();
+  const leaf = text.split(/[\\/]/).filter(Boolean).pop() || '';
+  const index = leaf.lastIndexOf('.');
+  if (index === -1) {
+    return 'no-ext';
+  }
+  return leaf.slice(index + 1).replace(/^\.+/, '') || 'no-ext';
+}
+
+function normalizeExportExtension(value) {
+  return String(value || '').trim().toLowerCase().replace(/^\.+/, '') || 'no-ext';
+}
+
+function exportFileIdentity(file) {
+  return String(file?.fileId || file?.path || file?.remotePath || file?.name || '').trim();
+}
+
+function exportFileIsImage(file) {
+  const mime = String(file?.mime || file?.type || '').toLowerCase();
+  const ext = exportFileExtension(file?.name || file?.path || file?.remotePath || '');
+  return Boolean(file?.isImage) || mime.startsWith('image/') || ['gif', 'jpeg', 'jpg', 'png', 'svg', 'webp'].includes(ext);
+}
+
+function parseExportList(value) {
+  return new Set(String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean));
+}
+
+function parseExportExtensionList(value) {
+  return new Set(Array.from(parseExportList(value), (item) => normalizeExportExtension(item)));
+}
+
+function parseExportDate(value, mode = 'start') {
+  const text = String(value || '').trim();
+  if (!text) {
+    return null;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    return new Date(`${text}T${mode === 'end' ? '23:59:59.999' : '00:00:00.000'}`);
+  }
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function normalizeSessionExportOptions(options = {}) {
+  const fromDate = parseExportDate(options.fromDate || options.startDate || '', 'start');
+  const toDate = parseExportDate(options.toDate || options.endDate || '', 'end');
+  const startIndex = Math.max(1, Number(options.startIndex || 1) || 1);
+  const endIndex = Math.max(startIndex, Number(options.endIndex || 0) || Number.MAX_SAFE_INTEGER);
+  const extensions = options.extensions instanceof Set
+    ? new Set(Array.from(options.extensions, (item) => normalizeExportExtension(item)))
+    : parseExportExtensionList(options.extensions);
+  const fileIds = options.fileIds instanceof Set ? options.fileIds : parseExportList(options.fileIds);
   return {
     includeThinking: Boolean(options.includeThinking),
+    includeImages: options.includeImages !== false,
+    includeFiles: options.includeFiles !== false,
+    includeAllFiles: options.includeAllFiles !== false,
+    filterExtensions: Boolean(options.filterExtensions),
+    fromDate,
+    toDate,
+    startIndex,
+    endIndex,
+    extensions,
+    fileIds,
   };
+}
+
+function exportFileAllowed(file, exportOptions) {
+  const isImage = exportFileIsImage(file);
+  if (!exportOptions.includeImages && isImage) {
+    return false;
+  }
+  if (!exportOptions.includeFiles && !isImage) {
+    return false;
+  }
+  const extension = exportFileExtension(file?.name || file?.path || file?.remotePath || '');
+  if (exportOptions.filterExtensions && !exportOptions.extensions.has(extension)) {
+    return false;
+  }
+  if (!exportOptions.includeAllFiles) {
+    return exportOptions.fileIds.has(exportFileIdentity(file));
+  }
+  return true;
+}
+
+function filterSessionDetailForExport(detail, exportOptions) {
+  const transcript = filterTranscriptForExport(detail.transcript, exportOptions);
+  const receivedFiles = (Array.isArray(detail.receivedFiles) ? detail.receivedFiles : [])
+    .filter((file) => exportFileAllowed(file, exportOptions));
+  return {
+    ...detail,
+    transcript,
+    receivedFiles,
+  };
+}
+
+function exportDayKey(value) {
+  const parsed = value ? new Date(value) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) {
+    return '';
+  }
+  return parsed.toISOString().slice(0, 10);
+}
+
+function exportEarliestTimestamp(left, right) {
+  if (!left) {
+    return right || null;
+  }
+  if (!right) {
+    return left || null;
+  }
+  return Date.parse(right) < Date.parse(left) ? right : left;
+}
+
+function exportLatestTimestamp(left, right) {
+  if (!left) {
+    return right || null;
+  }
+  if (!right) {
+    return left || null;
+  }
+  return Date.parse(right) > Date.parse(left) ? right : left;
+}
+
+function buildSessionExportSummary(detail) {
+  const session = detail?.session || {};
+  const transcript = (Array.isArray(detail?.transcript) ? detail.transcript : [])
+    .filter((entry) => entry && ['user', 'agent', 'assistant', 'system'].includes(entry.speaker || ''));
+  const dayStats = new Map();
+  let firstMessageAt = null;
+  let lastMessageAt = null;
+
+  for (const entry of transcript) {
+    const day = exportDayKey(entry.timestamp);
+    if (!day) {
+      continue;
+    }
+    const stats = dayStats.get(day) || {
+      date: day,
+      messageCount: 0,
+      userCount: 0,
+      agentCount: 0,
+      firstTimestamp: entry.timestamp,
+      lastTimestamp: entry.timestamp,
+    };
+    stats.messageCount += 1;
+    if (entry.speaker === 'user') {
+      stats.userCount += 1;
+    }
+    if (entry.speaker === 'agent' || entry.speaker === 'assistant') {
+      stats.agentCount += 1;
+    }
+    stats.firstTimestamp = exportEarliestTimestamp(stats.firstTimestamp, entry.timestamp);
+    stats.lastTimestamp = exportLatestTimestamp(stats.lastTimestamp, entry.timestamp);
+    dayStats.set(day, stats);
+    firstMessageAt = exportEarliestTimestamp(firstMessageAt, entry.timestamp);
+    lastMessageAt = exportLatestTimestamp(lastMessageAt, entry.timestamp);
+  }
+
+  return {
+    session: {
+      hostId: session.hostId || null,
+      sessionId: session.sessionId || null,
+      title: session.title || null,
+      createdAt: session.createdAt || null,
+      updatedAt: session.lastUpdatedAt || session.updatedAt || null,
+      firstMessageAt,
+      lastMessageAt,
+      messageCount: transcript.length,
+    },
+    days: Array.from(dayStats.values())
+      .sort((a, b) => String(a.date).localeCompare(String(b.date))),
+  };
+}
+
+function serializeSessionExportOptions(options = {}) {
+  const exportOptions = normalizeSessionExportOptions(options);
+  return {
+    ...exportOptions,
+    fromDate: exportOptions.fromDate ? exportOptions.fromDate.toISOString() : null,
+    toDate: exportOptions.toDate ? exportOptions.toDate.toISOString() : null,
+    extensions: Array.from(exportOptions.extensions || []),
+    fileIds: Array.from(exportOptions.fileIds || []),
+  };
+}
+
+function filterTranscriptForExport(transcript, exportOptions) {
+  const entries = (Array.isArray(transcript) ? transcript : [])
+    .filter((entry) => entry && ['user', 'agent', 'assistant', 'system'].includes(entry.speaker || ''))
+    .filter((entry) => {
+      if (!exportOptions.fromDate && !exportOptions.toDate) {
+        return true;
+      }
+      const timestamp = Date.parse(entry.timestamp || '');
+      if (!Number.isFinite(timestamp)) {
+        return false;
+      }
+      if (exportOptions.fromDate && timestamp < exportOptions.fromDate.getTime()) {
+        return false;
+      }
+      if (exportOptions.toDate && timestamp > exportOptions.toDate.getTime()) {
+        return false;
+      }
+      return true;
+    });
+  const rangedEntries = (exportOptions.fromDate || exportOptions.toDate)
+    ? entries
+    : entries.slice(exportOptions.startIndex - 1, exportOptions.endIndex);
+  return rangedEntries
+    .map((entry) => ({
+      ...entry,
+      files: (Array.isArray(entry.files) ? entry.files : []).filter((file) => exportFileAllowed(file, exportOptions)),
+    }));
 }
 
 function formatExportDiagnosticEntry(entry) {
@@ -1761,7 +2141,7 @@ function buildSessionJsonExport(detail, options = {}) {
   return {
     exportedAt: nowIso(),
     version: 1,
-    exportOptions,
+    exportOptions: serializeSessionExportOptions(exportOptions),
     ...detail,
     diagnostics: exportOptions.includeThinking ? detail.diagnostics : [],
   };
@@ -1989,7 +2369,12 @@ function getSessionCachedFileRecords(session) {
 
 function prepareSessionBundleFiles(detail) {
   const usedPaths = new Set(['session.md', 'session.json', 'manifest.json']);
-  return getSessionCachedFileRecords(detail.session).map((file) => ({
+  const allowedIds = new Set((Array.isArray(detail.receivedFiles) ? detail.receivedFiles : [])
+    .map((file) => exportFileIdentity(file))
+    .filter(Boolean));
+  return getSessionCachedFileRecords(detail.session)
+    .filter((file) => allowedIds.has(exportFileIdentity(file)))
+    .map((file) => ({
     ...file,
     zipPath: uniqueZipPath(usedPaths, 'files', file.name || file.remotePath || file.fileId),
   }));
@@ -2001,7 +2386,7 @@ function buildSessionBundleManifest(detail, bundleFiles, options = {}) {
   return {
     exportedAt: nowIso(),
     version: 1,
-    exportOptions,
+    exportOptions: serializeSessionExportOptions(exportOptions),
     title: sessionExportTitle(detail.session),
     session: detail.session,
     referencedFiles,
@@ -2088,6 +2473,7 @@ function normalizeFileTransferRefs(rawFiles) {
       size: Number(rawFile.size || 0) || 0,
       mime: String(rawFile.mime || rawFile.type || 'application/octet-stream').trim() || 'application/octet-stream',
       isImage: Boolean(rawFile.isImage) || /^image\//i.test(String(rawFile.mime || rawFile.type || '')),
+      cached: Boolean(rawFile.cached),
       uploadedAt: rawFile.uploadedAt || rawFile.timestamp || nowIso(),
     });
   }
@@ -2277,9 +2663,12 @@ function resolvePendingSessionRequests(hostId, sessionId, patch = {}) {
 
 function appendSessionLog(hostId, sessionId, entry) {
   const key = sessionKey(hostId, sessionId);
-  const existing = state.sessionLogs.get(key) || [];
+  const existing = compactTranscriptEntries(state.sessionLogs.get(key) || []);
   const nextEntry = normalizeStoredTranscriptEntry(entry);
   if (!nextEntry) {
+    return null;
+  }
+  if (isAdjacentTranscriptDuplicate(existing[existing.length - 1], nextEntry)) {
     return null;
   }
   existing.push(nextEntry);
@@ -2623,17 +3012,23 @@ function getSessionTitleIdentities(existing, patch = {}) {
 }
 
 function findSessionMetadataTitle(hostId, identities = []) {
+  const entry = findSessionMetadataEntry(hostId, identities);
+  return entry?.title || '';
+}
+
+function findSessionMetadataEntry(hostId, identities = []) {
   for (const identity of identities) {
     const entry = state.sessionMetadata.get(sessionMetadataKey(hostId, identity));
     if (entry?.title && isMeaningfulSessionTitle(entry.title, identities)) {
-      return entry.title;
+      return entry;
     }
   }
-  return '';
+  return null;
 }
 
 function rememberSessionTitle(hostId, identities = [], title, options = {}) {
   const normalizedTitle = normalizeSessionTitle(title);
+  const source = String(options.source || 'metadata').trim() || 'metadata';
   const uniqueIdentities = Array.from(new Set((identities || [])
     .filter(Boolean)
     .map((value) => String(value).trim())
@@ -2646,6 +3041,9 @@ function rememberSessionTitle(hostId, identities = [], title, options = {}) {
   for (const identity of uniqueIdentities) {
     const key = sessionMetadataKey(hostId, identity);
     const existing = state.sessionMetadata.get(key);
+    if (!shouldOverwriteSessionMetadata(existing, source)) {
+      continue;
+    }
     if (existing?.title === normalizedTitle && existing?.cwd === (options.cwd || existing.cwd || '')) {
       continue;
     }
@@ -2654,7 +3052,7 @@ function rememberSessionTitle(hostId, identities = [], title, options = {}) {
       identity,
       title: normalizedTitle,
       cwd: String(options.cwd || existing?.cwd || '').trim(),
-      source: String(options.source || existing?.source || 'metadata').trim() || 'metadata',
+      source,
       updatedAt: nowIso(),
     });
     changed = true;
@@ -2668,17 +3066,42 @@ function rememberSessionTitle(hostId, identities = [], title, options = {}) {
 function resolveSessionTitle(hostId, existing, patch = {}) {
   const identities = getSessionTitleIdentities(existing, patch);
   const explicitTitle = normalizeSessionTitle(patch.title || '');
+  const patchSource = String(patch.source || existing?.source || 'session').trim() || 'session';
+  const existingManualTitle = normalizeSessionTitle(existing?.title || '');
+  if (
+    existing?.manualTitle
+    && patch.titleSource !== 'manual'
+    && patchSource !== 'manual'
+    && isMeaningfulSessionTitle(existingManualTitle, identities)
+  ) {
+    return existingManualTitle;
+  }
+  const storedEntry = findSessionMetadataEntry(hostId, identities);
+  if (
+    storedEntry?.title
+    && sessionTitleSourcePriority(storedEntry.source) > sessionTitleSourcePriority(patchSource)
+    && !(patchSource === 'manual' && isMeaningfulSessionTitle(explicitTitle, identities))
+  ) {
+    return storedEntry.title;
+  }
+
   if (isMeaningfulSessionTitle(explicitTitle, identities)) {
     rememberSessionTitle(hostId, identities, explicitTitle, {
       cwd: patch.cwd || existing?.cwd || '',
-      source: patch.source || existing?.source || 'session',
+      source: patchSource,
     });
+    const nextStoredEntry = findSessionMetadataEntry(hostId, identities);
+    if (
+      nextStoredEntry?.title
+      && sessionTitleSourcePriority(nextStoredEntry.source) > sessionTitleSourcePriority(patchSource)
+    ) {
+      return nextStoredEntry.title;
+    }
     return explicitTitle;
   }
 
-  const storedTitle = findSessionMetadataTitle(hostId, identities);
-  if (storedTitle) {
-    return storedTitle;
+  if (storedEntry?.title) {
+    return storedEntry.title;
   }
 
   const existingTitle = normalizeSessionTitle(existing?.title || '');
@@ -2687,6 +3110,10 @@ function resolveSessionTitle(hostId, existing, patch = {}) {
       cwd: patch.cwd || existing?.cwd || '',
       source: existing?.source || patch.source || 'session',
     });
+    const nextStoredEntry = findSessionMetadataEntry(hostId, identities);
+    if (nextStoredEntry?.title) {
+      return nextStoredEntry.title;
+    }
     return existingTitle;
   }
 
@@ -2748,6 +3175,8 @@ function updateSessionTitle(hostId, sessionId, title, options = {}) {
   const next = {
     ...session,
     title: normalizedTitle,
+    manualTitle: true,
+    titleSource: 'manual',
     lastUpdatedAt: options.touch === false ? session.lastUpdatedAt : nowIso(),
   };
   state.sessions.set(sessionKey(hostId, sessionId), next);
@@ -5032,11 +5461,11 @@ function awaitHostProbe(requestId, timeoutMs = 5000) {
   });
 }
 
-function awaitModelListRequest(requestId, timeoutMs = 15000) {
+function awaitModelListRequest(requestId, timeoutMs = 35000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       state.pendingModelRequests.delete(requestId);
-      reject(new Error('model list request timed out'));
+      reject(new Error('model list request timed out while waiting for host-agent / Codex app-server to respond'));
     }, timeoutMs);
 
     state.pendingModelRequests.set(requestId, {
@@ -5048,6 +5477,28 @@ function awaitModelListRequest(requestId, timeoutMs = 15000) {
       reject: (error) => {
         clearTimeout(timer);
         state.pendingModelRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function awaitSkillListRequest(requestId, timeoutMs = 35000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingSkillRequests.delete(requestId);
+      reject(new Error('skill list request timed out while waiting for host-agent / Codex app-server to respond'));
+    }, timeoutMs);
+
+    state.pendingSkillRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingSkillRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingSkillRequests.delete(requestId);
         reject(error);
       },
     });
@@ -5392,6 +5843,105 @@ function serveReceivedFile(res, record, inline) {
     'Access-Control-Allow-Origin': '*',
   });
   res.end(buffer);
+}
+
+function extensionForImageMime(mime = '') {
+  const normalized = String(mime || '').toLowerCase();
+  if (normalized === 'image/jpeg') {
+    return 'jpg';
+  }
+  if (normalized === 'image/svg+xml') {
+    return 'svg';
+  }
+  const match = normalized.match(/^image\/([a-z0-9.+-]+)$/);
+  return match ? match[1].replace(/[^a-z0-9]+/g, '').slice(0, 12) || 'png' : 'png';
+}
+
+function parseDataUrlImage(value = '') {
+  const text = String(value || '').trim();
+  const match = text.match(/^data:(image\/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\r\n]+)$/);
+  if (!match) {
+    return null;
+  }
+  const mime = match[1].toLowerCase();
+  const buffer = Buffer.from(match[2].replace(/\s+/g, ''), 'base64');
+  if (!buffer.length || buffer.length > MAX_FILE_TRANSFER_BYTES) {
+    return null;
+  }
+  return { mime, buffer };
+}
+
+function cacheInlineImageInputFiles(hostId, sessionId, inputItems = []) {
+  const files = [];
+  for (const [index, item] of (Array.isArray(inputItems) ? inputItems : []).entries()) {
+    if (item?.type !== 'image') {
+      continue;
+    }
+    const parsed = parseDataUrlImage(item.url || item.dataUrl || '');
+    if (!parsed) {
+      continue;
+    }
+    const extension = extensionForImageMime(parsed.mime);
+    const name = safeFileDisplayName(item.name || `image-${index + 1}.${extension}`, `image-${index + 1}.${extension}`);
+    const virtualId = makeId();
+    const record = storeReceivedFile({
+      hostId,
+      sessionId,
+      remotePath: `/inline-inputs/${sessionId}/${virtualId}-${name}`,
+      name,
+      mime: parsed.mime,
+      buffer: parsed.buffer,
+    });
+    files.push({
+      fileId: record.fileId,
+      name: record.name,
+      path: record.remotePath,
+      size: record.size,
+      mime: record.mime,
+      isImage: true,
+      cached: true,
+      uploadedAt: record.receivedAt,
+    });
+  }
+  return files;
+}
+
+function cacheInlineTextFiles(hostId, sessionId, rawFiles = []) {
+  const files = [];
+  for (const [index, rawFile] of (Array.isArray(rawFiles) ? rawFiles.slice(0, 8) : []).entries()) {
+    if (!rawFile || typeof rawFile !== 'object') {
+      continue;
+    }
+    const text = String(rawFile.text || rawFile.content || '');
+    if (!text && !rawFile.name) {
+      continue;
+    }
+    const buffer = Buffer.from(text, 'utf8');
+    if (buffer.length > MAX_FILE_TRANSFER_BYTES) {
+      continue;
+    }
+    const name = safeFileDisplayName(rawFile.name || `attachment-${index + 1}.txt`, `attachment-${index + 1}.txt`);
+    const virtualId = makeId();
+    const record = storeReceivedFile({
+      hostId,
+      sessionId,
+      remotePath: `/inline-files/${sessionId}/${virtualId}-${name}`,
+      name,
+      mime: String(rawFile.mime || rawFile.type || 'text/plain; charset=utf-8').trim() || 'text/plain; charset=utf-8',
+      buffer,
+    });
+    files.push({
+      fileId: record.fileId,
+      name: record.name,
+      path: record.remotePath,
+      size: record.size,
+      mime: record.mime,
+      isImage: false,
+      cached: true,
+      uploadedAt: record.receivedAt,
+    });
+  }
+  return files;
 }
 
 function normalizeTurnInputItems(rawItems) {
@@ -6765,37 +7315,67 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/export-summary$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = url.searchParams.get('hostId');
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+
+    const detail = getSessionDetail(hostId, sessionId, { fullTranscript: true });
+    if (!detail) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+
+    sendJson(res, 200, buildSessionExportSummary(detail));
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/export$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const hostId = url.searchParams.get('hostId');
     const format = String(url.searchParams.get('format') || 'markdown').trim().toLowerCase();
     const exportOptions = {
       includeThinking: parseExportBoolean(url.searchParams.get('includeThinking'), false),
+      includeImages: parseExportBoolean(url.searchParams.get('includeImages'), true),
+      includeFiles: parseExportBoolean(url.searchParams.get('includeFiles'), true),
+      includeAllFiles: parseExportBoolean(url.searchParams.get('includeAllFiles'), true),
+      filterExtensions: parseExportBoolean(url.searchParams.get('filterExtensions'), false),
+      fromDate: url.searchParams.get('fromDate') || '',
+      toDate: url.searchParams.get('toDate') || '',
+      startIndex: Number(url.searchParams.get('startIndex') || 1) || 1,
+      endIndex: Number(url.searchParams.get('endIndex') || 0) || Number.MAX_SAFE_INTEGER,
+      extensions: parseExportExtensionList(url.searchParams.get('extensions')),
+      fileIds: parseExportList(url.searchParams.get('fileIds')),
     };
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
 
-    const detail = getSessionDetail(hostId, sessionId);
+    const detail = getSessionDetail(hostId, sessionId, { fullTranscript: true });
     if (!detail) {
       sendJson(res, 404, { error: 'session not found' });
       return;
     }
 
+    const exportDetail = filterSessionDetailForExport(detail, normalizeSessionExportOptions(exportOptions));
+
     if (format === 'json') {
-      const body = JSON.stringify(buildSessionJsonExport(detail, exportOptions), null, 2);
+      const body = JSON.stringify(buildSessionJsonExport(exportDetail, exportOptions), null, 2);
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Content-Length': Buffer.byteLength(body),
-        'Content-Disposition': contentDispositionValue('attachment', `${sessionExportBaseName(detail.session)}.json`),
+        'Content-Disposition': contentDispositionValue('attachment', `${sessionExportBaseName(exportDetail.session)}.json`),
       });
       res.end(body);
       return;
     }
 
     if (format === 'zip' || format === 'bundle') {
-      await streamSessionZipExport(res, detail, exportOptions);
+      await streamSessionZipExport(res, exportDetail, exportOptions);
       return;
     }
 
@@ -6804,11 +7384,11 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const body = buildSessionMarkdownExport(detail, exportOptions);
+    const body = buildSessionMarkdownExport(exportDetail, exportOptions);
     res.writeHead(200, {
       'Content-Type': 'text/markdown; charset=utf-8',
       'Content-Length': Buffer.byteLength(body),
-      'Content-Disposition': contentDispositionValue('attachment', `${sessionExportBaseName(detail.session)}.md`),
+      'Content-Disposition': contentDispositionValue('attachment', `${sessionExportBaseName(exportDetail.session)}.md`),
     });
     res.end(body);
     return;
@@ -7100,12 +7680,67 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/skills$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = url.searchParams.get('hostId');
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+
+    const session = getSession(hostId, sessionId);
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (!session.live) {
+      sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+
+    const host = state.hosts.get(hostId);
+    if (!host?.capabilities?.skillList) {
+      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can list Codex skills' });
+      return;
+    }
+
+    const requestId = makeId();
+    const pending = awaitSkillListRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'session.skills_list',
+      sessionId,
+      requestId,
+      cwd: session.cwd || null,
+      forceReload: url.searchParams.get('forceReload') === 'true',
+    });
+
+    try {
+      const payload = await pending;
+      sendJson(res, 200, payload);
+    } catch (error) {
+      const statusCode = /not live|no live session/i.test(error.message || '') ? 409 : 504;
+      sendJson(res, statusCode, { error: error.message });
+    }
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/input$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const body = await readBody(req);
     const hostId = body.hostId;
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const inputCacheKey = inputRequestCacheKey(hostId, sessionId, body.clientRequestId);
+    const cachedInput = getCachedInputRequest(inputCacheKey);
+    if (cachedInput) {
+      sendJson(res, 200, cachedInput);
       return;
     }
     const hostError = getHostUnavailableError(hostId);
@@ -7136,7 +7771,8 @@ async function handleRequest(req, res) {
       return;
     }
     const host = state.hosts.get(hostId);
-    if (inputItems.length && !host?.capabilities?.imageInput) {
+    const hasImageInputItems = inputItems.some((item) => item.type === 'image' || item.type === 'localImage');
+    if (hasImageInputItems && !host?.capabilities?.imageInput) {
       sendJson(res, 409, { error: 'this host agent needs to be restarted before it can receive image inputs' });
       return;
     }
@@ -7155,11 +7791,14 @@ async function handleRequest(req, res) {
       sendJson(res, 409, { error: 'this host agent needs to be restarted before it can use Codex turn controls' });
       return;
     }
+    const inlineImageFiles = cacheInlineImageInputFiles(hostId, sessionId, inputItems);
+    const inlineTextFiles = cacheInlineTextFiles(hostId, sessionId, body.inlineFiles || body.inlineFileRefs || []);
+    const transcriptFiles = normalizeFileTransferRefs([...uploadedFiles, ...inlineImageFiles, ...inlineTextFiles]);
 
     emitTranscriptEntry(hostId, sessionId, {
       speaker: 'user',
       text: transcriptText,
-      files: uploadedFiles,
+      files: transcriptFiles,
       timestamp: nowIso(),
     });
     const apiConfig = normalizeApiConfig(body.apiConfig);
@@ -7199,7 +7838,9 @@ async function handleRequest(req, res) {
       personality: String(body.personality || '').trim() || null,
       apiConfig,
     });
-    sendJson(res, 200, { ok: true, command });
+    const responsePayload = { ok: true, command };
+    rememberInputRequest(inputCacheKey, responsePayload);
+    sendJson(res, 200, responsePayload);
     return;
   }
 
@@ -7629,6 +8270,22 @@ function applyAgentEvent(event) {
         pending.resolve({
           models: Array.isArray(event.models) ? event.models : [],
           nextCursor: event.nextCursor || null,
+          hostId: event.hostId,
+          sessionId: event.sessionId || null,
+        });
+      }
+    }
+    return;
+  }
+
+  if (event.type === 'session.skills_listed' && event.requestId) {
+    const pending = state.pendingSkillRequests.get(event.requestId);
+    if (pending) {
+      if (event.error) {
+        pending.reject(new Error(event.error));
+      } else {
+        pending.resolve({
+          data: Array.isArray(event.data) ? event.data : [],
           hostId: event.hostId,
           sessionId: event.sessionId || null,
         });
