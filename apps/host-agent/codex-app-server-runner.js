@@ -1569,9 +1569,17 @@ class CodexAppServerRunner {
     return this.activeTurnId;
   }
 
-  async compactThread() {
+  async compactThread(options = {}) {
     if (!this.threadId) {
       throw new Error('No thread is available to compact.');
+    }
+
+    const requestedApiConfig = normalizeApiConfig(options.apiConfig);
+    if (requestedApiConfig && !apiConfigsRuntimeEqual(this.apiConfig, requestedApiConfig)) {
+      throw new Error(
+        `API profile changed from ${describeApiConfig(this.apiConfig)} to ${describeApiConfig(requestedApiConfig)}. `
+        + 'Codex app-server reads API settings at process startup; restart this managed session before compacting with the new host API mapping.'
+      );
     }
 
     await this.emitRuntime({
@@ -1586,6 +1594,9 @@ class CodexAppServerRunner {
       message: 'Thread compaction requested.',
       data: {
         threadId: this.threadId,
+        apiBaseUrl: this.apiConfig?.baseUrl || null,
+        apiProviderKey: this.apiProviderKey || null,
+        codexHomeProfile: this.runtime.codexHomeProfile || null,
       },
     });
 

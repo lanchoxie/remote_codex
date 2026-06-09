@@ -8147,11 +8147,17 @@ async function compactCurrentThread() {
     return;
   }
 
+  const apiConfig = getApiRequestConfig(session.hostId);
+  const body = {
+    hostId: session.hostId,
+  };
+  if (apiConfig) {
+    body.apiConfig = apiConfig;
+  }
+
   await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/compact`, {
     method: 'POST',
-    body: JSON.stringify({
-      hostId: session.hostId,
-    }),
+    body: JSON.stringify(body),
   });
 }
 

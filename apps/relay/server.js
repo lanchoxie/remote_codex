@@ -8040,6 +8040,16 @@ async function handleRequest(req, res) {
     }
 
     const session = getSession(hostId, sessionId);
+    const apiConfig = normalizeApiConfig(body.apiConfig);
+    const apiProfile = summarizeApiConfig(apiConfig);
+    if (session && apiProfile) {
+      const next = upsertSession(hostId, {
+        sessionId,
+        apiProfile,
+        lastUpdatedAt: nowIso(),
+      });
+      broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
+    }
     const command = enqueueCommand(hostId, {
       type: 'session.compact',
       sessionId,
@@ -8048,6 +8058,7 @@ async function handleRequest(req, res) {
       originSessionId: session?.originSessionId || null,
       sourceSessionId: session?.sourceSessionId || null,
       conversationKey: session?.conversationKey || null,
+      apiConfig,
     });
     sendJson(res, 200, { ok: true, command });
     return;

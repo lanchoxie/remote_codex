@@ -1413,7 +1413,19 @@ async function handleCommand(command) {
 
   if (command.type === 'session.compact') {
     if (typeof runner.compactThread === 'function') {
-      await runner.compactThread();
+      try {
+        await runner.compactThread({
+          apiConfig: normalizeApiConfig(command.apiConfig),
+        });
+      } catch (error) {
+        await postEvent({
+          type: 'session.error',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          message: `Unable to compact Codex thread: ${error.message}`,
+          timestamp: nowIso(),
+        });
+      }
       return;
     }
 
