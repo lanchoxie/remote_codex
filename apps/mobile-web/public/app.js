@@ -990,14 +990,51 @@ function getSessionApiProfileSummary(session) {
     };
   }
 
+  const mapped = getApiProfileForHost(session.hostId);
+  const mappedLabel = mapped?.label || mapped?.profileId || mapped?.provider || 'Default';
+  const mappedHasRuntimeConfig = Boolean(mapped?.baseUrl || mapped?.apiKey);
+  const runtimeRecorded = session.runtime && (
+    session.runtime.apiProfileLabel
+    || session.runtime.apiProfileId
+    || session.runtime.apiProvider
+    || session.runtime.apiBaseUrl
+  )
+    ? {
+      label: session.runtime.apiProfileLabel || session.runtime.apiProfileId || session.runtime.apiProvider || 'API profile',
+      profileId: session.runtime.apiProfileId || '',
+      provider: session.runtime.apiProvider || '',
+      baseUrl: session.runtime.apiBaseUrl || '',
+    }
+    : null;
   const recorded = session.apiProfile || session.runtime?.apiProfile || null;
-  if (recorded?.label || recorded?.profileId || recorded?.provider || recorded?.baseUrl) {
-    const label = recorded.label || recorded.profileId || recorded.provider || 'API profile';
+  const effectiveRecorded = recorded || runtimeRecorded;
+  if (effectiveRecorded?.label || effectiveRecorded?.profileId || effectiveRecorded?.provider || effectiveRecorded?.baseUrl) {
+    const recordedRuntimeKey = apiConfigFingerprint({
+      provider: effectiveRecorded.provider || '',
+      baseUrl: effectiveRecorded.baseUrl || '',
+      profileId: effectiveRecorded.profileId || '',
+      label: effectiveRecorded.label || '',
+    });
+    const mappedRuntimeKey = apiConfigFingerprint({
+      provider: mapped?.provider || '',
+      baseUrl: mapped?.baseUrl || '',
+      profileId: mapped?.profileId || '',
+      label: mapped?.label || '',
+    });
+    const label = effectiveRecorded.label || effectiveRecorded.profileId || effectiveRecorded.provider || 'API profile';
     const details = [
-      recorded.provider ? `Provider: ${recorded.provider}` : '',
-      recorded.baseUrl ? `Base URL: ${recorded.baseUrl}` : '',
-      recorded.profileId ? `Profile ID: ${recorded.profileId}` : '',
+      effectiveRecorded.provider ? `Provider: ${effectiveRecorded.provider}` : '',
+      effectiveRecorded.baseUrl ? `Base URL: ${effectiveRecorded.baseUrl}` : '',
+      effectiveRecorded.profileId ? `Profile ID: ${effectiveRecorded.profileId}` : '',
+      mapped && mappedRuntimeKey !== recordedRuntimeKey ? `Current host mapping: ${mappedLabel}${mapped.baseUrl ? ` (${mapped.baseUrl})` : ''}` : '',
     ].filter(Boolean).join('\n');
+    if (session.live && mapped && mappedRuntimeKey !== recordedRuntimeKey) {
+      return {
+        label: `API: ${label} (restart for ${mappedLabel})`,
+        title: `${details}\nRestart this live managed session to use the current host API mapping.`.trim(),
+        source: 'stale',
+      };
+    }
     return {
       label: `API: ${label}`,
       title: details || 'API profile recorded when this session started.',
@@ -1005,7 +1042,14 @@ function getSessionApiProfileSummary(session) {
     };
   }
 
-  const mapped = getApiProfileForHost(session.hostId);
+  if (session.live && session.runtime && mappedHasRuntimeConfig) {
+    return {
+      label: `API: default (restart for ${mappedLabel})`,
+      title: `This live managed session was started with the host default API environment.\nCurrent host mapping: ${mappedLabel}${mapped.baseUrl ? ` (${mapped.baseUrl})` : ''}\nRestart this session to use the mapped API profile.`,
+      source: 'stale',
+    };
+  }
+
   if (mapped) {
     return {
       label: `API: ${mapped.label || mapped.provider || 'Default'}`,
