@@ -3528,6 +3528,57 @@ function apiConfigFingerprint(config) {
   });
 }
 
+function apiProfileDisplayFingerprint(config) {
+  if (!config) {
+    return '';
+  }
+  return JSON.stringify({
+    provider: String(config.provider || ''),
+    baseUrl: String(config.baseUrl || '').replace(/\/+$/, ''),
+    profileId: String(config.profileId || ''),
+    label: String(config.label || ''),
+  });
+}
+
+function getSessionRecordedApiProfile(session) {
+  if (!session) {
+    return null;
+  }
+  const recorded = session.apiProfile || session.runtime?.apiProfile || null;
+  if (recorded?.label || recorded?.profileId || recorded?.provider || recorded?.baseUrl) {
+    return recorded;
+  }
+  if (
+    session.runtime?.apiProfileLabel
+    || session.runtime?.apiProfileId
+    || session.runtime?.apiProvider
+    || session.runtime?.apiBaseUrl
+  ) {
+    return {
+      label: session.runtime.apiProfileLabel || session.runtime.apiProfileId || session.runtime.apiProvider || 'API profile',
+      profileId: session.runtime.apiProfileId || '',
+      provider: session.runtime.apiProvider || '',
+      baseUrl: session.runtime.apiBaseUrl || '',
+    };
+  }
+  return null;
+}
+
+function isLiveSessionApiMappingStale(session) {
+  if (!session?.live || session.source !== 'managed') {
+    return false;
+  }
+  const mapped = getApiProfileForHost(session.hostId);
+  if (!mapped || (!mapped.baseUrl && !mapped.apiKey)) {
+    return false;
+  }
+  const recorded = getSessionRecordedApiProfile(session);
+  if (!recorded) {
+    return Boolean(session.runtime);
+  }
+  return apiProfileDisplayFingerprint(recorded) !== apiProfileDisplayFingerprint(mapped);
+}
+
 function snapshotHostApiFingerprints() {
   const snapshots = {};
   for (const host of state.hosts) {
@@ -3545,7 +3596,16 @@ function getApiChangedLiveSessions(previousSnapshot = {}) {
       changedHosts.push(host.hostId);
     }
   }
-  return getRelayManagedLiveSessions(changedHosts);
+  const sessionsByKey = new Map();
+  if (changedHosts.length) {
+    for (const session of getRelayManagedLiveSessions(changedHosts)) {
+      sessionsByKey.set(getSessionKey(session), session);
+    }
+  }
+  for (const session of getRelayManagedLiveSessions().filter(isLiveSessionApiMappingStale)) {
+    sessionsByKey.set(getSessionKey(session), session);
+  }
+  return Array.from(sessionsByKey.values());
 }
 
 function setConnectorManagerOpen(open) {
