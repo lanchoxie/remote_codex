@@ -1,8 +1,11 @@
 # Mobile Codex Remote 中文使用指南
 
+中文产品首页：[README.md](README.md)
+English guide: [README.en.md](README.en.md)
+
 Mobile Codex Remote 是一个用浏览器控制 Codex 会话的轻量控制台。它可以同时管理本地电脑、远程 Linux 主机和 HPC 集群上的 Codex 会话，让你在桌面浏览器或手机上新建、恢复、派生、打断、引导、审查、导入导出和监控长时间运行的 Codex 工作。
 
-英文 README: [README.md](README.md)
+英文 README: [README.en.md](README.en.md)
 本次更新报告: [docs/update-report-2026-06-05.md](docs/update-report-2026-06-05.md)
 v2.01 阶段说明归档: [README_v2.01.md](README_v2.01.md)
 
