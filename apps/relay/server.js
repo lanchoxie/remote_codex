@@ -44,6 +44,9 @@ const FILE_TRANSFER_CHUNK_BYTES = Number(process.env.RELAY_FILE_TRANSFER_CHUNK_B
 const CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES = Number(process.env.RELAY_CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES || 16 * 1024 * 1024);
 const RECEIVED_FILE_TTL_MS = Number(process.env.RELAY_RECEIVED_FILE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const SESSION_LOG_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_LOG_ENTRY_LIMIT || 1000);
+const SESSION_LIST_PREVIEW_LIMIT = Number(process.env.RELAY_SESSION_LIST_PREVIEW_LIMIT || 3);
+const SESSION_LIST_TEXT_LIMIT = Number(process.env.RELAY_SESSION_LIST_TEXT_LIMIT || 1200);
+const SESSION_LIST_LATEST_TEXT_LIMIT = Number(process.env.RELAY_SESSION_LIST_LATEST_TEXT_LIMIT || 1000);
 const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRIES || 1000);
 const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
 const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
@@ -1014,7 +1017,42 @@ function getHostList() {
 function getSessionsForHost(hostId) {
   return Array.from(state.sessions.values())
     .filter((session) => session.hostId === hostId)
-    .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
+    .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')))
+    .map(publicSessionListRecord);
+}
+
+function limitListText(value, max = SESSION_LIST_TEXT_LIMIT) {
+  const text = String(value || '');
+  if (!text || text.length <= max) {
+    return text;
+  }
+  const omitted = text.length - max;
+  return `${text.slice(0, max).trimEnd()}\n...[truncated ${omitted} chars for session list]`;
+}
+
+function publicTranscriptPreview(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .slice(-SESSION_LIST_PREVIEW_LIMIT)
+    .map((entry) => ({
+      timestamp: entry?.timestamp || null,
+      speaker: entry?.speaker || 'system',
+      text: limitListText(entry?.text || '', SESSION_LIST_TEXT_LIMIT),
+      stream: entry?.stream || null,
+      fileCount: Array.isArray(entry?.files) ? entry.files.length : 0,
+    }))
+    .filter((entry) => entry.text || entry.fileCount);
+}
+
+function publicSessionListRecord(session) {
+  if (!session || typeof session !== 'object') {
+    return session;
+  }
+  return {
+    ...session,
+    latestUserMessage: limitListText(session.latestUserMessage || '', SESSION_LIST_LATEST_TEXT_LIMIT) || null,
+    latestAgentMessage: limitListText(session.latestAgentMessage || '', SESSION_LIST_LATEST_TEXT_LIMIT) || null,
+    transcriptPreview: publicTranscriptPreview(session.transcriptPreview),
+  };
 }
 
 function requestHostSessionDiscovery(hostId) {
@@ -6265,8 +6303,9 @@ function sendSse(res, eventName, payload) {
     return false;
   }
   try {
+    const eventPayload = publicSessionEventPayload(eventName, payload);
     res.write(`event: ${eventName}\n`);
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    res.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
     return true;
   } catch (error) {
     if (!isClientAbortError(error)) {
@@ -6274,6 +6313,13 @@ function sendSse(res, eventName, payload) {
     }
     return false;
   }
+}
+
+function publicSessionEventPayload(eventName, payload) {
+  if (eventName === 'session.snapshot' || eventName === 'session.started' || eventName === 'session.state_changed') {
+    return publicSessionListRecord(payload);
+  }
+  return payload;
 }
 
 function broadcastSessionEvent(hostId, sessionId, eventName, payload) {

@@ -38,6 +38,7 @@ const state = {
   transcriptEntryCounts: new Map(),
   transcriptUnread: new Set(),
   transcriptUserDetached: new Set(),
+  transcriptVisibleLimits: new Map(),
   manualSessionTitles: new Map(),
   alertWindowOpen: false,
   statusWindowOpen: false,
@@ -163,6 +164,8 @@ const MAX_COMPOSER_UPLOAD_FILES = 8;
 const MAX_COMPOSER_UPLOAD_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const TRANSCRIPT_RENDER_WINDOW = 160;
+const TRANSCRIPT_RENDER_INCREMENT = 160;
 const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
 const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
@@ -1451,6 +1454,10 @@ function limitText(value, max = 220) {
   return `${text.slice(0, Math.max(0, max - 3))}...`;
 }
 
+function limitSearchText(value, max = 1000) {
+  return limitText(value, max);
+}
+
 function summarizeData(value) {
   if (value === null || typeof value === 'undefined') {
     return '';
@@ -2315,16 +2322,16 @@ function getConversationSearchText(group) {
     ...titleValues,
     ...pathValues,
     group.conversationKey,
-    group.latestUserMessage,
-    group.latestAgentMessage,
+    limitSearchText(group.latestUserMessage),
+    limitSearchText(group.latestAgentMessage),
     ...(group.sessions || []).flatMap((session) => [
       session.sessionId,
       session.nativeThreadId,
       session.bridgeSessionId,
-      session.latestUserMessage,
-      session.latestAgentMessage,
-      ...(Array.isArray(session.transcriptPreview) ? session.transcriptPreview.map((entry) => entry.text) : []),
-      ...(state.transcripts.get(makeSessionKey(session.hostId, session.sessionId)) || []).map((entry) => entry.text),
+      limitSearchText(session.latestUserMessage),
+      limitSearchText(session.latestAgentMessage),
+      ...(Array.isArray(session.transcriptPreview) ? session.transcriptPreview.map((entry) => limitSearchText(entry.text)) : []),
+      ...(state.transcripts.get(makeSessionKey(session.hostId, session.sessionId)) || []).slice(-20).map((entry) => limitSearchText(entry.text)),
     ]),
   ].filter(Boolean).join(' ').toLowerCase();
 }
@@ -2940,6 +2947,10 @@ function restoreTranscriptScroll(log, options = {}) {
   }
   if (options.forceScroll || options.shouldStickToBottom) {
     log.scrollTop = log.scrollHeight;
+    return;
+  }
+  if (options.preserveScroll && Number.isFinite(options.bottomOffset)) {
+    log.scrollTop = Math.max(0, log.scrollHeight - log.clientHeight - options.bottomOffset);
     return;
   }
   if (Number.isFinite(options.scrollTop)) {
@@ -9694,6 +9705,14 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
 
   const transcript = getTranscriptForSession(session);
   const visibleTranscript = transcript.filter((entry) => entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant');
+  const visibleLimit = Math.max(
+    TRANSCRIPT_RENDER_WINDOW,
+    Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW)
+  );
+  const hiddenTranscriptCount = Math.max(0, visibleTranscript.length - visibleLimit);
+  const renderedTranscript = hiddenTranscriptCount
+    ? visibleTranscript.slice(-visibleLimit)
+    : visibleTranscript;
   const thinkingSegments = buildThinkingEntriesForSession(session);
   const renderedEntryCount = visibleTranscript.length
     + thinkingSegments.reduce((total, segment) => total + (Array.isArray(segment.entries) ? segment.entries.length : 0), 0);
@@ -9725,6 +9744,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     }
     restoreTranscriptScroll(log, {
       forceScroll: shouldStickToBottom,
+      preserveScroll: options.preserveScroll,
       scrollTop: previousScrollTop,
       bottomOffset,
     });
@@ -9732,7 +9752,19 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     return;
   }
 
-  for (const entry of visibleTranscript) {
+  if (hiddenTranscriptCount > 0) {
+    const gate = document.createElement('div');
+    gate.className = 'transcript-history-gate';
+    const loadOlder = document.createElement('button');
+    loadOlder.type = 'button';
+    loadOlder.className = 'secondary-button transcript-load-older-button';
+    loadOlder.dataset.loadOlderTranscript = key;
+    loadOlder.textContent = `Load ${Math.min(TRANSCRIPT_RENDER_INCREMENT, hiddenTranscriptCount)} older messages (${hiddenTranscriptCount} hidden)`;
+    gate.appendChild(loadOlder);
+    log.appendChild(gate);
+  }
+
+  for (const entry of renderedTranscript) {
     const message = document.createElement('div');
     const speaker = entry.speaker === 'assistant' ? 'agent' : entry.speaker;
     message.className = `message ${speaker || 'agent'}`;
@@ -9783,6 +9815,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   restoreTranscriptScroll(log, {
     forceScroll: shouldForceScroll,
     shouldStickToBottom,
+    preserveScroll: options.preserveScroll,
     scrollTop: previousScrollTop,
     bottomOffset,
   });
@@ -11476,6 +11509,7 @@ async function deleteHost(hostId) {
   for (const key of Array.from(state.transcripts.keys())) {
     if (key.startsWith(`${hostId}::`)) {
       state.transcripts.delete(key);
+      state.transcriptVisibleLimits.delete(key);
     }
   }
 
@@ -13503,6 +13537,15 @@ el('clear-alerts-button')?.addEventListener('click', () => {
 });
 
 el('session-log').addEventListener('click', async (event) => {
+  const loadOlder = event.target.closest('[data-load-older-transcript]');
+  if (loadOlder) {
+    const key = loadOlder.dataset.loadOlderTranscript || getSessionKey(getSelectedSession()) || '';
+    const current = Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW);
+    state.transcriptVisibleLimits.set(key, current + TRANSCRIPT_RENDER_INCREMENT);
+    renderTranscript(getSelectedSession(), { preserveScroll: true });
+    return;
+  }
+
   const button = event.target.closest('[data-copy-text]');
   if (!button) {
     return;

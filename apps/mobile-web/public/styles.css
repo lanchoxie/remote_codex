@@ -2966,6 +2966,18 @@ select:disabled {
   border-color: rgba(134, 167, 255, 0.26);
 }
 
+.transcript-history-gate {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0 12px;
+}
+
+.transcript-load-older-button {
+  min-height: 34px;
+  padding-inline: 14px;
+  font-size: 13px;
+}
+
 .message-file-list {
   display: grid;
   gap: 8px;
