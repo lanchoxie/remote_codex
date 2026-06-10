@@ -92,6 +92,18 @@
           </div>
         </section>
 
+        <section class="settings-section performance-settings-section">
+          <div>
+            <div class="settings-section-title" data-i18n-key="settings.performanceTitle">Performance mode</div>
+            <div class="settings-section-copy" data-i18n-key="settings.performanceCopy">Keep navigation fast by trimming session-list previews and rendering long transcripts in windows.</div>
+          </div>
+          <label class="settings-checkbox">
+            <input id="settings-optimize-speed-mode" type="checkbox" />
+            <span data-i18n-key="settings.optimizeSpeedMode">Optimize speed for large conversation histories</span>
+          </label>
+          <div class="settings-warning" data-i18n-key="settings.performanceRestartTip">Changing this mode affects session-list loading immediately after refresh. Restart the relay to apply server-side list payload behavior to already running pages.</div>
+        </section>
+
         <section class="settings-section host-settings-section">
           <div>
             <div class="settings-section-title" data-i18n-key="settings.hostsTitle">Hosts and connectors</div>

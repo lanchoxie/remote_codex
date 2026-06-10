@@ -112,6 +112,7 @@ const state = {
   ui: {
     locale: 'zh-CN',
     theme: 'minimal-light',
+    optimizeSpeedMode: true,
     apiProfiles: [],
     selectedApiProfileId: 'default',
     defaultApiProfileId: 'default',
@@ -184,6 +185,7 @@ const DEFAULT_COMPOSER_OPTIONS = {
 const DEFAULT_UI_SETTINGS = {
   locale: 'zh-CN',
   theme: 'minimal-light',
+  optimizeSpeedMode: true,
   selectedApiProfileId: 'default',
   defaultApiProfileId: 'default',
   hostApiProfiles: {},
@@ -209,6 +211,10 @@ const UI_TEXT = {
     'settings.subtitle': 'These preferences are stored in this browser only.',
     'settings.languageTitle': 'Interface language',
     'settings.languageCopy': 'Switch the browser UI between Chinese and English.',
+    'settings.performanceTitle': 'Performance mode',
+    'settings.performanceCopy': 'Keep navigation fast by trimming session-list previews and rendering long transcripts in windows.',
+    'settings.optimizeSpeedMode': 'Optimize speed for large conversation histories',
+    'settings.performanceRestartTip': 'Changing this mode affects session-list loading after refresh. Restart the relay to apply server-side payload behavior everywhere.',
     'settings.hostsTitle': 'Hosts and connectors',
     'settings.hostsCopy': 'Manage connected hosts, import a host id, or open HPC connector profiles.',
     'settings.sessionDefaultsTitle': 'Session defaults',
@@ -254,6 +260,10 @@ const UI_TEXT = {
     'settings.subtitle': '这些偏好只保存在当前浏览器。',
     'settings.languageTitle': '界面语言',
     'settings.languageCopy': '在中文和英文界面之间切换。',
+    'settings.performanceTitle': '性能模式',
+    'settings.performanceCopy': '通过裁剪会话列表摘要、分段渲染长对话来保持导航流畅。',
+    'settings.optimizeSpeedMode': '优化大量历史对话的加载速度',
+    'settings.performanceRestartTip': '修改后刷新页面会影响会话列表加载；重启 relay 后服务端列表 payload 行为会完整生效。',
     'settings.hostsTitle': 'Host 与连接器',
     'settings.hostsCopy': '管理已连接的 host、导入 host id，或打开 HPC 连接器配置。',
     'settings.sessionDefaultsTitle': '会话默认参数',
@@ -739,6 +749,7 @@ function normalizeHostApiProfiles(value = {}, profiles = []) {
 function normalizeUiSettings(input = {}) {
   const locale = input.locale === 'en' ? 'en' : 'zh-CN';
   const theme = input.theme === 'dark-tech' ? 'dark-tech' : 'minimal-light';
+  const optimizeSpeedMode = input.optimizeSpeedMode !== false;
   const apiProfiles = normalizeApiProfiles(input);
   const profileIds = new Set(apiProfiles.map((profile) => profile.profileId));
   const fallbackProfileId = apiProfiles[0]?.profileId || 'default';
@@ -747,6 +758,7 @@ function normalizeUiSettings(input = {}) {
   return {
     locale,
     theme,
+    optimizeSpeedMode,
     apiProfiles,
     selectedApiProfileId,
     defaultApiProfileId,
@@ -845,6 +857,7 @@ function initializePersistentUiState() {
   const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
   state.ui.locale = storedUi.locale;
   state.ui.theme = storedUi.theme;
+  state.ui.optimizeSpeedMode = storedUi.optimizeSpeedMode;
   state.ui.apiProfiles = storedUi.apiProfiles;
   state.ui.selectedApiProfileId = storedUi.selectedApiProfileId;
   state.ui.defaultApiProfileId = storedUi.defaultApiProfileId;
@@ -867,6 +880,7 @@ function persistUiSettings() {
   writeLocalStorageJson(UI_SETTINGS_STORAGE_KEY, {
     locale: normalized.locale,
     theme: normalized.theme,
+    optimizeSpeedMode: normalized.optimizeSpeedMode,
     apiProfiles,
     selectedApiProfileId: normalized.selectedApiProfileId,
     defaultApiProfileId: normalized.defaultApiProfileId,
@@ -876,6 +890,18 @@ function persistUiSettings() {
 
 function currentLocale() {
   return state.ui.locale === 'en' ? 'en' : 'zh-CN';
+}
+
+function isOptimizeSpeedMode() {
+  return state.ui.optimizeSpeedMode !== false;
+}
+
+function sessionListQuery(extra = {}) {
+  const params = new URLSearchParams(extra);
+  if (!isOptimizeSpeedMode()) {
+    params.set('full', '1');
+  }
+  return params.toString();
 }
 
 function currentTheme() {
@@ -1455,7 +1481,7 @@ function limitText(value, max = 220) {
 }
 
 function limitSearchText(value, max = 1000) {
-  return limitText(value, max);
+  return isOptimizeSpeedMode() ? limitText(value, max) : String(value || '');
 }
 
 function summarizeData(value) {
@@ -9705,10 +9731,9 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
 
   const transcript = getTranscriptForSession(session);
   const visibleTranscript = transcript.filter((entry) => entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant');
-  const visibleLimit = Math.max(
-    TRANSCRIPT_RENDER_WINDOW,
-    Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW)
-  );
+  const visibleLimit = isOptimizeSpeedMode()
+    ? Math.max(TRANSCRIPT_RENDER_WINDOW, Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW))
+    : visibleTranscript.length;
   const hiddenTranscriptCount = Math.max(0, visibleTranscript.length - visibleLimit);
   const renderedTranscript = hiddenTranscriptCount
     ? visibleTranscript.slice(-visibleLimit)
@@ -9950,12 +9975,14 @@ function populateSettingsForm() {
   const settings = normalizeUiSettings(state.ui);
   state.ui.locale = settings.locale;
   state.ui.theme = settings.theme;
+  state.ui.optimizeSpeedMode = settings.optimizeSpeedMode;
   state.ui.apiProfiles = settings.apiProfiles;
   state.ui.selectedApiProfileId = settings.selectedApiProfileId;
   state.ui.defaultApiProfileId = settings.defaultApiProfileId;
   state.ui.hostApiProfiles = settings.hostApiProfiles;
   el('settings-language-select').value = settings.locale;
   el('settings-theme-select').value = settings.theme;
+  el('settings-optimize-speed-mode').checked = settings.optimizeSpeedMode;
   appendApiProfileOptions(el('settings-api-profile-select'));
   appendApiProfileOptions(el('settings-default-api-profile'));
   el('settings-default-api-profile').value = settings.defaultApiProfileId;
@@ -10058,7 +10085,11 @@ function subscribeSession(session) {
 
   closeStream();
 
-  const url = `/api/sessions/${encodeURIComponent(session.sessionId)}/events?hostId=${encodeURIComponent(session.hostId)}`;
+  const eventParams = new URLSearchParams({ hostId: session.hostId });
+  if (!isOptimizeSpeedMode()) {
+    eventParams.set('full', '1');
+  }
+  const url = `/api/sessions/${encodeURIComponent(session.sessionId)}/events?${eventParams.toString()}`;
   state.eventSource = new EventSource(url);
   state.eventSourceKey = key;
   setStreamStatusForSession(session.hostId, session.sessionId, {
@@ -11410,7 +11441,7 @@ async function refresh() {
   }
 
   const sessionResponses = await Promise.all(
-    state.hosts.map((host) => fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/sessions?refresh=1`))
+    state.hosts.map((host) => fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/sessions?${sessionListQuery({ refresh: '1' })}`))
   );
 
   state.sessions = [];
@@ -11458,7 +11489,7 @@ async function waitForSession(hostId, sessionId, predicate, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
   let lastSession = null;
   while (Date.now() < deadline) {
-    const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/sessions`);
+    const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/sessions?${sessionListQuery()}`);
     const session = (response.sessions || []).find((item) => item.sessionId === sessionId || item.bridgeSessionId === sessionId) || null;
     lastSession = session || lastSession;
     if (session && predicate(session)) {
@@ -13089,8 +13120,10 @@ el('settings-host-api-list').addEventListener('change', (event) => {
 el('settings-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const beforeApiSnapshot = { ...(state.settingsApiSnapshot || {}) };
+  const beforeOptimizeSpeedMode = isOptimizeSpeedMode();
   state.ui.locale = el('settings-language-select').value === 'en' ? 'en' : 'zh-CN';
   state.ui.theme = el('settings-theme-select').value === 'dark-tech' ? 'dark-tech' : 'minimal-light';
+  state.ui.optimizeSpeedMode = el('settings-optimize-speed-mode').checked;
   saveActiveApiProfileFromSettingsForm();
   state.ui.defaultApiProfileId = el('settings-default-api-profile').value || getApiProfiles()[0]?.profileId || 'default';
   for (const select of el('settings-host-api-list').querySelectorAll('[data-host-api-profile-host]')) {
@@ -13102,9 +13135,16 @@ el('settings-form').addEventListener('submit', (event) => {
     }
   }
   persistUiSettings();
+  const optimizeSpeedModeChanged = beforeOptimizeSpeedMode !== isOptimizeSpeedMode();
   const restartCandidates = getApiChangedLiveSessions(beforeApiSnapshot);
   closeSettingsDialog();
   renderAll();
+  if (optimizeSpeedModeChanged) {
+    refresh().catch(reportError);
+    window.alert(isOptimizeSpeedMode()
+      ? 'Performance mode is on. Refresh pages and restart relay if you need server-side list trimming everywhere.'
+      : 'Performance mode is off. Refresh pages and restart relay if you need full session-list payloads everywhere.');
+  }
   if (restartCandidates.length) {
     openSessionActionDialog({
       mode: 'restart',

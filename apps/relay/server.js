@@ -1014,11 +1014,12 @@ function getHostList() {
   })).sort((a, b) => a.label.localeCompare(b.label));
 }
 
-function getSessionsForHost(hostId) {
-  return Array.from(state.sessions.values())
+function getSessionsForHost(hostId, options = {}) {
+  const optimize = options.optimize !== false;
+  const sessions = Array.from(state.sessions.values())
     .filter((session) => session.hostId === hostId)
-    .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')))
-    .map(publicSessionListRecord);
+    .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
+  return optimize ? sessions.map(publicSessionListRecord) : sessions;
 }
 
 function limitListText(value, max = SESSION_LIST_TEXT_LIMIT) {
@@ -6303,7 +6304,9 @@ function sendSse(res, eventName, payload) {
     return false;
   }
   try {
-    const eventPayload = publicSessionEventPayload(eventName, payload);
+    const eventPayload = publicSessionEventPayload(eventName, payload, {
+      optimize: res.sessionPayloadOptimize !== false,
+    });
     res.write(`event: ${eventName}\n`);
     res.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
     return true;
@@ -6315,8 +6318,11 @@ function sendSse(res, eventName, payload) {
   }
 }
 
-function publicSessionEventPayload(eventName, payload) {
-  if (eventName === 'session.snapshot' || eventName === 'session.started' || eventName === 'session.state_changed') {
+function publicSessionEventPayload(eventName, payload, options = {}) {
+  if (
+    options.optimize !== false
+    && (eventName === 'session.snapshot' || eventName === 'session.started' || eventName === 'session.state_changed')
+  ) {
     return publicSessionListRecord(payload);
   }
   return payload;
@@ -6344,9 +6350,10 @@ function broadcastSessionEvent(hostId, sessionId, eventName, payload) {
   }
 }
 
-function addSessionSubscriber(hostId, sessionId, res) {
+function addSessionSubscriber(hostId, sessionId, res, options = {}) {
   const key = sessionKey(hostId, sessionId);
   const subscribers = state.subscribers.get(key) || new Set();
+  res.sessionPayloadOptimize = options.optimize !== false;
   subscribers.add(res);
   state.subscribers.set(key, subscribers);
   res.once('error', () => {
@@ -6853,9 +6860,10 @@ async function handleRequest(req, res) {
   if (req.method === 'GET' && url.pathname.match(/^\/api\/hosts\/[^/]+\/sessions$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
     const refreshRequested = url.searchParams.get('refresh') === '1';
+    const optimize = url.searchParams.get('full') !== '1' && url.searchParams.get('optimize') !== '0';
     const discoveryRequested = refreshRequested ? requestHostSessionDiscovery(hostId) : false;
     sendJson(res, 200, {
-      sessions: getSessionsForHost(hostId),
+      sessions: getSessionsForHost(hostId, { optimize }),
       discoveryRequested,
     });
     return;
@@ -8168,6 +8176,7 @@ async function handleRequest(req, res) {
   if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/events$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const hostId = url.searchParams.get('hostId');
+    const optimize = url.searchParams.get('full') !== '1' && url.searchParams.get('optimize') !== '0';
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
@@ -8179,7 +8188,7 @@ async function handleRequest(req, res) {
       'Access-Control-Allow-Origin': '*',
     });
     res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, hostId, sessionId })}\n\n`);
-    addSessionSubscriber(hostId, sessionId, res);
+    addSessionSubscriber(hostId, sessionId, res, { optimize });
 
     const ping = setInterval(() => {
       res.write(`event: ping\ndata: ${JSON.stringify({ time: nowIso() })}\n\n`);
