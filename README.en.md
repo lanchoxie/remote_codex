@@ -2,7 +2,7 @@
 
 Chinese landing page: [README.md](README.md)
 Detailed Chinese guide: [README.zh-CN.md](README.zh-CN.md)
-Release/update report: [docs/update-report-2026-06-05.md](docs/update-report-2026-06-05.md)
+Release/update report: [docs/update-report-2026-06-15.md](docs/update-report-2026-06-15.md)
 
 Mobile Codex Remote is a browser control plane for Codex sessions running on local computers, remote Linux hosts, and HPC clusters. It gives you one web UI for starting, resuming, forking, steering, interrupting, reviewing, exporting, importing, and monitoring Codex work from a desktop browser or phone.
 
@@ -90,6 +90,28 @@ Examples:
 ```
 
 Keep the relay and host-agent windows open while using the app.
+
+### Windows desktop workflow
+
+The Windows desktop UI is the same browser app used on phones, but the wider layout shows the navigator, transcript, file cards, and settings at the same time. After launching, choose your local Windows host, for example `ILLUIN Windows`, from the left `Current Host` selector.
+
+<p align="center">
+  <img src="docs/assets/readme/windows-desktop-session.png" alt="Windows desktop session, file preview, and control bar" width="48%" />
+  <img src="docs/assets/readme/windows-host-manager.png" alt="Windows host manager and local restart controls" width="30%" />
+</p>
+<p align="center">
+  <img src="docs/assets/readme/windows-api-profiles.png" alt="Windows API profiles and host mapping settings" width="32%" />
+  <img src="docs/assets/readme/windows-export-options.png" alt="Windows conversation export options" width="32%" />
+  <img src="docs/assets/readme/windows-history-attachments.png" alt="Windows history import and export attachments" width="32%" />
+</p>
+
+Common Windows-side workflows:
+
+- Online file preview, download, and open: when Codex outputs a local or remote file path, the transcript renders a file card. Images and SVG files can be previewed with `Preview`, local files can be opened with `Open`, and any file can be downloaded with `Save`. Files already cached by the relay stay available in transcript/export bundles; very large files should remain on the host filesystem and be referenced by path.
+- Automatic conversation scan and import: the host-agent scans the host Codex home, usually `%USERPROFILE%\.codex\sessions` on Windows or `~/.codex/sessions` on Linux/HPC, then imports those history sessions into the left conversation list. Use search, sorting, collections, `Current`, `Others`, or `Resume From History` to reuse that context.
+- API switching: open `Settings -> API profiles`, create an OpenAI-compatible profile with Base URL and API Key, then map each host to the profile it should use. `Ping` tests the selected host/profile pair. Profile changes apply to newly started or restarted managed Codex app-server sessions; already running sessions keep the API environment they started with.
+- Conversation history import/export: `Export` creates Markdown, JSON, or Zip bundles with date range filters, per-date multi-select, `Select all dates`, thinking/activity, images, files, extension filters, and specific file selection. `Current` attaches the selected conversation export back to the composer, while `Others` can import multiple other conversations with per-session options.
+- Cross-platform import/export: Windows, remote Linux, and HPC sessions appear in the same relay. You can export a `.history.md` plus `.history.zip` from one host and attach it to a session on another host. Zip bundles include cached files, while Markdown keeps original host paths so you can still find files on the machine that produced them.
 
 ### npm scripts
 

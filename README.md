@@ -24,6 +24,26 @@
   <img src="docs/assets/readme/mobile-current-import.jpg" alt="手机端 Current 导入当前会话上下文" width="30%" />
 </p>
 
+## Windows 桌面端使用方法
+
+Windows 端和手机端使用同一套网页 UI。双击 `start-windows.bat` 后，在左侧选择本机 host，例如 `ILLUIN Windows`，就可以在桌面浏览器里管理本机、远程 Linux 和 HPC 上的 Codex 会话。
+
+<p align="center">
+  <img src="docs/assets/readme/windows-desktop-session.png" alt="Windows 桌面端会话、文件预览和控制栏" width="48%" />
+  <img src="docs/assets/readme/windows-host-manager.png" alt="Windows 端 host 管理和本地重启控制" width="30%" />
+</p>
+<p align="center">
+  <img src="docs/assets/readme/windows-api-profiles.png" alt="Windows 端 API profile 和 host 映射设置" width="32%" />
+  <img src="docs/assets/readme/windows-export-options.png" alt="Windows 端会话导出选项" width="32%" />
+  <img src="docs/assets/readme/windows-history-attachments.png" alt="Windows 端历史导入导出附件" width="32%" />
+</p>
+
+- 文件在线可视化、下载和打开：Codex 输出本机或远端文件路径后，页面会显示文件卡片。图片和 SVG 可以 `Preview`，文件可以 `Open` 或 `Save`；已经缓存到 relay 的图片和文本会一起进入 transcript 和 export。
+- 自动扫描所有对话并导入：host-agent 会扫描对应 host 的 Codex home，通常是 `%USERPROFILE%\.codex\sessions` 或 `~/.codex/sessions`，把历史会话自动导入左侧列表。`Current` 可以把当前会话重新附加到输入框，`Others` 可以多选其他会话作为上下文。
+- API 切换：在 `Settings -> API profiles` 新建 OpenAI 兼容 profile，填写 Base URL 和 API Key，再在 Host API 映射里给 Windows、Linux 或 HPC 分别指定 profile。新建或重启 managed session 后生效，已经运行的 session 会继续使用启动时的 API 环境。
+- 对话历史导入导出：`Export` 支持 Markdown、JSON 和 Zip bundle，可以按日期范围、具体日期、thinking/activity、图片、文件扩展名和具体文件筛选。导出的 `.history.md` 和 `.history.zip` 可以继续作为附件放回 composer。
+- 跨平台导入导出：Windows、远程 Linux 和 HPC 会话都在同一个 relay 里展示。你可以从一个 host 导出历史和文件，再附加到另一个 host 的会话继续问；Zip 里会保留已缓存的图片和文件，原始路径也会保留便于回到对应机器查找。
+
 ## 30 秒启动
 
 ### Windows 用户
