@@ -54,19 +54,7 @@ function normalizeApiBaseUrl(value) {
 
   parsed.hash = '';
   parsed.search = '';
-  let pathname = parsed.pathname.replace(/\/+$/, '');
-  if (/\/responses$/i.test(pathname)) {
-    pathname = pathname.replace(/\/responses$/i, '');
-  }
-  if (!pathname) {
-    pathname = '/v1';
-  } else {
-    const lastSegment = pathname.split('/').filter(Boolean).pop() || '';
-    if (!/^v\d+(?:\.\d+)?$/i.test(lastSegment)) {
-      pathname = `${pathname}/v1`;
-    }
-  }
-  parsed.pathname = pathname;
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '');
   return parsed.toString().replace(/\/+$/, '');
 }
 

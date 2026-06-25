@@ -4,7 +4,9 @@ param(
   [string]$HostLabel = "",
   [string]$CodexHome = "",
   [switch]$NoBrowser,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [switch]$Restart,
+  [switch]$NoRestart
 )
 
 $ErrorActionPreference = "Stop"
@@ -74,6 +76,32 @@ function Get-RepoProcess {
   }
 }
 
+function Stop-RepoProcesses {
+  param(
+    [string]$Name,
+    [object[]]$Processes
+  )
+
+  $targets = @($Processes | Where-Object { $_ -and $_.ProcessId } | Sort-Object ProcessId -Unique)
+  if ($targets.Count -eq 0) {
+    Write-Host "No existing $Name process found for this repo."
+    return
+  }
+
+  foreach ($process in $targets) {
+    if ($DryRun) {
+      Write-Host "[dry-run] would stop $Name PID: $($process.ProcessId)"
+      continue
+    }
+    try {
+      Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+      Write-Host "Stopped $Name PID: $($process.ProcessId)"
+    } catch {
+      Write-Host "Failed to stop $Name PID $($process.ProcessId): $($_.Exception.Message)"
+    }
+  }
+}
+
 function Start-RemoteCodexConsole {
   param(
     [string]$Title,
@@ -124,9 +152,10 @@ if ([string]::IsNullOrWhiteSpace($CodexHome)) {
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Set-Location -LiteralPath $Root
 
+$restartRequested = -not $NoRestart -or $Restart
 $url = "http://127.0.0.1:$Port"
-$relayProcess = Get-RepoProcess "apps\relay\server.js" | Select-Object -First 1
-$agentProcess = Get-RepoProcess "apps\host-agent\agent.js" | Select-Object -First 1
+$relayProcesses = @(Get-RepoProcess "apps\relay\server.js")
+$agentProcesses = @(Get-RepoProcess "apps\host-agent\agent.js")
 
 Write-Host "Remote Codex Windows launcher"
 Write-Host "Root:       $Root"
@@ -135,7 +164,22 @@ Write-Host "Host ID:    $HostId"
 Write-Host "Host label: $HostLabel"
 Write-Host "CODEX_HOME: $CodexHome"
 Write-Host "Logs:       $LogDir"
+Write-Host "Restart:    $restartRequested"
 Write-Host ""
+
+if ($restartRequested) {
+  Write-Host "Restart requested. Stopping repo relay and host-agent processes before launch..."
+  Stop-RepoProcesses -Name "host-agent" -Processes $agentProcesses
+  Stop-RepoProcesses -Name "relay" -Processes $relayProcesses
+  if (-not $DryRun) {
+    Start-Sleep -Seconds 1
+  }
+  $relayProcesses = @(Get-RepoProcess "apps\relay\server.js")
+  $agentProcesses = @(Get-RepoProcess "apps\host-agent\agent.js")
+}
+
+$relayProcess = $relayProcesses | Select-Object -First 1
+$agentProcess = $agentProcesses | Select-Object -First 1
 
 if ($relayProcess) {
   Write-Host "Relay already appears to be running in this repo. PID: $($relayProcess.ProcessId)"
@@ -193,3 +237,4 @@ if (-not $DryRun) {
 Write-Host ""
 Write-Host "Remote Codex launch requested. Keep the relay and host-agent windows open while using it."
 Write-Host "To use another port: .\start-windows.bat -Port 8787"
+Write-Host "Restart is enabled by default. To reuse existing processes: .\start-windows.bat -NoRestart"

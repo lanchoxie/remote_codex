@@ -11,6 +11,7 @@ tmp/connectors.json
 tmp/connector-secrets.json
 tmp/session-collections.json
 tmp/session-logs.json
+tmp/session-diagnostics.json
 tmp/session-metadata.json
 tmp/downloads/
 tmp/remote-codex-askpass.cmd

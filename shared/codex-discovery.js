@@ -152,6 +152,42 @@ function extractSessionTranscript(filePath, options = {}) {
   return dedupeTranscriptEntries(entries);
 }
 
+function extractSessionDiagnostics(filePath, options = {}) {
+  const headRows = Math.max(0, Number(options.headRows || 0) || 0);
+  const tailRows = Math.max(0, Number(options.tailRows || 0) || 0);
+  const maxRows = Object.prototype.hasOwnProperty.call(options, 'maxRows') ? options.maxRows : Infinity;
+  const rows = headRows || tailRows
+    ? mergeRowsByTimestampAndType([
+      ...readJsonLines(filePath, headRows || 0),
+      ...readJsonLinesTail(filePath, tailRows || 0),
+    ])
+    : readJsonLines(filePath, maxRows);
+  const diagnostics = [];
+  const seen = new Set();
+
+  for (const row of rows) {
+    const events = makeCodexRowEvents(row);
+    for (const event of events) {
+      if (event.type !== 'session.diagnostic') {
+        continue;
+      }
+      const entry = {
+        ...(event.entry || {}),
+        timestamp: event.entry?.timestamp || row.timestamp || null,
+      };
+      const key = `${entry.kind || ''}|${entry.method || ''}|${entry.timestamp || ''}|${entry.message || ''}|${entry.turnId || ''}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      diagnostics.push(entry);
+    }
+  }
+
+  const maxEntries = Number(options.maxEntries || 0) || 0;
+  return maxEntries > 0 ? diagnostics.slice(-maxEntries) : diagnostics;
+}
+
 function mergeRowsByTimestampAndType(rows) {
   const seen = new Set();
   const merged = [];
@@ -201,6 +237,36 @@ function parseTimestampFromFilePath(filePath) {
   return `${match[1].replace(/T(\d{2})-(\d{2})-(\d{2})$/, 'T$1:$2:$3')}.000Z`;
 }
 
+const INTERNAL_ASSISTANT_CHANNELS = new Set([
+  'analysis',
+  'commentary',
+  'reasoning',
+  'thinking',
+  'thought',
+  'internal',
+]);
+
+function getPayloadChannel(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return '';
+  }
+  return String(payload.phase || payload.channel || payload.kind || '').trim().toLowerCase();
+}
+
+function isInternalAssistantPayload(payload) {
+  return INTERNAL_ASSISTANT_CHANNELS.has(getPayloadChannel(payload));
+}
+
+function diagnosticKindForChannel(channel) {
+  if (channel === 'analysis' || channel === 'reasoning' || channel === 'thinking' || channel === 'thought') {
+    return 'reasoning';
+  }
+  if (channel === 'commentary') {
+    return 'commentary';
+  }
+  return 'diagnostic';
+}
+
 function getCwdFromRow(row) {
   if (!row || !row.payload) {
     return null;
@@ -220,7 +286,6 @@ function getCwdFromRow(row) {
 function makeTranscriptEntry(row, options = {}) {
   const payload = row.payload || {};
   const timestamp = row.timestamp || null;
-  const phase = String(payload.phase || '').trim().toLowerCase();
 
   if (row.type === 'response_item' && payload.type === 'message') {
     if (payload.role === 'user') {
@@ -231,7 +296,7 @@ function makeTranscriptEntry(row, options = {}) {
       return { speaker: 'user', text, timestamp };
     }
     if (payload.role === 'assistant' || payload.role === 'agent') {
-      if (phase === 'commentary') {
+      if (isInternalAssistantPayload(payload)) {
         return null;
       }
       const text = cleanTranscriptText(extractPayloadText(payload), 'agent', options);
@@ -259,7 +324,7 @@ function makeTranscriptEntry(row, options = {}) {
   }
 
   if (payload.type === 'agent_message' && payload.message) {
-    if (phase === 'commentary') {
+    if (isInternalAssistantPayload(payload)) {
       return null;
     }
     const text = cleanTranscriptText(payload.message, 'agent', options);
@@ -397,29 +462,30 @@ function makeRuntimePatch(row) {
 function makeDiagnosticEntry(row) {
   const payload = row.payload || {};
   const timestamp = row.timestamp || null;
-  const phase = String(payload.phase || '').trim().toLowerCase();
+  const channel = getPayloadChannel(payload);
 
-  if (phase === 'commentary') {
+  if (isInternalAssistantPayload(payload)) {
     let text = '';
     let method = '';
     if (row.type === 'response_item' && payload.type === 'message' && (payload.role === 'assistant' || payload.role === 'agent')) {
       text = cleanDiagnosticText(extractPayloadText(payload));
-      method = 'response_item/message/commentary';
+      method = `response_item/message/${channel || 'internal'}`;
     } else if (row.type === 'event_msg' && payload.type === 'agent_message') {
       text = cleanDiagnosticText(payload.message || '');
-      method = 'event_msg/agent_message/commentary';
+      method = `event_msg/agent_message/${channel || 'internal'}`;
     }
     if (text) {
       return {
         timestamp,
         severity: 'info',
         source: 'codex-jsonl',
-        kind: 'commentary',
+        kind: diagnosticKindForChannel(channel),
         method,
         message: limitText(text, 300),
         data: {
           text,
-          phase,
+          phase: payload.phase || null,
+          channel: payload.channel || null,
         },
       };
     }
@@ -858,12 +924,39 @@ function cleanUserFacingTranscriptText(value, speaker = '') {
     return '';
   }
 
+  text = stripTranscriptWrapperText(text).trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
   text = stripEnvironmentContextText(text).trim();
   if (String(speaker || '').toLowerCase() === 'user') {
     text = stripIdeContextText(text).trim();
   }
 
   return isInternalTranscriptText(text) ? '' : text;
+}
+
+function stripTranscriptWrapperText(value) {
+  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text) {
+    return '';
+  }
+
+  const wrapperPatterns = [
+    /\n?The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b[\s\S]*$/i,
+    /\n?>>> TRANSCRIPT(?: DELTA)? START\b[\s\S]*$/im,
+    /\n?>>> TRANSCRIPT(?: DELTA)? END\b[\s\S]*$/im,
+    /\n?>>> APPROVAL REQUEST START\b[\s\S]*$/im,
+    /\n?>>> APPROVAL REQUEST END\b[\s\S]*$/im,
+    /\n?Reviewed Codex session id:[\s\S]*$/i,
+    /\n?The Codex agent has requested the following (?:next action|action below|action):[\s\S]*$/i,
+  ];
+
+  for (const pattern of wrapperPatterns) {
+    text = text.replace(pattern, '').trim();
+  }
+  return text;
 }
 
 function stripEnvironmentContextText(value) {
@@ -992,6 +1085,7 @@ function walkFiles(rootDir, visit) {
 
 module.exports = {
   discoverCodexSessions,
+  extractSessionDiagnostics,
   extractSessionTranscript,
   getDefaultCodexHome,
   makeCodexRowEvents,

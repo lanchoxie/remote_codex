@@ -3,7 +3,8 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 const path = require('path');
-const { discoverCodexSessions, getDefaultCodexHome } = require('../../shared/codex-discovery');
+const readline = require('readline');
+const { discoverCodexSessions, extractSessionDiagnostics, extractSessionTranscript, getDefaultCodexHome, makeTranscriptEntry } = require('../../shared/codex-discovery');
 const { CodexSessionTailer } = require('../../shared/codex-tail');
 const { makeId, nowIso, normalizeArgs } = require('../../shared/protocol');
 const { resolveManagedRuntime, startManagedRuntimeSession } = require('./runtime-adapters');
@@ -30,6 +31,10 @@ const MAX_FILE_CHUNK_BYTES = Number(process.env.AGENT_FILE_TRANSFER_CHUNK_BYTES 
 const FETCH_RETRY_ATTEMPTS = Math.max(1, Number(process.env.AGENT_FETCH_RETRY_ATTEMPTS || 3));
 const FETCH_RETRY_BASE_MS = Math.max(50, Number(process.env.AGENT_FETCH_RETRY_BASE_MS || 150));
 const FETCH_REQUEST_TIMEOUT_MS = Number(process.env.AGENT_FETCH_TIMEOUT_MS || 30000);
+const SESSION_DETAIL_DIAGNOSTIC_LIMIT = Number(process.env.AGENT_SESSION_DETAIL_DIAGNOSTIC_LIMIT || 400);
+const WINDOWS_DRIVE_PROBE_LETTERS = String(process.env.AGENT_WINDOWS_BROWSE_DRIVES || 'CDE')
+  .toUpperCase()
+  .replace(/[^A-Z]/g, '');
 
 const liveSessions = new Map();
 const activeFileUploads = new Map();
@@ -65,8 +70,13 @@ function getCapabilities() {
     interrupt: true,
     hostProbe: true,
     turnControls: true,
+    nativePlan: true,
+    goalControls: true,
+    sessionDetail: true,
+    sessionSearch: true,
     modelList: true,
     skillList: true,
+    apiTest: true,
     review: true,
     imageInput: true,
     fileTransfer: true,
@@ -82,17 +92,27 @@ function logAgentError(...args) {
   console.error(`[${nowIso()}]`, ...args);
 }
 
+function logAgentNotice(...args) {
+  console.log(`[${nowIso()}]`, ...args);
+}
+
 function isTransientFetchError(error) {
   if (!error) {
     return false;
   }
   return error.code === 'ECONNRESET'
+    || error.code === 'ECONNREFUSED'
     || error.code === 'EPIPE'
     || error.code === 'ETIMEDOUT'
     || error.code === 'ECONNABORTED'
     || error.message === 'socket hang up'
     || error.message === 'aborted'
     || error.message === 'response aborted';
+}
+
+function logAgentTransient(prefix, error) {
+  const log = isTransientFetchError(error) ? logAgentNotice : logAgentError;
+  log(prefix, error?.message || String(error || 'unknown error'));
 }
 
 async function fetchJson(targetUrl, options = {}) {
@@ -184,6 +204,99 @@ function fetchJsonOnce(targetUrl, options = {}) {
   });
 }
 
+function buildApiTestUrl(baseUrl) {
+  const raw = String(baseUrl || '').trim() || 'https://api.openai.com/v1';
+  return `${raw.replace(/\/+$/, '')}/models`;
+}
+
+function summarizeApiTestBody(raw) {
+  const text = String(raw || '').trim();
+  if (!text) {
+    return '';
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed?.error?.message) {
+      return String(parsed.error.message).slice(0, 500);
+    }
+    if (parsed?.message) {
+      return String(parsed.message).slice(0, 500);
+    }
+    if (Array.isArray(parsed?.data)) {
+      return `${parsed.data.length} model${parsed.data.length === 1 ? '' : 's'} returned`;
+    }
+    return JSON.stringify(parsed).slice(0, 500);
+  } catch (_) {
+    return text.slice(0, 500);
+  }
+}
+
+function testApiProfile(apiConfig, options = {}) {
+  const config = normalizeApiConfig(apiConfig) || {};
+  const targetUrl = buildApiTestUrl(config.baseUrl);
+  const parsed = new URL(targetUrl);
+  const client = parsed.protocol === 'https:' ? https : http;
+  const timeoutMs = Number(options.timeoutMs || 15000) || 15000;
+  const startedAt = Date.now();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({
+        ok: Boolean(payload.ok),
+        statusCode: payload.statusCode || 0,
+        latencyMs: Date.now() - startedAt,
+        url: targetUrl,
+        provider: config.provider || null,
+        profileId: config.profileId || null,
+        label: config.label || null,
+        message: payload.message || '',
+        error: payload.error || null,
+        testedAt: nowIso(),
+      });
+    };
+
+    const req = client.request(
+      {
+        method: 'GET',
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: {
+          Accept: 'application/json',
+          ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          const statusCode = res.statusCode || 0;
+          const message = summarizeApiTestBody(raw);
+          finish({
+            ok: statusCode >= 200 && statusCode < 300,
+            statusCode,
+            message: message || `${statusCode} ${res.statusMessage || ''}`.trim(),
+            error: statusCode >= 400 ? (message || `${statusCode} ${res.statusMessage || 'HTTP error'}`.trim()) : null,
+          });
+        });
+        res.on('error', (error) => finish({ error: error.message }));
+        res.on('aborted', () => finish({ error: 'response aborted' }));
+      }
+    );
+    req.on('error', (error) => finish({ error: error.message }));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`API test timed out after ${timeoutMs}ms`));
+    });
+    req.end();
+  });
+}
+
 async function postEvent(event, options = {}) {
   try {
     await fetchJson(`${RELAY_URL}/api/agent/events`, {
@@ -193,7 +306,7 @@ async function postEvent(event, options = {}) {
     });
   } catch (error) {
     if (options.bestEffort || isTransientFetchError(error)) {
-      logAgentError(`[agent] failed to post ${event?.type || 'event'}:`, error.message);
+      logAgentTransient(`[agent] failed to post ${event?.type || 'event'}:`, error);
       return;
     }
     throw error;
@@ -240,6 +353,7 @@ async function sendDiscovery() {
     latestUserMessage: session.latestUserMessage || null,
     latestAgentMessage: session.latestAgentMessage || null,
     transcriptPreview: session.transcriptPreview || [],
+    rolloutPath: session.rolloutPath || null,
     originSessionId: session.originSessionId || null,
     conversationKey: session.conversationKey || session.sessionId,
   }));
@@ -272,6 +386,7 @@ async function sendDiscovery() {
       sourceSessionId: runner.sourceSessionId || null,
       conversationKey: runner.conversationKey || runner.originSessionId || liveSessionId,
       bridgeSessionId: runner.bridgeSessionId || null,
+      runId: runner.runId || runner.runtime?.runId || null,
       nativeThreadId: runner.nativeThreadId || liveSessionId,
       launchMode: runner.launchMode || null,
       runtime: runner.runtime || null,
@@ -283,6 +398,265 @@ async function sendDiscovery() {
     hostId: HOST_ID,
     sessions,
   }, { retryOnTransient: true });
+}
+
+function resolveDiscoveredSession(command = {}) {
+  const candidates = new Set([
+    command.sessionId,
+    command.nativeThreadId,
+    command.bridgeSessionId,
+    command.originSessionId,
+    command.sourceSessionId,
+    command.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean));
+
+  if (!candidates.size) {
+    return null;
+  }
+
+  return discoverCodexSessions({ codexHome: CODEX_HOME }).find((session) => (
+    candidates.has(String(session.sessionId || ''))
+    || candidates.has(String(session.nativeThreadId || ''))
+  )) || null;
+}
+
+function sessionDetailDiagnosticOptions(fullDiagnostics = false) {
+  if (fullDiagnostics) {
+    return { maxRows: Infinity };
+  }
+
+  const limit = SESSION_DETAIL_DIAGNOSTIC_LIMIT;
+  const options = {
+    headRows: 0,
+    tailRows: limit,
+  };
+  if (Number.isFinite(limit) && limit > 0) {
+    options.maxEntries = limit;
+  }
+  return options;
+}
+
+function normalizeSearchTerms(query) {
+  return String(query || '')
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function textMatchesTerms(value, terms) {
+  const haystack = String(value || '').toLowerCase();
+  return terms.every((term) => haystack.includes(term));
+}
+
+function makeSearchSnippet(text, terms, maxLength = 220) {
+  const source = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!source) {
+    return '';
+  }
+  const lower = source.toLowerCase();
+  const indexes = terms
+    .map((term) => lower.indexOf(term))
+    .filter((index) => index >= 0);
+  const firstIndex = indexes.length ? Math.min(...indexes) : 0;
+  const start = Math.max(0, firstIndex - Math.floor(maxLength / 3));
+  const end = Math.min(source.length, start + maxLength);
+  return `${start > 0 ? '...' : ''}${source.slice(start, end).trim()}${end < source.length ? '...' : ''}`;
+}
+
+function sessionSearchHaystack(session) {
+  return [
+    session?.title,
+    session?.cwd,
+    session?.sessionId,
+    session?.nativeThreadId,
+    session?.conversationKey,
+    session?.latestUserMessage,
+    session?.latestAgentMessage,
+  ].filter(Boolean).join('\n');
+}
+
+async function searchTranscriptFile(filePath, terms, maxMatches) {
+  const matches = [];
+  if (!filePath || !fs.existsSync(filePath) || !terms.length || maxMatches <= 0) {
+    return matches;
+  }
+
+  let entryIndex = 0;
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const reader = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity,
+  });
+
+  try {
+    for await (const line of reader) {
+      const trimmed = String(line || '').trim();
+      if (!trimmed) {
+        continue;
+      }
+      let row = null;
+      try {
+        row = JSON.parse(trimmed);
+      } catch (_) {
+        continue;
+      }
+      const entry = makeTranscriptEntry(row, { maxChars: Infinity });
+      if (!entry || !['user', 'agent', 'assistant'].includes(String(entry.speaker || '').toLowerCase())) {
+        continue;
+      }
+      const currentIndex = entryIndex;
+      entryIndex += 1;
+      if (!textMatchesTerms(entry.text || '', terms)) {
+        continue;
+      }
+      matches.push({
+        type: 'transcript',
+        entryIndex: currentIndex,
+        speaker: entry.speaker || 'system',
+        timestamp: entry.timestamp || null,
+        snippet: makeSearchSnippet(entry.text || '', terms),
+      });
+      if (matches.length >= maxMatches) {
+        break;
+      }
+    }
+  } finally {
+    reader.close();
+    stream.destroy();
+  }
+
+  return matches;
+}
+
+async function searchDiscoveredSessions(command = {}) {
+  const query = String(command.query || '').trim();
+  const mode = ['keyword', 'path', 'title'].includes(command.mode) ? command.mode : 'keyword';
+  const terms = normalizeSearchTerms(query);
+  const maxSessions = Math.max(1, Math.min(200, Number(command.maxSessions || 80) || 80));
+  const maxMatchesPerSession = Math.max(1, Math.min(20, Number(command.maxMatchesPerSession || 5) || 5));
+  const sessions = discoverCodexSessions({ codexHome: CODEX_HOME });
+  const results = [];
+
+  for (const session of sessions) {
+    const matches = [];
+    if (mode === 'title') {
+      if (textMatchesTerms(session.title || '', terms)) {
+        matches.push({
+          type: 'title',
+          entryIndex: -1,
+          speaker: 'title',
+          timestamp: session.updatedAt || session.createdAt || null,
+          snippet: makeSearchSnippet(session.title || '', terms),
+        });
+      }
+    } else if (mode === 'path') {
+      if (textMatchesTerms(session.cwd || '', terms)) {
+        matches.push({
+          type: 'path',
+          entryIndex: -1,
+          speaker: 'path',
+          timestamp: session.updatedAt || session.createdAt || null,
+          snippet: makeSearchSnippet(session.cwd || '', terms),
+        });
+      }
+    } else {
+      if (textMatchesTerms(sessionSearchHaystack(session), terms)) {
+        matches.push({
+          type: 'metadata',
+          entryIndex: -1,
+          speaker: 'session',
+          timestamp: session.updatedAt || session.createdAt || null,
+          snippet: makeSearchSnippet(sessionSearchHaystack(session), terms),
+        });
+      }
+      if (matches.length < maxMatchesPerSession) {
+        matches.push(...await searchTranscriptFile(
+          session.rolloutPath,
+          terms,
+          maxMatchesPerSession - matches.length
+        ));
+      }
+    }
+    if (!matches.length) {
+      continue;
+    }
+    results.push({
+      hostId: HOST_ID,
+      sessionId: session.sessionId,
+      conversationKey: session.conversationKey || session.sessionId,
+      title: session.title || session.sessionId,
+      cwd: session.cwd || null,
+      lastUpdatedAt: session.updatedAt || session.createdAt || null,
+      live: false,
+      matchCount: matches.length,
+      matches,
+    });
+    if (results.length >= maxSessions) {
+      break;
+    }
+  }
+  return {
+    query,
+    mode,
+    results,
+    scannedSessions: sessions.length,
+    truncated: results.length >= maxSessions,
+  };
+}
+
+async function handleSessionDetail(command) {
+  const requestId = command.requestId || makeId();
+  const requestedSessionId = String(command.sessionId || command.nativeThreadId || '').trim();
+  try {
+    const session = resolveDiscoveredSession(command);
+    if (!session || !session.rolloutPath || !fs.existsSync(session.rolloutPath)) {
+      throw new Error(`history session ${requestedSessionId || '(unknown)'} was not found under CODEX_HOME`);
+    }
+
+    const fullTranscript = command.fullTranscript === true || command.full === true;
+    const fullDiagnostics = command.fullDiagnostics === true || command.diagnostics === 'full';
+    const transcript = fullTranscript
+      ? extractSessionTranscript(session.rolloutPath, { maxChars: Infinity })
+      : (Array.isArray(session.transcriptPreview) ? session.transcriptPreview : []);
+    const diagnostics = extractSessionDiagnostics(session.rolloutPath, sessionDetailDiagnosticOptions(fullDiagnostics));
+
+    await postEvent({
+      type: 'session.detailed',
+      hostId: HOST_ID,
+      sessionId: requestedSessionId || session.sessionId,
+      nativeThreadId: session.nativeThreadId || session.sessionId,
+      requestId,
+      session: {
+        sessionId: session.sessionId,
+        nativeThreadId: session.nativeThreadId || session.sessionId,
+        title: session.title || session.sessionId,
+        cwd: session.cwd || null,
+        source: session.source || 'rollout',
+        createdAt: session.createdAt || null,
+        updatedAt: session.updatedAt || null,
+        messageCount: session.messageCount || transcript.length || 0,
+        latestUserMessage: session.latestUserMessage || null,
+        latestAgentMessage: session.latestAgentMessage || null,
+        conversationKey: session.conversationKey || session.sessionId,
+      },
+      transcript,
+      diagnostics,
+      fullTranscript,
+      fullDiagnostics,
+      timestamp: nowIso(),
+    }, { retryOnTransient: true });
+  } catch (error) {
+    await postEvent({
+      type: 'session.detailed',
+      hostId: HOST_ID,
+      sessionId: requestedSessionId,
+      requestId,
+      error: error.message || 'failed to load session detail',
+      timestamp: nowIso(),
+    }, { bestEffort: true });
+  }
 }
 
 function parseWorkspaceRoots(value) {
@@ -327,7 +701,11 @@ function listBrowseRoots() {
   }
 
   if (process.platform === 'win32') {
-    for (let code = 67; code <= 90; code += 1) {
+    for (const letter of WINDOWS_DRIVE_PROBE_LETTERS) {
+      const code = letter.charCodeAt(0);
+      if (code < 65 || code > 90) {
+        continue;
+      }
       const drive = `${String.fromCharCode(code)}:\\`;
       pushBrowseRoot(roots, seen, drive, drive);
     }
@@ -409,6 +787,7 @@ function uniqueFilePath(directory, filename) {
 function mimeFromPath(filePath, fallback = 'application/octet-stream') {
   const ext = path.extname(String(filePath || '')).toLowerCase();
   return {
+    '.apk': 'application/vnd.android.package-archive',
     '.avif': 'image/avif',
     '.bmp': 'image/bmp',
     '.c': 'text/plain; charset=utf-8',
@@ -478,6 +857,7 @@ function getRunnerIdentityValues(runner) {
   add(runner?.originSessionId);
   add(runner?.sourceSessionId);
   add(runner?.conversationKey);
+  add(runner?.runId);
   if (runner && typeof runner.currentSessionId === 'function') {
     add(runner.currentSessionId());
   }
@@ -492,6 +872,7 @@ function getCommandSessionCandidates(command = {}) {
     command.originSessionId,
     command.sourceSessionId,
     command.conversationKey,
+    command.runId,
   ].map((value) => String(value || '').trim()).filter(Boolean);
 }
 
@@ -1025,11 +1406,12 @@ function resolveManagedCwd(cwd) {
   return path.isAbsolute(target) ? target : path.resolve(MANAGED_CWD, target);
 }
 
-async function failManagedSession(sessionId, cwd, message, state = 'failed') {
+async function failManagedSession(sessionId, cwd, message, state = 'failed', runId = null) {
   await postEvent({
     type: 'session.error',
     hostId: HOST_ID,
     sessionId,
+    runId,
     message,
     timestamp: nowIso(),
   });
@@ -1038,6 +1420,7 @@ async function failManagedSession(sessionId, cwd, message, state = 'failed') {
     type: 'session.state_changed',
     hostId: HOST_ID,
     sessionId,
+    runId,
     state,
     live: false,
     timestamp: nowIso(),
@@ -1046,6 +1429,7 @@ async function failManagedSession(sessionId, cwd, message, state = 'failed') {
 
 async function startManagedSession(command) {
   const bridgeSessionId = command.sessionId || makeId();
+  const runId = command.runId || makeId();
   const createdAt = command.createdAt || nowIso();
   const cwd = resolveManagedCwd(command.cwd || MANAGED_CWD);
   const runtime = resolveManagedRuntime(command, {
@@ -1059,7 +1443,7 @@ async function startManagedSession(command) {
   let announcedSessionId = bridgeSessionId;
 
   if (!fs.existsSync(cwd)) {
-    await failManagedSession(bridgeSessionId, cwd, `workspace path does not exist: ${cwd}`, 'failed:missing-workspace');
+    await failManagedSession(bridgeSessionId, cwd, `workspace path does not exist: ${cwd}`, 'failed:missing-workspace', runId);
     return bridgeSessionId;
   }
 
@@ -1067,12 +1451,12 @@ async function startManagedSession(command) {
   try {
     cwdStats = fs.statSync(cwd);
   } catch (error) {
-    await failManagedSession(bridgeSessionId, cwd, `failed to inspect workspace path: ${error.message}`, 'failed:workspace-stat-error');
+    await failManagedSession(bridgeSessionId, cwd, `failed to inspect workspace path: ${error.message}`, 'failed:workspace-stat-error', runId);
     return bridgeSessionId;
   }
 
   if (!cwdStats.isDirectory()) {
-    await failManagedSession(bridgeSessionId, cwd, `workspace path is not a directory: ${cwd}`, 'failed:not-a-directory');
+    await failManagedSession(bridgeSessionId, cwd, `workspace path is not a directory: ${cwd}`, 'failed:not-a-directory', runId);
     return bridgeSessionId;
   }
 
@@ -1082,6 +1466,7 @@ async function startManagedSession(command) {
       hostId: HOST_ID,
       sessionId: bridgeSessionId,
       bridgeSessionId,
+      runId,
       title,
       cwd,
       launchMode: command.launchMode || null,
@@ -1094,20 +1479,29 @@ async function startManagedSession(command) {
       conversationKey: command.conversationKey || command.originSessionId || bridgeSessionId,
       postEvent,
       onTerminated: () => {
-        liveSessions.delete(bridgeSessionId);
-        liveSessions.delete(announcedSessionId);
+        if (liveSessions.get(bridgeSessionId) === runner) {
+          liveSessions.delete(bridgeSessionId);
+        }
+        if (liveSessions.get(announcedSessionId) === runner) {
+          liveSessions.delete(announcedSessionId);
+        }
+        if (liveSessions.get(runId) === runner) {
+          liveSessions.delete(runId);
+        }
       },
     });
     runner.createdAt = runner.createdAt || createdAt;
     announcedSessionId = runner.sessionId || bridgeSessionId;
     liveSessions.set(bridgeSessionId, runner);
     liveSessions.set(announcedSessionId, runner);
+    liveSessions.set(runId, runner);
 
     await postEvent({
       type: 'session.started',
       hostId: HOST_ID,
       sessionId: announcedSessionId,
       bridgeSessionId: announcedSessionId === bridgeSessionId ? null : bridgeSessionId,
+      runId,
       nativeThreadId: runner?.nativeThreadId || announcedSessionId,
       title,
       cwd,
@@ -1127,7 +1521,7 @@ async function startManagedSession(command) {
       },
     });
   } catch (error) {
-    await failManagedSession(bridgeSessionId, cwd, `failed to spawn managed session: ${error.message}`, 'failed:spawn-error');
+    await failManagedSession(bridgeSessionId, cwd, `failed to spawn managed session: ${error.message}`, 'failed:spawn-error', runId);
     return bridgeSessionId;
   }
 
@@ -1159,6 +1553,20 @@ async function handleCommand(command) {
       label: HOST_LABEL,
       platform: process.platform,
       capabilities: getCapabilities(),
+      timestamp: nowIso(),
+    });
+    return;
+  }
+
+  if (command.type === 'host.api_test') {
+    const result = await testApiProfile(command.apiConfig, {
+      timeoutMs: command.timeoutMs,
+    });
+    await postEvent({
+      type: 'host.api_tested',
+      hostId: HOST_ID,
+      requestId: command.requestId || makeId(),
+      result,
       timestamp: nowIso(),
     });
     return;
@@ -1209,6 +1617,39 @@ async function handleCommand(command) {
     return;
   }
 
+  if (command.type === 'session.detail') {
+    await handleSessionDetail(command);
+    return;
+  }
+
+  if (command.type === 'session.search') {
+    try {
+      const result = await searchDiscoveredSessions(command);
+      await postEvent({
+        type: 'session.searched',
+        hostId: HOST_ID,
+        requestId: command.requestId || makeId(),
+        query: result.query,
+        mode: result.mode,
+        results: result.results,
+        scannedSessions: result.scannedSessions,
+        truncated: result.truncated,
+        timestamp: nowIso(),
+      }, { retryOnTransient: true });
+    } catch (error) {
+      await postEvent({
+        type: 'session.searched',
+        hostId: HOST_ID,
+        requestId: command.requestId || makeId(),
+        query: command.query || '',
+        mode: command.mode || 'keyword',
+        error: error.message || 'session search failed',
+        timestamp: nowIso(),
+      }, { bestEffort: true });
+    }
+    return;
+  }
+
   const runner = getRunnerForCommand(command);
   if (!runner) {
     if (command.type === 'session.model_list' && command.requestId) {
@@ -1235,11 +1676,24 @@ async function handleCommand(command) {
       return;
     }
 
+    if (command.type === 'session.goal' && command.requestId) {
+      await postEvent({
+        type: 'session.goal_result',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        requestId: command.requestId,
+        error: 'session is not live on this host-agent; resume or restart the session before using native Goal controls',
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
     if (command.type === 'session.stop') {
       await postEvent({
         type: 'session.state_changed',
         hostId: HOST_ID,
         sessionId: command.requestedSessionId || command.sessionId,
+        runId: command.runId || null,
         state: 'history-only',
         live: false,
         timestamp: nowIso(),
@@ -1259,6 +1713,21 @@ async function handleCommand(command) {
 
   if (command.type === 'session.input') {
     try {
+      await postEvent({
+        type: 'session.runtime_updated',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        runId: runner.runId || command.runId || null,
+        patch: {
+          busy: true,
+          phase: 'submitting-turn',
+          currentTurnStatus: 'submitting',
+          queuedCommandId: command.id || null,
+          pendingInputSummary: String(command.text || '').slice(0, 240),
+          runId: runner.runId || command.runId || null,
+        },
+        timestamp: nowIso(),
+      }, { bestEffort: true });
       await runner.sendInput(String(command.text || ''), {
         inputItems: Array.isArray(command.inputItems) ? command.inputItems : [],
         attachments: Array.isArray(command.attachments) ? command.attachments : [],
@@ -1269,11 +1738,28 @@ async function handleCommand(command) {
         approvalPolicy: command.approvalPolicy || null,
         approvalsReviewer: command.approvalsReviewer || null,
         sandboxMode: command.sandboxMode || null,
+        planFallback: command.planFallback || null,
         serviceTier: command.serviceTier || null,
         personality: command.personality || null,
         apiConfig: normalizeApiConfig(command.apiConfig),
       });
     } catch (error) {
+      await postEvent({
+        type: 'session.runtime_updated',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        runId: runner.runId || command.runId || null,
+        patch: {
+          activeTurnId: null,
+          busy: false,
+          phase: 'error',
+          currentTurnStatus: 'failed',
+          pendingInputSummary: null,
+          lastCodexError: error.message || String(error),
+          runId: runner.runId || command.runId || null,
+        },
+        timestamp: nowIso(),
+      }, { bestEffort: true });
       await postEvent({
         type: 'session.error',
         hostId: HOST_ID,
@@ -1439,6 +1925,72 @@ async function handleCommand(command) {
     return;
   }
 
+  if (command.type === 'session.goal') {
+    try {
+      let result = null;
+      const action = String(command.action || '').trim() || 'get';
+      if (action === 'get') {
+        if (typeof runner.getGoal !== 'function') {
+          throw new Error('This runner does not support native Codex goals.');
+        }
+        result = await runner.getGoal();
+      } else if (action === 'set') {
+        if (typeof runner.setGoal !== 'function') {
+          throw new Error('This runner does not support native Codex goals.');
+        }
+        result = await runner.setGoal({
+          objective: command.objective,
+          status: command.status,
+          tokenBudget: command.tokenBudget,
+        });
+      } else if (action === 'clear') {
+        if (typeof runner.clearGoal !== 'function') {
+          throw new Error('This runner does not support native Codex goals.');
+        }
+        const clearResult = await runner.clearGoal();
+        await postEvent({
+          type: 'session.goal_result',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          requestId: command.requestId || makeId(),
+          goal: null,
+          result: clearResult || { cleared: true },
+          timestamp: nowIso(),
+        });
+        return;
+      } else {
+        throw new Error('Unknown goal action.');
+      }
+
+      await postEvent({
+        type: 'session.goal_result',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        requestId: command.requestId || makeId(),
+        goal: result || null,
+        result,
+        timestamp: nowIso(),
+      });
+    } catch (error) {
+      await postEvent({
+        type: 'session.goal_result',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        requestId: command.requestId || makeId(),
+        error: error.message,
+        timestamp: nowIso(),
+      });
+      await postEvent({
+        type: 'session.error',
+        hostId: HOST_ID,
+        sessionId: command.sessionId,
+        message: `Unable to run native Codex goal action: ${error.message}`,
+        timestamp: nowIso(),
+      });
+    }
+    return;
+  }
+
   if (command.type === 'session.review_start') {
     if (typeof runner.startReview === 'function') {
       try {
@@ -1506,6 +2058,7 @@ async function handleCommand(command) {
       type: 'session.state_changed',
       hostId: HOST_ID,
       sessionId: command.requestedSessionId || command.sessionId,
+      runId: runner.runId || command.runId || null,
       state: 'history-only',
       live: false,
       timestamp: nowIso(),
@@ -1567,7 +2120,7 @@ async function processPolledCommand(command) {
 async function pollCommandsLoop() {
   while (true) {
     try {
-      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}`, {
+      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}&ack=${lastCommandId}`, {
         retryOnTransient: true,
       });
       const commands = Array.isArray(result.body && result.body.commands) ? result.body.commands : [];
@@ -1576,7 +2129,7 @@ async function pollCommandsLoop() {
       }
       await sleep(POLL_INTERVAL_MS);
     } catch (error) {
-      logAgentError('[agent] command poll failed:', error.message);
+      logAgentTransient('[agent] command poll failed:', error);
       await sleep(Math.max(POLL_INTERVAL_MS, 3000));
     }
   }
@@ -1588,7 +2141,7 @@ async function discoveryLoop() {
       await sendDiscovery();
       await sleep(DISCOVERY_INTERVAL_MS);
     } catch (error) {
-      logAgentError('[agent] discovery failed:', error.message);
+      logAgentTransient('[agent] discovery failed:', error);
       await sleep(Math.max(DISCOVERY_INTERVAL_MS, 3000));
     }
   }
@@ -1607,7 +2160,7 @@ async function codexTailLoop() {
       }
       await sleep(CODEX_TAIL_INTERVAL_MS);
     } catch (error) {
-      logAgentError('[agent] codex tail failed:', error.message);
+      logAgentTransient('[agent] codex tail failed:', error);
       await sleep(Math.max(CODEX_TAIL_INTERVAL_MS, 3000));
     }
   }
@@ -1619,7 +2172,7 @@ async function heartbeatLoop() {
       await heartbeat();
       await sleep(5000);
     } catch (error) {
-      logAgentError('[agent] heartbeat failed:', error.message);
+      logAgentTransient('[agent] heartbeat failed:', error);
       await sleep(5000);
     }
   }

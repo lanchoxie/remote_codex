@@ -553,6 +553,45 @@ textarea {
   font-size: 12px;
 }
 
+.conversation-search-hits {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.conversation-search-hit {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  min-height: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(134, 167, 255, 0.22);
+  background: rgba(134, 167, 255, 0.08);
+  color: var(--text);
+  text-align: left;
+}
+
+.conversation-search-hit-meta {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.conversation-search-hit-snippet {
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.conversation-search-hit mark,
+.search-match-message mark,
+.search-focused-message mark {
+  padding: 0 2px;
+  border-radius: 4px;
+  background: rgba(255, 213, 105, 0.48);
+  color: inherit;
+}
+
 .host-switcher-row {
   display: grid;
   gap: 8px;
@@ -767,7 +806,7 @@ textarea {
 
 .settings-host-api-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.7fr);
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.7fr) auto;
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
@@ -776,11 +815,32 @@ textarea {
   background: rgba(255, 255, 255, 0.03);
 }
 
-.settings-host-api-row span {
+.settings-host-api-row > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.settings-api-ping-button {
+  min-height: 34px;
+  padding: 0 12px;
+}
+
+.settings-api-ping-result {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.settings-api-ping-result.success {
+  color: var(--accent);
+}
+
+.settings-api-ping-result.failure {
+  color: var(--danger);
 }
 
 .settings-empty {
@@ -1184,6 +1244,8 @@ textarea {
   margin-top: 8px;
   font-size: 18px;
   font-weight: 800;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
 .status-summary-note {
@@ -2362,6 +2424,27 @@ select:disabled {
   width: min(920px, 100%);
 }
 
+.session-id-copy-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  margin-left: 6px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.session-id-copy-button:hover {
+  color: var(--text);
+  border-color: rgba(134, 167, 255, 0.38);
+}
+
 .history-import-dialog-modal {
   width: min(860px, 100%);
 }
@@ -2535,6 +2618,13 @@ select:disabled {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.45;
+}
+
+.export-timeline-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
 }
 
 .export-day-list {
@@ -2775,6 +2865,15 @@ select:disabled {
   align-self: flex-end;
 }
 
+.message.search-focused-message .bubble {
+  border-color: rgba(255, 213, 105, 0.74);
+  box-shadow: 0 0 0 3px rgba(255, 213, 105, 0.16), var(--shadow);
+}
+
+.message.search-match-message:not(.search-focused-message) .bubble {
+  border-color: rgba(255, 213, 105, 0.28);
+}
+
 .message.system {
   align-self: center;
   max-width: 100%;
@@ -2901,8 +3000,15 @@ select:disabled {
 
 .markdown-math-inline,
 .markdown-math-block {
-  color: #dff7ff;
+  color: #111827;
   font-family: "Cambria Math", "STIX Two Math", "Times New Roman", serif;
+}
+
+.markdown-math-inline mjx-container,
+.markdown-math-block mjx-container,
+.markdown-math-inline .MathJax,
+.markdown-math-block .MathJax {
+  color: #111827 !important;
 }
 
 .markdown-math-block {
@@ -5581,6 +5687,61 @@ html[data-theme="minimal-light"] .markdown-body blockquote {
   pointer-events: none;
 }
 
+.transcript-search-navigator {
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  z-index: 19;
+  display: grid;
+  grid-template-columns: auto minmax(80px, 220px) auto auto auto;
+  align-items: center;
+  gap: 7px;
+  max-width: min(560px, calc(100% - 180px));
+  padding: 7px;
+  border: 1px solid rgba(255, 213, 105, 0.28);
+  border-radius: 999px;
+  background: rgba(10, 18, 34, 0.86);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(18px);
+  transform: translateX(-50%);
+}
+
+.transcript-search-label,
+.transcript-search-query {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.1;
+}
+
+.transcript-search-label {
+  color: rgba(255, 213, 105, 0.92);
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.transcript-search-query {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-search-nav-button,
+.transcript-search-close-button {
+  min-width: 0;
+  min-height: 30px;
+  padding: 6px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.transcript-search-close-button {
+  width: 30px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+}
+
 .scroll-jump-button {
   min-height: 34px;
   padding: 7px 11px;
@@ -5594,6 +5755,16 @@ html[data-theme="minimal-light"] .scroll-jump-button {
   color: #172033;
   background: rgba(255, 255, 255, 0.9);
   border-color: rgba(15, 23, 42, 0.12);
+}
+
+html[data-theme="minimal-light"] .transcript-search-navigator {
+  background: rgba(255, 255, 255, 0.92);
+  border-color: rgba(217, 119, 6, 0.24);
+  box-shadow: 0 16px 34px rgba(15, 23, 42, 0.1);
+}
+
+html[data-theme="minimal-light"] .transcript-search-label {
+  color: #9a6700;
 }
 
 .scroll-jump-button.has-new,
@@ -5655,6 +5826,16 @@ html[data-theme="minimal-light"] .conversation-card .path {
     min-height: 32px;
     padding: 6px 10px;
     font-size: 11px;
+  }
+
+  .transcript-search-navigator {
+    position: sticky;
+    top: 8px;
+    left: auto;
+    transform: none;
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    max-width: 100%;
+    margin: 0 6px -2px;
   }
 }
 
@@ -5896,6 +6077,15 @@ html[data-theme="minimal-light"] .conversation-card.active .conversation-card-ac
     border-color: rgba(15, 23, 42, 0.18);
     background: rgba(255, 255, 255, 0.94);
     touch-action: manipulation;
+  }
+
+  .transcript-search-navigator {
+    position: sticky !important;
+    top: 8px !important;
+    z-index: 70;
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    max-width: 100%;
+    margin: 0 0 -2px;
   }
 
   .slash-command-menu {

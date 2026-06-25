@@ -39,6 +39,7 @@ const state = {
   transcriptUnread: new Set(),
   transcriptUserDetached: new Set(),
   transcriptVisibleLimits: new Map(),
+  fullTranscriptLoaded: new Set(),
   manualSessionTitles: new Map(),
   alertWindowOpen: false,
   statusWindowOpen: false,
@@ -60,6 +61,15 @@ const state = {
   },
   sessionSearchQuery: '',
   sessionSearchMode: 'keyword',
+  sessionSearchLoading: false,
+  sessionSearchResults: [],
+  sessionSearchRequestId: 0,
+  pendingTranscriptFocus: null,
+  transcriptSearchNavigator: {
+    key: '',
+    query: '',
+    index: 0,
+  },
   sessionSortBy: 'updatedAt',
   sessionSortDir: 'desc',
   overviewCollapsed: false,
@@ -67,8 +77,11 @@ const state = {
   navigatorCollapsed: true,
   settingsOpen: false,
   settingsApiSnapshot: {},
+  apiPingResults: new Map(),
+  apiPingBusyHosts: new Set(),
   localAgentActionBusyId: null,
   hostRestartBusyId: null,
+  sessionLaunchBusy: null,
   imagePreview: {
     open: false,
     src: '',
@@ -95,6 +108,7 @@ const state = {
     format: 'markdown',
     fromDate: '',
     toDate: '',
+    selectedDays: new Set(),
     selectedExtensions: new Set(),
     selectedFileIds: new Set(),
     timelineKey: '',
@@ -167,6 +181,10 @@ const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const TRANSCRIPT_RENDER_WINDOW = 160;
 const TRANSCRIPT_RENDER_INCREMENT = 160;
+const CLIENT_DIAGNOSTIC_ENTRY_LIMIT = 10000;
+const CLIENT_DIAGNOSTIC_RECENT_DEDUPE_WINDOW = 200;
+const UI_EVENT_RENDER_DEBOUNCE_MS = 80;
+const TRANSCRIPT_EVENT_RENDER_DEBOUNCE_MS = 160;
 const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
 const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
@@ -195,7 +213,7 @@ const DEFAULT_UI_SETTINGS = {
     provider: 'OpenAI',
     baseUrl: '',
     apiKey: '',
-    rememberApiKey: false,
+    rememberApiKey: true,
   }],
 };
 const UI_TEXT = {
@@ -356,6 +374,10 @@ const ZH_STATIC_TEXT = {
   'Alerts': '提醒',
   'Join Running Session': '加入运行会话',
   'Resume From History': '从历史恢复',
+  'Resuming History...': '正在恢复历史...',
+  'Starting Session...': '正在启动会话...',
+  'Forking Branch...': '正在派生分支...',
+  'Waiting for this history session to become live...': '正在等待这个历史会话变成实时会话...',
   'Fork New Branch': '派生新分支',
   'Session': '会话',
   'Runtime': '运行时',
@@ -586,11 +608,13 @@ const TEXT_FILE_EXTENSIONS = new Set([
 const IMAGE_FILE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'jpeg', 'jpg', 'png', 'svg', 'tif', 'tiff', 'webp']);
 const MAX_TRANSCRIPT_FILE_CARDS = 48;
 const MAX_INLINE_IMAGE_PREVIEWS = 12;
+const MAX_UNCACHED_INLINE_IMAGE_PREVIEWS = 3;
 const COMPOSER_RECENT_SUBMISSION_TTL_MS = 2 * 60 * 1000;
 const COMPOSER_PENDING_SUBMISSION_TTL_MS = 90 * 1000;
 const OPTION_AUTO_RETRY_COOLDOWN_MS = 60 * 1000;
 const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
   ...IMAGE_FILE_EXTENSIONS,
+  'apk',
   'c',
   'cpp',
   'cs',
@@ -661,6 +685,74 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeSearchTerms(query) {
+  return String(query || '')
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function highlightSearchSnippet(value, query) {
+  let html = escapeHtml(value);
+  const terms = normalizeSearchTerms(query)
+    .sort((a, b) => b.length - a.length);
+  for (const term of terms) {
+    const pattern = new RegExp(`(${escapeRegExp(term)})`, 'ig');
+    html = html.replace(pattern, '<mark>$1</mark>');
+  }
+  return html;
+}
+
+function highlightTermsInElement(root, query) {
+  const terms = normalizeSearchTerms(query)
+    .sort((a, b) => b.length - a.length);
+  if (!root || !terms.length) {
+    return;
+  }
+  const pattern = new RegExp(`(${terms.map(escapeRegExp).join('|')})`, 'i');
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parentName = node.parentElement?.tagName?.toLowerCase() || '';
+      if (!node.nodeValue || parentName === 'mark' || parentName === 'script' || parentName === 'style') {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return pattern.test(node.nodeValue) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) {
+    nodes.push(walker.currentNode);
+  }
+  for (const node of nodes) {
+    const fragment = document.createDocumentFragment();
+    const parts = String(node.nodeValue || '').split(pattern);
+    for (const part of parts) {
+      if (!part) {
+        continue;
+      }
+      if (terms.some((term) => part.toLowerCase() === term)) {
+        const mark = document.createElement('mark');
+        mark.textContent = part;
+        fragment.appendChild(mark);
+      } else {
+        fragment.appendChild(document.createTextNode(part));
+      }
+    }
+    node.parentNode?.replaceChild(fragment, node);
+  }
+}
+
+function searchTermsMatchText(text, terms) {
+  const haystack = String(text || '').toLowerCase();
+  return terms.length > 0 && terms.every((term) => haystack.includes(term));
+}
+
 function makeClientId() {
   if (window.crypto && typeof window.crypto.randomUUID === 'function') {
     return window.crypto.randomUUID();
@@ -705,7 +797,7 @@ function normalizeApiProfile(input = {}, index = 0) {
     provider: String(input.provider || fallback.provider).trim() || fallback.provider,
     baseUrl: String(input.baseUrl || '').trim(),
     apiKey: String(input.apiKey || ''),
-    rememberApiKey: input.rememberApiKey === true,
+    rememberApiKey: input.rememberApiKey !== false || Boolean(input.apiKey),
   };
 }
 
@@ -875,7 +967,8 @@ function persistUiSettings() {
   const normalized = normalizeUiSettings(state.ui);
   const apiProfiles = normalized.apiProfiles.map((profile) => ({
     ...profile,
-    apiKey: profile.rememberApiKey ? profile.apiKey : '',
+    apiKey: profile.apiKey || '',
+    rememberApiKey: Boolean(profile.apiKey || profile.rememberApiKey),
   }));
   writeLocalStorageJson(UI_SETTINGS_STORAGE_KEY, {
     locale: normalized.locale,
@@ -1008,6 +1101,29 @@ function getApiRequestConfig(hostId = state.selectedHostId) {
     label: api.label,
   };
   return config.baseUrl || config.apiKey ? config : null;
+}
+
+function validateApiConfigForRequest(apiConfig, hostId = state.selectedHostId) {
+  if (!apiConfig) {
+    return;
+  }
+  if (apiConfig.baseUrl && !apiConfig.apiKey) {
+    const host = getHost(hostId);
+    const profileLabel = apiConfig.label || apiConfig.provider || apiConfig.profileId || 'selected API profile';
+    throw new Error(`${profileLabel} for ${host?.label || hostId || 'this host'} has a Base URL but no API key. Add the key in Settings, or clear the host mapping to use the host environment.`);
+  }
+}
+
+function summarizeApiConfigForDisplay(apiConfig) {
+  if (!apiConfig || typeof apiConfig !== 'object' || (!apiConfig.baseUrl && !apiConfig.apiKey)) {
+    return null;
+  }
+  return {
+    profileId: apiConfig.profileId || null,
+    label: apiConfig.label || apiConfig.provider || 'API profile',
+    provider: apiConfig.provider || null,
+    baseUrl: apiConfig.baseUrl || null,
+  };
 }
 
 function getSessionApiProfileSummary(session) {
@@ -1290,6 +1406,77 @@ function getSessionKey(session) {
   return session ? makeSessionKey(session.hostId, session.sessionId) : null;
 }
 
+function sessionLaunchLabel(mode) {
+  if (mode === 'resume') {
+    return 'Resuming History...';
+  }
+  if (mode === 'fork') {
+    return 'Forking Branch...';
+  }
+  return 'Starting Session...';
+}
+
+function getSessionLaunchBusyForSession(session) {
+  const busy = state.sessionLaunchBusy;
+  if (!busy || !session?.hostId) {
+    return null;
+  }
+  const key = getSessionKey(session);
+  if (busy.sessionKey && key && busy.sessionKey === key) {
+    return busy;
+  }
+  if (busy.hostId !== session.hostId) {
+    return null;
+  }
+  const identities = new Set([
+    busy.sessionId,
+    busy.sourceSessionId,
+    busy.originSessionId,
+    busy.nativeThreadId,
+    busy.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean));
+  return [
+    session.sessionId,
+    session.bridgeSessionId,
+    session.nativeThreadId,
+    session.originSessionId,
+    session.sourceSessionId,
+    session.conversationKey,
+  ].some((value) => identities.has(String(value || '').trim()))
+    ? busy
+    : null;
+}
+
+function setSessionLaunchBusy(patch) {
+  state.sessionLaunchBusy = {
+    id: patch.id || makeClientId(),
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...patch,
+  };
+  renderAll();
+}
+
+function updateSessionLaunchBusy(id, patch) {
+  if (!state.sessionLaunchBusy || state.sessionLaunchBusy.id !== id) {
+    return;
+  }
+  state.sessionLaunchBusy = {
+    ...state.sessionLaunchBusy,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  renderAll();
+}
+
+function clearSessionLaunchBusy(id) {
+  if (!state.sessionLaunchBusy || state.sessionLaunchBusy.id !== id) {
+    return;
+  }
+  state.sessionLaunchBusy = null;
+  renderAll();
+}
+
 function parseSessionTime(session) {
   const value = Date.parse(session?.lastUpdatedAt || session?.updatedAt || 0);
   return Number.isFinite(value) ? value : 0;
@@ -1395,6 +1582,8 @@ function prettyStatusLabel(value) {
     thinking: 'Thinking',
     planning: 'Planning',
     reviewing: 'Reviewing',
+    'queued-turn': 'Queued',
+    'submitting-turn': 'Submitting',
     reconnecting: 'Reconnecting',
     retrying: 'Retrying',
     interrupted: 'Interrupted',
@@ -1824,6 +2013,143 @@ function buildThinkingEntriesForSession(session) {
   return segments;
 }
 
+function getTranscriptSearchTerms() {
+  if (state.sessionSearchMode !== 'keyword') {
+    return [];
+  }
+  return normalizeSearchTerms(state.sessionSearchQuery);
+}
+
+function buildTranscriptSearchMatches(visibleTranscript, focus = null) {
+  const terms = getTranscriptSearchTerms();
+  if (!terms.length) {
+    return [];
+  }
+  const matches = [];
+  for (const [index, entry] of visibleTranscript.entries()) {
+    if (!entry || !['user', 'agent', 'assistant'].includes(entry.speaker || '')) {
+      continue;
+    }
+    if (searchTermsMatchText(entry.text || '', terms) || transcriptEntryMatchesSearchMatch(entry, focus)) {
+      matches.push({
+        entryIndex: index,
+        timestamp: entry.timestamp || null,
+        speaker: entry.speaker || 'system',
+      });
+    }
+  }
+  return matches;
+}
+
+function clampTranscriptSearchIndex(matches, focus = null) {
+  if (!matches.length) {
+    return 0;
+  }
+  const focusIndex = Number(focus?.entryIndex ?? -1);
+  if (focusIndex >= 0) {
+    const byIndex = matches.findIndex((match) => match.entryIndex === focusIndex);
+    if (byIndex >= 0) {
+      return byIndex;
+    }
+  }
+  if (focus?.timestamp) {
+    const byTimestamp = matches.findIndex((match) => match.timestamp === focus.timestamp);
+    if (byTimestamp >= 0) {
+      return byTimestamp;
+    }
+  }
+  return Math.min(Math.max(Number(state.transcriptSearchNavigator.index || 0), 0), matches.length - 1);
+}
+
+function getTranscriptSearchTarget(session = getSelectedSession()) {
+  const key = getSessionKey(session) || '';
+  const focus = state.pendingTranscriptFocus
+    && state.pendingTranscriptFocus.hostId === session?.hostId
+    && state.pendingTranscriptFocus.sessionId === session?.sessionId
+    ? state.pendingTranscriptFocus
+    : null;
+  const matches = buildTranscriptSearchMatches(
+    getTranscriptForSession(session).filter((entry) => entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant'),
+    focus
+  );
+  if (!key || !matches.length) {
+    return null;
+  }
+  const queryChanged = state.transcriptSearchNavigator.key !== key || state.transcriptSearchNavigator.query !== state.sessionSearchQuery;
+  const index = queryChanged ? 0 : clampTranscriptSearchIndex(matches, state.pendingTranscriptFocus);
+  return {
+    key,
+    query: state.sessionSearchQuery,
+    matches,
+    index,
+    match: matches[index],
+  };
+}
+
+function renderTranscriptSearchNavigator(session, matches = [], activeIndex = 0) {
+  const container = el('transcript-search-navigator');
+  if (!container) {
+    return;
+  }
+  container.innerHTML = '';
+  const key = getSessionKey(session) || '';
+  const query = String(state.sessionSearchQuery || '').trim();
+  if (!key || !query || !matches.length) {
+    container.classList.add('hidden');
+    return;
+  }
+
+  container.classList.remove('hidden');
+  const label = document.createElement('div');
+  label.className = 'transcript-search-label';
+  label.textContent = `${activeIndex + 1} / ${matches.length}`;
+  const queryText = document.createElement('div');
+  queryText.className = 'transcript-search-query';
+  queryText.textContent = query;
+  const previous = document.createElement('button');
+  previous.type = 'button';
+  previous.className = 'secondary-button transcript-search-nav-button';
+  previous.dataset.transcriptSearchNav = 'previous';
+  previous.textContent = 'Prev';
+  const next = document.createElement('button');
+  next.type = 'button';
+  next.className = 'secondary-button transcript-search-nav-button';
+  next.dataset.transcriptSearchNav = 'next';
+  next.textContent = 'Next';
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'secondary-button transcript-search-close-button';
+  close.dataset.transcriptSearchNav = 'clear';
+  close.textContent = '×';
+  container.append(label, queryText, previous, next, close);
+}
+
+function focusTranscriptSearchMatch(direction = 'next') {
+  const selected = getSelectedSession();
+  const target = getTranscriptSearchTarget(selected);
+  if (!target || !target.matches.length) {
+    return;
+  }
+  const delta = direction === 'previous' ? -1 : 1;
+  const nextIndex = direction === 'current'
+    ? target.index
+    : (target.index + delta + target.matches.length) % target.matches.length;
+  const match = target.matches[nextIndex];
+  state.transcriptSearchNavigator = {
+    key: target.key,
+    query: target.query,
+    index: nextIndex,
+  };
+  state.pendingTranscriptFocus = {
+    hostId: selected.hostId,
+    sessionId: selected.sessionId,
+    entryIndex: match.entryIndex,
+    timestamp: match.timestamp || null,
+    snippet: '',
+  };
+  renderTranscript(selected, { focus: state.pendingTranscriptFocus });
+}
+
 function isFileChangeDiagnostic(entry) {
   const method = String(entry?.method || '').toLowerCase();
   const kind = String(entry?.kind || '').toLowerCase();
@@ -2103,8 +2429,7 @@ function dedupeTranscript(entries) {
     compacted.push(entry);
   }
 
-  return compacted
-    .slice(-200);
+  return compacted;
 }
 
 function getRunnerSummary(session) {
@@ -2215,11 +2540,28 @@ function getRecentDirectories(hostId, limit = 8) {
   return recent;
 }
 
+function getSessionConversationKey(session) {
+  if (!session) {
+    return '';
+  }
+  const conversationKey = session.conversationKey || '';
+  const isIdentityConversationKey = conversationKey && conversationKey === session.sessionId;
+  if (conversationKey && !isIdentityConversationKey) {
+    return conversationKey;
+  }
+  return session.originSessionId
+    || session.sourceSessionId
+    || session.bridgeSessionId
+    || (session.nativeThreadId && session.nativeThreadId !== session.sessionId ? session.nativeThreadId : '')
+    || conversationKey
+    || session.sessionId;
+}
+
 function getConversationGroups(hostId) {
   const groups = new Map();
 
   for (const session of getSessionsForHost(hostId)) {
-    const conversationKey = session.conversationKey || session.originSessionId || session.sessionId;
+    const conversationKey = getSessionConversationKey(session);
     const group = groups.get(conversationKey) || {
       hostId,
       conversationKey,
@@ -2375,6 +2717,47 @@ function filterConversationGroups(groups) {
     });
 }
 
+function searchResultKey(result) {
+  return makeSessionKey(result?.hostId || '', result?.sessionId || '');
+}
+
+function getSearchResultsForGroup(group) {
+  if (!group || !state.sessionSearchQuery.trim()) {
+    return [];
+  }
+  const sessionIds = new Set((group.sessions || []).map((session) => session.sessionId));
+  return state.sessionSearchResults.filter((result) => (
+    result.hostId === group.hostId
+    && (
+      result.conversationKey === group.conversationKey
+      || sessionIds.has(result.sessionId)
+    )
+  ));
+}
+
+function hasServerSearchResult(group) {
+  return getSearchResultsForGroup(group).length > 0;
+}
+
+function filterConversationGroupsWithSearch(groups) {
+  const localMatches = filterConversationGroups(groups);
+  const query = String(state.sessionSearchQuery || '').trim();
+  if (!query || state.sessionSearchMode !== 'keyword' || !state.sessionSearchResults.length) {
+    return localMatches;
+  }
+
+  const seen = new Set(localMatches.map((group) => `${group.hostId}::${group.conversationKey}`));
+  const merged = [...localMatches];
+  for (const group of groups) {
+    const key = `${group.hostId}::${group.conversationKey}`;
+    if (!seen.has(key) && hasServerSearchResult(group)) {
+      seen.add(key);
+      merged.push(group);
+    }
+  }
+  return merged;
+}
+
 function getSelectedCollection() {
   return state.sessionCollections.find((collection) => collection.collectionId === state.selectedCollectionId)
     || state.sessionCollections[0]
@@ -2518,36 +2901,64 @@ function getConversationGroupsForCollection(collection = getSelectedCollection()
 
   const allGroups = getAllConversationGroups();
   const groupMap = new Map(allGroups.map((group) => [`${group.hostId}::${group.conversationKey}`, group]));
-  return (collection.items || [])
-    .map((item) => {
+  const seen = new Map();
+  const groups = [];
+
+  for (const item of collection.items || []) {
       const key = `${item.hostId}::${item.conversationKey}`;
       const group = groupMap.get(key) || findCollectionConversationGroup(allGroups, item);
-      if (group) {
-        return {
+    const resolved = group
+      ? {
           ...group,
+          collectionItem: item,
+        }
+      : {
+          hostId: item.hostId,
+          hostLabel: item.hostLabel,
+          conversationKey: item.conversationKey,
+          sessions: [],
+          totalCount: item.sessionId ? 1 : 0,
+          liveCount: 0,
+          preferredSession: null,
+          cwd: item.cwd || null,
+          title: item.title || item.conversationKey,
+          createdAt: item.createdAt || item.addedAt || null,
+          lastUpdatedAt: item.updatedAt || item.addedAt || null,
+          messageCount: Number(item.messageCount || 0),
+          latestUserMessage: null,
+          latestAgentMessage: null,
+          collectionOnly: true,
+          collectionItem: item,
+        };
+    const dedupeKeys = getCollectionGroupDedupeKeys(resolved, item);
+    const existingIndex = dedupeKeys
+      .map((dedupeKey) => seen.get(dedupeKey))
+      .find((index) => Number.isInteger(index));
+    if (Number.isInteger(existingIndex)) {
+      const existing = groups[existingIndex];
+      const existingItem = existing?.collectionItem || {};
+      if (parseSessionTime({ lastUpdatedAt: item.updatedAt || item.addedAt })
+        >= parseSessionTime({ lastUpdatedAt: existingItem.updatedAt || existingItem.addedAt })) {
+        groups[existingIndex] = {
+          ...existing,
+          ...resolved,
           collectionItem: item,
         };
       }
+      for (const dedupeKey of dedupeKeys) {
+        seen.set(dedupeKey, existingIndex);
+      }
+      continue;
+    }
 
-      return {
-        hostId: item.hostId,
-        hostLabel: item.hostLabel,
-        conversationKey: item.conversationKey,
-        sessions: [],
-        totalCount: item.sessionId ? 1 : 0,
-        liveCount: 0,
-        preferredSession: null,
-        cwd: item.cwd || null,
-        title: item.title || item.conversationKey,
-        createdAt: item.createdAt || item.addedAt || null,
-        lastUpdatedAt: item.updatedAt || item.addedAt || null,
-        messageCount: Number(item.messageCount || 0),
-        latestUserMessage: null,
-        latestAgentMessage: null,
-        collectionOnly: true,
-        collectionItem: item,
-      };
-    })
+    const nextIndex = groups.length;
+    for (const dedupeKey of dedupeKeys) {
+      seen.set(dedupeKey, nextIndex);
+    }
+    groups.push(resolved);
+  }
+
+  return groups
     .sort((a, b) => {
       const delta = parseSessionTime({ lastUpdatedAt: b.lastUpdatedAt }) - parseSessionTime({ lastUpdatedAt: a.lastUpdatedAt });
       if (delta !== 0) {
@@ -2555,6 +2966,29 @@ function getConversationGroupsForCollection(collection = getSelectedCollection()
       }
       return String(a.title || a.conversationKey).localeCompare(String(b.title || b.conversationKey));
     });
+}
+
+function getCollectionGroupDedupeKeys(group, item = {}) {
+  const hostId = group?.hostId || item.hostId || '';
+  const keys = new Set();
+  const add = (kind, value) => {
+    if (hostId && value) {
+      keys.add(`${kind}::${hostId}::${value}`);
+    }
+  };
+
+  add('group', group?.conversationKey);
+  add('item', item.conversationKey);
+  add('session', item.sessionId);
+  for (const session of group?.sessions || []) {
+    add('session', session.sessionId);
+    add('conversation', session.conversationKey);
+    add('origin', session.originSessionId);
+    add('source', session.sourceSessionId);
+    add('bridge', session.bridgeSessionId);
+    add('native', session.nativeThreadId);
+  }
+  return Array.from(keys);
 }
 
 function findCollectionConversationGroup(groups, item) {
@@ -2668,7 +3102,7 @@ function buildCollectionItemFromSession(session) {
   if (!session) {
     return null;
   }
-  const conversationKey = session.conversationKey || session.originSessionId || session.sourceSessionId || session.sessionId;
+  const conversationKey = getSessionConversationKey(session);
   return {
     hostId: session.hostId,
     conversationKey,
@@ -2829,8 +3263,21 @@ function mergeSession(session) {
     return nextSession;
   }
 
+  const existing = state.sessions[index];
+  if (
+    existing?.live
+    && existing.source === 'managed'
+    && nextSession.live === false
+    && nextSession.source !== 'managed'
+  ) {
+    nextSession.live = true;
+    nextSession.source = existing.source;
+    nextSession.state = existing.state || 'running';
+    nextSession.runtime = existing.runtime || nextSession.runtime || null;
+  }
+
   state.sessions[index] = {
-    ...state.sessions[index],
+    ...existing,
     ...nextSession,
   };
   return state.sessions[index];
@@ -2902,6 +3349,8 @@ function shouldDisplayAlert(entry) {
     || /Codex could not find bubblewrap on PATH/i.test(message)
     || /sandbox prerequisites/i.test(message)
     || /concepts\/sandboxing#prerequisites/i.test(message)
+    || /^Session state changed:\s*exited:(?:null|143):(?:SIGTERM|null)$/i.test(message)
+    || /^Session state changed:\s*exited:[^:]*:SIGTERM$/i.test(message)
   );
 }
 
@@ -3135,12 +3584,39 @@ function cleanTranscriptTextForDisplay(value, speaker = '') {
     return '';
   }
 
+  text = stripTranscriptWrapperText(text).trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
   text = stripEnvironmentContextText(text).trim();
   if (String(speaker || '').toLowerCase() === 'user') {
     text = stripIdeContextText(text).trim();
   }
 
   return isInternalTranscriptText(text) ? '' : text;
+}
+
+function stripTranscriptWrapperText(value) {
+  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text) {
+    return '';
+  }
+
+  const wrapperPatterns = [
+    /\n?The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b[\s\S]*$/i,
+    /\n?>>> TRANSCRIPT(?: DELTA)? START\b[\s\S]*$/im,
+    /\n?>>> TRANSCRIPT(?: DELTA)? END\b[\s\S]*$/im,
+    /\n?>>> APPROVAL REQUEST START\b[\s\S]*$/im,
+    /\n?>>> APPROVAL REQUEST END\b[\s\S]*$/im,
+    /\n?Reviewed Codex session id:[\s\S]*$/i,
+    /\n?The Codex agent has requested the following (?:next action|action below|action):[\s\S]*$/i,
+  ];
+
+  for (const pattern of wrapperPatterns) {
+    text = text.replace(pattern, '').trim();
+  }
+  return text;
 }
 
 function stripEnvironmentContextText(value) {
@@ -3253,27 +3729,37 @@ function getRuntimeForSession(session) {
   return key ? state.runtime.get(key) || null : null;
 }
 
+function normalizeDiagnosticEntry(entry) {
+  if (!entry) {
+    return null;
+  }
+  return {
+    timestamp: entry.timestamp || null,
+    severity: entry.severity || 'info',
+    source: entry.source || 'codex',
+    kind: entry.kind || 'event',
+    method: entry.method || null,
+    message: String(entry.message || ''),
+    detail: entry.detail || null,
+    data: entry.data || null,
+    turnId: entry.turnId || entry.data?.turnId || null,
+  };
+}
+
+function diagnosticEntryKey(entry) {
+  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.turnId || ''}`;
+}
+
 function dedupeDiagnostics(entries) {
   const seen = new Set();
   const deduped = [];
 
   for (const entry of entries || []) {
-    if (!entry) {
+    const normalized = normalizeDiagnosticEntry(entry);
+    if (!normalized) {
       continue;
     }
-
-    const normalized = {
-      timestamp: entry.timestamp || null,
-      severity: entry.severity || 'info',
-      source: entry.source || 'codex',
-      kind: entry.kind || 'event',
-      method: entry.method || null,
-      message: String(entry.message || ''),
-      detail: entry.detail || null,
-      data: entry.data || null,
-      turnId: entry.turnId || entry.data?.turnId || null,
-    };
-    const key = `${normalized.timestamp || ''}|${normalized.kind}|${normalized.method || ''}|${normalized.message}|${normalized.detail || ''}|${normalized.turnId || ''}`;
+    const key = diagnosticEntryKey(normalized);
     if (seen.has(key)) {
       continue;
     }
@@ -3281,7 +3767,19 @@ function dedupeDiagnostics(entries) {
     deduped.push(normalized);
   }
 
-  return deduped.slice(-200);
+  return deduped
+    .sort((a, b) => {
+      const left = Date.parse(a.timestamp || '');
+      const right = Date.parse(b.timestamp || '');
+      if (Number.isFinite(left) && Number.isFinite(right) && left !== right) {
+        return left - right;
+      }
+      if (Number.isFinite(left) !== Number.isFinite(right)) {
+        return Number.isFinite(left) ? -1 : 1;
+      }
+      return 0;
+    })
+    .slice(-CLIENT_DIAGNOSTIC_ENTRY_LIMIT);
 }
 
 function setDiagnosticsForSession(hostId, sessionId, diagnostics) {
@@ -3289,10 +3787,31 @@ function setDiagnosticsForSession(hostId, sessionId, diagnostics) {
   state.diagnostics.set(key, dedupeDiagnostics(diagnostics));
 }
 
+function mergeDiagnosticsForSession(hostId, sessionId, diagnostics) {
+  const key = makeSessionKey(hostId, sessionId);
+  const existing = state.diagnostics.get(key) || [];
+  state.diagnostics.set(key, dedupeDiagnostics([...existing, ...(Array.isArray(diagnostics) ? diagnostics : [])]));
+}
+
 function appendDiagnosticForSession(hostId, sessionId, entry) {
   const key = makeSessionKey(hostId, sessionId);
   const existing = state.diagnostics.get(key) || [];
-  state.diagnostics.set(key, dedupeDiagnostics([...existing, entry]));
+  const normalized = normalizeDiagnosticEntry(entry);
+  if (!normalized || !normalized.message) {
+    return;
+  }
+  const fingerprint = diagnosticEntryKey(normalized);
+  const recentStart = Math.max(0, existing.length - CLIENT_DIAGNOSTIC_RECENT_DEDUPE_WINDOW);
+  for (let index = existing.length - 1; index >= recentStart; index -= 1) {
+    if (diagnosticEntryKey(existing[index]) === fingerprint) {
+      return;
+    }
+  }
+  existing.push(normalized);
+  if (existing.length > CLIENT_DIAGNOSTIC_ENTRY_LIMIT) {
+    existing.splice(0, existing.length - CLIENT_DIAGNOSTIC_ENTRY_LIMIT);
+  }
+  state.diagnostics.set(key, existing);
 }
 
 function getDiagnosticsForSession(session) {
@@ -3645,6 +4164,63 @@ function getApiChangedLiveSessions(previousSnapshot = {}) {
   return Array.from(sessionsByKey.values());
 }
 
+function getApiProfileForHostSelection(hostId, profileId = '') {
+  const profiles = getApiProfiles();
+  const selectedProfileId = profileId || state.ui.hostApiProfiles?.[hostId] || state.ui.defaultApiProfileId || profiles[0]?.profileId || 'default';
+  return profiles.find((profile) => profile.profileId === selectedProfileId)
+    || profiles.find((profile) => profile.profileId === state.ui.defaultApiProfileId)
+    || profiles[0]
+    || null;
+}
+
+async function pingHostApiProfile(hostId, profileId = '') {
+  const host = state.hosts.find((item) => item.hostId === hostId);
+  if (!host) {
+    throw new Error('Host is no longer available.');
+  }
+  if (!host.online) {
+    throw new Error(`${host.label || hostId} is offline.`);
+  }
+  saveActiveApiProfileFromSettingsForm();
+  const profile = getApiProfileForHostSelection(hostId, profileId);
+  const apiConfig = profile ? {
+    provider: profile.provider,
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    profileId: profile.profileId,
+    label: profile.label,
+  } : null;
+  if (!apiConfig || (!apiConfig.baseUrl && !apiConfig.apiKey)) {
+    throw new Error('Enter a Base URL or API Key before testing.');
+  }
+
+  state.apiPingBusyHosts.add(hostId);
+  state.apiPingResults.set(hostId, { pending: true });
+  renderHostApiProfileList();
+  try {
+    const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/api-test`, {
+      method: 'POST',
+      body: JSON.stringify({ apiConfig }),
+    });
+    const result = response.result || {};
+    state.apiPingResults.set(hostId, {
+      ...result,
+      ok: Boolean(result.ok),
+      testedAt: response.timestamp || result.testedAt || new Date().toISOString(),
+    });
+  } catch (error) {
+    state.apiPingResults.set(hostId, {
+      ok: false,
+      error: error.message || 'API test failed.',
+      message: error.message || 'API test failed.',
+      testedAt: new Date().toISOString(),
+    });
+  } finally {
+    state.apiPingBusyHosts.delete(hostId);
+    renderHostApiProfileList();
+  }
+}
+
 function setConnectorManagerOpen(open) {
   state.connectorManagerOpen = Boolean(open);
   renderConnectorManager();
@@ -3974,7 +4550,7 @@ function isLocalAgentCandidate(host) {
   if (!host?.hostId) {
     return false;
   }
-  if (host.localAgent) {
+  if (host.localAgent || host.relayLocal) {
     return true;
   }
   const relayPlatform = state.stats?.relay?.platform || '';
@@ -4451,7 +5027,7 @@ function renderConversationNav() {
 
   const collection = getSelectedCollection();
   const groups = getConversationGroupsForCollection(collection);
-  const visibleGroups = sortConversationGroups(filterConversationGroups(groups));
+  const visibleGroups = sortConversationGroups(filterConversationGroupsWithSearch(groups));
   const searchInput = el('session-search-input');
   const searchMode = el('session-search-mode');
   const searchModeButton = el('session-search-mode-button');
@@ -4502,8 +5078,10 @@ function renderConversationNav() {
     const scope = collection.collectionId === 'default'
       ? `Default on ${host?.label || 'selected host'}`
       : collection.name;
+    const fullMatchCount = state.sessionSearchResults.length;
+    const loadingText = state.sessionSearchLoading ? ' Searching full history...' : '';
     searchSummary.textContent = query
-      ? `${visibleGroups.length} of ${groups.length} in ${scope} match "${query}"`
+      ? `${visibleGroups.length} of ${groups.length} in ${scope} match "${query}"${fullMatchCount ? ` | ${fullMatchCount} full-history hits` : ''}.${loadingText}`
       : groups.length
         ? `${groups.length} conversations in ${scope}`
         : '';
@@ -4576,6 +5154,11 @@ function renderConversationNav() {
     variantRow.className = 'variant-row';
     renderVariantButtons(variantRow, group, state.selectedSessionId);
     item.appendChild(variantRow);
+
+    const searchResults = getSearchResultsForGroup(group);
+    if (searchResults.length) {
+      item.appendChild(renderConversationSearchHits(group, searchResults));
+    }
 
     const actions = document.createElement('div');
     actions.className = 'conversation-card-actions';
@@ -4651,6 +5234,11 @@ function renderConversationNav() {
       removeButton.textContent = 'Remove';
       removeButton.onclick = async (event) => {
         event.stopPropagation();
+        const conversationTitle = group.title || group.conversationKey || 'this conversation';
+        const collectionName = collection.name || 'this collection';
+        if (!window.confirm(`Remove "${conversationTitle}" from collection "${collectionName}"?`)) {
+          return;
+        }
         try {
           await removeConversationFromCollection(collection.collectionId, group);
         } catch (error) {
@@ -4668,6 +5256,48 @@ function renderConversationNav() {
     };
     list.appendChild(item);
   }
+}
+
+function renderConversationSearchHits(group, results) {
+  const box = document.createElement('div');
+  box.className = 'conversation-search-hits';
+  const query = state.sessionSearchQuery;
+  const matches = [];
+  for (const result of results.slice(0, 3)) {
+    for (const match of (result.matches || []).slice(0, 3)) {
+      matches.push({ result, match });
+      if (matches.length >= 4) {
+        break;
+      }
+    }
+    if (matches.length >= 4) {
+      break;
+    }
+  }
+
+  for (const { result, match } of matches) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'conversation-search-hit';
+    button.dataset.searchHostId = result.hostId;
+    button.dataset.searchSessionId = result.sessionId;
+    button.dataset.searchEntryIndex = String(match.entryIndex ?? -1);
+    button.innerHTML = `
+      <span class="conversation-search-hit-meta">${escapeHtml(match.speaker || match.type || 'match')} ${escapeHtml(formatTime(match.timestamp) || '')}</span>
+      <span class="conversation-search-hit-snippet">${highlightSearchSnippet(match.snippet || '', query)}</span>
+    `;
+    button.onclick = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await openSearchResult(result, match, group);
+      } catch (error) {
+        reportError(error);
+      }
+    };
+    box.appendChild(button);
+  }
+  return box;
 }
 
 function modelCacheKey(session) {
@@ -4864,6 +5494,21 @@ function receivedFileToTranscriptRef(file) {
     isImage: Boolean(file.isImage) || isImageFileRef({ name: file.name, path: pathValue, mime: file.mime }),
     cached: true,
   };
+}
+
+function getCachedReceivedFileRefForPath(session, filePath) {
+  const normalizedPath = normalizeRemoteFilePath(filePath || '');
+  if (!normalizedPath) {
+    return null;
+  }
+  for (const file of getReceivedFilesForSession(session)) {
+    const cachedPath = normalizeRemoteFilePath(file?.remotePath || file?.path || '');
+    if (cachedPath !== normalizedPath) {
+      continue;
+    }
+    return receivedFileToTranscriptRef(file);
+  }
+  return null;
 }
 
 function getCachedFileRefsForMentionedDirectories(session, entry) {
@@ -5639,6 +6284,7 @@ function renderComposerControls(session, disabled) {
     'codex-local-image-path',
     'codex-clear-attachments-button',
     'codex-plan-button',
+    'codex-goal-button',
     'composer-exit-plan-mode-button',
     'codex-send-button',
   ];
@@ -5688,20 +6334,33 @@ function findSteerQueueItem(itemId) {
 }
 
 function getSteerQueueText(item) {
-  return String(item?.text || item?.payload?.text || item?.payload?.displayText || '');
+  return String(item?.text || item?.payload?.displayText || item?.payload?.composerDraft?.text || item?.payload?.text || '');
 }
 
 function setSteerQueueItemText(item, text) {
   if (!item) {
     return;
   }
+  const previousPayload = item.payload || {};
+  const previousDisplayText = String(previousPayload.displayText || item.text || previousPayload.composerDraft?.text || '');
+  const previousPayloadText = String(previousPayload.text || '');
+  const hasStructuredInputs = Boolean(
+    previousPayload.inputItems?.length
+    || previousPayload.uploadedFiles?.length
+    || previousPayload.inlineFiles?.length
+  );
   const nextText = String(text || '');
   item.text = nextText;
   item.updatedAt = new Date().toISOString();
-  item.payload = {
-    ...(item.payload || {}),
-    text: nextText,
+  const nextPayload = {
+    ...previousPayload,
     displayText: nextText,
+  };
+  if (!hasStructuredInputs && (!previousPayloadText || previousPayloadText === previousDisplayText)) {
+    nextPayload.text = nextText;
+  }
+  item.payload = {
+    ...nextPayload,
   };
   if (item.payload.composerDraft) {
     item.payload.composerDraft = {
@@ -5712,7 +6371,7 @@ function setSteerQueueItemText(item, text) {
 }
 
 function addSteerQueueItem(session, payload, steerText) {
-  const text = String(steerText || '').trim();
+  const text = String(steerText || payload?.displayText || payload?.composerDraft?.text || '').trim();
   const item = {
     id: makeClientId(),
     sessionKey: getSessionKey(session),
@@ -5721,8 +6380,7 @@ function addSteerQueueItem(session, payload, steerText) {
     text,
     payload: {
       ...payload,
-      text,
-      displayText: text,
+      displayText: payload?.displayText || text,
     },
     createdAt: new Date().toISOString(),
     sentAt: null,
@@ -5954,6 +6612,64 @@ function getDefaultTextForInputItems(inputItems = []) {
   return 'Please inspect the attached file(s).';
 }
 
+function buildComposerDisplayText(rawText, inputItems = [], uploadedFiles = [], draft = null) {
+  const userVisibleText = String(rawText || '').trim();
+  const attachments = getComposerDraftAttachments(draft);
+  const summaries = [];
+
+  const historyNames = attachments
+    .filter((attachment) => attachment.source === 'historyImport')
+    .map((attachment) => attachment.name || 'conversation history');
+  if (historyNames.length) {
+    summaries.push(`Attached history: ${historyNames.slice(0, 3).join(', ')}${historyNames.length > 3 ? ` and ${historyNames.length - 3} more` : ''}`);
+  }
+
+  const promptCards = attachments
+    .filter((attachment) => attachment.type === 'promptCard')
+    .map((attachment) => attachment.title || 'Prompt card');
+  if (promptCards.length) {
+    summaries.push(`Prompt card: ${promptCards.slice(0, 3).join(', ')}${promptCards.length > 3 ? ` and ${promptCards.length - 3} more` : ''}`);
+  }
+
+  const textFiles = attachments
+    .filter((attachment) => attachment.type === 'textFile' && attachment.source !== 'historyImport')
+    .map((attachment) => attachment.name || 'text file');
+  if (textFiles.length) {
+    summaries.push(`Attached text: ${textFiles.slice(0, 3).join(', ')}${textFiles.length > 3 ? ` and ${textFiles.length - 3} more` : ''}`);
+  }
+
+  const images = inputItems
+    .filter((item) => item.type === 'image' || item.type === 'localImage')
+    .map((item) => item.name || item.path || 'image');
+  if (images.length) {
+    summaries.push(`Attached image: ${images.slice(0, 3).join(', ')}${images.length > 3 ? ` and ${images.length - 3} more` : ''}`);
+  }
+
+  const skills = inputItems
+    .filter((item) => item.type === 'skill')
+    .map((item) => item.name || 'skill');
+  if (skills.length) {
+    summaries.push(`Skill: ${skills.slice(0, 3).join(', ')}${skills.length > 3 ? ` and ${skills.length - 3} more` : ''}`);
+  }
+
+  const uploads = uploadedFiles
+    .map((file) => file.name || basename(file.path) || 'file');
+  if (uploads.length) {
+    summaries.push(`Uploaded file: ${uploads.slice(0, 3).join(', ')}${uploads.length > 3 ? ` and ${uploads.length - 3} more` : ''}`);
+  }
+
+  if (userVisibleText && summaries.length) {
+    return [userVisibleText, ...summaries].join('\n\n');
+  }
+  if (userVisibleText) {
+    return userVisibleText;
+  }
+  if (summaries.length) {
+    return summaries.join('\n\n');
+  }
+  return inputItems.length ? getDefaultTextForInputItems(inputItems) : '';
+}
+
 function getComposerTextFileSections(draft = null) {
   return getComposerDraftAttachments(draft)
     .filter((attachment) => attachment.type === 'textFile')
@@ -6132,17 +6848,6 @@ function restoreActiveDraftForSession(session) {
   }
   state.codexControls.activeDraftsBySession.delete(key);
   return true;
-}
-
-function buildPlanPrompt(text, hasAttachments) {
-  const request = text || (hasAttachments ? 'Please inspect the attached image(s) and propose a safe next-step plan.' : '');
-  return [
-    'Plan mode: do not modify files, do not run destructive commands, and do not make irreversible changes.',
-    'Analyze the request, list the concrete steps you would take, and call out risks or decisions that need confirmation.',
-    '',
-    'User request:',
-    request,
-  ].join('\n').trim();
 }
 
 const SLASH_COMMANDS = [
@@ -6985,18 +7690,14 @@ async function buildComposerPayload(session, rawText, overrides = {}) {
     text = getDefaultTextForInputItems(inputItems);
   }
   if (options.mode === 'plan' && hasOriginalContent) {
-    text = buildPlanPrompt(text, inputItems.length > 0);
-    options.approvalPolicy = 'never';
-    options.sandboxMode = 'readOnly';
+    options.planFallback = options.planFallback || 'local';
   }
-  const fallbackDisplayText = promptCardSections.length
-    ? promptCardSections.map((section) => section.split('\n')[0]).join(', ')
-    : (hasOriginalContent ? getDefaultTextForInputItems(inputItems) : '');
+  const displayText = buildComposerDisplayText(userVisibleText, inputItems, uploadedFiles, composerDraft);
 
   return {
     ...options,
     text,
-    displayText: userVisibleText || fallbackDisplayText,
+    displayText,
     inputItems,
     uploadedFiles,
     inlineFiles,
@@ -7352,7 +8053,7 @@ function renderSessionDetails() {
         apiSummary.label,
       ].filter(Boolean).join(' | ');
       headerMeta.innerHTML = [
-        escapeHtml(metaLine),
+        `<span class="session-meta-line">${escapeHtml(metaLine)} <button type="button" class="session-id-copy-button" data-copy-session-id="${escapeHtml(session.sessionId)}" title="Copy full session ID">Copy ID</button></span>`,
         session.cwd ? `<span class="session-meta-path">${escapeHtml(session.cwd)}</span>` : '',
       ].filter(Boolean).join('<br>');
       headerMeta.title = [metaLine, session.cwd || ''].filter(Boolean).join('\n');
@@ -7442,6 +8143,7 @@ function renderSessionDetails() {
   const liveSession = getLiveSessionForConversation(conversation);
   const canActivateHistory = Boolean(session && !session.live && session.cwd);
   const canFork = Boolean(session && session.cwd);
+  const launchBusy = getSessionLaunchBusyForSession(session);
   if (!session) {
     joinButton.disabled = true;
     joinButton.textContent = 'Join Running Session';
@@ -7452,7 +8154,10 @@ function renderSessionDetails() {
     forkButton.disabled = true;
     forkButton.textContent = 'Fork New Branch';
   } else {
-    if (!liveSession) {
+    if (launchBusy) {
+      joinButton.disabled = true;
+      joinButton.textContent = sessionLaunchLabel(launchBusy.launchMode);
+    } else if (!liveSession) {
       joinButton.disabled = true;
       joinButton.textContent = 'No Running Session';
     } else if (session.live && liveSession.sessionId === session.sessionId) {
@@ -7467,8 +8172,11 @@ function renderSessionDetails() {
     resumeButton.classList.toggle('danger-button', Boolean(session.live));
     resumeButton.classList.toggle('secondary-button', !session.live);
     if (session.live) {
-      resumeButton.disabled = isEnding;
+      resumeButton.disabled = isEnding || Boolean(launchBusy);
       resumeButton.textContent = isEnding ? 'Stopping Session...' : 'Stop Session';
+    } else if (launchBusy) {
+      resumeButton.disabled = true;
+      resumeButton.textContent = sessionLaunchLabel(launchBusy.launchMode);
     } else {
       resumeButton.disabled = !canActivateHistory;
       if (canActivateHistory && liveSession) {
@@ -7480,15 +8188,19 @@ function renderSessionDetails() {
       }
     }
 
-    forkButton.disabled = !canFork;
-    forkButton.textContent = session.live ? 'Fork Running Session' : 'Fork New Branch';
+    forkButton.disabled = !canFork || Boolean(launchBusy);
+    forkButton.textContent = launchBusy?.launchMode === 'fork'
+      ? sessionLaunchLabel('fork')
+      : session.live ? 'Fork Running Session' : 'Fork New Branch';
   }
 
-  const composerDisabled = !session || (!session.live && !canActivateHistory);
+  const composerDisabled = !session || Boolean(launchBusy) || (!session.live && !canActivateHistory);
   composer.classList.toggle('disabled', composerDisabled);
   input.disabled = composerDisabled;
   renderComposerControls(session, composerDisabled);
-  if (session?.live) {
+  if (launchBusy) {
+    input.placeholder = 'Waiting for this history session to become live...';
+  } else if (session?.live) {
     input.placeholder = 'Send a follow-up prompt to the live managed session...';
   } else if (canActivateHistory) {
     input.placeholder = liveSession
@@ -7578,6 +8290,7 @@ function renderRuntimePanel() {
   }
 
   const runtimeState = describeRuntimeStatus(runtime, stream, session);
+  const launchBusy = getSessionLaunchBusyForSession(session);
   const connectionSince = formatElapsedSince(getStreamElapsedAnchor(stream) || runtime.runtimeConnectionStartedAt);
   const phaseSince = formatElapsedSince(getRuntimeElapsedAnchor(runtime));
   const pingSince = formatElapsedSince(stream.lastPingAt);
@@ -7601,6 +8314,9 @@ function renderRuntimePanel() {
     subtitleEl.textContent = runtime.busy
       ? `${runtimeState.phase} for ${phaseSince || '0s'} | ${prettyStatusLabel(runtimeState.connection)}${connectionSince ? ` for ${connectionSince}` : ''}`
       : `${prettyStatusLabel(runtimeState.connection)}${connectionSince ? ` for ${connectionSince}` : ''} | ${runtimeState.phase}`;
+  } else if (launchBusy) {
+    titleEl.textContent = `${session.title || session.sessionId} is starting`;
+    subtitleEl.textContent = `${sessionLaunchLabel(launchBusy.launchMode)}${launchBusy.runId ? ` | run ${shortId(launchBusy.runId)}` : ''}`;
   } else {
     titleEl.textContent = `${session.title || session.sessionId} is history only`;
     subtitleEl.textContent = 'You can resume it, fork it, or open a different live variant from this workspace.';
@@ -7612,6 +8328,13 @@ function renderRuntimePanel() {
     detailSubtitleEl.textContent = subtitleEl.textContent;
   }
 
+  if (launchBusy) {
+    appendRuntimeChip(
+      'Launch',
+      `${sessionLaunchLabel(launchBusy.launchMode)}${launchBusy.runId ? ` | ${shortId(launchBusy.runId)}` : ''}`,
+      'warning'
+    );
+  }
   appendRuntimeChip('Bridge', prettyStatusLabel(runtimeState.connection), connectionTone);
   appendRuntimeChip(
     'Phase',
@@ -7851,11 +8574,20 @@ function formatRateLimits(runtime) {
 function renderStatusSummaryCard(container, label, value, note = '') {
   const card = document.createElement('div');
   card.className = 'status-summary-card';
-  card.innerHTML = `
-    <div class="status-summary-label">${label}</div>
-    <div class="status-summary-value">${value}</div>
-    ${note ? `<div class="status-summary-note">${note}</div>` : ''}
-  `;
+  const labelEl = document.createElement('div');
+  labelEl.className = 'status-summary-label';
+  labelEl.textContent = label;
+  const valueEl = document.createElement('div');
+  valueEl.className = 'status-summary-value';
+  valueEl.textContent = value;
+  valueEl.title = String(value || '');
+  card.append(labelEl, valueEl);
+  if (note) {
+    const noteEl = document.createElement('div');
+    noteEl.className = 'status-summary-note';
+    noteEl.textContent = note;
+    card.appendChild(noteEl);
+  }
   container.appendChild(card);
 }
 
@@ -8439,12 +9171,38 @@ async function stopManagedSession(session) {
   });
 }
 
+async function waitForSessionStopped(session, timeoutMs = 15000) {
+  if (!session?.hostId || !session?.sessionId) {
+    return null;
+  }
+  const stopped = await waitForSession(
+    session.hostId,
+    session.sessionId,
+    (candidate) => candidate.live === false || ['history-only', 'stopped', 'closed'].includes(String(candidate.state || '').toLowerCase()),
+    timeoutMs,
+    {
+      sessionId: session.sessionId,
+      bridgeSessionId: session.bridgeSessionId,
+      nativeThreadId: session.nativeThreadId,
+      runId: session.runId || session.runtime?.runId,
+      originSessionId: session.originSessionId,
+      sourceSessionId: session.sourceSessionId,
+      conversationKey: session.conversationKey,
+    }
+  );
+  return stopped;
+}
+
 async function restartManagedSession(session) {
   await stopManagedSession(session);
-  await delay(900);
+  const stoppedSession = await waitForSessionStopped(session).catch(() => ({
+    ...session,
+    live: false,
+    state: 'stopped',
+  }));
   await startManagedSession({
     session: {
-      ...session,
+      ...stoppedSession,
       live: false,
       state: 'stopped',
     },
@@ -8480,7 +9238,79 @@ async function runSessionActionDialog() {
   closeSessionActionDialog();
   if (failures.length) {
     window.alert(`Some session actions failed:\n${failures.join('\n')}`);
+  } else {
+    const actionLabel = dialog.mode === 'restart' ? 'Restart completed' : 'Session closed';
+    const countLabel = selected.length === 1 ? '1 session' : `${selected.length} sessions`;
+    window.alert(`${actionLabel} successfully for ${countLabel}.`);
   }
+}
+
+function formatGoalSummary(goal) {
+  if (!goal) {
+    return 'No native goal is active for this thread.';
+  }
+  const lines = [];
+  const objective = String(goal.objective || '').trim();
+  lines.push(`Status: ${goal.status || 'active'}`);
+  if (objective) {
+    lines.push(`Objective: ${objective}`);
+  }
+  if (goal.tokenBudget || goal.token_budget) {
+    lines.push(`Token budget: ${goal.tokenBudget || goal.token_budget}`);
+  }
+  if (goal.tokenUsage || goal.token_usage || goal.usage) {
+    lines.push(`Usage: ${summarizeData(goal.tokenUsage || goal.token_usage || goal.usage)}`);
+  }
+  return lines.join('\n');
+}
+
+async function requestNativeGoal(action, payload = {}) {
+  const session = getSelectedSession();
+  if (!session) {
+    throw new Error('Select a live session before using Goal controls.');
+  }
+  if (!session.live) {
+    throw new Error('Native Goal controls require a live Codex app-server session.');
+  }
+  const body = {
+    hostId: session.hostId,
+    action,
+    ...payload,
+  };
+  return fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/goal`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+async function refreshNativeGoal() {
+  const result = await requestNativeGoal('get');
+  return result?.goal || null;
+}
+
+async function setNativeGoalFromStatus(status = '') {
+  const objective = el('goal-objective-input')?.value.trim() || '';
+  const budgetValue = el('goal-token-budget-input')?.value || '';
+  const tokenBudget = Number(budgetValue);
+  const payload = {};
+  if (objective) {
+    payload.objective = objective;
+  }
+  if (status) {
+    payload.status = status;
+  }
+  if (Number.isFinite(tokenBudget) && tokenBudget > 0) {
+    payload.tokenBudget = Math.floor(tokenBudget);
+  }
+  if (!payload.objective && !payload.status && !payload.tokenBudget) {
+    throw new Error('Enter a goal objective, token budget, or choose a status.');
+  }
+  const result = await requestNativeGoal('set', payload);
+  return result?.goal || null;
+}
+
+async function clearNativeGoal() {
+  return requestNativeGoal('clear');
 }
 
 async function runThreadShellCommand(command) {
@@ -8552,6 +9382,12 @@ function renderStatusWindow() {
   renderStatusSummaryCard(summaryGrid, 'Host', host?.online ? 'Online' : 'Offline', host?.label || session.hostId);
   renderStatusSummaryCard(
     summaryGrid,
+    'Session ID',
+    session.sessionId || 'unknown',
+    session.nativeThreadId && session.nativeThreadId !== session.sessionId ? `Native thread ${session.nativeThreadId}` : ''
+  );
+  renderStatusSummaryCard(
+    summaryGrid,
     'Bridge',
     prettyStatusLabel(stream.connection || runtime.connection || (session.live ? 'connecting' : 'history only')),
     [
@@ -8592,6 +9428,10 @@ function renderStatusWindow() {
   el('status-thinking').textContent = thinkingRecordCount
     ? `${thinkingRecordCount} structured thinking record${thinkingRecordCount === 1 ? '' : 's'} are available in the conversation flow.`
     : 'Structured reasoning and plan history, when available, is shown in the conversation flow.';
+  const goalSummary = el('status-goal-summary');
+  if (goalSummary) {
+    goalSummary.textContent = formatGoalSummary(runtime.goal || null);
+  }
   el('status-usage').textContent = formatTokenUsage(runtime);
   el('status-rate-limits').textContent = formatRateLimits(runtime);
 
@@ -8602,6 +9442,15 @@ function renderStatusWindow() {
   const steerSubmitButton = el('steer-submit-button');
   const shellCommandInput = el('shell-command-input');
   const shellCommandSubmitButton = el('shell-command-submit-button');
+  const goalObjectiveInput = el('goal-objective-input');
+  const goalTokenBudgetInput = el('goal-token-budget-input');
+  const goalButtons = [
+    el('goal-set-button'),
+    el('goal-complete-button'),
+    el('goal-blocked-button'),
+    el('goal-refresh-button'),
+    el('goal-clear-button'),
+  ].filter(Boolean);
   interruptButton.disabled = !session.live || !runtime.activeTurnId;
   interruptButton.textContent = runtime.activeTurnId ? 'Interrupt Active Turn' : 'No Active Turn';
   endSessionButton.disabled = !session.live || runtime.phase === 'ending' || runtime.connection === 'closing';
@@ -8620,6 +9469,22 @@ function renderStatusWindow() {
   shellCommandInput.placeholder = runtime.threadId
     ? 'Run a shell command inside the current Codex thread context'
     : 'No live Codex thread is attached';
+  const goalDisabled = !session.live || !runtime.threadId;
+  if (goalObjectiveInput) {
+    goalObjectiveInput.disabled = goalDisabled;
+  }
+  if (goalTokenBudgetInput) {
+    goalTokenBudgetInput.disabled = goalDisabled;
+  }
+  for (const button of goalButtons) {
+    button.disabled = goalDisabled;
+  }
+  const goalNote = el('status-goal-note');
+  if (goalNote) {
+    goalNote.textContent = goalDisabled
+      ? 'Native Goal controls require a live Codex thread.'
+      : 'Uses native Codex thread/goal APIs. If the selected app-server does not support them, the request will fail.';
+  }
 
   const requestList = el('status-requests');
   const focusedRequestForm = requestList?.querySelector('.user-input-request-form') || null;
@@ -9601,26 +10466,36 @@ function renderFileCards(container, session, entry) {
   const list = document.createElement('div');
   list.className = 'message-file-list';
   let imagePreviewCount = 0;
+  let uncachedImagePreviewCount = 0;
   const visibleFiles = files.slice(0, MAX_TRANSCRIPT_FILE_CARDS);
   for (const file of visibleFiles) {
     if (!file.path || isBareDownloadableFilename(file.path)) {
       continue;
     }
+    const cachedRef = getCachedReceivedFileRefForPath(session, file.path);
+    const displayFile = cachedRef || file;
+    const isCachedFile = Boolean(displayFile.cached && displayFile.fileId);
     const card = document.createElement('div');
-    card.className = `message-file-card ${isImageFileRef(file) ? 'image' : ''}`.trim();
-    const inlineUrl = file.cached && file.fileId ? buildReceivedFileUrl(file, true) : buildHostFileUrl(session, file, true);
-    const downloadUrl = file.cached && file.fileId ? buildReceivedFileUrl(file, false) : buildHostFileUrl(session, file, false);
-    const name = file.name || basename(file.path) || 'remote file';
+    card.className = `message-file-card ${isImageFileRef(displayFile) ? 'image' : ''}`.trim();
+    const inlineUrl = isCachedFile ? buildReceivedFileUrl(displayFile, true) : buildHostFileUrl(session, displayFile, true);
+    const downloadUrl = isCachedFile ? buildReceivedFileUrl(displayFile, false) : buildHostFileUrl(session, displayFile, false);
+    const name = displayFile.name || basename(displayFile.path) || 'remote file';
     const meta = [
-      file.mime || (isImageFileRef(file) ? 'image' : 'file'),
-      file.size ? formatBytes(file.size) : '',
-      file.cached ? 'cached by relay' : 'streams on open/save',
+      displayFile.mime || (isImageFileRef(displayFile) ? 'image' : 'file'),
+      displayFile.size ? formatBytes(displayFile.size) : '',
+      isCachedFile ? 'cached by relay' : 'streams on open/save',
     ].filter(Boolean).join(' | ');
 
-    const isImage = isImageFileRef(file);
-    const showInlinePreview = isImage && imagePreviewCount < MAX_INLINE_IMAGE_PREVIEWS;
-    if (isImage) {
+    const isImage = isImageFileRef(displayFile);
+    const canShowUncachedInlinePreview = !isCachedFile && uncachedImagePreviewCount < MAX_UNCACHED_INLINE_IMAGE_PREVIEWS;
+    const showInlinePreview = isImage
+      && imagePreviewCount < MAX_INLINE_IMAGE_PREVIEWS
+      && (isCachedFile || canShowUncachedInlinePreview);
+    if (showInlinePreview) {
       imagePreviewCount += 1;
+      if (!isCachedFile) {
+        uncachedImagePreviewCount += 1;
+      }
     }
     if (showInlinePreview) {
       const previewButton = document.createElement('button');
@@ -9639,7 +10514,7 @@ function renderFileCards(container, session, entry) {
         openImagePreview({
           src: inlineUrl,
           title: name,
-          subtitle: file.path,
+          subtitle: displayFile.path,
           downloadUrl,
         });
       };
@@ -9650,7 +10525,7 @@ function renderFileCards(container, session, entry) {
     body.className = 'message-file-body';
     body.innerHTML = `
       <div class="message-file-name">${escapeHtml(name)}</div>
-      <div class="message-file-path">${escapeHtml(file.path)}</div>
+      <div class="message-file-path">${escapeHtml(displayFile.path)}</div>
       <div class="message-file-meta">${escapeHtml(meta || 'remote file')}</div>
     `;
 
@@ -9672,7 +10547,7 @@ function renderFileCards(container, session, entry) {
         openImagePreview({
           src: inlineUrl,
           title: name,
-          subtitle: file.path,
+          subtitle: displayFile.path,
           downloadUrl,
         });
       };
@@ -9731,6 +10606,36 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
 
   const transcript = getTranscriptForSession(session);
   const visibleTranscript = transcript.filter((entry) => entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant');
+  const focus = options.focus || (state.pendingTranscriptFocus && state.pendingTranscriptFocus.hostId === session.hostId && state.pendingTranscriptFocus.sessionId === session.sessionId
+    ? state.pendingTranscriptFocus
+    : null);
+  const searchMatches = buildTranscriptSearchMatches(visibleTranscript, focus);
+  let activeSearchIndex = searchMatches.length ? clampTranscriptSearchIndex(searchMatches, focus) : 0;
+  let activeSearchMatch = searchMatches[activeSearchIndex] || null;
+  if (searchMatches.length && key) {
+    const queryChanged = state.transcriptSearchNavigator.key !== key || state.transcriptSearchNavigator.query !== state.sessionSearchQuery;
+    if (!focus && !queryChanged) {
+      activeSearchIndex = Math.min(Math.max(Number(state.transcriptSearchNavigator.index || 0), 0), searchMatches.length - 1);
+      activeSearchMatch = searchMatches[activeSearchIndex] || activeSearchMatch;
+    }
+    state.transcriptSearchNavigator = {
+      key,
+      query: state.sessionSearchQuery,
+      index: activeSearchIndex,
+    };
+    const currentLimit = Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW);
+    const requiredLimit = visibleTranscript.length - Number(activeSearchMatch?.entryIndex || 0);
+    state.transcriptVisibleLimits.set(key, Math.max(currentLimit, requiredLimit));
+  } else if (key && state.transcriptSearchNavigator.key === key) {
+    state.transcriptSearchNavigator = { key: '', query: '', index: 0 };
+  }
+  const focusIndex = Number(focus?.entryIndex ?? -1);
+  if (focus && focusIndex >= 0 && key) {
+    state.transcriptVisibleLimits.set(key, Math.max(
+      Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW),
+      visibleTranscript.length - focusIndex
+    ));
+  }
   const visibleLimit = isOptimizeSpeedMode()
     ? Math.max(TRANSCRIPT_RENDER_WINDOW, Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW))
     : visibleTranscript.length;
@@ -9752,6 +10657,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     state.transcriptEntryCounts.set(key, renderedEntryCount);
   }
   const thinkingByUserTimestamp = new Map(thinkingSegments.map((segment) => [segment.userTimestamp || '', segment]));
+  const searchMatchIndexes = new Set(searchMatches.map((match) => match.entryIndex));
   const runtime = getRuntimeForSession(session) || {};
   const stream = getStreamStatusForSession(session) || {};
   const latestUserEntry = [...visibleTranscript].reverse().find((entry) => entry.speaker === 'user') || null;
@@ -9774,8 +10680,11 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       bottomOffset,
     });
     updateTranscriptUnreadButton(key);
+    renderTranscriptSearchNavigator(session, [], 0);
     return;
   }
+
+  renderTranscriptSearchNavigator(session, searchMatches, activeSearchIndex);
 
   if (hiddenTranscriptCount > 0) {
     const gate = document.createElement('div');
@@ -9789,11 +10698,26 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     log.appendChild(gate);
   }
 
-  for (const entry of renderedTranscript) {
+  const renderedStartIndex = hiddenTranscriptCount ? Math.max(0, visibleTranscript.length - renderedTranscript.length) : 0;
+  for (const [renderedIndex, entry] of renderedTranscript.entries()) {
     const message = document.createElement('div');
     const speaker = entry.speaker === 'assistant' ? 'agent' : entry.speaker;
     message.className = `message ${speaker || 'agent'}`;
     message.title = entry.timestamp ? `Sent ${formatTime(entry.timestamp)}` : '';
+    const fullEntryIndex = renderedStartIndex + renderedIndex;
+    const isFocused = focus && (
+      (focusIndex >= 0 && fullEntryIndex === focusIndex)
+      || transcriptEntryMatchesSearchMatch(entry, focus)
+    );
+    const isSearchMatched = searchMatchIndexes.has(fullEntryIndex);
+    const isActiveSearchMatch = Boolean(activeSearchMatch && fullEntryIndex === activeSearchMatch.entryIndex);
+    if (isSearchMatched) {
+      message.classList.add('search-match-message');
+    }
+    if (isFocused || isActiveSearchMatch) {
+      message.id = 'focused-transcript-entry';
+      message.classList.add('search-focused-message');
+    }
 
     if (speaker !== 'system') {
       const toolbar = document.createElement('div');
@@ -9814,6 +10738,9 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     const bubble = document.createElement('div');
     bubble.className = 'bubble markdown-body';
     renderMarkdown(bubble, entry.text || '');
+    if (isSearchMatched && state.sessionSearchQuery.trim()) {
+      highlightTermsInElement(bubble, state.sessionSearchQuery);
+    }
     message.appendChild(bubble);
     renderFileCards(message, session, entry);
 
@@ -9838,12 +10765,25 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   }
 
   restoreTranscriptScroll(log, {
-    forceScroll: shouldForceScroll,
-    shouldStickToBottom,
+    forceScroll: shouldForceScroll && !focus,
+    shouldStickToBottom: focus ? false : shouldStickToBottom,
     preserveScroll: options.preserveScroll,
     scrollTop: previousScrollTop,
     bottomOffset,
   });
+  if (focus) {
+    window.setTimeout(() => {
+      const target = document.getElementById('focused-transcript-entry');
+      if (target) {
+        target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        state.pendingTranscriptFocus = null;
+      }
+    }, 80);
+  } else if (activeSearchMatch) {
+    window.setTimeout(() => {
+      document.getElementById('focused-transcript-entry')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }, 80);
+  }
   updateTranscriptUnreadButton(key);
 }
 
@@ -9926,7 +10866,9 @@ function populateApiProfileEditor(profile = getSelectedApiProfile()) {
   el('settings-api-provider').value = current.provider || '';
   el('settings-api-base-url').value = current.baseUrl || '';
   el('settings-api-key').value = current.apiKey || '';
-  el('settings-api-key-remember').checked = current.rememberApiKey === true;
+  if (el('settings-api-key-remember')) {
+    el('settings-api-key-remember').checked = current.rememberApiKey !== false;
+  }
   el('settings-delete-api-profile-button').disabled = getApiProfiles().length <= 1;
 }
 
@@ -9939,7 +10881,7 @@ function saveActiveApiProfileFromSettingsForm() {
   profile.provider = el('settings-api-provider').value.trim() || 'OpenAI';
   profile.baseUrl = el('settings-api-base-url').value.trim();
   profile.apiKey = el('settings-api-key').value;
-  profile.rememberApiKey = el('settings-api-key-remember').checked;
+  profile.rememberApiKey = true;
   return profile;
 }
 
@@ -9958,7 +10900,7 @@ function renderHostApiProfileList() {
   }
 
   for (const host of state.hosts) {
-    const row = document.createElement('label');
+    const row = document.createElement('div');
     row.className = 'settings-host-api-row';
     const label = document.createElement('span');
     label.textContent = `${host.label || host.hostId} (${host.hostId})`;
@@ -9966,9 +10908,33 @@ function renderHostApiProfileList() {
     select.dataset.hostApiProfileHost = host.hostId;
     appendApiProfileOptions(select, { includeDefault: true });
     select.value = state.ui.hostApiProfiles?.[host.hostId] || '';
-    row.append(label, select);
+    const pingButton = document.createElement('button');
+    pingButton.type = 'button';
+    pingButton.className = 'secondary-button settings-api-ping-button';
+    pingButton.dataset.hostApiPing = host.hostId;
+    pingButton.disabled = state.apiPingBusyHosts.has(host.hostId) || !host.online;
+    pingButton.textContent = state.apiPingBusyHosts.has(host.hostId) ? 'Pinging...' : 'Ping';
+    const result = document.createElement('div');
+    const pingResult = state.apiPingResults.get(host.hostId);
+    result.className = `settings-api-ping-result ${pingResult ? (pingResult.ok ? 'success' : 'failure') : ''}`.trim();
+    result.textContent = formatApiPingResult(pingResult, host);
+    row.append(label, select, pingButton, result);
     container.appendChild(row);
   }
+}
+
+function formatApiPingResult(result, host = null) {
+  if (!result) {
+    return host?.online ? 'Not tested yet.' : 'Host offline.';
+  }
+  if (result.pending) {
+    return 'Testing from this host...';
+  }
+  const status = result.statusCode ? `HTTP ${result.statusCode}` : 'No HTTP response';
+  const latency = Number.isFinite(Number(result.latencyMs)) ? `${Math.round(Number(result.latencyMs))}ms` : '';
+  const prefix = result.ok ? 'OK' : 'Failed';
+  const detail = result.message || result.error || '';
+  return [prefix, status, latency, detail].filter(Boolean).join(' | ');
 }
 
 function populateSettingsForm() {
@@ -10048,6 +11014,140 @@ function renderAll() {
   renderLocaleLabels();
 }
 
+const queuedUiRenders = {
+  timer: null,
+  all: false,
+  selectedViews: false,
+  transcript: false,
+  transcriptForceScroll: false,
+  transcriptPreserveScroll: false,
+  sessionDetails: false,
+  runtimePanel: false,
+  thinkingPanel: false,
+  alertsWindow: false,
+  statusWindow: false,
+  sessionActionDialog: false,
+  exportDialog: false,
+  approvalPopup: false,
+};
+
+function resetQueuedUiRenderFlags() {
+  queuedUiRenders.all = false;
+  queuedUiRenders.selectedViews = false;
+  queuedUiRenders.transcript = false;
+  queuedUiRenders.transcriptForceScroll = false;
+  queuedUiRenders.transcriptPreserveScroll = false;
+  queuedUiRenders.sessionDetails = false;
+  queuedUiRenders.runtimePanel = false;
+  queuedUiRenders.thinkingPanel = false;
+  queuedUiRenders.alertsWindow = false;
+  queuedUiRenders.statusWindow = false;
+  queuedUiRenders.sessionActionDialog = false;
+  queuedUiRenders.exportDialog = false;
+  queuedUiRenders.approvalPopup = false;
+}
+
+function scheduleQueuedUiFlush(delayMs = UI_EVENT_RENDER_DEBOUNCE_MS) {
+  if (queuedUiRenders.timer) {
+    return;
+  }
+  queuedUiRenders.timer = window.setTimeout(flushQueuedUiRenders, Math.max(0, Number(delayMs) || 0));
+}
+
+function scheduleRenderAll(delayMs = UI_EVENT_RENDER_DEBOUNCE_MS) {
+  queuedUiRenders.all = true;
+  scheduleQueuedUiFlush(delayMs);
+}
+
+function scheduleSelectedViewsRender(delayMs = UI_EVENT_RENDER_DEBOUNCE_MS) {
+  queuedUiRenders.selectedViews = true;
+  scheduleQueuedUiFlush(delayMs);
+}
+
+function scheduleRuntimeStatusRender(delayMs = UI_EVENT_RENDER_DEBOUNCE_MS) {
+  queuedUiRenders.sessionDetails = true;
+  queuedUiRenders.runtimePanel = true;
+  queuedUiRenders.thinkingPanel = true;
+  queuedUiRenders.statusWindow = true;
+  scheduleQueuedUiFlush(delayMs);
+}
+
+function scheduleTranscriptRender(options = {}, delayMs = TRANSCRIPT_EVENT_RENDER_DEBOUNCE_MS) {
+  queuedUiRenders.transcript = true;
+  queuedUiRenders.transcriptForceScroll = queuedUiRenders.transcriptForceScroll || Boolean(options.forceScroll);
+  queuedUiRenders.transcriptPreserveScroll = queuedUiRenders.transcriptPreserveScroll || Boolean(options.preserveScroll);
+  scheduleQueuedUiFlush(delayMs);
+}
+
+function scheduleSessionChromeRender(delayMs = UI_EVENT_RENDER_DEBOUNCE_MS) {
+  queuedUiRenders.sessionDetails = true;
+  queuedUiRenders.runtimePanel = true;
+  queuedUiRenders.thinkingPanel = true;
+  queuedUiRenders.alertsWindow = true;
+  queuedUiRenders.statusWindow = true;
+  queuedUiRenders.sessionActionDialog = true;
+  queuedUiRenders.exportDialog = true;
+  scheduleQueuedUiFlush(delayMs);
+}
+
+function flushQueuedUiRenders() {
+  queuedUiRenders.timer = null;
+  const renderPlan = {
+    all: queuedUiRenders.all,
+    selectedViews: queuedUiRenders.selectedViews,
+    transcript: queuedUiRenders.transcript,
+    transcriptForceScroll: queuedUiRenders.transcriptForceScroll,
+    transcriptPreserveScroll: queuedUiRenders.transcriptPreserveScroll,
+    sessionDetails: queuedUiRenders.sessionDetails,
+    runtimePanel: queuedUiRenders.runtimePanel,
+    thinkingPanel: queuedUiRenders.thinkingPanel,
+    alertsWindow: queuedUiRenders.alertsWindow,
+    statusWindow: queuedUiRenders.statusWindow,
+    sessionActionDialog: queuedUiRenders.sessionActionDialog,
+    exportDialog: queuedUiRenders.exportDialog,
+    approvalPopup: queuedUiRenders.approvalPopup,
+  };
+  resetQueuedUiRenderFlags();
+
+  if (renderPlan.all) {
+    renderAll();
+  } else if (renderPlan.selectedViews) {
+    updateSelectedViews({ hostId: state.selectedHostId });
+  } else {
+    if (renderPlan.sessionDetails) {
+      renderSessionDetails();
+    }
+    if (renderPlan.runtimePanel) {
+      renderRuntimePanel();
+    }
+    if (renderPlan.thinkingPanel) {
+      renderThinkingPanel();
+    }
+    if (renderPlan.alertsWindow) {
+      renderAlertsWindow();
+    }
+    if (renderPlan.statusWindow) {
+      renderStatusWindow();
+    }
+    if (renderPlan.sessionActionDialog) {
+      renderSessionActionDialog();
+    }
+    if (renderPlan.exportDialog) {
+      renderExportDialog();
+    }
+  }
+
+  if (renderPlan.transcript) {
+    renderTranscript(getSelectedSession(), {
+      forceScroll: renderPlan.transcriptForceScroll,
+      preserveScroll: renderPlan.transcriptPreserveScroll,
+    });
+  }
+  if (renderPlan.approvalPopup) {
+    renderApprovalPopup();
+  }
+}
+
 function closeStream() {
   if (state.eventSource) {
     if (state.eventSourceKey) {
@@ -10096,16 +11196,13 @@ function subscribeSession(session) {
     connection: 'connecting',
     lastPingAt: null,
   });
-  renderRuntimePanel();
-  renderThinkingPanel();
+  scheduleRuntimeStatusRender();
 
   state.eventSource.addEventListener('open', () => {
     setStreamStatusForSession(session.hostId, session.sessionId, {
       connection: 'connected',
     });
-    renderRuntimePanel();
-    renderThinkingPanel();
-    renderStatusWindow();
+    scheduleRuntimeStatusRender();
   });
 
   state.eventSource.addEventListener('ready', () => {
@@ -10113,9 +11210,7 @@ function subscribeSession(session) {
       connection: 'connected',
       lastPingAt: new Date().toISOString(),
     });
-    renderRuntimePanel();
-    renderThinkingPanel();
-    renderStatusWindow();
+    scheduleRuntimeStatusRender();
   });
 
   state.eventSource.addEventListener('ping', () => {
@@ -10123,17 +11218,16 @@ function subscribeSession(session) {
       connection: 'connected',
       lastPingAt: new Date().toISOString(),
     });
-    renderRuntimePanel();
-    renderStatusWindow();
+    queuedUiRenders.runtimePanel = true;
+    queuedUiRenders.statusWindow = true;
+    scheduleQueuedUiFlush();
   });
 
   state.eventSource.addEventListener('error', () => {
     setStreamStatusForSession(session.hostId, session.sessionId, {
       connection: session.live ? 'reconnecting' : 'disconnected',
     });
-    renderRuntimePanel();
-    renderThinkingPanel();
-    renderStatusWindow();
+    scheduleRuntimeStatusRender();
   });
 
   state.eventSource.addEventListener('session.snapshot', (event) => {
@@ -10142,7 +11236,9 @@ function subscribeSession(session) {
     if (payload.bridgeSessionId && state.selectedSessionId === payload.bridgeSessionId) {
       state.selectedSessionId = payload.sessionId;
     }
-    updateSelectedViews(payload);
+    if (payload.hostId === state.selectedHostId) {
+      scheduleSelectedViewsRender();
+    }
   });
 
   state.eventSource.addEventListener('session.started', (event) => {
@@ -10151,13 +11247,13 @@ function subscribeSession(session) {
     if (payload.bridgeSessionId && state.selectedSessionId === payload.bridgeSessionId) {
       state.selectedSessionId = payload.sessionId;
     }
-    renderAll();
+    scheduleRenderAll();
   });
 
   state.eventSource.addEventListener('session.state_changed', (event) => {
     const payload = JSON.parse(event.data);
     mergeSession(payload);
-    renderAll();
+    scheduleRenderAll();
   });
 
   state.eventSource.addEventListener('session.transcript', (event) => {
@@ -10171,8 +11267,9 @@ function subscribeSession(session) {
     }
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === key) {
-      renderTranscript(selected, { forceScroll: payload.speaker === 'user' });
-      renderThinkingPanel();
+      scheduleTranscriptRender({ forceScroll: payload.speaker === 'user' });
+      queuedUiRenders.thinkingPanel = true;
+      scheduleQueuedUiFlush();
     }
   });
 
@@ -10182,8 +11279,9 @@ function subscribeSession(session) {
     if ((payload.severity || 'warning') === 'error') {
       state.alertWindowOpen = true;
     }
-    renderSessionDetails();
-    renderAlertsWindow();
+    queuedUiRenders.sessionDetails = true;
+    queuedUiRenders.alertsWindow = true;
+    scheduleQueuedUiFlush();
   });
 
   const handleRuntimePayload = (payload) => {
@@ -10209,10 +11307,7 @@ function subscribeSession(session) {
       maybeScheduleQueuedPromptSend(selected);
       refreshInferredComposerOptionsForSession(selected);
     }
-    renderSessionDetails();
-    renderRuntimePanel();
-    renderThinkingPanel();
-    renderStatusWindow();
+    scheduleRuntimeStatusRender();
   };
 
   state.eventSource.addEventListener('session.runtime', (event) => {
@@ -10229,11 +11324,12 @@ function subscribeSession(session) {
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
       refreshInferredComposerOptionsForSession(selected);
-      renderSessionDetails();
-      renderTranscript(selected);
-      renderThinkingPanel();
+      queuedUiRenders.sessionDetails = true;
+      queuedUiRenders.thinkingPanel = true;
+      scheduleTranscriptRender();
     }
-    renderStatusWindow();
+    queuedUiRenders.statusWindow = true;
+    scheduleQueuedUiFlush();
   });
 
   state.eventSource.addEventListener('session.request', (event) => {
@@ -10247,13 +11343,15 @@ function subscribeSession(session) {
     if (isSelectedSession) {
       state.statusWindowOpen = false;
       state.sessionDetailsOpen = true;
-      renderTranscript(selected);
-      renderThinkingPanel();
-      renderSessionDetails();
-      renderApprovalPopup();
-      renderStatusWindow();
+      scheduleTranscriptRender();
+      queuedUiRenders.thinkingPanel = true;
+      queuedUiRenders.sessionDetails = true;
+      queuedUiRenders.approvalPopup = true;
+      queuedUiRenders.statusWindow = true;
+      scheduleQueuedUiFlush();
     } else {
-      renderStatusWindow();
+      queuedUiRenders.statusWindow = true;
+      scheduleQueuedUiFlush();
     }
   });
 
@@ -10265,22 +11363,24 @@ function subscribeSession(session) {
     resolveRequestForSession(eventHostId, eventSessionId, payload);
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === eventSessionKey) {
-      renderTranscript(selected);
-      renderThinkingPanel();
-      renderSessionDetails();
-      renderApprovalPopup();
-      renderStatusWindow();
+      scheduleTranscriptRender();
+      queuedUiRenders.thinkingPanel = true;
+      queuedUiRenders.sessionDetails = true;
+      queuedUiRenders.approvalPopup = true;
+      queuedUiRenders.statusWindow = true;
+      scheduleQueuedUiFlush();
     } else {
-      renderStatusWindow();
+      queuedUiRenders.statusWindow = true;
+      scheduleQueuedUiFlush();
     }
   });
 }
 
-async function showSession(session = getSelectedSession()) {
+async function showSession(session = getSelectedSession(), options = {}) {
   renderSessionDetails();
   renderRuntimePanel();
   renderThinkingPanel();
-  renderTranscript(session, { forceScroll: true });
+  renderTranscript(session, { forceScroll: true, focus: options.focus || null });
 
   if (!session) {
     closeStream();
@@ -10290,33 +11390,70 @@ async function showSession(session = getSelectedSession()) {
   subscribeSession(session);
 
   try {
-    const detail = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/detail?hostId=${encodeURIComponent(session.hostId)}`);
-    mergeSession(detail.session);
-    const existing = getTranscriptForSession(session);
-    setTranscriptForSession(session.hostId, session.sessionId, [...detail.transcript, ...existing]);
-    setAlertsForSession(session.hostId, session.sessionId, detail.alerts || []);
-    setRuntimeForSession(session.hostId, session.sessionId, detail.runtime || null);
-    setDiagnosticsForSession(session.hostId, session.sessionId, detail.diagnostics || []);
-    setRequestsForSession(session.hostId, session.sessionId, detail.requests || []);
-    loadReceivedFilesForSession(session).then((files) => {
+    const originalSessionKey = getSessionKey(session);
+    const shouldLoadFullTranscript = Boolean(options.full || !state.fullTranscriptLoaded.has(originalSessionKey));
+    const detailParams = new URLSearchParams({ hostId: session.hostId });
+    if (shouldLoadFullTranscript) {
+      detailParams.set('full', '1');
+    }
+    if (options.fullDiagnostics) {
+      detailParams.set('fullDiagnostics', '1');
+    }
+    const detail = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/detail?${detailParams.toString()}`);
+    const detailSession = mergeSession(detail.session) || session;
+    const detailHostId = detailSession.hostId || session.hostId;
+    const detailSessionId = detailSession.sessionId || session.sessionId;
+    const detailSessionKey = makeSessionKey(detailHostId, detailSessionId);
+    const loadedTranscriptCount = Array.isArray(detail.transcript) ? detail.transcript.length : 0;
+    const expectedTranscriptCount = Math.max(Number(detailSession.messageCount || 0), Number(session.messageCount || 0));
+    const looksCompleteTranscript = loadedTranscriptCount > 0 && (!expectedTranscriptCount || loadedTranscriptCount >= expectedTranscriptCount);
+    if (detail.remoteDetail?.fullTranscript || (shouldLoadFullTranscript && !detail.remoteDetail?.error && looksCompleteTranscript)) {
+      state.fullTranscriptLoaded.add(detailSessionKey);
+    }
+    if (state.selectedHostId === session.hostId && state.selectedSessionId === session.sessionId && detailSessionId !== session.sessionId) {
+      state.selectedHostId = detailHostId;
+      state.selectedSessionId = detailSessionId;
+      state.selectedConversationKey = detailSession.conversationKey || state.selectedConversationKey;
+    }
+    const existing = dedupeTranscript([
+      ...getTranscriptForSession(session),
+      ...getTranscriptForSession(detailSession),
+    ]);
+    setTranscriptForSession(detailHostId, detailSessionId, [...detail.transcript, ...existing]);
+    setAlertsForSession(detailHostId, detailSessionId, detail.alerts || []);
+    setRuntimeForSession(detailHostId, detailSessionId, detail.runtime || null);
+    mergeDiagnosticsForSession(detailHostId, detailSessionId, getDiagnosticsForSession(session));
+    mergeDiagnosticsForSession(detailHostId, detailSessionId, detail.diagnostics || []);
+    setRequestsForSession(detailHostId, detailSessionId, detail.requests || []);
+    loadReceivedFilesForSession(detailSession).then((files) => {
       if (!files.length) {
         return;
       }
       const selected = getSelectedSession();
-      if (selected && getSessionKey(selected) === getSessionKey(session)) {
+      if (selected && getSessionKey(selected) === getSessionKey(detailSession)) {
         renderTranscript(selected);
         renderStatusWindow();
       }
     }).catch(reportError);
 
     const selected = getSelectedSession();
-    if (selected && getSessionKey(selected) === getSessionKey(session)) {
+    if (selected && getSessionKey(selected) === getSessionKey(detailSession)) {
       renderSessionDetails();
       renderRuntimePanel();
       renderThinkingPanel();
       renderAlertsWindow();
       renderStatusWindow();
-      renderTranscript(selected);
+      const navigatorTarget = !options.focus && getTranscriptSearchTarget(selected);
+      const navigatorFocus = navigatorTarget?.match
+        ? {
+          hostId: selected.hostId,
+          sessionId: selected.sessionId,
+          entryIndex: navigatorTarget.match.entryIndex,
+          timestamp: navigatorTarget.match.timestamp || null,
+          snippet: '',
+        }
+        : null;
+      renderTranscript(selected, { focus: options.focus || navigatorFocus || null });
     }
   } catch (error) {
     appendAlertForSession(session.hostId, session.sessionId, {
@@ -10358,11 +11495,17 @@ function buildSessionExportUrl(session, format = 'markdown', options = {}) {
   if (options.includeAllFiles === false) {
     params.set('includeAllFiles', '0');
   }
+  if (options.fullTranscript || options.importHistory) {
+    params.set('full', '1');
+  }
   if (options.fromDate) {
     params.set('fromDate', options.fromDate);
   }
   if (options.toDate) {
     params.set('toDate', options.toDate);
+  }
+  if (Array.isArray(options.dates) && options.dates.length) {
+    params.set('dates', options.dates.join(','));
   }
   if (Number.isFinite(Number(options.startIndex))) {
     params.set('startIndex', String(Math.max(1, Number(options.startIndex) || 1)));
@@ -10409,7 +11552,54 @@ function exportDateInputToIso(value) {
   return Number.isNaN(date.getTime()) ? '' : date.toISOString();
 }
 
+function exportSelectedDaysToRanges(selectedDays = new Set()) {
+  const days = Array.from(selectedDays || [])
+    .filter(Boolean)
+    .sort();
+  const ranges = [];
+  let start = '';
+  let previous = '';
+  const nextDay = (day) => {
+    const date = new Date(`${day}T00:00:00.000Z`);
+    if (Number.isNaN(date.getTime())) {
+      return '';
+    }
+    date.setUTCDate(date.getUTCDate() + 1);
+    return date.toISOString().slice(0, 10);
+  };
+  for (const day of days) {
+    if (!start) {
+      start = day;
+      previous = day;
+      continue;
+    }
+    if (nextDay(previous) === day) {
+      previous = day;
+      continue;
+    }
+    ranges.push(start === previous ? start : `${start}..${previous}`);
+    start = day;
+    previous = day;
+  }
+  if (start) {
+    ranges.push(start === previous ? start : `${start}..${previous}`);
+  }
+  return ranges;
+}
+
+function exportRangesLabel(selectedDays = new Set()) {
+  const ranges = exportSelectedDaysToRanges(selectedDays);
+  if (!ranges.length) {
+    return '';
+  }
+  return ranges.join(', ');
+}
+
 function exportDateRangeLabel(dialog) {
+  const selectedLabel = exportRangesLabel(dialog?.selectedDays);
+  if (selectedLabel) {
+    return `selected dates ${selectedLabel}`;
+  }
   const from = dialog?.fromDate ? formatTime(dialog.fromDate) : '';
   const to = dialog?.toDate ? formatTime(dialog.toDate) : '';
   if (from && to) {
@@ -10554,6 +11744,12 @@ function getExportRangeMessageCount(timeline, dialog, fallbackCount = 0) {
   if (!days.length) {
     return fallbackCount;
   }
+  const selectedDays = dialog?.selectedDays || new Set();
+  if (selectedDays.size) {
+    return days
+      .filter((day) => selectedDays.has(day.date))
+      .reduce((sum, day) => sum + (Number(day.messageCount || 0) || 0), 0);
+  }
   const fromDay = exportDateKey(dialog?.fromDate || '');
   const toDay = exportDateKey(dialog?.toDate || '');
   return days
@@ -10567,6 +11763,17 @@ function getExportRangeMessageCount(timeline, dialog, fallbackCount = 0) {
       return true;
     })
     .reduce((sum, day) => sum + (Number(day.messageCount || 0) || 0), 0);
+}
+
+function getExportSelectableDays(session = getSelectedSession()) {
+  if (!session) {
+    return [];
+  }
+  const rows = getExportTimelineRows(getExportTimeline(session));
+  return rows.days
+    .filter((day) => day && !day.empty)
+    .map((day) => day.date)
+    .filter(Boolean);
 }
 
 function collectExportFiles(session) {
@@ -10691,6 +11898,7 @@ function renderExportTimelinePanel(session, entries) {
   const rows = getExportTimelineRows(timeline);
   const fromDay = exportDateKey(state.exportDialog.fromDate || '');
   const toDay = exportDateKey(state.exportDialog.toDate || '');
+  const selectedDays = state.exportDialog.selectedDays || new Set();
   dayList.innerHTML = '';
   if (!rows.days.length) {
     dayList.textContent = 'No dated messages found for this session.';
@@ -10698,10 +11906,12 @@ function renderExportTimelinePanel(session, entries) {
   }
   for (const day of rows.days) {
     const button = document.createElement('button');
-    const selected = Boolean(fromDay || toDay)
-      && (!fromDay || day.date >= fromDay)
-      && (!toDay || day.date <= toDay)
-      && !day.empty;
+    const selected = selectedDays.size
+      ? selectedDays.has(day.date)
+      : Boolean(fromDay || toDay)
+        && (!fromDay || day.date >= fromDay)
+        && (!toDay || day.date <= toDay)
+        && !day.empty;
     button.type = 'button';
     button.className = `export-day-chip ${day.empty ? 'empty' : 'active'}${selected ? ' selected' : ''}`;
     button.dataset.exportDay = day.date;
@@ -10740,6 +11950,7 @@ function openExportDialog() {
   state.exportDialog.format = 'markdown';
   state.exportDialog.fromDate = '';
   state.exportDialog.toDate = '';
+  state.exportDialog.selectedDays = new Set();
   state.exportDialog.selectedExtensions = extensions;
   state.exportDialog.selectedFileIds = new Set(files.map((file) => file.identity).filter(Boolean));
   renderExportDialog();
@@ -10778,8 +11989,13 @@ function renderExportDialog() {
   const totalBytes = selectedCandidateFiles.reduce((sum, file) => sum + (Number(file.size || 0) || 0), 0);
   const fromTime = Date.parse(dialog.fromDate || '');
   const toTime = Date.parse(dialog.toDate || '');
+  const selectedDays = dialog.selectedDays || new Set();
   const timeline = getExportTimeline(session);
   const rangedEntries = entries.filter((entry) => {
+    if (selectedDays.size) {
+      const day = exportDateKey(entry.timestamp);
+      return Boolean(day && selectedDays.has(day));
+    }
     if (!Number.isFinite(fromTime) && !Number.isFinite(toTime)) {
       return true;
     }
@@ -10813,6 +12029,15 @@ function renderExportDialog() {
   includeAllCheckbox.checked = allCandidatesSelected;
   includeAllCheckbox.indeterminate = someCandidatesSelected && !allCandidatesSelected;
   includeAllCheckbox.disabled = !candidateFiles.length;
+  const selectableDays = getExportSelectableDays(session);
+  const dateSelectAllButton = el('export-dates-select-all-button');
+  const dateClearButton = el('export-dates-clear-button');
+  if (dateSelectAllButton) {
+    dateSelectAllButton.disabled = !selectableDays.length || selectableDays.every((day) => selectedDays.has(day.date));
+  }
+  if (dateClearButton) {
+    dateClearButton.disabled = !selectedDays.size && !dialog.fromDate && !dialog.toDate;
+  }
   const selectAllButton = el('export-files-select-all-button');
   const selectNoneButton = el('export-files-select-none-button');
   if (selectAllButton) {
@@ -10891,9 +12116,10 @@ function exportFromDialog() {
   const session = getSelectedSession();
   const fromDateValue = el('export-start-date-input')?.value || '';
   const toDateValue = el('export-end-date-input')?.value || '';
+  const selectedDateRanges = exportSelectedDaysToRanges(dialog.selectedDays);
   const fromTime = Date.parse(fromDateValue || '');
   const toTime = Date.parse(toDateValue || '');
-  if (Number.isFinite(fromTime) && Number.isFinite(toTime) && fromTime > toTime) {
+  if (!selectedDateRanges.length && Number.isFinite(fromTime) && Number.isFinite(toTime) && fromTime > toTime) {
     reportError(new Error('Export start date must be before the end date.'));
     return;
   }
@@ -10909,8 +12135,9 @@ function exportFromDialog() {
     includeImages: dialog.includeImages,
     includeFiles: dialog.includeFiles,
     includeAllFiles: dialog.includeAllFiles,
-    fromDate: exportDateInputToIso(fromDateValue),
-    toDate: exportDateInputToIso(toDateValue),
+    fromDate: selectedDateRanges.length ? '' : exportDateInputToIso(fromDateValue),
+    toDate: selectedDateRanges.length ? '' : exportDateInputToIso(toDateValue),
+    dates: selectedDateRanges,
     filterExtensions,
     extensions: selectedExtensions,
     fileIds: getExportSelectedFileIds(),
@@ -10991,10 +12218,12 @@ async function attachHistoryBundle(session, options = {}) {
 
 async function attachSessionHistory(session, options = {}) {
   const exportOptions = {
-    includeThinking: Boolean(options.includeThinking),
+    includeThinking: options.includeThinking !== false,
     includeImages: options.includeImages !== false,
     includeFiles: options.includeFiles !== false,
     includeAllFiles: true,
+    fullTranscript: true,
+    importHistory: true,
   };
   await attachHistoryMarkdown(session, exportOptions);
   if (exportOptions.includeImages || exportOptions.includeFiles) {
@@ -11018,7 +12247,7 @@ async function importCurrentSessionHistory() {
 
 function defaultHistoryImportOptions() {
   return {
-    includeThinking: false,
+    includeThinking: true,
     includeImages: true,
     includeFiles: true,
   };
@@ -11344,6 +12573,17 @@ async function ensureHostAvailable(hostId) {
   }
 }
 
+async function ensureHostAvailableForSessionStart(hostId) {
+  const host = getHost(hostId);
+  if (!host) {
+    throw new Error(`Host ${hostId || '(unknown)'} is not registered.`);
+  }
+  if (host.online) {
+    return { ok: true, mode: 'heartbeat' };
+  }
+  return ensureHostAvailable(hostId);
+}
+
 async function setSelectedHost(hostId, options = {}) {
   if (state.selectedHostId === hostId) {
     return;
@@ -11366,12 +12606,119 @@ async function setSelectedHost(hostId, options = {}) {
 
 function setSessionSearchQuery(query) {
   state.sessionSearchQuery = String(query || '').trim();
+  state.pendingTranscriptFocus = null;
+  state.transcriptSearchNavigator = { key: '', query: '', index: 0 };
+  scheduleFullSessionSearch();
   renderAll();
 }
 
 function setSessionSearchMode(mode) {
   state.sessionSearchMode = ['keyword', 'path', 'title'].includes(mode) ? mode : 'keyword';
+  state.pendingTranscriptFocus = null;
+  state.transcriptSearchNavigator = { key: '', query: '', index: 0 };
+  scheduleFullSessionSearch();
   renderAll();
+}
+
+let fullSessionSearchTimer = null;
+
+function scheduleFullSessionSearch() {
+  if (fullSessionSearchTimer) {
+    window.clearTimeout(fullSessionSearchTimer);
+  }
+  fullSessionSearchTimer = window.setTimeout(() => {
+    runFullSessionSearch().catch(reportError);
+  }, 900);
+}
+
+async function runFullSessionSearch() {
+  const query = String(state.sessionSearchQuery || '').trim();
+  const mode = state.sessionSearchMode;
+  const requestId = state.sessionSearchRequestId + 1;
+  state.sessionSearchRequestId = requestId;
+  if (query.length < 3 || mode !== 'keyword') {
+    state.sessionSearchResults = [];
+    state.sessionSearchLoading = false;
+    renderConversationNav();
+    return;
+  }
+
+  state.sessionSearchLoading = true;
+  renderConversationNav();
+  const params = new URLSearchParams({
+    q: query,
+    mode,
+    hostId: state.selectedHostId || '',
+    collectionId: state.selectedCollectionId || '',
+    limit: '80',
+    matchesPerSession: '5',
+  });
+  const response = await fetchJson(`/api/sessions/search?${params.toString()}`);
+  if (state.sessionSearchRequestId !== requestId) {
+    return;
+  }
+  state.sessionSearchResults = Array.isArray(response.results) ? response.results : [];
+  for (const result of state.sessionSearchResults) {
+    if (result?.hostId && result?.sessionId) {
+      mergeSession({
+        hostId: result.hostId,
+        sessionId: result.sessionId,
+        conversationKey: result.conversationKey || result.sessionId,
+        title: result.title || result.sessionId,
+        cwd: result.cwd || null,
+        ...(result.live ? { source: 'managed', state: 'running', live: true } : {}),
+        lastUpdatedAt: result.lastUpdatedAt || null,
+      });
+    }
+  }
+  state.sessionSearchLoading = false;
+  renderConversationNav();
+}
+
+function findSessionForSearchResult(result) {
+  return state.sessions.find((session) => (
+    session.hostId === result.hostId
+    && session.sessionId === result.sessionId
+  )) || {
+    hostId: result.hostId,
+    sessionId: result.sessionId,
+    conversationKey: result.conversationKey,
+    title: result.title,
+    cwd: result.cwd,
+  };
+}
+
+function transcriptEntryMatchesSearchMatch(entry, match) {
+  if (!entry || !match) {
+    return false;
+  }
+  if (match.timestamp && entry.timestamp === match.timestamp) {
+    return true;
+  }
+  const snippet = String(match.snippet || '').replace(/\.\.\./g, '').trim();
+  return Boolean(snippet && String(entry.text || '').replace(/\s+/g, ' ').includes(snippet.replace(/\s+/g, ' ')));
+}
+
+async function openSearchResult(result, match, group = null) {
+  const session = findSessionForSearchResult(result);
+  if (!session?.hostId || !session?.sessionId) {
+    throw new Error('Search result no longer maps to a known session.');
+  }
+  if (state.selectedHostId !== session.hostId) {
+    await ensureHostAvailable(session.hostId);
+  }
+  state.selectedHostId = session.hostId;
+  state.selectedConversationKey = result.conversationKey || group?.conversationKey || getSessionConversationKey(session);
+  state.selectedSessionId = session.sessionId;
+  state.pendingTranscriptFocus = {
+    hostId: session.hostId,
+    sessionId: session.sessionId,
+    entryIndex: Number(match.entryIndex ?? -1),
+    timestamp: match.timestamp || null,
+    snippet: match.snippet || '',
+  };
+  renderAll();
+  await showSession(session, { full: match.type === 'transcript', focus: state.pendingTranscriptFocus });
 }
 
 function setSessionSortBy(mode) {
@@ -11410,7 +12757,7 @@ async function selectSession(session) {
   }
 
   state.selectedHostId = session.hostId;
-  state.selectedConversationKey = session.conversationKey || session.originSessionId || session.sessionId;
+  state.selectedConversationKey = getSessionConversationKey(session);
   state.selectedSessionId = session.sessionId;
   renderAll();
   showSession(session).catch(reportError);
@@ -11485,12 +12832,108 @@ async function refresh() {
   }
 }
 
-async function waitForSession(hostId, sessionId, predicate, timeoutMs = 60000) {
+function addSessionIdentityValue(values, value) {
+  const text = String(value || '').trim();
+  if (text) {
+    values.add(text);
+  }
+}
+
+function sessionIdentityText(value) {
+  return String(value || '').trim();
+}
+
+function launchResponseRunId(launchResponse = {}) {
+  const command = launchResponse?.command || {};
+  return sessionIdentityText(
+    launchResponse?.runId
+    || launchResponse?.runtime?.runId
+    || command.runId
+    || command.runtime?.runId
+  );
+}
+
+function sessionRunIdMatches(session, runId) {
+  const text = sessionIdentityText(runId);
+  if (!text) {
+    return false;
+  }
+  return [
+    session?.runId,
+    session?.runtime?.runId,
+  ].some((value) => sessionIdentityText(value) === text);
+}
+
+function collectLaunchSessionIdentities(sessionId, launchResponse = {}) {
+  const values = new Set();
+  const command = launchResponse?.command || {};
+  const fields = [
+    sessionId,
+    launchResponse.sessionId,
+    launchResponse.bridgeSessionId,
+    launchResponse.runId,
+    launchResponse.nativeThreadId,
+    launchResponse.originSessionId,
+    launchResponse.sourceSessionId,
+    launchResponse.conversationKey,
+    command.sessionId,
+    command.bridgeSessionId,
+    command.runId,
+    command.nativeThreadId,
+    command.originSessionId,
+    command.sourceSessionId,
+    command.conversationKey,
+  ];
+  fields.forEach((value) => addSessionIdentityValue(values, value));
+  return values;
+}
+
+function sessionMatchesAnyIdentity(session, identities) {
+  if (!session || !identities?.size) {
+    return false;
+  }
+  return [
+    session.sessionId,
+    session.bridgeSessionId,
+    session.runId,
+    session.runtime?.runId,
+    session.nativeThreadId,
+    session.originSessionId,
+    session.sourceSessionId,
+    session.conversationKey,
+  ].some((value) => identities.has(String(value || '').trim()));
+}
+
+function chooseBestSessionMatch(matches, predicate) {
+  return matches.find((session) => predicate(session))
+    || matches.find((session) => session.live)
+    || matches.find((session) => session.source === 'managed' || session.state === 'starting')
+    || matches[0]
+    || null;
+}
+
+function pickBestSessionMatch(sessions, identities, predicate, options = {}) {
+  const matches = (sessions || []).filter((session) => sessionMatchesAnyIdentity(session, identities));
+  if (!matches.length) {
+    return null;
+  }
+
+  const runId = launchResponseRunId(options.launchResponse || options);
+  if (runId) {
+    const exactRunMatches = matches.filter((session) => sessionRunIdMatches(session, runId));
+    return exactRunMatches.length ? chooseBestSessionMatch(exactRunMatches, predicate) : null;
+  }
+
+  return chooseBestSessionMatch(matches, predicate);
+}
+
+async function waitForSession(hostId, sessionId, predicate, timeoutMs = 60000, options = {}) {
   const deadline = Date.now() + timeoutMs;
+  const identities = collectLaunchSessionIdentities(sessionId, options.launchResponse || options);
   let lastSession = null;
   while (Date.now() < deadline) {
     const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/sessions?${sessionListQuery()}`);
-    const session = (response.sessions || []).find((item) => item.sessionId === sessionId || item.bridgeSessionId === sessionId) || null;
+    const session = pickBestSessionMatch(response.sessions || [], identities, predicate, options);
     lastSession = session || lastSession;
     if (session && predicate(session)) {
       return session;
@@ -11498,17 +12941,46 @@ async function waitForSession(hostId, sessionId, predicate, timeoutMs = 60000) {
     await sleep(400);
   }
 
-  const stateText = lastSession?.state ? ` Last state: ${lastSession.state}.` : '';
-  throw new Error(`Timed out while waiting for the live session to start.${stateText}`);
+  const runId = launchResponseRunId(options.launchResponse || options);
+  const runText = runId ? ` Expected run: ${shortId(runId)}.` : '';
+  const lastText = lastSession
+    ? ` Last match: ${shortId(lastSession.sessionId)} state=${lastSession.state || 'unknown'} live=${lastSession.live ? 'yes' : 'no'}${lastSession.runId ? ` run=${shortId(lastSession.runId)}` : ''}.`
+    : ' No matching session was reported by the relay.';
+  const startingHint = String(lastSession?.state || '').toLowerCase() === 'starting'
+    ? ' The host is still reporting startup; Windows Codex app-server launches can take longer during cold starts.'
+    : '';
+  throw new Error(`Timed out while waiting for the live session to start.${lastText}${runText}${startingHint}`);
 }
 
-async function waitForSessionReady(hostId, sessionId, timeoutMs = 60000) {
+function isNormalStopExitState(stateValue) {
+  const stateText = String(stateValue || '').trim();
+  return /^exited:(?:null|143):(?:SIGTERM|null)$/i.test(stateText)
+    || /^exited:[^:]*:SIGTERM$/i.test(stateText);
+}
+
+function isSessionStartTerminalState(session) {
+  const stateText = String(session?.state || '');
+  return stateText.startsWith('failed')
+    || (stateText.startsWith('exited') && !isNormalStopExitState(stateText));
+}
+
+async function waitForSessionReady(hostId, sessionId, timeoutMs = 60000, options = {}) {
   return waitForSession(
     hostId,
     sessionId,
-    (session) => session.live === true || String(session.state || '').startsWith('failed') || String(session.state || '').startsWith('exited'),
-    timeoutMs
+    (session) => session.live === true || isSessionStartTerminalState(session),
+    timeoutMs,
+    options
   );
+}
+
+function managedSessionStartTimeoutMs(host, launchMode) {
+  const platform = String(host?.platform || host?.os || '').toLowerCase();
+  const isWindowsHost = platform.includes('win');
+  if (isWindowsHost) {
+    return launchMode === 'fresh' ? 120000 : 240000;
+  }
+  return launchMode === 'fresh' ? 60000 : 90000;
 }
 
 async function importHost(hostId) {
@@ -11933,7 +13405,12 @@ async function runConnectorAction(action) {
 }
 
 function getOriginSessionId(session) {
-  return session.originSessionId || session.conversationKey || session.sessionId;
+  return session.originSessionId
+    || session.conversationKey
+    || session.sourceSessionId
+    || session.bridgeSessionId
+    || session.nativeThreadId
+    || session.sessionId;
 }
 
 function pathLeaf(value) {
@@ -12085,69 +13562,127 @@ async function startManagedSession(options = {}) {
     reportError(new Error('Select a host before starting a managed session.'));
     return null;
   }
-  if (host && !host.online) {
-    throw new Error(`Host ${host.label || host.hostId} is offline. Start its agent first, then try again.`);
-  }
-
   if (!cwd) {
     reportError(new Error('No workspace path is available for this conversation.'));
     return null;
   }
 
-  await verifyHostAvailable(hostId);
-
-  const body = {
-    cwd,
-    label: label || cwd,
+  const launchBusyId = makeClientId();
+  const sourceSessionKey = getSessionKey(sourceSession);
+  setSessionLaunchBusy({
+    id: launchBusyId,
+    hostId,
+    sessionId: sourceSession?.sessionId || null,
+    sourceSessionId: sourceSession?.sessionId || null,
+    originSessionId: sourceSession ? getOriginSessionId(sourceSession) : null,
+    nativeThreadId: sourceSession?.nativeThreadId || sourceSession?.sessionId || null,
+    conversationKey: sourceSession?.conversationKey || conversation?.conversationKey || null,
+    sessionKey: sourceSessionKey,
     launchMode,
-  };
-  const apiConfig = getApiRequestConfig(hostId);
-  if (apiConfig) {
-    body.apiConfig = apiConfig;
-  }
-
-  if (options.command) {
-    body.command = options.command;
-  }
-
-  if (sourceSession?.sessionId) {
-    body.sourceSessionId = sourceSession.sessionId;
-    body.originSessionId = getOriginSessionId(sourceSession);
-    body.conversationKey = sourceSession.conversationKey
-      || sourceSession.originSessionId
-      || (conversation?.preferredSession?.sessionId === sourceSession.sessionId ? conversation.conversationKey : '')
-      || getOriginSessionId(sourceSession);
-    body.nativeThreadId = sourceSession.nativeThreadId || sourceSession.sessionId;
-  }
-
-  const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/sessions/start`, {
-    method: 'POST',
-    body: JSON.stringify(body),
+    label: label || cwd,
+    cwd,
+    stage: 'checking-host',
   });
 
-  const startedSession = await waitForSessionReady(hostId, response.sessionId);
-  if (!startedSession.live) {
-    const detail = await fetchJson(`/api/sessions/${encodeURIComponent(startedSession.sessionId)}/detail?hostId=${encodeURIComponent(hostId)}`).catch(() => null);
-    const alertMessage = Array.isArray(detail?.alerts) ? [...detail.alerts].reverse().find((entry) => entry && entry.message)?.message : null;
-    const transcript = Array.isArray(detail?.transcript) ? [...detail.transcript].reverse() : [];
-    const systemMessage = transcript.find((entry) => entry.speaker === 'system' && entry.text && !String(entry.text).startsWith('State changed:'))?.text
-      || transcript.find((entry) => entry.speaker === 'system' && entry.text)?.text
-      || null;
-    throw new Error(alertMessage || systemMessage || `Managed session failed to start: ${startedSession.state || 'unknown error'}`);
-  }
+  try {
+    await ensureHostAvailableForSessionStart(hostId);
+    updateSessionLaunchBusy(launchBusyId, { stage: 'queueing-start' });
 
-  await refresh();
-  const next = state.sessions.find((item) => item.hostId === hostId && item.sessionId === startedSession.sessionId) || null;
-  if (next && inheritCollectionId) {
-    await addSessionToCollection(inheritCollectionId, next);
+    const body = {
+      cwd,
+      label: label || cwd,
+      launchMode,
+    };
+    const apiConfig = getApiRequestConfig(hostId);
+    validateApiConfigForRequest(apiConfig, hostId);
+    if (apiConfig) {
+      body.apiConfig = apiConfig;
+    }
+
+    if (options.command) {
+      body.command = options.command;
+    }
+
+    if (sourceSession?.sessionId) {
+      body.sourceSessionId = sourceSession.sessionId;
+      body.originSessionId = getOriginSessionId(sourceSession);
+      body.conversationKey = sourceSession.conversationKey
+        || sourceSession.originSessionId
+        || (conversation?.preferredSession?.sessionId === sourceSession.sessionId ? conversation.conversationKey : '')
+        || getOriginSessionId(sourceSession);
+      body.nativeThreadId = sourceSession.nativeThreadId || sourceSession.sessionId;
+    }
+
+    const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/sessions/start`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    updateSessionLaunchBusy(launchBusyId, {
+      stage: 'waiting-live-session',
+      sessionId: response.sessionId || sourceSession?.sessionId || null,
+      sourceSessionId: response.sourceSessionId || body.sourceSessionId || sourceSession?.sessionId || null,
+      originSessionId: response.originSessionId || body.originSessionId || null,
+      nativeThreadId: response.nativeThreadId || body.nativeThreadId || null,
+      conversationKey: response.conversationKey || body.conversationKey || conversation?.conversationKey || null,
+      runId: response.runId || null,
+      sessionKey: makeSessionKey(hostId, response.sessionId || sourceSession?.sessionId || ''),
+    });
+    if (response.sessionId) {
+      const startingSession = mergeSession({
+        ...(sourceSession || {}),
+        hostId,
+        sessionId: response.sessionId,
+        title: label || sourceSession?.title || cwd,
+        cwd,
+        source: 'managed',
+        state: 'starting',
+        live: false,
+        originSessionId: response.originSessionId || body.originSessionId || null,
+        sourceSessionId: response.sourceSessionId || body.sourceSessionId || null,
+        conversationKey: response.conversationKey || body.conversationKey || response.originSessionId || response.sessionId,
+        launchMode,
+        bridgeSessionId: response.bridgeSessionId || response.sessionId,
+        runId: response.runId || null,
+        nativeThreadId: response.nativeThreadId || body.nativeThreadId || response.sessionId,
+        apiProfile: apiConfig ? summarizeApiConfigForDisplay(apiConfig) : sourceSession?.apiProfile || null,
+      });
+      if (startingSession && options.selectAfterStart !== false) {
+        state.selectedHostId = hostId;
+        state.selectedConversationKey = getSessionConversationKey(startingSession);
+        state.selectedSessionId = startingSession.sessionId;
+        renderAll();
+      }
+    }
+
+    const startTimeoutMs = managedSessionStartTimeoutMs(host, launchMode);
+    const startedSession = await waitForSessionReady(hostId, response.sessionId, startTimeoutMs, {
+      launchResponse: response,
+    });
+    if (!startedSession.live) {
+      const detail = await fetchJson(`/api/sessions/${encodeURIComponent(startedSession.sessionId)}/detail?hostId=${encodeURIComponent(hostId)}`).catch(() => null);
+      const alertMessage = Array.isArray(detail?.alerts) ? [...detail.alerts].reverse().find((entry) => entry && entry.message)?.message : null;
+      const transcript = Array.isArray(detail?.transcript) ? [...detail.transcript].reverse() : [];
+      const systemMessage = transcript.find((entry) => entry.speaker === 'system' && entry.text && !String(entry.text).startsWith('State changed:'))?.text
+        || transcript.find((entry) => entry.speaker === 'system' && entry.text)?.text
+        || null;
+      throw new Error(alertMessage || systemMessage || `Managed session failed to start: ${startedSession.state || 'unknown error'}`);
+    }
+
+    await refresh();
+    const next = state.sessions.find((item) => item.hostId === hostId && item.sessionId === startedSession.sessionId) || null;
+    if (next && inheritCollectionId) {
+      await addSessionToCollection(inheritCollectionId, next);
+    }
+    if (next && options.selectAfterStart !== false) {
+      await selectSession(next);
+    }
+    if (next && (options.initialText || options.initialInputOptions?.inputItems?.length)) {
+      await sendInputToSession(next, options.initialText || '', options.initialInputOptions || {});
+    }
+    return next;
+  } finally {
+    clearSessionLaunchBusy(launchBusyId);
   }
-  if (next && options.selectAfterStart !== false) {
-    await selectSession(next);
-  }
-  if (next && (options.initialText || options.initialInputOptions?.inputItems?.length)) {
-    await sendInputToSession(next, options.initialText || '', options.initialInputOptions || {});
-  }
-  return next;
 }
 
 async function resumeFromHistory(options = {}) {
@@ -12241,6 +13776,8 @@ function getActiveTurnBlocker(session) {
     'waiting-user-input',
     'retrying',
     'reconnecting',
+    'queued-turn',
+    'submitting-turn',
   ].includes(phase);
 
   if (!runtime.activeTurnId && !runtime.busy && !runtime.waitingOnApproval && !runtime.waitingOnUserInput && !activePhase) {
@@ -12272,6 +13809,8 @@ function runtimeIsActive(runtime = {}) {
     'waiting-user-input',
     'retrying',
     'reconnecting',
+    'queued-turn',
+    'submitting-turn',
     'running-shell-command',
     'compacting',
   ].includes(phase);
@@ -12286,6 +13825,23 @@ function openStatusForActiveTurnBlocker() {
   renderStatusWindow();
 }
 
+function openGoalControls() {
+  const session = getSelectedSession();
+  if (!session) {
+    reportError(new Error('Select a conversation before opening Goal controls.'));
+    return;
+  }
+  state.statusWindowOpen = false;
+  state.sessionDetailsOpen = true;
+  renderSessionDetails();
+  renderRuntimePanel();
+  renderStatusWindow();
+  window.setTimeout(() => {
+    el('goal-objective-input')?.focus();
+    el('status-goal-summary')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, 0);
+}
+
 async function sendInputToSession(session, text, options = {}) {
   const blocker = options.skipActiveTurnBlocker ? null : getActiveTurnBlocker(session);
   if (blocker) {
@@ -12295,6 +13851,7 @@ async function sendInputToSession(session, text, options = {}) {
 
   await verifyHostAvailable(session.hostId);
   const apiConfig = options.apiConfig || getApiRequestConfig(session.hostId);
+  validateApiConfigForRequest(apiConfig, session.hostId);
   const body = {
     hostId: session.hostId,
     clientRequestId: options.clientRequestId || null,
@@ -12310,6 +13867,7 @@ async function sendInputToSession(session, text, options = {}) {
     approvalPolicy: options.approvalPolicy || null,
     approvalsReviewer: options.approvalsReviewer || null,
     sandboxMode: options.sandboxMode || null,
+    planFallback: options.planFallback || null,
     serviceTier: options.serviceTier || null,
     personality: options.personality || null,
   };
@@ -12354,8 +13912,8 @@ async function submitComposerPayload(session, payload, input) {
   }
 
   if (session.live && runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
-    const queuedText = String(payload.text || payload.displayText || '').trim();
-    const hasInputs = Boolean(payload.inputItems?.length || payload.uploadedFiles?.length);
+    const queuedText = String(payload.displayText || payload.composerDraft?.text || payload.text || '').trim();
+    const hasInputs = Boolean(payload.inputItems?.length || payload.uploadedFiles?.length || payload.inlineFiles?.length);
     if (!queuedText && !hasInputs) {
       throw new Error('Codex is already working. Add text or files to queue, or interrupt it first.');
     }
@@ -13040,7 +14598,9 @@ el('clear-api-key-button').addEventListener('click', () => {
   profile.apiKey = '';
   profile.rememberApiKey = false;
   el('settings-api-key').value = '';
-  el('settings-api-key-remember').checked = false;
+  if (el('settings-api-key-remember')) {
+    el('settings-api-key-remember').checked = false;
+  }
   persistUiSettings();
 });
 
@@ -13115,6 +14675,17 @@ el('settings-host-api-list').addEventListener('change', (event) => {
     return;
   }
   state.ui.hostApiProfiles[hostId] = select.value;
+});
+
+el('settings-host-api-list').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-host-api-ping]');
+  if (!button) {
+    return;
+  }
+  const hostId = button.dataset.hostApiPing;
+  const row = button.closest('.settings-host-api-row');
+  const select = row?.querySelector('[data-host-api-profile-host]');
+  pingHostApiProfile(hostId, select?.value || '').catch(reportError);
 });
 
 el('settings-form').addEventListener('submit', (event) => {
@@ -13380,11 +14951,13 @@ el('export-format-select')?.addEventListener('change', (event) => {
 
 el('export-start-date-input')?.addEventListener('input', (event) => {
   state.exportDialog.fromDate = event.target.value || '';
+  state.exportDialog.selectedDays = new Set();
   renderExportDialog();
 });
 
 el('export-end-date-input')?.addEventListener('input', (event) => {
   state.exportDialog.toDate = event.target.value || '';
+  state.exportDialog.selectedDays = new Set();
   renderExportDialog();
 });
 
@@ -13394,8 +14967,27 @@ el('export-day-list')?.addEventListener('click', (event) => {
     return;
   }
   const day = button.dataset.exportDay || '';
-  state.exportDialog.fromDate = exportDateInputForDay(day, false);
-  state.exportDialog.toDate = exportDateInputForDay(day, true);
+  state.exportDialog.fromDate = '';
+  state.exportDialog.toDate = '';
+  if (state.exportDialog.selectedDays.has(day)) {
+    state.exportDialog.selectedDays.delete(day);
+  } else {
+    state.exportDialog.selectedDays.add(day);
+  }
+  renderExportDialog();
+});
+
+el('export-dates-select-all-button')?.addEventListener('click', () => {
+  state.exportDialog.fromDate = '';
+  state.exportDialog.toDate = '';
+  state.exportDialog.selectedDays = new Set(getExportSelectableDays().map((day) => day.date).filter(Boolean));
+  renderExportDialog();
+});
+
+el('export-dates-clear-button')?.addEventListener('click', () => {
+  state.exportDialog.fromDate = '';
+  state.exportDialog.toDate = '';
+  state.exportDialog.selectedDays = new Set();
   renderExportDialog();
 });
 
@@ -13538,7 +15130,28 @@ el('session-details-button').addEventListener('click', () => {
   renderSessionDetails();
 });
 
+el('session-meta')?.addEventListener('click', (event) => {
+  const copySessionButton = event.target.closest('[data-copy-session-id]');
+  if (!copySessionButton) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  copyTextToClipboard(copySessionButton.dataset.copySessionId || '')
+    .then(() => flashCopyButton(copySessionButton))
+    .catch(reportError);
+});
+
 el('session-detail-panel').addEventListener('click', (event) => {
+  const copySessionButton = event.target.closest('[data-copy-session-id]');
+  if (copySessionButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    copyTextToClipboard(copySessionButton.dataset.copySessionId || '')
+      .then(() => flashCopyButton(copySessionButton))
+      .catch(reportError);
+    return;
+  }
   if (event.target.closest('button')) {
     return;
   }
@@ -13596,6 +15209,22 @@ el('session-log').addEventListener('click', async (event) => {
   } catch (error) {
     reportError(error);
   }
+});
+
+el('transcript-search-navigator')?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-transcript-search-nav]');
+  if (!button) {
+    return;
+  }
+  event.preventDefault();
+  const action = button.dataset.transcriptSearchNav;
+  if (action === 'clear') {
+    el('session-search-input').value = '';
+    setSessionSearchQuery('');
+    renderTranscript(getSelectedSession());
+    return;
+  }
+  focusTranscriptSearchMatch(action === 'previous' ? 'previous' : 'next');
 });
 
 el('alerts-fab').addEventListener('click', () => {
@@ -13656,6 +15285,52 @@ el('end-session-status-button').addEventListener('click', async () => {
 el('compact-thread-button').addEventListener('click', async () => {
   try {
     await compactCurrentThread();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('goal-form')?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    await setNativeGoalFromStatus();
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('goal-refresh-button')?.addEventListener('click', async () => {
+  try {
+    await refreshNativeGoal();
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('goal-complete-button')?.addEventListener('click', async () => {
+  try {
+    await setNativeGoalFromStatus('complete');
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('goal-blocked-button')?.addEventListener('click', async () => {
+  try {
+    await setNativeGoalFromStatus('blocked');
+    await refresh();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+el('goal-clear-button')?.addEventListener('click', async () => {
+  try {
+    await clearNativeGoal();
+    await refresh();
   } catch (error) {
     reportError(error);
   }
@@ -14111,6 +15786,10 @@ el('codex-clear-attachments-button').addEventListener('click', () => {
 el('codex-plan-button').addEventListener('click', () => {
   toggleComposerPlanMode();
   focusComposerInput();
+});
+
+el('codex-goal-button')?.addEventListener('click', () => {
+  openGoalControls();
 });
 
 el('composer-exit-plan-mode-button').addEventListener('click', () => {

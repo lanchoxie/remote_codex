@@ -213,11 +213,7 @@
             </label>
             <label>
               <span data-i18n-key="settings.api-key">API key</span>
-              <input id="settings-api-key" type="password" placeholder="sk-... stored locally if enabled" autocomplete="off" />
-            </label>
-            <label class="settings-checkbox">
-              <input id="settings-api-key-remember" type="checkbox" />
-              <span data-i18n-key="settings.rememberKey">Remember API key in this browser</span>
+              <input id="settings-api-key" type="password" placeholder="sk-..." autocomplete="off" />
             </label>
           </div>
           <div class="settings-warning" data-i18n-key="settings.apiRestartTip">After changing an API key or Base URL, restart the affected conversation/managed session. Running Codex app-server processes keep the API environment they started with.</div>
@@ -469,6 +465,7 @@
             <button id="scroll-transcript-top-button" type="button" class="secondary-button scroll-jump-button">Top</button>
             <button id="scroll-transcript-bottom-button" type="button" class="secondary-button scroll-jump-button">Bottom</button>
           </div>
+          <div id="transcript-search-navigator" class="transcript-search-navigator hidden" aria-live="polite"></div>
           <div id="session-log" class="log"></div>
           <form id="input-form" class="composer">
             <div class="composer-attachment-grid">
@@ -500,6 +497,7 @@
               </div>
               <div class="composer-action-stack">
                 <button id="codex-plan-button" type="button" class="secondary-button" aria-pressed="false">Plan</button>
+                <button id="codex-goal-button" type="button" class="secondary-button">Goal</button>
                 <button id="codex-review-button" type="button" class="secondary-button">Review</button>
                 <button id="codex-interrupt-button" type="button" class="danger-button hidden">Interrupt</button>
                 <button id="codex-send-button" type="submit">Send</button>
@@ -564,6 +562,22 @@
           </section>
         </div>
         <div id="status-summary-grid" class="status-summary-grid"></div>
+        <div class="status-section native-goal-section">
+          <div class="status-section-label">Goal</div>
+          <div id="status-goal-summary" class="status-copy">No native goal loaded.</div>
+          <form id="goal-form" class="status-inline-form">
+            <textarea id="goal-objective-input" rows="3" placeholder="Set a native Codex thread goal..."></textarea>
+            <input id="goal-token-budget-input" type="number" min="1" step="1" placeholder="Token budget" />
+            <div class="status-request-actions">
+              <button id="goal-set-button" type="submit" class="secondary-button">Set Goal</button>
+              <button id="goal-complete-button" type="button" class="secondary-button">Complete</button>
+              <button id="goal-blocked-button" type="button" class="secondary-button">Blocked</button>
+              <button id="goal-refresh-button" type="button" class="secondary-button">Refresh Goal</button>
+              <button id="goal-clear-button" type="button" class="danger-button">Clear Goal</button>
+            </div>
+          </form>
+          <div id="status-goal-note" class="status-request-note">Uses native Codex thread/goal APIs. If the selected app-server does not support them, the request will fail.</div>
+        </div>
         <div class="status-section">
           <div class="status-section-label">Thinking</div>
           <div id="status-thinking" class="status-copy">No reasoning summary yet.</div>
@@ -648,7 +662,13 @@
           </label>
         </div>
         <div class="export-timeline-panel">
-          <div id="export-session-time-summary" class="export-time-summary">Session timeline is loading.</div>
+          <div class="export-timeline-header">
+            <div id="export-session-time-summary" class="export-time-summary">Session timeline is loading.</div>
+            <div class="choice-section-actions">
+              <button id="export-dates-select-all-button" type="button" class="secondary-button">Select all dates</button>
+              <button id="export-dates-clear-button" type="button" class="secondary-button">Clear dates</button>
+            </div>
+          </div>
           <div id="export-day-list" class="export-day-list"></div>
         </div>
         <div class="export-checkbox-grid">

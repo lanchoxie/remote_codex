@@ -14,6 +14,9 @@ const {
 
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_REQUEST_TIMEOUT_MS || 15000);
 const LIST_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_LIST_REQUEST_TIMEOUT_MS || 30000);
+const INITIALIZE_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_INITIALIZE_TIMEOUT_MS || 60000);
+const THREAD_OPEN_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_THREAD_OPEN_TIMEOUT_MS || 120000);
+const TURN_START_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_TURN_START_TIMEOUT_MS || 120000);
 
 function stripAnsi(value) {
   return String(value || '').replace(/\x1b\[[0-9;]*m/g, '');
@@ -745,6 +748,10 @@ function normalizeTurnStartParams(threadId, cwd, text, options = {}) {
     input,
   };
 
+  if (options.collaborationMode && typeof options.collaborationMode === 'object') {
+    params.collaborationMode = options.collaborationMode;
+  }
+
   const model = String(options.model || '').trim();
   if (model) {
     params.model = model;
@@ -776,6 +783,48 @@ function normalizeTurnStartParams(threadId, cwd, text, options = {}) {
   }
 
   return params;
+}
+
+function normalizeOfficialCollaborationMode(value) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const mode = String(value.mode || '').trim();
+  if (mode !== 'plan' && mode !== 'default') {
+    return null;
+  }
+  const settings = value.settings && typeof value.settings === 'object' ? value.settings : {};
+  return {
+    mode,
+    settings: {
+      model: String(settings.model || '').trim(),
+      reasoning_effort: settings.reasoning_effort || settings.reasoningEffort || null,
+      developer_instructions: settings.developer_instructions ?? settings.developerInstructions ?? null,
+    },
+  };
+}
+
+function shouldUseLocalPlanFallback(error) {
+  const message = String(error?.message || error || '');
+  return /collaborationMode\/list/i.test(message)
+    || /collaboration mode/i.test(message)
+    || /method not found/i.test(message)
+    || /unknown method/i.test(message)
+    || /unknown field/i.test(message)
+    || /invalid params/i.test(message)
+    || /did not return an official plan/i.test(message);
+}
+
+function buildLocalPlanPrompt(text, hasAttachments) {
+  const request = String(text || '').trim()
+    || (hasAttachments ? 'Please inspect the attached file or image inputs and propose a safe next-step plan.' : '');
+  return [
+    'Local Plan fallback: do not modify files, do not run destructive commands, and do not make irreversible changes.',
+    'Analyze the request, list the concrete steps you would take, and call out risks or decisions that need confirmation.',
+    '',
+    'User request:',
+    request,
+  ].join('\n').trim();
 }
 
 function normalizeReviewTarget(input = {}) {
@@ -1019,9 +1068,13 @@ class CodexAppServerRunner {
     this.hostId = options.hostId;
     this.sessionId = options.sessionId;
     this.bridgeSessionId = options.bridgeSessionId || options.sessionId;
+    this.runId = options.runId || null;
     this.title = options.title;
     this.cwd = options.cwd;
     this.launchMode = options.launchMode || 'fresh';
+    this.originSessionId = options.originSessionId || null;
+    this.sourceSessionId = options.sourceSessionId || null;
+    this.conversationKey = options.conversationKey || this.originSessionId || this.bridgeSessionId;
     this.bootstrap = options.bootstrap || null;
     this.postEvent = options.postEvent;
     this.onTerminated = options.onTerminated || null;
@@ -1030,6 +1083,10 @@ class CodexAppServerRunner {
     const preparedCodexHome = prepareApiProfileCodexHome(this.baseCodexHome, this.apiConfig, {
       sessionId: this.sessionId,
       bridgeSessionId: this.bridgeSessionId,
+      nativeThreadId: options.nativeThreadId || null,
+      sourceSessionId: this.sourceSessionId,
+      originSessionId: this.originSessionId,
+      conversationKey: this.conversationKey,
     });
     this.codexHome = preparedCodexHome.codexHome;
     this.apiProfileHome = preparedCodexHome.profileHome;
@@ -1043,6 +1100,7 @@ class CodexAppServerRunner {
     this.nativeThreadId = options.nativeThreadId || null;
     this.activeTurnId = null;
     this.turnBuffers = new Map();
+    this.turnModes = new Map();
     this.planBuffers = new Map();
     this.reasoningBuffers = new Map();
     this.pendingRequests = new Map();
@@ -1052,11 +1110,12 @@ class CodexAppServerRunner {
       kind: 'codex_app_server',
       adapterId: 'codex-app-server',
       runtimeId: 'codex-app-server',
+      runId: this.runId,
       runtimeLabel: 'Codex app-server',
       command: this.codexBin,
       args: ['app-server'],
       cwd: this.cwd,
-      nativeThreadId: null,
+      nativeThreadId: this.nativeThreadId || null,
       launchMode: this.launchMode,
       codexHomeProfile: this.apiProfileHome ? 'api-profile-isolated' : 'managed-isolated',
       apiProfileId: this.apiConfig?.profileId || null,
@@ -1067,6 +1126,7 @@ class CodexAppServerRunner {
       resumeStrategy: 'fresh',
       connection: 'starting',
       phase: 'starting',
+      startupStep: 'starting',
       busy: false,
       waitingOnApproval: false,
       waitingOnUserInput: false,
@@ -1134,7 +1194,12 @@ class CodexAppServerRunner {
     };
     this.child.once('error', onEarlyError);
 
-    await this.emitRuntime({ connection: 'connecting', phase: 'booting' });
+    await this.emitRuntime({
+      connection: 'connecting',
+      phase: 'booting',
+      startupStep: 'spawned-app-server',
+      busy: true,
+    });
     if (spawnError) {
       this.child.off('error', onEarlyError);
       throw new Error(formatCodexStartError(spawnError));
@@ -1205,6 +1270,25 @@ class CodexAppServerRunner {
     });
     this.child.off('error', onEarlyError);
 
+    await this.emitRuntime({
+      connection: 'connecting',
+      phase: 'initializing',
+      startupStep: 'initialize-app-server',
+      busy: true,
+    });
+    await this.emitDiagnostic({
+      severity: 'info',
+      source: 'codex',
+      kind: 'lifecycle',
+      method: 'app-server/initialize',
+      message: 'Initializing Codex app-server.',
+      data: {
+        launchMode: this.launchMode,
+        nativeThreadId: this.nativeThreadId || null,
+        codexHome: this.codexHome,
+        processHome,
+      },
+    }).catch(() => {});
     await this.rpc.request('initialize', {
       clientInfo: {
         name: 'mobile-codex-remote',
@@ -1213,9 +1297,14 @@ class CodexAppServerRunner {
       capabilities: {
         experimentalApi: true,
       },
-    });
+    }, INITIALIZE_REQUEST_TIMEOUT_MS);
 
-    await this.emitRuntime({ connection: 'ready', phase: 'idle' });
+    await this.emitRuntime({
+      connection: 'ready',
+      phase: 'opening-thread',
+      startupStep: 'opening-thread',
+      busy: true,
+    });
     await this.emitDiagnostic({
       severity: 'info',
       source: 'codex',
@@ -1246,13 +1335,33 @@ class CodexAppServerRunner {
           detail: String(reason.message || reason).slice(0, 500),
         }).catch(() => {});
       }
+      await this.emitRuntime({
+        connection: 'ready',
+        phase: 'starting-thread',
+        startupStep: reason ? 'thread-start-fallback' : 'thread-start',
+        busy: true,
+      });
+      await this.emitDiagnostic({
+        severity: reason ? 'warning' : 'info',
+        source: 'codex',
+        kind: 'lifecycle',
+        method: 'thread/start',
+        message: reason
+          ? 'Starting a fallback Codex thread from transcript context.'
+          : 'Starting a new Codex thread.',
+        detail: reason ? String(reason.message || reason).slice(0, 500) : undefined,
+        data: {
+          launchMode: this.launchMode,
+          nativeThreadId: this.nativeThreadId || null,
+        },
+      }).catch(() => {});
       const fallbackThread = await this.rpc.request('thread/start', {
         cwd: this.cwd,
         approvalPolicy: 'on-request',
         sandbox: 'workspace-write',
         personality: 'friendly',
         ...threadApiParams,
-      });
+      }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
       this.runtime.resumeStrategy = this.launchMode === 'resume' || this.launchMode === 'fork'
         ? 'transcript_fallback'
         : 'fresh';
@@ -1262,6 +1371,23 @@ class CodexAppServerRunner {
     let thread = null;
     if (this.launchMode === 'resume' && this.nativeThreadId) {
       try {
+        await this.emitRuntime({
+          connection: 'ready',
+          phase: 'resuming-thread',
+          startupStep: 'thread-resume',
+          busy: true,
+        });
+        await this.emitDiagnostic({
+          severity: 'info',
+          source: 'codex',
+          kind: 'lifecycle',
+          method: 'thread/resume',
+          message: `Resuming Codex thread ${limitText(this.nativeThreadId, 64)}.`,
+          data: {
+            launchMode: this.launchMode,
+            nativeThreadId: this.nativeThreadId,
+          },
+        }).catch(() => {});
         thread = await this.rpc.request('thread/resume', {
           threadId: this.nativeThreadId,
           cwd: this.cwd,
@@ -1269,13 +1395,30 @@ class CodexAppServerRunner {
           sandbox: 'workspace-write',
           personality: 'friendly',
           ...threadApiParams,
-        });
+        }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
         this.runtime.resumeStrategy = 'native_resume';
       } catch (error) {
         thread = await startTranscriptFallbackThread(error);
       }
     } else if (this.launchMode === 'fork' && this.nativeThreadId) {
       try {
+        await this.emitRuntime({
+          connection: 'ready',
+          phase: 'forking-thread',
+          startupStep: 'thread-fork',
+          busy: true,
+        });
+        await this.emitDiagnostic({
+          severity: 'info',
+          source: 'codex',
+          kind: 'lifecycle',
+          method: 'thread/fork',
+          message: `Forking Codex thread ${limitText(this.nativeThreadId, 64)}.`,
+          data: {
+            launchMode: this.launchMode,
+            nativeThreadId: this.nativeThreadId,
+          },
+        }).catch(() => {});
         thread = await this.rpc.request('thread/fork', {
           threadId: this.nativeThreadId,
           cwd: this.cwd,
@@ -1284,7 +1427,7 @@ class CodexAppServerRunner {
           ephemeral: false,
           threadSource: 'user',
           ...threadApiParams,
-        });
+        }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
         this.runtime.resumeStrategy = 'native_fork';
       } catch (error) {
         thread = await startTranscriptFallbackThread(error);
@@ -1301,8 +1444,10 @@ class CodexAppServerRunner {
     this.nativeThreadId = this.threadId;
     this.runtime.nativeThreadId = this.threadId;
     await this.emitRuntime({
+      connection: 'ready',
       threadId: this.threadId,
       phase: 'idle',
+      startupStep: 'ready',
       busy: false,
     });
   }
@@ -1336,44 +1481,155 @@ class CodexAppServerRunner {
       await this.emitOutput('[codex] continuing from imported history context', 'stderr');
     }
 
-    const params = normalizeTurnStartParams(this.threadId, this.cwd, prompt, options);
+    let collaborationMode = normalizeOfficialCollaborationMode(options.collaborationMode);
     const mode = String(options.mode || '').trim();
+    if (!collaborationMode && mode === 'plan') {
+      try {
+        collaborationMode = await this.getOfficialCollaborationMode('plan');
+      } catch (error) {
+        if (String(options.planFallback || '').trim() !== 'local' || !shouldUseLocalPlanFallback(error)) {
+          throw error;
+        }
+        await this.emitDiagnostic({
+          severity: 'warning',
+          source: 'codex',
+          kind: 'control',
+          method: 'collaborationMode/list',
+          message: `Native Codex Plan is unavailable; using Local Plan fallback: ${error.message}`,
+          data: { error: error.message },
+        });
+      }
+    }
+
+    const localPlanFallback = mode === 'plan' && !collaborationMode && String(options.planFallback || '').trim() === 'local';
+    const effectivePrompt = localPlanFallback
+      ? buildLocalPlanPrompt(prompt, normalizedItems.some((item) => item.type === 'image' || item.type === 'localImage'))
+      : prompt;
+    const effectiveOptions = localPlanFallback
+      ? {
+        ...options,
+        collaborationMode: null,
+        approvalPolicy: 'never',
+        sandboxMode: 'readOnly',
+      }
+      : options;
+
+    const params = normalizeTurnStartParams(this.threadId, this.cwd, effectivePrompt, effectiveOptions);
+    if (collaborationMode) {
+      params.collaborationMode = collaborationMode;
+    }
+    await this.emitRuntime({
+      busy: true,
+      phase: 'submitting-turn',
+      currentTurnStatus: 'submitting',
+      pendingInputSummary: limitText(effectivePrompt, 240),
+      model: params.model || null,
+      effort: params.effort || null,
+      summary: params.summary || null,
+      collaborationMode: params.collaborationMode || null,
+      approvalPolicy: params.approvalPolicy || null,
+      approvalsReviewer: params.approvalsReviewer || null,
+      sandboxPolicy: params.sandboxPolicy || null,
+    });
     await this.emitDiagnostic({
       severity: 'info',
       source: 'codex',
       kind: 'control',
       method: 'turn/start',
-      message: mode === 'plan'
+      message: collaborationMode?.mode === 'plan'
         ? 'Starting a plan-mode turn.'
+        : localPlanFallback
+          ? 'Starting a Local Plan fallback turn.'
         : 'Starting a Codex turn.',
       data: {
         model: params.model || null,
         effort: params.effort || null,
         summary: params.summary || null,
+        collaborationMode: params.collaborationMode || null,
         apiBaseUrl: this.apiConfig?.baseUrl || null,
         apiProviderKey: this.apiProviderKey || null,
         codexHomeProfile: this.runtime.codexHomeProfile || null,
         approvalPolicy: params.approvalPolicy || null,
         approvalsReviewer: params.approvalsReviewer || null,
         sandboxPolicy: params.sandboxPolicy || null,
+        localPlanFallback,
         inputTypes: params.input.map((item) => item.type),
       },
     });
 
-    const turn = await this.rpc.request('turn/start', params);
+    let turn = null;
+    try {
+      turn = await this.rpc.request('turn/start', params, TURN_START_REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      if (
+        mode === 'plan'
+        && collaborationMode
+        && String(options.planFallback || '').trim() === 'local'
+        && shouldUseLocalPlanFallback(error)
+      ) {
+        await this.emitDiagnostic({
+          severity: 'warning',
+          source: 'codex',
+          kind: 'control',
+          method: 'turn/start',
+          message: `Native Codex Plan turn failed; retrying with Local Plan fallback: ${error.message}`,
+          data: { error: error.message, collaborationMode },
+        });
+        const fallbackParams = normalizeTurnStartParams(
+          this.threadId,
+          this.cwd,
+          buildLocalPlanPrompt(prompt, normalizedItems.some((item) => item.type === 'image' || item.type === 'localImage')),
+          {
+            ...options,
+            collaborationMode: null,
+            approvalPolicy: 'never',
+            sandboxMode: 'readOnly',
+          }
+        );
+        await this.emitRuntime({
+          busy: true,
+          phase: 'submitting-turn',
+          currentTurnStatus: 'submitting',
+          pendingInputSummary: limitText(prompt, 240),
+          model: fallbackParams.model || null,
+          effort: fallbackParams.effort || null,
+          summary: fallbackParams.summary || null,
+          collaborationMode: null,
+          approvalPolicy: fallbackParams.approvalPolicy || null,
+          approvalsReviewer: fallbackParams.approvalsReviewer || null,
+          sandboxPolicy: fallbackParams.sandboxPolicy || null,
+        });
+        turn = await this.rpc.request('turn/start', fallbackParams, TURN_START_REQUEST_TIMEOUT_MS);
+        Object.keys(params).forEach((key) => delete params[key]);
+        Object.assign(params, fallbackParams);
+        collaborationMode = null;
+      } else {
+        await this.emitRuntime({
+          activeTurnId: null,
+          busy: false,
+          phase: 'error',
+          currentTurnStatus: 'failed',
+          pendingInputSummary: null,
+          lastCodexError: error.message || String(error),
+        }).catch(() => {});
+        throw error;
+      }
+    }
 
     const turnId = turn?.turn?.id || null;
     if (turnId) {
       this.activeTurnId = turnId;
       this.turnBuffers.set(turnId, '');
+      this.turnModes.set(turnId, collaborationMode?.mode || mode || 'default');
       await this.emitRuntime({
         activeTurnId: turnId,
         busy: true,
-        phase: mode === 'plan' ? 'planning' : 'thinking',
+        phase: (collaborationMode?.mode === 'plan' || mode === 'plan') ? 'planning' : 'thinking',
         currentTurnStatus: 'inProgress',
         model: params.model || null,
         effort: params.effort || null,
         summary: params.summary || null,
+        collaborationMode: params.collaborationMode || null,
         approvalPolicy: params.approvalPolicy || null,
         approvalsReviewer: params.approvalsReviewer || null,
         sandboxPolicy: params.sandboxPolicy || null,
@@ -1382,6 +1638,28 @@ class CodexAppServerRunner {
       });
     }
     return turnId;
+  }
+
+  async getOfficialCollaborationMode(modeName) {
+    const response = await this.rpc.request('collaborationMode/list', {});
+    const modes = Array.isArray(response?.data) ? response.data : [];
+    const match = modes.find((entry) => String(entry?.mode || '').trim() === modeName)
+      || modes.find((entry) => String(entry?.name || '').trim().toLowerCase() === modeName);
+    if (!match) {
+      throw new Error(`Codex app-server did not return an official ${modeName} collaboration mode.`);
+    }
+    const model = String(match.model || '').trim();
+    if (!model) {
+      throw new Error(`Official ${modeName} collaboration mode is missing required settings.model.`);
+    }
+    return {
+      mode: modeName,
+      settings: {
+        model,
+        reasoning_effort: match.reasoning_effort || match.reasoningEffort || null,
+        developer_instructions: null,
+      },
+    };
   }
 
   async listModels(options = {}) {
@@ -1481,9 +1759,32 @@ class CodexAppServerRunner {
   }
 
   async stop() {
-    if (this.child && !this.child.killed) {
-      this.child.kill();
+    const child = this.child;
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      return;
     }
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        child.off('exit', finish);
+        child.off('error', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, 5000);
+      if (typeof timer.unref === 'function') {
+        timer.unref();
+      }
+      child.once('exit', finish);
+      child.once('error', finish);
+      if (!child.killed) {
+        child.kill();
+      }
+    });
   }
 
   async interruptTurn() {
@@ -1504,6 +1805,7 @@ class CodexAppServerRunner {
     if (this.activeTurnId === interruptedTurnId) {
       this.activeTurnId = null;
       this.turnBuffers.delete(interruptedTurnId);
+      this.turnModes.delete(interruptedTurnId);
       this.planBuffers.delete(interruptedTurnId);
       this.reasoningBuffers.delete(interruptedTurnId);
     }
@@ -1604,6 +1906,74 @@ class CodexAppServerRunner {
       threadId: this.threadId,
     });
     return true;
+  }
+
+  async getGoal() {
+    if (!this.threadId) {
+      throw new Error('No thread is available for goal state.');
+    }
+    const response = await this.rpc.request('thread/goal/get', {
+      threadId: this.threadId,
+    });
+    const goal = response?.goal || null;
+    await this.emitRuntime({ goal });
+    await this.emitDiagnostic({
+      severity: 'info',
+      source: 'codex',
+      kind: 'goal',
+      method: 'thread/goal/get',
+      message: goal ? `Goal loaded: ${goal.status || 'active'}` : 'No active goal.',
+      data: { goal },
+    });
+    return goal;
+  }
+
+  async setGoal(options = {}) {
+    if (!this.threadId) {
+      throw new Error('No thread is available for goal state.');
+    }
+    const params = { threadId: this.threadId };
+    if (Object.prototype.hasOwnProperty.call(options, 'objective')) {
+      params.objective = String(options.objective || '').trim() || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'status')) {
+      params.status = String(options.status || '').trim() || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'tokenBudget')) {
+      const tokenBudget = Number(options.tokenBudget);
+      params.tokenBudget = Number.isFinite(tokenBudget) && tokenBudget > 0 ? Math.floor(tokenBudget) : null;
+    }
+    const response = await this.rpc.request('thread/goal/set', params);
+    const goal = response?.goal || null;
+    await this.emitRuntime({ goal });
+    await this.emitDiagnostic({
+      severity: 'info',
+      source: 'codex',
+      kind: 'goal',
+      method: 'thread/goal/set',
+      message: goal ? `Goal updated: ${goal.status || 'active'}` : 'Goal updated.',
+      data: { goal, params },
+    });
+    return goal;
+  }
+
+  async clearGoal() {
+    if (!this.threadId) {
+      throw new Error('No thread is available for goal state.');
+    }
+    const response = await this.rpc.request('thread/goal/clear', {
+      threadId: this.threadId,
+    });
+    await this.emitRuntime({ goal: null });
+    await this.emitDiagnostic({
+      severity: 'info',
+      source: 'codex',
+      kind: 'goal',
+      method: 'thread/goal/clear',
+      message: response?.cleared === false ? 'Goal was already clear.' : 'Goal cleared.',
+      data: response || null,
+    });
+    return response || { cleared: true };
   }
 
   async runShellCommand(command) {
@@ -1767,15 +2137,48 @@ class CodexAppServerRunner {
       return;
     }
 
+    if (method === 'thread/goal/updated') {
+      await this.emitRuntime({
+        goal: params.goal || null,
+      });
+      await this.emitDiagnostic({
+        severity: 'info',
+        source: 'codex',
+        kind: 'goal',
+        method,
+        message: params.goal
+          ? `Goal ${params.goal.status || 'active'}: ${limitText(params.goal.objective || '', 180)}`
+          : 'Goal updated.',
+        data: params || null,
+      });
+      return;
+    }
+
+    if (method === 'thread/goal/cleared') {
+      await this.emitRuntime({
+        goal: null,
+      });
+      await this.emitDiagnostic({
+        severity: 'info',
+        source: 'codex',
+        kind: 'goal',
+        method,
+        message: 'Goal cleared.',
+        data: params || null,
+      });
+      return;
+    }
+
     if (method === 'turn/started') {
       this.activeTurnId = params.turn?.id || params.turnId || this.activeTurnId;
       if (this.activeTurnId && !this.turnBuffers.has(this.activeTurnId)) {
         this.turnBuffers.set(this.activeTurnId, '');
       }
+      const turnMode = this.activeTurnId ? this.turnModes.get(this.activeTurnId) : '';
       await this.emitRuntime({
         activeTurnId: this.activeTurnId,
         busy: true,
-        phase: 'thinking',
+        phase: turnMode === 'plan' ? 'planning' : 'thinking',
         currentTurnStatus: params.turn?.status?.type || 'inProgress',
         reasoningSummary: null,
         planSummary: null,
@@ -1952,6 +2355,7 @@ class CodexAppServerRunner {
       }
       if (turnId) {
         this.turnBuffers.delete(turnId);
+        this.turnModes.delete(turnId);
         this.planBuffers.delete(turnId);
         this.reasoningBuffers.delete(turnId);
       }
@@ -2200,6 +2604,7 @@ class CodexAppServerRunner {
   async handleExit(code, signal) {
     this.activeTurnId = null;
     this.turnBuffers.clear();
+    this.turnModes.clear();
     this.planBuffers.clear();
     this.reasoningBuffers.clear();
     await this.resolvePendingRequestsForClosedTurn(
@@ -2221,6 +2626,7 @@ class CodexAppServerRunner {
       type: 'session.state_changed',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      runId: this.runId,
       state: `exited:${code ?? 'null'}:${signal ?? 'null'}`,
       live: false,
       timestamp: nowIso(),
@@ -2232,6 +2638,7 @@ class CodexAppServerRunner {
       type: 'session.output',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      runId: this.runId,
       stream,
       chunk: text,
       timestamp: nowIso(),
@@ -2247,6 +2654,7 @@ class CodexAppServerRunner {
       type: 'session.alert',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      runId: this.runId,
       severity: entry.severity || 'warning',
       source: entry.source || 'runtime',
       message: entry.message || '',
@@ -2264,6 +2672,7 @@ class CodexAppServerRunner {
       type: 'session.runtime_updated',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      runId: this.runId,
       patch,
       timestamp: nowIso(),
     });
@@ -2274,6 +2683,7 @@ class CodexAppServerRunner {
       type: 'session.diagnostic',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      runId: this.runId,
       severity: entry.severity || 'info',
       source: entry.source || 'codex',
       kind: entry.kind || 'event',
@@ -2291,6 +2701,7 @@ class CodexAppServerRunner {
       type: 'session.request',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      runId: this.runId,
       requestId: String(entry.requestId || ''),
       kind: entry.kind || 'request',
       method: entry.method || null,
@@ -2308,6 +2719,7 @@ class CodexAppServerRunner {
       type: 'session.request.resolved',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      runId: this.runId,
       requestId: String(entry.requestId || ''),
       status: entry.status || 'resolved',
       method: entry.method || null,

@@ -21,7 +21,7 @@ const {
   normalizeConnectorSecretsInput,
   saveConnectorSecrets,
 } = require('../../shared/connector-secrets');
-const { extractSessionTranscript, makeCodexRowEvents } = require('../../shared/codex-discovery');
+const { extractSessionDiagnostics, extractSessionTranscript, makeTranscriptEntry } = require('../../shared/codex-discovery');
 const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 
 const PORT = Number(process.env.PORT || 8787);
@@ -29,6 +29,7 @@ const PUBLIC_DIR = path.join(__dirname, '..', 'mobile-web', 'public');
 const SESSION_COLLECTIONS_PATH = process.env.SESSION_COLLECTIONS_PATH || path.join(process.cwd(), 'tmp', 'session-collections.json');
 const SESSION_METADATA_PATH = process.env.SESSION_METADATA_PATH || path.join(process.cwd(), 'tmp', 'session-metadata.json');
 const SESSION_LOGS_PATH = process.env.SESSION_LOGS_PATH || path.join(process.cwd(), 'tmp', 'session-logs.json');
+const SESSION_DIAGNOSTICS_PATH = process.env.SESSION_DIAGNOSTICS_PATH || path.join(process.cwd(), 'tmp', 'session-diagnostics.json');
 const RECEIVED_FILES_ROOT = path.join(process.cwd(), 'tmp', 'received-files');
 const RECEIVED_FILES_MANIFEST_PATH = path.join(RECEIVED_FILES_ROOT, 'manifest.json');
 const LOCAL_AGENT_LOG_ROOT = path.join(process.cwd(), 'tmp', 'local-agents');
@@ -42,24 +43,28 @@ const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES
 const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
 const FILE_TRANSFER_CHUNK_BYTES = Number(process.env.RELAY_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
 const CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES = Number(process.env.RELAY_CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES || 16 * 1024 * 1024);
+const CHUNKED_FILE_CACHE_MAX_BYTES = Number(process.env.RELAY_CHUNKED_FILE_CACHE_MAX_BYTES || MAX_FILE_TRANSFER_BYTES);
 const RECEIVED_FILE_TTL_MS = Number(process.env.RELAY_RECEIVED_FILE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const SESSION_LOG_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_LOG_ENTRY_LIMIT || 1000);
+const SESSION_DIAGNOSTIC_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_DIAGNOSTIC_ENTRY_LIMIT || 10000);
+const SESSION_DETAIL_DIAGNOSTIC_LIMIT = Number(process.env.RELAY_SESSION_DETAIL_DIAGNOSTIC_LIMIT || 400);
+const PERSIST_DEBOUNCE_MS = Number(process.env.RELAY_PERSIST_DEBOUNCE_MS || 500);
 const SESSION_LIST_PREVIEW_LIMIT = Number(process.env.RELAY_SESSION_LIST_PREVIEW_LIMIT || 3);
 const SESSION_LIST_TEXT_LIMIT = Number(process.env.RELAY_SESSION_LIST_TEXT_LIMIT || 1200);
 const SESSION_LIST_LATEST_TEXT_LIMIT = Number(process.env.RELAY_SESSION_LIST_LATEST_TEXT_LIMIT || 1000);
 const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRIES || 1000);
 const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
 const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
-const STALE_MANAGED_SESSION_GRACE_MS = Number(process.env.RELAY_STALE_MANAGED_SESSION_GRACE_MS || 30000);
+const STALE_MANAGED_SESSION_GRACE_MS = Number(process.env.RELAY_STALE_MANAGED_SESSION_GRACE_MS || 2 * 60 * 1000);
 const INPUT_REQUEST_DEDUPE_TTL_MS = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_TTL_MS || 2 * 60 * 1000);
 const INPUT_REQUEST_DEDUPE_LIMIT = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_LIMIT || 500);
-const JSONL_DIAGNOSTIC_MAX_BYTES = Number(process.env.RELAY_JSONL_DIAGNOSTIC_MAX_BYTES || 16 * 1024 * 1024);
-const JSONL_DIAGNOSTIC_HEAD_BYTES = Number(process.env.RELAY_JSONL_DIAGNOSTIC_HEAD_BYTES || 2 * 1024 * 1024);
 const LOCAL_AGENT_WATCHDOG_ENABLED = String(process.env.RELAY_LOCAL_AGENT_WATCHDOG_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const LOCAL_AGENT_WATCHDOG_INTERVAL_MS = Number(process.env.RELAY_LOCAL_AGENT_WATCHDOG_INTERVAL_MS || 5000);
 const LOCAL_AGENT_OFFLINE_RESTART_MS = Number(process.env.RELAY_LOCAL_AGENT_OFFLINE_RESTART_MS || 45000);
 const LOCAL_AGENT_RESTART_COOLDOWN_MS = Number(process.env.RELAY_LOCAL_AGENT_RESTART_COOLDOWN_MS || 10000);
 const LOCAL_AGENT_EXIT_RESTART_DELAY_MS = Number(process.env.RELAY_LOCAL_AGENT_EXIT_RESTART_DELAY_MS || 2000);
+const COMMAND_QUEUE_TTL_MS = Number(process.env.RELAY_COMMAND_QUEUE_TTL_MS || 10 * 60 * 1000);
+const COMMAND_QUEUE_MAX_LENGTH = Number(process.env.RELAY_COMMAND_QUEUE_MAX_LENGTH || 1000);
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
 let relayAuthAccount = loadRelayAuthAccount();
 
@@ -253,12 +258,72 @@ function normalizeSessionCollectionItem(input = {}) {
     connectorLabel: String(input.connectorLabel || '').trim(),
     relayUrl: String(input.relayUrl || '').trim(),
     addedAt: input.addedAt || nowIso(),
-    updatedAt: nowIso(),
+    updatedAt: input.updatedAt || nowIso(),
   };
 }
 
 function collectionItemKey(item) {
   return `${item.hostId}::${item.conversationKey}`;
+}
+
+function collectionItemDedupeKeys(item) {
+  const keys = [];
+  const hostId = String(item?.hostId || '').trim();
+  const add = (kind, value) => {
+    const text = String(value || '').trim();
+    if (hostId && text) {
+      keys.push(`${kind}::${hostId}::${text}`);
+    }
+  };
+  add('conversation', item?.conversationKey);
+  add('session', item?.sessionId);
+  return keys;
+}
+
+function collectionItemUpdatedMs(item) {
+  const value = Date.parse(item?.updatedAt || item?.addedAt || '');
+  return Number.isFinite(value) ? value : 0;
+}
+
+function collectionItemsMatch(left, right) {
+  if (!left || !right || left.hostId !== right.hostId) {
+    return false;
+  }
+  if (left.conversationKey && right.conversationKey && left.conversationKey === right.conversationKey) {
+    return true;
+  }
+  return Boolean(left.sessionId && right.sessionId && left.sessionId === right.sessionId);
+}
+
+function filterCollectionItems(items = [], targetItem = {}) {
+  return (Array.isArray(items) ? items : []).filter((entry) => !collectionItemsMatch(entry, targetItem));
+}
+
+function dedupeCollectionItems(items = []) {
+  const seen = new Map();
+  const next = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const dedupeKeys = collectionItemDedupeKeys(item);
+    const existingIndex = dedupeKeys
+      .map((key) => seen.get(key))
+      .find((index) => Number.isInteger(index));
+    if (Number.isInteger(existingIndex)) {
+      const existing = next[existingIndex];
+      if (collectionItemUpdatedMs(item) >= collectionItemUpdatedMs(existing)) {
+        next[existingIndex] = item;
+      }
+      for (const key of [...collectionItemDedupeKeys(existing), ...dedupeKeys]) {
+        seen.set(key, existingIndex);
+      }
+      continue;
+    }
+    const nextIndex = next.length;
+    for (const key of dedupeKeys) {
+      seen.set(key, nextIndex);
+    }
+    next.push(item);
+  }
+  return next;
 }
 
 function looksLikeSessionId(value) {
@@ -328,7 +393,6 @@ function shouldOverwriteSessionMetadata(existing, nextSource = '') {
 function normalizeSessionCollection(input = {}) {
   const collectionId = String(input.collectionId || input.id || makeId()).trim();
   const name = String(input.name || '').trim() || 'Untitled';
-  const seen = new Set();
   const items = [];
 
   for (const rawItem of Array.isArray(input.items) ? input.items : []) {
@@ -336,11 +400,6 @@ function normalizeSessionCollection(input = {}) {
     if (!item) {
       continue;
     }
-    const key = collectionItemKey(item);
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
     items.push(item);
   }
 
@@ -348,7 +407,7 @@ function normalizeSessionCollection(input = {}) {
     collectionId,
     name,
     system: collectionId === DEFAULT_COLLECTION_ID,
-    items,
+    items: dedupeCollectionItems(items),
     createdAt: input.createdAt || nowIso(),
     updatedAt: input.updatedAt || nowIso(),
   };
@@ -358,7 +417,13 @@ function loadSessionCollections() {
   try {
     const parsed = JSON.parse(fs.readFileSync(SESSION_COLLECTIONS_PATH, 'utf8'));
     const collections = Array.isArray(parsed.collections) ? parsed.collections : [];
-    return collections.map(normalizeSessionCollection);
+    const normalized = collections.map(normalizeSessionCollection);
+    const rawItemCount = collections.reduce((total, collection) => total + (Array.isArray(collection?.items) ? collection.items.length : 0), 0);
+    const normalizedItemCount = normalized.reduce((total, collection) => total + (Array.isArray(collection?.items) ? collection.items.length : 0), 0);
+    if (normalizedItemCount !== rawItemCount) {
+      saveSessionCollections(normalized);
+    }
+    return normalized;
   } catch {
     return [];
   }
@@ -489,12 +554,39 @@ function cleanStoredTranscriptText(value, speaker = '') {
     return '';
   }
 
+  text = stripTranscriptWrapperText(text).trim();
+  if (!text || isInternalTranscriptText(text)) {
+    return '';
+  }
+
   text = stripEnvironmentContextText(text).trim();
   if (String(speaker || '').toLowerCase() === 'user') {
     text = stripIdeContextText(text).trim();
   }
 
   return isInternalTranscriptText(text) ? '' : text;
+}
+
+function stripTranscriptWrapperText(value) {
+  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  if (!text) {
+    return '';
+  }
+
+  const wrapperPatterns = [
+    /\n?The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b[\s\S]*$/i,
+    /\n?>>> TRANSCRIPT(?: DELTA)? START\b[\s\S]*$/im,
+    /\n?>>> TRANSCRIPT(?: DELTA)? END\b[\s\S]*$/im,
+    /\n?>>> APPROVAL REQUEST START\b[\s\S]*$/im,
+    /\n?>>> APPROVAL REQUEST END\b[\s\S]*$/im,
+    /\n?Reviewed Codex session id:[\s\S]*$/i,
+    /\n?The Codex agent has requested the following (?:next action|action below|action):[\s\S]*$/i,
+  ];
+
+  for (const pattern of wrapperPatterns) {
+    text = text.replace(pattern, '').trim();
+  }
+  return text;
 }
 
 function stripEnvironmentContextText(value) {
@@ -553,13 +645,10 @@ function isAdjacentTranscriptDuplicate(previous, entry) {
   }
   const previousFiles = (previous.files || []).map((file) => file.path || file.name || '').join(',');
   const entryFiles = (entry.files || []).map((file) => file.path || file.name || '').join(',');
-  if (previousFiles !== entryFiles) {
-    return false;
-  }
 
   const previousText = canonicalTranscriptText(previous.text);
   const entryText = canonicalTranscriptText(entry.text);
-  if (previousText && entryText && previousText === entryText) {
+  if (previousFiles === entryFiles && previousText && entryText && previousText === entryText) {
     return true;
   }
 
@@ -569,6 +658,9 @@ function isAdjacentTranscriptDuplicate(previous, entry) {
   if (!near) {
     return false;
   }
+  if (previousFiles !== entryFiles) {
+    return isInlineTextFileEchoDuplicate(previous, entry);
+  }
   if (previousText.length >= 80 && entryText.includes(previousText)) {
     return true;
   }
@@ -576,6 +668,37 @@ function isAdjacentTranscriptDuplicate(previous, entry) {
     return true;
   }
   return false;
+}
+
+function firstTranscriptContentLine(value) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line && !/^Attached (?:history|file|text file contents)\b/i.test(line)) || '';
+}
+
+function isInlineTextFileEchoDuplicate(previous, entry) {
+  if (String(previous?.speaker || '').toLowerCase() !== 'user') {
+    return false;
+  }
+  const previousText = String(previous.text || '');
+  const entryText = String(entry.text || '');
+  const previousHasFiles = Array.isArray(previous.files) && previous.files.length > 0;
+  const entryHasFiles = Array.isArray(entry.files) && entry.files.length > 0;
+  if (previousHasFiles === entryHasFiles) {
+    return false;
+  }
+  const combined = `${previousText}\n${entryText}`;
+  if (!/Attached text file contents:/i.test(combined)) {
+    return false;
+  }
+  if (!/Attached (?:history|file):/i.test(combined)) {
+    return false;
+  }
+  const previousFirstLine = canonicalTranscriptText(firstTranscriptContentLine(previousText));
+  const entryFirstLine = canonicalTranscriptText(firstTranscriptContentLine(entryText));
+  return Boolean(previousFirstLine && entryFirstLine && previousFirstLine === entryFirstLine);
 }
 
 function sortTranscriptEntries(entries) {
@@ -602,7 +725,10 @@ function loadSessionLogs() {
     const parsed = JSON.parse(fs.readFileSync(SESSION_LOGS_PATH, 'utf8'));
     const rawLogs = parsed && typeof parsed.logs === 'object' ? parsed.logs : {};
     const logs = new Map();
+    const persistedLogs = {};
+    let changed = false;
     for (const [key, entries] of Object.entries(rawLogs)) {
+      const rawEntries = Array.isArray(entries) ? entries : [];
       const normalized = (Array.isArray(entries) ? entries : [])
         .map(normalizeStoredTranscriptEntry)
         .filter(Boolean);
@@ -610,7 +736,18 @@ function loadSessionLogs() {
         .slice(-SESSION_LOG_ENTRY_LIMIT);
       if (compacted.length) {
         logs.set(key, compacted);
+        persistedLogs[key] = compacted;
       }
+      if (JSON.stringify(rawEntries) !== JSON.stringify(compacted)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      fs.mkdirSync(path.dirname(SESSION_LOGS_PATH), { recursive: true });
+      fs.writeFileSync(SESSION_LOGS_PATH, JSON.stringify({
+        savedAt: nowIso(),
+        logs: persistedLogs,
+      }, null, 2), 'utf8');
     }
     return logs;
   } catch {
@@ -637,25 +774,139 @@ function saveSessionLogs() {
   }, null, 2), 'utf8');
 }
 
+function normalizeStoredSessionDiagnostic(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const message = String(entry.message || '').trim();
+  if (!message) {
+    return null;
+  }
+  return {
+    timestamp: entry.timestamp || nowIso(),
+    severity: entry.severity || 'info',
+    source: entry.source || 'codex',
+    kind: entry.kind || 'event',
+    method: entry.method || null,
+    message,
+    detail: entry.detail || null,
+    data: entry.data || null,
+    turnId: entry.turnId || entry.data?.turnId || null,
+  };
+}
+
+function loadSessionDiagnostics() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SESSION_DIAGNOSTICS_PATH, 'utf8'));
+    const rawDiagnostics = parsed && typeof parsed.diagnostics === 'object' ? parsed.diagnostics : {};
+    const diagnostics = new Map();
+    const persistedDiagnostics = {};
+    let changed = false;
+    for (const [key, entries] of Object.entries(rawDiagnostics)) {
+      const rawEntries = Array.isArray(entries) ? entries : [];
+      const compacted = compactSessionDiagnostics(rawEntries
+        .map(normalizeStoredSessionDiagnostic)
+        .filter(Boolean));
+      if (compacted.length) {
+        diagnostics.set(key, compacted);
+        persistedDiagnostics[key] = compacted;
+      }
+      if (JSON.stringify(rawEntries) !== JSON.stringify(compacted)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      fs.mkdirSync(path.dirname(SESSION_DIAGNOSTICS_PATH), { recursive: true });
+      fs.writeFileSync(SESSION_DIAGNOSTICS_PATH, JSON.stringify({
+        savedAt: nowIso(),
+        diagnostics: persistedDiagnostics,
+      }, null, 2), 'utf8');
+    }
+    return diagnostics;
+  } catch {
+    return new Map();
+  }
+}
+
+function saveSessionDiagnostics() {
+  const diagnostics = {};
+  for (const [key, entries] of state.sessionDiagnostics.entries()) {
+    const compacted = compactSessionDiagnostics((Array.isArray(entries) ? entries : [])
+      .map(normalizeStoredSessionDiagnostic)
+      .filter(Boolean));
+    if (compacted.length) {
+      diagnostics[key] = compacted;
+    }
+  }
+  fs.mkdirSync(path.dirname(SESSION_DIAGNOSTICS_PATH), { recursive: true });
+  fs.writeFileSync(SESSION_DIAGNOSTICS_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    diagnostics,
+  }, null, 2), 'utf8');
+}
+
+let sessionLogsSaveTimer = null;
+let sessionDiagnosticsSaveTimer = null;
+
+function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
+  if (sessionLogsSaveTimer) {
+    return;
+  }
+  sessionLogsSaveTimer = setTimeout(() => {
+    sessionLogsSaveTimer = null;
+    try {
+      saveSessionLogs();
+    } catch (error) {
+      console.warn(`[relay] failed to save session logs: ${error.message}`);
+    }
+  }, Math.max(0, Number(delayMs) || 0));
+  if (typeof sessionLogsSaveTimer.unref === 'function') {
+    sessionLogsSaveTimer.unref();
+  }
+}
+
+function scheduleSessionDiagnosticsSave(delayMs = PERSIST_DEBOUNCE_MS) {
+  if (sessionDiagnosticsSaveTimer) {
+    return;
+  }
+  sessionDiagnosticsSaveTimer = setTimeout(() => {
+    sessionDiagnosticsSaveTimer = null;
+    try {
+      saveSessionDiagnostics();
+    } catch (error) {
+      console.warn(`[relay] failed to save session diagnostics: ${error.message}`);
+    }
+  }, Math.max(0, Number(delayMs) || 0));
+  if (typeof sessionDiagnosticsSaveTimer.unref === 'function') {
+    sessionDiagnosticsSaveTimer.unref();
+  }
+}
+
 const state = {
   hosts: new Map(),
   sessions: new Map(),
+  sessionAliases: new Map(),
   commandQueues: new Map(),
   subscribers: new Map(),
   dismissedHosts: new Set(),
   sessionLogs: loadSessionLogs(),
   sessionAlerts: new Map(),
   sessionRuntime: new Map(),
-  sessionDiagnostics: new Map(),
+  sessionDiagnostics: loadSessionDiagnostics(),
   sessionRequests: new Map(),
   pendingDirectoryRequests: new Map(),
   pendingHostProbes: new Map(),
+  pendingApiTestRequests: new Map(),
   pendingModelRequests: new Map(),
   pendingSkillRequests: new Map(),
+  pendingGoalRequests: new Map(),
+  pendingSessionDetailRequests: new Map(),
+  pendingSessionSearchRequests: new Map(),
   pendingFileRequests: new Map(),
   chunkedUploads: new Map(),
   sessionDiscoveryRequests: new Map(),
   inputRequestCache: new Map(),
+  pendingUserTranscriptEchoes: new Map(),
   localAgents: new Map(),
   askpassActions: new Map(),
   sshMultiplexDisabled: new Map(),
@@ -1020,6 +1271,308 @@ function getSessionsForHost(hostId, options = {}) {
     .filter((session) => session.hostId === hostId)
     .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
   return optimize ? sessions.map(publicSessionListRecord) : sessions;
+}
+
+function normalizeSearchTerms(query) {
+  return String(query || '')
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function textMatchesTerms(value, terms) {
+  const haystack = String(value || '').toLowerCase();
+  return terms.every((term) => haystack.includes(term));
+}
+
+function makeSearchSnippet(text, terms, maxLength = 220) {
+  const source = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!source) {
+    return '';
+  }
+  const lower = source.toLowerCase();
+  const indexes = terms
+    .map((term) => lower.indexOf(term))
+    .filter((index) => index >= 0);
+  const firstIndex = indexes.length ? Math.min(...indexes) : 0;
+  const start = Math.max(0, firstIndex - Math.floor(maxLength / 3));
+  const end = Math.min(source.length, start + maxLength);
+  const prefix = start > 0 ? '...' : '';
+  const suffix = end < source.length ? '...' : '';
+  return `${prefix}${source.slice(start, end).trim()}${suffix}`;
+}
+
+function sessionSearchHaystack(session) {
+  return [
+    session?.title,
+    session?.cwd,
+    session?.sessionId,
+    session?.nativeThreadId,
+    session?.bridgeSessionId,
+    session?.originSessionId,
+    session?.sourceSessionId,
+    session?.conversationKey,
+    session?.latestUserMessage,
+    session?.latestAgentMessage,
+  ].filter(Boolean).join('\n');
+}
+
+function getSearchTranscript(hostId, session) {
+  const key = sessionKey(hostId, session.sessionId);
+  const storedTranscript = state.sessionLogs.get(key) || [];
+  const rolloutTranscript = loadSessionTranscriptFromRollout(session);
+  return mergeExportTranscriptEntries([...storedTranscript, ...rolloutTranscript]);
+}
+
+function searchTranscriptFileSync(filePath, terms, maxMatches) {
+  const matches = [];
+  if (!filePath || !fs.existsSync(filePath) || !terms.length || maxMatches <= 0) {
+    return matches;
+  }
+  let raw = '';
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return matches;
+  }
+  let entryIndex = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let row = null;
+    try {
+      row = JSON.parse(trimmed);
+    } catch (_) {
+      continue;
+    }
+    const entry = makeTranscriptEntry(row, { maxChars: Infinity });
+    if (!entry || !['user', 'agent', 'assistant'].includes(String(entry.speaker || '').toLowerCase())) {
+      continue;
+    }
+    const currentIndex = entryIndex;
+    entryIndex += 1;
+    if (!textMatchesTerms(entry.text || '', terms)) {
+      continue;
+    }
+    matches.push({
+      type: 'transcript',
+      entryIndex: currentIndex,
+      speaker: entry.speaker || 'system',
+      timestamp: entry.timestamp || null,
+      snippet: makeSearchSnippet(entry.text || '', terms),
+    });
+    if (matches.length >= maxMatches) {
+      break;
+    }
+  }
+  return matches;
+}
+
+function searchSessions(options = {}) {
+  const hostId = String(options.hostId || '').trim();
+  const query = String(options.query || '').trim();
+  const mode = ['keyword', 'path', 'title'].includes(options.mode) ? options.mode : 'keyword';
+  const collectionId = String(options.collectionId || '').trim();
+  const maxSessions = Math.max(1, Math.min(200, Number(options.maxSessions || 80) || 80));
+  const maxMatchesPerSession = Math.max(1, Math.min(20, Number(options.maxMatchesPerSession || 5) || 5));
+  const terms = normalizeSearchTerms(query);
+  if (!terms.length) {
+    return { query, mode, results: [], scannedSessions: 0, truncated: false };
+  }
+
+  const allowedKeys = new Set();
+  if (collectionId && collectionId !== DEFAULT_COLLECTION_ID) {
+    const collection = state.sessionCollections.get(collectionId);
+    for (const item of collection?.items || []) {
+      if (item.hostId && item.sessionId) {
+        allowedKeys.add(sessionKey(item.hostId, item.sessionId));
+      }
+      if (item.hostId && item.conversationKey) {
+        allowedKeys.add(`${item.hostId}::conversation::${item.conversationKey}`);
+      }
+    }
+  }
+
+  const sessions = Array.from(state.sessions.values())
+    .filter((session) => !hostId || session.hostId === hostId)
+    .filter((session) => {
+      if (!allowedKeys.size) {
+        return true;
+      }
+      return allowedKeys.has(sessionKey(session.hostId, session.sessionId))
+        || allowedKeys.has(`${session.hostId}::conversation::${session.conversationKey || session.originSessionId || session.sessionId}`);
+    })
+    .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
+
+  const results = [];
+  let scannedSessions = 0;
+  for (const session of sessions) {
+    scannedSessions += 1;
+    const matches = [];
+
+    if (mode === 'title') {
+      if (textMatchesTerms(session.title || '', terms)) {
+        matches.push({
+          type: 'title',
+          entryIndex: -1,
+          speaker: 'title',
+          timestamp: session.lastUpdatedAt || session.createdAt || null,
+          snippet: makeSearchSnippet(session.title || '', terms),
+        });
+      }
+    } else if (mode === 'path') {
+      if (textMatchesTerms(session.cwd || '', terms)) {
+        matches.push({
+          type: 'path',
+          entryIndex: -1,
+          speaker: 'path',
+          timestamp: session.lastUpdatedAt || session.createdAt || null,
+          snippet: makeSearchSnippet(session.cwd || '', terms),
+        });
+      }
+    } else {
+      if (textMatchesTerms(sessionSearchHaystack(session), terms)) {
+        matches.push({
+          type: 'metadata',
+          entryIndex: -1,
+          speaker: 'session',
+          timestamp: session.lastUpdatedAt || session.createdAt || null,
+          snippet: makeSearchSnippet(sessionSearchHaystack(session), terms),
+        });
+      }
+      const storedTranscript = (state.sessionLogs.get(sessionKey(session.hostId, session.sessionId)) || [])
+        .filter((entry) => ['user', 'agent', 'assistant'].includes(String(entry?.speaker || '').toLowerCase()));
+      storedTranscript.forEach((entry, index) => {
+        if (matches.length < maxMatchesPerSession && textMatchesTerms(entry.text || '', terms)) {
+          matches.push({
+            type: 'transcript',
+            entryIndex: index,
+            speaker: entry.speaker || 'system',
+            timestamp: entry.timestamp || null,
+            snippet: makeSearchSnippet(entry.text || '', terms),
+          });
+        }
+      });
+      if (matches.length < maxMatchesPerSession) {
+        matches.push(...searchTranscriptFileSync(
+          resolveSessionRolloutPath(session),
+          terms,
+          maxMatchesPerSession - matches.length
+        ));
+      }
+    }
+
+    if (!matches.length) {
+      continue;
+    }
+    results.push({
+      hostId: session.hostId,
+      sessionId: session.sessionId,
+      conversationKey: session.conversationKey || session.originSessionId || session.sessionId,
+      title: session.title || session.sessionId,
+      cwd: session.cwd || null,
+      lastUpdatedAt: session.lastUpdatedAt || session.updatedAt || null,
+      live: Boolean(session.live),
+      matchCount: matches.length,
+      matches,
+    });
+    if (results.length >= maxSessions) {
+      break;
+    }
+  }
+
+  return {
+    query,
+    mode,
+    results,
+    scannedSessions,
+    truncated: results.length >= maxSessions,
+  };
+}
+
+function filterSearchResultsForCollection(results, collectionId) {
+  if (!collectionId || collectionId === DEFAULT_COLLECTION_ID) {
+    return Array.isArray(results) ? results : [];
+  }
+  const collection = state.sessionCollections.get(collectionId);
+  if (!collection) {
+    return [];
+  }
+  const allowed = new Set();
+  for (const item of collection.items || []) {
+    if (item.hostId && item.sessionId) {
+      allowed.add(sessionKey(item.hostId, item.sessionId));
+    }
+    if (item.hostId && item.conversationKey) {
+      allowed.add(`${item.hostId}::conversation::${item.conversationKey}`);
+    }
+  }
+  return (Array.isArray(results) ? results : []).filter((result) => (
+    allowed.has(sessionKey(result.hostId, result.sessionId))
+    || allowed.has(`${result.hostId}::conversation::${result.conversationKey || result.sessionId}`)
+  ));
+}
+
+async function searchSessionsHydrated(options = {}) {
+  const hostId = String(options.hostId || '').trim();
+  const query = String(options.query || '').trim();
+  const mode = ['keyword', 'path', 'title'].includes(options.mode) ? options.mode : 'keyword';
+  const maxSessions = Math.max(1, Math.min(200, Number(options.maxSessions || 80) || 80));
+  const maxMatchesPerSession = Math.max(1, Math.min(20, Number(options.maxMatchesPerSession || 5) || 5));
+  const host = hostId ? state.hosts.get(hostId) : null;
+  if (host && hostOnline(host) && host.capabilities?.sessionSearch) {
+    const requestId = makeId();
+    const pending = awaitSessionSearchRequest(requestId, 60000);
+    enqueueCommand(hostId, {
+      type: 'session.search',
+      requestId,
+      query,
+      mode,
+      maxSessions,
+      maxMatchesPerSession,
+      collectionId: options.collectionId || '',
+    });
+    try {
+      const remote = await pending;
+      if (remote && Array.isArray(remote.results)) {
+        remote.results = filterSearchResultsForCollection(remote.results, options.collectionId || '');
+        for (const result of remote.results) {
+          if (result?.sessionId) {
+            const existing = getSession(hostId, result.sessionId);
+            upsertSession(hostId, {
+              sessionId: result.sessionId,
+              title: result.title || result.sessionId,
+              cwd: result.cwd || null,
+              source: existing?.source || 'imported',
+              state: existing?.state || (existing?.live ? 'running' : 'imported'),
+              live: Boolean(existing?.live),
+              lastUpdatedAt: result.lastUpdatedAt || nowIso(),
+              conversationKey: result.conversationKey || result.sessionId,
+            });
+          }
+        }
+        return {
+          ...remote,
+          source: 'host-agent',
+        };
+      }
+    } catch (error) {
+      const fallback = searchSessions(options);
+      return {
+        ...fallback,
+        source: 'relay-fallback',
+        remoteError: error.message,
+      };
+    }
+  }
+  return {
+    ...searchSessions(options),
+    source: 'relay',
+  };
 }
 
 function limitListText(value, max = SESSION_LIST_TEXT_LIMIT) {
@@ -1417,8 +1970,82 @@ function localAgentWatchdogTick() {
   }
 }
 
+function resolveSessionKey(hostId, sessionId) {
+  const key = sessionKey(hostId, sessionId);
+  const seen = new Set();
+  let current = key;
+  while (state.sessionAliases.has(current) && !seen.has(current)) {
+    seen.add(current);
+    current = state.sessionAliases.get(current);
+  }
+  return current || key;
+}
+
+function resolveSessionId(hostId, sessionId) {
+  const key = resolveSessionKey(hostId, sessionId);
+  const prefix = `${hostId}::`;
+  return key.startsWith(prefix) ? key.slice(prefix.length) : sessionId;
+}
+
+function rememberSessionAlias(hostId, aliasSessionId, canonicalSessionId) {
+  const alias = String(aliasSessionId || '').trim();
+  const canonical = String(canonicalSessionId || '').trim();
+  if (!hostId || !alias || !canonical || alias === canonical) {
+    return;
+  }
+  const aliasKey = sessionKey(hostId, alias);
+  const canonicalKey = resolveSessionKey(hostId, canonical);
+  if (aliasKey !== canonicalKey) {
+    state.sessionAliases.set(aliasKey, canonicalKey);
+  }
+}
+
+function rememberSessionIdentityAliases(hostId, session) {
+  if (!session?.sessionId) {
+    return;
+  }
+  rememberSessionAlias(hostId, session.bridgeSessionId, session.sessionId);
+  rememberSessionAlias(hostId, session.nativeThreadId, session.sessionId);
+}
+
+function sessionIdentityValues(session = {}) {
+  return [
+    session.sessionId,
+    session.bridgeSessionId,
+    session.runId,
+    session.runtime?.runId,
+    session.nativeThreadId,
+    session.originSessionId,
+    session.sourceSessionId,
+    session.conversationKey,
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+}
+
+function findManagedLiveSessionByIdentities(hostId, identities = []) {
+  const candidates = new Set(
+    identities
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  );
+  if (!hostId || !candidates.size) {
+    return null;
+  }
+  for (const session of state.sessions.values()) {
+    if (session.hostId !== hostId || session.source !== 'managed' || !session.live) {
+      continue;
+    }
+    const values = sessionIdentityValues(session);
+    if (values.some((value) => candidates.has(value))) {
+      return session;
+    }
+  }
+  return null;
+}
+
 function getSession(hostId, sessionId) {
-  return state.sessions.get(sessionKey(hostId, sessionId)) || null;
+  return state.sessions.get(resolveSessionKey(hostId, sessionId)) || null;
 }
 
 function walkLocalFiles(rootDir, visit) {
@@ -1475,78 +2102,29 @@ function resolveSessionRolloutPath(session) {
   return found;
 }
 
-function loadSessionDiagnosticsFromRollout(session) {
+function loadSessionDiagnosticsFromRollout(session, options = {}) {
   const rolloutPath = resolveSessionRolloutPath(session);
   if (!rolloutPath) {
     return [];
   }
 
-  let stats = null;
+  const limit = options.full
+    ? Infinity
+    : (Object.prototype.hasOwnProperty.call(options, 'limit') ? Number(options.limit) : SESSION_DIAGNOSTIC_ENTRY_LIMIT);
   try {
-    stats = fs.statSync(rolloutPath);
+    const diagnostics = extractSessionDiagnostics(rolloutPath, options.full
+      ? { maxRows: Infinity }
+      : { tailRows: Math.max(1, Number(limit) || SESSION_DETAIL_DIAGNOSTIC_LIMIT), maxEntries: limit });
+    return compactSessionDiagnostics(diagnostics, { limit });
   } catch (_) {
     return [];
   }
-
-  let raw = '';
-  try {
-    if (stats.size <= JSONL_DIAGNOSTIC_MAX_BYTES) {
-      raw = fs.readFileSync(rolloutPath, 'utf8');
-    } else {
-      const headBytes = Math.min(JSONL_DIAGNOSTIC_HEAD_BYTES, stats.size);
-      const tailBytes = Math.max(0, JSONL_DIAGNOSTIC_MAX_BYTES - headBytes);
-      const headBuffer = Buffer.alloc(headBytes);
-      const tailBuffer = Buffer.alloc(tailBytes);
-      const fd = fs.openSync(rolloutPath, 'r');
-      try {
-        fs.readSync(fd, headBuffer, 0, headBytes, 0);
-        if (tailBytes > 0) {
-          fs.readSync(fd, tailBuffer, 0, tailBytes, Math.max(0, stats.size - tailBytes));
-        }
-      } finally {
-        fs.closeSync(fd);
-      }
-      raw = `${headBuffer.toString('utf8')}\n${tailBuffer.toString('utf8')}`;
-    }
-  } catch (_) {
-    return [];
-  }
-
-  const diagnostics = [];
-  const seen = new Set();
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    let row = null;
-    try {
-      row = JSON.parse(trimmed);
-    } catch (_) {
-      continue;
-    }
-    const events = makeCodexRowEvents(row);
-    for (const event of events) {
-      if (event.type !== 'session.diagnostic') {
-        continue;
-      }
-      const entry = {
-        ...(event.entry || {}),
-        timestamp: event.entry?.timestamp || row.timestamp || nowIso(),
-      };
-      const key = `${entry.kind || ''}|${entry.method || ''}|${entry.timestamp || ''}|${entry.message || ''}|${entry.turnId || ''}`;
-      if (seen.has(key)) {
-        continue;
-      }
-      seen.add(key);
-      diagnostics.push(entry);
-    }
-  }
-
-  return compactSessionDiagnostics(diagnostics);
 }
 
-function compactSessionDiagnostics(entries) {
+function compactSessionDiagnostics(entries, options = {}) {
+  const limit = Object.prototype.hasOwnProperty.call(options, 'limit')
+    ? Number(options.limit)
+    : SESSION_DIAGNOSTIC_ENTRY_LIMIT;
   const normalized = [];
   const seen = new Set();
   const sorted = (Array.isArray(entries) ? entries : [])
@@ -1579,7 +2157,7 @@ function compactSessionDiagnostics(entries) {
     seen.add(key);
     normalized.push(entry);
   }
-  return normalized.slice(-400);
+  return Number.isFinite(limit) && limit > 0 ? normalized.slice(-limit) : normalized;
 }
 
 function loadSessionTranscriptFromRollout(session) {
@@ -1662,7 +2240,8 @@ function getSessionDetail(hostId, sessionId, options = {}) {
     return null;
   }
 
-  const key = sessionKey(hostId, sessionId);
+  const effectiveSessionId = session.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+  const key = resolveSessionKey(hostId, effectiveSessionId);
   const storedTranscript = state.sessionLogs.get(key) || session.transcriptPreview || [];
   const rolloutTranscript = options.fullTranscript ? loadSessionTranscriptFromRollout(session) : [];
   const transcript = options.fullTranscript
@@ -1676,23 +2255,39 @@ function getSessionDetail(hostId, sessionId, options = {}) {
     )).slice(-SESSION_LOG_ENTRY_LIMIT);
   if (!options.fullTranscript && state.sessionLogs.has(key) && transcript.length !== storedTranscript.length) {
     state.sessionLogs.set(key, transcript);
-    saveSessionLogs();
+    scheduleSessionLogsSave();
   }
-  session = refreshSessionMessageSummaries(hostId, sessionId, transcript) || session;
-  session = maybeInferAndPersistSessionTitle(hostId, sessionId, transcript) || session;
+  session = refreshSessionMessageSummaries(hostId, effectiveSessionId, transcript) || session;
+  session = maybeInferAndPersistSessionTitle(hostId, effectiveSessionId, transcript) || session;
   const alerts = state.sessionAlerts.get(key) || [];
   const runtime = state.sessionRuntime.get(key) || null;
-  const diagnostics = compactSessionDiagnostics([
-    ...loadSessionDiagnosticsFromRollout(session),
-    ...(state.sessionDiagnostics.get(key) || []),
-  ]);
-  if (diagnostics.length) {
+  const persistedDiagnostics = options.skipDiagnostics ? [] : (state.sessionDiagnostics.get(key) || []);
+  const diagnosticLimit = options.fullDiagnostics ? Infinity : SESSION_DETAIL_DIAGNOSTIC_LIMIT;
+  const diagnostics = options.skipDiagnostics
+    ? []
+    : compactSessionDiagnostics([
+      ...loadSessionDiagnosticsFromRollout(session, { full: options.fullDiagnostics, limit: diagnosticLimit }),
+      ...persistedDiagnostics,
+    ], { limit: diagnosticLimit });
+  if (!options.skipDiagnostics && diagnostics.length) {
     state.sessionDiagnostics.set(key, diagnostics);
+    if (JSON.stringify(persistedDiagnostics) !== JSON.stringify(diagnostics)) {
+      scheduleSessionDiagnosticsSave();
+    }
   }
   const requests = state.sessionRequests.get(key) || [];
   pruneReceivedFiles();
+  const receivedFileSessionIds = new Set([
+    sessionId,
+    effectiveSessionId,
+    session.bridgeSessionId,
+    session.nativeThreadId,
+    session.originSessionId,
+    session.sourceSessionId,
+    session.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean));
   const receivedFiles = Array.from(state.receivedFiles.values())
-    .filter((file) => file.hostId === hostId && file.sessionId === sessionId)
+    .filter((file) => file.hostId === hostId && receivedFileSessionIds.has(String(file.sessionId || '')))
     .sort((a, b) => String(b.receivedAt || '').localeCompare(String(a.receivedAt || '')))
     .map((file) => ({
       fileId: file.fileId,
@@ -1716,6 +2311,141 @@ function getSessionDetail(hostId, sessionId, options = {}) {
     requests,
     receivedFiles,
   };
+}
+
+function shouldRequestRemoteSessionDetail(host, detail, options = {}) {
+  if (options.skipRemoteDetail) {
+    return false;
+  }
+  if (!host || !hostOnline(host) || !host.capabilities?.sessionDetail) {
+    return false;
+  }
+  const session = detail?.session || {};
+  if (options.forceRemoteDetail || options.fullTranscript || options.fullDiagnostics) {
+    return true;
+  }
+  if (!session.live || session.source !== 'managed') {
+    return true;
+  }
+  return !(Array.isArray(detail.diagnostics) && detail.diagnostics.length);
+}
+
+async function requestRemoteSessionDetail(hostId, session, options = {}) {
+  const requestId = makeId();
+  enqueueCommand(hostId, {
+    type: 'session.detail',
+    requestId,
+    sessionId: session.sessionId,
+    bridgeSessionId: session.bridgeSessionId || null,
+    nativeThreadId: session.nativeThreadId || null,
+    originSessionId: session.originSessionId || null,
+    sourceSessionId: session.sourceSessionId || null,
+    conversationKey: session.conversationKey || null,
+    fullTranscript: Boolean(options.fullTranscript),
+    fullDiagnostics: Boolean(options.fullDiagnostics),
+  });
+  return awaitSessionDetailRequest(requestId, (options.fullTranscript || options.fullDiagnostics) ? 90000 : 45000);
+}
+
+function mergeRemoteSessionDetail(hostId, sessionId, detail, remoteDetail, options = {}) {
+  if (!remoteDetail || typeof remoteDetail !== 'object') {
+    return detail;
+  }
+
+  const remoteSession = remoteDetail.session || {};
+  const effectiveSessionId = detail.session?.sessionId || remoteSession.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+  rememberSessionAlias(hostId, sessionId, effectiveSessionId);
+  rememberSessionAlias(hostId, remoteSession.sessionId, effectiveSessionId);
+  rememberSessionAlias(hostId, remoteSession.nativeThreadId, effectiveSessionId);
+  if (remoteSession && typeof remoteSession === 'object') {
+    upsertSession(hostId, {
+      sessionId: effectiveSessionId,
+      title: remoteSession.title || detail.session?.title || effectiveSessionId,
+      cwd: remoteSession.cwd || detail.session?.cwd || null,
+      source: detail.session?.source || remoteSession.source || 'imported',
+      state: detail.session?.state || (detail.session?.live ? 'running' : 'imported'),
+      live: Boolean(detail.session?.live),
+      createdAt: detail.session?.createdAt || remoteSession.createdAt || null,
+      lastUpdatedAt: remoteSession.updatedAt || detail.session?.lastUpdatedAt || nowIso(),
+      messageCount: Math.max(Number(detail.session?.messageCount || 0), Number(remoteSession.messageCount || 0)),
+      latestUserMessage: remoteSession.latestUserMessage || detail.session?.latestUserMessage || null,
+      latestAgentMessage: remoteSession.latestAgentMessage || detail.session?.latestAgentMessage || null,
+      originSessionId: detail.session?.originSessionId || remoteSession.originSessionId || null,
+      sourceSessionId: detail.session?.sourceSessionId || remoteSession.sourceSessionId || null,
+      conversationKey: detail.session?.conversationKey || remoteSession.conversationKey || effectiveSessionId,
+      bridgeSessionId: detail.session?.bridgeSessionId || remoteSession.bridgeSessionId || null,
+      nativeThreadId: detail.session?.nativeThreadId || remoteSession.nativeThreadId || remoteSession.sessionId || effectiveSessionId,
+      runtime: detail.session?.runtime || null,
+    });
+  }
+
+  const remoteTranscript = (Array.isArray(remoteDetail.transcript) ? remoteDetail.transcript : [])
+    .map(normalizeStoredTranscriptEntry)
+    .filter(Boolean);
+  const remoteDiagnostics = (Array.isArray(remoteDetail.diagnostics) ? remoteDetail.diagnostics : [])
+    .map(normalizeStoredSessionDiagnostic)
+    .filter(Boolean);
+
+  if (remoteTranscript.length) {
+    setSessionLog(hostId, effectiveSessionId, remoteTranscript, { merge: true });
+  }
+  if (remoteDiagnostics.length) {
+    setSessionDiagnostics(hostId, effectiveSessionId, remoteDiagnostics, { merge: true });
+  }
+
+  const transcript = options.fullTranscript
+    ? mergeExportTranscriptEntries([...(detail.transcript || []), ...remoteTranscript])
+    : compactTranscriptEntries(mergeByFingerprint(
+      [...(detail.transcript || []), ...remoteTranscript],
+      transcriptFingerprint,
+      SESSION_LOG_ENTRY_LIMIT
+    )).slice(-SESSION_LOG_ENTRY_LIMIT);
+  const diagnosticLimit = options.fullDiagnostics ? Infinity : SESSION_DETAIL_DIAGNOSTIC_LIMIT;
+  const diagnostics = compactSessionDiagnostics(
+    [...(detail.diagnostics || []), ...remoteDiagnostics],
+    { limit: diagnosticLimit }
+  );
+
+  return {
+    ...detail,
+    session: getSession(hostId, effectiveSessionId) || detail.session,
+    transcript,
+    diagnostics,
+    remoteDetail: {
+      loaded: Boolean(remoteTranscript.length || remoteDiagnostics.length),
+      fullTranscript: Boolean(remoteDetail.fullTranscript),
+      fullDiagnostics: Boolean(remoteDetail.fullDiagnostics),
+      transcriptCount: remoteTranscript.length,
+      diagnosticCount: remoteDiagnostics.length,
+    },
+  };
+}
+
+async function getSessionDetailHydrated(hostId, sessionId, options = {}) {
+  let detail = getSessionDetail(hostId, sessionId, options);
+  if (!detail) {
+    return null;
+  }
+
+  const host = state.hosts.get(hostId);
+  if (!shouldRequestRemoteSessionDetail(host, detail, options)) {
+    return detail;
+  }
+
+  try {
+    const remoteDetail = await requestRemoteSessionDetail(hostId, detail.session, options);
+    detail = mergeRemoteSessionDetail(hostId, detail.session?.sessionId || sessionId, detail, remoteDetail, options);
+  } catch (error) {
+    detail = {
+      ...detail,
+      remoteDetail: {
+        loaded: false,
+        error: error.message || 'failed to load remote session history',
+      },
+    };
+  }
+
+  return detail;
 }
 
 function exportTimestamp(value) {
@@ -1855,6 +2585,26 @@ function exportFileIdentity(file) {
   return String(file?.fileId || file?.path || file?.remotePath || file?.name || '').trim();
 }
 
+function exportFileIdentityValues(file) {
+  const values = [
+    file?.fileId,
+    file?.path,
+    file?.remotePath,
+    file?.name,
+  ];
+  for (const value of [file?.path, file?.remotePath]) {
+    const leaf = path.basename(String(value || ''));
+    if (leaf) {
+      values.push(leaf);
+    }
+  }
+  return Array.from(new Set(values.map((value) => String(value || '').trim()).filter(Boolean)));
+}
+
+function exportFileIdentityMatches(file, identities = new Set()) {
+  return exportFileIdentityValues(file).some((identity) => identities.has(identity));
+}
+
 function exportFileIsImage(file) {
   const mime = String(file?.mime || file?.type || '').toLowerCase();
   const ext = exportFileExtension(file?.name || file?.path || file?.remotePath || '');
@@ -1884,6 +2634,56 @@ function parseExportDate(value, mode = 'start') {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function normalizeExportDay(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    const parsed = new Date(`${text}T00:00:00.000Z`);
+    return Number.isNaN(parsed.getTime()) ? '' : text;
+  }
+  return exportDayKey(text);
+}
+
+function addExportDateRange(days, startValue, endValue) {
+  const start = normalizeExportDay(startValue);
+  const end = normalizeExportDay(endValue || startValue);
+  if (!start || !end) {
+    return;
+  }
+  const startDate = new Date(`${start}T00:00:00.000Z`);
+  const endDate = new Date(`${end}T00:00:00.000Z`);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+    return;
+  }
+  const minTime = Math.min(startDate.getTime(), endDate.getTime());
+  const maxTime = Math.max(startDate.getTime(), endDate.getTime());
+  const cursor = new Date(minTime);
+  let guard = 0;
+  while (cursor.getTime() <= maxTime && guard < 3660) {
+    days.add(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    guard += 1;
+  }
+}
+
+function parseExportDateSelection(value) {
+  const days = new Set();
+  const items = value instanceof Set || Array.isArray(value)
+    ? Array.from(value)
+    : String(value || '').split(/[,;\n]+/);
+  for (const item of items) {
+    const text = String(item || '').trim();
+    if (!text) {
+      continue;
+    }
+    const range = text.split('..').map((part) => part.trim()).filter(Boolean);
+    addExportDateRange(days, range[0], range[1] || range[0]);
+  }
+  return days;
+}
+
 function normalizeSessionExportOptions(options = {}) {
   const fromDate = parseExportDate(options.fromDate || options.startDate || '', 'start');
   const toDate = parseExportDate(options.toDate || options.endDate || '', 'end');
@@ -1893,6 +2693,7 @@ function normalizeSessionExportOptions(options = {}) {
     ? new Set(Array.from(options.extensions, (item) => normalizeExportExtension(item)))
     : parseExportExtensionList(options.extensions);
   const fileIds = options.fileIds instanceof Set ? options.fileIds : parseExportList(options.fileIds);
+  const selectedDates = parseExportDateSelection(options.selectedDates || options.dates || '');
   return {
     includeThinking: Boolean(options.includeThinking),
     includeImages: options.includeImages !== false,
@@ -1905,6 +2706,7 @@ function normalizeSessionExportOptions(options = {}) {
     endIndex,
     extensions,
     fileIds,
+    selectedDates,
   };
 }
 
@@ -1921,7 +2723,7 @@ function exportFileAllowed(file, exportOptions) {
     return false;
   }
   if (!exportOptions.includeAllFiles) {
-    return exportOptions.fileIds.has(exportFileIdentity(file));
+    return exportFileIdentityMatches(file, exportOptions.fileIds);
   }
   return true;
 }
@@ -2022,15 +2824,21 @@ function serializeSessionExportOptions(options = {}) {
     ...exportOptions,
     fromDate: exportOptions.fromDate ? exportOptions.fromDate.toISOString() : null,
     toDate: exportOptions.toDate ? exportOptions.toDate.toISOString() : null,
+    selectedDates: Array.from(exportOptions.selectedDates || []),
     extensions: Array.from(exportOptions.extensions || []),
     fileIds: Array.from(exportOptions.fileIds || []),
   };
 }
 
 function filterTranscriptForExport(transcript, exportOptions) {
+  const hasSelectedDates = Boolean(exportOptions.selectedDates?.size);
   const entries = (Array.isArray(transcript) ? transcript : [])
     .filter((entry) => entry && ['user', 'agent', 'assistant', 'system'].includes(entry.speaker || ''))
     .filter((entry) => {
+      if (hasSelectedDates) {
+        const day = exportDayKey(entry.timestamp);
+        return Boolean(day && exportOptions.selectedDates.has(day));
+      }
       if (!exportOptions.fromDate && !exportOptions.toDate) {
         return true;
       }
@@ -2046,7 +2854,7 @@ function filterTranscriptForExport(transcript, exportOptions) {
       }
       return true;
     });
-  const rangedEntries = (exportOptions.fromDate || exportOptions.toDate)
+  const rangedEntries = (hasSelectedDates || exportOptions.fromDate || exportOptions.toDate)
     ? entries
     : entries.slice(exportOptions.startIndex - 1, exportOptions.endIndex);
   return rangedEntries
@@ -2406,13 +3214,25 @@ function getSessionCachedFileRecords(session) {
     .sort((a, b) => String(a.receivedAt || '').localeCompare(String(b.receivedAt || '')));
 }
 
-function prepareSessionBundleFiles(detail) {
+function prepareSessionBundleFiles(detail, exportOptions = normalizeSessionExportOptions()) {
   const usedPaths = new Set(['session.md', 'session.json', 'manifest.json']);
-  const allowedIds = new Set((Array.isArray(detail.receivedFiles) ? detail.receivedFiles : [])
-    .map((file) => exportFileIdentity(file))
-    .filter(Boolean));
+  const allowedIds = new Set();
+  const addFileIds = (file) => {
+    if (!exportFileAllowed(file, exportOptions)) {
+      return;
+    }
+    for (const identity of exportFileIdentityValues(file)) {
+      allowedIds.add(identity);
+    }
+  };
+  for (const file of Array.isArray(detail.receivedFiles) ? detail.receivedFiles : []) {
+    addFileIds(file);
+  }
+  for (const file of collectTranscriptFiles(detail.transcript || [])) {
+    addFileIds(file);
+  }
   return getSessionCachedFileRecords(detail.session)
-    .filter((file) => allowedIds.has(exportFileIdentity(file)))
+    .filter((file) => exportFileIdentityMatches(file, allowedIds))
     .map((file) => ({
     ...file,
     zipPath: uniqueZipPath(usedPaths, 'files', file.name || file.remotePath || file.fileId),
@@ -2448,7 +3268,7 @@ function buildSessionBundleManifest(detail, bundleFiles, options = {}) {
 
 async function streamSessionZipExport(res, detail, options = {}) {
   const exportOptions = normalizeSessionExportOptions(options);
-  const bundleFiles = prepareSessionBundleFiles(detail);
+  const bundleFiles = prepareSessionBundleFiles(detail, exportOptions);
   const manifest = buildSessionBundleManifest(detail, bundleFiles, exportOptions);
   const jsonExport = {
     ...buildSessionJsonExport(detail, exportOptions),
@@ -2523,8 +3343,12 @@ function transcriptFingerprint(entry) {
   return `${entry.speaker || 'system'}|${entry.timestamp || ''}|${canonicalTranscriptText(entry.text || '')}|${(entry.files || []).map((file) => file.path || file.name || '').join(',')}`;
 }
 
+function diagnosticFingerprint(entry) {
+  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.turnId || ''}`;
+}
+
 function setSessionLog(hostId, sessionId, entries, options = {}) {
-  const key = sessionKey(hostId, sessionId);
+  const key = resolveSessionKey(hostId, sessionId);
   const normalized = (Array.isArray(entries) ? entries : [])
     .map(normalizeStoredTranscriptEntry)
     .filter(Boolean);
@@ -2534,7 +3358,18 @@ function setSessionLog(hostId, sessionId, entries, options = {}) {
     compactTranscriptEntries(mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT))
       .slice(-SESSION_LOG_ENTRY_LIMIT)
   );
-  saveSessionLogs();
+  scheduleSessionLogsSave();
+}
+
+function setSessionDiagnostics(hostId, sessionId, entries, options = {}) {
+  const key = resolveSessionKey(hostId, sessionId);
+  const normalized = (Array.isArray(entries) ? entries : [])
+    .map(normalizeStoredSessionDiagnostic)
+    .filter(Boolean);
+  const existing = options.merge ? state.sessionDiagnostics.get(key) || [] : [];
+  const merged = mergeByFingerprint([...existing, ...normalized], diagnosticFingerprint, SESSION_DIAGNOSTIC_ENTRY_LIMIT);
+  state.sessionDiagnostics.set(key, compactSessionDiagnostics(merged));
+  scheduleSessionDiagnosticsSave();
 }
 
 function mergeByFingerprint(entries, fingerprint, limit) {
@@ -2555,13 +3390,13 @@ function mergeByFingerprint(entries, fingerprint, limit) {
 }
 
 function setSessionAlerts(hostId, sessionId, entries) {
-  const key = sessionKey(hostId, sessionId);
+  const key = resolveSessionKey(hostId, sessionId);
   const alerts = Array.isArray(entries) ? entries : [];
   state.sessionAlerts.set(key, mergeByFingerprint(alerts, (entry) => `${entry.severity || 'warning'}|${entry.timestamp || ''}|${entry.message || ''}`, 100));
 }
 
 function setSessionRuntime(hostId, sessionId, runtime) {
-  const key = sessionKey(hostId, sessionId);
+  const key = resolveSessionKey(hostId, sessionId);
   if (!runtime || typeof runtime !== 'object') {
     state.sessionRuntime.delete(key);
     return null;
@@ -2578,7 +3413,7 @@ function setSessionRuntime(hostId, sessionId, runtime) {
 }
 
 function appendSessionDiagnostic(hostId, sessionId, entry) {
-  const key = sessionKey(hostId, sessionId);
+  const key = resolveSessionKey(hostId, sessionId);
   const existing = state.sessionDiagnostics.get(key) || [];
   const nextEntry = {
     timestamp: entry.timestamp || nowIso(),
@@ -2596,22 +3431,45 @@ function appendSessionDiagnostic(hostId, sessionId, entry) {
     key,
     compactSessionDiagnostics(mergeByFingerprint(
       existing,
-      (item) => `${item.timestamp || ''}|${item.kind || ''}|${item.method || ''}|${item.message || ''}|${item.detail || ''}|${item.turnId || ''}`,
-      200
+      diagnosticFingerprint,
+      SESSION_DIAGNOSTIC_ENTRY_LIMIT
     ))
   );
+  scheduleSessionDiagnosticsSave();
   return nextEntry;
 }
 
 function emitSessionDiagnostic(hostId, sessionId, entry) {
-  const nextEntry = appendSessionDiagnostic(hostId, sessionId, entry);
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const nextEntry = appendSessionDiagnostic(hostId, effectiveSessionId, entry);
   const payload = {
     ...nextEntry,
     hostId,
-    sessionId,
+    sessionId: effectiveSessionId,
   };
-  broadcastSessionEvent(hostId, sessionId, 'session.diagnostic', payload);
+  broadcastSessionEvent(hostId, effectiveSessionId, 'session.diagnostic', payload);
   return payload;
+}
+
+function emitSessionRuntimePatch(hostId, sessionId, patch = {}) {
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const timestamp = patch.updatedAt || nowIso();
+  const runtime = setSessionRuntime(hostId, effectiveSessionId, {
+    ...patch,
+    updatedAt: timestamp,
+  });
+  upsertSession(hostId, {
+    sessionId: effectiveSessionId,
+    runtime,
+    lastUpdatedAt: timestamp,
+  });
+  broadcastSessionEvent(hostId, effectiveSessionId, 'session.runtime_updated', {
+    hostId,
+    sessionId: effectiveSessionId,
+    patch,
+    timestamp,
+  });
+  return runtime;
 }
 
 function upsertSessionRequest(hostId, sessionId, entry) {
@@ -2722,7 +3580,7 @@ function appendSessionLog(hostId, sessionId, entry) {
     session.lastUpdatedAt = nextEntry.timestamp || nowIso();
     state.sessions.set(key, session);
   }
-  saveSessionLogs();
+  scheduleSessionLogsSave();
   return nextEntry;
 }
 
@@ -2755,6 +3613,68 @@ function emitTranscriptEntry(hostId, sessionId, entry) {
   };
   broadcastSessionEvent(hostId, sessionId, 'session.transcript', payload);
   return payload;
+}
+
+const PENDING_USER_TRANSCRIPT_ECHO_TTL_MS = 5 * 60 * 1000;
+const PENDING_USER_TRANSCRIPT_ECHO_LIMIT = 16;
+
+function prunePendingUserTranscriptEchoesForKey(key) {
+  const records = state.pendingUserTranscriptEchoes.get(key) || [];
+  const cutoff = Date.now() - PENDING_USER_TRANSCRIPT_ECHO_TTL_MS;
+  const fresh = records.filter((record) => Number(record.createdAt || 0) >= cutoff);
+  if (fresh.length) {
+    state.pendingUserTranscriptEchoes.set(key, fresh.slice(-PENDING_USER_TRANSCRIPT_ECHO_LIMIT));
+  } else {
+    state.pendingUserTranscriptEchoes.delete(key);
+  }
+  return fresh;
+}
+
+function recordPendingUserTranscriptEcho(hostId, sessionId, entry) {
+  const key = sessionKey(hostId, sessionId);
+  const fullText = cleanStoredTranscriptText(entry?.fullText || '', 'user');
+  const displayText = cleanStoredTranscriptText(entry?.displayText || '', 'user');
+  const fullCanonical = canonicalTranscriptText(fullText);
+  const displayCanonical = canonicalTranscriptText(displayText);
+  if (!fullCanonical && !displayCanonical) {
+    return;
+  }
+  const records = prunePendingUserTranscriptEchoesForKey(key);
+  records.push({
+    createdAt: Date.now(),
+    fullCanonical,
+    displayCanonical,
+  });
+  state.pendingUserTranscriptEchoes.set(key, records.slice(-PENDING_USER_TRANSCRIPT_ECHO_LIMIT));
+}
+
+function consumePendingUserTranscriptEcho(hostId, sessionId, entry) {
+  if (String(entry?.speaker || '').toLowerCase() !== 'user') {
+    return false;
+  }
+  const key = sessionKey(hostId, sessionId);
+  const records = prunePendingUserTranscriptEchoesForKey(key);
+  if (!records.length) {
+    return false;
+  }
+  const entryCanonical = canonicalTranscriptText(cleanStoredTranscriptText(entry.text || '', 'user'));
+  if (!entryCanonical) {
+    return false;
+  }
+  const index = records.findIndex((record) => (
+    (record.fullCanonical && entryCanonical === record.fullCanonical)
+    || (record.displayCanonical && entryCanonical === record.displayCanonical)
+  ));
+  if (index < 0) {
+    return false;
+  }
+  records.splice(index, 1);
+  if (records.length) {
+    state.pendingUserTranscriptEchoes.set(key, records);
+  } else {
+    state.pendingUserTranscriptEchoes.delete(key);
+  }
+  return true;
 }
 
 function emitSessionAlert(hostId, sessionId, entry) {
@@ -2838,6 +3758,36 @@ function classifyOutputSpeaker(chunk, stream = 'stdout') {
   return 'agent';
 }
 
+const INTERNAL_OUTPUT_CHANNELS = new Set([
+  'analysis',
+  'commentary',
+  'reasoning',
+  'thinking',
+  'thought',
+  'internal',
+]);
+
+function getOutputChannel(event) {
+  if (!event || typeof event !== 'object') {
+    return '';
+  }
+  return String(event.phase || event.channel || event.kind || '').trim().toLowerCase();
+}
+
+function isInternalOutputEvent(event) {
+  return INTERNAL_OUTPUT_CHANNELS.has(getOutputChannel(event));
+}
+
+function diagnosticKindForOutputChannel(channel) {
+  if (channel === 'analysis' || channel === 'reasoning' || channel === 'thinking' || channel === 'thought') {
+    return 'reasoning';
+  }
+  if (channel === 'commentary') {
+    return 'commentary';
+  }
+  return 'diagnostic';
+}
+
 function isImportantAlertText(text) {
   const normalized = String(text || '').trim();
   if (!normalized) {
@@ -2906,7 +3856,7 @@ function moveSessionArtifacts(hostId, fromSessionId, toSessionId) {
       mergeByFingerprint([...toLogs, ...fromLogs], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT)
     );
     state.sessionLogs.delete(fromKey);
-    saveSessionLogs();
+    scheduleSessionLogsSave();
   }
 
   const fromAlerts = state.sessionAlerts.get(fromKey) || [];
@@ -2938,10 +3888,11 @@ function moveSessionArtifacts(hostId, fromSessionId, toSessionId) {
       mergeByFingerprint(
         [...toDiagnostics, ...fromDiagnostics],
         (entry) => `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}`,
-        200
+        SESSION_DIAGNOSTIC_ENTRY_LIMIT
       )
     );
     state.sessionDiagnostics.delete(fromKey);
+    scheduleSessionDiagnosticsSave();
   }
 
   const fromRequests = state.sessionRequests.get(fromKey) || [];
@@ -2994,6 +3945,7 @@ function migrateSessionIdentity(hostId, fromSessionId, toSessionId, patch = {}) 
 
   state.sessions.set(toKey, next);
   state.sessions.delete(fromKey);
+  rememberSessionAlias(hostId, fromSessionId, toSessionId);
   moveSessionArtifacts(hostId, fromSessionId, toSessionId);
   const identities = getSessionTitleIdentities(fromSession || toSession, {
     ...patch,
@@ -3009,6 +3961,7 @@ function migrateSessionIdentity(hostId, fromSessionId, toSessionId, patch = {}) 
   });
   next.title = title || next.title;
   state.sessions.set(toKey, next);
+  rememberSessionIdentityAliases(hostId, next);
   rememberSessionTitle(hostId, identities, title, {
     cwd: patch.cwd || fromSession?.cwd || toSession?.cwd || '',
     source: patch.source || fromSession?.source || toSession?.source || 'migration',
@@ -3415,13 +4368,9 @@ function migrateSessionCollectionItems(hostId, fromSessionId, toSessionId, patch
       continue;
     }
 
-    const deduped = new Map();
-    for (const item of nextItems) {
-      deduped.set(collectionItemKey(item), item);
-    }
     state.sessionCollections.set(collection.collectionId, {
       ...collection,
-      items: Array.from(deduped.values()),
+      items: dedupeCollectionItems(nextItems),
       updatedAt: nowIso(),
     });
   }
@@ -3434,12 +4383,28 @@ function migrateSessionCollectionItems(hostId, fromSessionId, toSessionId, patch
 
 function getSessionCollectionList() {
   return Array.from(state.sessionCollections.values())
-    .map((collection) => ({
-      ...collection,
-      itemCount: collection.collectionId === DEFAULT_COLLECTION_ID
-        ? Array.from(state.sessions.values()).length
-        : collection.items.length,
-    }))
+    .map((collection) => {
+      if (collection.collectionId === DEFAULT_COLLECTION_ID) {
+        return {
+          ...collection,
+          itemCount: Array.from(state.sessions.values()).length,
+        };
+      }
+      const items = dedupeCollectionItems(collection.items);
+      if (items.length !== (collection.items || []).length) {
+        state.sessionCollections.set(collection.collectionId, {
+          ...collection,
+          items,
+          updatedAt: nowIso(),
+        });
+        persistSessionCollections();
+      }
+      return {
+        ...collection,
+        items,
+        itemCount: items.length,
+      };
+    })
     .sort((a, b) => {
       if (a.collectionId === DEFAULT_COLLECTION_ID) {
         return -1;
@@ -5522,6 +6487,28 @@ function awaitModelListRequest(requestId, timeoutMs = 35000) {
   });
 }
 
+function awaitApiTestRequest(requestId, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingApiTestRequests.delete(requestId);
+      reject(new Error('API test timed out while waiting for host-agent to respond'));
+    }, timeoutMs);
+
+    state.pendingApiTestRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingApiTestRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingApiTestRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
 function awaitSkillListRequest(requestId, timeoutMs = 35000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -5538,6 +6525,72 @@ function awaitSkillListRequest(requestId, timeoutMs = 35000) {
       reject: (error) => {
         clearTimeout(timer);
         state.pendingSkillRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function awaitGoalRequest(requestId, timeoutMs = 35000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingGoalRequests.delete(requestId);
+      reject(new Error('goal request timed out while waiting for host-agent / Codex app-server to respond'));
+    }, timeoutMs);
+
+    state.pendingGoalRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingGoalRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingGoalRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function awaitSessionDetailRequest(requestId, timeoutMs = 45000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingSessionDetailRequests.delete(requestId);
+      reject(new Error('session detail request timed out while waiting for host-agent to read history'));
+    }, timeoutMs);
+
+    state.pendingSessionDetailRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingSessionDetailRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingSessionDetailRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function awaitSessionSearchRequest(requestId, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingSessionSearchRequests.delete(requestId);
+      reject(new Error('session search timed out while waiting for host-agent to scan history'));
+    }, timeoutMs);
+
+    state.pendingSessionSearchRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingSessionSearchRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingSessionSearchRequests.delete(requestId);
         reject(error);
       },
     });
@@ -5711,6 +6764,20 @@ async function streamHostFileDownload(res, {
     throw new Error(`file is too large to stream (${size} bytes); limit is ${MAX_CHUNKED_FILE_TRANSFER_BYTES} bytes`);
   }
 
+  let cachePath = '';
+  let cacheFd = null;
+  let cacheCommitted = false;
+  if (size > 0 && size <= CHUNKED_FILE_CACHE_MAX_BYTES) {
+    const cacheDirectory = path.join(RECEIVED_FILES_ROOT, safePathSegment(hostId, 'host'), safePathSegment(sessionId || '', 'session'));
+    fs.mkdirSync(cacheDirectory, { recursive: true });
+    cachePath = path.resolve(cacheDirectory, `.partial-${makeId()}-${filename}`);
+    if (pathInside(RECEIVED_FILES_ROOT, cachePath)) {
+      cacheFd = fs.openSync(cachePath, 'w');
+    } else {
+      cachePath = '';
+    }
+  }
+
   res.writeHead(200, {
     'Content-Type': info.mime || 'application/octet-stream',
     'Content-Length': size,
@@ -5723,41 +6790,75 @@ async function streamHostFileDownload(res, {
     'Access-Control-Allow-Origin': '*',
   });
 
-  let offset = 0;
-  while (offset < size) {
-    if (res.destroyed || res.writableEnded) {
-      return;
+  try {
+    let offset = 0;
+    while (offset < size) {
+      if (res.destroyed || res.writableEnded) {
+        return;
+      }
+      const length = Math.min(FILE_TRANSFER_CHUNK_BYTES, size - offset);
+      const requestId = makeId();
+      const pending = awaitFileRequest(requestId, 120000, {
+        suppressAlert: true,
+        source: 'download-chunk',
+      });
+      enqueueCommand(hostId, {
+        type: 'host.file_download_chunk',
+        requestId,
+        sessionId,
+        path: remotePath,
+        cwd,
+        offset,
+        length,
+      });
+      const chunk = await pending;
+      const chunkOffset = Number(chunk.offset || 0) || 0;
+      const buffer = Buffer.from(String(chunk.dataBase64 || ''), 'base64');
+      if (chunkOffset !== offset) {
+        throw new Error(`download chunk offset mismatch: expected ${offset}, got ${chunkOffset}`);
+      }
+      if (!buffer.length && length > 0) {
+        throw new Error('download chunk was empty before the file ended');
+      }
+      if (cacheFd !== null) {
+        fs.writeSync(cacheFd, buffer, 0, buffer.length, offset);
+      }
+      offset += buffer.length;
+      if (!res.write(buffer)) {
+        await waitForStreamDrain(res);
+      }
     }
-    const length = Math.min(FILE_TRANSFER_CHUNK_BYTES, size - offset);
-    const requestId = makeId();
-    const pending = awaitFileRequest(requestId, 120000, {
-      suppressAlert: true,
-      source: 'download-chunk',
-    });
-    enqueueCommand(hostId, {
-      type: 'host.file_download_chunk',
-      requestId,
-      sessionId,
-      path: remotePath,
-      cwd,
-      offset,
-      length,
-    });
-    const chunk = await pending;
-    const chunkOffset = Number(chunk.offset || 0) || 0;
-    const buffer = Buffer.from(String(chunk.dataBase64 || ''), 'base64');
-    if (chunkOffset !== offset) {
-      throw new Error(`download chunk offset mismatch: expected ${offset}, got ${chunkOffset}`);
+    if (cacheFd !== null) {
+      fs.closeSync(cacheFd);
+      cacheFd = null;
+      try {
+        storeReceivedFileFromPath({
+          hostId,
+          sessionId: sessionId || '',
+          remotePath,
+          name: filename,
+          mime: info.mime || 'application/octet-stream',
+          localPath: cachePath,
+          size,
+        });
+        cacheCommitted = true;
+      } catch (error) {
+        console.warn(`[relay] failed to cache streamed file ${remotePath}: ${error.message}`);
+      }
     }
-    if (!buffer.length && length > 0) {
-      throw new Error('download chunk was empty before the file ended');
+    res.end();
+  } finally {
+    if (cacheFd !== null) {
+      try {
+        fs.closeSync(cacheFd);
+      } catch {}
     }
-    offset += buffer.length;
-    if (!res.write(buffer)) {
-      await waitForStreamDrain(res);
+    if (cachePath && !cacheCommitted && fs.existsSync(cachePath)) {
+      try {
+        fs.unlinkSync(cachePath);
+      } catch {}
     }
   }
-  res.end();
 }
 
 function contentDispositionValue(disposition, filename) {
@@ -5860,6 +6961,58 @@ function storeReceivedFile({ hostId, sessionId, remotePath, name, mime, buffer }
   return record;
 }
 
+function storeReceivedFileFromPath({ hostId, sessionId, remotePath, name, mime, localPath, size }) {
+  pruneReceivedFiles();
+  const sourcePath = path.resolve(localPath || '');
+  if (!sourcePath || !fs.existsSync(sourcePath)) {
+    throw new Error('received file cache source does not exist');
+  }
+  const fileId = makeId();
+  const normalizedRemotePath = normalizeRemoteFilePath(remotePath);
+  const filename = safeFileDisplayName(name || normalizedRemotePath || 'download');
+  const hostSegment = safePathSegment(hostId, 'host');
+  const sessionSegment = safePathSegment(sessionId, 'session');
+  const targetDirectory = path.join(RECEIVED_FILES_ROOT, hostSegment, sessionSegment);
+  fs.mkdirSync(targetDirectory, { recursive: true });
+
+  const targetPath = path.resolve(targetDirectory, `${fileId}-${filename}`);
+  if (!pathInside(RECEIVED_FILES_ROOT, targetPath)) {
+    throw new Error('refusing to cache outside received-files directory');
+  }
+  if (sourcePath !== targetPath) {
+    fs.renameSync(sourcePath, targetPath);
+  }
+
+  const existing = findReceivedFile(hostId, sessionId, normalizedRemotePath);
+  if (existing?.localPath && pathInside(RECEIVED_FILES_ROOT, existing.localPath) && fs.existsSync(existing.localPath)) {
+    try {
+      fs.unlinkSync(existing.localPath);
+    } catch {
+      // The new cache copy is already written; stale files are cleaned by TTL.
+    }
+    state.receivedFiles.delete(existing.fileId);
+  }
+
+  const stats = fs.statSync(targetPath);
+  const expiresAt = new Date(Date.now() + RECEIVED_FILE_TTL_MS).toISOString();
+  const record = {
+    fileId,
+    hostId: String(hostId || ''),
+    sessionId: String(sessionId || ''),
+    remotePath: normalizedRemotePath,
+    name: filename,
+    mime: String(mime || 'application/octet-stream'),
+    size: Number(size || stats.size || 0) || stats.size,
+    localPath: targetPath,
+    receivedAt: nowIso(),
+    lastAccessedAt: nowIso(),
+    expiresAt,
+  };
+  state.receivedFiles.set(fileId, record);
+  saveReceivedFiles();
+  return record;
+}
+
 function serveReceivedFile(res, record, inline) {
   if (!record?.localPath || !fs.existsSync(record.localPath)) {
     sendJson(res, 404, { error: 'received file not found or expired' });
@@ -5868,10 +7021,10 @@ function serveReceivedFile(res, record, inline) {
   record.lastAccessedAt = nowIso();
   state.receivedFiles.set(record.fileId, record);
   saveReceivedFiles();
-  const buffer = fs.readFileSync(record.localPath);
+  const stats = fs.statSync(record.localPath);
   res.writeHead(200, {
     'Content-Type': record.mime || 'application/octet-stream',
-    'Content-Length': buffer.length,
+    'Content-Length': stats.size,
     'Content-Disposition': contentDispositionValue(inline ? 'inline' : 'attachment', record.name || 'download'),
     'Cache-Control': 'no-store',
     'Content-Security-Policy': 'sandbox',
@@ -5881,7 +7034,11 @@ function serveReceivedFile(res, record, inline) {
     'X-Codex-Remote-Path': encodeURIComponent(record.remotePath || ''),
     'Access-Control-Allow-Origin': '*',
   });
-  res.end(buffer);
+  const stream = fs.createReadStream(record.localPath);
+  stream.on('error', (error) => {
+    res.destroy(error);
+  });
+  stream.pipe(res);
 }
 
 function extensionForImageMime(mime = '') {
@@ -6116,12 +7273,30 @@ function resolveSessionCreatedAt(existing, patch) {
   return earliestIso(existing?.createdAt, patch.createdAt) || patch.createdAt;
 }
 
-function upsertSession(hostId, patch) {
-  const key = sessionKey(hostId, patch.sessionId);
+function upsertSession(hostId, patch, options = {}) {
+  const identityValues = [
+    patch.sessionId,
+    patch.bridgeSessionId,
+    patch.runId,
+    patch.runtime?.runId,
+    patch.nativeThreadId,
+    patch.originSessionId,
+    patch.sourceSessionId,
+    patch.conversationKey,
+  ];
+  const preserveManagedLive = options.preserveManagedLive !== false;
+  const managedLiveMatch = preserveManagedLive && patch.source !== 'managed' && patch.live !== true
+    ? findManagedLiveSessionByIdentities(hostId, identityValues)
+    : null;
+  const canonicalSessionId = managedLiveMatch?.sessionId || resolveSessionId(hostId, patch.sessionId) || patch.sessionId;
+  if (managedLiveMatch && patch.sessionId !== canonicalSessionId) {
+    rememberSessionAlias(hostId, patch.sessionId, canonicalSessionId);
+  }
+  const key = resolveSessionKey(hostId, canonicalSessionId);
   const existing = state.sessions.get(key) || {
     hostId,
-    sessionId: patch.sessionId,
-    title: patch.title || patch.sessionId,
+    sessionId: canonicalSessionId,
+    title: patch.title || canonicalSessionId,
     cwd: patch.cwd || null,
     createdAt: patch.createdAt || null,
     source: patch.source || 'imported',
@@ -6134,11 +7309,39 @@ function upsertSession(hostId, patch) {
     ...existing,
     ...patch,
     hostId,
-    sessionId: patch.sessionId,
+    sessionId: canonicalSessionId,
     title: resolveSessionTitle(hostId, existing, patch),
     createdAt: resolveSessionCreatedAt(existing, patch),
     lastUpdatedAt: patch.lastUpdatedAt || nowIso(),
   };
+
+  if (managedLiveMatch && existing.live) {
+    next.source = existing.source || 'managed';
+    next.state = existing.state || 'running';
+    next.live = true;
+    next.runtime = existing.runtime || next.runtime || null;
+  }
+
+  const patchConversationKey = patch.conversationKey ? String(patch.conversationKey) : '';
+  const patchConversationKeyIsIdentity = Boolean(patchConversationKey && patchConversationKey === patch.sessionId);
+  const patchHasExplicitLineage = Boolean(
+    patch.originSessionId
+    || patch.sourceSessionId
+    || (patchConversationKey && !patchConversationKeyIsIdentity)
+  );
+  if (!patch.originSessionId && existing.originSessionId) {
+    next.originSessionId = existing.originSessionId;
+  }
+  if (!patch.sourceSessionId && existing.sourceSessionId) {
+    next.sourceSessionId = existing.sourceSessionId;
+  }
+  if (
+    existing.conversationKey
+    && (!patchConversationKey || patchConversationKey === patch.sessionId)
+    && !patchHasExplicitLineage
+  ) {
+    next.conversationKey = existing.conversationKey;
+  }
 
   if (typeof next.live === 'undefined') {
     next.live = Boolean(existing.live);
@@ -6153,6 +7356,7 @@ function upsertSession(hostId, patch) {
   }
 
   state.sessions.set(key, next);
+  rememberSessionIdentityAliases(hostId, next);
   return next;
 }
 
@@ -6164,17 +7368,19 @@ function enqueueCommand(hostId, command) {
     ...command,
   };
   queue.push(next);
-  state.commandQueues.set(hostId, queue);
+  state.commandQueues.set(hostId, pruneCommandQueue(queue));
   return next;
 }
 
 function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
+  const existing = getSession(hostId, sessionId);
   const next = upsertSession(hostId, {
     sessionId,
     state: stateName,
     live: false,
+    runId: existing?.runId || null,
     lastUpdatedAt: nowIso(),
-  });
+  }, { preserveManagedLive: false });
   const runtime = setSessionRuntime(hostId, sessionId, {
     phase: 'closed',
     connection: 'closed',
@@ -6182,6 +7388,7 @@ function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
     activeTurnId: null,
     waitingOnApproval: false,
     waitingOnUserInput: false,
+    runId: existing?.runId || null,
     updatedAt: nowIso(),
   });
   broadcastSessionEvent(hostId, sessionId, 'session.runtime_updated', {
@@ -6192,6 +7399,22 @@ function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
   });
   broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
   return next;
+}
+
+function getCurrentSessionRunId(hostId, sessionId) {
+  const session = getSession(hostId, sessionId);
+  const runtime = state.sessionRuntime.get(sessionKey(hostId, sessionId))
+    || state.sessionRuntime.get(resolveSessionKey(hostId, sessionId))
+    || null;
+  return session?.runId || runtime?.runId || null;
+}
+
+function isStaleSessionRunEvent(event, effectiveSessionId) {
+  if (!event?.runId) {
+    return false;
+  }
+  const currentRunId = getCurrentSessionRunId(event.hostId, effectiveSessionId);
+  return Boolean(currentRunId && currentRunId !== event.runId);
 }
 
 function sessionAgeMs(session) {
@@ -6205,7 +7428,7 @@ function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds) {
     if (session.hostId !== hostId || session.source !== 'managed' || !session.live) {
       continue;
     }
-    if (liveSessionIds.has(session.sessionId)) {
+    if (sessionIdentityValues(session).some((identity) => liveSessionIds.has(identity))) {
       continue;
     }
     if (session.state === 'starting' && sessionAgeMs(session) < STALE_MANAGED_SESSION_GRACE_MS) {
@@ -6215,14 +7438,18 @@ function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds) {
     closedCount += 1;
   }
   if (closedCount > 0) {
-    console.warn(`[relay] closed ${closedCount} stale managed session(s) for ${hostId} after discovery`);
+    console.log(`[relay] closed ${closedCount} stale managed session(s) for ${hostId} after discovery`);
   }
 }
 
 function scheduleStopFallback(hostId, sessionId, delayMs = 4000) {
+  const expectedRunId = getSession(hostId, sessionId)?.runId || null;
   const timer = setTimeout(() => {
     const session = getSession(hostId, sessionId);
     const runtime = state.sessionRuntime.get(sessionKey(hostId, sessionId)) || null;
+    if (expectedRunId && session?.runId && session.runId !== expectedRunId) {
+      return;
+    }
     if (session?.live && (session.state === 'ending' || runtime?.phase === 'ending')) {
       markSessionClosed(hostId, sessionId);
     }
@@ -6240,6 +7467,7 @@ function beginSessionStop(hostId, sessionId) {
       sessionId: effectiveSessionId,
       state: 'ending',
       live: true,
+      runId: session.runId || null,
       lastUpdatedAt: nowIso(),
     });
     setSessionRuntime(hostId, effectiveSessionId, {
@@ -6247,6 +7475,7 @@ function beginSessionStop(hostId, sessionId) {
       connection: 'closing',
       busy: false,
       activeTurnId: null,
+      runId: session.runId || null,
       updatedAt: nowIso(),
     });
     broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', next);
@@ -6272,6 +7501,7 @@ function beginSessionStop(hostId, sessionId) {
     type: 'session.stop',
     sessionId: candidateSessionId,
     requestedSessionId: effectiveSessionId,
+    runId: session?.runId || null,
     bridgeSessionId: session?.bridgeSessionId || null,
     nativeThreadId: session?.nativeThreadId || null,
     originSessionId: session?.originSessionId || null,
@@ -6295,8 +7525,32 @@ function getRelayManagedLiveSessions(hostId = '') {
 }
 
 function getCommands(hostId, afterId = 0) {
-  const queue = state.commandQueues.get(hostId) || [];
+  const queue = pruneCommandQueue(state.commandQueues.get(hostId) || []);
+  state.commandQueues.set(hostId, queue);
   return queue.filter((command) => command.id > afterId);
+}
+
+function pruneCommandQueue(queue) {
+  const now = Date.now();
+  const fresh = (Array.isArray(queue) ? queue : []).filter((command) => {
+    const created = Date.parse(command?.createdAt || '');
+    return !Number.isFinite(created) || now - created <= COMMAND_QUEUE_TTL_MS;
+  });
+  if (fresh.length <= COMMAND_QUEUE_MAX_LENGTH) {
+    return fresh;
+  }
+  return fresh.slice(fresh.length - COMMAND_QUEUE_MAX_LENGTH);
+}
+
+function ackCommands(hostId, throughId = 0) {
+  const id = Number(throughId || 0) || 0;
+  if (!hostId || id <= 0) {
+    return 0;
+  }
+  const queue = state.commandQueues.get(hostId) || [];
+  const next = pruneCommandQueue(queue.filter((command) => Number(command?.id || 0) > id));
+  state.commandQueues.set(hostId, next);
+  return Math.max(0, queue.length - next.length);
 }
 
 function sendSse(res, eventName, payload) {
@@ -6329,8 +7583,13 @@ function publicSessionEventPayload(eventName, payload, options = {}) {
 }
 
 function broadcastSessionEvent(hostId, sessionId, eventName, payload) {
-  const key = sessionKey(hostId, sessionId);
-  const subscribers = state.subscribers.get(key);
+  const keys = new Set([sessionKey(hostId, sessionId), resolveSessionKey(hostId, sessionId)]);
+  const subscribers = new Set();
+  for (const key of keys) {
+    for (const subscriber of state.subscribers.get(key) || []) {
+      subscribers.add(subscriber);
+    }
+  }
   if (!subscribers) {
     return;
   }
@@ -6343,10 +7602,15 @@ function broadcastSessionEvent(hostId, sessionId, eventName, payload) {
   }
 
   for (const res of staleSubscribers) {
-    subscribers.delete(res);
-  }
-  if (subscribers.size === 0) {
-    state.subscribers.delete(key);
+    for (const key of keys) {
+      const bucket = state.subscribers.get(key);
+      if (bucket) {
+        bucket.delete(res);
+        if (bucket.size === 0) {
+          state.subscribers.delete(key);
+        }
+      }
+    }
   }
 }
 
@@ -6575,6 +7839,30 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/sessions/search') {
+    const query = String(url.searchParams.get('q') || url.searchParams.get('query') || '').trim();
+    if (query.length < 2) {
+      sendJson(res, 200, {
+        query,
+        mode: url.searchParams.get('mode') || 'keyword',
+        results: [],
+        scannedSessions: 0,
+        truncated: false,
+      });
+      return;
+    }
+    const payload = await searchSessionsHydrated({
+      hostId: url.searchParams.get('hostId') || '',
+      collectionId: url.searchParams.get('collectionId') || '',
+      mode: url.searchParams.get('mode') || 'keyword',
+      query,
+      maxSessions: url.searchParams.get('limit') || 80,
+      maxMatchesPerSession: url.searchParams.get('matchesPerSession') || 5,
+    });
+    sendJson(res, 200, payload);
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/session-collections') {
     const body = await readBody(req);
     const collection = normalizeSessionCollection({
@@ -6652,8 +7940,7 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const key = collectionItemKey(item);
-    const existingItems = collection.items.filter((entry) => collectionItemKey(entry) !== key);
+    const existingItems = filterCollectionItems(collection.items, item);
     const next = {
       ...collection,
       items: [...existingItems, item],
@@ -6688,10 +7975,9 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const key = collectionItemKey(item);
     const next = {
       ...collection,
-      items: collection.items.filter((entry) => collectionItemKey(entry) !== key),
+      items: filterCollectionItems(collection.items, item),
       updatedAt: nowIso(),
     };
     state.sessionCollections.set(collectionId, next);
@@ -6946,8 +8232,16 @@ async function handleRequest(req, res) {
       path: targetPath || null,
     });
 
-    const result = await awaitDirectoryRequest(requestId);
-    sendJson(res, 200, result);
+    try {
+      const result = await awaitDirectoryRequest(requestId);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 504, {
+        error: error.message || 'directory listing timed out',
+        hostId,
+        path: targetPath || null,
+      });
+    }
     return;
   }
 
@@ -7332,7 +8626,15 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const detail = getSessionDetail(hostId, sessionId);
+    const fullTranscript = url.searchParams.get('full') === '1' || url.searchParams.get('fullTranscript') === '1';
+    const fullDiagnostics = url.searchParams.get('fullDiagnostics') === '1' || url.searchParams.get('diagnostics') === 'full';
+    const forceRemoteDetail = url.searchParams.get('remote') === '1';
+    const detail = await getSessionDetailHydrated(hostId, sessionId, {
+      fullTranscript,
+      fullDiagnostics,
+      forceRemoteDetail,
+      skipRemoteDetail: !fullTranscript && !fullDiagnostics && !forceRemoteDetail,
+    });
     if (!detail) {
       sendJson(res, 404, { error: 'session not found' });
       return;
@@ -7377,7 +8679,7 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const detail = getSessionDetail(hostId, sessionId, { fullTranscript: true });
+    const detail = await getSessionDetailHydrated(hostId, sessionId, { fullTranscript: true, fullDiagnostics: true });
     if (!detail) {
       sendJson(res, 404, { error: 'session not found' });
       return;
@@ -7399,6 +8701,7 @@ async function handleRequest(req, res) {
       filterExtensions: parseExportBoolean(url.searchParams.get('filterExtensions'), false),
       fromDate: url.searchParams.get('fromDate') || '',
       toDate: url.searchParams.get('toDate') || '',
+      selectedDates: url.searchParams.get('dates') || url.searchParams.get('selectedDates') || '',
       startIndex: Number(url.searchParams.get('startIndex') || 1) || 1,
       endIndex: Number(url.searchParams.get('endIndex') || 0) || Number.MAX_SAFE_INTEGER,
       extensions: parseExportExtensionList(url.searchParams.get('extensions')),
@@ -7409,7 +8712,7 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const detail = getSessionDetail(hostId, sessionId, { fullTranscript: true });
+    const detail = await getSessionDetailHydrated(hostId, sessionId, { fullTranscript: true, fullDiagnostics: true });
     if (!detail) {
       sendJson(res, 404, { error: 'session not found' });
       return;
@@ -7533,6 +8836,7 @@ async function handleRequest(req, res) {
       }
     }
     saveSessionLogs();
+    saveSessionDiagnostics();
     sendJson(res, 200, { ok: true, hostId });
     return;
   }
@@ -7558,7 +8862,7 @@ async function handleRequest(req, res) {
     };
     state.hosts.set(body.hostId, host);
     attachMatchingConnectorsToHost(host);
-    state.commandQueues.delete(body.hostId);
+    state.commandQueues.set(body.hostId, pruneCommandQueue(state.commandQueues.get(body.hostId) || []));
     sendJson(res, 200, { ok: true, host });
     return;
   }
@@ -7601,7 +8905,9 @@ async function handleRequest(req, res) {
       return;
     }
 
-    sendJson(res, 200, { commands: getCommands(hostId, after) });
+    const ack = Number(url.searchParams.get('ack') || url.searchParams.get('lastProcessed') || '0');
+    const acked = ackCommands(hostId, ack);
+    sendJson(res, 200, { commands: getCommands(hostId, after), acked });
     return;
   }
 
@@ -7627,13 +8933,19 @@ async function handleRequest(req, res) {
     const originSessionId = body.originSessionId || null;
     const sourceSessionId = body.sourceSessionId || originSessionId;
     const launchMode = body.launchMode || (sourceSessionId ? 'resume' : 'fresh');
-    const sourceDetail = sourceSessionId ? getSessionDetail(hostId, sourceSessionId) : null;
+    const sourceDetail = sourceSessionId
+      ? getSessionDetail(hostId, sourceSessionId, {
+        skipDiagnostics: true,
+        skipRemoteDetail: true,
+      })
+      : null;
     const sourceSession = sourceDetail?.session || null;
     const nativeThreadId = String(body.nativeThreadId || sourceSession?.nativeThreadId || sourceSession?.sessionId || '').trim() || null;
     const sessionId = launchMode === 'resume' && sourceSessionId
       ? sourceSessionId
       : (body.sessionId || makeId());
     const bridgeSessionId = sessionId;
+    const runId = body.runId || makeId();
     const createdAt = nowIso();
     const resolvedConversationKey = body.conversationKey || originSessionId || sessionId;
     const resumeTranscript = sourceDetail ? buildResumeTranscript(sourceDetail.transcript) : [];
@@ -7654,6 +8966,7 @@ async function handleRequest(req, res) {
       conversationKey: resolvedConversationKey,
       launchMode,
       bridgeSessionId,
+      runId,
       nativeThreadId: nativeThreadId || sessionId,
       messageCount: sourceDetail?.transcript?.length || 0,
       apiProfile,
@@ -7667,6 +8980,7 @@ async function handleRequest(req, res) {
       type: 'session.start',
       sessionId,
       bridgeSessionId,
+      runId,
       cwd,
       label: body.label || cwd || sessionId,
       command: body.command || null,
@@ -7680,7 +8994,18 @@ async function handleRequest(req, res) {
       nativeThreadId,
       apiConfig,
     });
-    sendJson(res, 200, { ok: true, sessionId, command });
+    sendJson(res, 200, {
+      ok: true,
+      sessionId,
+      bridgeSessionId,
+      runId,
+      nativeThreadId,
+      originSessionId,
+      sourceSessionId,
+      conversationKey: resolvedConversationKey,
+      launchMode,
+      command,
+    });
     return;
   }
 
@@ -7730,6 +9055,45 @@ async function handleRequest(req, res) {
     } catch (error) {
       const statusCode = /not live|no live session/i.test(error.message || '') ? 409 : 504;
       sendJson(res, statusCode, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/api-test$/)) {
+    const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+
+    const host = state.hosts.get(hostId);
+    if (!host?.capabilities?.apiTest) {
+      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can test API profiles' });
+      return;
+    }
+
+    const body = await readBody(req);
+    const apiConfig = normalizeApiConfig(body.apiConfig);
+    if (!apiConfig || (!apiConfig.baseUrl && !apiConfig.apiKey)) {
+      sendJson(res, 400, { error: 'API Base URL or API Key is required before testing this host' });
+      return;
+    }
+
+    const requestId = makeId();
+    const pending = awaitApiTestRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'host.api_test',
+      requestId,
+      apiConfig,
+      timeoutMs: Number(body.timeoutMs || 15000) || 15000,
+    });
+
+    try {
+      const payload = await pending;
+      sendJson(res, 200, payload);
+    } catch (error) {
+      sendJson(res, 504, { error: error.message });
     }
     return;
   }
@@ -7848,8 +9212,13 @@ async function handleRequest(req, res) {
     const inlineImageFiles = cacheInlineImageInputFiles(hostId, sessionId, inputItems);
     const inlineTextFiles = cacheInlineTextFiles(hostId, sessionId, body.inlineFiles || body.inlineFileRefs || []);
     const transcriptFiles = normalizeFileTransferRefs([...uploadedFiles, ...inlineImageFiles, ...inlineTextFiles]);
+    const effectiveSessionId = session.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+    recordPendingUserTranscriptEcho(hostId, effectiveSessionId, {
+      fullText: text,
+      displayText: transcriptText,
+    });
 
-    emitTranscriptEntry(hostId, sessionId, {
+    emitTranscriptEntry(hostId, effectiveSessionId, {
       speaker: 'user',
       text: transcriptText,
       files: transcriptFiles,
@@ -7858,7 +9227,7 @@ async function handleRequest(req, res) {
     const apiConfig = normalizeApiConfig(body.apiConfig);
     const apiProfile = summarizeApiConfig(apiConfig);
     const next = upsertSession(hostId, {
-      sessionId,
+      sessionId: effectiveSessionId,
       latestUserMessage: transcriptText,
       apiProfile: apiProfile || session.apiProfile || null,
       codexOptions: {
@@ -7874,11 +9243,17 @@ async function handleRequest(req, res) {
       },
       lastUpdatedAt: nowIso(),
     });
-    broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
+    broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', next);
 
     const command = enqueueCommand(hostId, {
       type: 'session.input',
-      sessionId,
+      sessionId: session.sessionId || sessionId,
+      requestedSessionId: sessionId,
+      bridgeSessionId: session.bridgeSessionId || null,
+      nativeThreadId: session.nativeThreadId || null,
+      originSessionId: session.originSessionId || null,
+      sourceSessionId: session.sourceSessionId || null,
+      conversationKey: session.conversationKey || null,
       text,
       inputItems,
       mode: String(body.mode || '').trim() || null,
@@ -7888,9 +9263,31 @@ async function handleRequest(req, res) {
       approvalPolicy: typeof body.approvalPolicy === 'object' ? body.approvalPolicy : String(body.approvalPolicy || '').trim() || null,
       approvalsReviewer: String(body.approvalsReviewer || '').trim() || null,
       sandboxMode: String(body.sandboxMode || '').trim() || null,
+      planFallback: String(body.planFallback || '').trim() || null,
       serviceTier: String(body.serviceTier || '').trim() || null,
       personality: String(body.personality || '').trim() || null,
       apiConfig,
+    });
+    emitSessionRuntimePatch(hostId, effectiveSessionId, {
+      phase: 'queued-turn',
+      busy: true,
+      currentTurnStatus: 'queued',
+      queuedCommandId: command.id,
+      queuedInputAt: command.createdAt,
+      pendingInputSummary: transcriptText.slice(0, 240),
+      runId: session.runId || null,
+    });
+    emitSessionDiagnostic(hostId, effectiveSessionId, {
+      severity: 'info',
+      source: 'relay',
+      kind: 'control',
+      method: 'session.input/queued',
+      message: `Queued Codex turn command ${command.id}.`,
+      data: {
+        commandId: command.id,
+        mode: String(body.mode || '').trim() || null,
+        inputTypes: inputItems.map((item) => item.type),
+      },
     });
     const responsePayload = { ok: true, command };
     rememberInputRequest(inputCacheKey, responsePayload);
@@ -8118,6 +9515,57 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/goal$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = body.hostId;
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+
+    const session = getSession(hostId, sessionId);
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (!session.live) {
+      sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+
+    const action = String(body.action || '').trim() || 'get';
+    if (!['get', 'set', 'clear'].includes(action)) {
+      sendJson(res, 400, { error: 'action must be get, set, or clear' });
+      return;
+    }
+    const tokenBudget = Number(body.tokenBudget);
+    const requestId = makeId();
+    const pending = awaitGoalRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'session.goal',
+      sessionId,
+      requestId,
+      action,
+      objective: Object.prototype.hasOwnProperty.call(body, 'objective') ? String(body.objective || '').trim() : undefined,
+      status: Object.prototype.hasOwnProperty.call(body, 'status') ? String(body.status || '').trim() : undefined,
+      tokenBudget: Number.isFinite(tokenBudget) && tokenBudget > 0 ? Math.floor(tokenBudget) : undefined,
+    });
+
+    try {
+      const payload = await pending;
+      sendJson(res, 200, { ok: true, goal: payload.goal || null, result: payload.result || null });
+    } catch (error) {
+      sendJson(res, /not live|no live session/i.test(error.message || '') ? 409 : 504, { error: error.message });
+    }
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/shell-command$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const body = await readBody(req);
@@ -8244,22 +9692,32 @@ function applyAgentEvent(event) {
       state.hosts.set(event.hostId, host);
     }
     const sessions = Array.isArray(event.sessions) ? event.sessions : [];
-    const liveSessionIds = new Set(
-      sessions
-        .filter((session) => session && session.sessionId && session.live)
-        .map((session) => String(session.sessionId))
-    );
+    const liveSessionIds = new Set();
+    for (const discoveredSession of sessions) {
+      if (!discoveredSession?.live) {
+        continue;
+      }
+      for (const identity of sessionIdentityValues(discoveredSession)) {
+        liveSessionIds.add(identity);
+      }
+    }
     for (const session of sessions) {
       if (!session || !session.sessionId) {
         continue;
       }
       const existing = getSession(event.hostId, session.sessionId);
-      const isCurrentlyLive = liveSessionIds.has(String(session.sessionId));
+      const isCurrentlyLive = sessionIdentityValues(session).some((identity) => liveSessionIds.has(identity));
       const preserveManagedState = existing
         && existing.source === 'managed'
-        && isCurrentlyLive
-        && (existing.live || existing.state === 'starting');
+        && (existing.live || existing.state === 'starting')
+        && (
+          isCurrentlyLive
+          || (existing.state === 'starting' && sessionAgeMs(existing) < STALE_MANAGED_SESSION_GRACE_MS)
+        );
       const discoveredCreatedAt = session.createdAt || null;
+      const discoveredConversationKey = session.conversationKey && session.conversationKey !== session.sessionId
+        ? session.conversationKey
+        : '';
       const next = upsertSession(event.hostId, {
         sessionId: session.sessionId,
         title: session.title || session.sessionId,
@@ -8274,11 +9732,17 @@ function applyAgentEvent(event) {
         latestAgentMessage: session.latestAgentMessage || null,
         transcriptPreview: session.transcriptPreview || [],
         rolloutPath: session.rolloutPath || existing?.rolloutPath || null,
-        originSessionId: session.originSessionId || null,
-        sourceSessionId: session.sourceSessionId || null,
-        conversationKey: session.conversationKey || session.originSessionId || session.sessionId,
+        originSessionId: session.originSessionId || existing?.originSessionId || null,
+        sourceSessionId: session.sourceSessionId || existing?.sourceSessionId || null,
+        conversationKey: discoveredConversationKey
+          || session.originSessionId
+          || existing?.conversationKey
+          || existing?.originSessionId
+          || existing?.sourceSessionId
+          || session.sessionId,
         launchMode: session.launchMode || null,
         runtime: preserveManagedState ? existing.runtime || null : session.runtime || existing?.runtime || null,
+        runId: session.runId || session.runtime?.runId || existing?.runId || null,
         bridgeSessionId: session.bridgeSessionId || existing?.bridgeSessionId || null,
         nativeThreadId: existing?.nativeThreadId || session.nativeThreadId || session.sessionId,
       });
@@ -8327,6 +9791,65 @@ function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'host.api_tested' && event.requestId) {
+    const pending = state.pendingApiTestRequests.get(event.requestId);
+    if (pending) {
+      if (event.error) {
+        pending.reject(new Error(event.error));
+      } else {
+        pending.resolve({
+          hostId: event.hostId,
+          requestId: event.requestId,
+          result: event.result || null,
+          timestamp: event.timestamp || nowIso(),
+        });
+      }
+    }
+    return;
+  }
+
+  if (event.type === 'session.detailed' && event.requestId) {
+    const pending = state.pendingSessionDetailRequests.get(event.requestId);
+    if (pending) {
+      if (event.error) {
+        pending.reject(new Error(event.error));
+      } else {
+        pending.resolve({
+          hostId: event.hostId,
+          sessionId: event.sessionId || null,
+          nativeThreadId: event.nativeThreadId || null,
+          session: event.session || null,
+          transcript: Array.isArray(event.transcript) ? event.transcript : [],
+          diagnostics: Array.isArray(event.diagnostics) ? event.diagnostics : [],
+          fullTranscript: Boolean(event.fullTranscript),
+          fullDiagnostics: Boolean(event.fullDiagnostics),
+          timestamp: event.timestamp || nowIso(),
+        });
+      }
+    }
+    return;
+  }
+
+  if (event.type === 'session.searched' && event.requestId) {
+    const pending = state.pendingSessionSearchRequests.get(event.requestId);
+    if (pending) {
+      if (event.error) {
+        pending.reject(new Error(event.error));
+      } else {
+        pending.resolve({
+          hostId: event.hostId,
+          query: event.query || '',
+          mode: event.mode || 'keyword',
+          results: Array.isArray(event.results) ? event.results : [],
+          scannedSessions: Number(event.scannedSessions || 0) || 0,
+          truncated: Boolean(event.truncated),
+          timestamp: event.timestamp || nowIso(),
+        });
+      }
+    }
+    return;
+  }
+
   if (event.type === 'session.model_listed' && event.requestId) {
     const pending = state.pendingModelRequests.get(event.requestId);
     if (pending) {
@@ -8356,6 +9879,43 @@ function applyAgentEvent(event) {
           sessionId: event.sessionId || null,
         });
       }
+    }
+    return;
+  }
+
+  if (event.type === 'session.goal_result' && event.requestId) {
+    const pending = state.pendingGoalRequests.get(event.requestId);
+    if (pending) {
+      if (event.error) {
+        pending.reject(new Error(event.error));
+      } else {
+        pending.resolve({
+          goal: event.goal || null,
+          result: event.result || null,
+          hostId: event.hostId,
+          sessionId: event.sessionId || null,
+        });
+      }
+    }
+    if (!event.error && event.sessionId) {
+      const runtimeKey = sessionKey(event.hostId, event.sessionId);
+      const current = state.sessionRuntime.get(runtimeKey) || {};
+      const runtime = {
+        ...current,
+        goal: event.goal || null,
+        updatedAt: event.timestamp || nowIso(),
+      };
+      state.sessionRuntime.set(runtimeKey, runtime);
+      upsertSession(event.hostId, {
+        sessionId: event.sessionId,
+        runtime,
+        lastUpdatedAt: event.timestamp || nowIso(),
+      });
+      broadcastSessionEvent(event.hostId, event.sessionId, 'session.runtime_updated', {
+        sessionId: event.sessionId,
+        runtime,
+        timestamp: event.timestamp || nowIso(),
+      });
     }
     return;
   }
@@ -8482,11 +10042,53 @@ function applyAgentEvent(event) {
 
   if (event.type === 'session.started') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
-    const bridgeSession = event.bridgeSessionId && event.bridgeSessionId !== effectiveSessionId
-      ? getSession(event.hostId, event.bridgeSessionId)
+    const bridgeSessionId = event.bridgeSessionId && event.bridgeSessionId !== effectiveSessionId
+      ? event.bridgeSessionId
+      : null;
+    const bridgeSession = bridgeSessionId
+      ? (state.sessions.get(sessionKey(event.hostId, bridgeSessionId)) || getSession(event.hostId, bridgeSessionId))
       : null;
     const currentSession = getSession(event.hostId, effectiveSessionId);
+    const currentRunId = bridgeSession?.runId || currentSession?.runId || null;
+    if (event.runId && currentRunId && event.runId !== currentRunId) {
+      emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+        severity: 'info',
+        source: 'relay',
+        kind: 'lifecycle',
+        method: 'session.started/ignored-stale-run',
+        message: `Ignored stale start update from run ${event.runId}.`,
+        data: {
+          eventRunId: event.runId,
+          currentRunId,
+        },
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
+    if (bridgeSessionId) {
+      rememberSessionAlias(event.hostId, bridgeSessionId, effectiveSessionId);
+    }
+    const runId = event.runId || bridgeSession?.runId || currentSession?.runId || null;
     const apiProfile = bridgeSession?.apiProfile || currentSession?.apiProfile || null;
+    const inheritedOriginSessionId = event.originSessionId
+      || bridgeSession?.originSessionId
+      || currentSession?.originSessionId
+      || null;
+    const inheritedSourceSessionId = event.sourceSessionId
+      || bridgeSession?.sourceSessionId
+      || currentSession?.sourceSessionId
+      || null;
+    const eventConversationKey = event.conversationKey && event.conversationKey !== effectiveSessionId
+      ? event.conversationKey
+      : '';
+    const inheritedConversationKey = eventConversationKey
+      || event.originSessionId
+      || bridgeSession?.conversationKey
+      || currentSession?.conversationKey
+      || inheritedOriginSessionId
+      || inheritedSourceSessionId
+      || event.bridgeSessionId
+      || effectiveSessionId;
     const next = event.bridgeSessionId && event.bridgeSessionId !== effectiveSessionId
       ? migrateSessionIdentity(event.hostId, event.bridgeSessionId, effectiveSessionId, {
         title: event.title || effectiveSessionId,
@@ -8497,9 +10099,10 @@ function applyAgentEvent(event) {
         createdAt: event.createdAt || bridgeSession?.createdAt || currentSession?.createdAt || nowIso(),
         messageCount: bridgeSession?.messageCount || currentSession?.messageCount || 0,
         runtime: event.runtime || null,
-        originSessionId: event.originSessionId || null,
-        sourceSessionId: event.sourceSessionId || null,
-        conversationKey: event.conversationKey || event.originSessionId || effectiveSessionId,
+        runId,
+        originSessionId: inheritedOriginSessionId,
+        sourceSessionId: inheritedSourceSessionId,
+        conversationKey: inheritedConversationKey,
         launchMode: event.launchMode || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
         apiProfile,
@@ -8514,9 +10117,10 @@ function applyAgentEvent(event) {
         createdAt: event.createdAt || currentSession?.createdAt || nowIso(),
         messageCount: currentSession?.messageCount || 0,
         runtime: event.runtime || null,
-        originSessionId: event.originSessionId || null,
-        sourceSessionId: event.sourceSessionId || null,
-        conversationKey: event.conversationKey || event.originSessionId || effectiveSessionId,
+        runId,
+        originSessionId: inheritedOriginSessionId,
+        sourceSessionId: inheritedSourceSessionId,
+        conversationKey: inheritedConversationKey,
         launchMode: event.launchMode || null,
         bridgeSessionId: event.bridgeSessionId || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
@@ -8529,7 +10133,10 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.output') {
-    const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
     const next = upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
       state: 'running',
@@ -8546,18 +10153,20 @@ function applyAgentEvent(event) {
       return;
     }
 
-    if (String(event.phase || event.kind || '').trim().toLowerCase() === 'commentary') {
+    const outputChannel = getOutputChannel(event);
+    if (isInternalOutputEvent(event)) {
       emitSessionDiagnostic(event.hostId, effectiveSessionId, {
         timestamp: event.timestamp || nowIso(),
         severity: 'info',
         source: event.source || 'codex',
-        kind: 'commentary',
-        method: event.method || 'session.output/commentary',
+        kind: diagnosticKindForOutputChannel(outputChannel),
+        method: event.method || `session.output/${outputChannel || 'internal'}`,
         message: event.chunk || '',
         data: {
           stream: event.stream || 'stdout',
           text: event.chunk || '',
-          phase: 'commentary',
+          phase: event.phase || null,
+          channel: event.channel || null,
         },
       });
       broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.snapshot', next);
@@ -8594,7 +10203,10 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.transcript') {
-    const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
     const normalizedTranscript = normalizeStoredTranscriptEntry({
       speaker: event.speaker || 'system',
       text: event.text || '',
@@ -8606,6 +10218,9 @@ function applyAgentEvent(event) {
       return;
     }
     const speaker = normalizedTranscript.speaker || 'system';
+    if (consumePendingUserTranscriptEcho(event.hostId, effectiveSessionId, normalizedTranscript)) {
+      return;
+    }
     const existing = getSession(event.hostId, effectiveSessionId);
     const next = upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
@@ -8623,16 +10238,35 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.state_changed') {
-    const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
     const existingSession = getSession(event.hostId, effectiveSessionId);
     const existingRuntime = state.sessionRuntime.get(sessionKey(event.hostId, effectiveSessionId)) || null;
+    const existingRunId = existingSession?.runId || existingRuntime?.runId || null;
+    if (event.runId && existingRunId && event.runId !== existingRunId) {
+      emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+        severity: 'info',
+        source: 'relay',
+        kind: 'lifecycle',
+        method: 'session.state_changed/ignored-stale-run',
+        message: `Ignored stale state update from run ${event.runId}.`,
+        data: {
+          eventRunId: event.runId,
+          currentRunId: existingRunId,
+          state: event.state || null,
+          live: typeof event.live === 'boolean' ? event.live : null,
+        },
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
     const wasEnding = existingSession?.state === 'ending' || existingRuntime?.phase === 'ending';
     const next = upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
       state: event.state || 'unknown',
       live: typeof event.live === 'boolean' ? event.live : true,
+      runId: event.runId || existingRunId || null,
       lastUpdatedAt: nowIso(),
-    });
+    }, { preserveManagedLive: event.live !== false });
 
     if (event.live === false) {
       const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
@@ -8642,6 +10276,7 @@ function applyAgentEvent(event) {
         activeTurnId: null,
         waitingOnApproval: false,
         waitingOnUserInput: false,
+        runId: event.runId || existingRunId || null,
         updatedAt: event.timestamp || nowIso(),
       });
       broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.runtime_updated', {
@@ -8652,11 +10287,22 @@ function applyAgentEvent(event) {
       });
     }
 
-    if (/^failed:/i.test(next.state) || (/^exited:(?!0:)/i.test(next.state) && !wasEnding)) {
+    const nextState = String(next.state || '');
+    const isExitState = /^exited:/i.test(nextState);
+    const isCleanExit = /^exited:0:/i.test(nextState);
+    const isStoppedState = /^(history-only|stopped|closed)$/i.test(nextState);
+    if (isStoppedState) {
+      emitSessionAlert(event.hostId, effectiveSessionId, {
+        severity: 'info',
+        source: 'runtime',
+        message: 'Session stopped successfully. History is still available and can be resumed.',
+        timestamp: event.timestamp || nowIso(),
+      });
+    } else if (/^failed:/i.test(nextState) || (isExitState && !isCleanExit && !wasEnding)) {
       emitSessionAlert(event.hostId, effectiveSessionId, {
         severity: 'error',
         source: 'runtime',
-        message: `Session state changed: ${next.state}`,
+        message: `Session state changed: ${nextState}`,
         timestamp: event.timestamp || nowIso(),
       });
     }
@@ -8666,7 +10312,10 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.runtime_updated') {
-    const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
     const existing = getSession(event.hostId, effectiveSessionId);
     upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
@@ -8674,6 +10323,7 @@ function applyAgentEvent(event) {
       source: existing?.source || (event.source === 'codex-jsonl' ? 'imported' : 'managed'),
       state: existing?.state || (event.patch?.phase || 'imported'),
       live: Boolean(existing?.live),
+      runId: event.runId || existing?.runId || event.patch?.runId || null,
       lastUpdatedAt: event.timestamp || nowIso(),
       nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
     });
@@ -8704,6 +10354,9 @@ function applyAgentEvent(event) {
 
   if (event.type === 'session.review_started') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
     emitSessionDiagnostic(event.hostId, effectiveSessionId, {
       severity: 'info',
       source: 'codex',
@@ -8723,17 +10376,22 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.diagnostic') {
-    const existing = getSession(event.hostId, sessionId);
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    const existing = getSession(event.hostId, effectiveSessionId);
     upsertSession(event.hostId, {
-      sessionId,
-      title: existing?.title || sessionId,
+      sessionId: effectiveSessionId,
+      title: existing?.title || effectiveSessionId,
       source: existing?.source || (event.source === 'codex-jsonl' ? 'imported' : 'managed'),
       state: existing?.state || 'imported',
       live: Boolean(existing?.live),
+      runId: event.runId || existing?.runId || null,
       lastUpdatedAt: event.timestamp || nowIso(),
-      nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || sessionId,
+      nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
     });
-    emitSessionDiagnostic(event.hostId, sessionId, {
+    emitSessionDiagnostic(event.hostId, effectiveSessionId, {
       severity: event.severity || 'info',
       source: event.source || 'codex',
       kind: event.kind || 'event',
@@ -8748,6 +10406,10 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.request') {
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
     emitSessionRequest(event.hostId, sessionId, {
       requestId: event.requestId,
       createdAt: event.timestamp || nowIso(),
@@ -8765,7 +10427,11 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.request.resolved') {
-    resolveSessionRequest(event.hostId, sessionId, event.requestId, {
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    resolveSessionRequest(event.hostId, effectiveSessionId, event.requestId, {
       status: event.status || 'resolved',
       updatedAt: event.timestamp || nowIso(),
       response: event.response || null,
@@ -8776,19 +10442,23 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.error') {
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
     const message = event.message || 'session error';
     if (/no live session for command session\.(model_list|stop)/i.test(message)) {
-      markSessionClosed(event.hostId, sessionId);
+      markSessionClosed(event.hostId, effectiveSessionId);
       return;
     }
 
-    emitSessionAlert(event.hostId, sessionId, {
+    emitSessionAlert(event.hostId, effectiveSessionId, {
       severity: 'error',
       source: 'runtime',
       message,
       timestamp: event.timestamp || nowIso(),
     });
-    broadcastSessionEvent(event.hostId, sessionId, 'session.error', {
+    broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.error', {
       ...event,
       timestamp: event.timestamp || nowIso(),
     });
@@ -8796,7 +10466,11 @@ function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.alert') {
-    emitSessionAlert(event.hostId, sessionId, {
+    const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    emitSessionAlert(event.hostId, effectiveSessionId, {
       severity: event.severity || 'warning',
       source: event.source || 'runtime',
       message: event.message || '',
