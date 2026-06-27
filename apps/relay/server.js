@@ -61,10 +61,26 @@ const INPUT_REQUEST_DEDUPE_LIMIT = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE
 const LOCAL_AGENT_WATCHDOG_ENABLED = String(process.env.RELAY_LOCAL_AGENT_WATCHDOG_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const LOCAL_AGENT_WATCHDOG_INTERVAL_MS = Number(process.env.RELAY_LOCAL_AGENT_WATCHDOG_INTERVAL_MS || 5000);
 const LOCAL_AGENT_OFFLINE_RESTART_MS = Number(process.env.RELAY_LOCAL_AGENT_OFFLINE_RESTART_MS || 45000);
+const LOCAL_AGENT_STARTUP_GRACE_MS = Number(process.env.RELAY_LOCAL_AGENT_STARTUP_GRACE_MS || 5 * 60 * 1000);
 const LOCAL_AGENT_RESTART_COOLDOWN_MS = Number(process.env.RELAY_LOCAL_AGENT_RESTART_COOLDOWN_MS || 10000);
 const LOCAL_AGENT_EXIT_RESTART_DELAY_MS = Number(process.env.RELAY_LOCAL_AGENT_EXIT_RESTART_DELAY_MS || 2000);
 const COMMAND_QUEUE_TTL_MS = Number(process.env.RELAY_COMMAND_QUEUE_TTL_MS || 10 * 60 * 1000);
 const COMMAND_QUEUE_MAX_LENGTH = Number(process.env.RELAY_COMMAND_QUEUE_MAX_LENGTH || 1000);
+const COMMAND_PRIORITY = Object.freeze({
+  high: 0,
+  normal: 10,
+});
+const HIGH_PRIORITY_COMMAND_TYPES = new Set([
+  'host.file_download',
+  'host.file_download_info',
+  'host.file_download_chunk',
+  'session.watch',
+  'session.unwatch',
+  'session.input',
+  'session.interrupt',
+  'session.steer',
+  'session.request.respond',
+]);
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
 let relayAuthAccount = loadRelayAuthAccount();
 
@@ -816,11 +832,7 @@ function loadSessionDiagnostics() {
       }
     }
     if (changed) {
-      fs.mkdirSync(path.dirname(SESSION_DIAGNOSTICS_PATH), { recursive: true });
-      fs.writeFileSync(SESSION_DIAGNOSTICS_PATH, JSON.stringify({
-        savedAt: nowIso(),
-        diagnostics: persistedDiagnostics,
-      }, null, 2), 'utf8');
+      void writeSessionDiagnosticsSnapshot(persistedDiagnostics);
     }
     return diagnostics;
   } catch {
@@ -828,7 +840,7 @@ function loadSessionDiagnostics() {
   }
 }
 
-function saveSessionDiagnostics() {
+function buildSessionDiagnosticsSnapshot() {
   const diagnostics = {};
   for (const [key, entries] of state.sessionDiagnostics.entries()) {
     const compacted = compactSessionDiagnostics((Array.isArray(entries) ? entries : [])
@@ -838,15 +850,25 @@ function saveSessionDiagnostics() {
       diagnostics[key] = compacted;
     }
   }
-  fs.mkdirSync(path.dirname(SESSION_DIAGNOSTICS_PATH), { recursive: true });
-  fs.writeFileSync(SESSION_DIAGNOSTICS_PATH, JSON.stringify({
+  return diagnostics;
+}
+
+async function writeSessionDiagnosticsSnapshot(diagnostics) {
+  await fs.promises.mkdir(path.dirname(SESSION_DIAGNOSTICS_PATH), { recursive: true });
+  await fs.promises.writeFile(SESSION_DIAGNOSTICS_PATH, JSON.stringify({
     savedAt: nowIso(),
     diagnostics,
   }, null, 2), 'utf8');
 }
 
+async function saveSessionDiagnostics() {
+  await writeSessionDiagnosticsSnapshot(buildSessionDiagnosticsSnapshot());
+}
+
 let sessionLogsSaveTimer = null;
 let sessionDiagnosticsSaveTimer = null;
+let sessionDiagnosticsSaveInFlight = null;
+let sessionDiagnosticsSavePending = false;
 
 function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
   if (sessionLogsSaveTimer) {
@@ -866,20 +888,38 @@ function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
 }
 
 function scheduleSessionDiagnosticsSave(delayMs = PERSIST_DEBOUNCE_MS) {
+  sessionDiagnosticsSavePending = true;
   if (sessionDiagnosticsSaveTimer) {
     return;
   }
   sessionDiagnosticsSaveTimer = setTimeout(() => {
     sessionDiagnosticsSaveTimer = null;
-    try {
-      saveSessionDiagnostics();
-    } catch (error) {
-      console.warn(`[relay] failed to save session diagnostics: ${error.message}`);
-    }
+    void flushSessionDiagnosticsSave();
   }, Math.max(0, Number(delayMs) || 0));
   if (typeof sessionDiagnosticsSaveTimer.unref === 'function') {
     sessionDiagnosticsSaveTimer.unref();
   }
+}
+
+async function flushSessionDiagnosticsSave() {
+  if (sessionDiagnosticsSaveInFlight) {
+    return sessionDiagnosticsSaveInFlight;
+  }
+  if (!sessionDiagnosticsSavePending) {
+    return null;
+  }
+  sessionDiagnosticsSavePending = false;
+  sessionDiagnosticsSaveInFlight = saveSessionDiagnostics()
+    .catch((error) => {
+      console.warn(`[relay] failed to save session diagnostics: ${error.message}`);
+    })
+    .finally(() => {
+      sessionDiagnosticsSaveInFlight = null;
+      if (sessionDiagnosticsSavePending) {
+        void flushSessionDiagnosticsSave();
+      }
+    });
+  return sessionDiagnosticsSaveInFlight;
 }
 
 const state = {
@@ -1626,6 +1666,38 @@ function requestHostSessionDiscovery(hostId) {
   return true;
 }
 
+function enqueueSessionWatch(hostId, sessionId, body = {}) {
+  const session = getSession(hostId, sessionId) || {};
+  return enqueueCommand(hostId, {
+    type: 'session.watch',
+    sessionId,
+    requestId: body.requestId || makeId(),
+    clientId: body.clientId || null,
+    viewId: body.viewId || null,
+    nativeThreadId: body.nativeThreadId || session.nativeThreadId || null,
+    bridgeSessionId: body.bridgeSessionId || session.bridgeSessionId || null,
+    originSessionId: body.originSessionId || session.originSessionId || null,
+    sourceSessionId: body.sourceSessionId || session.sourceSessionId || null,
+    conversationKey: body.conversationKey || session.conversationKey || null,
+  });
+}
+
+function enqueueSessionUnwatch(hostId, sessionId, body = {}) {
+  const session = getSession(hostId, sessionId) || {};
+  return enqueueCommand(hostId, {
+    type: 'session.unwatch',
+    sessionId,
+    requestId: body.requestId || makeId(),
+    clientId: body.clientId || null,
+    viewId: body.viewId || null,
+    nativeThreadId: body.nativeThreadId || session.nativeThreadId || null,
+    bridgeSessionId: body.bridgeSessionId || session.bridgeSessionId || null,
+    originSessionId: body.originSessionId || session.originSessionId || null,
+    sourceSessionId: body.sourceSessionId || session.sourceSessionId || null,
+    conversationKey: body.conversationKey || session.conversationKey || null,
+  });
+}
+
 function getLocalRelayHostId() {
   return safeLocalAgentId(process.env.RELAY_LOCAL_HOST_ID || process.env.HOST_ID || os.hostname() || 'local')
     .toLowerCase();
@@ -1959,7 +2031,7 @@ function localAgentWatchdogTick() {
     }
     const startedAtMs = localAgentTimestampMs(record.startedAt);
     const startedAgeMs = startedAtMs ? Date.now() - startedAtMs : Number.POSITIVE_INFINITY;
-    if (startedAgeMs < LOCAL_AGENT_OFFLINE_RESTART_MS) {
+    if (startedAgeMs < LOCAL_AGENT_STARTUP_GRACE_MS) {
       continue;
     }
     const host = state.hosts.get(record.hostId);
@@ -7363,13 +7435,20 @@ function upsertSession(hostId, patch, options = {}) {
 function enqueueCommand(hostId, command) {
   const queue = state.commandQueues.get(hostId) || [];
   const next = {
+    ...command,
     id: state.nextCommandId++,
     createdAt: nowIso(),
-    ...command,
+    priority: commandPriority(command),
   };
   queue.push(next);
   state.commandQueues.set(hostId, pruneCommandQueue(queue));
   return next;
+}
+
+function commandPriority(command) {
+  return HIGH_PRIORITY_COMMAND_TYPES.has(String(command?.type || ''))
+    ? COMMAND_PRIORITY.high
+    : COMMAND_PRIORITY.normal;
 }
 
 function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
@@ -7527,7 +7606,17 @@ function getRelayManagedLiveSessions(hostId = '') {
 function getCommands(hostId, afterId = 0) {
   const queue = pruneCommandQueue(state.commandQueues.get(hostId) || []);
   state.commandQueues.set(hostId, queue);
-  return queue.filter((command) => command.id > afterId);
+  return sortCommandsForDelivery(queue.filter((command) => command.id > afterId));
+}
+
+function sortCommandsForDelivery(commands) {
+  return [...(Array.isArray(commands) ? commands : [])].sort((a, b) => {
+    const priorityDelta = Number(a?.priority ?? COMMAND_PRIORITY.normal) - Number(b?.priority ?? COMMAND_PRIORITY.normal);
+    if (priorityDelta !== 0) {
+      return priorityDelta;
+    }
+    return Number(a?.id || 0) - Number(b?.id || 0);
+  });
 }
 
 function pruneCommandQueue(queue) {
@@ -8644,6 +8733,31 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if ((req.method === 'POST' || req.method === 'DELETE') && url.pathname.match(/^\/api\/sessions\/[^/]+\/watch$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = String(url.searchParams.get('hostId') || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+
+    const body = req.method === 'POST' ? await readBody(req) : {};
+    const command = req.method === 'POST'
+      ? enqueueSessionWatch(hostId, sessionId, body)
+      : enqueueSessionUnwatch(hostId, sessionId, {
+        clientId: url.searchParams.get('clientId') || '',
+        viewId: url.searchParams.get('viewId') || '',
+      });
+    sendJson(res, 200, { ok: true, command });
+    return;
+  }
+
   if (req.method === 'PATCH' && url.pathname.match(/^\/api\/sessions\/[^/]+\/title$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const body = await readBody(req);
@@ -8836,7 +8950,7 @@ async function handleRequest(req, res) {
       }
     }
     saveSessionLogs();
-    saveSessionDiagnostics();
+    scheduleSessionDiagnosticsSave(0);
     sendJson(res, 200, { ok: true, hostId });
     return;
   }
@@ -9755,6 +9869,22 @@ function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'watch.performance') {
+    const targets = event.sessionId
+      ? [getSession(event.hostId, event.sessionId)].filter(Boolean)
+      : Array.from(state.sessions.values()).filter((session) => session.hostId === event.hostId && session.live);
+    const message = event.message || 'Realtime session sync is slow. Close idle live conversations to reduce Windows-side history work.';
+    for (const session of targets.slice(0, 20)) {
+      emitSessionAlert(event.hostId, session.sessionId, {
+        severity: event.severity || 'warning',
+        source: 'watch.performance',
+        message,
+        timestamp: event.timestamp || nowIso(),
+      });
+    }
+    return;
+  }
+
   if (event.type === 'directory.listed' && event.requestId) {
     const pending = state.pendingDirectoryRequests.get(event.requestId);
     if (pending) {
@@ -10502,7 +10632,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`relay listening on http://127.0.0.1:${PORT}`);
   if (LOCAL_AGENT_WATCHDOG_ENABLED) {
-    console.log(`local agent watchdog enabled; restart after ${Math.round(LOCAL_AGENT_OFFLINE_RESTART_MS / 1000)}s stale heartbeat`);
+    console.log(`local agent watchdog enabled; startup grace ${Math.round(LOCAL_AGENT_STARTUP_GRACE_MS / 1000)}s, restart after ${Math.round(LOCAL_AGENT_OFFLINE_RESTART_MS / 1000)}s stale heartbeat`);
   }
   if (RELAY_AUTH_TOKEN) {
     console.log(`relay auth enabled; token file: ${RELAY_AUTH_TOKEN_PATH}`);

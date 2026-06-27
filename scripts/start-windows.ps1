@@ -15,7 +15,6 @@ $ScriptsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $ScriptsDir
 $LogDir = Join-Path $Root "tmp\windows-start"
 $RelayLog = Join-Path $LogDir "relay.log"
-$AgentLog = Join-Path $LogDir "host-agent.log"
 
 function Get-EnvOrDefault {
   param(
@@ -122,6 +121,70 @@ function Start-RemoteCodexConsole {
     -PassThru
 }
 
+function Get-RelayAuthHeader {
+  $tokenPath = Join-Path $Root "tmp\relay-auth-token.txt"
+  if (-not (Test-Path -LiteralPath $tokenPath)) {
+    return @{}
+  }
+  $token = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
+  if ([string]::IsNullOrWhiteSpace($token)) {
+    return @{}
+  }
+  return @{ Authorization = "Bearer $token" }
+}
+
+function Wait-RelayHealth {
+  param(
+    [string]$Url,
+    [int]$Attempts = 30
+  )
+
+  for ($i = 0; $i -lt $Attempts; $i += 1) {
+    try {
+      Invoke-WebRequest -UseBasicParsing -Uri "$Url/health" -TimeoutSec 1 | Out-Null
+      return $true
+    } catch {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  return $false
+}
+
+function Start-RelayManagedLocalAgent {
+  param(
+    [string]$Url,
+    [string]$TargetHostId,
+    [string]$TargetHostLabel
+  )
+
+  $headers = Get-RelayAuthHeader
+  $body = @{
+    action = "start"
+    label = $TargetHostLabel
+  } | ConvertTo-Json -Compress
+
+  if ($DryRun) {
+    Write-Host "[dry-run] would request relay-managed local agent for $TargetHostId"
+    Write-Host "POST $Url/api/hosts/$TargetHostId/local-agent $body"
+    return
+  }
+
+  try {
+    $response = Invoke-RestMethod `
+      -UseBasicParsing `
+      -Method Post `
+      -Uri "$Url/api/hosts/$TargetHostId/local-agent" `
+      -Headers $headers `
+      -ContentType "application/json" `
+      -Body $body `
+      -TimeoutSec 10
+    $status = if ($response.localAgent -and $response.localAgent.status) { $response.localAgent.status } else { $response.status }
+    Write-Host "Relay-managed local agent requested. Status: $status"
+  } catch {
+    throw "Failed to start relay-managed local agent: $($_.Exception.Message)"
+  }
+}
+
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
   throw "Node.js was not found in PATH. Install Node.js 22+ first, then run start-windows.bat again."
@@ -175,11 +238,9 @@ if ($restartRequested) {
     Start-Sleep -Seconds 1
   }
   $relayProcesses = @(Get-RepoProcess "apps\relay\server.js")
-  $agentProcesses = @(Get-RepoProcess "apps\host-agent\agent.js")
 }
 
 $relayProcess = $relayProcesses | Select-Object -First 1
-$agentProcess = $agentProcesses | Select-Object -First 1
 
 if ($relayProcess) {
   Write-Host "Relay already appears to be running in this repo. PID: $($relayProcess.ProcessId)"
@@ -189,6 +250,9 @@ if ($relayProcess) {
   $relayCommand = @"
 Set-Location -LiteralPath $(ConvertTo-PsLiteral $Root)
 `$env:PORT = $(ConvertTo-PsLiteral ([string]$Port))
+`$env:LOCAL_CODEX_HOME = $(ConvertTo-PsLiteral $CodexHome)
+`$env:RELAY_LOCAL_AGENT_WATCHDOG_ENABLED = 'true'
+`$env:RELAY_LOCAL_AGENT_STARTUP_GRACE_MS = '300000'
 Write-Host "[relay] starting at $url"
 Write-Host "[relay] log: $RelayLog"
 node apps/relay/server.js *>&1 | Tee-Object -FilePath $(ConvertTo-PsLiteral $RelayLog) -Append
@@ -199,42 +263,21 @@ node apps/relay/server.js *>&1 | Tee-Object -FilePath $(ConvertTo-PsLiteral $Rel
   }
 }
 
-if ($agentProcess) {
-  Write-Host "Host-agent already appears to be running in this repo. PID: $($agentProcess.ProcessId)"
-} else {
-  $agentCommand = @"
-Set-Location -LiteralPath $(ConvertTo-PsLiteral $Root)
-Start-Sleep -Seconds 2
-`$env:RELAY_URL = $(ConvertTo-PsLiteral $url)
-`$env:HOST_ID = $(ConvertTo-PsLiteral $HostId)
-`$env:HOST_LABEL = $(ConvertTo-PsLiteral $HostLabel)
-`$env:CODEX_HOME = $(ConvertTo-PsLiteral $CodexHome)
-Write-Host "[agent] host $HostId connecting to $url"
-Write-Host "[agent] log: $AgentLog"
-node apps/host-agent/agent.js *>&1 | Tee-Object -FilePath $(ConvertTo-PsLiteral $AgentLog) -Append
-"@
-  $startedAgent = Start-RemoteCodexConsole -Title "Remote Codex Host Agent" -Command $agentCommand
-  if ($startedAgent) {
-    Write-Host "Started host-agent. PID: $($startedAgent.Id)"
-  }
-}
-
 if (-not $DryRun) {
-  for ($i = 0; $i -lt 30; $i += 1) {
-    try {
-      Invoke-WebRequest -UseBasicParsing -Uri "$url/health" -TimeoutSec 1 | Out-Null
-      break
-    } catch {
-      Start-Sleep -Milliseconds 500
-    }
+  if (-not (Wait-RelayHealth -Url $url)) {
+    throw "Relay did not become healthy at $url"
   }
+  Start-RelayManagedLocalAgent -Url $url -TargetHostId $HostId -TargetHostLabel $HostLabel
 
   if (-not $NoBrowser) {
     Start-Process $url
   }
+} else {
+  Start-RelayManagedLocalAgent -Url $url -TargetHostId $HostId -TargetHostLabel $HostLabel
 }
 
 Write-Host ""
-Write-Host "Remote Codex launch requested. Keep the relay and host-agent windows open while using it."
+Write-Host "Remote Codex launch requested. Keep the relay window open while using it."
+Write-Host "The local host-agent is managed by relay watchdog and the UI Restart Local / Stop Local controls."
 Write-Host "To use another port: .\start-windows.bat -Port 8787"
 Write-Host "Restart is enabled by default. To reuse existing processes: .\start-windows.bat -NoRestart"

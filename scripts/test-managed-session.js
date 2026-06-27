@@ -255,16 +255,47 @@ async function verifyAgentJsonlTail() {
     '',
   ].join('\n'));
 
+  await postJson(`/api/hosts/${encodeURIComponent(HOST_ID)}/import`, {});
+
   await waitFor(async () => {
     const sessions = await getJson(`/api/hosts/${encodeURIComponent(HOST_ID)}/sessions`);
     return (sessions.sessions || []).find((item) => item.sessionId === tailSessionId) || null;
   }, 10000, 250);
 
+  await postJson(`/api/sessions/${encodeURIComponent(tailSessionId)}/watch?hostId=${encodeURIComponent(HOST_ID)}`, {
+    clientId: 'managed-smoke',
+    viewId: 'jsonl-tail',
+  });
+
+  const appendedPrompt = `${prompt}-appended`;
+  await sleep(1800);
+  fs.appendFileSync(rolloutPath, [
+    JSON.stringify({
+      timestamp: '2026-05-27T04:35:03.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'agent_message',
+        message: appendedPrompt,
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-27T04:35:04.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_started',
+        turn_id: 'jsonl-tail-appended-turn',
+        model_context_window: 258400,
+      },
+    }),
+    '',
+  ].join('\n'));
+
   const detail = await waitFor(async () => {
-    const response = await getJson(`/api/sessions/${encodeURIComponent(tailSessionId)}/detail?hostId=${encodeURIComponent(HOST_ID)}`);
+    const response = await getJson(`/api/sessions/${encodeURIComponent(tailSessionId)}/detail?hostId=${encodeURIComponent(HOST_ID)}&full=1`);
     const hasPrompt = (response.transcript || []).some((entry) => entry.text === prompt);
-    const hasRuntime = response.runtime?.activeTurnId === 'jsonl-tail-turn';
-    return hasPrompt && hasRuntime ? response : null;
+    const hasAppendedPrompt = (response.transcript || []).some((entry) => entry.text === appendedPrompt);
+    const hasRuntime = response.runtime?.activeTurnId === 'jsonl-tail-appended-turn';
+    return hasPrompt && hasAppendedPrompt && hasRuntime ? response : null;
   }, 10000, 250);
 
   return {
@@ -300,6 +331,7 @@ async function verifyCodexTailer() {
       events.push(event);
     },
   });
+  tailer.setWatchedSessions([{ sessionId, nativeThreadId: sessionId, rolloutPath }]);
   tailer.prime();
   fs.appendFileSync(rolloutPath, [
     JSON.stringify({

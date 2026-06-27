@@ -12,10 +12,11 @@ class CodexSessionTailer {
     this.maxBytesPerPoll = Number(options.maxBytesPerPoll || DEFAULT_MAX_BYTES_PER_POLL);
     this.log = typeof options.log === 'function' ? options.log : () => {};
     this.files = new Map();
+    this.watchedSessions = new Map();
   }
 
   prime() {
-    const sessions = this.discoverTailSessions();
+    const sessions = this.getActiveTailSessions();
     for (const session of sessions) {
       const stats = safeStat(session.rolloutPath);
       if (!stats) {
@@ -31,8 +32,36 @@ class CodexSessionTailer {
     return { sessionCount: sessions.length };
   }
 
+  setWatchedSessions(sessions = []) {
+    const next = new Map();
+    for (const session of sessions || []) {
+      const normalized = normalizeTailSession(session);
+      if (!normalized) {
+        continue;
+      }
+      next.set(normalized.rolloutPath, normalized);
+      if (!this.files.has(normalized.rolloutPath)) {
+        const stats = safeStat(normalized.rolloutPath);
+        this.files.set(normalized.rolloutPath, {
+          session: normalized,
+          offset: stats?.size || 0,
+          partial: '',
+          primed: true,
+        });
+      }
+    }
+    this.watchedSessions = next;
+
+    for (const filePath of Array.from(this.files.keys())) {
+      if (!next.has(filePath)) {
+        this.files.delete(filePath);
+      }
+    }
+    return this.watchedSessions.size;
+  }
+
   async poll() {
-    const sessions = this.discoverTailSessions();
+    const sessions = this.getActiveTailSessions();
     const seenPaths = new Set();
     let newSessionCount = 0;
     let emittedEvents = 0;
@@ -44,14 +73,16 @@ class CodexSessionTailer {
       seenPaths.add(session.rolloutPath);
       let state = this.files.get(session.rolloutPath);
       if (!state) {
+        const stats = safeStat(session.rolloutPath);
         state = {
           session,
-          offset: 0,
+          offset: stats?.size || 0,
           partial: '',
-          primed: false,
+          primed: true,
         };
         this.files.set(session.rolloutPath, state);
         newSessionCount += 1;
+        continue;
       } else {
         state.session = {
           ...state.session,
@@ -106,8 +137,13 @@ class CodexSessionTailer {
     return {
       newSessionCount,
       emittedEvents,
+      activeSessionCount: sessions.length,
       truncated: false,
     };
+  }
+
+  getActiveTailSessions() {
+    return Array.from(this.watchedSessions.values());
   }
 
   discoverTailSessions() {
@@ -167,6 +203,22 @@ class CodexSessionTailer {
       }, { retryOnTransient: true });
     }
   }
+}
+
+function normalizeTailSession(session) {
+  if (!session || !session.rolloutPath) {
+    return null;
+  }
+  const sessionId = String(session.sessionId || session.nativeThreadId || parseSessionIdFromFilePath(session.rolloutPath) || '').trim();
+  if (!sessionId) {
+    return null;
+  }
+  return {
+    ...session,
+    sessionId,
+    nativeThreadId: session.nativeThreadId || sessionId,
+    rolloutPath: session.rolloutPath,
+  };
 }
 
 function readFileDelta(filePath, offset, byteLength) {

@@ -4,7 +4,15 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const { discoverCodexSessions, extractSessionDiagnostics, extractSessionTranscript, getDefaultCodexHome, makeTranscriptEntry } = require('../../shared/codex-discovery');
+const {
+  discoverCodexSessions,
+  extractSessionDiagnostics,
+  extractSessionTranscript,
+  findCodexSessionFile,
+  getDefaultCodexHome,
+  makeTranscriptEntry,
+  readCodexSessionSummary,
+} = require('../../shared/codex-discovery');
 const { CodexSessionTailer } = require('../../shared/codex-tail');
 const { makeId, nowIso, normalizeArgs } = require('../../shared/protocol');
 const { resolveManagedRuntime, startManagedRuntimeSession } = require('./runtime-adapters');
@@ -19,6 +27,16 @@ const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1500);
 const DISCOVERY_INTERVAL_MS = Number(process.env.DISCOVERY_INTERVAL_MS || 15000);
 const CODEX_TAIL_ENABLED = String(process.env.CODEX_TAIL_ENABLED || 'true') !== 'false';
 const CODEX_TAIL_INTERVAL_MS = Number(process.env.CODEX_TAIL_INTERVAL_MS || 1000);
+const CODEX_DISCOVERY_LIST_PREVIEW = String(
+  process.env.CODEX_DISCOVERY_LIST_PREVIEW || (process.platform !== 'win32' ? 'true' : 'false')
+).trim().toLowerCase() !== 'false';
+const CODEX_DISCOVERY_LIST_META_LIMIT = Number(
+  process.env.CODEX_DISCOVERY_LIST_META_LIMIT || (CODEX_DISCOVERY_LIST_PREVIEW ? 250 : 40)
+);
+const SESSION_WATCH_TTL_MS = Math.max(30000, Number(process.env.AGENT_SESSION_WATCH_TTL_MS || 5 * 60 * 1000));
+const WATCH_PERFORMANCE_WARN_MS = Math.max(1000, Number(process.env.AGENT_WATCH_PERFORMANCE_WARN_MS || 8000));
+const WATCH_PERFORMANCE_SLOW_MS = Math.max(WATCH_PERFORMANCE_WARN_MS, Number(process.env.AGENT_WATCH_PERFORMANCE_SLOW_MS || 15000));
+const WATCH_PERFORMANCE_REPORT_COOLDOWN_MS = Math.max(10000, Number(process.env.AGENT_WATCH_PERFORMANCE_REPORT_COOLDOWN_MS || 60000));
 const AUTO_START_SESSION = String(process.env.AUTO_START_SESSION || 'true') !== 'false';
 const MANAGED_RUNTIME = process.env.MANAGED_RUNTIME || '';
 const MANAGED_COMMAND = process.env.MANAGED_COMMAND || 'codex-app-server';
@@ -38,6 +56,8 @@ const WINDOWS_DRIVE_PROBE_LETTERS = String(process.env.AGENT_WINDOWS_BROWSE_DRIV
 
 const liveSessions = new Map();
 const activeFileUploads = new Map();
+const watchedHistorySessions = new Map();
+let lastWatchPerformanceReportAt = 0;
 const codexTailer = CODEX_TAIL_ENABLED
   ? new CodexSessionTailer({
     codexHome: CODEX_HOME,
@@ -341,7 +361,11 @@ async function heartbeat() {
 }
 
 async function sendDiscovery() {
-  const sessions = discoverCodexSessions({ codexHome: CODEX_HOME }).map((session) => ({
+  const sessions = discoverCodexSessions({
+    codexHome: CODEX_HOME,
+    preview: CODEX_DISCOVERY_LIST_PREVIEW,
+    metaReadLimit: CODEX_DISCOVERY_LIST_META_LIMIT,
+  }).map((session) => ({
     sessionId: session.sessionId,
     title: session.title,
     cwd: session.cwd,
@@ -400,24 +424,232 @@ async function sendDiscovery() {
   }, { retryOnTransient: true });
 }
 
+function collectSessionIdentityCandidates(input = {}) {
+  return [
+    input.sessionId,
+    input.nativeThreadId,
+    input.bridgeSessionId,
+    input.originSessionId,
+    input.sourceSessionId,
+    input.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+}
+
+function resolveSessionFileFromCandidates(input = {}) {
+  for (const candidate of collectSessionIdentityCandidates(input)) {
+    const found = findCodexSessionFile({
+      codexHome: CODEX_HOME,
+      sessionId: candidate,
+      nativeThreadId: candidate,
+      bridgeSessionId: candidate,
+      originSessionId: candidate,
+      sourceSessionId: candidate,
+      conversationKey: candidate,
+    });
+    if (found) {
+      return found;
+    }
+  }
+  return null;
+}
+
 function resolveDiscoveredSession(command = {}) {
-  const candidates = new Set([
-    command.sessionId,
-    command.nativeThreadId,
-    command.bridgeSessionId,
-    command.originSessionId,
-    command.sourceSessionId,
-    command.conversationKey,
-  ].map((value) => String(value || '').trim()).filter(Boolean));
+  const candidates = new Set(collectSessionIdentityCandidates(command));
 
   if (!candidates.size) {
     return null;
+  }
+
+  const found = resolveSessionFileFromCandidates(command);
+  if (found?.rolloutPath) {
+    const includePreview = !(command.fullTranscript === true || command.full === true || command.preview === false);
+    return readCodexSessionSummary(found.rolloutPath, {
+      metaReadLimit: 80,
+      preview: includePreview,
+    }) || found;
   }
 
   return discoverCodexSessions({ codexHome: CODEX_HOME }).find((session) => (
     candidates.has(String(session.sessionId || ''))
     || candidates.has(String(session.nativeThreadId || ''))
   )) || null;
+}
+
+function watchKey(command = {}) {
+  return [
+    command.clientId,
+    command.viewId,
+    command.sessionId,
+    command.nativeThreadId,
+    command.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean).join('::');
+}
+
+async function handleSessionWatch(command = {}) {
+  const requestId = command.requestId || makeId();
+  const requestedSessionId = String(command.sessionId || command.nativeThreadId || '').trim();
+  const found = resolveSessionFileFromCandidates(command);
+  if (!found?.rolloutPath) {
+    await postEvent({
+      type: 'session.watch.updated',
+      hostId: HOST_ID,
+      requestId,
+      sessionId: requestedSessionId,
+      watched: false,
+      error: `history session ${requestedSessionId || '(unknown)'} was not found under CODEX_HOME`,
+      timestamp: nowIso(),
+    }, { bestEffort: true });
+    return;
+  }
+
+  const key = watchKey(command) || found.sessionId;
+  watchedHistorySessions.set(key, {
+    ...found,
+    sessionId: found.sessionId,
+    nativeThreadId: found.nativeThreadId || found.sessionId,
+    clientId: command.clientId || null,
+    viewId: command.viewId || null,
+    requestedSessionId: requestedSessionId || null,
+    conversationKey: command.conversationKey || null,
+    expiresAt: Date.now() + SESSION_WATCH_TTL_MS,
+  });
+  refreshTailerWatchedSessions();
+  await postEvent({
+    type: 'session.watch.updated',
+    hostId: HOST_ID,
+    requestId,
+    sessionId: found.sessionId,
+    requestedSessionId: requestedSessionId || null,
+    nativeThreadId: found.nativeThreadId || found.sessionId,
+    watched: true,
+    watchedSessionCount: watchedHistorySessions.size,
+    timestamp: nowIso(),
+  }, { bestEffort: true });
+}
+
+async function handleSessionUnwatch(command = {}) {
+  const key = watchKey(command);
+  let removed = 0;
+  if (key && watchedHistorySessions.delete(key)) {
+    removed += 1;
+  }
+
+  const identities = new Set(collectSessionIdentityCandidates(command));
+  if (identities.size) {
+    for (const [entryKey, entry] of Array.from(watchedHistorySessions.entries())) {
+      if (
+        identities.has(String(entry.sessionId || ''))
+        || identities.has(String(entry.nativeThreadId || ''))
+        || identities.has(String(entry.requestedSessionId || ''))
+        || identities.has(String(entry.conversationKey || ''))
+      ) {
+        watchedHistorySessions.delete(entryKey);
+        removed += 1;
+      }
+    }
+  }
+
+  refreshTailerWatchedSessions();
+  await postEvent({
+    type: 'session.watch.updated',
+    hostId: HOST_ID,
+    requestId: command.requestId || makeId(),
+    sessionId: command.sessionId || command.nativeThreadId || null,
+    watched: false,
+    removed,
+    watchedSessionCount: watchedHistorySessions.size,
+    timestamp: nowIso(),
+  }, { bestEffort: true });
+}
+
+function pruneExpiredWatchedSessions() {
+  const now = Date.now();
+  for (const [key, entry] of Array.from(watchedHistorySessions.entries())) {
+    if (Number(entry.expiresAt || 0) <= now) {
+      watchedHistorySessions.delete(key);
+    }
+  }
+}
+
+function uniqueLiveRunners() {
+  return Array.from(new Set(Array.from(liveSessions.values()).filter(Boolean)));
+}
+
+function resolveLiveTailSessions() {
+  const sessions = [];
+  for (const runner of uniqueLiveRunners()) {
+    const liveSessionId = typeof runner.currentSessionId === 'function'
+      ? runner.currentSessionId()
+      : runner.sessionId;
+    const found = resolveSessionFileFromCandidates({
+      sessionId: liveSessionId,
+      nativeThreadId: runner.nativeThreadId,
+      bridgeSessionId: runner.bridgeSessionId,
+      runId: runner.runId,
+      conversationKey: runner.conversationKey,
+    });
+    if (found?.rolloutPath) {
+      sessions.push({
+        ...found,
+        live: true,
+      });
+    }
+  }
+  return sessions;
+}
+
+function refreshTailerWatchedSessions() {
+  if (!codexTailer) {
+    return { activeSessionCount: 0, watchedSessionCount: 0, liveSessionCount: 0 };
+  }
+  pruneExpiredWatchedSessions();
+  const liveTailSessions = resolveLiveTailSessions();
+  const active = new Map();
+  for (const session of watchedHistorySessions.values()) {
+    if (session?.rolloutPath) {
+      active.set(session.rolloutPath, session);
+    }
+  }
+  for (const session of liveTailSessions) {
+    if (session?.rolloutPath) {
+      active.set(session.rolloutPath, session);
+    }
+  }
+  const activeSessionCount = codexTailer.setWatchedSessions(Array.from(active.values()));
+  return {
+    activeSessionCount,
+    watchedSessionCount: watchedHistorySessions.size,
+    liveSessionCount: liveTailSessions.length,
+  };
+}
+
+async function maybeReportWatchPerformance(pollMs, result, scope) {
+  if (pollMs < WATCH_PERFORMANCE_WARN_MS) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastWatchPerformanceReportAt < WATCH_PERFORMANCE_REPORT_COOLDOWN_MS) {
+    return;
+  }
+  lastWatchPerformanceReportAt = now;
+  const severity = pollMs >= WATCH_PERFORMANCE_SLOW_MS ? 'warning' : 'info';
+  const activeSessionCount = Number(result?.activeSessionCount ?? scope?.activeSessionCount ?? 0) || 0;
+  const message = severity === 'warning'
+    ? `Realtime session sync took ${Math.round(pollMs / 1000)}s for ${activeSessionCount} active session(s). Close idle live conversations or switch away from sessions you no longer need.`
+    : `Realtime session sync is slowing down (${Math.round(pollMs)}ms for ${activeSessionCount} active session(s)).`;
+  await postEvent({
+    type: 'watch.performance',
+    hostId: HOST_ID,
+    severity,
+    message,
+    pollMs,
+    platform: process.platform,
+    activeSessionCount,
+    watchedSessionCount: scope?.watchedSessionCount || 0,
+    liveSessionCount: scope?.liveSessionCount || 0,
+    thresholdMs: severity === 'warning' ? WATCH_PERFORMANCE_SLOW_MS : WATCH_PERFORMANCE_WARN_MS,
+    timestamp: nowIso(),
+  }, { bestEffort: true });
 }
 
 function sessionDetailDiagnosticOptions(fullDiagnostics = false) {
@@ -1617,6 +1849,16 @@ async function handleCommand(command) {
     return;
   }
 
+  if (command.type === 'session.watch') {
+    await handleSessionWatch(command);
+    return;
+  }
+
+  if (command.type === 'session.unwatch') {
+    await handleSessionUnwatch(command);
+    return;
+  }
+
   if (command.type === 'session.detail') {
     await handleSessionDetail(command);
     return;
@@ -2154,7 +2396,11 @@ async function codexTailLoop() {
 
   while (true) {
     try {
+      const scope = refreshTailerWatchedSessions();
+      const startedAt = Date.now();
       const result = await codexTailer.poll();
+      const pollMs = Date.now() - startedAt;
+      await maybeReportWatchPerformance(pollMs, result, scope);
       if (result.newSessionCount > 0) {
         await sendDiscovery();
       }
@@ -2182,35 +2428,50 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function runStartupDiscovery() {
+  await retryStartupStep('send initial discovery', sendDiscovery);
+}
+
+async function runStartupTailPrime() {
+  if (!codexTailer) {
+    return;
+  }
+  try {
+    const result = codexTailer.prime();
+    console.log(`[agent] codex tail primed ${result.sessionCount} session(s)`);
+  } catch (error) {
+    logAgentError('[agent] codex tail prime failed:', error.message);
+  }
+}
+
+async function runStartupAutoStart() {
+  if (!AUTO_START_SESSION) {
+    return;
+  }
+  try {
+    await startManagedSession({
+      command: MANAGED_COMMAND,
+      args: MANAGED_ARGS,
+      cwd: MANAGED_CWD,
+      label: MANAGED_COMMAND === 'demo' ? `${HOST_LABEL} demo` : `${HOST_LABEL} live`,
+    });
+  } catch (error) {
+    console.error('[agent] auto-start session failed:', error.message);
+  }
+}
+
 async function main() {
   console.log(`[agent] host ${HOST_ID} connecting to ${RELAY_URL}`);
   console.log(`[agent] codex home ${CODEX_HOME}`);
 
   await retryStartupStep('register host', registerHost);
-  await retryStartupStep('send initial discovery', sendDiscovery);
-  if (codexTailer) {
-    try {
-      const result = codexTailer.prime();
-      console.log(`[agent] codex tail primed ${result.sessionCount} session(s)`);
-    } catch (error) {
-      logAgentError('[agent] codex tail prime failed:', error.message);
-    }
-  }
 
-  if (AUTO_START_SESSION) {
-    try {
-      await startManagedSession({
-        command: MANAGED_COMMAND,
-        args: MANAGED_ARGS,
-        cwd: MANAGED_CWD,
-        label: MANAGED_COMMAND === 'demo' ? `${HOST_LABEL} demo` : `${HOST_LABEL} live`,
-      });
-    } catch (error) {
-      console.error('[agent] auto-start session failed:', error.message);
-    }
-  }
+  const loops = [pollCommandsLoop(), heartbeatLoop(), discoveryLoop(), codexTailLoop()];
+  void runStartupDiscovery();
+  void runStartupTailPrime();
+  void runStartupAutoStart();
 
-  await Promise.all([pollCommandsLoop(), discoveryLoop(), heartbeatLoop(), codexTailLoop()]);
+  await Promise.all(loops);
 }
 
 async function retryStartupStep(label, task, attempts = 8) {

@@ -40,6 +40,9 @@ const state = {
   transcriptUserDetached: new Set(),
   transcriptVisibleLimits: new Map(),
   fullTranscriptLoaded: new Set(),
+  historyLoading: new Set(),
+  watchedSessionKey: null,
+  watchClientId: null,
   manualSessionTitles: new Map(),
   alertWindowOpen: false,
   statusWindowOpen: false,
@@ -1404,6 +1407,90 @@ function makeSessionKey(hostId, sessionId) {
 
 function getSessionKey(session) {
   return session ? makeSessionKey(session.hostId, session.sessionId) : null;
+}
+
+function getWatchClientId() {
+  if (!state.watchClientId) {
+    state.watchClientId = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+  return state.watchClientId;
+}
+
+function setHistoryLoading(session, loading) {
+  const key = getSessionKey(session);
+  if (!key) {
+    return;
+  }
+  if (loading) {
+    state.historyLoading.add(key);
+  } else {
+    state.historyLoading.delete(key);
+  }
+}
+
+function isHistoryLoading(session) {
+  const key = getSessionKey(session);
+  return Boolean(key && state.historyLoading.has(key));
+}
+
+async function unwatchSelectedSession(sessionKey = state.watchedSessionKey) {
+  if (!sessionKey) {
+    return;
+  }
+  const [hostId, sessionId] = sessionKey.split('::');
+  if (!hostId || !sessionId) {
+    return;
+  }
+  if (state.watchedSessionKey === sessionKey) {
+    state.watchedSessionKey = null;
+  }
+  const params = new URLSearchParams({
+    hostId,
+    clientId: getWatchClientId(),
+    viewId: 'primary',
+  });
+  try {
+    await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/watch?${params.toString()}`, {
+      method: 'DELETE',
+      skipAuthHandling: true,
+    });
+  } catch (_) {
+    // Best effort: stale watches expire on the host-agent side.
+  }
+}
+
+async function watchSelectedSession(session) {
+  const key = getSessionKey(session);
+  if (!session?.hostId || !session?.sessionId || !key) {
+    return;
+  }
+  if (state.watchedSessionKey && state.watchedSessionKey !== key) {
+    await unwatchSelectedSession(state.watchedSessionKey);
+  }
+  state.watchedSessionKey = key;
+  const params = new URLSearchParams({ hostId: session.hostId });
+  try {
+    await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/watch?${params.toString()}`, {
+      method: 'POST',
+      skipAuthHandling: true,
+      body: JSON.stringify({
+        clientId: getWatchClientId(),
+        viewId: 'primary',
+        nativeThreadId: session.nativeThreadId || null,
+        bridgeSessionId: session.bridgeSessionId || null,
+        originSessionId: session.originSessionId || null,
+        sourceSessionId: session.sourceSessionId || null,
+        conversationKey: session.conversationKey || null,
+      }),
+    });
+  } catch (error) {
+    appendAlertForSession(session.hostId, session.sessionId, {
+      severity: 'warning',
+      source: 'ui',
+      message: `Realtime watch could not be started: ${error.message}`,
+      timestamp: new Date().toISOString(),
+    });
+  }
 }
 
 function sessionLaunchLabel(mode) {
@@ -10664,7 +10751,9 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   if (!visibleTranscript.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = session.source === 'managed'
+    empty.textContent = isHistoryLoading(session)
+      ? 'Loading history...'
+      : session.source === 'managed'
       ? 'Waiting for the managed session transcript...'
       : 'No transcript preview was captured for this imported session.';
     log.appendChild(empty);
@@ -11149,6 +11238,7 @@ function flushQueuedUiRenders() {
 }
 
 function closeStream() {
+  const previousWatchKey = state.watchedSessionKey;
   if (state.eventSource) {
     if (state.eventSourceKey) {
       state.streamStatus.set(state.eventSourceKey, {
@@ -11159,6 +11249,9 @@ function closeStream() {
     state.eventSource.close();
     state.eventSource = null;
     state.eventSourceKey = null;
+  }
+  if (previousWatchKey) {
+    unwatchSelectedSession(previousWatchKey).catch(() => {});
   }
 }
 
@@ -11380,14 +11473,16 @@ async function showSession(session = getSelectedSession(), options = {}) {
   renderSessionDetails();
   renderRuntimePanel();
   renderThinkingPanel();
-  renderTranscript(session, { forceScroll: true, focus: options.focus || null });
 
   if (!session) {
     closeStream();
     return;
   }
 
+  setHistoryLoading(session, true);
+  renderTranscript(session, { forceScroll: true, focus: options.focus || null });
   subscribeSession(session);
+  void watchSelectedSession(session);
 
   try {
     const originalSessionKey = getSessionKey(session);
@@ -11425,6 +11520,8 @@ async function showSession(session = getSelectedSession(), options = {}) {
     mergeDiagnosticsForSession(detailHostId, detailSessionId, getDiagnosticsForSession(session));
     mergeDiagnosticsForSession(detailHostId, detailSessionId, detail.diagnostics || []);
     setRequestsForSession(detailHostId, detailSessionId, detail.requests || []);
+    setHistoryLoading(session, false);
+    setHistoryLoading(detailSession, false);
     loadReceivedFilesForSession(detailSession).then((files) => {
       if (!files.length) {
         return;
@@ -11456,6 +11553,7 @@ async function showSession(session = getSelectedSession(), options = {}) {
       renderTranscript(selected, { focus: options.focus || navigatorFocus || null });
     }
   } catch (error) {
+    setHistoryLoading(session, false);
     appendAlertForSession(session.hostId, session.sessionId, {
       severity: 'error',
       source: 'ui',
@@ -12033,7 +12131,7 @@ function renderExportDialog() {
   const dateSelectAllButton = el('export-dates-select-all-button');
   const dateClearButton = el('export-dates-clear-button');
   if (dateSelectAllButton) {
-    dateSelectAllButton.disabled = !selectableDays.length || selectableDays.every((day) => selectedDays.has(day.date));
+    dateSelectAllButton.disabled = !selectableDays.length || selectableDays.every((day) => selectedDays.has(day));
   }
   if (dateClearButton) {
     dateClearButton.disabled = !selectedDays.size && !dialog.fromDate && !dialog.toDate;
@@ -12105,6 +12203,13 @@ function exportSelectedSessionHistory(format = 'markdown', options = {}) {
   const link = document.createElement('a');
   link.href = url;
   link.rel = 'noopener';
+  const normalizedFormat = String(format || 'markdown').toLowerCase();
+  const extension = normalizedFormat === 'zip' || normalizedFormat === 'bundle'
+    ? 'zip'
+    : normalizedFormat === 'json'
+      ? 'json'
+      : 'md';
+  link.download = `${makeSafeAttachmentName(sessionDisplayTitle(session), shortId(session.sessionId || 'conversation'))}.${extension}`;
   link.style.display = 'none';
   document.body.appendChild(link);
   link.click();
@@ -14980,7 +15085,7 @@ el('export-day-list')?.addEventListener('click', (event) => {
 el('export-dates-select-all-button')?.addEventListener('click', () => {
   state.exportDialog.fromDate = '';
   state.exportDialog.toDate = '';
-  state.exportDialog.selectedDays = new Set(getExportSelectableDays().map((day) => day.date).filter(Boolean));
+  state.exportDialog.selectedDays = new Set(getExportSelectableDays().filter(Boolean));
   renderExportDialog();
 });
 

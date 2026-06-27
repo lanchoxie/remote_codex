@@ -15,6 +15,10 @@ function getDefaultCodexHome() {
 
 function discoverCodexSessions(options = {}) {
   const codexHome = options.codexHome || getDefaultCodexHome();
+  const includePreview = options.preview !== false;
+  const metaReadLimit = Math.max(0, Number(
+    Object.prototype.hasOwnProperty.call(options, 'metaReadLimit') ? options.metaReadLimit : 250
+  ) || 0);
   const discovered = new Map();
 
   const indexPath = path.join(codexHome, 'session_index.jsonl');
@@ -46,13 +50,13 @@ function discoverCodexSessions(options = {}) {
       return;
     }
 
-    const rows = readJsonLines(filePath, 250);
+    const rows = metaReadLimit > 0 ? readJsonLines(filePath, metaReadLimit) : [];
     const meta = getSessionMeta(filePath, rows);
     if (!meta || !meta.id) {
       return;
     }
 
-    const preview = extractSessionPreview(filePath);
+    const preview = includePreview ? extractSessionPreview(filePath) : emptySessionPreview();
     const stats = safeStat(filePath);
     const existing = discovered.get(meta.id) || {};
     discovered.set(meta.id, {
@@ -94,6 +98,100 @@ function discoverCodexSessions(options = {}) {
       nativeThreadId: session.nativeThreadId || session.sessionId,
       cwdLabel: session.cwd ? path.basename(session.cwd) || session.cwd : '(unknown)',
     }));
+}
+
+function emptySessionPreview() {
+  return {
+    latestUserMessage: null,
+    latestAgentMessage: null,
+    transcriptPreview: [],
+    cwd: null,
+    firstTimestamp: null,
+    lastTimestamp: null,
+    messageCount: 0,
+  };
+}
+
+function findCodexSessionFile(options = {}) {
+  const codexHome = options.codexHome || getDefaultCodexHome();
+  const candidates = new Set([
+    options.sessionId,
+    options.nativeThreadId,
+    options.bridgeSessionId,
+    options.originSessionId,
+    options.sourceSessionId,
+    options.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean));
+
+  if (!candidates.size) {
+    return null;
+  }
+
+  let found = null;
+  const sessionsRoot = path.join(codexHome, 'sessions');
+  walkFiles(sessionsRoot, (filePath) => {
+    if (found || !filePath.endsWith('.jsonl')) {
+      return;
+    }
+    const sessionId = parseSessionIdFromFilePath(filePath);
+    if (!sessionId || !candidates.has(sessionId)) {
+      return;
+    }
+    const stats = safeStat(filePath);
+    found = {
+      sessionId,
+      nativeThreadId: sessionId,
+      rolloutPath: filePath,
+      createdAt: parseTimestampFromFilePath(filePath),
+      updatedAt: stats?.mtime?.toISOString() || null,
+      source: 'rollout',
+      live: false,
+      imported: true,
+    };
+    return false;
+  });
+  return found;
+}
+
+function readCodexSessionSummary(filePath, options = {}) {
+  if (!filePath) {
+    return null;
+  }
+  const rows = readJsonLines(filePath, Math.max(0, Number(options.metaReadLimit || 80) || 80));
+  const meta = getSessionMeta(filePath, rows);
+  if (!meta || !meta.id) {
+    return null;
+  }
+  const preview = options.preview === false ? emptySessionPreview() : extractSessionPreview(filePath);
+  const stats = safeStat(filePath);
+  return {
+    sessionId: meta.id,
+    nativeThreadId: meta.id,
+    title: meta.thread_name || meta.id,
+    cwd: meta.cwd || preview.cwd || null,
+    createdAt: earliestTimestamp(
+      meta.timestamp,
+      preview.firstTimestamp,
+      parseTimestampFromFilePath(filePath)
+    ),
+    updatedAt: latestTimestamp(
+      preview.lastTimestamp,
+      stats?.mtime?.toISOString(),
+      meta.timestamp
+    ),
+    messageCount: preview.messageCount || 0,
+    source: meta.source || 'rollout',
+    originator: meta.originator || null,
+    cliVersion: meta.cli_version || null,
+    imported: true,
+    live: false,
+    summary: pick(meta, ['cwd', 'timestamp', 'originator', 'cli_version', 'source']),
+    latestUserMessage: preview.latestUserMessage || null,
+    latestAgentMessage: preview.latestAgentMessage || null,
+    transcriptPreview: preview.transcriptPreview || [],
+    rolloutPath: filePath,
+    cwdLabel: (meta.cwd || preview.cwd) ? path.basename(meta.cwd || preview.cwd) || (meta.cwd || preview.cwd) : '(unknown)',
+  };
 }
 
 function extractSessionPreview(filePath) {
@@ -1069,25 +1167,32 @@ function safeStat(filePath) {
 
 function walkFiles(rootDir, visit) {
   if (!fs.existsSync(rootDir)) {
-    return;
+    return true;
   }
 
   const entries = fs.readdirSync(rootDir, { withFileTypes: true });
   for (const entry of entries) {
     const fullPath = path.join(rootDir, entry.name);
     if (entry.isDirectory()) {
-      walkFiles(fullPath, visit);
+      if (walkFiles(fullPath, visit) === false) {
+        return false;
+      }
     } else if (entry.isFile()) {
-      visit(fullPath);
+      if (visit(fullPath) === false) {
+        return false;
+      }
     }
   }
+  return true;
 }
 
 module.exports = {
   discoverCodexSessions,
   extractSessionDiagnostics,
   extractSessionTranscript,
+  findCodexSessionFile,
   getDefaultCodexHome,
   makeCodexRowEvents,
   makeTranscriptEntry,
+  readCodexSessionSummary,
 };

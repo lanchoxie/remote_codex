@@ -8,6 +8,8 @@
     "dev": "node scripts/dev.js",
     "relay": "node apps/relay/server.js",
     "agent": "node apps/host-agent/agent.js",
-    "test:managed": "node scripts/test-managed-session.js"
+    "test:managed": "node scripts/test-managed-session.js",
+    "test:export-dialog": "node scripts/test-export-dialog.js",
+    "test:start-windows": "node scripts/test-start-windows-script.js"
   }
 }
