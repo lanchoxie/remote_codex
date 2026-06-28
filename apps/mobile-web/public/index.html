@@ -355,6 +355,23 @@
             <button id="toggle-navigator-button" type="button" class="secondary-button navigator-toggle-button">Navigator</button>
             <button id="toggle-language-button" type="button" class="secondary-button">中文</button>
             <button id="open-settings-button" type="button" class="secondary-button">Settings</button>
+            <div class="message-notification-anchor">
+              <button id="message-notification-button" type="button" class="secondary-button message-notification-button" aria-expanded="false" aria-controls="message-notification-panel" title="No unread Codex messages">
+                <span class="message-notification-icon" aria-hidden="true">&#128276;</span>
+                <span id="message-notification-count" class="message-notification-count hidden">0</span>
+              </button>
+              <div id="message-notification-panel" class="message-notification-panel hidden" aria-hidden="true">
+                <div class="message-notification-header">
+                  <div>
+                    <div class="eyebrow">New Messages</div>
+                    <div class="message-notification-heading">Unread Codex replies</div>
+                  </div>
+                  <button id="mark-all-message-notifications-read-button" type="button" class="secondary-button">Mark all read</button>
+                </div>
+                <div id="message-notification-empty" class="empty-state">No unread Codex messages.</div>
+                <div id="message-notification-list" class="message-notification-list"></div>
+              </div>
+            </div>
             <button id="toggle-status-button" type="button" class="secondary-button hidden" hidden aria-hidden="true">Status</button>
             <button id="end-session-button" type="button" class="danger-button hidden">End Session</button>
             <button id="end-all-sessions-button" type="button" class="danger-button hidden">Stop All</button>

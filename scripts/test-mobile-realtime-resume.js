@@ -93,4 +93,20 @@ assertContains(
   'mobile realtime health checks should run periodically'
 );
 
+assertContains(
+  app,
+  'await showSession(selected, { full: true, preserveScroll: true })',
+  'mobile realtime resume should reload the selected live session without pulling the transcript to the bottom'
+);
+assertContains(
+  app,
+  'const initialTranscriptRenderOptions = {',
+  'showSession should centralize its initial transcript scroll behavior'
+);
+assertContains(
+  app,
+  'preserveScroll: Boolean(options.preserveScroll)',
+  'showSession should be able to preserve transcript scroll during live refreshes'
+);
+
 console.log('mobile realtime resume assertions passed');

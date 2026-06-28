@@ -36,6 +36,10 @@ const state = {
   thinkingScrollPositions: new Map(),
   thinkingEntryCounts: new Map(),
   thinkingUnread: new Set(),
+  messageReadReceipts: new Map(),
+  messageUnread: new Set(),
+  messageNotificationOpen: false,
+  messageReadReceiptsInitializedAt: '',
   transcriptEntryCounts: new Map(),
   transcriptUnread: new Set(),
   transcriptUserDetached: new Set(),
@@ -204,6 +208,7 @@ const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
 const DISMISSED_ALERTS_STORAGE_KEY = 'mobile-codex-remote.dismissed-alerts.v1';
 const MANUAL_SESSION_TITLES_STORAGE_KEY = 'mobile-codex-remote.manual-session-titles.v1';
+const MESSAGE_READ_RECEIPTS_STORAGE_KEY = 'mobile-codex-remote.message-read-receipts.v1';
 const DEFAULT_COMPOSER_OPTIONS = {
   model: '',
   effort: 'xhigh',
@@ -938,6 +943,44 @@ function persistManualSessionTitles() {
   writeLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, serializeManualSessionTitles());
 }
 
+function normalizeMessageReadReceipts(input = {}) {
+  const result = new Map();
+  if (!input || typeof input !== 'object') {
+    return result;
+  }
+  for (const [key, value] of Object.entries(input)) {
+    if (!key || !value || typeof value !== 'object') {
+      continue;
+    }
+    const lastReadMessageKey = String(value.lastReadMessageKey || value.marker || '').trim();
+    if (!lastReadMessageKey) {
+      continue;
+    }
+    result.set(key, {
+      lastReadMessageKey,
+      lastReadAt: value.lastReadAt || new Date(0).toISOString(),
+    });
+  }
+  return result;
+}
+
+function serializeMessageReadReceipts() {
+  const serialized = {};
+  for (const [key, receipt] of state.messageReadReceipts.entries()) {
+    if (key && receipt?.lastReadMessageKey) {
+      serialized[key] = {
+        lastReadMessageKey: receipt.lastReadMessageKey,
+        lastReadAt: receipt.lastReadAt || new Date().toISOString(),
+      };
+    }
+  }
+  return serialized;
+}
+
+function persistMessageReadReceipts() {
+  writeLocalStorageJson(MESSAGE_READ_RECEIPTS_STORAGE_KEY, serializeMessageReadReceipts());
+}
+
 function rememberManualSessionTitle(session, title) {
   const key = getSessionKey(session);
   const normalized = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 180);
@@ -960,6 +1003,7 @@ function initializePersistentUiState() {
   state.navigatorCollapsed = readLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, true) !== false;
   state.dismissedAlerts = normalizeDismissedAlerts(readLocalStorageJson(DISMISSED_ALERTS_STORAGE_KEY, {}));
   state.manualSessionTitles = normalizeManualSessionTitles(readLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, {}));
+  state.messageReadReceipts = normalizeMessageReadReceipts(readLocalStorageJson(MESSAGE_READ_RECEIPTS_STORAGE_KEY, {}));
   const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
   state.ui.locale = storedUi.locale;
   state.ui.theme = storedUi.theme;
@@ -2785,6 +2829,11 @@ function sortConversationGroups(groups) {
     return direction === 1 ? Infinity : -Infinity;
   };
   sorted.sort((a, b) => {
+    const liveDelta = Number(a.liveCount > 0) - Number(b.liveCount > 0);
+    if (liveDelta !== 0) {
+      return -liveDelta;
+    }
+
     let delta = 0;
     if (sortBy === 'createdAt') {
       delta = sortableTime(a.createdAt) - sortableTime(b.createdAt);
@@ -3477,6 +3526,217 @@ function appendTranscriptEntry(hostId, sessionId, entry) {
   state.transcripts.set(key, dedupeTranscript([...existing, entry]));
 }
 
+function simpleMessageHash(value) {
+  const text = String(value || '');
+  let hash = 5381;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = ((hash << 5) + hash) ^ text.charCodeAt(index);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function isAssistantTranscriptEntry(entry) {
+  return Boolean(entry && (entry.speaker === 'agent' || entry.speaker === 'assistant') && String(entry.text || '').trim());
+}
+
+function getLatestAssistantMessageMarker(session) {
+  if (!session) {
+    return null;
+  }
+  const transcript = getTranscriptForSession(session).filter(isAssistantTranscriptEntry);
+  const latest = transcript[transcript.length - 1] || null;
+  if (latest) {
+    return {
+      key: [
+        latest.timestamp || '',
+        latest.speaker || 'assistant',
+        simpleMessageHash(latest.text),
+      ].join('|'),
+      timestamp: latest.timestamp || session.lastUpdatedAt || session.updatedAt || '',
+      text: latest.text || '',
+      source: 'transcript',
+    };
+  }
+
+  const fallback = String(session.latestAgentMessage || '').trim();
+  if (!fallback || fallback === '[object Object]' || /^\s*[\[{]/.test(fallback)) {
+    return null;
+  }
+  return {
+    key: [
+      session.lastUpdatedAt || session.updatedAt || '',
+      'summary',
+      Number(session.messageCount || 0),
+      simpleMessageHash(fallback),
+    ].join('|'),
+    timestamp: session.lastUpdatedAt || session.updatedAt || '',
+    text: fallback,
+    source: 'summary',
+  };
+}
+
+function markSessionMessagesRead(sessionOrHostId, sessionId = null) {
+  const session = typeof sessionOrHostId === 'object'
+    ? sessionOrHostId
+    : state.sessions.find((item) => item.hostId === sessionOrHostId && item.sessionId === sessionId);
+  const key = typeof sessionOrHostId === 'object'
+    ? getSessionKey(session)
+    : makeSessionKey(sessionOrHostId, sessionId);
+  if (!key || !session) {
+    return;
+  }
+  const marker = getLatestAssistantMessageMarker(session);
+  if (!marker?.key) {
+    state.messageUnread.delete(key);
+    return;
+  }
+  state.messageReadReceipts.set(key, {
+    lastReadMessageKey: marker.key,
+    lastReadAt: new Date().toISOString(),
+  });
+  state.messageUnread.delete(key);
+  persistMessageReadReceipts();
+}
+
+function updateMessageUnreadForSession(hostId, sessionId) {
+  const key = makeSessionKey(hostId, sessionId);
+  const session = state.sessions.find((item) => makeSessionKey(item.hostId, item.sessionId) === key) || { hostId, sessionId };
+  const marker = getLatestAssistantMessageMarker(session);
+  if (!marker?.key) {
+    state.messageUnread.delete(key);
+    return false;
+  }
+  const receipt = state.messageReadReceipts.get(key);
+  if (receipt?.lastReadMessageKey === marker.key) {
+    state.messageUnread.delete(key);
+    return false;
+  }
+  state.messageUnread.add(key);
+  return true;
+}
+
+function initializeMessageReadReceiptsForExistingSessions() {
+  if (state.messageReadReceiptsInitializedAt) {
+    return;
+  }
+  if (state.messageReadReceipts.size > 0) {
+    state.messageReadReceiptsInitializedAt = new Date().toISOString();
+    return;
+  }
+  let changed = false;
+  for (const session of state.sessions || []) {
+    const key = getSessionKey(session);
+    if (!key || state.messageReadReceipts.has(key)) {
+      continue;
+    }
+    const marker = getLatestAssistantMessageMarker(session);
+    if (!marker?.key) {
+      continue;
+    }
+    state.messageReadReceipts.set(key, {
+      lastReadMessageKey: marker.key,
+      lastReadAt: new Date().toISOString(),
+    });
+    changed = true;
+  }
+  state.messageReadReceiptsInitializedAt = new Date().toISOString();
+  if (changed) {
+    persistMessageReadReceipts();
+  }
+}
+
+function refreshMessageUnreadState() {
+  state.messageUnread.clear();
+  for (const session of state.sessions || []) {
+    updateMessageUnreadForSession(session.hostId, session.sessionId);
+  }
+}
+
+function hasUnreadMessagesForSession(session) {
+  const key = getSessionKey(session);
+  return Boolean(key && state.messageUnread.has(key));
+}
+
+function hasUnreadMessagesForGroup(group) {
+  return Boolean((group?.sessions || []).some(hasUnreadMessagesForSession));
+}
+
+function getUnreadMessageNotifications() {
+  return (state.sessions || [])
+    .filter(hasUnreadMessagesForSession)
+    .map((session) => {
+      const marker = getLatestAssistantMessageMarker(session);
+      return {
+        session,
+        key: getSessionKey(session),
+        title: session.title || session.conversationKey || session.sessionId,
+        hostLabel: getHost(session.hostId)?.label || session.hostId,
+        text: marker?.text || session.latestAgentMessage || '',
+        timestamp: marker?.timestamp || session.lastUpdatedAt || session.updatedAt || '',
+      };
+    })
+    .sort((a, b) => Date.parse(b.timestamp || '') - Date.parse(a.timestamp || ''));
+}
+
+function markAllMessageNotificationsRead() {
+  for (const notification of getUnreadMessageNotifications()) {
+    markSessionMessagesRead(notification.session);
+  }
+  state.messageNotificationOpen = false;
+  renderMessageNotificationBell();
+  renderConversationNav();
+}
+
+function renderMessageNotificationBell() {
+  const button = el('message-notification-button');
+  const panel = el('message-notification-panel');
+  const countEl = el('message-notification-count');
+  const list = el('message-notification-list');
+  const empty = el('message-notification-empty');
+  const notifications = getUnreadMessageNotifications();
+  const count = notifications.length;
+
+  if (button) {
+    button.classList.toggle('has-unread', count > 0);
+    button.setAttribute('aria-expanded', state.messageNotificationOpen ? 'true' : 'false');
+    button.title = count > 0 ? `${count} session(s) have unread Codex messages` : 'No unread Codex messages';
+  }
+  if (countEl) {
+    countEl.textContent = String(count);
+    countEl.classList.toggle('hidden', count < 1);
+  }
+  if (!panel || !list || !empty) {
+    return;
+  }
+
+  panel.classList.toggle('hidden', !state.messageNotificationOpen);
+  panel.setAttribute('aria-hidden', state.messageNotificationOpen ? 'false' : 'true');
+  list.innerHTML = '';
+  empty.classList.toggle('hidden', count > 0);
+  if (!count) {
+    return;
+  }
+
+  for (const notification of notifications) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'message-notification-item';
+    item.innerHTML = `
+      <span class="message-notification-title">${escapeHtml(notification.title)}</span>
+      <span class="message-notification-meta">${escapeHtml(notification.hostLabel)} | ${notification.session.live ? 'live' : 'history'} | ${escapeHtml(formatTime(notification.timestamp) || 'new')}</span>
+      <span class="message-notification-preview">${escapeHtml(truncatePreview(notification.text || 'New Codex message'))}</span>
+    `;
+    item.onclick = async () => {
+      state.messageNotificationOpen = false;
+      markSessionMessagesRead(notification.session);
+      await selectSession(notification.session);
+      renderMessageNotificationBell();
+      renderConversationNav();
+    };
+    list.appendChild(item);
+  }
+}
+
 function dedupeAlerts(entries) {
   const seen = new Set();
   const deduped = [];
@@ -3713,6 +3973,9 @@ function scrollTranscriptTo(position) {
     if (position === 'bottom') {
       setTranscriptUserDetached(key, false);
       clearTranscriptUnread();
+      markSessionMessagesRead(getSelectedSession());
+      renderConversationNav();
+      renderMessageNotificationBell();
     } else if (position === 'top') {
       setTranscriptUserDetached(key, true);
     }
@@ -5358,7 +5621,7 @@ function renderConversationNav() {
         : 'No prompt preview available';
 
     const item = document.createElement('div');
-    item.className = `conversation-card ${group.conversationKey === state.selectedConversationKey ? 'active' : ''}`;
+    item.className = `conversation-card ${group.liveCount > 0 ? 'live' : 'history'} ${hasUnreadMessagesForGroup(group) ? 'message-unread' : ''} ${group.conversationKey === state.selectedConversationKey ? 'active' : ''}`.trim();
     const createdLabel = formatTime(group.createdAt) || 'Unknown';
     const updatedLabel = formatTime(group.lastUpdatedAt) || 'Unknown';
     const messageCount = Number(group.messageCount || 0);
@@ -5392,6 +5655,12 @@ function renderConversationNav() {
     const variantRow = document.createElement('div');
     variantRow.className = 'variant-row';
     renderVariantButtons(variantRow, group, state.selectedSessionId);
+    if (group.liveCount > 0) {
+      const liveDot = document.createElement('span');
+      liveDot.className = 'conversation-live-dot';
+      liveDot.title = 'Live session';
+      item.appendChild(liveDot);
+    }
     item.appendChild(variantRow);
 
     const searchResults = getSearchResultsForGroup(group);
@@ -11308,6 +11577,7 @@ function renderAll() {
   renderSessionDetails();
   renderRuntimePanel();
   renderThinkingPanel();
+  renderMessageNotificationBell();
   renderAlertsWindow();
   renderStatusWindow();
   renderDirectoryPicker();
@@ -11334,6 +11604,7 @@ const queuedUiRenders = {
   sessionActionDialog: false,
   exportDialog: false,
   approvalPopup: false,
+  messageNotificationBell: false,
 };
 
 function resetQueuedUiRenderFlags() {
@@ -11350,6 +11621,7 @@ function resetQueuedUiRenderFlags() {
   queuedUiRenders.sessionActionDialog = false;
   queuedUiRenders.exportDialog = false;
   queuedUiRenders.approvalPopup = false;
+  queuedUiRenders.messageNotificationBell = false;
 }
 
 function scheduleQueuedUiFlush(delayMs = UI_EVENT_RENDER_DEBOUNCE_MS) {
@@ -11411,6 +11683,7 @@ function flushQueuedUiRenders() {
     sessionActionDialog: queuedUiRenders.sessionActionDialog,
     exportDialog: queuedUiRenders.exportDialog,
     approvalPopup: queuedUiRenders.approvalPopup,
+    messageNotificationBell: queuedUiRenders.messageNotificationBell,
   };
   resetQueuedUiRenderFlags();
 
@@ -11451,6 +11724,9 @@ function flushQueuedUiRenders() {
   if (renderPlan.approvalPopup) {
     renderApprovalPopup();
   }
+  if (renderPlan.messageNotificationBell) {
+    renderMessageNotificationBell();
+  }
 }
 
 function closeStream(options = {}) {
@@ -11489,7 +11765,7 @@ async function resumeSelectedSessionRealtime() {
     subscribeSession(selected);
     void watchSelectedSession(selected);
     if (selected.live) {
-      await showSession(selected, { full: true });
+      await showSession(selected, { full: true, preserveScroll: true });
     }
   } finally {
     state.streamRecoveryInFlight = false;
@@ -11594,6 +11870,7 @@ function subscribeSession(session) {
     const payload = JSON.parse(event.data);
     appendTranscriptEntry(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
     if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
+      updateMessageUnreadForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
       clearActiveDraftForSession({
         hostId: payload.hostId || session.hostId,
         sessionId: payload.sessionId || session.sessionId,
@@ -11603,6 +11880,11 @@ function subscribeSession(session) {
     if (selected && getSessionKey(selected) === key) {
       scheduleTranscriptRender({ forceScroll: payload.speaker === 'user' });
       queuedUiRenders.thinkingPanel = true;
+      queuedUiRenders.messageNotificationBell = true;
+      scheduleQueuedUiFlush();
+    } else if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
+      queuedUiRenders.messageNotificationBell = true;
+      queuedUiRenders.selectedViews = true;
       scheduleQueuedUiFlush();
     }
   });
@@ -11721,7 +12003,12 @@ async function showSession(session = getSelectedSession(), options = {}) {
   }
 
   setHistoryLoading(session, true);
-  renderTranscript(session, { forceScroll: true, focus: options.focus || null });
+  const initialTranscriptRenderOptions = {
+    forceScroll: !options.preserveScroll,
+    preserveScroll: Boolean(options.preserveScroll),
+    focus: options.focus || null,
+  };
+  renderTranscript(session, initialTranscriptRenderOptions);
   subscribeSession(session);
   void watchSelectedSession(session);
 
@@ -11732,7 +12019,10 @@ async function showSession(session = getSelectedSession(), options = {}) {
       renderSessionDetails();
       renderRuntimePanel();
       renderThinkingPanel();
-      renderTranscript(session, { focus: options.focus || null });
+      renderTranscript(session, {
+        focus: options.focus || null,
+        preserveScroll: Boolean(options.preserveScroll),
+      });
       return;
     }
 
@@ -13275,6 +13565,9 @@ async function selectConversation(conversation) {
   state.selectedHostId = conversation.hostId;
   state.selectedConversationKey = conversation.conversationKey;
   state.selectedSessionId = conversation.preferredSession?.sessionId || null;
+  if (conversation.preferredSession) {
+    markSessionMessagesRead(conversation.preferredSession);
+  }
   renderAll();
   showSession().catch(reportError);
 }
@@ -13291,6 +13584,7 @@ async function selectSession(session) {
   state.selectedHostId = session.hostId;
   state.selectedConversationKey = getSessionConversationKey(session);
   state.selectedSessionId = session.sessionId;
+  markSessionMessagesRead(session);
   renderAll();
   showSession(session).catch(reportError);
 }
@@ -13327,6 +13621,8 @@ async function refresh() {
   sessionResponses.forEach((response) => {
     (response.sessions || []).forEach((session) => state.sessions.push(applyManualSessionTitle(session)));
   });
+  initializeMessageReadReceiptsForExistingSessions();
+  refreshMessageUnreadState();
 
   if (state.connectorEditorId && !getConnector(state.connectorEditorId)) {
     state.connectorEditorId = null;
@@ -16035,6 +16331,19 @@ el('toggle-navigator-button').addEventListener('click', () => {
   renderAll();
 });
 
+el('message-notification-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  state.messageNotificationOpen = !state.messageNotificationOpen;
+  renderMessageNotificationBell();
+});
+
+el('mark-all-message-notifications-read-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  markAllMessageNotificationsRead();
+});
+
 el('scroll-transcript-top-button')?.addEventListener('click', (event) => {
   event.preventDefault();
   event.stopPropagation();
@@ -16052,6 +16361,9 @@ el('session-log')?.addEventListener('scroll', () => {
   if (isTranscriptPinnedToBottom(log)) {
     setTranscriptUserDetached();
     clearTranscriptUnread();
+    markSessionMessagesRead(getSelectedSession());
+    renderConversationNav();
+    renderMessageNotificationBell();
   } else {
     setTranscriptUserDetached(undefined, true);
   }
