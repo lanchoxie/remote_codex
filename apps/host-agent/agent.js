@@ -435,19 +435,37 @@ function collectSessionIdentityCandidates(input = {}) {
   ].map((value) => String(value || '').trim()).filter(Boolean);
 }
 
+function commandCodexHomeCandidates(input = {}) {
+  const values = [];
+  const add = (value) => {
+    const text = String(value || '').trim();
+    if (text && !values.includes(text)) {
+      values.push(text);
+    }
+  };
+  add(input.codexHome);
+  const runner = getRunnerForCommand(input);
+  add(runner?.codexHome);
+  add(runner?.runtime?.codexHome);
+  add(CODEX_HOME);
+  return values;
+}
+
 function resolveSessionFileFromCandidates(input = {}) {
-  for (const candidate of collectSessionIdentityCandidates(input)) {
-    const found = findCodexSessionFile({
-      codexHome: CODEX_HOME,
-      sessionId: candidate,
-      nativeThreadId: candidate,
-      bridgeSessionId: candidate,
-      originSessionId: candidate,
-      sourceSessionId: candidate,
-      conversationKey: candidate,
-    });
-    if (found) {
-      return found;
+  for (const codexHome of commandCodexHomeCandidates(input)) {
+    for (const candidate of collectSessionIdentityCandidates(input)) {
+      const found = findCodexSessionFile({
+        codexHome,
+        sessionId: candidate,
+        nativeThreadId: candidate,
+        bridgeSessionId: candidate,
+        originSessionId: candidate,
+        sourceSessionId: candidate,
+        conversationKey: candidate,
+      });
+      if (found) {
+        return found;
+      }
     }
   }
   return null;
@@ -469,10 +487,16 @@ function resolveDiscoveredSession(command = {}) {
     }) || found;
   }
 
-  return discoverCodexSessions({ codexHome: CODEX_HOME }).find((session) => (
-    candidates.has(String(session.sessionId || ''))
-    || candidates.has(String(session.nativeThreadId || ''))
-  )) || null;
+  for (const codexHome of commandCodexHomeCandidates(command)) {
+    const discovered = discoverCodexSessions({ codexHome }).find((session) => (
+      candidates.has(String(session.sessionId || ''))
+      || candidates.has(String(session.nativeThreadId || ''))
+    ));
+    if (discovered) {
+      return discovered;
+    }
+  }
+  return null;
 }
 
 function watchKey(command = {}) {
@@ -1941,6 +1965,26 @@ async function handleCommand(command) {
         timestamp: nowIso(),
       });
       return;
+    }
+
+    if (command.type === 'session.input') {
+      await postEvent({
+        type: 'session.runtime_updated',
+        hostId: HOST_ID,
+        sessionId: command.requestedSessionId || command.sessionId,
+        runId: command.runId || null,
+        patch: {
+          activeTurnId: null,
+          busy: false,
+          phase: 'error',
+          currentTurnStatus: 'failed',
+          queuedCommandId: null,
+          pendingInputSummary: null,
+          lastCodexError: 'session is not live on this host-agent; wait for the session to finish starting, then resend',
+          runId: command.runId || null,
+        },
+        timestamp: nowIso(),
+      }, { bestEffort: true });
     }
 
     await postEvent({

@@ -1115,6 +1115,7 @@ class CodexAppServerRunner {
       command: this.codexBin,
       args: ['app-server'],
       cwd: this.cwd,
+      codexHome: this.codexHome,
       nativeThreadId: this.nativeThreadId || null,
       launchMode: this.launchMode,
       codexHomeProfile: this.apiProfileHome ? 'api-profile-isolated' : 'managed-isolated',
@@ -2094,6 +2095,8 @@ class CodexAppServerRunner {
       await this.emitRuntime({
         threadId: params.thread.id,
         phase: 'idle',
+        startupStep: 'ready',
+        busy: false,
       });
       await this.emitDiagnostic({
         severity: 'info',

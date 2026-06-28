@@ -174,6 +174,9 @@ const state = {
   },
 };
 
+const DEFAULT_COLLECTION_ID = 'default';
+const TRASH_COLLECTION_ID = 'trash';
+
 const MAX_COMPOSER_IMAGES = 4;
 const MAX_COMPOSER_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_COMPOSER_TEXT_FILES = 4;
@@ -2601,6 +2604,53 @@ function getSessionsForHost(hostId) {
   return state.sessions.filter((session) => session.hostId === hostId);
 }
 
+function getTrashCollection() {
+  return state.sessionCollections.find((collection) => collection.collectionId === TRASH_COLLECTION_ID) || null;
+}
+
+function collectionItemsMatch(left, right) {
+  if (!left || !right || left.hostId !== right.hostId) {
+    return false;
+  }
+  if (left.conversationKey && right.conversationKey && left.conversationKey === right.conversationKey) {
+    return true;
+  }
+  return Boolean(left.sessionId && right.sessionId && left.sessionId === right.sessionId);
+}
+
+function buildCollectionMatchItem(groupOrSession) {
+  const conversationKey = groupOrSession?.conversationKey || getSessionConversationKey(groupOrSession);
+  return {
+    hostId: groupOrSession?.hostId,
+    conversationKey,
+    sessionId: groupOrSession?.sessionId || groupOrSession?.preferredSession?.sessionId || '',
+  };
+}
+
+function isConversationInTrash(groupOrSession) {
+  const trash = getTrashCollection();
+  const trashItems = Array.isArray(trash?.items) ? trash.items : [];
+  if (!trashItems.length || !groupOrSession) {
+    return false;
+  }
+  const item = buildCollectionMatchItem(groupOrSession);
+  return trashItems.some((entry) => collectionItemsMatch(entry, item));
+}
+
+function isConversationDiscarded(groupOrSession) {
+  const trash = getTrashCollection();
+  const discardedItems = Array.isArray(trash?.discardedItems) ? trash.discardedItems : [];
+  if (!discardedItems.length || !groupOrSession) {
+    return false;
+  }
+  const item = buildCollectionMatchItem(groupOrSession);
+  return discardedItems.some((entry) => collectionItemsMatch(entry, item));
+}
+
+function isConversationHiddenByTrash(groupOrSession) {
+  return isConversationInTrash(groupOrSession) || isConversationDiscarded(groupOrSession);
+}
+
 function getRecentDirectories(hostId, limit = 8) {
   const seen = new Set();
   const recent = [];
@@ -2647,7 +2697,7 @@ function getSessionConversationKey(session) {
 function getConversationGroups(hostId) {
   const groups = new Map();
 
-  for (const session of getSessionsForHost(hostId)) {
+  for (const session of getSessionsForHost(hostId).filter((entry) => !isConversationHiddenByTrash(entry))) {
     const conversationKey = getSessionConversationKey(session);
     const group = groups.get(conversationKey) || {
       hostId,
@@ -3273,7 +3323,7 @@ async function addSessionToCollection(collectionId, session) {
 }
 
 async function removeConversationFromCollection(collectionId, group) {
-  if (!collectionId || collectionId === 'default') {
+  if (!collectionId || collectionId === DEFAULT_COLLECTION_ID || collectionId === TRASH_COLLECTION_ID) {
     return;
   }
   await fetchJson(`/api/session-collections/${encodeURIComponent(collectionId)}/items/remove`, {
@@ -3282,6 +3332,44 @@ async function removeConversationFromCollection(collectionId, group) {
   });
   await refreshSessionCollections();
   renderAll();
+}
+
+async function previewConversationTrash(group) {
+  const response = await fetchJson('/api/session-collections/trash/preview', {
+    method: 'POST',
+    body: JSON.stringify({ item: buildCollectionItemFromConversation(group) }),
+  });
+  return response;
+}
+
+async function moveConversationToTrash(group) {
+  const response = await fetchJson('/api/session-collections/trash/items', {
+    method: 'POST',
+    body: JSON.stringify({ item: buildCollectionItemFromConversation(group) }),
+  });
+  await refreshSessionCollections();
+  renderAll();
+  return response;
+}
+
+async function restoreConversationFromTrash(group) {
+  const response = await fetchJson('/api/session-collections/trash/items/restore', {
+    method: 'POST',
+    body: JSON.stringify({ item: buildCollectionItemFromConversation(group) }),
+  });
+  await refreshSessionCollections();
+  renderAll();
+  return response;
+}
+
+async function emptyTrashCollection() {
+  const response = await fetchJson('/api/session-collections/trash/empty', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  await refreshSessionCollections();
+  renderAll();
+  return response;
 }
 
 function getLiveSessionForConversation(conversation) {
@@ -5046,16 +5134,38 @@ function renderCollectionTabs() {
   for (const collection of state.sessionCollections) {
     const row = document.createElement('div');
     row.className = 'collection-manager-row';
-    const isDefault = collection.collectionId === 'default';
+    const isDefault = collection.collectionId === DEFAULT_COLLECTION_ID;
+    const isTrash = collection.collectionId === TRASH_COLLECTION_ID;
     row.innerHTML = `
       <div class="collection-manager-copy">
         <strong>${escapeHtml(collection.name || 'Collection')}</strong>
-        <span>${escapeHtml(isDefault ? 'Default collection keeps every session.' : `${collection.itemCount || 0} saved conversation${collection.itemCount === 1 ? '' : 's'}.`)}</span>
+        <span>${escapeHtml(isDefault
+          ? 'Default collection keeps every visible session.'
+          : isTrash
+            ? `${collection.itemCount || 0} conversation${collection.itemCount === 1 ? '' : 's'} waiting for restore or discard.`
+            : `${collection.itemCount || 0} saved conversation${collection.itemCount === 1 ? '' : 's'}.`)}</span>
       </div>
     `;
     const actions = document.createElement('div');
     actions.className = 'collection-manager-actions';
-    if (!isDefault) {
+    if (isTrash) {
+      const emptyButton = document.createElement('button');
+      emptyButton.type = 'button';
+      emptyButton.className = 'danger-button';
+      emptyButton.textContent = 'Empty trash';
+      emptyButton.disabled = !Number(collection.itemCount || 0);
+      emptyButton.onclick = async () => {
+        if (!window.confirm('Empty trash? These conversations will disappear from this app and cannot be restored from Trash. Codex history files will not be deleted.')) {
+          return;
+        }
+        try {
+          await emptyTrashCollection();
+        } catch (error) {
+          reportError(error);
+        }
+      };
+      actions.appendChild(emptyButton);
+    } else if (!isDefault) {
       const renameButton = document.createElement('button');
       renameButton.type = 'button';
       renameButton.className = 'secondary-button';
@@ -5162,7 +5272,7 @@ function renderConversationNav() {
   }
   if (searchSummary) {
     const query = state.sessionSearchQuery.trim();
-    const scope = collection.collectionId === 'default'
+    const scope = collection.collectionId === DEFAULT_COLLECTION_ID
       ? `Default on ${host?.label || 'selected host'}`
       : collection.name;
     const fullMatchCount = state.sessionSearchResults.length;
@@ -5180,9 +5290,11 @@ function renderConversationNav() {
   if (!groups.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = collection.collectionId === 'default'
+    empty.textContent = collection.collectionId === DEFAULT_COLLECTION_ID
       ? 'Import a host or start a managed session to see conversations here.'
-      : 'This collection is empty. Save a conversation into it from Default.';
+      : collection.collectionId === TRASH_COLLECTION_ID
+        ? 'Trash is empty.'
+        : 'This collection is empty. Save a conversation into it from Default.';
     list.appendChild(empty);
     return;
   }
@@ -5257,14 +5369,15 @@ function renderConversationNav() {
     const collectionSelect = document.createElement('select');
     collectionSelect.className = 'collection-move-select native-select-control mobile-replaced-select';
     collectionSelect.innerHTML = '<option value="">Save to collection...</option>';
-    const collectionTargets = state.sessionCollections.filter((entry) => entry.collectionId !== 'default');
+    const isTrashCollection = collection.collectionId === TRASH_COLLECTION_ID;
+    const collectionTargets = state.sessionCollections.filter((entry) => entry.collectionId !== DEFAULT_COLLECTION_ID && entry.collectionId !== TRASH_COLLECTION_ID);
     for (const target of collectionTargets) {
       const option = document.createElement('option');
       option.value = target.collectionId;
       option.textContent = target.name;
       collectionSelect.appendChild(option);
     }
-    collectionSelect.disabled = group.collectionOnly || state.sessionCollections.length <= 1;
+    collectionSelect.disabled = isTrashCollection || group.collectionOnly || collectionTargets.length < 1;
     collectionSelect.onclick = (event) => event.stopPropagation();
     collectionSelect.onchange = async (event) => {
       event.stopPropagation();
@@ -5314,7 +5427,29 @@ function renderConversationNav() {
     });
     moveAnchor.append(collectionSelect, moveButton, moveMenu);
     actions.appendChild(moveAnchor);
-    if (collection.collectionId !== 'default') {
+    if (isTrashCollection) {
+      const restoreButton = document.createElement('button');
+      restoreButton.type = 'button';
+      restoreButton.className = 'secondary-button collection-restore-button';
+      restoreButton.textContent = 'Restore';
+      restoreButton.onclick = async (event) => {
+        event.stopPropagation();
+        const conversationTitle = group.title || group.conversationKey || 'this conversation';
+        const sources = Array.isArray(group.collectionItem?.trashedFrom) ? group.collectionItem.trashedFrom : [];
+        const sourceText = sources.length
+          ? sources.map((source) => source.name || source.collectionId).join(', ')
+          : 'its original collections';
+        if (!window.confirm(`Restore "${conversationTitle}" to ${sourceText}?`)) {
+          return;
+        }
+        try {
+          await restoreConversationFromTrash(group);
+        } catch (error) {
+          reportError(error);
+        }
+      };
+      actions.appendChild(restoreButton);
+    } else if (collection.collectionId !== DEFAULT_COLLECTION_ID) {
       const removeButton = document.createElement('button');
       removeButton.type = 'button';
       removeButton.className = 'secondary-button collection-remove-button';
@@ -5333,6 +5468,31 @@ function renderConversationNav() {
         }
       };
       actions.appendChild(removeButton);
+    }
+    if (!isTrashCollection) {
+      const trashButton = document.createElement('button');
+      trashButton.type = 'button';
+      trashButton.className = 'danger-button collection-trash-button';
+      trashButton.textContent = 'Move to trash';
+      trashButton.disabled = group.collectionOnly;
+      trashButton.onclick = async (event) => {
+        event.stopPropagation();
+        const conversationTitle = group.title || group.conversationKey || 'this conversation';
+        try {
+          const previewResult = await previewConversationTrash(group);
+          const sources = previewResult.previousCollections || [];
+          const sourceText = sources.length
+            ? sources.map((source) => source.name || source.collectionId).join(', ')
+            : 'no saved collection';
+          if (!window.confirm(`Move "${conversationTitle}" to Trash? It currently exists in: ${sourceText}. It will be removed from those collections and can be restored later.`)) {
+            return;
+          }
+          await moveConversationToTrash(group);
+        } catch (error) {
+          reportError(error);
+        }
+      };
+      actions.appendChild(trashButton);
     }
     item.appendChild(actions);
 
@@ -8228,8 +8388,8 @@ function renderSessionDetails() {
   renderVariantButtons(el('session-variants'), conversation, state.selectedSessionId);
 
   const liveSession = getLiveSessionForConversation(conversation);
-  const canActivateHistory = Boolean(session && !session.live && session.cwd);
-  const canFork = Boolean(session && session.cwd);
+  const canActivateHistory = canActivateSessionHistory(session);
+  const canFork = canForkSession(session);
   const launchBusy = getSessionLaunchBusyForSession(session);
   if (!session) {
     joinButton.disabled = true;
@@ -8287,6 +8447,10 @@ function renderSessionDetails() {
   renderComposerControls(session, composerDisabled);
   if (launchBusy) {
     input.placeholder = 'Waiting for this history session to become live...';
+  } else if (isManagedSessionStarting(session)) {
+    input.placeholder = 'Waiting for this new session to finish starting...';
+  } else if (isEmptyManagedSessionShell(session)) {
+    input.placeholder = 'This new session closed before any message was sent. Create a new session to continue.';
   } else if (session?.live) {
     input.placeholder = 'Send a follow-up prompt to the live managed session...';
   } else if (canActivateHistory) {
@@ -8404,6 +8568,9 @@ function renderRuntimePanel() {
   } else if (launchBusy) {
     titleEl.textContent = `${session.title || session.sessionId} is starting`;
     subtitleEl.textContent = `${sessionLaunchLabel(launchBusy.launchMode)}${launchBusy.runId ? ` | run ${shortId(launchBusy.runId)}` : ''}`;
+  } else if (isEmptyManagedSessionShell(session)) {
+    titleEl.textContent = `${session.title || session.sessionId} has no saved turn`;
+    subtitleEl.textContent = 'This new session closed before a message was sent. Start a new session from this workspace.';
   } else {
     titleEl.textContent = `${session.title || session.sessionId} is history only`;
     subtitleEl.textContent = 'You can resume it, fork it, or open a different live variant from this workspace.';
@@ -11485,6 +11652,16 @@ async function showSession(session = getSelectedSession(), options = {}) {
   void watchSelectedSession(session);
 
   try {
+    const shouldFetchDetail = shouldFetchSessionDetailOnOpen(session, options);
+    if (!shouldFetchDetail) {
+      setHistoryLoading(session, false);
+      renderSessionDetails();
+      renderRuntimePanel();
+      renderThinkingPanel();
+      renderTranscript(session, { focus: options.focus || null });
+      return;
+    }
+
     const originalSessionKey = getSessionKey(session);
     const shouldLoadFullTranscript = Boolean(options.full || !state.fullTranscriptLoaded.has(originalSessionKey));
     const detailParams = new URLSearchParams({ hostId: session.hostId });
@@ -13063,6 +13240,62 @@ function isNormalStopExitState(stateValue) {
     || /^exited:[^:]*:SIGTERM$/i.test(stateText);
 }
 
+function isManagedSessionStarting(session) {
+  return Boolean(
+    session
+    && session.source === 'managed'
+    && !session.live
+    && String(session.state || '').toLowerCase() === 'starting'
+  );
+}
+
+function isEmptyManagedSessionShell(session) {
+  if (!session || session.source !== 'managed' || session.live) {
+    return false;
+  }
+  const messageCount = Number(session.messageCount || 0);
+  const previewCount = Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0;
+  const transcriptCount = state.transcripts.get(makeSessionKey(session.hostId, session.sessionId))?.length || 0;
+  if (Math.max(messageCount, previewCount, transcriptCount) > 0) {
+    return false;
+  }
+  const stateText = String(session.state || '').toLowerCase();
+  return stateText === 'history-only'
+    || stateText === 'closed'
+    || stateText.startsWith('exited')
+    || stateText.startsWith('failed');
+}
+
+function isFreshLiveManagedSessionWithoutHistory(session) {
+  if (!session || session.source !== 'managed' || !session.live) {
+    return false;
+  }
+  const messageCount = Number(session.messageCount || 0);
+  const previewCount = Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0;
+  const transcriptCount = state.transcripts.get(makeSessionKey(session.hostId, session.sessionId))?.length || 0;
+  return Math.max(messageCount, previewCount, transcriptCount) === 0;
+}
+
+function shouldFetchSessionDetailOnOpen(session, options = {}) {
+  if (!session) {
+    return false;
+  }
+  if (options.full || options.fullDiagnostics) {
+    return true;
+  }
+  return !isManagedSessionStarting(session)
+    && !isEmptyManagedSessionShell(session)
+    && !isFreshLiveManagedSessionWithoutHistory(session);
+}
+
+function canActivateSessionHistory(session) {
+  return Boolean(session && !session.live && session.cwd && !isManagedSessionStarting(session) && !isEmptyManagedSessionShell(session));
+}
+
+function canForkSession(session) {
+  return Boolean(session && session.cwd && !isManagedSessionStarting(session));
+}
+
 function isSessionStartTerminalState(session) {
   const stateText = String(session?.state || '');
   return stateText.startsWith('failed')
@@ -13997,6 +14230,13 @@ async function sendInputToSession(session, text, options = {}) {
 async function sendInput(session, text, options = {}) {
   if (!session) {
     return;
+  }
+
+  if (isManagedSessionStarting(session)) {
+    throw new Error('This new Windows session is still starting. Wait until it becomes live before sending files or imported history.');
+  }
+  if (isEmptyManagedSessionShell(session)) {
+    throw new Error('This new Windows session closed before any message was sent. Create a new session before uploading files or importing history.');
   }
 
   if (!session.live) {

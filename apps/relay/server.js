@@ -37,6 +37,7 @@ const RELAY_AUTH_TOKEN_PATH = process.env.RELAY_AUTH_TOKEN_PATH || path.join(pro
 const RELAY_AUTH_ACCOUNT_PATH = process.env.RELAY_AUTH_ACCOUNT_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-account.json');
 const RELAY_AUTH_COOKIE_NAME = 'remote_codex_auth';
 const DEFAULT_COLLECTION_ID = 'default';
+const TRASH_COLLECTION_ID = 'trash';
 const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
 const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 192 * 1024 * 1024);
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
@@ -71,6 +72,12 @@ const COMMAND_PRIORITY = Object.freeze({
   normal: 10,
 });
 const HIGH_PRIORITY_COMMAND_TYPES = new Set([
+  'session.start',
+  'host.file_upload',
+  'host.file_upload_begin',
+  'host.file_upload_chunk',
+  'host.file_upload_complete',
+  'host.file_upload_abort',
   'host.file_download',
   'host.file_download_info',
   'host.file_download_chunk',
@@ -252,6 +259,23 @@ function createRelayAuthAccount(username, password) {
   });
 }
 
+function normalizeTrashSourceList(input = []) {
+  const seen = new Set();
+  const sources = [];
+  for (const entry of Array.isArray(input) ? input : []) {
+    const collectionId = String(entry?.collectionId || '').trim();
+    if (!collectionId || collectionId === DEFAULT_COLLECTION_ID || collectionId === TRASH_COLLECTION_ID || seen.has(collectionId)) {
+      continue;
+    }
+    seen.add(collectionId);
+    sources.push({
+      collectionId,
+      name: String(entry?.name || '').trim() || 'Collection',
+    });
+  }
+  return sources;
+}
+
 function normalizeSessionCollectionItem(input = {}) {
   const hostId = String(input.hostId || '').trim();
   const conversationKey = String(input.conversationKey || input.originSessionId || input.sessionId || '').trim();
@@ -260,7 +284,7 @@ function normalizeSessionCollectionItem(input = {}) {
     return null;
   }
 
-  return {
+  const item = {
     hostId,
     conversationKey,
     sessionId,
@@ -276,6 +300,17 @@ function normalizeSessionCollectionItem(input = {}) {
     addedAt: input.addedAt || nowIso(),
     updatedAt: input.updatedAt || nowIso(),
   };
+  if (input.trashedAt) {
+    item.trashedAt = String(input.trashedAt);
+  }
+  const trashedFrom = normalizeTrashSourceList(input.trashedFrom);
+  if (trashedFrom.length) {
+    item.trashedFrom = trashedFrom;
+  }
+  if (input.discardedAt) {
+    item.discardedAt = String(input.discardedAt);
+  }
+  return item;
 }
 
 function collectionItemKey(item) {
@@ -313,6 +348,14 @@ function collectionItemsMatch(left, right) {
 
 function filterCollectionItems(items = [], targetItem = {}) {
   return (Array.isArray(items) ? items : []).filter((entry) => !collectionItemsMatch(entry, targetItem));
+}
+
+function stripCollectionItemTrashFields(item = {}) {
+  const next = { ...item };
+  delete next.trashedAt;
+  delete next.trashedFrom;
+  delete next.discardedAt;
+  return next;
 }
 
 function dedupeCollectionItems(items = []) {
@@ -421,9 +464,12 @@ function normalizeSessionCollection(input = {}) {
 
   return {
     collectionId,
-    name,
-    system: collectionId === DEFAULT_COLLECTION_ID,
+    name: collectionId === TRASH_COLLECTION_ID ? 'Trash' : name,
+    system: collectionId === DEFAULT_COLLECTION_ID || collectionId === TRASH_COLLECTION_ID || Boolean(input.system),
     items: dedupeCollectionItems(items),
+    discardedItems: collectionId === TRASH_COLLECTION_ID
+      ? dedupeCollectionItems((Array.isArray(input.discardedItems) ? input.discardedItems : []).map(normalizeSessionCollectionItem).filter(Boolean))
+      : [],
     createdAt: input.createdAt || nowIso(),
     updatedAt: input.updatedAt || nowIso(),
   };
@@ -452,8 +498,197 @@ function saveSessionCollections(collections) {
     collections: collections.map((collection) => ({
       ...collection,
       items: collection.collectionId === DEFAULT_COLLECTION_ID ? [] : collection.items,
+      discardedItems: collection.collectionId === TRASH_COLLECTION_ID ? (collection.discardedItems || []) : [],
     })),
   }, null, 2), 'utf8');
+}
+
+function ensureTrashCollection() {
+  const existing = state.sessionCollections.get(TRASH_COLLECTION_ID);
+  if (existing) {
+    const normalized = normalizeSessionCollection({
+      ...existing,
+      collectionId: TRASH_COLLECTION_ID,
+      name: 'Trash',
+      system: true,
+    });
+    if (normalized.name !== existing.name || !existing.system) {
+      state.sessionCollections.set(TRASH_COLLECTION_ID, normalized);
+    }
+    return normalized;
+  }
+  const collection = normalizeSessionCollection({
+    collectionId: TRASH_COLLECTION_ID,
+    name: 'Trash',
+    system: true,
+    items: [],
+  });
+  state.sessionCollections.set(TRASH_COLLECTION_ID, collection);
+  return collection;
+}
+
+function findCollectionMembershipsForItem(item) {
+  const normalized = normalizeSessionCollectionItem(item);
+  if (!normalized) {
+    return [];
+  }
+  const memberships = [];
+  for (const collection of state.sessionCollections.values()) {
+    if (!collection || collection.collectionId === DEFAULT_COLLECTION_ID || collection.collectionId === TRASH_COLLECTION_ID) {
+      continue;
+    }
+    if ((collection.items || []).some((entry) => collectionItemsMatch(entry, normalized))) {
+      memberships.push({
+        collectionId: collection.collectionId,
+        name: collection.name || 'Collection',
+      });
+    }
+  }
+  return memberships;
+}
+
+function findDiscardedSessionItem(item) {
+  const normalized = normalizeSessionCollectionItem(item);
+  if (!normalized) {
+    return null;
+  }
+  const discarded = state.sessionCollections.get(TRASH_COLLECTION_ID)?.discardedItems || [];
+  return discarded.find((entry) => collectionItemsMatch(entry, normalized)) || null;
+}
+
+function isCollectionItemDiscarded(item) {
+  return Boolean(findDiscardedSessionItem(item));
+}
+
+function isCollectionItemInTrash(item) {
+  const normalized = normalizeSessionCollectionItem(item);
+  if (!normalized) {
+    return false;
+  }
+  const trash = ensureTrashCollection();
+  return (trash.items || []).some((entry) => collectionItemsMatch(entry, normalized));
+}
+
+function isCollectionItemHiddenFromCollections(item) {
+  return isCollectionItemInTrash(item) || isCollectionItemDiscarded(item);
+}
+
+function moveCollectionItemToTrash(input) {
+  const item = normalizeSessionCollectionItem(input);
+  if (!item) {
+    throw new Error('hostId and conversationKey are required');
+  }
+  const trash = ensureTrashCollection();
+  const previousCollections = findCollectionMembershipsForItem(item);
+  const restoredItem = stripCollectionItemTrashFields(item);
+  const trashedItem = {
+    ...restoredItem,
+    trashedAt: nowIso(),
+    trashedFrom: previousCollections,
+    updatedAt: nowIso(),
+  };
+
+  for (const source of previousCollections) {
+    const collection = state.sessionCollections.get(source.collectionId);
+    if (!collection) {
+      continue;
+    }
+    state.sessionCollections.set(collection.collectionId, {
+      ...collection,
+      items: filterCollectionItems(collection.items, item),
+      updatedAt: nowIso(),
+    });
+  }
+
+  const nextTrashItems = [
+    ...filterCollectionItems(trash.items, item),
+    trashedItem,
+  ];
+  state.sessionCollections.set(TRASH_COLLECTION_ID, {
+    ...trash,
+    items: dedupeCollectionItems(nextTrashItems),
+    updatedAt: nowIso(),
+  });
+  persistSessionCollections();
+  return {
+    item: trashedItem,
+    previousCollections,
+    trash: state.sessionCollections.get(TRASH_COLLECTION_ID),
+  };
+}
+
+function restoreCollectionItemFromTrash(input) {
+  const item = normalizeSessionCollectionItem(input);
+  if (!item) {
+    throw new Error('hostId and conversationKey are required');
+  }
+  const trash = ensureTrashCollection();
+  const trashItem = (trash.items || []).find((entry) => collectionItemsMatch(entry, item));
+  if (!trashItem) {
+    throw new Error('trash item not found');
+  }
+
+  const restoredCollections = [];
+  const restoredItem = stripCollectionItemTrashFields(trashItem);
+  for (const source of normalizeTrashSourceList(trashItem.trashedFrom)) {
+    const collection = state.sessionCollections.get(source.collectionId);
+    if (!collection || collection.collectionId === DEFAULT_COLLECTION_ID || collection.collectionId === TRASH_COLLECTION_ID) {
+      continue;
+    }
+    state.sessionCollections.set(collection.collectionId, {
+      ...collection,
+      items: dedupeCollectionItems([
+        ...filterCollectionItems(collection.items, restoredItem),
+        {
+          ...restoredItem,
+          updatedAt: nowIso(),
+        },
+      ]),
+      updatedAt: nowIso(),
+    });
+    restoredCollections.push({
+      collectionId: collection.collectionId,
+      name: collection.name || source.name || 'Collection',
+    });
+  }
+
+  state.sessionCollections.set(TRASH_COLLECTION_ID, {
+    ...trash,
+    items: filterCollectionItems(trash.items, item),
+    discardedItems: (trash.discardedItems || []).filter((entry) => !collectionItemsMatch(entry, item)),
+    updatedAt: nowIso(),
+  });
+  persistSessionCollections();
+  return {
+    item: restoredItem,
+    restoredCollections,
+    trash: state.sessionCollections.get(TRASH_COLLECTION_ID),
+  };
+}
+
+function emptyTrashCollection() {
+  const trash = ensureTrashCollection();
+  const trashedItems = Array.isArray(trash.items) ? trash.items : [];
+  const discardedAt = nowIso();
+  const discardedItems = dedupeCollectionItems([
+    ...(Array.isArray(trash.discardedItems) ? trash.discardedItems : []),
+    ...trashedItems.map((item) => ({
+      ...item,
+      discardedAt,
+      updatedAt: discardedAt,
+    })),
+  ]);
+  state.sessionCollections.set(TRASH_COLLECTION_ID, {
+    ...trash,
+    items: [],
+    discardedItems,
+    updatedAt: nowIso(),
+  });
+  persistSessionCollections();
+  return {
+    discardedItems,
+    trash: state.sessionCollections.get(TRASH_COLLECTION_ID),
+  };
 }
 
 function loadSessionMetadata() {
@@ -975,6 +1210,7 @@ if (!state.sessionCollections.has(DEFAULT_COLLECTION_ID)) {
     items: [],
   }));
 }
+ensureTrashCollection();
 seedSessionMetadataFromCollections();
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
@@ -2155,21 +2391,32 @@ function resolveSessionRolloutPath(session) {
     candidates.push(String(session.sessionId));
   }
 
-  const codexHome = process.env.LOCAL_CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-  const sessionsRoot = path.join(codexHome, 'sessions');
+  const codexHomes = [
+    session.runtime?.codexHome,
+    session.codexHome,
+    process.env.LOCAL_CODEX_HOME,
+    process.env.CODEX_HOME,
+    path.join(os.homedir(), '.codex'),
+  ].map((value) => String(value || '').trim()).filter(Boolean);
   const seen = new Set();
   let found = null;
 
-  walkLocalFiles(sessionsRoot, (filePath) => {
-    if (found || !filePath.endsWith('.jsonl') || seen.has(filePath)) {
-      return;
+  for (const codexHome of codexHomes) {
+    const sessionsRoot = path.join(codexHome, 'sessions');
+    walkLocalFiles(sessionsRoot, (filePath) => {
+      if (found || !filePath.endsWith('.jsonl') || seen.has(filePath)) {
+        return;
+      }
+      seen.add(filePath);
+      const base = path.basename(filePath);
+      if (candidates.some((candidate) => candidate && base.includes(candidate))) {
+        found = filePath;
+      }
+    });
+    if (found) {
+      break;
     }
-    seen.add(filePath);
-    const base = path.basename(filePath);
-    if (candidates.some((candidate) => candidate && base.includes(candidate))) {
-      found = filePath;
-    }
-  });
+  }
 
   return found;
 }
@@ -2413,6 +2660,7 @@ async function requestRemoteSessionDetail(hostId, session, options = {}) {
     originSessionId: session.originSessionId || null,
     sourceSessionId: session.sourceSessionId || null,
     conversationKey: session.conversationKey || null,
+    codexHome: session.runtime?.codexHome || session.codexHome || null,
     fullTranscript: Boolean(options.fullTranscript),
     fullDiagnostics: Boolean(options.fullDiagnostics),
   });
@@ -3945,8 +4193,8 @@ function moveSessionArtifacts(hostId, fromSessionId, toSessionId) {
   const toRuntime = state.sessionRuntime.get(toKey) || null;
   if (fromRuntime || toRuntime) {
     state.sessionRuntime.set(toKey, {
-      ...(toRuntime || {}),
       ...(fromRuntime || {}),
+      ...(toRuntime || {}),
       updatedAt: nowIso(),
     });
     state.sessionRuntime.delete(fromKey);
@@ -4454,15 +4702,20 @@ function migrateSessionCollectionItems(hostId, fromSessionId, toSessionId, patch
 }
 
 function getSessionCollectionList() {
+  ensureTrashCollection();
   return Array.from(state.sessionCollections.values())
     .map((collection) => {
       if (collection.collectionId === DEFAULT_COLLECTION_ID) {
         return {
           ...collection,
-          itemCount: Array.from(state.sessions.values()).length,
+          itemCount: Array.from(state.sessions.values())
+            .filter((session) => !isCollectionItemHiddenFromCollections(session))
+            .length,
         };
       }
-      const items = dedupeCollectionItems(collection.items);
+      const items = collection.collectionId === TRASH_COLLECTION_ID
+        ? dedupeCollectionItems(collection.items)
+        : dedupeCollectionItems(collection.items).filter((item) => !isCollectionItemHiddenFromCollections(item));
       if (items.length !== (collection.items || []).length) {
         state.sessionCollections.set(collection.collectionId, {
           ...collection,
@@ -4483,6 +4736,12 @@ function getSessionCollectionList() {
       }
       if (b.collectionId === DEFAULT_COLLECTION_ID) {
         return 1;
+      }
+      if (a.collectionId === TRASH_COLLECTION_ID) {
+        return 1;
+      }
+      if (b.collectionId === TRASH_COLLECTION_ID) {
+        return -1;
       }
       return String(a.name).localeCompare(String(b.name));
     });
@@ -7611,10 +7870,8 @@ function getCommands(hostId, afterId = 0) {
 
 function sortCommandsForDelivery(commands) {
   return [...(Array.isArray(commands) ? commands : [])].sort((a, b) => {
-    const priorityDelta = Number(a?.priority ?? COMMAND_PRIORITY.normal) - Number(b?.priority ?? COMMAND_PRIORITY.normal);
-    if (priorityDelta !== 0) {
-      return priorityDelta;
-    }
+    // The host-agent acknowledges commands by the highest processed command id,
+    // so delivery must remain monotonic even when commands carry priority.
     return Number(a?.id || 0) - Number(b?.id || 0);
   });
 }
@@ -7996,8 +8253,8 @@ async function handleRequest(req, res) {
 
   if (req.method === 'DELETE' && url.pathname.match(/^\/api\/session-collections\/[^/]+$/)) {
     const collectionId = decodeURIComponent(url.pathname.split('/')[3]);
-    if (collectionId === DEFAULT_COLLECTION_ID) {
-      sendJson(res, 409, { error: 'default collection cannot be deleted' });
+    if (collectionId === DEFAULT_COLLECTION_ID || collectionId === TRASH_COLLECTION_ID) {
+      sendJson(res, 409, { error: 'system collection cannot be deleted' });
       return;
     }
     const existed = state.sessionCollections.delete(collectionId);
@@ -8010,6 +8267,50 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/session-collections/trash/preview') {
+    const body = await readBody(req);
+    const item = normalizeSessionCollectionItem(body.item || body);
+    if (!item) {
+      sendJson(res, 400, { error: 'hostId and conversationKey are required' });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      item,
+      previousCollections: findCollectionMembershipsForItem(item),
+      discarded: isCollectionItemDiscarded(item),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/session-collections/trash/items') {
+    const body = await readBody(req);
+    try {
+      const result = moveCollectionItemToTrash(body.item || body);
+      sendJson(res, 200, { ok: true, ...result });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message || 'failed to move item to trash' });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/session-collections/trash/items/restore') {
+    const body = await readBody(req);
+    try {
+      const result = restoreCollectionItemFromTrash(body.item || body);
+      sendJson(res, 200, { ok: true, ...result });
+    } catch (error) {
+      sendJson(res, 404, { error: error.message || 'trash item not found' });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/session-collections/trash/empty') {
+    const result = emptyTrashCollection();
+    sendJson(res, 200, { ok: true, ...result });
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/session-collections\/[^/]+\/items$/)) {
     const collectionId = decodeURIComponent(url.pathname.split('/')[3]);
     const collection = state.sessionCollections.get(collectionId);
@@ -8017,8 +8318,8 @@ async function handleRequest(req, res) {
       sendJson(res, 404, { error: 'collection not found' });
       return;
     }
-    if (collectionId === DEFAULT_COLLECTION_ID) {
-      sendJson(res, 409, { error: 'default collection already contains all sessions' });
+    if (collectionId === DEFAULT_COLLECTION_ID || collectionId === TRASH_COLLECTION_ID) {
+      sendJson(res, 409, { error: 'system collection items must use their dedicated actions' });
       return;
     }
 
@@ -8052,8 +8353,8 @@ async function handleRequest(req, res) {
       sendJson(res, 404, { error: 'collection not found' });
       return;
     }
-    if (collectionId === DEFAULT_COLLECTION_ID) {
-      sendJson(res, 409, { error: 'default collection items cannot be removed' });
+    if (collectionId === DEFAULT_COLLECTION_ID || collectionId === TRASH_COLLECTION_ID) {
+      sendJson(res, 409, { error: 'system collection items must use their dedicated actions' });
       return;
     }
 
