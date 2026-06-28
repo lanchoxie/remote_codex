@@ -62,4 +62,35 @@ assertContains(
   'mobile focus restore should trigger realtime resume'
 );
 
+assertContains(
+  app,
+  'STREAM_STALE_RECONNECT_MS',
+  'mobile realtime should define a stale SSE threshold'
+);
+assertContains(
+  app,
+  'state.streamRecoveryInFlight',
+  'mobile realtime resume should guard against overlapping reconnects'
+);
+assertContains(
+  app,
+  'function checkSelectedSessionStreamHealth',
+  'mobile realtime should proactively check selected live session stream health'
+);
+assertContains(
+  app,
+  'stream.lastPingAt',
+  'stream health should use the relay ping timestamp'
+);
+assertContains(
+  app,
+  'resumeSelectedSessionRealtime().catch(reportError)',
+  'stale stream health checks should actively reconnect the selected session'
+);
+assertContains(
+  app,
+  'setInterval(() => {\n  checkSelectedSessionStreamHealth();',
+  'mobile realtime health checks should run periodically'
+);
+
 console.log('mobile realtime resume assertions passed');

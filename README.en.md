@@ -62,6 +62,29 @@ The project currently uses built-in Node.js modules only, so there is usually no
 npm install
 ```
 
+## Updating Without Losing Local Data
+
+When updating in the same repository directory, pull the latest code and restart the relay/agent:
+
+```bash
+git pull --ff-only
+```
+
+Windows launcher users can restart with:
+
+```powershell
+.\scripts\start-windows.ps1 -Restart
+```
+
+Collections, Trash, manual titles, and local logs are not tracked by git, so a normal `git pull` does not overwrite them. By default they live in:
+
+- `tmp/session-collections.json`: collections, Trash, and collection membership.
+- `tmp/session-metadata.json`: manual titles and other session metadata.
+- `tmp/session-logs.json`: relay-side session logs.
+- `tmp/session-diagnostics.json`: diagnostics cache.
+
+If you clone into a new directory, stop the old relay first, then copy those `tmp/session-*.json` files into the new clone's `tmp/` directory. You can also point a new checkout at the old files with `SESSION_COLLECTIONS_PATH`, `SESSION_METADATA_PATH`, `SESSION_LOGS_PATH`, and `SESSION_DIAGNOSTICS_PATH`.
+
 ## Quick Start
 
 ### Windows one-click launcher

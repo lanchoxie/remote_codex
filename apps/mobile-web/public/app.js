@@ -22,6 +22,7 @@ const state = {
   selectedSessionId: null,
   eventSource: null,
   eventSourceKey: null,
+  streamRecoveryInFlight: false,
   transcripts: new Map(),
   alerts: new Map(),
   dismissedAlerts: new Map(),
@@ -177,6 +178,9 @@ const state = {
     error: null,
   },
 };
+
+const STREAM_HEALTH_CHECK_MS = 15_000;
+const STREAM_STALE_RECONNECT_MS = 65_000;
 
 const DEFAULT_COLLECTION_ID = 'default';
 const TRASH_COLLECTION_ID = 'trash';
@@ -4084,6 +4088,38 @@ function setStreamStatusForSession(hostId, sessionId, patch) {
 function getStreamStatusForSession(session) {
   const key = getSessionKey(session);
   return key ? state.streamStatus.get(key) || null : null;
+}
+
+function parseStreamTimestamp(value) {
+  const time = Date.parse(value || '');
+  return Number.isFinite(time) ? time : 0;
+}
+
+function checkSelectedSessionStreamHealth() {
+  if (!authAllowsRequests()) {
+    return;
+  }
+  const selected = getSelectedSession();
+  if (!selected?.live) {
+    return;
+  }
+  const selectedKey = getSessionKey(selected);
+  if (!selectedKey || state.eventSourceKey !== selectedKey || !state.eventSource) {
+    return;
+  }
+  const stream = getStreamStatusForSession(selected);
+  if (!stream?.lastPingAt) {
+    return;
+  }
+  const lastPingAt = parseStreamTimestamp(stream.lastPingAt);
+  if (!lastPingAt || Date.now() - lastPingAt < STREAM_STALE_RECONNECT_MS) {
+    return;
+  }
+  setStreamStatusForSession(selected.hostId, selected.sessionId, {
+    connection: 'reconnecting',
+    staleAt: new Date().toISOString(),
+  });
+  resumeSelectedSessionRealtime().catch(reportError);
 }
 
 function getConnector(connectorId) {
@@ -11436,19 +11472,27 @@ function closeStream(options = {}) {
 }
 
 async function resumeSelectedSessionRealtime() {
+  if (state.streamRecoveryInFlight) {
+    return;
+  }
   const selected = getSelectedSession();
   if (!selected?.hostId || !selected?.sessionId) {
     return;
   }
-  const selectedKey = getSessionKey(selected);
-  if (selectedKey) {
-    state.fullTranscriptLoaded.delete(selectedKey);
-  }
-  closeStream({ unwatch: false });
-  subscribeSession(selected);
-  void watchSelectedSession(selected);
-  if (selected.live) {
-    await showSession(selected, { full: true });
+  state.streamRecoveryInFlight = true;
+  try {
+    const selectedKey = getSessionKey(selected);
+    if (selectedKey) {
+      state.fullTranscriptLoaded.delete(selectedKey);
+    }
+    closeStream({ unwatch: false });
+    subscribeSession(selected);
+    void watchSelectedSession(selected);
+    if (selected.live) {
+      await showSession(selected, { full: true });
+    }
+  } finally {
+    state.streamRecoveryInFlight = false;
   }
 }
 
@@ -16637,6 +16681,10 @@ setInterval(() => {
   renderApprovalPopup();
   renderStatusWindow();
 }, 1000);
+
+setInterval(() => {
+  checkSelectedSessionStreamHealth();
+}, STREAM_HEALTH_CHECK_MS);
 
 setInterval(() => {
   if (!authAllowsRequests()) {

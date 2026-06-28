@@ -63,6 +63,29 @@ cd remote_codex
 npm install
 ```
 
+## 升级并保留本地数据
+
+如果是在同一个仓库目录里升级，直接拉取最新代码并重启 relay/agent 即可：
+
+```bash
+git pull --ff-only
+```
+
+Windows 一键启动用户可以重启：
+
+```powershell
+.\scripts\start-windows.ps1 -Restart
+```
+
+收藏夹、Trash、手动标题和本地日志不在 git 里，正常 `git pull` 不会覆盖它们。默认文件位置是：
+
+- `tmp/session-collections.json`：收藏夹、Trash、会话所属 collection。
+- `tmp/session-metadata.json`：手动标题等会话元数据。
+- `tmp/session-logs.json`：relay 侧会话日志。
+- `tmp/session-diagnostics.json`：diagnostics 缓存。
+
+如果是重新 clone 到一个新目录，先停掉旧 relay，再把上面这些 `tmp/session-*.json` 文件复制到新目录的 `tmp/` 下。也可以用 `SESSION_COLLECTIONS_PATH`、`SESSION_METADATA_PATH`、`SESSION_LOGS_PATH`、`SESSION_DIAGNOSTICS_PATH` 环境变量指向旧数据文件。
+
 ## 快速启动
 
 ### Windows 一键启动
