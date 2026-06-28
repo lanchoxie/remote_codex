@@ -217,6 +217,15 @@ state.sessions = [session];
 state.selectedHostId = session.hostId;
 state.selectedConversationKey = session.conversationKey;
 state.selectedSessionId = session.sessionId;
+state.receivedFiles.set(`${session.hostId}::${session.sessionId}`, [
+  {
+    fileId: 'file-1',
+    name: 'analysis.py',
+    path: `${ROOT}\\analysis.py`,
+    size: 512,
+    receivedAt: '2026-06-25T10:00:00.000Z',
+  },
+]);
 state.exportDialog.timeline = {
   session: {
     createdAt: session.createdAt,
@@ -292,6 +301,38 @@ assert(dialogClick, 'export dialog should create and click a download link');
 assert(dialogClick.href.includes('format=zip'), `dialog export should request zip, got ${dialogClick.href}`);
 assert(dialogClick.href.includes('dates=2026-06-24..2026-06-26'), `dialog export should pass date range, got ${dialogClick.href}`);
 assert(dialogClick.download.endsWith('.zip'), `zip dialog export should set a .zip download name, got ${dialogClick.download}`);
+
+state.exportDialog.format = 'markdown';
+vm.runInContext('renderExportDialog()', sandbox, { filename: appPath });
+const formatChange = elements.get('export-format-select').listeners.get('change');
+assert(typeof formatChange === 'function', 'export format select should have a change handler');
+formatChange({ target: { value: 'zip' } });
+assert(state.exportDialog.format === 'zip', `format change should update dialog state to zip, got ${state.exportDialog.format}`);
+const confirmClick = elements.get('export-dialog-confirm-button').listeners.get('click');
+assert(typeof confirmClick === 'function', 'export dialog confirm should have a click handler');
+confirmClick();
+const changedFormatClick = clickedLinks.pop();
+assert(changedFormatClick, 'export dialog confirm should click a download link after changing the format select');
+assert(changedFormatClick.href.includes('format=zip'), `format select change should export zip, got ${changedFormatClick.href}`);
+assert(changedFormatClick.download.endsWith('.zip'), `format select change should download .zip, got ${changedFormatClick.download}`);
+
+clickedLinks.length = 0;
+state.exportDialog.format = 'markdown';
+state.exportDialog.includeThinking = false;
+state.exportDialog.includeImages = true;
+state.exportDialog.includeFiles = true;
+state.exportDialog.includeAllFiles = true;
+state.exportDialog.selectedExtensions = new Set(['py']);
+state.exportDialog.selectedFileIds = new Set(['file-1']);
+state.exportDialog.selectedDays = new Set();
+elements.get('export-start-date-input').value = '';
+elements.get('export-end-date-input').value = '';
+exportFromDialog();
+assert(clickedLinks.length === 2, `markdown export with selected files should trigger md and zip downloads, got ${clickedLinks.length}`);
+assert(clickedLinks[0].href.includes('format=markdown'), `first download should be markdown, got ${clickedLinks[0].href}`);
+assert(clickedLinks[0].download.endsWith('.md'), `first download should be .md, got ${clickedLinks[0].download}`);
+assert(clickedLinks[1].href.includes('format=zip'), `second download should be zip, got ${clickedLinks[1].href}`);
+assert(clickedLinks[1].download.endsWith('.zip'), `second download should be .zip, got ${clickedLinks[1].download}`);
 
 exportSelectedSessionHistory('markdown');
 const markdownClick = clickedLinks.pop();

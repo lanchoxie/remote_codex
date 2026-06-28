@@ -2449,6 +2449,53 @@ select:disabled {
   width: min(860px, 100%);
 }
 
+.history-import-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.8fr) minmax(140px, auto) auto;
+  gap: 10px;
+  align-items: start;
+}
+
+.history-import-collection-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.history-import-collection-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.history-import-collection-choice input {
+  width: auto;
+  margin: 0;
+}
+
+.history-import-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.choice-session-copy .history-import-meta span {
+  width: auto;
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  white-space: normal;
+}
+
 .choice-dialog-header,
 .choice-dialog-actions,
 .choice-section-heading,

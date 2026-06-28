@@ -125,6 +125,10 @@ const state = {
     sessions: [],
     selectedKeys: new Set(),
     optionsByKey: new Map(),
+    selectedCollectionIds: new Set(),
+    searchQuery: '',
+    sortBy: 'updatedAt',
+    sortDir: 'desc',
   },
   ui: {
     locale: 'zh-CN',
@@ -10116,6 +10120,14 @@ function isThinkingContentPinnedToBottom(scroller) {
   return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
 }
 
+function hasDetachedThinkingScroller(container = el('session-log')) {
+  if (!container) {
+    return false;
+  }
+  return Array.from(container.querySelectorAll('.thinking-content[data-thinking-state-key]'))
+    .some((scroller) => !isThinkingContentPinnedToBottom(scroller));
+}
+
 function updateThinkingScrollState(stateKey, scroller) {
   if (!stateKey || !scroller) {
     return;
@@ -10837,9 +10849,10 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   captureThinkingScrollStates(log);
   const switchingSession = previousKey !== key;
   const pinnedToBottom = isTranscriptPinnedToBottom(log);
+  const thinkingReaderDetached = !switchingSession && hasDetachedThinkingScroller(log);
   const userDetached = !switchingSession && isTranscriptUserDetached(key);
   const shouldForceScroll = Boolean(options.forceScroll && !userDetached);
-  const shouldStickToBottom = switchingSession || shouldForceScroll || (!userDetached && pinnedToBottom);
+  const shouldStickToBottom = switchingSession || shouldForceScroll || (!userDetached && !thinkingReaderDetached && pinnedToBottom);
   if (switchingSession && key) {
     setTranscriptUserDetached(key, false);
   }
@@ -10902,7 +10915,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     + thinkingSegments.reduce((total, segment) => total + (Array.isArray(segment.entries) ? segment.entries.length : 0), 0);
   const previousRenderedEntryCount = state.transcriptEntryCounts.get(key) || 0;
   if (key) {
-    if (previousKey === key && renderedEntryCount > previousRenderedEntryCount && !shouldStickToBottom) {
+    if (previousKey === key && renderedEntryCount > previousRenderedEntryCount && (!shouldStickToBottom || thinkingReaderDetached)) {
       state.transcriptUnread.add(key);
     }
     if (shouldStickToBottom) {
@@ -11404,7 +11417,7 @@ function flushQueuedUiRenders() {
   }
 }
 
-function closeStream() {
+function closeStream(options = {}) {
   const previousWatchKey = state.watchedSessionKey;
   if (state.eventSource) {
     if (state.eventSourceKey) {
@@ -11417,8 +11430,25 @@ function closeStream() {
     state.eventSource = null;
     state.eventSourceKey = null;
   }
-  if (previousWatchKey) {
+  if (previousWatchKey && options.unwatch !== false) {
     unwatchSelectedSession(previousWatchKey).catch(() => {});
+  }
+}
+
+async function resumeSelectedSessionRealtime() {
+  const selected = getSelectedSession();
+  if (!selected?.hostId || !selected?.sessionId) {
+    return;
+  }
+  const selectedKey = getSessionKey(selected);
+  if (selectedKey) {
+    state.fullTranscriptLoaded.delete(selectedKey);
+  }
+  closeStream({ unwatch: false });
+  subscribeSession(selected);
+  void watchSelectedSession(selected);
+  if (selected.live) {
+    await showSession(selected, { full: true });
   }
 }
 
@@ -12412,7 +12442,8 @@ function exportFromDialog() {
   const selectedExtensions = getExportSelectedExtensions();
   const filterExtensions = selectedExtensions.length !== discoveredExtensions.size
     || selectedExtensions.some((extension) => !discoveredExtensions.has(extension));
-  exportSelectedSessionHistory(dialog.format || 'markdown', {
+  const selectedFileIds = getExportSelectedFileIds();
+  const exportOptions = {
     includeThinking: dialog.includeThinking,
     includeImages: dialog.includeImages,
     includeFiles: dialog.includeFiles,
@@ -12422,8 +12453,17 @@ function exportFromDialog() {
     dates: selectedDateRanges,
     filterExtensions,
     extensions: selectedExtensions,
-    fileIds: getExportSelectedFileIds(),
-  });
+    fileIds: selectedFileIds,
+  };
+  const candidateFiles = getExportCandidateFiles(files, dialog);
+  const hasSelectedFiles = dialog.includeAllFiles
+    ? candidateFiles.length > 0
+    : candidateFiles.some((file) => dialog.selectedFileIds.has(file.identity));
+  const format = dialog.format || 'markdown';
+  exportSelectedSessionHistory(format, exportOptions);
+  if ((format === 'markdown' || format === 'md') && hasSelectedFiles) {
+    exportSelectedSessionHistory('zip', exportOptions);
+  }
   closeExportDialog();
 }
 
@@ -12542,11 +12582,117 @@ function getHistoryImportOptions(key) {
   return state.historyImportDialog.optionsByKey.get(key);
 }
 
-function getHistoryImportSessions() {
-  const selectedKey = getSessionKey(getSelectedSession());
-  return state.sessions
-    .filter((session) => getSessionKey(session) && getSessionKey(session) !== selectedKey)
-    .sort((a, b) => parseSessionTime(b) - parseSessionTime(a));
+function getHistoryImportGroupKey(group) {
+  const hostId = group?.hostId || group?.preferredSession?.hostId || '';
+  const conversationKey = group?.conversationKey || getSessionConversationKey(group?.preferredSession || group);
+  return hostId && conversationKey ? `${hostId}::${conversationKey}` : getSessionKey(group?.preferredSession || group);
+}
+
+function getHistoryImportSessionForGroup(group) {
+  return group?.preferredSession || group?.sessions?.[0] || group || null;
+}
+
+function getHistoryImportCollections() {
+  return state.sessionCollections.filter((collection) => collection.collectionId !== TRASH_COLLECTION_ID);
+}
+
+function getHistoryImportCollectionIds(dialog = state.historyImportDialog) {
+  const available = new Set(getHistoryImportCollections().map((collection) => collection.collectionId));
+  return Array.from(dialog.selectedCollectionIds || []).filter((collectionId) => available.has(collectionId));
+}
+
+function getHistoryImportSearchText(group) {
+  return getConversationSearchText(group);
+}
+
+function compareHistoryImportGroups(a, b) {
+  const dialog = state.historyImportDialog;
+  const direction = dialog.sortDir === 'asc' ? 1 : -1;
+  const sortableTime = (value) => {
+    const time = Date.parse(value || '');
+    if (Number.isFinite(time)) {
+      return time;
+    }
+    return direction === 1 ? Infinity : -Infinity;
+  };
+  let delta = 0;
+  if (dialog.sortBy === 'createdAt') {
+    delta = sortableTime(a.createdAt) - sortableTime(b.createdAt);
+  } else if (dialog.sortBy === 'messageCount') {
+    delta = Number(a.messageCount || 0) - Number(b.messageCount || 0);
+  } else {
+    delta = sortableTime(a.lastUpdatedAt) - sortableTime(b.lastUpdatedAt);
+  }
+  if (delta !== 0) {
+    return delta * direction;
+  }
+  return String(a.title || a.conversationKey).localeCompare(String(b.title || b.conversationKey));
+}
+
+function getHistoryImportCandidateGroups(dialog = state.historyImportDialog) {
+  const selectedSession = getSelectedSession();
+  const selectedConversationKey = getSessionConversationKey(selectedSession);
+  const selectedHostId = selectedSession?.hostId || '';
+  const selectedCollectionIds = getHistoryImportCollectionIds(dialog);
+  const collections = getHistoryImportCollections()
+    .filter((collection) => selectedCollectionIds.includes(collection.collectionId));
+  const byKey = new Map();
+
+  for (const collection of collections) {
+    for (const group of getConversationGroupsForCollection(collection)) {
+      if (group.hostId === selectedHostId && group.conversationKey === selectedConversationKey) {
+        continue;
+      }
+      const key = `${group.hostId}::${group.conversationKey}`;
+      const collectionName = collection.name || 'Collection';
+      const existing = byKey.get(key);
+      if (existing) {
+        if (!existing.collectionNames.includes(collectionName)) {
+          existing.collectionNames.push(collectionName);
+        }
+        continue;
+      }
+      byKey.set(key, {
+        ...group,
+        collectionNames: [collectionName],
+      });
+    }
+  }
+
+  const query = String(dialog.searchQuery || '').trim().toLowerCase();
+  const groups = Array.from(byKey.values()).filter((group) => {
+    if (!query) {
+      return true;
+    }
+    const terms = query.split(/\s+/).filter(Boolean);
+    const haystack = getHistoryImportSearchText(group);
+    return terms.every((term) => haystack.includes(term));
+  });
+  return groups.sort(compareHistoryImportGroups);
+}
+
+function setHistoryImportSort(sortBy) {
+  state.historyImportDialog.sortBy = ['updatedAt', 'createdAt', 'messageCount'].includes(sortBy)
+    ? sortBy
+    : 'updatedAt';
+}
+
+function setHistoryImportSearch(query) {
+  state.historyImportDialog.searchQuery = String(query || '');
+}
+
+function toggleHistoryImportCollection(collectionId, checked) {
+  const dialog = state.historyImportDialog;
+  if (!(dialog.selectedCollectionIds instanceof Set)) {
+    dialog.selectedCollectionIds = new Set(dialog.selectedCollectionIds || []);
+  }
+  if (checked) {
+    if (collectionId !== TRASH_COLLECTION_ID) {
+      dialog.selectedCollectionIds.add(collectionId);
+    }
+  } else {
+    dialog.selectedCollectionIds.delete(collectionId);
+  }
 }
 
 function ensureHistoryImportUi() {
@@ -12588,6 +12734,16 @@ function ensureHistoryImportUi() {
         <button id="history-import-dialog-close-button" type="button" class="secondary-button">Cancel</button>
       </div>
       <div id="history-import-dialog-summary" class="choice-summary">Select conversations to attach.</div>
+      <div class="history-import-toolbar">
+        <div id="history-import-collection-filter" class="history-import-collection-filter"></div>
+        <input id="history-import-search-input" type="search" placeholder="Search conversations" />
+        <select id="history-import-sort-select">
+          <option value="updatedAt">Updated time</option>
+          <option value="createdAt">Created time</option>
+          <option value="messageCount">Message count</option>
+        </select>
+        <button id="history-import-sort-dir-button" type="button" class="secondary-button">Desc</button>
+      </div>
       <label class="choice-select-all">
         <input id="history-import-select-all-checkbox" type="checkbox" />
         <span>Select all visible conversations</span>
@@ -12610,12 +12766,19 @@ function closeHistoryImportDialog() {
 }
 
 function openHistoryImportDialog() {
-  const sessions = getHistoryImportSessions();
+  const collections = getHistoryImportCollections();
+  const selectedCollection = collections.find((collection) => collection.collectionId === state.selectedCollectionId)
+    || collections[0]
+    || null;
+  state.historyImportDialog.selectedCollectionIds = new Set(selectedCollection ? [selectedCollection.collectionId] : []);
   state.historyImportDialog.open = true;
   state.historyImportDialog.busy = false;
-  state.historyImportDialog.sessions = sessions;
   state.historyImportDialog.selectedKeys = new Set();
-  state.historyImportDialog.optionsByKey = new Map(sessions.map((session) => [getSessionKey(session), defaultHistoryImportOptions()]));
+  state.historyImportDialog.searchQuery = '';
+  state.historyImportDialog.sortBy = 'updatedAt';
+  state.historyImportDialog.sortDir = 'desc';
+  state.historyImportDialog.sessions = getHistoryImportCandidateGroups();
+  state.historyImportDialog.optionsByKey = new Map(state.historyImportDialog.sessions.map((group) => [getHistoryImportGroupKey(group), defaultHistoryImportOptions()]));
   renderHistoryImportDialog();
 }
 
@@ -12628,9 +12791,39 @@ function renderHistoryImportDialog() {
   }
   overlay.classList.toggle('hidden', !dialog.open);
   overlay.setAttribute('aria-hidden', dialog.open ? 'false' : 'true');
-  const sessions = dialog.sessions || [];
-  const selectedCount = sessions.filter((session) => dialog.selectedKeys.has(getSessionKey(session))).length;
-  el('history-import-dialog-summary').textContent = `${selectedCount} conversation(s) selected. Markdown history is attached for each; images/files add a zip bundle.`;
+  const sessions = getHistoryImportCandidateGroups(dialog);
+  dialog.sessions = sessions;
+  const selectedCount = sessions.filter((group) => dialog.selectedKeys.has(getHistoryImportGroupKey(group))).length;
+  const activeCollectionCount = getHistoryImportCollectionIds(dialog).length;
+  el('history-import-dialog-summary').textContent = `${selectedCount} conversation(s) selected from ${activeCollectionCount} collection(s). Markdown history is attached for each; images/files add a zip bundle.`;
+  const collectionFilter = el('history-import-collection-filter');
+  if (collectionFilter) {
+    collectionFilter.innerHTML = '';
+    for (const collection of getHistoryImportCollections()) {
+      const row = document.createElement('label');
+      row.className = 'history-import-collection-choice';
+      row.innerHTML = `
+        <input type="checkbox" data-history-import-collection-id="${escapeHtml(collection.collectionId)}" ${dialog.selectedCollectionIds.has(collection.collectionId) ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
+        <span>${escapeHtml(collection.name || 'Collection')}</span>
+      `;
+      collectionFilter.appendChild(row);
+    }
+  }
+  const searchInput = el('history-import-search-input');
+  if (searchInput && document.activeElement !== searchInput) {
+    searchInput.value = dialog.searchQuery || '';
+  }
+  const sortSelect = el('history-import-sort-select');
+  if (sortSelect) {
+    sortSelect.value = dialog.sortBy || 'updatedAt';
+    sortSelect.disabled = dialog.busy;
+  }
+  const sortDirButton = el('history-import-sort-dir-button');
+  if (sortDirButton) {
+    sortDirButton.textContent = dialog.sortDir === 'asc' ? 'Asc' : 'Desc';
+    sortDirButton.title = dialog.sortDir === 'asc' ? 'Oldest or smallest first' : 'Newest or largest first';
+    sortDirButton.disabled = dialog.busy;
+  }
   const selectAll = el('history-import-select-all-checkbox');
   selectAll.checked = sessions.length > 0 && selectedCount === sessions.length;
   selectAll.indeterminate = selectedCount > 0 && selectedCount < sessions.length;
@@ -12642,19 +12835,30 @@ function renderHistoryImportDialog() {
 
   const list = el('history-import-dialog-list');
   list.innerHTML = '';
-  for (const session of sessions) {
-    const key = getSessionKey(session);
+  for (const group of sessions) {
+    const session = getHistoryImportSessionForGroup(group);
+    const key = getHistoryImportGroupKey(group);
     const options = getHistoryImportOptions(key);
     const row = document.createElement('div');
     row.className = 'choice-session-row history-import-session-row';
+    const createdLabel = formatTime(group.createdAt) || 'Unknown';
+    const updatedLabel = formatTime(group.lastUpdatedAt) || 'Unknown';
+    const messageCount = Number(group.messageCount || 0);
+    const collectionNames = (group.collectionNames || []).join(', ');
     row.innerHTML = `
       <label class="history-import-main-toggle">
         <input type="checkbox" data-history-import-key="${escapeHtml(key)}" ${dialog.selectedKeys.has(key) ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
       </label>
       <div class="choice-session-copy">
-        <strong>${escapeHtml(sessionDisplayTitle(session))}</strong>
-        <span>${escapeHtml(sessionPlatformLabel(session))} | ${escapeHtml(shortId(session.sessionId))}</span>
-        <span title="${escapeHtml(session.cwd || '')}">${escapeHtml(session.cwd || '(no path)')}</span>
+        <strong>${escapeHtml(group.title || sessionDisplayTitle(session))}</strong>
+        <span>${escapeHtml(sessionPlatformLabel(session))} | ${escapeHtml(shortId(session?.sessionId || group.conversationKey))}</span>
+        <span title="${escapeHtml(group.cwd || session?.cwd || '')}">${escapeHtml(group.cwd || session?.cwd || '(no path)')}</span>
+        <div class="history-import-meta">
+          <span>${escapeHtml(collectionNames || 'No collection')}</span>
+          <span>Created ${escapeHtml(createdLabel)}</span>
+          <span>Updated ${escapeHtml(updatedLabel)}</span>
+          <span>${messageCount} messages</span>
+        </div>
         <div class="history-import-options">
           <label><input type="checkbox" data-history-import-option="includeThinking" data-history-import-option-key="${escapeHtml(key)}" ${options.includeThinking ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} /> Thinking</label>
           <label><input type="checkbox" data-history-import-option="includeImages" data-history-import-option-key="${escapeHtml(key)}" ${options.includeImages ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} /> Images</label>
@@ -12669,18 +12873,20 @@ function renderHistoryImportDialog() {
 
 async function importSelectedHistorySessions() {
   const dialog = state.historyImportDialog;
-  const selected = (dialog.sessions || []).filter((session) => dialog.selectedKeys.has(getSessionKey(session)));
+  const selected = getHistoryImportCandidateGroups(dialog)
+    .filter((group) => dialog.selectedKeys.has(getHistoryImportGroupKey(group)));
   if (!selected.length || dialog.busy) {
     return;
   }
   dialog.busy = true;
   renderHistoryImportDialog();
   const failures = [];
-  for (const session of selected) {
+  for (const group of selected) {
+    const session = getHistoryImportSessionForGroup(group);
     try {
-      await attachSessionHistory(session, getHistoryImportOptions(getSessionKey(session)));
+      await attachSessionHistory(session, getHistoryImportOptions(getHistoryImportGroupKey(group)));
     } catch (error) {
-      failures.push(`${sessionDisplayTitle(session)}: ${error.message}`);
+      failures.push(`${group.title || sessionDisplayTitle(session)}: ${error.message}`);
     }
   }
   renderAttachmentChips();
@@ -15455,6 +15661,20 @@ el('export-dialog-confirm-button')?.addEventListener('click', () => {
   exportFromDialog();
 });
 
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    resumeSelectedSessionRealtime().catch(reportError);
+  }
+});
+
+window.addEventListener('pageshow', () => {
+  resumeSelectedSessionRealtime().catch(reportError);
+});
+
+window.addEventListener('focus', () => {
+  resumeSelectedSessionRealtime().catch(reportError);
+});
+
 el('rename-session-button')?.addEventListener('click', async () => {
   try {
     await renameSelectedSession();
@@ -16049,14 +16269,38 @@ el('history-import-select-all-checkbox')?.addEventListener('change', (event) => 
   const checked = Boolean(event.target.checked);
   const next = new Set();
   if (checked) {
-    for (const session of state.historyImportDialog.sessions || []) {
-      const key = getSessionKey(session);
+    for (const group of getHistoryImportCandidateGroups()) {
+      const key = getHistoryImportGroupKey(group);
       if (key) {
         next.add(key);
       }
     }
   }
   state.historyImportDialog.selectedKeys = next;
+  renderHistoryImportDialog();
+});
+
+el('history-import-collection-filter')?.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-history-import-collection-id]');
+  if (!checkbox) {
+    return;
+  }
+  toggleHistoryImportCollection(checkbox.dataset.historyImportCollectionId, checkbox.checked);
+  renderHistoryImportDialog();
+});
+
+el('history-import-search-input')?.addEventListener('input', (event) => {
+  setHistoryImportSearch(event.target.value);
+  renderHistoryImportDialog();
+});
+
+el('history-import-sort-select')?.addEventListener('change', (event) => {
+  setHistoryImportSort(event.target.value);
+  renderHistoryImportDialog();
+});
+
+el('history-import-sort-dir-button')?.addEventListener('click', () => {
+  state.historyImportDialog.sortDir = state.historyImportDialog.sortDir === 'asc' ? 'desc' : 'asc';
   renderHistoryImportDialog();
 });
 
