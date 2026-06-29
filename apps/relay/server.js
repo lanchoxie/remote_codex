@@ -5,7 +5,10 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const {
+  agentLogCommand,
+  buildAgentLaunchCommand,
   buildDetachedBootstrapCommand,
+  buildCodexBinResolutionCommand,
   buildRemoteStatusCommand,
   buildSshCommandParts,
   connectorUsesGateway,
@@ -14,6 +17,7 @@ const {
   normalizeConnectorInput,
   requiresInteractiveAuth,
   saveConnectors,
+  shellQuote,
 } = require('../../shared/connectors');
 const {
   getConnectorSecretStatus,
@@ -5959,27 +5963,8 @@ function shellSingleQuote(value) {
 }
 
 function buildRemoteCodexResolutionScript(connector, codexRuntimeIncluded) {
-  const codexHome = remoteShellPath(connector.codexHome || '~/.codex');
   const lines = [
-    `CODEX_HOME_DIR=${codexHome}`,
-    'CODEX_BIN="$(command -v codex 2>/dev/null || true)"',
-    'if [ -z "$CODEX_BIN" ]; then',
-    '  for p in "$CODEX_HOME_DIR/bin/codex" "$CODEX_HOME_DIR/codex" "$CODEX_HOME_DIR/bin/codex-x86_64-unknown-linux-musl" "$CODEX_HOME_DIR/bin/codex-x86_64-unknown-linux-gnu" "$CODEX_HOME_DIR/node_modules/.bin/codex"; do',
-    '    if [ -x "$p" ]; then CODEX_BIN="$p"; break; fi',
-    '  done',
-    'fi',
-    'if [ -z "$CODEX_BIN" ] && [ -d "$CODEX_HOME_DIR" ]; then',
-    '  CODEX_BIN="$(find "$CODEX_HOME_DIR" -maxdepth 5 -type f \\( -name codex -o -name "codex-*" -o -name codex.exe \\) -perm -111 2>/dev/null | head -n 1 || true)"',
-    'fi',
-    'if [ -z "$CODEX_BIN" ]; then',
-    '  for root in "$HOME/.local/bin" "$HOME/bin" "$HOME/.npm-global/bin" "$HOME/.conda/envs" "$HOME/miniconda3/envs" "$HOME/anaconda3/envs" "$HOME/mambaforge/envs" "$HOME/.micromamba/envs" "$HOME/.nvm/versions/node"; do',
-    '    if [ -x "$root/codex" ]; then CODEX_BIN="$root/codex"; break; fi',
-    '    if [ -d "$root" ]; then',
-    '      CODEX_BIN="$(find "$root" -maxdepth 5 -type f \\( -name codex -o -name codex.exe -o -name "codex-*" \\) -perm -111 2>/dev/null | head -n 1 || true)"',
-    '      if [ -n "$CODEX_BIN" ]; then break; fi',
-    '    fi',
-    '  done',
-    'fi',
+    buildCodexBinResolutionCommand(connector),
   ];
 
   if (codexRuntimeIncluded) {
@@ -5996,9 +5981,57 @@ function buildRemoteCodexResolutionScript(connector, codexRuntimeIncluded) {
   return lines.join('\n');
 }
 
+function buildRemoteOneShotAgentLauncherScript(connector, restart) {
+  const mode = connector.bootstrap?.mode || 'manual_tmux';
+  if (mode !== 'manual_tmux') {
+    return buildDetachedBootstrapCommand(connector, { restart });
+  }
+
+  const tmuxSession = connector.bootstrap?.tmuxSession || 'codex-remote';
+  const launchCommand = agentLogCommand(buildAgentLaunchCommand(connector));
+  const launchScriptPath = '.remote-codex-agent-launch.sh';
+  const launchScriptCommand = 'sh .remote-codex-agent-launch.sh';
+  const restartFlag = restart ? '1' : '0';
+  const tmuxStartCommand = `tmux new-session -d -s ${shellQuote(tmuxSession)} ${shellQuote(launchScriptCommand)}`;
+  const tmuxEnsureCommand = restart
+    ? tmuxStartCommand
+    : `tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null || ${tmuxStartCommand}`;
+  const script = [
+    'cat > ' + launchScriptPath + " <<'REMOTE_CODEX_AGENT_LAUNCH'",
+    '#!/bin/sh',
+    launchCommand,
+    'REMOTE_CODEX_AGENT_LAUNCH',
+    'chmod +x ' + launchScriptPath,
+    'if command -v tmux >/dev/null 2>&1; then',
+    restart
+      ? `  tmux kill-session -t ${shellQuote(tmuxSession)} 2>/dev/null || true`
+      : '  true',
+    `  if ${tmuxEnsureCommand}; then`,
+    '    echo CODEX_REMOTE_AGENT_TMUX_BOOTSTRAPPED',
+    '  else',
+    '    echo CODEX_REMOTE_AGENT_LAUNCH_FAILED',
+    '    exit 74',
+    '  fi',
+    'else',
+    '  pid_file=codex-remote.agent.pid',
+    `  if [ "${restartFlag}" = "1" ] && [ -f "$pid_file" ]; then kill "$(cat "$pid_file")" 2>/dev/null || true; fi`,
+    `  if [ "${restartFlag}" = "1" ] || ! { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }; then`,
+    `    nohup ${launchScriptCommand} >/dev/null 2>&1 < /dev/null &`,
+    '    agent_pid=$!',
+    '    echo "$agent_pid" > "$pid_file"',
+    '    sleep 1',
+    '    if ! kill -0 "$agent_pid" 2>/dev/null; then echo CODEX_REMOTE_AGENT_LAUNCH_FAILED; exit 74; fi',
+    '  fi',
+    '  echo CODEX_REMOTE_AGENT_NOHUP_BOOTSTRAPPED',
+    'fi',
+    'echo CODEX_REMOTE_AGENT_BOOTSTRAPPED',
+  ];
+  return script.join('\n');
+}
+
 function buildRemoteOneShotBootstrapCommand(connector, action, payload = {}) {
   const nodeArchive = String(payload.nodeArchiveName || '').replace(/'/g, '');
-  const bootstrapCommand = buildDetachedBootstrapCommand(connector, { restart: action === 'restart' });
+  const bootstrapCommand = buildRemoteOneShotAgentLauncherScript(connector, action === 'restart');
   const script = [
     'echo CODEX_REMOTE_AGENT_DIR_READY',
     'test -f apps/host-agent/agent.js && echo CODEX_REMOTE_CHECK_AGENT=ok || { echo CODEX_REMOTE_CHECK_AGENT=missing; exit 70; }',
@@ -6065,6 +6098,12 @@ function classifyOneShotBootstrapFailure(action, step) {
   if (/CODEX_REMOTE_CHECK_CODEX=missing/.test(text)) {
     return { status: 'codex_runtime_missing', message: 'No usable Codex CLI was found in PATH, CODEX_HOME, common conda/nvm locations, or the uploaded runtime.' };
   }
+  if (/command too long/i.test(text)) {
+    return { status: 'launcher_failed', message: 'The remote shell rejected the host-agent launch command as too long.' };
+  }
+  if (/CODEX_REMOTE_AGENT_LAUNCH_FAILED/.test(text)) {
+    return { status: 'launcher_failed', message: 'The remote host-agent launcher failed after the bundle was deployed.' };
+  }
   if (/CODEX_REMOTE_CHECK_TMUX=missing/.test(text) && !/CODEX_REMOTE_AGENT_(TMUX|NOHUP)_BOOTSTRAPPED|CODEX_REMOTE_AGENT_BOOTSTRAPPED/.test(text)) {
     return { status: 'launcher_failed', message: 'tmux is missing and the nohup fallback did not confirm that the remote host-agent started.' };
   }
@@ -6124,7 +6163,11 @@ async function runConnectorBootstrapOneShot(connector, action, secret) {
     };
   }
   const steps = upload.step ? [upload.step] : [];
-  const ok = upload.ok && upload.step?.stdout?.includes('CODEX_REMOTE_AGENT_BOOTSTRAPPED');
+  const combinedText = sshRunText(upload.step || upload);
+  const ok = upload.ok
+    && upload.step?.stdout?.includes('CODEX_REMOTE_AGENT_BOOTSTRAPPED')
+    && !/command too long/i.test(combinedText)
+    && !/CODEX_REMOTE_AGENT_LAUNCH_FAILED/.test(combinedText);
   const classification = ok
     ? {
       status: action === 'restart' ? 'restarted' : 'bootstrapped',

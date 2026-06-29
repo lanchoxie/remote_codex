@@ -10,6 +10,7 @@
     "agent": "node apps/host-agent/agent.js",
     "test:managed": "node scripts/test-managed-session.js",
     "test:export-dialog": "node scripts/test-export-dialog.js",
+    "test:remote-codex-env": "node scripts/test-remote-codex-env-resolution.js",
     "test:start-windows": "node scripts/test-start-windows-script.js"
   }
 }

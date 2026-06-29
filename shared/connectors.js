@@ -130,6 +130,65 @@ function shellCommand(command, args = []) {
   return [command, ...args.map((arg) => shellQuote(arg))].join(' ');
 }
 
+function buildNodeBinResolutionCommand() {
+  return [
+    'NODE_BIN="$(command -v node 2>/dev/null || command -v nodejs 2>/dev/null || true)"',
+    'if [ -z "$NODE_BIN" ] && [ -x .runtime/node/bin/node ]; then NODE_BIN="$PWD/.runtime/node/bin/node"; fi',
+  ].join('\n');
+}
+
+function buildCodexBinResolutionCommand(connector = {}) {
+  const codexHome = shellEnvValue(connector.codexHome || '~/.codex', { allowHome: true });
+  return [
+    'codex_remote_is_rejected_bin() {',
+    '  case "$1" in',
+    '    */tmp/*|*/arg0/*|*codex-execve-wrapper*|*codex-command-runner*|*codex-sandbox*|*codex-windows-sandbox*) return 0 ;;',
+    '    *) return 1 ;;',
+    '  esac',
+    '}',
+    'codex_remote_first_usable_bin() {',
+    '  while IFS= read -r candidate; do',
+    '    test -n "$candidate" || continue',
+    '    test -x "$candidate" || continue',
+    '    codex_remote_is_rejected_bin "$candidate" && continue',
+    '    printf "%s\\n" "$candidate"',
+    '    return 0',
+    '  done',
+    '  return 1',
+    '}',
+    `CODEX_HOME_DIR=${codexHome}`,
+    'CODEX_BIN="$(command -v codex 2>/dev/null || true)"',
+    'if [ -n "$CODEX_BIN" ] && codex_remote_is_rejected_bin "$CODEX_BIN"; then CODEX_BIN=""; fi',
+    'if [ -z "$CODEX_BIN" ]; then',
+    '  for p in "$PWD/.runtime/codex/codex" "$CODEX_HOME_DIR/bin/codex" "$CODEX_HOME_DIR/codex" "$CODEX_HOME_DIR/bin/codex-x86_64-unknown-linux-musl" "$CODEX_HOME_DIR/bin/codex-x86_64-unknown-linux-gnu" "$CODEX_HOME_DIR/node_modules/.bin/codex"; do',
+    '    if [ -x "$p" ]; then CODEX_BIN="$p"; break; fi',
+    '  done',
+    'fi',
+    'if [ -z "$CODEX_BIN" ]; then',
+    '  for bin_dir in "$HOME/.conda/envs/node_env/bin" "$HOME/miniconda3/envs/node_env/bin" "$HOME/anaconda3/envs/node_env/bin" "$HOME/mambaforge/envs/node_env/bin" "$HOME/.micromamba/envs/node_env/bin"; do',
+    '    if [ -x "$bin_dir/codex" ]; then CODEX_BIN="$bin_dir/codex"; break; fi',
+    '  done',
+    'fi',
+    'if [ -z "$CODEX_BIN" ] && [ -d "$CODEX_HOME_DIR" ]; then',
+    '  CODEX_BIN="$(find -L "$CODEX_HOME_DIR" -maxdepth 5 -type f \\( -name codex -o -name "codex-*" -o -name codex.exe \\) -perm -111 2>/dev/null | codex_remote_first_usable_bin || true)"',
+    'fi',
+    'if [ -z "$CODEX_BIN" ]; then',
+    '  for root in "$HOME/.local/bin" "$HOME/bin" "$HOME/.npm-global/bin" "$HOME/.conda/envs" "$HOME/miniconda3/envs" "$HOME/anaconda3/envs" "$HOME/mambaforge/envs" "$HOME/.micromamba/envs" "$HOME/.nvm/versions/node"; do',
+    '    if [ -x "$root/codex" ]; then CODEX_BIN="$root/codex"; break; fi',
+    '    if [ -d "$root" ]; then',
+    '      CODEX_BIN="$(find -L "$root" -maxdepth 5 -type f \\( -name codex -o -name codex.exe -o -name "codex-*" \\) -perm -111 2>/dev/null | codex_remote_first_usable_bin || true)"',
+    '      if [ -n "$CODEX_BIN" ]; then break; fi',
+    '    fi',
+    '  done',
+    'fi',
+    'if [ -n "$CODEX_BIN" ]; then',
+    '  CODEX_BIN_DIR="$(dirname "$CODEX_BIN")"',
+    '  PATH="$CODEX_BIN_DIR:$PATH"',
+    '  export CODEX_BIN PATH',
+    'fi',
+  ].join('\n');
+}
+
 function kindLabel(kind) {
   return {
     outbound_agent: 'Outbound Agent',
@@ -257,7 +316,11 @@ function buildAgentLaunchCommand(connector) {
 
   const envBlock = exports.length ? `${exports.join(' ')} ` : '';
   return connector.bootstrap.launchCommand
-    || `NODE_BIN="$(command -v node || command -v nodejs || test -x .runtime/node/bin/node && printf '%s\\n' "$PWD/.runtime/node/bin/node" || true)" && CODEX_BIN="$(command -v codex || test -x .runtime/codex/codex && printf '%s\\n' "$PWD/.runtime/codex/codex" || true)" && test -n "$NODE_BIN" && ${envBlock}CODEX_BIN="$CODEX_BIN" "$NODE_BIN" apps/host-agent/agent.js`;
+    || [
+      buildNodeBinResolutionCommand(),
+      buildCodexBinResolutionCommand(connector),
+      `test -n "$NODE_BIN" && ${envBlock}PATH="$PATH" CODEX_BIN="$CODEX_BIN" "$NODE_BIN" apps/host-agent/agent.js`,
+    ].join('\n');
 }
 
 function tmuxShellCommand(command) {
@@ -692,7 +755,11 @@ function saveConnectors(connectors, storePath = DEFAULT_STORE_PATH) {
 
 module.exports = {
   DEFAULT_STORE_PATH,
+  agentLogCommand,
+  buildAgentLaunchCommand,
+  buildCodexBinResolutionCommand,
   buildDetachedBootstrapCommand,
+  buildNodeBinResolutionCommand,
   buildRemoteStatusCommand,
   buildSshCommandParts,
   decorateConnector,
@@ -701,4 +768,5 @@ module.exports = {
   normalizeConnectorInput,
   requiresInteractiveAuth,
   saveConnectors,
+  shellQuote,
 };
