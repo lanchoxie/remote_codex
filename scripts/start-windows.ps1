@@ -6,7 +6,8 @@ param(
   [switch]$NoBrowser,
   [switch]$DryRun,
   [switch]$Restart,
-  [switch]$NoRestart
+  [switch]$NoRestart,
+  [switch]$SkipPreflight
 )
 
 $ErrorActionPreference = "Stop"
@@ -214,6 +215,18 @@ if ([string]::IsNullOrWhiteSpace($CodexHome)) {
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Set-Location -LiteralPath $Root
+
+if (-not $SkipPreflight) {
+  Write-Host "Running local Codex preflight..."
+  $preflight = & node scripts/check-codex-preflight.js --codex-home "$CodexHome"
+  $preflightExit = $LASTEXITCODE
+  if ($preflight) {
+    Write-Host $preflight
+  }
+  if ($preflightExit -ne 0) {
+    throw "Local Codex preflight failed. Fix the reported Codex install/CODEX_HOME issue, or rerun with -SkipPreflight if you know what you are doing."
+  }
+}
 
 $restartRequested = -not $NoRestart -or $Restart
 $url = "http://127.0.0.1:$Port"

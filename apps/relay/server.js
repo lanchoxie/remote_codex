@@ -5981,6 +5981,23 @@ function buildRemoteCodexResolutionScript(connector, codexRuntimeIncluded) {
   return lines.join('\n');
 }
 
+function buildRemoteCodexPreflightScript(connector) {
+  const codexHome = remoteShellPath(connector.codexHome || '~/.codex');
+  return [
+    'echo CODEX_REMOTE_PREFLIGHT_BEGIN',
+    `CODEX_PREFLIGHT_HOME=${codexHome}`,
+    'if [ ! -d "$CODEX_PREFLIGHT_HOME" ]; then echo CODEX_REMOTE_PREFLIGHT_HOME=missing; exit 73; fi',
+    'echo CODEX_REMOTE_PREFLIGHT_HOME=ok',
+    'if [ ! -f "$CODEX_PREFLIGHT_HOME/auth.json" ] && [ ! -f "$CODEX_PREFLIGHT_HOME/config.toml" ]; then echo CODEX_REMOTE_PREFLIGHT_INIT=missing; exit 73; fi',
+    'echo CODEX_REMOTE_PREFLIGHT_INIT=ok',
+    'mkdir -p "$CODEX_PREFLIGHT_HOME/sessions" 2>/dev/null || true',
+    'if [ ! -d "$CODEX_PREFLIGHT_HOME/sessions" ]; then echo CODEX_REMOTE_PREFLIGHT_SESSIONS=missing; exit 73; fi',
+    'if [ ! -w "$CODEX_PREFLIGHT_HOME/sessions" ]; then echo CODEX_REMOTE_PREFLIGHT_SESSIONS=unwritable; exit 73; fi',
+    'echo CODEX_REMOTE_PREFLIGHT_SESSIONS=ok',
+    'echo CODEX_REMOTE_PREFLIGHT_END',
+  ].join('\n');
+}
+
 function buildRemoteOneShotAgentLauncherScript(connector, restart) {
   const mode = connector.bootstrap?.mode || 'manual_tmux';
   if (mode !== 'manual_tmux') {
@@ -6054,6 +6071,7 @@ function buildRemoteOneShotBootstrapCommand(connector, action, payload = {}) {
     buildRemoteCodexResolutionScript(connector, Boolean(payload.codexRuntimeIncluded)),
     'test -n "$CODEX_BIN" && echo "CODEX_REMOTE_CHECK_CODEX=$CODEX_BIN" || { echo CODEX_REMOTE_CHECK_CODEX=missing; exit 73; }',
     '"$CODEX_BIN" --help >/dev/null 2>&1 && echo CODEX_REMOTE_CODEX_HELP_OK || echo CODEX_REMOTE_CODEX_HELP_WARNING',
+    buildRemoteCodexPreflightScript(connector),
     'command -v tmux >/dev/null && echo CODEX_REMOTE_CHECK_TMUX=$(command -v tmux) || echo CODEX_REMOTE_CHECK_TMUX=missing',
     bootstrapCommand,
     'echo CODEX_REMOTE_ONESHOT_BOOTSTRAP_DONE',
@@ -6097,6 +6115,9 @@ function classifyOneShotBootstrapFailure(action, step) {
   }
   if (/CODEX_REMOTE_CHECK_CODEX=missing/.test(text)) {
     return { status: 'codex_runtime_missing', message: 'No usable Codex CLI was found in PATH, CODEX_HOME, common conda/nvm locations, or the uploaded runtime.' };
+  }
+  if (/CODEX_REMOTE_PREFLIGHT_(HOME|INIT|SESSIONS)=(missing|unwritable)/.test(text)) {
+    return { status: 'codex_init_failed', message: 'Remote Codex CLI was found, but CODEX_HOME is missing, uninitialized, or not writable.' };
   }
   if (/command too long/i.test(text)) {
     return { status: 'launcher_failed', message: 'The remote shell rejected the host-agent launch command as too long.' };

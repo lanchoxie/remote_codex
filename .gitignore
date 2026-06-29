@@ -25,4 +25,5 @@ tmp/.codex-remote-files/
 tmp/received-files/
 tmp/codex-linux-x86_64/
 tmp/node-*.tar.*
+config/remote-codex.local.json
 docs/researches_and_papers/*.pdf

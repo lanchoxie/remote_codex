@@ -159,6 +159,25 @@ npm install -g @openai/codex
 codex --help
 ```
 
+## Windows setup helpers
+
+For a fresh Windows checkout, double-click:
+
+```text
+Setup and Start Remote Codex.bat
+```
+
+This runs `download-runtimes.bat` first, which fills the local runtime cache under `tmp/`:
+
+```text
+tmp/node-v16.20.2-linux-x64.tar.xz
+tmp/codex-linux-x86_64/
+```
+
+Then it starts `scripts/start-windows.ps1`. Advanced users can double-click `Start Remote Codex.bat` after the runtime cache already exists.
+
+Install-helper defaults live in `config/remote-codex.defaults.json`. The future interactive helper should copy user-specific overrides to `config/remote-codex.local.json`; that local file is ignored by Git and can store machine-specific Codex paths such as `CODEX_HOME` or a custom remote `codex` binary hint.
+
 ## 常用命令
 
 ```bash

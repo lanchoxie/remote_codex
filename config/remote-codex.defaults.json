@@ -1,0 +1,21 @@
+{
+  "runtimeReleaseRepo": "lanchoxie/remote_codex",
+  "runtimeReleaseTag": "v2.4.5",
+  "localCodexHome": "~/.codex",
+  "remoteCodexHome": "~/.codex",
+  "remoteCodexBinHints": [
+    "~/.conda/envs/*/bin/codex",
+    "~/miniconda3/envs/*/bin/codex",
+    "~/anaconda3/envs/*/bin/codex",
+    "~/mambaforge/envs/*/bin/codex",
+    "~/.micromamba/envs/*/bin/codex",
+    "~/.nvm/versions/node/*/bin/codex",
+    "~/.local/bin/codex",
+    "~/bin/codex"
+  ],
+  "remotePreflightCommand": "echo CODEX_REMOTE_PREFLIGHT_BEGIN && test -d \"$CODEX_HOME\" && test -w \"$CODEX_HOME/sessions\" && echo CODEX_REMOTE_PREFLIGHT_END",
+  "nextInstallHelper": {
+    "enabled": false,
+    "description": "Future interactive setup helper can copy this file to config/remote-codex.local.json and let users edit Codex paths before starting relay."
+  }
+}

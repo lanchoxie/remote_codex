@@ -65,4 +65,41 @@ assertContains(payloadBody, 'codexRuntimeIncluded', 'one-shot payload should tel
 const gitignore = fs.readFileSync('.gitignore', 'utf8');
 assert(!/^runtimes\/$/m.test(gitignore), 'release runtime directory must not be wholly ignored');
 
+assert(fs.existsSync('download-runtimes.bat'), 'repo root should include a double-click runtime downloader');
+assert(fs.existsSync('scripts/download-runtimes.ps1'), 'runtime downloader PowerShell script should exist');
+
+const downloadBat = fs.readFileSync('download-runtimes.bat', 'utf8');
+const downloadScript = fs.readFileSync('scripts/download-runtimes.ps1', 'utf8');
+
+assertContains(
+  downloadBat,
+  'scripts\\download-runtimes.ps1',
+  'download-runtimes.bat should call the PowerShell downloader'
+);
+assertContains(
+  downloadScript,
+  'mobile-codex-remote-v2.4.5.zip.manifest.json',
+  'runtime downloader should know the release manifest asset name'
+);
+assertContains(
+  downloadScript,
+  'mobile-codex-remote-v2.4.5.zip.part',
+  'runtime downloader should support split release zip parts'
+);
+assertContains(
+  downloadScript,
+  'tmp\\node-v16.20.2-linux-x64.tar.xz',
+  'runtime downloader should install the Node archive into the tmp cache'
+);
+assertContains(
+  downloadScript,
+  'tmp\\codex-linux-x86_64',
+  'runtime downloader should install the Codex Linux runtime into the tmp cache'
+);
+assertContains(
+  downloadScript,
+  'Expand-Archive',
+  'runtime downloader should extract the release zip when needed'
+);
+
 console.log('runtime bundle path assertions passed');

@@ -65,6 +65,31 @@ assertContains(
 );
 assertContains(
   relay,
+  'CODEX_REMOTE_PREFLIGHT_BEGIN',
+  'one-shot bootstrap should emit a remote Codex preflight begin marker'
+);
+assertContains(
+  relay,
+  'CODEX_REMOTE_PREFLIGHT_HOME=missing',
+  'one-shot bootstrap should fail clearly when remote CODEX_HOME is missing'
+);
+assertContains(
+  relay,
+  'CODEX_REMOTE_PREFLIGHT_INIT=missing',
+  'one-shot bootstrap should fail clearly when remote CODEX_HOME is not initialized'
+);
+assertContains(
+  relay,
+  'CODEX_REMOTE_PREFLIGHT_SESSIONS=unwritable',
+  'one-shot bootstrap should fail clearly when remote Codex sessions cannot be written'
+);
+assertContains(
+  relay,
+  'codex_init_failed',
+  'one-shot bootstrap failure classifier should expose Codex initialization failures'
+);
+assertContains(
+  relay,
   'REMOTE_CODEX_AGENT_LAUNCH',
   'one-shot bootstrap should write the remote agent launch command to a script file before invoking tmux/nohup'
 );
