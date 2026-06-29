@@ -86,8 +86,23 @@ assertContains(
 );
 assertContains(
   app,
-  'updateMessageUnreadForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId);',
+  'markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);',
   'session transcript SSE should update formal message notifications'
+);
+assertContains(
+  app,
+  'markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);',
+  'session transcript SSE should refresh both the bell and sidebar unread dot when assistant messages arrive'
+);
+assertContains(
+  app,
+  'markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);',
+  'session snapshot/state events should update unread state from latest assistant summary messages'
+);
+assertContains(
+  app,
+  'queuedUiRenders.conversationNav = true',
+  'queued UI flush should be able to redraw sidebar unread dots without rendering every selected view'
 );
 assertContains(
   app,

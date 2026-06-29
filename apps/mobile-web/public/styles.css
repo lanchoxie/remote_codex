@@ -861,6 +861,45 @@ textarea {
   justify-content: flex-end;
 }
 
+.settings-update-section {
+  align-items: stretch;
+}
+
+.settings-update-panel {
+  display: grid;
+  gap: 10px;
+  min-width: min(100%, 420px);
+}
+
+.settings-update-summary {
+  color: var(--text);
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.settings-update-badge {
+  display: inline-flex;
+  margin-left: 8px;
+  padding: 2px 7px;
+  border: 1px solid rgba(245, 158, 11, 0.38);
+  border-radius: 999px;
+  color: #92400e;
+  background: rgba(251, 191, 36, 0.18);
+  font-size: 11px;
+  font-weight: 800;
+  vertical-align: middle;
+}
+
+.settings-update-details {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
 .connector-manager-modal {
   width: min(1180px, 100%);
   max-height: min(90vh, 1040px);

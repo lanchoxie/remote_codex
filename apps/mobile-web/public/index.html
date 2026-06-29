@@ -69,6 +69,23 @@
           <button id="close-settings-button" type="button" class="secondary-button" data-i18n-key="common.close">Close</button>
         </div>
 
+        <section class="settings-section settings-update-section">
+          <div>
+            <div class="settings-section-title">Software update <span class="settings-update-badge">Experimental / Untested</span></div>
+            <div class="settings-section-copy">Check the latest stable tag, back up local tmp data, then update code without touching browser API profiles or collections. This update tool is currently marked untested.</div>
+          </div>
+          <div class="settings-update-panel">
+            <div id="software-update-summary" class="settings-update-summary">Update status has not been checked yet.</div>
+            <div id="software-update-details" class="settings-update-details"></div>
+            <div class="settings-inline-actions">
+              <button id="check-update-button" type="button" class="secondary-button">Check update</button>
+              <button id="apply-update-button" type="button">One-click update</button>
+              <button id="restart-after-update-button" type="button" class="secondary-button hidden">Restart relay/agent</button>
+            </div>
+            <div class="settings-warning">Updates use the newest stable tag. A data backup is created under tmp/update-backups before checkout. Restart is explicit after update.</div>
+          </div>
+        </section>
+
         <section class="settings-section">
           <div>
             <div class="settings-section-title" data-i18n-key="settings.languageTitle">Interface language</div>

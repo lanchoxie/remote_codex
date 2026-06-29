@@ -2056,6 +2056,7 @@ class CodexAppServerRunner {
     await this.emitRuntime({
       waitingOnApproval: false,
       waitingOnUserInput: false,
+      busy: Boolean(this.activeTurnId),
       phase: this.activeTurnId ? 'thinking' : 'idle',
     });
     return true;
@@ -2248,9 +2249,12 @@ class CodexAppServerRunner {
     if (method === 'item/reasoning/summaryTextDelta') {
       const turnId = params.turnId || this.activeTurnId;
       const reasoningChunk = normalizeThinkingText(params.delta || '');
+      const isActiveTurn = turnId && turnId === this.activeTurnId;
       if (turnId) {
         const previous = this.reasoningBuffers.get(turnId) || '';
         this.reasoningBuffers.set(turnId, mergeThinkingBuffer(previous, reasoningChunk));
+      }
+      if (isActiveTurn) {
         await this.emitRuntime({
           activeTurnId: turnId,
           busy: true,
@@ -2277,15 +2281,18 @@ class CodexAppServerRunner {
     if (method === 'item/plan/delta' || method === 'turn/plan/updated') {
       const turnId = params.turnId || this.activeTurnId;
       const planChunk = normalizeThinkingText(params.delta || params.plan || '');
+      const isActiveTurn = turnId && turnId === this.activeTurnId;
       if (turnId) {
         const previous = this.planBuffers.get(turnId) || '';
         const next = mergeThinkingBuffer(previous, planChunk);
         this.planBuffers.set(turnId, next);
+      }
+      if (isActiveTurn) {
         await this.emitRuntime({
           activeTurnId: turnId,
           busy: true,
           phase: 'planning',
-          planSummary: limitText(next, 1200),
+          planSummary: limitText(this.planBuffers.get(turnId), 1200),
         });
       }
       await this.emitDiagnostic({

@@ -19,6 +19,26 @@ assertContains(relay, "'host.file_download_chunk'", 'file download chunks should
 assertContains(relay, "type: 'session.watch'", 'relay should enqueue session.watch when the UI opens a conversation');
 assertContains(relay, "type: 'session.unwatch'", 'relay should enqueue session.unwatch when a conversation is no longer open');
 assertContains(relay, "event.type === 'watch.performance'", 'relay should turn slow watch telemetry into a visible session warning');
+assertContains(
+  relay,
+  'isBenignSessionWatchNoLiveError(message)',
+  'relay should treat old-agent session.watch no-live errors as a benign realtime-watch downgrade, not a user-visible session error'
+);
+assertContains(
+  relay,
+  "event.type === 'session.watch.updated'",
+  'relay should process session.watch.updated events separately from generic session errors'
+);
+assertContains(
+  relay,
+  'resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId)',
+  'session.watch.updated handling should not reference the later sessionId binding before it is declared'
+);
+assertContains(
+  app,
+  '/no live session for command session\\.(watch|unwatch)\\b/i.test(message)',
+  'UI should hide stale old-agent watch/unwatch no-live alerts from the visible session alerts panel'
+);
 
 assertContains(agent, "command.type === 'session.watch'", 'host-agent should handle session.watch commands');
 assertContains(agent, "command.type === 'session.unwatch'", 'host-agent should handle session.unwatch commands');

@@ -23,6 +23,11 @@ const {
 } = require('../../shared/connector-secrets');
 const { extractSessionDiagnostics, extractSessionTranscript, makeTranscriptEntry } = require('../../shared/codex-discovery');
 const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
+const {
+  applyStableTagUpdate,
+  getLocalUpdateStatus,
+  scheduleWindowsRestart,
+} = require('../../shared/updater');
 
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_DIR = path.join(__dirname, '..', 'mobile-web', 'public');
@@ -4008,6 +4013,10 @@ function emitSessionAlert(hostId, sessionId, entry) {
   return payload;
 }
 
+function isBenignSessionWatchNoLiveError(message) {
+  return /no live session for command session\.(watch|unwatch)\b/i.test(String(message || ''));
+}
+
 function buildResumeTranscript(entries, options = {}) {
   if (!Array.isArray(entries)) {
     return [];
@@ -5688,14 +5697,24 @@ async function runSshTarExtract(connector, secret, localSources, remoteDirectory
 
 function getLocalNodeRuntimeArchive() {
   const archiveName = 'node-v16.20.2-linux-x64.tar.xz';
-  const archivePath = path.join(process.cwd(), 'tmp', archiveName);
-  if (!fs.existsSync(archivePath)) {
-    return null;
+  const candidates = [
+    process.env.CODEX_NODE_RUNTIME_ARCHIVE,
+    path.join(process.cwd(), 'runtimes', 'node', archiveName),
+    path.join(process.cwd(), 'tmp', archiveName),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const archivePath = path.resolve(candidate);
+    if (!fs.existsSync(archivePath)) {
+      continue;
+    }
+    return {
+      archiveName: path.basename(archivePath),
+      localPath: localScpPath(path.relative(process.cwd(), archivePath)),
+    };
   }
-  return {
-    archiveName,
-    localPath: localScpPath(path.relative(process.cwd(), archivePath)),
-  };
+
+  return null;
 }
 
 function copyDirectoryRecursive(sourceDir, targetDir) {
@@ -5718,6 +5737,16 @@ function getLocalCodexLinuxSourceDir() {
   const override = String(process.env.CODEX_LINUX_RUNTIME_DIR || '').trim();
   if (override && fs.existsSync(path.join(override, 'codex'))) {
     return path.resolve(override);
+  }
+
+  const bundledRuntime = path.join(process.cwd(), 'runtimes', 'codex', 'linux-x86_64');
+  if (fs.existsSync(path.join(bundledRuntime, 'codex'))) {
+    return bundledRuntime;
+  }
+
+  const legacyStagedRuntime = path.join(process.cwd(), 'tmp', 'codex-linux-x86_64');
+  if (fs.existsSync(path.join(legacyStagedRuntime, 'codex'))) {
+    return legacyStagedRuntime;
   }
 
   const cursorExtensions = path.join(os.homedir(), '.cursor', 'extensions');
@@ -8167,6 +8196,55 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/update/status') {
+    try {
+      sendJson(res, 200, {
+        ok: true,
+        update: getLocalUpdateStatus({ rootDir: process.cwd(), fetch: url.searchParams.get('fetch') !== '0' }),
+      });
+    } catch (error) {
+      sendJson(res, 500, {
+        ok: false,
+        error: error.message || 'failed to check for updates',
+      });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/update/apply') {
+    try {
+      const result = applyStableTagUpdate({ rootDir: process.cwd(), fetch: true });
+      sendJson(res, 200, {
+        ok: true,
+        update: result,
+      });
+    } catch (error) {
+      sendJson(res, error.code === 'DIRTY_TRACKED_FILES' ? 409 : 500, {
+        ok: false,
+        error: error.message || 'failed to apply update',
+        code: error.code || 'UPDATE_FAILED',
+        trackedChanges: error.trackedChanges || [],
+      });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/update/restart') {
+    try {
+      const result = scheduleWindowsRestart({ rootDir: process.cwd(), delayMs: 1500 });
+      sendJson(res, 202, {
+        ok: true,
+        restart: result,
+      });
+    } catch (error) {
+      sendJson(res, 500, {
+        ok: false,
+        error: error.message || 'failed to schedule restart',
+      });
+    }
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/hosts') {
     sendJson(res, 200, {
       hosts: getHostList(),
@@ -10101,6 +10179,20 @@ function applyAgentEvent(event) {
     state.hosts.set(event.hostId, host);
   }
 
+  if (event.type === 'session.watch.updated') {
+    const effectiveSessionId = (event.sessionId || event.nativeThreadId)
+      ? resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId)
+      : null;
+    if (effectiveSessionId) {
+      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.watch.updated', {
+        ...event,
+        sessionId: effectiveSessionId,
+        timestamp: event.timestamp || nowIso(),
+      });
+    }
+    return;
+  }
+
   if (event.type === 'session.discovery') {
     if (host) {
       host.lastDiscoveryAt = nowIso();
@@ -10878,6 +10970,17 @@ function applyAgentEvent(event) {
       return;
     }
     const message = event.message || 'session error';
+    if (isBenignSessionWatchNoLiveError(message)) {
+      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.watch.updated', {
+        hostId: event.hostId,
+        sessionId: effectiveSessionId,
+        watched: false,
+        error: message,
+        compatibilityDowngrade: true,
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
     if (/no live session for command session\.(model_list|stop)/i.test(message)) {
       markSessionClosed(event.hostId, effectiveSessionId);
       return;

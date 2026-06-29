@@ -85,6 +85,13 @@ const state = {
   navigatorCollapsed: true,
   settingsOpen: false,
   settingsApiSnapshot: {},
+  softwareUpdate: {
+    status: null,
+    busy: false,
+    message: '',
+    lastBackupDir: '',
+    restartScheduled: false,
+  },
   apiPingResults: new Map(),
   apiPingBusyHosts: new Set(),
   localAgentActionBusyId: null,
@@ -3615,6 +3622,19 @@ function updateMessageUnreadForSession(hostId, sessionId) {
   return true;
 }
 
+function markSessionMessageNotificationChanged(hostId, sessionId) {
+  const key = makeSessionKey(hostId, sessionId);
+  const wasUnread = state.messageUnread.has(key);
+  const changed = updateMessageUnreadForSession(hostId, sessionId);
+  const isUnread = state.messageUnread.has(key);
+  if (changed || wasUnread !== isUnread) {
+    queuedUiRenders.messageNotificationBell = true;
+    queuedUiRenders.conversationNav = true;
+    scheduleQueuedUiFlush();
+  }
+  return changed;
+}
+
 function initializeMessageReadReceiptsForExistingSessions() {
   if (state.messageReadReceiptsInitializedAt) {
     return;
@@ -3792,6 +3812,7 @@ function shouldDisplayAlert(entry) {
     || /Codex could not find bubblewrap on PATH/i.test(message)
     || /sandbox prerequisites/i.test(message)
     || /concepts\/sandboxing#prerequisites/i.test(message)
+    || /no live session for command session\.(watch|unwatch)\b/i.test(message)
     || /^Session state changed:\s*exited:(?:null|143):(?:SIGTERM|null)$/i.test(message)
     || /^Session state changed:\s*exited:[^:]*:SIGTERM$/i.test(message)
   );
@@ -11528,7 +11549,152 @@ function populateSettingsForm() {
   el('settings-default-api-profile').value = settings.defaultApiProfileId;
   populateApiProfileEditor(getSelectedApiProfile());
   renderHostApiProfileList();
+  renderSoftwareUpdatePanel();
   applyStaticLocalization(el('settings-dialog'));
+}
+
+function formatSoftwareUpdateSummary(update) {
+  if (!update) {
+    return state.softwareUpdate.message || 'Update status has not been checked yet.';
+  }
+  if (update.dirty) {
+    return 'Local tracked files changed. One-click update is blocked until those changes are handled.';
+  }
+  if (update.updateAvailable) {
+    return `Update available: ${update.currentTag || update.currentVersion || 'current'} -> ${update.latestStableTag}.`;
+  }
+  if (update.latestStableTag) {
+    return `Already on the latest stable tag: ${update.latestStableTag}.`;
+  }
+  return 'No stable update tag was found.';
+}
+
+function formatSoftwareUpdateDetails(update) {
+  if (!update) {
+    return [];
+  }
+  const lines = [
+    `Package path: ${update.rootDir || 'unknown'}`,
+    `Current version: ${update.currentVersion || 'unknown'}`,
+    `Current tag: ${update.currentTag || 'none'} (${update.currentCommit || 'unknown commit'})`,
+    `Latest stable tag: ${update.latestStableTag || 'not found'}`,
+  ];
+  if (Array.isArray(update.trackedChanges) && update.trackedChanges.length) {
+    lines.push(`Tracked changes blocking update: ${update.trackedChanges.join(', ')}`);
+  }
+  if (Array.isArray(update.untrackedFiles) && update.untrackedFiles.length) {
+    lines.push(`Untracked files are left alone: ${update.untrackedFiles.slice(0, 8).join(', ')}${update.untrackedFiles.length > 8 ? ' ...' : ''}`);
+  }
+  if (state.softwareUpdate.lastBackupDir) {
+    lines.push(`Last backup: ${state.softwareUpdate.lastBackupDir}`);
+  }
+  if (state.softwareUpdate.restartScheduled) {
+    lines.push('Restart has been scheduled. Reconnect after the relay comes back online.');
+  }
+  return lines;
+}
+
+function renderSoftwareUpdatePanel() {
+  const update = state.softwareUpdate.status;
+  const summary = el('software-update-summary');
+  const details = el('software-update-details');
+  const checkButton = el('check-update-button');
+  const applyButton = el('apply-update-button');
+  const restartButton = el('restart-after-update-button');
+  const busy = Boolean(state.softwareUpdate.busy);
+
+  if (summary) {
+    summary.textContent = busy ? 'Working on software update...' : formatSoftwareUpdateSummary(update);
+  }
+  if (details) {
+    details.innerHTML = '';
+    for (const line of formatSoftwareUpdateDetails(update)) {
+      const item = document.createElement('div');
+      item.textContent = line;
+      details.appendChild(item);
+    }
+  }
+  if (checkButton) {
+    checkButton.disabled = busy;
+    checkButton.textContent = busy ? 'Checking...' : 'Check update';
+  }
+  if (applyButton) {
+    const canApply = Boolean(update?.updateAvailable && !update?.dirty);
+    applyButton.disabled = busy || !canApply;
+    applyButton.textContent = busy ? 'Updating...' : 'One-click update';
+    applyButton.title = update?.dirty
+      ? 'Tracked local changes must be handled before updating.'
+      : 'Back up local data and update to the newest stable tag.';
+  }
+  if (restartButton) {
+    const showRestart = Boolean(state.softwareUpdate.lastBackupDir || update?.restartRequired);
+    restartButton.classList.toggle('hidden', !showRestart);
+    restartButton.disabled = busy;
+  }
+}
+
+async function refreshSoftwareUpdateStatus(options = {}) {
+  state.softwareUpdate.busy = true;
+  state.softwareUpdate.message = 'Checking for updates...';
+  renderSoftwareUpdatePanel();
+  try {
+    const query = options.fetch === false ? '?fetch=0' : '';
+    const response = await fetchJson(`/api/update/status${query}`);
+    state.softwareUpdate.status = response.update || null;
+    state.softwareUpdate.message = '';
+  } finally {
+    state.softwareUpdate.busy = false;
+    renderSoftwareUpdatePanel();
+  }
+}
+
+async function applySoftwareUpdate() {
+  const update = state.softwareUpdate.status;
+  if (update?.dirty) {
+    reportError(new Error('Tracked local changes block one-click update. Commit or stash them first.'));
+    return;
+  }
+  if (!update?.updateAvailable) {
+    await refreshSoftwareUpdateStatus();
+    return;
+  }
+  const confirmed = window.confirm(`Update from ${update.currentTag || update.currentVersion || 'current'} to ${update.latestStableTag}?\n\nA backup will be created under tmp/update-backups before checkout. Browser API profiles and localStorage will not be touched.`);
+  if (!confirmed) {
+    return;
+  }
+  state.softwareUpdate.busy = true;
+  state.softwareUpdate.message = 'Applying update...';
+  renderSoftwareUpdatePanel();
+  try {
+    const response = await fetchJson('/api/update/apply', { method: 'POST', body: '{}' });
+    const result = response.update || {};
+    state.softwareUpdate.lastBackupDir = result.backupDir || '';
+    state.softwareUpdate.status = result.after || result.before || state.softwareUpdate.status;
+    state.softwareUpdate.message = result.updated
+      ? `Updated to ${result.targetTag}. Restart relay/agent to use the new code.`
+      : `No update applied: ${result.reason || 'already current'}.`;
+  } finally {
+    state.softwareUpdate.busy = false;
+    renderSoftwareUpdatePanel();
+  }
+}
+
+async function restartAfterSoftwareUpdate() {
+  const confirmed = window.confirm('Restart the Windows relay and local host-agent now?\n\nThe page will disconnect briefly and should reconnect after the relay starts again.');
+  if (!confirmed) {
+    return;
+  }
+  state.softwareUpdate.busy = true;
+  state.softwareUpdate.message = 'Scheduling restart...';
+  renderSoftwareUpdatePanel();
+  try {
+    await fetchJson('/api/update/restart', { method: 'POST', body: '{}' });
+    state.softwareUpdate.restartScheduled = true;
+    state.softwareUpdate.message = 'Restart scheduled. Reconnect after the relay comes back online.';
+  } finally {
+    state.softwareUpdate.busy = false;
+    renderSoftwareUpdatePanel();
+  }
 }
 
 function renderSettingsDialog() {
@@ -11547,6 +11713,9 @@ function openSettingsDialog() {
   populateSettingsForm();
   renderSettingsDialog();
   renderLocaleLabels();
+  if (!state.softwareUpdate.status && authAllowsRequests()) {
+    refreshSoftwareUpdateStatus({ fetch: false }).catch(reportError);
+  }
 }
 
 function closeSettingsDialog() {
@@ -11592,6 +11761,7 @@ function renderAll() {
 const queuedUiRenders = {
   timer: null,
   all: false,
+  conversationNav: false,
   selectedViews: false,
   transcript: false,
   transcriptForceScroll: false,
@@ -11609,6 +11779,7 @@ const queuedUiRenders = {
 
 function resetQueuedUiRenderFlags() {
   queuedUiRenders.all = false;
+  queuedUiRenders.conversationNav = false;
   queuedUiRenders.selectedViews = false;
   queuedUiRenders.transcript = false;
   queuedUiRenders.transcriptForceScroll = false;
@@ -11671,6 +11842,7 @@ function flushQueuedUiRenders() {
   queuedUiRenders.timer = null;
   const renderPlan = {
     all: queuedUiRenders.all,
+    conversationNav: queuedUiRenders.conversationNav,
     selectedViews: queuedUiRenders.selectedViews,
     transcript: queuedUiRenders.transcript,
     transcriptForceScroll: queuedUiRenders.transcriptForceScroll,
@@ -11692,6 +11864,9 @@ function flushQueuedUiRenders() {
   } else if (renderPlan.selectedViews) {
     updateSelectedViews({ hostId: state.selectedHostId });
   } else {
+    if (renderPlan.conversationNav) {
+      renderConversationNav();
+    }
     if (renderPlan.sessionDetails) {
       renderSessionDetails();
     }
@@ -11843,6 +12018,7 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.snapshot', (event) => {
     const payload = JSON.parse(event.data);
     mergeSession(payload);
+    markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
     if (payload.bridgeSessionId && state.selectedSessionId === payload.bridgeSessionId) {
       state.selectedSessionId = payload.sessionId;
     }
@@ -11854,6 +12030,7 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.started', (event) => {
     const payload = JSON.parse(event.data);
     mergeSession(payload);
+    markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
     if (payload.bridgeSessionId && state.selectedSessionId === payload.bridgeSessionId) {
       state.selectedSessionId = payload.sessionId;
     }
@@ -11863,6 +12040,7 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.state_changed', (event) => {
     const payload = JSON.parse(event.data);
     mergeSession(payload);
+    markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
     scheduleRenderAll();
   });
 
@@ -11870,7 +12048,7 @@ function subscribeSession(session) {
     const payload = JSON.parse(event.data);
     appendTranscriptEntry(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
     if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
-      updateMessageUnreadForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
+      markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
       clearActiveDraftForSession({
         hostId: payload.hostId || session.hostId,
         sessionId: payload.sessionId || session.sessionId,
@@ -11880,11 +12058,8 @@ function subscribeSession(session) {
     if (selected && getSessionKey(selected) === key) {
       scheduleTranscriptRender({ forceScroll: payload.speaker === 'user' });
       queuedUiRenders.thinkingPanel = true;
-      queuedUiRenders.messageNotificationBell = true;
       scheduleQueuedUiFlush();
     } else if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
-      queuedUiRenders.messageNotificationBell = true;
-      queuedUiRenders.selectedViews = true;
       scheduleQueuedUiFlush();
     }
   });
@@ -15504,6 +15679,18 @@ el('settings-api-profile-select').addEventListener('change', (event) => {
 el('settings-theme-select').addEventListener('change', (event) => {
   state.ui.theme = event.target.value === 'dark-tech' ? 'dark-tech' : 'minimal-light';
   applyUiTheme();
+});
+
+el('check-update-button')?.addEventListener('click', () => {
+  refreshSoftwareUpdateStatus().catch(reportError);
+});
+
+el('apply-update-button')?.addEventListener('click', () => {
+  applySoftwareUpdate().catch(reportError);
+});
+
+el('restart-after-update-button')?.addEventListener('click', () => {
+  restartAfterSoftwareUpdate().catch(reportError);
 });
 
 el('settings-add-api-profile-button').addEventListener('click', () => {
