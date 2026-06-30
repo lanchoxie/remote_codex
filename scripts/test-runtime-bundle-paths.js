@@ -78,12 +78,12 @@ assertContains(
 );
 assertContains(
   downloadScript,
-  'mobile-codex-remote-v2.4.5.zip.manifest.json',
+  'mobile-codex-remote-v2.4.6.zip.manifest.json',
   'runtime downloader should know the release manifest asset name'
 );
 assertContains(
   downloadScript,
-  'mobile-codex-remote-v2.4.5.zip.part',
+  'mobile-codex-remote-v2.4.6.zip.part',
   'runtime downloader should support split release zip parts'
 );
 assertContains(

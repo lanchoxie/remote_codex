@@ -1,7 +1,7 @@
 {
   "name": "mobile-codex-remote",
   "private": true,
-  "version": "2.4.5",
+  "version": "2.4.6",
   "description": "Mobile control plane for Codex sessions on PCs and HPC hosts.",
   "type": "commonjs",
   "scripts": {

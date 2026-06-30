@@ -1,6 +1,6 @@
 param(
   [string]$Repo = "lanchoxie/remote_codex",
-  [string]$Tag = "v2.4.5",
+  [string]$Tag = "v2.4.6",
   [string]$OutDir = "",
   [switch]$Force,
   [switch]$DryRun
@@ -20,7 +20,7 @@ $DownloadDir = Join-Path $OutDir "runtime-download"
 $ZipName = "mobile-codex-remote-$Tag.zip"
 $ManifestName = "$ZipName.manifest.json"
 $ReleaseBase = "https://github.com/$Repo/releases/download/$Tag"
-# Default release assets: mobile-codex-remote-v2.4.5.zip.manifest.json and mobile-codex-remote-v2.4.5.zip.partNNN.
+# Default release assets: mobile-codex-remote-v2.4.6.zip.manifest.json and mobile-codex-remote-v2.4.6.zip.partNNN.
 
 function Write-Step {
   param([string]$Message)
@@ -133,7 +133,7 @@ try {
       $zipStream.Dispose()
     }
   } else {
-    Write-Step "would assemble $ZipName from mobile-codex-remote-v2.4.5.zip.part files"
+    Write-Step "would assemble $ZipName from mobile-codex-remote-v2.4.6.zip.part files"
   }
 } catch {
   Write-Step "manifest download failed, trying full release zip"
