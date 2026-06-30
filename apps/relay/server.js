@@ -6008,11 +6008,10 @@ function buildRemoteOneShotAgentLauncherScript(connector, restart) {
   const launchCommand = agentLogCommand(buildAgentLaunchCommand(connector));
   const launchScriptPath = '.remote-codex-agent-launch.sh';
   const launchScriptCommand = 'sh .remote-codex-agent-launch.sh';
-  const restartFlag = restart ? '1' : '0';
+  const refreshExistingAgent = true;
+  const restartFlag = refreshExistingAgent ? '1' : '0';
   const tmuxStartCommand = `tmux new-session -d -s ${shellQuote(tmuxSession)} ${shellQuote(launchScriptCommand)}`;
-  const tmuxEnsureCommand = restart
-    ? tmuxStartCommand
-    : `tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null || ${tmuxStartCommand}`;
+  const tmuxEnsureCommand = tmuxStartCommand;
   const script = [
     'cat > ' + launchScriptPath + " <<'REMOTE_CODEX_AGENT_LAUNCH'",
     '#!/bin/sh',
@@ -6020,7 +6019,7 @@ function buildRemoteOneShotAgentLauncherScript(connector, restart) {
     'REMOTE_CODEX_AGENT_LAUNCH',
     'chmod +x ' + launchScriptPath,
     'if command -v tmux >/dev/null 2>&1; then',
-    restart
+    refreshExistingAgent
       ? `  tmux kill-session -t ${shellQuote(tmuxSession)} 2>/dev/null || true`
       : '  true',
     `  if ${tmuxEnsureCommand}; then`,

@@ -100,6 +100,21 @@ assertContains(
 );
 assertContains(
   relay,
+  'const refreshExistingAgent = true;',
+  'Start Agent one-shot bootstrap should refresh any existing remote host-agent instead of reusing stale tmux/nohup state'
+);
+assertContains(
+  relay,
+  'const restartFlag = refreshExistingAgent ? \'1\' : \'0\';',
+  'one-shot bootstrap should use refresh semantics for both Start Agent and Restart Agent'
+);
+assertContains(
+  relay,
+  'const tmuxEnsureCommand = tmuxStartCommand;',
+  'Start Agent should launch a fresh tmux session after killing any stale one'
+);
+assertContains(
+  relay,
   'command too long',
   'one-shot bootstrap failure classifier should not report success when the remote shell rejects a long launcher command'
 );
