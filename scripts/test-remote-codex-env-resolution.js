@@ -115,6 +115,11 @@ assertContains(
 );
 assertContains(
   relay,
+  'state.dismissedHosts.delete(actionConnector.hostId);',
+  'starting or restarting a saved connector should restore a previously deleted host id'
+);
+assertContains(
+  relay,
   'command too long',
   'one-shot bootstrap failure classifier should not report success when the remote shell rejects a long launcher command'
 );

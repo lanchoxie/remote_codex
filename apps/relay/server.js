@@ -8663,6 +8663,9 @@ async function handleRequest(req, res) {
     const actionConnector = (action === 'bootstrap' || action === 'restart')
       ? connectorWithActionRelayOrigin(connector, requestOrigin)
       : connector;
+    if ((action === 'bootstrap' || action === 'restart') && actionConnector.hostId) {
+      state.dismissedHosts.delete(actionConnector.hostId);
+    }
     const actionSecret = buildConnectorActionSecret(connector.connectorId, body);
     const askpassRecord = registerAskpassAction(connector.connectorId, action, actionSecret);
     try {
