@@ -57,8 +57,61 @@ function findCodexOnPath(envPath = process.env.PATH || '') {
   return '';
 }
 
+function defaultCursorExtensionsDir() {
+  return path.join(os.homedir(), '.cursor', 'extensions');
+}
+
+function getLocalCodexPlatformCandidates() {
+  if (process.platform === 'win32') {
+    return [{ dir: 'windows-x86_64', bin: 'codex.exe' }];
+  }
+  if (process.platform === 'darwin') {
+    return [{ dir: process.arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64', bin: 'codex' }];
+  }
+  if (process.platform === 'linux') {
+    return [{ dir: process.arch === 'arm64' ? 'linux-arm64' : 'linux-x64', bin: 'codex' }];
+  }
+  return [{ dir: '', bin: process.platform === 'win32' ? 'codex.exe' : 'codex' }];
+}
+
+function findCodexInCursorExtensions(cursorExtensionsDir = defaultCursorExtensionsDir()) {
+  const root = expandHome(cursorExtensionsDir);
+  let entries = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (_) {
+    return '';
+  }
+  const extensionDirs = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('openai.chatgpt-'))
+    .map((entry) => entry.name)
+    .sort()
+    .reverse();
+  const platforms = getLocalCodexPlatformCandidates();
+  for (const extensionDir of extensionDirs) {
+    for (const platform of platforms) {
+      const candidate = platform.dir
+        ? path.join(root, extensionDir, 'bin', platform.dir, platform.bin)
+        : path.join(root, extensionDir, 'bin', platform.bin);
+      if (isExecutableCandidate(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return '';
+}
+
 function defaultCodexHome() {
   return path.join(os.homedir(), '.codex');
+}
+
+function resolveLocalCodexBin(options = {}) {
+  const explicit = cleanString(options.codexBin || process.env.CODEX_BIN);
+  if (explicit) {
+    return explicit;
+  }
+  const pathEnv = Object.prototype.hasOwnProperty.call(options, 'pathEnv') ? options.pathEnv : process.env.PATH;
+  return findCodexOnPath(pathEnv) || findCodexInCursorExtensions(options.cursorExtensionsDir);
 }
 
 function checkLocalCodexPreflight(options = {}) {
@@ -66,14 +119,14 @@ function checkLocalCodexPreflight(options = {}) {
   const errors = [];
   const warnings = [];
   const codexHome = expandHome(options.codexHome || process.env.CODEX_HOME || defaultCodexHome());
-  const codexBin = cleanString(options.codexBin || process.env.CODEX_BIN) || findCodexOnPath(options.pathEnv || process.env.PATH);
+  const codexBin = resolveLocalCodexBin(options);
 
   if (codexBin && isExecutableCandidate(codexBin)) {
     checks.push({ code: 'codex_cli_found', ok: true, path: codexBin });
   } else {
     errors.push({
       code: 'codex_cli_missing',
-      message: 'Codex CLI was not found. Install the Cursor/OpenAI Codex extension or set CODEX_BIN to the codex executable.',
+      message: 'Codex CLI was not found in PATH, CODEX_BIN, or the Cursor extension bins. Install the Cursor/OpenAI Codex extension or set CODEX_BIN to the codex executable.',
     });
   }
 
@@ -135,6 +188,9 @@ function checkLocalCodexPreflight(options = {}) {
 module.exports = {
   checkLocalCodexPreflight,
   defaultCodexHome,
+  defaultCursorExtensionsDir,
   expandHome,
+  findCodexInCursorExtensions,
   findCodexOnPath,
+  resolveLocalCodexBin,
 };

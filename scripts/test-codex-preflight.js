@@ -5,6 +5,7 @@ const path = require('path');
 
 const {
   checkLocalCodexPreflight,
+  findCodexInCursorExtensions,
 } = require('../shared/codex-preflight');
 
 function makeTempHome(name) {
@@ -73,6 +74,25 @@ function writeInitializedHome(home) {
   assert.strictEqual(result.ok, true, 'initialized Codex home and executable should pass preflight');
   assert(result.checks.some((item) => item.code === 'codex_cli_found'), 'valid preflight should report codex_cli_found');
   assert(result.checks.some((item) => item.code === 'codex_home_initialized'), 'valid preflight should report codex_home_initialized');
+}
+
+{
+  const home = makeTempHome('cursor-extension-home');
+  const extensionRoot = makeTempHome('cursor-extensions');
+  const bin = makeCodexBin(
+    path.join(extensionRoot, 'openai.chatgpt-26.5623.61825-win32-x64', 'bin', 'windows-x86_64'),
+    'codex.exe',
+  );
+  writeInitializedHome(home);
+  assert.strictEqual(findCodexInCursorExtensions(extensionRoot), bin, 'preflight should find Codex in Cursor extension bins');
+  const result = checkLocalCodexPreflight({
+    codexHome: home,
+    cursorExtensionsDir: extensionRoot,
+    pathEnv: '',
+    runHelp: false,
+  });
+  assert.strictEqual(result.ok, true, 'Cursor extension Codex binary should pass local preflight without PATH');
+  assert.strictEqual(result.codexBin, bin, 'preflight should report the Cursor extension Codex path');
 }
 
 console.log('codex preflight assertions passed');
