@@ -156,6 +156,16 @@ assertContains(
   '.message-notification-panel',
   'bell should open a dedicated notification panel'
 );
+assertContains(
+  styles,
+  '.message-notification-panel:not(.hidden)',
+  'mobile bell panel should become a viewport-level overlay when opened so phone taps are not clipped by the header'
+);
+assertContains(
+  styles,
+  'position: fixed',
+  'mobile bell panel overlay should use fixed positioning instead of header-relative absolute positioning'
+);
 
 class ElementStub {
   constructor(id = '') {

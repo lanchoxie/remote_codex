@@ -22,6 +22,68 @@ function stripAnsi(value) {
   return String(value || '').replace(/\x1b\[[0-9;]*m/g, '');
 }
 
+function countTextLines(value) {
+  const text = String(value || '');
+  if (!text) {
+    return 0;
+  }
+  return text.split(/\r?\n/).filter((line, index, lines) => line || index < lines.length - 1).length;
+}
+
+function countDiffLines(diffText) {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of String(diffText || '').split(/\r?\n/)) {
+    if (line.startsWith('+++') || line.startsWith('---')) {
+      continue;
+    }
+    if (line.startsWith('+')) {
+      additions += 1;
+    } else if (line.startsWith('-')) {
+      deletions += 1;
+    }
+  }
+  return { additions, deletions };
+}
+
+function normalizeAppServerFileChangeStatus(value) {
+  const text = String(value || '').toLowerCase();
+  if (text === 'add') {
+    return 'added';
+  }
+  if (text === 'delete') {
+    return 'deleted';
+  }
+  if (text === 'update') {
+    return 'modified';
+  }
+  return text || 'modified';
+}
+
+function normalizeAppServerFileChanges(fileChanges) {
+  if (!fileChanges || typeof fileChanges !== 'object') {
+    return [];
+  }
+  return Object.entries(fileChanges)
+    .map(([pathValue, change]) => {
+      if (!change || typeof change !== 'object') {
+        return null;
+      }
+      const status = normalizeAppServerFileChangeStatus(change.type || change.status);
+      const diff = String(change.unified_diff || change.unifiedDiff || change.diff || change.patch || '').trim();
+      const diffCounts = countDiffLines(diff);
+      const contentLines = countTextLines(change.content || '');
+      return {
+        path: String(pathValue || change.path || change.file || change.file_path || 'workspace change'),
+        status,
+        additions: status === 'added' && !diff ? contentLines : diff ? diffCounts.additions : null,
+        deletions: status === 'deleted' && !diff ? contentLines : diff ? diffCounts.deletions : null,
+        diff,
+      };
+    })
+    .filter(Boolean);
+}
+
 function shouldSurfaceStderrLine(text) {
   if (!text) {
     return false;
@@ -2550,6 +2612,7 @@ class CodexAppServerRunner {
 
     if (method === 'item/fileChange/requestApproval') {
       const requestId = String(message.id);
+      const fileChanges = normalizeAppServerFileChanges(params.fileChanges);
       this.pendingRequests.set(requestId, {
         message,
         method,
@@ -2570,6 +2633,21 @@ class CodexAppServerRunner {
         summary: params.reason || params.grantRoot || null,
         payload: params,
       });
+      if (fileChanges.length) {
+        await this.emitDiagnostic({
+          severity: 'warning',
+          source: 'codex',
+          kind: 'file-change',
+          method,
+          message: `File change approval requested: ${fileChanges.length} file(s)`,
+          data: {
+            requestId,
+            fileChanges,
+            reason: params.reason || null,
+            grantRoot: params.grantRoot || null,
+          },
+        });
+      }
       await this.emitAlert({
         severity: 'warning',
         source: 'codex',
@@ -2748,6 +2826,7 @@ async function startCodexAppServerSession(options) {
 }
 
 module.exports = {
+  normalizeAppServerFileChanges,
   prepareApiProfileCodexHome,
   resolveDefaultCodexBin,
   startCodexAppServerSession,

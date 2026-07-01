@@ -206,8 +206,14 @@ const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const TRANSCRIPT_RENDER_WINDOW = 160;
 const TRANSCRIPT_RENDER_INCREMENT = 160;
+const TRANSCRIPT_RENDER_MIN_WINDOW = 32;
+const TRANSCRIPT_RENDER_CHAR_BUDGET = 90_000;
+const TRANSCRIPT_RENDER_LINE_BUDGET = 3_000;
+const TRANSCRIPT_RENDER_CODE_FENCE_BUDGET = 180;
 const CLIENT_DIAGNOSTIC_ENTRY_LIMIT = 10000;
 const CLIENT_DIAGNOSTIC_RECENT_DEDUPE_WINDOW = 200;
+const LIVE_THINKING_DIAGNOSTIC_WINDOW = 240;
+const LIVE_THINKING_TRANSCRIPT_LOOKBACK = 240;
 const UI_EVENT_RENDER_DEBOUNCE_MS = 80;
 const TRANSCRIPT_EVENT_RENDER_DEBOUNCE_MS = 160;
 const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
@@ -701,6 +707,12 @@ const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
 ]);
 
 const el = (id) => document.getElementById(id);
+const cssEscape = (value) => {
+  if (window.CSS?.escape) {
+    return window.CSS.escape(String(value || ''));
+  }
+  return String(value || '').replace(/["\\]/g, '\\$&');
+};
 
 function escapeHtml(value) {
   return String(value || '')
@@ -2059,10 +2071,13 @@ function isUserSuitableThinkingText(text, entry = {}) {
   return true;
 }
 
-function buildLiveActivitySegment(session, latestUserEntry = null) {
+function buildLiveActivitySegment(session, latestUserEntry = null, diagnostics = null) {
   const startTime = Date.parse(latestUserEntry?.timestamp || '');
   const startGraceMs = 5000;
-  const entries = getThinkingDiagnosticsForSession(session)
+  const sourceDiagnostics = Array.isArray(diagnostics)
+    ? diagnostics.filter(isThinkingActivityDiagnostic)
+    : getThinkingDiagnosticsForSession(session);
+  const entries = sourceDiagnostics
     .filter((diag) => {
       if (!Number.isFinite(startTime)) {
         return true;
@@ -2083,6 +2098,18 @@ function buildLiveActivitySegment(session, latestUserEntry = null) {
   };
 }
 
+function getLatestUserTranscriptEntry(session) {
+  const transcript = getTranscriptForSession(session);
+  const minIndex = Math.max(0, transcript.length - LIVE_THINKING_TRANSCRIPT_LOOKBACK);
+  for (let index = transcript.length - 1; index >= minIndex; index -= 1) {
+    const entry = transcript[index];
+    if (entry?.speaker === 'user') {
+      return entry;
+    }
+  }
+  return null;
+}
+
 function getLatestFormalAgentMessage(session) {
   if (!session) {
     return 'No recent agent reply captured.';
@@ -2098,14 +2125,19 @@ function getLatestFormalAgentMessage(session) {
   return latest?.text || 'No recent agent reply captured.';
 }
 
-function buildThinkingEntriesForSession(session) {
+function buildThinkingEntriesForSession(session, options = {}) {
   if (!session) {
     return [];
   }
 
-  const transcript = getTranscriptForSession(session)
+  const transcriptSource = Array.isArray(options.transcriptEntries)
+    ? options.transcriptEntries
+    : getTranscriptForSession(session);
+  const transcript = transcriptSource
     .filter((entry) => entry && (entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant'));
-  const thinkingDiagnostics = getThinkingDiagnosticsForSession(session);
+  const thinkingDiagnostics = Array.isArray(options.diagnostics)
+    ? options.diagnostics
+    : getThinkingDiagnosticsForSession(session);
 
   const transcriptTimes = transcript.map((entry) => Date.parse(entry.timestamp || '')).map((value) => (Number.isFinite(value) ? value : null));
   const segments = [];
@@ -2328,9 +2360,49 @@ function countDiffLines(diffText) {
   return { additions, deletions };
 }
 
+function countTextLines(text) {
+  const value = String(text || '');
+  if (!value) {
+    return 0;
+  }
+  return value.split(/\r?\n/).filter((line, index, lines) => line || index < lines.length - 1).length;
+}
+
 function toCount(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function normalizeFileChangeStatus(value) {
+  const text = String(value || '').toLowerCase();
+  if (['a', 'add', 'added', 'create', 'created', 'new'].includes(text)) {
+    return 'added';
+  }
+  if (['d', 'delete', 'deleted', 'remove', 'removed'].includes(text)) {
+    return 'deleted';
+  }
+  if (['m', 'modify', 'modified', 'update', 'updated', 'edit', 'edited'].includes(text)) {
+    return 'modified';
+  }
+  if (['r', 'rename', 'renamed', 'move', 'moved'].includes(text)) {
+    return 'renamed';
+  }
+  return '';
+}
+
+function fileChangeStatusLabel(status) {
+  switch (normalizeFileChangeStatus(status)) {
+    case 'added':
+      return 'Added';
+    case 'deleted':
+      return 'Deleted';
+    case 'renamed':
+      return 'Renamed';
+    case 'modified':
+      return 'Modified';
+    default:
+      return 'Changed';
+  }
 }
 
 function pathFromDiffHeader(diffText) {
@@ -2360,6 +2432,7 @@ function splitUnifiedDiff(diffText) {
     const counts = countDiffLines(chunk);
     return {
       path: pathFromDiffHeader(chunk) || 'workspace change',
+      status: 'modified',
       additions: counts.additions,
       deletions: counts.deletions,
       diff: chunk,
@@ -2371,8 +2444,9 @@ function normalizeFileChangeRecord(raw, fallbackPath = '') {
   if (!raw || typeof raw !== 'object') {
     return null;
   }
-  const diff = String(raw.diff || raw.patch || raw.unifiedDiff || raw.unified_diff || raw.content || raw.text || '').trim();
+  const diff = String(raw.diff || raw.patch || raw.unifiedDiff || raw.unified_diff || '').trim();
   const counts = countDiffLines(diff);
+  const rawStatus = normalizeFileChangeStatus(raw.status || raw.changeType || raw.change_type || raw.type || raw.kind || raw.action);
   const pathValue = String(
     raw.path
       || raw.filePath
@@ -2385,17 +2459,50 @@ function normalizeFileChangeRecord(raw, fallbackPath = '') {
       || pathFromDiffHeader(diff)
       || ''
   ).trim();
-  const additions = toCount(raw.additions ?? raw.added ?? raw.insertions ?? raw.linesAdded ?? raw.addedLines) ?? counts.additions;
-  const deletions = toCount(raw.deletions ?? raw.deleted ?? raw.removed ?? raw.linesDeleted ?? raw.deletedLines) ?? counts.deletions;
-  if (!diff && !additions && !deletions) {
+  const contentLineCount = countTextLines(raw.content || raw.text || '');
+  const additions = toCount(raw.additions ?? raw.added ?? raw.insertions ?? raw.linesAdded ?? raw.addedLines)
+    ?? (diff ? counts.additions : rawStatus === 'added' ? contentLineCount : null);
+  const deletions = toCount(raw.deletions ?? raw.deleted ?? raw.removed ?? raw.linesDeleted ?? raw.deletedLines)
+    ?? (diff ? counts.deletions : rawStatus === 'deleted' ? contentLineCount : null);
+  if (!diff && !rawStatus && additions === null && deletions === null) {
     return null;
   }
   return {
     path: pathValue || 'workspace change',
+    status: rawStatus || (diff ? 'modified' : ''),
     additions,
     deletions,
     diff,
   };
+}
+
+function parsePatchApplyUpdatedFiles(value) {
+  const text = String(value || '');
+  const marker = 'Updated the following files:';
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex < 0) {
+    return [];
+  }
+  const lines = text.slice(markerIndex + marker.length).split(/\r?\n/);
+  const records = [];
+  for (const line of lines) {
+    const match = line.match(/^\s*([AMDR])\s+(.+?)\s*$/);
+    if (!match) {
+      if (records.length && line.trim()) {
+        break;
+      }
+      continue;
+    }
+    const status = normalizeFileChangeStatus(match[1]);
+    records.push({
+      path: match[2],
+      status,
+      additions: null,
+      deletions: null,
+      diff: '',
+    });
+  }
+  return records;
 }
 
 function normalizeFileChanges(entry) {
@@ -2447,6 +2554,23 @@ function normalizeFileChanges(entry) {
     }
 
     const nextFallback = String(value.path || value.filePath || value.file_path || value.filename || value.name || fallbackPath || '');
+    const looksLikeFileChangeMap = !Array.isArray(value)
+      && Object.keys(value).length > 0
+      && Object.values(value).every((item) => item && typeof item === 'object' && (
+        item.type || item.unified_diff || item.unifiedDiff || item.diff || item.patch || item.content
+      ))
+      && !('type' in value)
+      && !('diff' in value)
+      && !('patch' in value)
+      && !('unified_diff' in value)
+      && !('unifiedDiff' in value);
+    if (looksLikeFileChangeMap) {
+      for (const [pathKey, item] of Object.entries(value)) {
+        addRecord(normalizeFileChangeRecord(item, pathKey));
+      }
+      return;
+    }
+
     addRecord(normalizeFileChangeRecord(value, nextFallback));
     for (const key of ['changes', 'files', 'fileChanges', 'file_changes', 'edits', 'patches', 'diffs', 'items']) {
       if (value[key]) {
@@ -2456,6 +2580,13 @@ function normalizeFileChanges(entry) {
     for (const key of ['diff', 'patch', 'unifiedDiff', 'unified_diff']) {
       if (typeof value[key] === 'string') {
         visit(value[key], nextFallback, depth + 1);
+      }
+    }
+    for (const key of ['stdout', 'stderr', 'output']) {
+      if (typeof value[key] === 'string') {
+        for (const record of parsePatchApplyUpdatedFiles(value[key])) {
+          addRecord(record);
+        }
       }
     }
   }
@@ -8984,11 +9115,38 @@ function renderRuntimePanel() {
 }
 
 function renderThinkingPanel() {
-  const panel = el('thinking-panel');
-  if (panel) {
-    panel.innerHTML = '';
-    panel.classList.add('hidden');
+  const session = getSelectedSession();
+  if (!session) {
+    return;
   }
+
+  const runtime = getRuntimeForSession(session) || {};
+  const stream = getStreamStatusForSession(session) || {};
+  const showLivePlaceholder = Boolean(session.live && runtimeIsActive(runtime));
+  if (!showLivePlaceholder) {
+    return;
+  }
+
+  const diagnostics = [
+    ...getDiagnosticsForSession(session).slice(-LIVE_THINKING_DIAGNOSTIC_WINDOW),
+    ...getRequestsForSession(session).map(requestToThinkingDiagnostic).filter(Boolean),
+  ];
+
+  const latestUserEntry = getLatestUserTranscriptEntry(session);
+  const liveSegment = buildLiveActivitySegment(session, latestUserEntry, diagnostics);
+  if (!liveSegment && !showLivePlaceholder) {
+    return;
+  }
+
+  const log = el('session-log');
+  const expectedStateKey = `${getSessionKey(session) || session.sessionId || 'session'}::thinking::${liveSegment?.userTimestamp || latestUserEntry?.timestamp || 'live'}`;
+  const existingCard = log?.querySelector(`.thinking-card[data-thinking-state-key="${cssEscape(expectedStateKey)}"]`);
+  const existingMessage = existingCard?.closest('.message.thinking');
+  if (!existingMessage) {
+    return;
+  }
+
+  existingMessage.replaceWith(buildThinkingMessageElement(session, liveSegment, runtime, stream, !liveSegment));
 }
 
 function renderAlertsWindow() {
@@ -10008,7 +10166,7 @@ function renderStatusWindow() {
   );
   renderStatusSummaryCard(summaryGrid, 'Runner', getRunnerSummary(session).label, runtime.lastCodexError || '');
 
-  const thinkingRecordCount = buildThinkingEntriesForSession(session).reduce((total, segment) => total + (segment.entries?.length || 0), 0);
+  const thinkingRecordCount = getThinkingDiagnosticsForSession(session).length;
   el('status-thinking').textContent = thinkingRecordCount
     ? `${thinkingRecordCount} structured thinking record${thinkingRecordCount === 1 ? '' : 's'} are available in the conversation flow.`
     : 'Structured reasoning and plan history, when available, is shown in the conversation flow.';
@@ -10405,13 +10563,23 @@ function renderFileChangeDetails(fileChanges = []) {
   for (const change of fileChanges) {
     const details = document.createElement('details');
     details.className = 'thinking-file-change-card';
-    const additions = Number(change.additions || 0);
-    const deletions = Number(change.deletions || 0);
+    const additions = toCount(change.additions);
+    const deletions = toCount(change.deletions);
+    const status = normalizeFileChangeStatus(change.status) || (change.diff ? 'modified' : 'changed');
+    const stats = [];
+    if (additions !== null) {
+      stats.push(`<span class="diff-stat added">+${additions}</span>`);
+    }
+    if (deletions !== null) {
+      stats.push(`<span class="diff-stat removed">-${deletions}</span>`);
+    }
+    if (!stats.length) {
+      stats.push(`<span class="diff-stat status">${escapeHtml(fileChangeStatusLabel(status))}</span>`);
+    }
     details.innerHTML = `
       <summary class="thinking-file-change-summary">
         <span class="thinking-file-path">${escapeHtml(change.path || 'workspace change')}</span>
-        <span class="diff-stat added">+${additions}</span>
-        <span class="diff-stat removed">-${deletions}</span>
+        ${stats.join('')}
       </summary>
     `;
     const diff = document.createElement('div');
@@ -11168,6 +11336,61 @@ function renderFileCards(container, session, entry) {
   }
 }
 
+function estimateTranscriptEntryRenderCost(entry) {
+  const text = String(entry?.text || '');
+  const newlineMatches = text.match(/\n/g);
+  const fenceMatches = text.match(/```/g);
+  return {
+    chars: text.length,
+    lines: (newlineMatches ? newlineMatches.length : 0) + 1,
+    codeFences: fenceMatches ? fenceMatches.length : 0,
+  };
+}
+
+function selectTranscriptRenderWindow(visibleTranscript, desiredLimit, options = {}) {
+  const entries = Array.isArray(visibleTranscript) ? visibleTranscript : [];
+  const baseLimit = Math.max(0, Number(desiredLimit) || 0);
+  const limitedEntries = baseLimit && entries.length > baseLimit
+    ? entries.slice(-baseLimit)
+    : entries.slice();
+  if (!options.enforceBudget || limitedEntries.length <= TRANSCRIPT_RENDER_MIN_WINDOW) {
+    return {
+      hiddenTranscriptCount: Math.max(0, entries.length - limitedEntries.length),
+      renderedTranscript: limitedEntries,
+    };
+  }
+
+  let chars = 0;
+  let lines = 0;
+  let codeFences = 0;
+  let keepFrom = limitedEntries.length;
+  for (let index = limitedEntries.length - 1; index >= 0; index -= 1) {
+    const cost = estimateTranscriptEntryRenderCost(limitedEntries[index]);
+    const nextChars = chars + cost.chars;
+    const nextLines = lines + cost.lines;
+    const nextCodeFences = codeFences + cost.codeFences;
+    const keptCount = limitedEntries.length - index;
+    const exceedsBudget = keptCount > TRANSCRIPT_RENDER_MIN_WINDOW && (
+      nextChars > TRANSCRIPT_RENDER_CHAR_BUDGET
+      || nextLines > TRANSCRIPT_RENDER_LINE_BUDGET
+      || nextCodeFences > TRANSCRIPT_RENDER_CODE_FENCE_BUDGET
+    );
+    if (exceedsBudget) {
+      break;
+    }
+    chars = nextChars;
+    lines = nextLines;
+    codeFences = nextCodeFences;
+    keepFrom = index;
+  }
+
+  const renderedTranscript = limitedEntries.slice(Math.max(0, keepFrom));
+  return {
+    hiddenTranscriptCount: Math.max(0, entries.length - renderedTranscript.length),
+    renderedTranscript,
+  };
+}
+
 function renderTranscript(session = getSelectedSession(), options = {}) {
   const log = el('session-log');
   const key = getSessionKey(session) || '';
@@ -11229,14 +11452,17 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       visibleTranscript.length - focusIndex
     ));
   }
-  const visibleLimit = isOptimizeSpeedMode()
+  const requestedVisibleLimit = isOptimizeSpeedMode()
     ? Math.max(TRANSCRIPT_RENDER_WINDOW, Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW))
     : visibleTranscript.length;
-  const hiddenTranscriptCount = Math.max(0, visibleTranscript.length - visibleLimit);
-  const renderedTranscript = hiddenTranscriptCount
-    ? visibleTranscript.slice(-visibleLimit)
-    : visibleTranscript;
-  const thinkingSegments = buildThinkingEntriesForSession(session);
+  const renderWindow = selectTranscriptRenderWindow(visibleTranscript, requestedVisibleLimit, {
+    enforceBudget: Boolean(isOptimizeSpeedMode() && !focus && !state.sessionSearchQuery.trim()),
+  });
+  const hiddenTranscriptCount = renderWindow.hiddenTranscriptCount;
+  const renderedTranscript = renderWindow.renderedTranscript;
+  const thinkingSegments = buildThinkingEntriesForSession(session, {
+    transcriptEntries: renderedTranscript,
+  });
   const renderedEntryCount = visibleTranscript.length
     + thinkingSegments.reduce((total, segment) => total + (Array.isArray(segment.entries) ? segment.entries.length : 0), 0);
   const previousRenderedEntryCount = state.transcriptEntryCounts.get(key) || 0;
@@ -12117,7 +12343,6 @@ function subscribeSession(session) {
       refreshInferredComposerOptionsForSession(selected);
       queuedUiRenders.sessionDetails = true;
       queuedUiRenders.thinkingPanel = true;
-      scheduleTranscriptRender();
     }
     queuedUiRenders.statusWindow = true;
     scheduleQueuedUiFlush();

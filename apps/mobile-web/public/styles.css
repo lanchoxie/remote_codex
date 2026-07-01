@@ -2269,6 +2269,11 @@ select:disabled {
   background: rgba(255, 111, 129, 0.13);
 }
 
+.diff-stat.status {
+  color: rgba(134, 167, 255, 0.92);
+  background: rgba(134, 167, 255, 0.14);
+}
+
 .thinking-diff-block {
   max-height: 420px;
   overflow: auto;
@@ -5112,6 +5117,20 @@ button {
     radial-gradient(circle at top left, rgba(251, 191, 36, 0.14), transparent 34%),
     linear-gradient(180deg, rgba(12, 22, 42, 0.98), rgba(8, 15, 30, 0.98));
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.42);
+}
+
+@media (max-width: 980px), (pointer: coarse), (hover: none) {
+  .message-notification-panel:not(.hidden) {
+    position: fixed;
+    top: 76px;
+    right: 12px;
+    left: 12px;
+    z-index: 3000;
+    width: auto;
+    max-height: min(72dvh, 520px);
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
 }
 
 .message-notification-header {
