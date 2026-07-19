@@ -105,6 +105,17 @@ function defaultCodexHome() {
   return path.join(os.homedir(), '.codex');
 }
 
+function isWindowsCommandShim(filePath) {
+  return process.platform === 'win32' && /\.(cmd|bat)$/i.test(String(filePath || ''));
+}
+
+function spawnCodexForPreflight(codexBin, args = [], options = {}) {
+  return spawnSync(codexBin, args, {
+    ...options,
+    shell: isWindowsCommandShim(codexBin),
+  });
+}
+
 function resolveLocalCodexBin(options = {}) {
   const explicit = cleanString(options.codexBin || process.env.CODEX_BIN);
   if (explicit) {
@@ -153,7 +164,7 @@ function checkLocalCodexPreflight(options = {}) {
   }
 
   if (codexBin && isExecutableCandidate(codexBin) && options.runHelp !== false) {
-    const help = spawnSync(codexBin, ['--help'], {
+    const help = spawnCodexForPreflight(codexBin, ['--help'], {
       encoding: 'utf8',
       timeout: options.helpTimeoutMs || 8_000,
       env: {
@@ -193,4 +204,5 @@ module.exports = {
   findCodexInCursorExtensions,
   findCodexOnPath,
   resolveLocalCodexBin,
+  spawnCodexForPreflight,
 };

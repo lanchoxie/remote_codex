@@ -1,4 +1,5 @@
 const fs = require('fs');
+const { StringDecoder } = require('string_decoder');
 
 const JSONL_READ_CHUNK_BYTES = Number(process.env.CODEX_JSONL_READ_CHUNK_BYTES || 64 * 1024);
 
@@ -24,16 +25,17 @@ function readJsonLinesHeadLimited(filePath, maxEntries) {
   const fd = fs.openSync(filePath, 'r');
   try {
     const buffer = Buffer.alloc(JSONL_READ_CHUNK_BYTES);
+    const decoder = new StringDecoder('utf8');
     let offset = 0;
     let pending = '';
     while (entries.length < maxEntries) {
       const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, offset);
       if (bytesRead <= 0) {
-        parseJsonLineIntoEntries(pending, entries, maxEntries);
+        parseJsonLineIntoEntries(pending + decoder.end(), entries, maxEntries);
         break;
       }
       offset += bytesRead;
-      const text = pending + buffer.subarray(0, bytesRead).toString('utf8');
+      const text = pending + decoder.write(buffer.subarray(0, bytesRead));
       const lines = text.split(/\r?\n/);
       pending = lines.pop() || '';
       parseJsonLinesIntoEntries(lines, entries, maxEntries);
@@ -77,11 +79,15 @@ function readJsonLinesTailLimited(filePath, maxEntries) {
       if (bytesRead <= 0) {
         break;
       }
-      const text = buffer.subarray(0, bytesRead).toString('utf8');
-      chunks.unshift(text);
-      newlineCount += (text.match(/\n/g) || []).length;
+      const chunk = buffer.subarray(0, bytesRead);
+      chunks.unshift(chunk);
+      for (const byte of chunk) {
+        if (byte === 0x0a) {
+          newlineCount += 1;
+        }
+      }
     }
-    return parseJsonLinesFromTail(chunks.join('').split(/\r?\n/), maxEntries);
+    return parseJsonLinesFromTail(Buffer.concat(chunks).toString('utf8').split(/\r?\n/), maxEntries);
   } finally {
     fs.closeSync(fd);
   }

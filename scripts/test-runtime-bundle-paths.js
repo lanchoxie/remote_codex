@@ -28,7 +28,7 @@ assertContains(
 );
 assertContains(
   nodeBody,
-  "path.join(process.cwd(), 'tmp'",
+  'LEGACY_RUNTIME_CACHE_ROOT',
   'Node runtime lookup should keep the legacy tmp cache fallback'
 );
 
@@ -49,8 +49,14 @@ assertContains(
 );
 assertContains(
   codexBody,
-  "path.join(process.cwd(), 'tmp', 'codex-linux-x86_64')",
+  "path.join(LEGACY_RUNTIME_CACHE_ROOT, 'codex-linux-x86_64')",
   'Codex runtime lookup should keep the legacy tmp staged runtime fallback'
+);
+
+assertContains(
+  relay,
+  "const LEGACY_RUNTIME_CACHE_ROOT = path.resolve(process.cwd(), 'tmp')",
+  'the legacy runtime cache must be explicitly separated from writable Relay state'
 );
 
 const payloadStart = relay.indexOf('function collectOneShotBootstrapSources()');

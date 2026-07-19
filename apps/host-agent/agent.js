@@ -14,9 +14,35 @@ const {
   readCodexSessionSummary,
 } = require('../../shared/codex-discovery');
 const { CodexSessionTailer } = require('../../shared/codex-tail');
+const {
+  CodexAssistantCursorIndex,
+  normalizedFileKey,
+} = require('../../shared/codex-assistant-cursor');
+const { deliverAgentEventBatch } = require('../../shared/agent-event-batch');
+const { createCoalescedAsyncTask } = require('../../shared/coalesced-async-task');
 const { makeId, nowIso, normalizeArgs } = require('../../shared/protocol');
+const { normalizePortableSkillId } = require('../../shared/skill-id');
 const { resolveManagedRuntime, startManagedRuntimeSession } = require('./runtime-adapters');
+const {
+  abortUnconfirmedRunner,
+  buildManagedSessionStartedEvent,
+  createManagedSessionStartGate,
+  createManagedSessionShutdown,
+  findRunnerForCommand,
+  retainRunnerForStartRetry,
+  replayManagedSessionStart,
+  shouldPublishMissingRunnerStop,
+} = require('./managed-session-lifecycle');
+const { cleanupStaleApiProfileCodexHomes } = require('./codex-app-server-runner');
 const { normalizeApiConfig } = require('./runtime-utils');
+const {
+  attestHostEnvironmentBinding,
+  deriveRunBinding,
+  normalizeProviderModelPage,
+} = require('./session-api-runtime');
+const { HostSkillArtifactService } = require('./skill-artifact-service');
+const { HostSkillDeploymentService } = require('./skill-deployment-service');
+const { HostSkillInventoryService } = require('./skill-inventory-service');
 
 const RELAY_URL = process.env.RELAY_URL || 'http://127.0.0.1:8787';
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
@@ -33,6 +59,15 @@ const CODEX_DISCOVERY_LIST_PREVIEW = String(
 const CODEX_DISCOVERY_LIST_META_LIMIT = Number(
   process.env.CODEX_DISCOVERY_LIST_META_LIMIT || (CODEX_DISCOVERY_LIST_PREVIEW ? 250 : 40)
 );
+const CODEX_ASSISTANT_CURSOR_MAX_BYTES_PER_SCAN = Math.max(
+  1024,
+  Number(process.env.CODEX_ASSISTANT_CURSOR_MAX_BYTES_PER_SCAN || 256 * 1024) || 256 * 1024
+);
+const CODEX_ASSISTANT_CURSOR_MAX_BYTES_PER_DISCOVERY = Math.max(
+  CODEX_ASSISTANT_CURSOR_MAX_BYTES_PER_SCAN,
+  Number(process.env.CODEX_ASSISTANT_CURSOR_MAX_BYTES_PER_DISCOVERY || 4 * 1024 * 1024)
+    || 4 * 1024 * 1024
+);
 const SESSION_WATCH_TTL_MS = Math.max(30000, Number(process.env.AGENT_SESSION_WATCH_TTL_MS || 5 * 60 * 1000));
 const WATCH_PERFORMANCE_WARN_MS = Math.max(1000, Number(process.env.AGENT_WATCH_PERFORMANCE_WARN_MS || 8000));
 const WATCH_PERFORMANCE_SLOW_MS = Math.max(WATCH_PERFORMANCE_WARN_MS, Number(process.env.AGENT_WATCH_PERFORMANCE_SLOW_MS || 15000));
@@ -43,6 +78,10 @@ const MANAGED_COMMAND = process.env.MANAGED_COMMAND || 'codex-app-server';
 const MANAGED_ARGS = normalizeArgs(process.env.MANAGED_ARGS_JSON || '[]');
 const MANAGED_CWD = process.env.MANAGED_CWD || process.cwd();
 const WORKSPACE_ROOTS = parseWorkspaceRoots(process.env.WORKSPACE_ROOTS || '');
+const AGENTS_HOME = process.env.AGENTS_HOME || path.join(os.homedir(), '.agents');
+const CC_SWITCH_HOME = process.env.CC_SWITCH_HOME || path.join(os.homedir(), '.cc-switch');
+const SKILL_PLUGIN_ROOTS = parseWorkspaceRoots(process.env.SKILL_PLUGIN_ROOTS || '');
+const REMOTE_CODEX_STATE_ROOT = process.env.REMOTE_CODEX_STATE_ROOT || path.join(os.homedir(), '.remote-codex');
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
 const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
 const MAX_FILE_CHUNK_BYTES = Number(process.env.AGENT_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
@@ -53,20 +92,154 @@ const SESSION_DETAIL_DIAGNOSTIC_LIMIT = Number(process.env.AGENT_SESSION_DETAIL_
 const WINDOWS_DRIVE_PROBE_LETTERS = String(process.env.AGENT_WINDOWS_BROWSE_DRIVES || 'CDE')
   .toUpperCase()
   .replace(/[^A-Z]/g, '');
+const AGENT_SHUTDOWN_GRACE_MS = Math.max(
+  1000,
+  Number(process.env.AGENT_SHUTDOWN_GRACE_MS || 10000) || 10000
+);
+const AGENT_PROCESS_STARTED_AT = nowIso();
+const RELAY_MANAGED_LOCAL_AGENT = /^(1|true|yes|on)$/i.test(
+  String(process.env.RELAY_MANAGED_LOCAL_AGENT || '').trim()
+);
+const RELAY_MANAGED_AGENT_INSTANCE_ID = String(
+  process.env.RELAY_MANAGED_AGENT_INSTANCE_ID || ''
+).trim();
+const RELAY_MANAGED_AGENT_TOKEN = String(process.env.RELAY_MANAGED_AGENT_TOKEN || '').trim();
+const RELAY_MANAGED_MARKER_PATH = String(process.env.RELAY_MANAGED_MARKER_PATH || '').trim();
+const RELAY_MANAGED_OWNER_PID = Math.trunc(Number(process.env.RELAY_MANAGED_OWNER_PID || 0));
+const CLEAN_LEGACY_MANAGED_OVERLAYS = String(
+  process.env.AGENT_CLEAN_LEGACY_MANAGED_OVERLAYS || ''
+).trim().toLowerCase() === 'true';
 
 const liveSessions = new Map();
+const managedSessionStartGate = createManagedSessionStartGate();
 const activeFileUploads = new Map();
 const watchedHistorySessions = new Map();
 let lastWatchPerformanceReportAt = 0;
+let hostSkillInventory = null;
+let hostSkillDeployment = null;
+const assistantCursorIndex = new CodexAssistantCursorIndex({
+  maxBytesPerScan: CODEX_ASSISTANT_CURSOR_MAX_BYTES_PER_SCAN,
+  maxBytesPerScanMany: CODEX_ASSISTANT_CURSOR_MAX_BYTES_PER_DISCOVERY,
+  now: nowIso,
+});
 const codexTailer = CODEX_TAIL_ENABLED
   ? new CodexSessionTailer({
     codexHome: CODEX_HOME,
     hostId: HOST_ID,
     postEvent,
+    postEvents,
+    assistantCursorIndex,
     log: logAgentError,
   })
   : null;
 let lastCommandId = 0;
+let relayInstanceId = null;
+
+function observeRelayInstance(body) {
+  const nextRelayInstanceId = String(body?.relayInstanceId || '').trim();
+  if (!nextRelayInstanceId) return false;
+  const changed = Boolean(relayInstanceId && relayInstanceId !== nextRelayInstanceId);
+  if (changed) {
+    lastCommandId = 0;
+  }
+  relayInstanceId = nextRelayInstanceId;
+  return changed;
+}
+
+function managedAgentProcessMetadata() {
+  if (
+    !RELAY_MANAGED_LOCAL_AGENT
+    || !RELAY_MANAGED_AGENT_INSTANCE_ID
+    || !RELAY_MANAGED_AGENT_TOKEN
+  ) {
+    return null;
+  }
+  return {
+    relayManaged: true,
+    pid: process.pid,
+    parentPid: process.ppid,
+    instanceId: RELAY_MANAGED_AGENT_INSTANCE_ID,
+    ownershipToken: RELAY_MANAGED_AGENT_TOKEN,
+    relayUrl: RELAY_URL,
+    startedAt: AGENT_PROCESS_STARTED_AT,
+  };
+}
+
+function managedAgentRequestHeaders() {
+  const metadata = managedAgentProcessMetadata();
+  if (!metadata) return {};
+  return {
+    'X-Remote-Codex-Agent-Managed': '1',
+    'X-Remote-Codex-Agent-Pid': String(metadata.pid),
+    'X-Remote-Codex-Agent-Instance': metadata.instanceId,
+    'X-Remote-Codex-Agent-Token': metadata.ownershipToken,
+  };
+}
+
+function managedAgentOwnershipMarker() {
+  const metadata = managedAgentProcessMetadata();
+  if (!metadata || !RELAY_MANAGED_MARKER_PATH) return null;
+  return {
+    kind: 'remote-codex-local-agent-owner',
+    version: 1,
+    hostId: HOST_ID,
+    pid: process.pid,
+    instanceId: metadata.instanceId,
+    ownershipToken: metadata.ownershipToken,
+    ownerRelayPid: RELAY_MANAGED_OWNER_PID > 0 ? RELAY_MANAGED_OWNER_PID : process.ppid,
+    relayUrl: RELAY_URL,
+    startedAt: AGENT_PROCESS_STARTED_AT,
+  };
+}
+
+function ensureManagedAgentOwnershipMarker() {
+  const marker = managedAgentOwnershipMarker();
+  if (!marker) return false;
+  try {
+    if (fs.existsSync(RELAY_MANAGED_MARKER_PATH)) {
+      const existing = JSON.parse(fs.readFileSync(RELAY_MANAGED_MARKER_PATH, 'utf8'));
+      return String(existing?.instanceId || '') === marker.instanceId
+        && String(existing?.ownershipToken || '') === marker.ownershipToken
+        && Number(existing?.pid || 0) === marker.pid;
+    }
+    fs.mkdirSync(path.dirname(RELAY_MANAGED_MARKER_PATH), { recursive: true });
+    const tempPath = `${RELAY_MANAGED_MARKER_PATH}.${process.pid}.${makeId()}.tmp`;
+    fs.writeFileSync(tempPath, `${JSON.stringify(marker, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    try {
+      fs.renameSync(tempPath, RELAY_MANAGED_MARKER_PATH);
+    } catch (error) {
+      try {
+        fs.rmSync(tempPath, { force: true });
+      } catch (_) {
+        // Best effort cleanup of an incomplete marker write.
+      }
+      throw error;
+    }
+    return true;
+  } catch (error) {
+    logAgentError('[agent] failed to ensure Relay ownership marker:', error.message || error);
+    return false;
+  }
+}
+
+function removeManagedAgentOwnershipMarker() {
+  const marker = managedAgentOwnershipMarker();
+  if (!marker) return false;
+  try {
+    const existing = JSON.parse(fs.readFileSync(RELAY_MANAGED_MARKER_PATH, 'utf8'));
+    if (
+      String(existing?.instanceId || '') !== marker.instanceId
+      || String(existing?.ownershipToken || '') !== marker.ownershipToken
+      || Number(existing?.pid || 0) !== marker.pid
+    ) {
+      return false;
+    }
+    fs.rmSync(RELAY_MANAGED_MARKER_PATH, { force: true });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 
 function loadRelayAuthToken() {
   const envToken = String(process.env.RELAY_AUTH_TOKEN || '').trim();
@@ -85,6 +258,10 @@ function getCapabilities() {
     discovery: true,
     managedSessions: true,
     directoryBrowse: true,
+    hostSkills: true,
+    hostSkillInventoryV2: true,
+    hostSkillArtifactsV1: true,
+    hostSkillDeploymentV1: true,
     structuredStatus: true,
     requestResponses: true,
     interrupt: true,
@@ -97,6 +274,9 @@ function getCapabilities() {
     modelList: true,
     skillList: true,
     apiTest: true,
+    apiCatalog: true,
+    bindingPreflight: true,
+    runApiBinding: MANAGED_RUNTIME !== 'demo' && MANAGED_COMMAND !== 'demo',
     review: true,
     imageInput: true,
     fileTransfer: true,
@@ -106,6 +286,242 @@ function getCapabilities() {
     codexJsonlTail: CODEX_TAIL_ENABLED,
     demoMode: MANAGED_RUNTIME === 'demo' || MANAGED_COMMAND === 'demo',
   };
+}
+
+function normalizeSkillId(value) {
+  return normalizePortableSkillId(value);
+}
+
+function ensureSafeSkillPath(codexHome, skillId) {
+  const normalizedId = normalizeSkillId(skillId);
+  const skillsRoot = path.resolve(codexHome || CODEX_HOME, 'skills');
+  const target = path.resolve(skillsRoot, normalizedId);
+  const relative = path.relative(skillsRoot, target);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('skill path escapes CODEX_HOME skills directory');
+  }
+  return { skillsRoot, skillId: normalizedId, target };
+}
+
+function listInstalledSkills(options = {}) {
+  const codexHome = options.codexHome || CODEX_HOME;
+  const snapshot = options.snapshot || hostSkillInventory?.snapshot();
+  return (Array.isArray(snapshot?.instances) ? snapshot.instances : [])
+    .filter((instance) => instance.scope === 'user' && instance.enabled !== false)
+    .map((instance) => ({
+      skillId: instance.skillId,
+      name: instance.name || instance.skillId,
+      description: instance.description || '',
+      installed: true,
+      readonly: Boolean(instance.readonly),
+      source: instance.sourceKind || 'codexHome',
+      sourceId: instance.sourceId || null,
+      hostId: HOST_ID,
+      codexHome,
+      installPath: instance.activationPath,
+      observedHash: instance.observedHash || null,
+    }))
+    .sort((a, b) => String(a.name || a.skillId).localeCompare(String(b.name || b.skillId)));
+}
+
+function skillMarkdownFromCatalog(skill) {
+  const name = String(skill?.name || skill?.skillId || 'Skill').trim();
+  const description = String(skill?.description || '').trim();
+  const body = String(skill?.markdown || skill?.content || '').trim();
+  if (body) {
+    return body.endsWith('\n') ? body : `${body}\n`;
+  }
+  return [
+    '---',
+    `name: ${name}`,
+    `description: ${description}`,
+    '---',
+    '',
+    `# ${name}`,
+    '',
+    description || 'Installed from Remote Codex Skills Manager.',
+    '',
+  ].join('\n');
+}
+
+function installHostSkill(skill, options = {}) {
+  const codexHome = options.codexHome || CODEX_HOME;
+  const { skillId, target } = ensureSafeSkillPath(codexHome, skill?.skillId || skill?.id || skill?.name);
+  fs.mkdirSync(target, { recursive: true });
+  const markdown = skillMarkdownFromCatalog({ ...skill, skillId });
+  fs.writeFileSync(path.join(target, 'SKILL.md'), markdown, 'utf8');
+  return {
+    ok: true,
+    action: 'install',
+    skillId,
+    hostId: HOST_ID,
+    codexHome,
+    installPath: target,
+  };
+}
+
+function uninstallHostSkill(skillId, options = {}) {
+  const codexHome = options.codexHome || CODEX_HOME;
+  const { target, skillId: normalizedId } = ensureSafeSkillPath(codexHome, skillId);
+  const markdownPath = path.join(target, 'SKILL.md');
+  if (!fs.existsSync(markdownPath)) {
+    return {
+      ok: true,
+      action: 'uninstall',
+      skillId: normalizedId,
+      hostId: HOST_ID,
+      codexHome,
+      skipped: true,
+      message: 'not installed',
+    };
+  }
+  const markdown = fs.readFileSync(markdownPath, 'utf8');
+  const readonly = /remote-codex-readonly:\s*true/i.test(markdown);
+  if (readonly) {
+    throw new Error(`skill ${normalizedId} is readonly and cannot be uninstalled`);
+  }
+  fs.rmSync(target, { recursive: true, force: true });
+  return {
+    ok: true,
+    action: 'uninstall',
+    skillId: normalizedId,
+    hostId: HOST_ID,
+    codexHome,
+  };
+}
+
+async function handleHostSkillsCommand(command) {
+  const requestId = command.requestId || makeId();
+  const action = command.type === 'host.skills.install'
+    ? 'install'
+    : command.type === 'host.skills.uninstall'
+      ? 'uninstall'
+      : 'list';
+  try {
+    if (action === 'list') {
+      const inventory = await hostSkillInventory.refresh({ force: true });
+      await postEvent({
+        type: 'host.skills.result',
+        hostId: HOST_ID,
+        requestId,
+        action,
+        ok: true,
+        skills: listInstalledSkills({
+          codexHome: command.codexHome || CODEX_HOME,
+          snapshot: inventory.snapshot,
+        }),
+        timestamp: nowIso(),
+      });
+      return;
+    }
+    if (hostSkillDeployment) {
+      throw new Error('Legacy Skill install/uninstall commands are disabled for managed deployment Hosts');
+    }
+    const skills = Array.isArray(command.skills) ? command.skills : [];
+    const results = skills.map((skill) => {
+      try {
+        return action === 'install'
+          ? installHostSkill(skill, { codexHome: command.codexHome || CODEX_HOME })
+          : uninstallHostSkill(skill.skillId || skill.id || skill.name || skill, { codexHome: command.codexHome || CODEX_HOME });
+      } catch (error) {
+        return {
+          ok: false,
+          action,
+          skillId: String(skill?.skillId || skill?.id || skill?.name || skill || ''),
+          hostId: HOST_ID,
+          codexHome: command.codexHome || CODEX_HOME,
+          error: error.message,
+        };
+      }
+    });
+    const inventory = await hostSkillInventory.refresh({ force: true });
+    await postEvent({
+      type: 'host.skills.result',
+      hostId: HOST_ID,
+      requestId,
+      action,
+      ok: results.every((result) => result.ok),
+      results,
+      skills: listInstalledSkills({
+        codexHome: command.codexHome || CODEX_HOME,
+        snapshot: inventory.snapshot,
+      }),
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'host.skills.result',
+      hostId: HOST_ID,
+      requestId,
+      action,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleHostSkillArtifactCommand(command) {
+  const adoptionId = String(command.adoptionId || '').trim();
+  const instanceId = String(command.instanceId || '').trim();
+  try {
+    const result = await hostSkillArtifact.exportInstance(command);
+    await postEvent({
+      type: 'host.skills.artifact.result',
+      hostId: HOST_ID,
+      adoptionId,
+      instanceId,
+      ok: true,
+      ...result,
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    await postEvent({
+      type: 'host.skills.artifact.result',
+      hostId: HOST_ID,
+      adoptionId,
+      instanceId,
+      ok: false,
+      error: error.message,
+      timestamp: nowIso(),
+    });
+  }
+}
+
+async function handleHostSkillDeploymentCommand(command) {
+  let deploymentEvent;
+  const pendingDeploymentResult = hostSkillDeployment.getPendingResult(command.deploymentId);
+  if (pendingDeploymentResult) {
+    deploymentEvent = pendingDeploymentResult;
+  } else {
+    try {
+      const result = await hostSkillDeployment.applyDeployment(command);
+      deploymentEvent = {
+        type: 'host.skills.deployment.result',
+        ...result,
+        commandId: Number(command.id || 0),
+        timestamp: result.timestamp || nowIso(),
+      };
+    } catch (error) {
+      deploymentEvent = {
+        type: 'host.skills.deployment.result',
+        hostId: HOST_ID,
+        deploymentId: String(command.deploymentId || '').trim(),
+        commandId: Number(command.id || 0),
+        action: String(command.action || '').trim(),
+        skillId: String(command.skillId || '').trim(),
+        artifactId: String(command.artifactId || '').trim(),
+        targetScope: String(command.targetScope || '').trim(),
+        scopeId: String(command.scopeId || '').trim(),
+        ok: false,
+        error: error.message,
+        timestamp: nowIso(),
+      };
+    }
+    hostSkillDeployment.stagePendingResult(deploymentEvent);
+  }
+  await postEvent(deploymentEvent);
+  hostSkillDeployment.clearPendingResult(command.deploymentId);
 }
 
 function logAgentError(...args) {
@@ -128,6 +544,15 @@ function isTransientFetchError(error) {
     || error.message === 'socket hang up'
     || error.message === 'aborted'
     || error.message === 'response aborted';
+}
+
+function isRelayOwnershipRevokedError(error) {
+  if (!RELAY_MANAGED_LOCAL_AGENT || Number(error?.statusCode || 0) !== 409) return false;
+  return new Set([
+    'local_agent_ownership_required',
+    'local_agent_ownership_mismatch',
+    'local_agent_instance_conflict',
+  ]).has(String(error?.body?.code || '').trim());
 }
 
 function logAgentTransient(prefix, error) {
@@ -191,11 +616,17 @@ function fetchJsonOnce(targetUrl, options = {}) {
           try {
             body = raw ? JSON.parse(raw) : null;
           } catch (error) {
-            settle(reject, new Error(`invalid JSON from ${targetUrl}: ${error.message}`));
+            const responseError = new Error(`invalid JSON from ${targetUrl}: ${error.message}`);
+            responseError.statusCode = res.statusCode || 0;
+            responseError.body = raw;
+            settle(reject, responseError);
             return;
           }
-          if ((res.statusCode || 0) >= 400) {
-            settle(reject, new Error((body && body.error) || `relay request failed with ${res.statusCode}`));
+          if ((res.statusCode || 0) < 200 || (res.statusCode || 0) >= 300) {
+            const error = new Error((body && body.error) || `relay request failed with ${res.statusCode}`);
+            error.statusCode = res.statusCode || 0;
+            error.body = body;
+            settle(reject, error);
             return;
           }
           settle(resolve, { statusCode: res.statusCode || 0, body });
@@ -224,9 +655,18 @@ function fetchJsonOnce(targetUrl, options = {}) {
   });
 }
 
-function buildApiTestUrl(baseUrl) {
+function buildApiTestUrl(baseUrl, options = {}) {
   const raw = String(baseUrl || '').trim() || 'https://api.openai.com/v1';
-  return `${raw.replace(/\/+$/, '')}/models`;
+  const url = new URL(`${raw.replace(/\/+$/, '')}/models`);
+  const cursor = String(options.cursor || '').trim();
+  const limit = Math.max(1, Math.min(500, Number(options.limit || 200) || 200));
+  if (cursor) {
+    url.searchParams.set('after', cursor);
+  }
+  if (options.includeLimit === true) {
+    url.searchParams.set('limit', String(limit));
+  }
+  return url.toString();
 }
 
 function summarizeApiTestBody(raw) {
@@ -253,7 +693,7 @@ function summarizeApiTestBody(raw) {
 
 function testApiProfile(apiConfig, options = {}) {
   const config = normalizeApiConfig(apiConfig) || {};
-  const targetUrl = buildApiTestUrl(config.baseUrl);
+  const targetUrl = buildApiTestUrl(config.baseUrl, options);
   const parsed = new URL(targetUrl);
   const client = parsed.protocol === 'https:' ? https : http;
   const timeoutMs = Number(options.timeoutMs || 15000) || 15000;
@@ -276,6 +716,7 @@ function testApiProfile(apiConfig, options = {}) {
         label: config.label || null,
         message: payload.message || '',
         error: payload.error || null,
+        modelPage: payload.modelPage || null,
         testedAt: nowIso(),
       });
     };
@@ -298,11 +739,22 @@ function testApiProfile(apiConfig, options = {}) {
           const raw = Buffer.concat(chunks).toString('utf8');
           const statusCode = res.statusCode || 0;
           const message = summarizeApiTestBody(raw);
+          let modelPage = null;
+          if (statusCode >= 200 && statusCode < 300) {
+            try {
+              modelPage = normalizeProviderModelPage(JSON.parse(raw || '{}'), {
+                limit: options.limit,
+              });
+            } catch (_) {
+              modelPage = null;
+            }
+          }
           finish({
             ok: statusCode >= 200 && statusCode < 300,
             statusCode,
             message: message || `${statusCode} ${res.statusMessage || ''}`.trim(),
             error: statusCode >= 400 ? (message || `${statusCode} ${res.statusMessage || 'HTTP error'}`.trim()) : null,
+            modelPage,
           });
         });
         res.on('error', (error) => finish({ error: error.message }));
@@ -317,70 +769,165 @@ function testApiProfile(apiConfig, options = {}) {
   });
 }
 
-async function postEvent(event, options = {}) {
+async function postAgentEventPayload(body, label, options = {}) {
   try {
-    await fetchJson(`${RELAY_URL}/api/agent/events`, {
+    return await fetchJson(`${RELAY_URL}/api/agent/events`, {
       method: 'POST',
-      body: { event },
+      body,
       retryOnTransient: options.retryOnTransient !== false,
+      headers: managedAgentRequestHeaders(),
     });
   } catch (error) {
-    if (options.bestEffort || isTransientFetchError(error)) {
-      logAgentTransient(`[agent] failed to post ${event?.type || 'event'}:`, error);
-      return;
+    if (options.bestEffort) {
+      logAgentTransient(`[agent] failed to post ${label}:`, error);
+      return null;
+    }
+    if (isTransientFetchError(error)) {
+      logAgentTransient(`[agent] failed to post ${label}:`, error);
     }
     throw error;
   }
 }
 
+async function postEvent(event, options = {}) {
+  await postAgentEventPayload({ event }, event?.type || 'event', options);
+}
+
+async function postEvents(events, options = {}) {
+  const batch = (Array.isArray(events) ? events : []).filter(Boolean);
+  return deliverAgentEventBatch(batch, {
+    batchId: options.batchId || null,
+    bestEffort: Boolean(options.bestEffort),
+    sendBatch: (eventBatch, batchId) => postAgentEventPayload({
+      events: eventBatch,
+      ...(batchId ? { batchId } : {}),
+    }, `${eventBatch.length} event(s)`, options),
+    sendSingle: (event) => postEvent(event, options),
+  });
+}
+
+hostSkillInventory = new HostSkillInventoryService({
+  hostId: HOST_ID,
+  codexHome: CODEX_HOME,
+  agentsHome: AGENTS_HOME,
+  ccSwitchHome: CC_SWITCH_HOME,
+  pluginRoots: SKILL_PLUGIN_ROOTS,
+  workspaceRoots: [
+    ...WORKSPACE_ROOTS,
+    MANAGED_CWD,
+    ...uniqueLiveRunners().map((runner) => runner.cwd || runner.runtime?.cwd).filter(Boolean),
+  ],
+  transformSnapshot: (snapshot) => (
+    hostSkillDeployment ? hostSkillDeployment.decorateInventorySnapshot(snapshot) : snapshot
+  ),
+  publish: async (snapshot, context = null) => {
+    await postEvent({
+      type: 'host.skills.inventory',
+      hostId: HOST_ID,
+      requestId: context?.requestId || null,
+      ...snapshot,
+      timestamp: nowIso(),
+    }, { retryOnTransient: true });
+  },
+  log: logAgentNotice,
+});
+
+const hostSkillArtifact = new HostSkillArtifactService({
+  hostId: HOST_ID,
+  inventoryService: hostSkillInventory,
+  relayUrl: RELAY_URL,
+  authToken: RELAY_AUTH_TOKEN,
+  tempRoot: process.env.SKILL_ARTIFACT_TEMP_ROOT || undefined,
+});
+
+hostSkillDeployment = new HostSkillDeploymentService({
+  hostId: HOST_ID,
+  codexHome: CODEX_HOME,
+  stateRoot: REMOTE_CODEX_STATE_ROOT,
+  inventoryService: hostSkillInventory,
+  relayUrl: RELAY_URL,
+  authToken: RELAY_AUTH_TOKEN,
+});
+
 async function registerHost() {
-  await fetchJson(`${RELAY_URL}/api/agent/register`, {
+  const result = await fetchJson(`${RELAY_URL}/api/agent/register`, {
     method: 'POST',
     retryOnTransient: true,
     body: {
       hostId: HOST_ID,
       label: HOST_LABEL,
       platform: process.platform,
+      codexHome: CODEX_HOME,
+      skillsRevision: hostSkillInventory.snapshot()?.revision || null,
       capabilities: getCapabilities(),
+      agentProcess: managedAgentProcessMetadata(),
     },
   });
+  observeRelayInstance(result.body);
 }
 
 async function heartbeat() {
-  await fetchJson(`${RELAY_URL}/api/agent/heartbeat`, {
+  const result = await fetchJson(`${RELAY_URL}/api/agent/heartbeat`, {
     method: 'POST',
     retryOnTransient: true,
     body: {
       hostId: HOST_ID,
       label: HOST_LABEL,
       platform: process.platform,
+      codexHome: CODEX_HOME,
+      skillsRevision: hostSkillInventory.snapshot()?.revision || null,
       capabilities: getCapabilities(),
+      agentProcess: managedAgentProcessMetadata(),
       time: nowIso(),
     },
   });
+  observeRelayInstance(result.body);
 }
 
-async function sendDiscovery() {
-  const sessions = discoverCodexSessions({
+async function performDiscovery() {
+  const discoveredSessions = discoverCodexSessions({
     codexHome: CODEX_HOME,
     preview: CODEX_DISCOVERY_LIST_PREVIEW,
     metaReadLimit: CODEX_DISCOVERY_LIST_META_LIMIT,
-  }).map((session) => ({
-    sessionId: session.sessionId,
-    title: session.title,
-    cwd: session.cwd,
-    source: session.source || 'imported',
-    live: false,
-    createdAt: session.createdAt || null,
-    updatedAt: session.updatedAt,
-    messageCount: session.messageCount || 0,
-    latestUserMessage: session.latestUserMessage || null,
-    latestAgentMessage: session.latestAgentMessage || null,
-    transcriptPreview: session.transcriptPreview || [],
-    rolloutPath: session.rolloutPath || null,
-    originSessionId: session.originSessionId || null,
-    conversationKey: session.conversationKey || session.sessionId,
-  }));
+  });
+  const cursorResults = assistantCursorIndex.scanMany(discoveredSessions);
+  const cursorByPath = new Map(cursorResults.map((result) => [
+    normalizedFileKey(result.rolloutPath),
+    result,
+  ]));
+  const sessions = discoveredSessions.map((session) => {
+    const cursor = session.rolloutPath
+      ? cursorByPath.get(normalizedFileKey(session.rolloutPath))
+      : null;
+    return {
+      sessionId: session.sessionId,
+      nativeThreadId: session.nativeThreadId || session.sessionId,
+      title: session.title,
+      cwd: session.cwd,
+      source: session.source || 'imported',
+      live: false,
+      createdAt: session.createdAt || null,
+      updatedAt: session.updatedAt,
+      messageCount: session.messageCount || 0,
+      latestUserMessage: session.latestUserMessage || null,
+      latestAgentMessage: session.latestAgentMessage || null,
+      transcriptPreview: session.transcriptPreview || [],
+      rolloutPath: session.rolloutPath || null,
+      originSessionId: session.originSessionId || null,
+      conversationKey: session.conversationKey || session.sessionId,
+      ...(cursor ? {
+        assistantCursor: {
+          observations: cursor.observations,
+          cursorOffset: cursor.cursorOffset,
+          cursorUnknown: cursor.cursorUnknown,
+          fileIdentity: cursor.fileIdentity,
+          replaced: cursor.replaced,
+          truncated: cursor.truncated,
+          projectionRevision: cursor.projectionRevision,
+        },
+      } : {}),
+    };
+  });
 
   const seenRunners = new Set();
   for (const runner of liveSessions.values()) {
@@ -417,11 +964,31 @@ async function sendDiscovery() {
     });
   }
 
-  await postEvent({
+  const addedWorkspaceRoots = hostSkillInventory.addWorkspaceRoots(
+    sessions.map((session) => session.cwd).filter(Boolean)
+  );
+  hostSkillInventory.refresh({ force: addedWorkspaceRoots > 0 }).catch((error) => {
+    logAgentTransient('[agent] skill inventory refresh failed:', error);
+  });
+
+  const discoveryId = makeId();
+  await postEvents([{
     type: 'session.discovery',
     hostId: HOST_ID,
+    discoveryId,
+    discoveredAt: nowIso(),
     sessions,
-  }, { retryOnTransient: true });
+  }], {
+    batchId: `session.discovery:${discoveryId}`,
+    retryOnTransient: true,
+  });
+  assistantCursorIndex.acknowledgeMany(cursorResults);
+}
+
+const runCoalescedDiscovery = createCoalescedAsyncTask(performDiscovery);
+
+function sendDiscovery() {
+  return runCoalescedDiscovery();
 }
 
 function collectSessionIdentityCandidates(input = {}) {
@@ -444,7 +1011,7 @@ function commandCodexHomeCandidates(input = {}) {
     }
   };
   add(input.codexHome);
-  const runner = getRunnerForCommand(input);
+  const runner = findRunnerForCommand(liveSessions, input);
   add(runner?.codexHome);
   add(runner?.runtime?.codexHome);
   add(CODEX_HOME);
@@ -658,9 +1225,14 @@ async function maybeReportWatchPerformance(pollMs, result, scope) {
   lastWatchPerformanceReportAt = now;
   const severity = pollMs >= WATCH_PERFORMANCE_SLOW_MS ? 'warning' : 'info';
   const activeSessionCount = Number(result?.activeSessionCount ?? scope?.activeSessionCount ?? 0) || 0;
+  const emittedEvents = Number(result?.emittedEvents || 0) || 0;
+  const postedBatchCount = Number(result?.postedBatchCount || 0) || 0;
+  const workload = emittedEvents
+    ? `, ${emittedEvents} event(s) in ${postedBatchCount} batch(es)`
+    : '';
   const message = severity === 'warning'
-    ? `Realtime session sync took ${Math.round(pollMs / 1000)}s for ${activeSessionCount} active session(s). Close idle live conversations or switch away from sessions you no longer need.`
-    : `Realtime session sync is slowing down (${Math.round(pollMs)}ms for ${activeSessionCount} active session(s)).`;
+    ? `Realtime session sync took ${Math.round(pollMs / 1000)}s for ${activeSessionCount} active session(s)${workload}.`
+    : `Realtime session sync is slowing down (${Math.round(pollMs)}ms for ${activeSessionCount} active session(s)${workload}).`;
   await postEvent({
     type: 'watch.performance',
     hostId: HOST_ID,
@@ -669,6 +1241,8 @@ async function maybeReportWatchPerformance(pollMs, result, scope) {
     pollMs,
     platform: process.platform,
     activeSessionCount,
+    emittedEvents,
+    postedBatchCount,
     watchedSessionCount: scope?.watchedSessionCount || 0,
     liveSessionCount: scope?.liveSessionCount || 0,
     thresholdMs: severity === 'warning' ? WATCH_PERFORMANCE_SLOW_MS : WATCH_PERFORMANCE_WARN_MS,
@@ -1099,66 +1673,8 @@ function getRunnerForSession(sessionId) {
   return liveSessions.get(sessionId) || null;
 }
 
-function getRunnerIdentityValues(runner) {
-  const values = new Set();
-  const add = (value) => {
-    if (value) {
-      values.add(String(value));
-    }
-  };
-  add(runner?.sessionId);
-  add(runner?.bridgeSessionId);
-  add(runner?.nativeThreadId);
-  add(runner?.threadId);
-  add(runner?.originSessionId);
-  add(runner?.sourceSessionId);
-  add(runner?.conversationKey);
-  add(runner?.runId);
-  if (runner && typeof runner.currentSessionId === 'function') {
-    add(runner.currentSessionId());
-  }
-  return values;
-}
-
-function getCommandSessionCandidates(command = {}) {
-  return [
-    command.sessionId,
-    command.bridgeSessionId,
-    command.nativeThreadId,
-    command.originSessionId,
-    command.sourceSessionId,
-    command.conversationKey,
-    command.runId,
-  ].map((value) => String(value || '').trim()).filter(Boolean);
-}
-
-function getRunnerForCommand(command = {}) {
-  for (const candidate of getCommandSessionCandidates(command)) {
-    const direct = liveSessions.get(candidate);
-    if (direct) {
-      return direct;
-    }
-  }
-
-  const candidates = new Set(getCommandSessionCandidates(command));
-  const seenRunners = new Set();
-  for (const runner of liveSessions.values()) {
-    if (!runner || seenRunners.has(runner)) {
-      continue;
-    }
-    seenRunners.add(runner);
-    const identities = getRunnerIdentityValues(runner);
-    for (const candidate of candidates) {
-      if (identities.has(candidate)) {
-        return runner;
-      }
-    }
-  }
-  return null;
-}
-
 function resolveCommandCwd(command = {}) {
-  const runner = getRunnerForCommand(command);
+  const runner = findRunnerForCommand(liveSessions, command);
   const cwd = String(command.cwd || command.targetDirectory || runner?.cwd || MANAGED_CWD || '').trim();
   return resolveManagedCwd(cwd || MANAGED_CWD);
 }
@@ -1663,61 +2179,177 @@ function resolveManagedCwd(cwd) {
 }
 
 async function failManagedSession(sessionId, cwd, message, state = 'failed', runId = null) {
-  await postEvent({
-    type: 'session.error',
-    hostId: HOST_ID,
-    sessionId,
-    runId,
-    message,
-    timestamp: nowIso(),
-  });
+  let diagnosticDeliveryError = null;
+  try {
+    await postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId,
+      runId,
+      message,
+      timestamp: nowIso(),
+    });
+  } catch (error) {
+    diagnosticDeliveryError = error;
+    logAgentTransient('[agent] failed to deliver managed Session failure diagnostic:', error);
+  }
 
+  try {
+    await postEvent({
+      type: 'session.state_changed',
+      hostId: HOST_ID,
+      sessionId,
+      runId,
+      state,
+      live: false,
+      timestamp: nowIso(),
+    });
+  } catch (terminalDeliveryError) {
+    terminalDeliveryError.retryCommand = true;
+    terminalDeliveryError.code = terminalDeliveryError.code || 'session_terminal_delivery_failed';
+    if (diagnosticDeliveryError) {
+      terminalDeliveryError.diagnosticDeliveryError = diagnosticDeliveryError;
+    }
+    throw terminalDeliveryError;
+  }
+}
+
+async function postSessionCommandFailure(command, error, operation, runner = null) {
   await postEvent({
-    type: 'session.state_changed',
+    type: 'session.command_failed',
     hostId: HOST_ID,
-    sessionId,
-    runId,
-    state,
-    live: false,
+    sessionId: command.requestedSessionId || command.sessionId || runner?.sessionId || null,
+    runId: runner?.runId || command.runId || null,
+    operation,
+    code: error?.code || 'session_command_failed',
+    error: error?.message || String(error || 'Session command failed.'),
+    canRebind: Boolean(error?.canRebind),
     timestamp: nowIso(),
-  });
+  }, { bestEffort: true });
+}
+
+async function failShutdownCancelledManagedSession(command, sessionId, runId, cwd, runner = null) {
+  if (hostAgentShutdownSuppressesTerminalEvents()) return false;
+  const error = new Error('Managed Session start was cancelled because the Host Agent is shutting down.');
+  error.code = 'session_start_cancelled_host_shutdown';
+  error.failureState = 'failed:host-shutdown';
+  await postSessionCommandFailure(command, error, 'start', runner);
+  try {
+    await failManagedSession(
+      sessionId,
+      cwd,
+      error.message,
+      error.failureState,
+      runId
+    );
+  } catch (terminalDeliveryError) {
+    terminalDeliveryError.shutdownTerminalDelivery = true;
+    throw terminalDeliveryError;
+  }
+  return true;
 }
 
 async function startManagedSession(command) {
   const bridgeSessionId = command.sessionId || makeId();
   const runId = command.runId || makeId();
-  const createdAt = command.createdAt || nowIso();
-  const cwd = resolveManagedCwd(command.cwd || MANAGED_CWD);
-  const runtime = resolveManagedRuntime(command, {
-    defaultRuntime: MANAGED_RUNTIME,
-    defaultCommand: MANAGED_COMMAND,
-    defaultArgs: MANAGED_ARGS,
-  });
-  const bootstrap = buildResumeBootstrap(command);
-  const title = command.label || command.cwd || bridgeSessionId;
-  const apiConfig = normalizeApiConfig(command.apiConfig);
+  let cwd = null;
   let announcedSessionId = bridgeSessionId;
-
-  if (!fs.existsSync(cwd)) {
-    await failManagedSession(bridgeSessionId, cwd, `workspace path does not exist: ${cwd}`, 'failed:missing-workspace', runId);
+  let runner = null;
+  let startHandle = null;
+  let shutdownFailurePublished = false;
+  let startCompletionError = null;
+  const removeRunnerIndexes = () => {
+    if (!runner) return;
+    for (const [key, candidate] of liveSessions.entries()) {
+      if (candidate === runner) liveSessions.delete(key);
+    }
+  };
+  const publishShutdownFailureOnce = async () => {
+    if (shutdownFailurePublished) return true;
+    const published = await failShutdownCancelledManagedSession(
+      command,
+      bridgeSessionId,
+      runId,
+      cwd,
+      runner
+    );
+    shutdownFailurePublished = published;
+    return published;
+  };
+  const cancelStartForShutdown = async () => {
+    if (runner) {
+      await abortUnconfirmedRunner(runner).catch((abortError) => {
+        logAgentError('[agent] failed to stop shutdown-cancelled managed runner:', abortError.message);
+      });
+      removeRunnerIndexes();
+    }
+    try {
+      await publishShutdownFailureOnce();
+    } catch (error) {
+      if (error?.shutdownTerminalDelivery) startCompletionError = error;
+      throw error;
+    }
     return bridgeSessionId;
-  }
-
-  let cwdStats = null;
+  };
   try {
-    cwdStats = fs.statSync(cwd);
-  } catch (error) {
-    await failManagedSession(bridgeSessionId, cwd, `failed to inspect workspace path: ${error.message}`, 'failed:workspace-stat-error', runId);
-    return bridgeSessionId;
-  }
+    startHandle = managedSessionStartGate.beginStart();
+    runner = command.runId
+      ? findRunnerForCommand(liveSessions, { runId: command.runId })
+      : null;
+    const replayedSessionId = await replayManagedSessionStart({
+      liveSessions,
+      command,
+      hostId: HOST_ID,
+      postEvent,
+    });
+    if (replayedSessionId) return replayedSessionId;
+    runner = null;
 
-  if (!cwdStats.isDirectory()) {
-    await failManagedSession(bridgeSessionId, cwd, `workspace path is not a directory: ${cwd}`, 'failed:not-a-directory', runId);
-    return bridgeSessionId;
-  }
+    const createdAt = command.createdAt || nowIso();
+    cwd = resolveManagedCwd(command.cwd || MANAGED_CWD);
+    const runtime = resolveManagedRuntime(command, {
+      defaultRuntime: MANAGED_RUNTIME,
+      defaultCommand: MANAGED_COMMAND,
+      defaultArgs: MANAGED_ARGS,
+    });
+    const bootstrap = buildResumeBootstrap(command);
+    const title = command.label || command.cwd || bridgeSessionId;
+    const apiConfig = normalizeApiConfig(command.apiConfig);
+    const apiBinding = deriveRunBinding({
+      apiBinding: command.apiBinding,
+      apiConfig,
+      env: process.env,
+      codexHome: CODEX_HOME,
+      expectedBinding: command.expectedBinding,
+      allowUnavailable: true,
+    });
 
-  try {
-    const runner = await startManagedRuntimeSession({
+    if (!fs.existsSync(cwd)) {
+      const error = new Error(`workspace path does not exist: ${cwd}`);
+      error.code = 'session_workspace_missing';
+      error.failureState = 'failed:missing-workspace';
+      throw error;
+    }
+
+    let cwdStats = null;
+    try {
+      cwdStats = fs.statSync(cwd);
+    } catch (cause) {
+      const error = new Error(`failed to inspect workspace path: ${cause.message}`);
+      error.code = 'session_workspace_stat_failed';
+      error.failureState = 'failed:workspace-stat-error';
+      throw error;
+    }
+
+    if (!cwdStats.isDirectory()) {
+      const error = new Error(`workspace path is not a directory: ${cwd}`);
+      error.code = 'session_workspace_not_directory';
+      error.failureState = 'failed:not-a-directory';
+      throw error;
+    }
+
+    startHandle.assertCanSpawn();
+    runner = await startManagedRuntimeSession({
       runtime,
       hostId: HOST_ID,
       sessionId: bridgeSessionId,
@@ -1729,56 +2361,84 @@ async function startManagedSession(command) {
       nativeThreadId: command.nativeThreadId || null,
       codexHome: CODEX_HOME,
       apiConfig,
+      apiBinding,
       bootstrap,
       originSessionId: command.originSessionId || null,
       sourceSessionId: command.sourceSessionId || null,
       conversationKey: command.conversationKey || command.originSessionId || bridgeSessionId,
       postEvent,
+      onRunnerCreated: (createdRunner) => {
+        runner = createdRunner;
+        startHandle.setRunner(createdRunner);
+      },
       onTerminated: () => {
-        if (liveSessions.get(bridgeSessionId) === runner) {
-          liveSessions.delete(bridgeSessionId);
-        }
-        if (liveSessions.get(announcedSessionId) === runner) {
-          liveSessions.delete(announcedSessionId);
-        }
-        if (liveSessions.get(runId) === runner) {
-          liveSessions.delete(runId);
-        }
+        removeRunnerIndexes();
       },
     });
+    startHandle.setRunner(runner);
+    if (managedSessionStartGate.isShuttingDown()) {
+      return await cancelStartForShutdown();
+    }
     runner.createdAt = runner.createdAt || createdAt;
     announcedSessionId = runner.sessionId || bridgeSessionId;
     liveSessions.set(bridgeSessionId, runner);
     liveSessions.set(announcedSessionId, runner);
     liveSessions.set(runId, runner);
 
-    await postEvent({
-      type: 'session.started',
+    if (managedSessionStartGate.isShuttingDown()) {
+      return await cancelStartForShutdown();
+    }
+
+    await postEvent(buildManagedSessionStartedEvent({
       hostId: HOST_ID,
-      sessionId: announcedSessionId,
-      bridgeSessionId: announcedSessionId === bridgeSessionId ? null : bridgeSessionId,
-      runId,
-      nativeThreadId: runner?.nativeThreadId || announcedSessionId,
-      title,
-      cwd,
-      source: 'managed',
-      createdAt: runner?.createdAt || createdAt,
-      originSessionId: command.originSessionId || null,
-      sourceSessionId: command.sourceSessionId || null,
-      conversationKey: command.conversationKey || command.originSessionId || bridgeSessionId,
-      launchMode: command.launchMode || null,
-      runtime: runner.runtime || {
-        kind: 'child_process',
-        adapterId: runtime.kind,
-        runtimeId: runtime.runtimeId,
-        command: runtime.command,
-        args: runtime.args,
+      runner,
+      command: {
+        ...command,
+        sessionId: bridgeSessionId,
+        runId,
+        createdAt,
+        label: title,
         cwd,
+        apiBinding: runner.apiBinding || apiBinding || null,
       },
-    });
+    }));
+    if (managedSessionStartGate.isShuttingDown()) {
+      return await cancelStartForShutdown();
+    }
   } catch (error) {
-    await failManagedSession(bridgeSessionId, cwd, `failed to spawn managed session: ${error.message}`, 'failed:spawn-error', runId);
+    if (error?.shutdownTerminalDelivery) {
+      startCompletionError = error;
+      throw error;
+    }
+    if (error?.code === 'host_agent_shutting_down' || managedSessionStartGate.isShuttingDown()) {
+      return await cancelStartForShutdown();
+    }
+    if (retainRunnerForStartRetry(liveSessions, runner, {
+      ...command,
+      sessionId: bridgeSessionId,
+      bridgeSessionId,
+      runId,
+    }, error)) {
+      throw error;
+    }
+    if (error?.retryCommand) throw error;
+    if (runner) {
+      await abortUnconfirmedRunner(runner).catch((abortError) => {
+        logAgentError('[agent] failed to stop unconfirmed managed runner:', abortError.message);
+      });
+      removeRunnerIndexes();
+    }
+    await postSessionCommandFailure(command, error, 'start');
+    await failManagedSession(
+      bridgeSessionId,
+      cwd,
+      `failed to spawn managed session: ${error.message}`,
+      error.failureState || 'failed:spawn-error',
+      runId
+    );
     return bridgeSessionId;
+  } finally {
+    startHandle?.finish(startCompletionError);
   }
 
   return announcedSessionId;
@@ -1786,6 +2446,11 @@ async function startManagedSession(command) {
 
 async function handleCommand(command) {
   if (!command || !command.type) {
+    return;
+  }
+
+  if (command.type === 'host.shutdown') {
+    await shutdownHostAgent('relay-command');
     return;
   }
 
@@ -1825,6 +2490,83 @@ async function handleCommand(command) {
       result,
       timestamp: nowIso(),
     });
+    return;
+  }
+
+  if (command.type === 'host.api_catalog') {
+    const result = await testApiProfile(command.apiConfig, {
+      timeoutMs: command.timeoutMs,
+      cursor: command.cursor,
+      limit: command.limit,
+      includeLimit: true,
+    });
+    await postEvent({
+      type: 'host.api_cataloged',
+      hostId: HOST_ID,
+      requestId: command.requestId || makeId(),
+      bindingFingerprint: command.bindingFingerprint || null,
+      runId: command.runId || null,
+      result,
+      timestamp: nowIso(),
+    });
+    return;
+  }
+
+  if (command.type === 'host.binding_preflight') {
+    try {
+      const result = attestHostEnvironmentBinding({
+        env: process.env,
+        expectedBinding: command.expectedBinding,
+      });
+      await postEvent({
+        type: 'host.binding_preflighted',
+        hostId: HOST_ID,
+        requestId: command.requestId || makeId(),
+        ok: true,
+        binding: result.binding,
+        timestamp: nowIso(),
+      });
+    } catch (error) {
+      await postEvent({
+        type: 'host.binding_preflighted',
+        hostId: HOST_ID,
+        requestId: command.requestId || makeId(),
+        ok: false,
+        code: error.code || 'session_api_binding_unavailable',
+        error: error.message,
+        canRebind: Boolean(error.canRebind),
+        timestamp: nowIso(),
+      });
+    }
+    return;
+  }
+
+  if (command.type === 'host.skills.inventory.refresh') {
+    hostSkillInventory.addWorkspaceRoots(command.workspaceRoots || []);
+    await hostSkillInventory.refresh({
+      force: true,
+      publishUnchanged: true,
+      publishContext: { requestId: command.requestId || null },
+    });
+    return;
+  }
+
+  if (command.type === 'host.skills.artifact.export') {
+    await handleHostSkillArtifactCommand(command);
+    return;
+  }
+
+  if (command.type === 'host.skills.deployment.apply') {
+    await handleHostSkillDeploymentCommand(command);
+    return;
+  }
+
+  if (
+    command.type === 'host.skills.list'
+    || command.type === 'host.skills.install'
+    || command.type === 'host.skills.uninstall'
+  ) {
+    await handleHostSkillsCommand(command);
     return;
   }
 
@@ -1916,7 +2658,7 @@ async function handleCommand(command) {
     return;
   }
 
-  const runner = getRunnerForCommand(command);
+  const runner = findRunnerForCommand(liveSessions, command);
   if (!runner) {
     if (command.type === 'session.model_list' && command.requestId) {
       await postEvent({
@@ -1955,6 +2697,7 @@ async function handleCommand(command) {
     }
 
     if (command.type === 'session.stop') {
+      if (!shouldPublishMissingRunnerStop(command)) return;
       await postEvent({
         type: 'session.state_changed',
         hostId: HOST_ID,
@@ -2028,8 +2771,10 @@ async function handleCommand(command) {
         serviceTier: command.serviceTier || null,
         personality: command.personality || null,
         apiConfig: normalizeApiConfig(command.apiConfig),
+        apiBinding: command.apiBinding || null,
       });
     } catch (error) {
+      await postSessionCommandFailure(command, error, 'input', runner);
       await postEvent({
         type: 'session.runtime_updated',
         hostId: HOST_ID,
@@ -2072,9 +2817,14 @@ async function handleCommand(command) {
           requestId: command.requestId || makeId(),
           models: Array.isArray(result?.data) ? result.data : [],
           nextCursor: result?.nextCursor || null,
+          complete: !result?.nextCursor,
+          truncated: false,
+          bindingFingerprint: result?.bindingFingerprint || null,
+          runId: result?.runId || runner.runId || null,
           timestamp: nowIso(),
         });
       } catch (error) {
+        await postSessionCommandFailure(command, error, 'model_list', runner);
         await postEvent({
           type: 'session.model_listed',
           hostId: HOST_ID,
@@ -2188,8 +2938,10 @@ async function handleCommand(command) {
       try {
         await runner.compactThread({
           apiConfig: normalizeApiConfig(command.apiConfig),
+          apiBinding: command.apiBinding || null,
         });
       } catch (error) {
+        await postSessionCommandFailure(command, error, 'compact', runner);
         await postEvent({
           type: 'session.error',
           hostId: HOST_ID,
@@ -2339,16 +3091,16 @@ async function handleCommand(command) {
   }
 
   if (command.type === 'session.stop') {
-    await runner.stop();
-    await postEvent({
-      type: 'session.state_changed',
-      hostId: HOST_ID,
-      sessionId: command.requestedSessionId || command.sessionId,
-      runId: runner.runId || command.runId || null,
-      state: 'history-only',
-      live: false,
-      timestamp: nowIso(),
-    });
+    try {
+      await runner.stop({ suppressTerminalEvent: command.suppressTerminalEvent === true });
+    } catch (cause) {
+      const stopError = cause instanceof Error
+        ? cause
+        : new Error(String(cause || 'Managed Session stop failed.'));
+      stopError.retryCommand = true;
+      stopError.code = stopError.code || 'session_stop_incomplete';
+      throw stopError;
+    }
     return;
   }
 }
@@ -2397,24 +3149,71 @@ async function processPolledCommand(command) {
   try {
     await handleCommand(command);
   } catch (error) {
+    if (error?.retryCommand) return false;
+    if (command?.type === 'host.skills.deployment.apply') {
+      logAgentTransient('[agent] will retry deployment result delivery:', error);
+      return false;
+    }
     await postCommandFailure(command, error);
-  } finally {
-    lastCommandId = Math.max(lastCommandId, commandId);
   }
+  lastCommandId = Math.max(lastCommandId, commandId);
+  return true;
+}
+
+async function acknowledgeCommandsBeforeShutdown() {
+  const throughId = Number(lastCommandId || 0);
+  if (throughId <= 0) return true;
+  const result = await fetchJson(
+    `${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${Number.MAX_SAFE_INTEGER}&ack=${throughId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}`,
+    {
+      retryOnTransient: true,
+      headers: managedAgentRequestHeaders(),
+    }
+  );
+  if (observeRelayInstance(result.body)) {
+    await registerHost();
+    return false;
+  }
+  return true;
 }
 
 async function pollCommandsLoop() {
   while (true) {
     try {
-      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}&ack=${lastCommandId}`, {
+      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}&ack=${lastCommandId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}`, {
         retryOnTransient: true,
+        headers: managedAgentRequestHeaders(),
       });
-      const commands = Array.isArray(result.body && result.body.commands) ? result.body.commands : [];
+      if (observeRelayInstance(result.body)) {
+        await registerHost();
+      }
+      const commands = (Array.isArray(result.body && result.body.commands)
+        ? result.body.commands
+        : [])
+        .slice()
+        .sort((left, right) => Number(left?.id || 0) - Number(right?.id || 0));
       for (const command of commands) {
-        await processPolledCommand(command);
+        if (
+          command?.type === 'host.shutdown'
+          && !(await acknowledgeCommandsBeforeShutdown())
+        ) {
+          break;
+        }
+        const processed = await processPolledCommand(command);
+        if (!processed) {
+          break;
+        }
+        if (command?.type === 'host.shutdown') {
+          return;
+        }
       }
       await sleep(POLL_INTERVAL_MS);
     } catch (error) {
+      if (isRelayOwnershipRevokedError(error)) {
+        logAgentError('[agent] Relay ownership was revoked; stopping this Agent instance');
+        await shutdownHostAgent('ownership-revoked');
+        return;
+      }
       logAgentTransient('[agent] command poll failed:', error);
       await sleep(Math.max(POLL_INTERVAL_MS, 3000));
     }
@@ -2462,6 +3261,11 @@ async function heartbeatLoop() {
       await heartbeat();
       await sleep(5000);
     } catch (error) {
+      if (isRelayOwnershipRevokedError(error)) {
+        logAgentError('[agent] Relay ownership was revoked; stopping this Agent instance');
+        await shutdownHostAgent('ownership-revoked');
+        return;
+      }
       logAgentTransient('[agent] heartbeat failed:', error);
       await sleep(5000);
     }
@@ -2507,16 +3311,95 @@ async function runStartupAutoStart() {
 async function main() {
   console.log(`[agent] host ${HOST_ID} connecting to ${RELAY_URL}`);
   console.log(`[agent] codex home ${CODEX_HOME}`);
+  ensureManagedAgentOwnershipMarker();
+
+  const overlayCleanup = CLEAN_LEGACY_MANAGED_OVERLAYS
+    ? cleanupStaleApiProfileCodexHomes(CODEX_HOME, {
+      // This opt-in is an operator attestation that all previous Agents and
+      // app-servers using this CODEX_HOME have already stopped.
+      legacyOverlayIsInactive: () => true,
+    })
+    : cleanupStaleApiProfileCodexHomes(CODEX_HOME);
+  if (overlayCleanup.removed > 0) {
+    logAgentNotice(`[agent] removed ${overlayCleanup.removed} stale managed Codex overlay(s)`);
+  }
+  for (const diagnostic of overlayCleanup.diagnostics || []) {
+    logAgentNotice('[agent] managed Codex overlay janitor:', diagnostic.message);
+  }
+  for (const error of overlayCleanup.errors) {
+    logAgentError('[agent] managed Codex overlay janitor:', error);
+  }
 
   await retryStartupStep('register host', registerHost);
+  const heartbeatTask = heartbeatLoop();
+  hostSkillInventory.start();
+  await runStartupDiscovery();
 
-  const loops = [pollCommandsLoop(), heartbeatLoop(), discoveryLoop(), codexTailLoop()];
-  void runStartupDiscovery();
+  const loops = [pollCommandsLoop(), heartbeatTask, discoveryLoop(), codexTailLoop()];
   void runStartupTailPrime();
   void runStartupAutoStart();
 
   await Promise.all(loops);
 }
+
+function stopHostSkillInventory() {
+  if (hostSkillInventory) {
+    hostSkillInventory.stop();
+  }
+}
+
+const managedSessionShutdownStopOptions = {};
+let hostAgentShutdownReason = null;
+const shutdownManagedSessions = createManagedSessionShutdown({
+  liveSessions,
+  startGate: managedSessionStartGate,
+  stopInventory: stopHostSkillInventory,
+  graceTimeoutMs: AGENT_SHUTDOWN_GRACE_MS,
+  stopOptions: managedSessionShutdownStopOptions,
+  log: (message) => logAgentError('[agent] shutdown:', message),
+});
+
+function hostAgentShutdownSuppressesTerminalEvents() {
+  return hostAgentShutdownReason === 'ownership-revoked';
+}
+
+function shutdownHostAgent(reason = 'SIGTERM') {
+  const requestedReason = String(reason || 'SIGTERM');
+  if (!hostAgentShutdownReason) {
+    hostAgentShutdownReason = requestedReason;
+    if (hostAgentShutdownSuppressesTerminalEvents()) {
+      managedSessionShutdownStopOptions.suppressTerminalEvent = true;
+    }
+  } else if (
+    requestedReason === 'ownership-revoked'
+    && !hostAgentShutdownSuppressesTerminalEvents()
+  ) {
+    hostAgentShutdownReason = 'ownership-revoked';
+    managedSessionShutdownStopOptions.suppressTerminalEvent = true;
+    shutdownManagedSessions.upgradeStopOptions({ suppressTerminalEvent: true })
+      .then((result) => {
+        if (result.errors.length) {
+          logAgentError(`[agent] shutdown: suppression upgrade had ${result.errors.length} runner stop error(s).`);
+        }
+      })
+      .catch((error) => {
+        logAgentError('[agent] shutdown: failed to upgrade terminal suppression:', error.message);
+      });
+  }
+  return shutdownManagedSessions(hostAgentShutdownReason);
+}
+
+function handleShutdownSignal(signal) {
+  logAgentNotice(`[agent] received ${signal}; stopping`);
+  return shutdownHostAgent(signal);
+}
+
+process.once('SIGINT', () => handleShutdownSignal('SIGINT'));
+process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
+process.once('exit', () => {
+  stopHostSkillInventory();
+  removeManagedAgentOwnershipMarker();
+});
 
 async function retryStartupStep(label, task, attempts = 8) {
   let lastError = null;
@@ -2526,6 +3409,9 @@ async function retryStartupStep(label, task, attempts = 8) {
       return;
     } catch (error) {
       lastError = error;
+      if (isRelayOwnershipRevokedError(error)) {
+        throw error;
+      }
       const delay = Math.min(5000, 300 * attempt * attempt);
       logAgentError(`[agent] ${label} failed (${attempt}/${attempts}): ${error.message}`);
       await sleep(delay);

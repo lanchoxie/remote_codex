@@ -4,17 +4,23 @@ const http = require('http');
 const path = require('path');
 const { discoverCodexSessions, makeCodexRowEvents } = require('../shared/codex-discovery');
 const { CodexSessionTailer } = require('../shared/codex-tail');
+const { makeProfileBinding } = require('../shared/api-binding');
 
 const ROOT = path.join(__dirname, '..');
 const PORT = 8792;
 const RELAY_URL = `http://127.0.0.1:${PORT}`;
 const RELAY_AUTH_TOKEN = 'managed-test-relay-token';
-const RELAY_AUTH_TOKEN_PATH = path.join(ROOT, 'tmp', 'runtime', `managed-test-relay-auth-token-${process.pid}.txt`);
-const RELAY_AUTH_ACCOUNT_PATH = path.join(ROOT, 'tmp', 'runtime', `managed-test-auth-account-${process.pid}.json`);
-const SESSION_COLLECTIONS_PATH = path.join(ROOT, 'tmp', 'runtime', `managed-test-session-collections-${process.pid}.json`);
-const SESSION_METADATA_PATH = path.join(ROOT, 'tmp', 'runtime', `managed-test-session-metadata-${process.pid}.json`);
-const SESSION_LOGS_PATH = path.join(ROOT, 'tmp', 'runtime', `managed-test-session-logs-${process.pid}.json`);
+const RELAY_STATE_ROOT = path.join(ROOT, 'tmp', 'runtime', `managed-test-relay-state-${process.pid}`);
+const RELAY_AUTH_TOKEN_PATH = path.join(RELAY_STATE_ROOT, 'relay-auth-token.txt');
+const RELAY_AUTH_ACCOUNT_PATH = path.join(RELAY_STATE_ROOT, 'relay-auth-account.json');
+const SESSION_COLLECTIONS_PATH = path.join(RELAY_STATE_ROOT, 'session-collections.json');
+const SESSION_METADATA_PATH = path.join(RELAY_STATE_ROOT, 'session-metadata.json');
+const SESSION_RECORD_STORE_ROOT = path.join(RELAY_STATE_ROOT, 'session-record-store');
+const SESSION_LOGS_PATH = path.join(RELAY_STATE_ROOT, 'session-logs.json');
+const SKILL_INVENTORIES_PATH = path.join(RELAY_STATE_ROOT, 'skill-inventories.json');
 const TEST_CODEX_HOME = path.join(ROOT, 'tmp', 'runtime', `managed-test-codex-home-${process.pid}`);
+const TEST_AGENTS_HOME = path.join(ROOT, 'tmp', 'runtime', `managed-test-agents-home-${process.pid}`);
+const TEST_CC_SWITCH_HOME = path.join(ROOT, 'tmp', 'runtime', `managed-test-cc-switch-home-${process.pid}`);
 const HOST_ID = 'managed-test-host';
 const HOST_LABEL = 'Managed Test Host';
 
@@ -25,12 +31,15 @@ async function main() {
   const relay = spawnNode(path.join(ROOT, 'apps', 'relay', 'server.js'), {
     ...process.env,
     PORT: String(PORT),
+    RELAY_STATE_ROOT,
     RELAY_AUTH_TOKEN,
     RELAY_AUTH_TOKEN_PATH,
     RELAY_AUTH_ACCOUNT_PATH,
     SESSION_COLLECTIONS_PATH,
     SESSION_METADATA_PATH,
+    SESSION_RECORD_STORE_ROOT,
     SESSION_LOGS_PATH,
+    SKILL_INVENTORIES_PATH,
   });
 
   let agent = null;
@@ -45,6 +54,9 @@ async function main() {
       HOST_ID,
       HOST_LABEL,
       CODEX_HOME: TEST_CODEX_HOME,
+      AGENTS_HOME: TEST_AGENTS_HOME,
+      CC_SWITCH_HOME: TEST_CC_SWITCH_HOME,
+      SKILL_PLUGIN_ROOTS: '',
       AUTO_START_SESSION: 'true',
       MANAGED_COMMAND: 'demo',
       MANAGED_CWD: ROOT,
@@ -544,24 +556,25 @@ function verifyCodexDiscoveryFormats() {
 async function verifyBridgeSessionMigration() {
   const fakeHostId = `${HOST_ID}-native-migration`;
   const nativeSessionId = `native-thread-${Date.now()}`;
+  const migrationApi = {
+    label: 'Migration API',
+    provider: 'test',
+    baseUrl: 'http://example.invalid/v1',
+    apiKey: 'test-key-not-used',
+    profileId: 'migration-api',
+  };
   await postJson('/api/agent/register', {
     hostId: fakeHostId,
     label: 'Native Migration Test Host',
     platform: process.platform,
-    capabilities: { managedSessions: true },
+    capabilities: { managedSessions: true, runApiBinding: true },
   });
 
   const start = await postJson(`/api/hosts/${encodeURIComponent(fakeHostId)}/sessions/start`, {
     cwd: ROOT,
     label: 'native migration smoke',
     launchMode: 'fresh',
-    apiConfig: {
-      label: 'Migration API',
-      provider: 'test',
-      baseUrl: 'http://example.invalid/v1',
-      apiKey: 'test-key-not-used',
-      profileId: 'migration-api',
-    },
+    apiConfig: migrationApi,
   });
   if (!start.sessionId) {
     throw new Error('start response did not include bridge session id');
@@ -589,10 +602,12 @@ async function verifyBridgeSessionMigration() {
       sessionId: nativeSessionId,
       bridgeSessionId: start.sessionId,
       nativeThreadId: nativeSessionId,
+      runId: start.runId,
       title: 'native migration smoke',
       cwd: ROOT,
       source: 'managed',
       launchMode: 'fresh',
+      effectiveBinding: makeProfileBinding(migrationApi),
       runtime: {
         kind: 'codex-app-server',
         threadId: nativeSessionId,

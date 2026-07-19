@@ -1,8 +1,12 @@
+const SKILLS_DEPLOYMENT_SUMMARY_LIMIT = 100;
+
 const state = {
   hosts: [],
   dismissedHosts: [],
   sessions: [],
   stats: null,
+  refreshRequestId: 0,
+  refreshPromise: null,
   auth: {
     ready: false,
     required: false,
@@ -22,6 +26,7 @@ const state = {
   selectedSessionId: null,
   eventSource: null,
   eventSourceKey: null,
+  eventCursorByCanonical: new Map(),
   streamRecoveryInFlight: false,
   transcripts: new Map(),
   alerts: new Map(),
@@ -32,17 +37,45 @@ const state = {
   receivedFiles: new Map(),
   receivedFilesLoadingKeys: new Set(),
   streamStatus: new Map(),
+  activityProjection: window.RemoteCodexTranscriptState?.createTranscriptActivityProjection?.() || null,
+  activityCanonicalKeysBySession: new Map(),
   thinkingPanels: new Map(),
   thinkingScrollPositions: new Map(),
+  thinkingScrollVersions: new Map(),
+  thinkingScrollMachines: new Map(),
   thinkingEntryCounts: new Map(),
   thinkingUnread: new Set(),
-  messageReadReceipts: new Map(),
+  messageReceiptStore: null,
+  legacyMessageReadReceipts: {},
+  assistantProjections: new Map(),
+  assistantCanonicalKeysBySession: new Map(),
+  messageProjectionRequests: new Map(),
+  messageProjectionSyncPromise: null,
+  messageReadGates: new Map(),
+  messageReadRenderReady: new Set(),
+  transcriptNotificationRenderVersions: new Map(),
+  transcriptNotificationRenderedAssistantSeq: new Map(),
+  messageNotificationOutbox: null,
+  messageNotificationChannel: null,
+  messageNotificationDrainPromise: null,
+  messageNotificationDrainRequested: false,
+  messageNotificationObservedDrainPromise: null,
+  messageNotificationBroadcastTimer: null,
+  messageNotificationBroadcastTypes: new Set(),
+  messageReceiptPersistRetryTimer: null,
+  messageOutboxPersistRetryTimer: null,
+  messageReceiptPersistRetryAttempt: 0,
+  messageOutboxPersistRetryAttempt: 0,
+  messageNotificationLockDbPromise: null,
+  messageNotificationTabId: '',
+  messageDocumentVisible: document.visibilityState !== 'hidden',
+  messageWindowFocused: typeof document.hasFocus !== 'function' || document.hasFocus(),
   messageUnread: new Set(),
   messageNotificationOpen: false,
-  messageReadReceiptsInitializedAt: '',
   transcriptEntryCounts: new Map(),
   transcriptUnread: new Set(),
   transcriptUserDetached: new Set(),
+  transcriptScrollMachines: new WeakMap(),
   transcriptVisibleLimits: new Map(),
   fullTranscriptLoaded: new Set(),
   historyLoading: new Set(),
@@ -57,6 +90,59 @@ const state = {
   connectorEditorId: null,
   connectorActionResults: new Map(),
   connectorActionBusy: null,
+  skillsManager: {
+    open: false,
+    loading: false,
+    tab: 'installed',
+    query: '',
+    hosts: [],
+    catalog: [],
+    installed: [],
+    instances: [],
+    inventories: [],
+    favorites: [],
+    sources: [],
+    skillLibrary: [],
+    artifacts: [],
+    adoptions: [],
+    imports: [],
+    deployments: [],
+    desiredSkillStates: [],
+    appliedSkillStates: [],
+    registryRevision: 0,
+    deploymentVersion: 0,
+    desiredVersion: 0,
+    dailySkillDigest: null,
+    selectedHostIds: new Set(),
+    selectedSkillIds: new Set(),
+    selectedCleanupKeys: new Set(),
+    deploymentScope: 'user',
+    projectCwd: '',
+    confirmProjectWrite: false,
+    projectWriteConfirmationKey: '',
+    deploying: false,
+    deploymentSequence: 0,
+    refreshingHostIds: new Set(),
+    busyInstanceIds: new Set(),
+    importingGithub: false,
+    lifecycleBusyKeys: new Set(),
+    sourceAutomationDrafts: new Map(),
+    sourceAutomationStatus: new Map(),
+    auditEvents: [],
+    auditLoading: false,
+    auditLoaded: false,
+    auditError: '',
+    auditLatestSequence: 0,
+    collectingArtifacts: false,
+    events: null,
+    eventsRetryTimer: null,
+    eventsRetryDelayMs: 1000,
+    dirty: false,
+    reloadTimer: null,
+    renderTimer: null,
+    loadError: '',
+    actionSummary: '',
+  },
   sessionCollections: [],
   selectedCollectionId: 'default',
   collectionManagerOpen: false,
@@ -84,7 +170,6 @@ const state = {
   newSessionCollapsed: true,
   navigatorCollapsed: true,
   settingsOpen: false,
-  settingsApiSnapshot: {},
   softwareUpdate: {
     status: null,
     busy: false,
@@ -94,9 +179,22 @@ const state = {
   },
   apiPingResults: new Map(),
   apiPingBusyHosts: new Set(),
+  apiProfileBackup: {
+    open: false,
+    mode: 'export',
+    busy: false,
+    fileText: '',
+    importedPayload: null,
+    preview: null,
+    conflicts: [],
+    status: '',
+    error: '',
+  },
   localAgentActionBusyId: null,
   hostRestartBusyId: null,
   sessionLaunchBusy: null,
+  sessionApiRebindBusyKeys: new Set(),
+  sessionTranscriptFallbackBusyKeys: new Set(),
   imagePreview: {
     open: false,
     src: '',
@@ -153,12 +251,15 @@ const state = {
   },
   hostSwitchBusyId: null,
   codexControls: {
-    modelOptionsBySession: new Map(),
+    modelCatalogByKey: new Map(),
     modelOptionsLoadingKeys: new Set(),
     modelOptionsRetryAfterBySession: new Map(),
+    rebindTargetProfileBySession: new Map(),
+    rebindTargetIdentityBySession: new Map(),
     skillOptionsBySession: new Map(),
     skillOptionsLoadingKeys: new Set(),
     skillOptionsRetryAfterBySession: new Map(),
+    recentSkillChangesByHost: new Set(),
     sessionOptionsByKey: new Map(),
     persistedSessionOptionKeys: new Set(),
     attachments: [],
@@ -213,6 +314,7 @@ const TRANSCRIPT_RENDER_CODE_FENCE_BUDGET = 180;
 const CLIENT_DIAGNOSTIC_ENTRY_LIMIT = 10000;
 const CLIENT_DIAGNOSTIC_RECENT_DEDUPE_WINDOW = 200;
 const LIVE_THINKING_DIAGNOSTIC_WINDOW = 240;
+const LIVE_THINKING_ACTIVITY_ENTRY_LIMIT = 160;
 const LIVE_THINKING_TRANSCRIPT_LOOKBACK = 240;
 const UI_EVENT_RENDER_DEBOUNCE_MS = 80;
 const TRANSCRIPT_EVENT_RENDER_DEBOUNCE_MS = 160;
@@ -221,10 +323,21 @@ const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
 const DISMISSED_ALERTS_STORAGE_KEY = 'mobile-codex-remote.dismissed-alerts.v1';
 const MANUAL_SESSION_TITLES_STORAGE_KEY = 'mobile-codex-remote.manual-session-titles.v1';
-const MESSAGE_READ_RECEIPTS_STORAGE_KEY = 'mobile-codex-remote.message-read-receipts.v1';
+const LEGACY_MESSAGE_READ_RECEIPTS_STORAGE_KEY = 'mobile-codex-remote.message-read-receipts.v1';
+const MESSAGE_READ_RECEIPTS_STORAGE_KEY = 'mobile-codex-remote.message-read-receipts.v2';
+const MESSAGE_NOTIFICATION_OUTBOX_STORAGE_KEY = 'mobile-codex-remote.message-notification-outbox.v1';
+const MESSAGE_NOTIFICATION_LEASE_STORAGE_KEY = 'mobile-codex-remote.message-notification-lease.v1';
+const MESSAGE_RECEIPT_WRITE_LOCK_NAME = 'mobile-codex-remote.message-receipt-write.v1';
+const MESSAGE_OUTBOX_WRITE_LOCK_NAME = 'mobile-codex-remote.message-outbox-write.v1';
+const MESSAGE_NOTIFICATION_LOCK_DB_NAME = 'mobile-codex-remote.notification-locks.v1';
+const MESSAGE_NOTIFICATION_LOCK_STORE_NAME = 'locks';
+const MESSAGE_NOTIFICATION_CHANNEL_NAME = 'mobile-codex-remote.message-notifications.v1';
+const MESSAGE_NOTIFICATION_BROADCAST_DEBOUNCE_MS = 80;
+const ASSISTANT_PROJECTION_PAGE_LIMIT = 100;
+const ASSISTANT_PROJECTION_MAX_RESTARTS = 3;
 const DEFAULT_COMPOSER_OPTIONS = {
   model: '',
-  effort: 'xhigh',
+  effort: '',
   summary: '',
   mode: 'default',
   approvalPolicy: 'on-request',
@@ -267,10 +380,10 @@ const UI_TEXT = {
     'settings.performanceRestartTip': 'Changing this mode affects session-list loading after refresh. Restart the relay to apply server-side payload behavior everywhere.',
     'settings.hostsTitle': 'Hosts and connectors',
     'settings.hostsCopy': 'Manage connected hosts, import a host id, or open HPC connector profiles.',
-    'settings.sessionDefaultsTitle': 'Session defaults',
-    'settings.sessionDefaultsCopy': 'These controls are remembered per selected session. Switching sessions restores that session\'s model, effort, reviewer, sandbox, and personality choices.',
+    'settings.sessionDefaultsTitle': 'Selected Session',
+    'settings.sessionDefaultsCopy': 'Model and runtime controls target the selected Session. The browser default below is used only for new Sessions.',
     'settings.apiTitle': 'API profiles',
-    'settings.apiCopy': 'Create multiple API profiles and choose which host uses which key. Changes apply when starting or restarting Codex app-server sessions.',
+    'settings.apiCopy': 'Create API profiles and choose the browser default for each Host\'s new Sessions.',
     'settings.profileSelect': 'Editing profile',
     'settings.addProfile': 'New profile',
     'settings.deleteProfile': 'Delete profile',
@@ -278,11 +391,11 @@ const UI_TEXT = {
     'settings.apiProvider': 'Provider label',
     'settings.api-base-url': 'Base URL',
     'settings.api-key': 'API key',
-    'settings.defaultProfile': 'Default API profile',
-    'settings.hostMappingTitle': 'Host API mapping',
-    'settings.hostMappingCopy': 'A host can use the default profile or a dedicated profile.',
+    'settings.defaultProfile': 'New Session default API profile',
+    'settings.hostMappingTitle': 'New Session API by Host',
+    'settings.hostMappingCopy': 'Each Host can use the browser default profile or a dedicated profile for new Sessions.',
     'settings.rememberKey': 'Remember API key in this browser',
-    'settings.apiRestartTip': 'After changing an API key or Base URL, restart the affected conversation/managed session. Running Codex app-server processes keep the API environment they started with.',
+    'settings.apiRestartTip': 'Host mappings are defaults for new Sessions only. Existing Sessions keep their run binding; use Session Rebind to change provider or Base URL.',
     'settings.apiWarning': 'Do not use this on an untrusted relay or shared browser. The key is sent through your relay when starting a session.',
     'settings.clearKey': 'Clear API key',
     'settings.clearKeyConfirm': 'Clear the API key for "{profile}"? This removes it from this browser only. Already running sessions keep their current environment.',
@@ -316,10 +429,10 @@ const UI_TEXT = {
     'settings.performanceRestartTip': '修改后刷新页面会影响会话列表加载；重启 relay 后服务端列表 payload 行为会完整生效。',
     'settings.hostsTitle': 'Host 与连接器',
     'settings.hostsCopy': '管理已连接的 host、导入 host id，或打开 HPC 连接器配置。',
-    'settings.sessionDefaultsTitle': '会话默认参数',
-    'settings.sessionDefaultsCopy': '这些控件按当前选中的 session 单独记忆。切换 session 时，会恢复那个 session 自己的模型、推理强度、审查者、沙盒和个性选择。',
+    'settings.sessionDefaultsTitle': '当前 Session',
+    'settings.sessionDefaultsCopy': '模型与运行设置仅作用于当前选中的 Session；下方浏览器默认 API 只用于新 Session。',
     'settings.apiTitle': 'API 配置',
-    'settings.apiCopy': 'Base URL 和 API Key 会在新建或重启 Codex app-server 会话时生效。',
+    'settings.apiCopy': '创建 API 配置，并为每个 Host 的新 Session 选择当前浏览器默认值。',
     'settings.apiProvider': '提供方标签',
     'settings.api-base-url': 'Base URL',
     'settings.api-key': 'API Key',
@@ -327,11 +440,11 @@ const UI_TEXT = {
     'settings.addProfile': '新建配置',
     'settings.deleteProfile': '删除配置',
     'settings.profileName': '配置名称',
-    'settings.defaultProfile': '默认 API 配置',
-    'settings.hostMappingTitle': 'Host API 映射',
-    'settings.hostMappingCopy': '每个 host 可以使用默认配置，也可以指定专用配置。',
+    'settings.defaultProfile': '新 Session 默认 API 配置',
+    'settings.hostMappingTitle': '各 Host 的新 Session API',
+    'settings.hostMappingCopy': '每个 Host 可为新 Session 使用浏览器默认配置或指定专用配置。',
     'settings.rememberKey': '在当前浏览器记住 API Key',
-    'settings.apiRestartTip': '更换 API Key 或 Base URL 后，需要重启对应对话/managed session。已经运行的 Codex app-server 会继续使用启动时的 API 环境。',
+    'settings.apiRestartTip': 'Host 映射只用于新 Session；现有 Session 保留原 run binding。更换提供方或 Base URL 请使用 Session Rebind。',
     'settings.apiWarning': '不要在不可信 relay 或共享浏览器上使用。启动会话时，这个 key 会经过你的 relay 发送到对应 host。',
     'settings.clearKey': '清除 API Key',
     'settings.clearKeyConfirm': '确定清除“{profile}”的 API Key 吗？这只会从当前浏览器移除。已经运行中的 session 会继续使用当前环境。',
@@ -962,42 +1075,60 @@ function persistManualSessionTitles() {
   writeLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, serializeManualSessionTitles());
 }
 
-function normalizeMessageReadReceipts(input = {}) {
-  const result = new Map();
-  if (!input || typeof input !== 'object') {
-    return result;
+function initializeMessageNotificationState() {
+  const client = window.MessageNotificationClient;
+  if (!client?.ReceiptStore || !client?.NotificationOutbox) {
+    return;
   }
-  for (const [key, value] of Object.entries(input)) {
-    if (!key || !value || typeof value !== 'object') {
-      continue;
-    }
-    const lastReadMessageKey = String(value.lastReadMessageKey || value.marker || '').trim();
-    if (!lastReadMessageKey) {
-      continue;
-    }
-    result.set(key, {
-      lastReadMessageKey,
-      lastReadAt: value.lastReadAt || new Date(0).toISOString(),
+  state.messageNotificationTabId = makeClientId();
+  state.messageReceiptStore = new client.ReceiptStore({
+    load: () => window.localStorage?.getItem(MESSAGE_READ_RECEIPTS_STORAGE_KEY) || '',
+    save: (value) => window.localStorage?.setItem(MESSAGE_READ_RECEIPTS_STORAGE_KEY, value),
+    onPersist: () => {
+      resetMessageNotificationStoreRetry('receipt');
+      broadcastMessageNotificationState('receipts-changed');
+    },
+    runExclusive: (callback) => runMessageNotificationStorageTransaction(
+      MESSAGE_RECEIPT_WRITE_LOCK_NAME,
+      callback
+    ),
+    onLockUnavailable: () => scheduleMessageNotificationStoreRetry('receipt'),
+    onPersistError: (error) => {
+      reportError(error);
+      scheduleMessageNotificationStoreRetry('receipt');
+    },
+  });
+  state.legacyMessageReadReceipts = readLocalStorageJson(
+    LEGACY_MESSAGE_READ_RECEIPTS_STORAGE_KEY,
+    {}
+  ) || {};
+  state.messageNotificationOutbox = new client.NotificationOutbox({
+    load: () => window.localStorage?.getItem(MESSAGE_NOTIFICATION_OUTBOX_STORAGE_KEY) || '',
+    save: (value) => window.localStorage?.setItem(
+      MESSAGE_NOTIFICATION_OUTBOX_STORAGE_KEY,
+      JSON.stringify(value)
+    ),
+    onPersist: () => {
+      resetMessageNotificationStoreRetry('outbox');
+      broadcastMessageNotificationState('outbox-changed');
+    },
+    runExclusive: (callback) => runMessageNotificationStorageTransaction(
+      MESSAGE_OUTBOX_WRITE_LOCK_NAME,
+      callback
+    ),
+    onLockUnavailable: () => scheduleMessageNotificationStoreRetry('outbox'),
+    onPersistError: (error) => {
+      reportError(error);
+      scheduleMessageNotificationStoreRetry('outbox');
+    },
+  });
+  if (typeof window.BroadcastChannel === 'function') {
+    state.messageNotificationChannel = new window.BroadcastChannel(MESSAGE_NOTIFICATION_CHANNEL_NAME);
+    state.messageNotificationChannel.addEventListener('message', (event) => {
+      scheduleMessageNotificationBroadcastFlush(event?.data?.type);
     });
   }
-  return result;
-}
-
-function serializeMessageReadReceipts() {
-  const serialized = {};
-  for (const [key, receipt] of state.messageReadReceipts.entries()) {
-    if (key && receipt?.lastReadMessageKey) {
-      serialized[key] = {
-        lastReadMessageKey: receipt.lastReadMessageKey,
-        lastReadAt: receipt.lastReadAt || new Date().toISOString(),
-      };
-    }
-  }
-  return serialized;
-}
-
-function persistMessageReadReceipts() {
-  writeLocalStorageJson(MESSAGE_READ_RECEIPTS_STORAGE_KEY, serializeMessageReadReceipts());
+  window.setTimeout(() => void requestMessageNotificationOutboxDrain(), 0);
 }
 
 function rememberManualSessionTitle(session, title) {
@@ -1022,7 +1153,7 @@ function initializePersistentUiState() {
   state.navigatorCollapsed = readLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, true) !== false;
   state.dismissedAlerts = normalizeDismissedAlerts(readLocalStorageJson(DISMISSED_ALERTS_STORAGE_KEY, {}));
   state.manualSessionTitles = normalizeManualSessionTitles(readLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, {}));
-  state.messageReadReceipts = normalizeMessageReadReceipts(readLocalStorageJson(MESSAGE_READ_RECEIPTS_STORAGE_KEY, {}));
+  initializeMessageNotificationState();
   const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
   state.ui.locale = storedUi.locale;
   state.ui.theme = storedUi.theme;
@@ -1040,14 +1171,14 @@ function initializePersistentUiState() {
   }
 }
 
-function persistUiSettings() {
-  const normalized = normalizeUiSettings(state.ui);
+function uiSettingsStorageValue(input = state.ui) {
+  const normalized = normalizeUiSettings(input);
   const apiProfiles = normalized.apiProfiles.map((profile) => ({
     ...profile,
     apiKey: profile.apiKey || '',
     rememberApiKey: Boolean(profile.apiKey || profile.rememberApiKey),
   }));
-  writeLocalStorageJson(UI_SETTINGS_STORAGE_KEY, {
+  return {
     locale: normalized.locale,
     theme: normalized.theme,
     optimizeSpeedMode: normalized.optimizeSpeedMode,
@@ -1055,7 +1186,11 @@ function persistUiSettings() {
     selectedApiProfileId: normalized.selectedApiProfileId,
     defaultApiProfileId: normalized.defaultApiProfileId,
     hostApiProfiles: normalized.hostApiProfiles,
-  });
+  };
+}
+
+function persistUiSettings() {
+  writeLocalStorageJson(UI_SETTINGS_STORAGE_KEY, uiSettingsStorageValue(state.ui));
 }
 
 function currentLocale() {
@@ -1180,6 +1315,145 @@ function getApiRequestConfig(hostId = state.selectedHostId) {
   return config.baseUrl || config.apiKey ? config : null;
 }
 
+function apiProfileRequestConfig(profile) {
+  if (!profile) {
+    return null;
+  }
+  return {
+    provider: profile.provider || '',
+    baseUrl: profile.baseUrl || '',
+    apiKey: profile.apiKey || '',
+    profileId: profile.profileId || '',
+    label: profile.label || profile.provider || profile.profileId || '',
+  };
+}
+
+function normalizeApiIdentityBaseUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+  try {
+    const url = new URL(raw);
+    url.hash = '';
+    url.searchParams.sort();
+    url.pathname = url.pathname.replace(/\/+$/, '') || '/';
+    return url.toString().replace(/\/$/, '');
+  } catch (_) {
+    return raw.replace(/\/+$/, '');
+  }
+}
+
+function apiBindingMatchesProfileIdentity(binding, profile) {
+  if (binding?.kind !== 'profile' || !profile) {
+    return false;
+  }
+  const bindingProfileId = String(binding.profileId || '').trim();
+  const profileId = String(profile.profileId || '').trim();
+  if (bindingProfileId && bindingProfileId !== profileId) {
+    return false;
+  }
+  const bindingProvider = String(binding.provider || '').trim().toLowerCase();
+  const profileProvider = String(profile.provider || 'OpenAI').trim().toLowerCase();
+  if (bindingProvider !== profileProvider) {
+    return false;
+  }
+  return normalizeApiIdentityBaseUrl(binding.normalizedBaseUrl || binding.baseUrl)
+    === normalizeApiIdentityBaseUrl(profile.baseUrl);
+}
+
+function sessionApiBinding(session) {
+  if (session?.runtimeConfig && Object.prototype.hasOwnProperty.call(session.runtimeConfig, 'apiBinding')) {
+    return session.runtimeConfig.apiBinding ?? null;
+  }
+  if (session?.runtimeConfig && Object.prototype.hasOwnProperty.call(session.runtimeConfig, 'sessionBinding')) {
+    return session.runtimeConfig.sessionBinding ?? null;
+  }
+  if (session && Object.prototype.hasOwnProperty.call(session, 'apiBinding')) {
+    return session.apiBinding ?? null;
+  }
+  return session?.sessionRecord?.apiBinding || null;
+}
+
+function sessionContractError(code, message, details = {}) {
+  const error = new Error(message);
+  error.code = code;
+  Object.assign(error, details);
+  return error;
+}
+
+function resolveApiProfileRequestConfig(profile, binding, hostId) {
+  const apiConfig = apiProfileRequestConfig(profile);
+  if (!apiConfig?.baseUrl && !apiConfig?.apiKey) {
+    throw sessionContractError(
+      'session_api_binding_unavailable',
+      'The API profile bound to this Session has no saved credentials.',
+      { sessionBinding: binding, canRebind: true }
+    );
+  }
+  validateApiConfigForRequest(apiConfig, hostId);
+  return apiConfig;
+}
+
+function resolveLaunchApiConfig({ hostId, sourceSession = null, explicitProfileId = '' }) {
+  if (!sourceSession) {
+    const apiConfig = getApiRequestConfig(hostId);
+    validateApiConfigForRequest(apiConfig, hostId);
+    return { apiConfig, explicitRebind: false };
+  }
+
+  const binding = sessionApiBinding(sourceSession);
+  if (explicitProfileId) {
+    const profile = (state.ui.apiProfiles || []).find((item) => item.profileId === explicitProfileId);
+    if (!profile) {
+      throw sessionContractError(
+        'session_api_binding_unavailable',
+        'Selected API profile is unavailable.',
+        { sessionBinding: binding, canRebind: true }
+      );
+    }
+    const apiConfig = resolveApiProfileRequestConfig(profile, binding, hostId);
+    return { apiConfig, explicitRebind: true };
+  }
+  if (binding?.kind === 'host_environment') {
+    return { apiConfig: null, explicitRebind: false };
+  }
+  if (binding?.kind !== 'profile') {
+    throw sessionContractError(
+      'session_api_binding_unavailable',
+      'This Session has no verifiable API binding. Choose an API before resuming.',
+      { sessionBinding: binding, canRebind: true }
+    );
+  }
+  const profile = (state.ui.apiProfiles || []).find((item) => item.profileId === binding.profileId);
+  if (!profile) {
+    throw sessionContractError(
+      'session_api_binding_unavailable',
+      'The API profile bound to this Session was removed.',
+      { sessionBinding: binding, canRebind: true }
+    );
+  }
+  const apiConfig = resolveApiProfileRequestConfig(profile, binding, hostId);
+  if (!apiBindingMatchesProfileIdentity(binding, profile)) {
+    throw sessionContractError(
+      'session_api_binding_mismatch',
+      'The saved API profile identity changed. Use Session Rebind to change provider or Base URL.',
+      {
+        sessionBinding: binding,
+        submittedBinding: {
+          kind: 'profile',
+          profileId: profile.profileId || null,
+          label: profile.label || null,
+          provider: profile.provider || 'OpenAI',
+          normalizedBaseUrl: normalizeApiIdentityBaseUrl(profile.baseUrl) || null,
+        },
+        canRebind: true,
+      }
+    );
+  }
+  return { apiConfig, explicitRebind: false };
+}
+
 function validateApiConfigForRequest(apiConfig, hostId = state.selectedHostId) {
   if (!apiConfig) {
     return;
@@ -1212,9 +1486,49 @@ function getSessionApiProfileSummary(session) {
     };
   }
 
-  const mapped = getApiProfileForHost(session.hostId);
-  const mappedLabel = mapped?.label || mapped?.profileId || mapped?.provider || 'Default';
-  const mappedHasRuntimeConfig = Boolean(mapped?.baseUrl || mapped?.apiKey);
+  const binding = sessionApiBinding(session);
+  if (binding?.kind === 'profile') {
+    const label = binding.label || binding.profileId || binding.provider || 'API profile';
+    const details = [
+      binding.provider ? `Provider: ${binding.provider}` : '',
+      binding.normalizedBaseUrl || binding.baseUrl
+        ? `Base URL: ${binding.normalizedBaseUrl || binding.baseUrl}`
+        : '',
+      binding.profileId ? `Profile ID: ${binding.profileId}` : '',
+    ].filter(Boolean).join('\n');
+    return {
+      label: `API: ${label}`,
+      title: details || 'API identity bound to this Session run.',
+      source: 'binding',
+    };
+  }
+
+  if (binding?.kind === 'host_environment') {
+    const label = binding.label || binding.provider || binding.modelProviderHint || 'Host environment';
+    const details = [
+      binding.provider ? `Provider: ${binding.provider}` : '',
+      binding.normalizedBaseUrl || binding.baseUrl
+        ? `Base URL: ${binding.normalizedBaseUrl || binding.baseUrl}`
+        : '',
+      binding.modelProviderHint ? `Model provider: ${binding.modelProviderHint}` : '',
+    ].filter(Boolean).join('\n');
+    return {
+      label: `API: ${label}`,
+      title: details || 'API environment attested for this Session run.',
+      source: 'binding',
+    };
+  }
+
+  if (binding?.kind === 'unknown') {
+    return {
+      label: 'API: unknown',
+      title: binding.modelProviderHint
+        ? `No verifiable API binding. Model provider hint: ${binding.modelProviderHint}`
+        : 'No verifiable API binding is available for this Session.',
+      source: 'unknown',
+    };
+  }
+
   const runtimeRecorded = session.runtime && (
     session.runtime.apiProfileLabel
     || session.runtime.apiProfileId
@@ -1231,59 +1545,23 @@ function getSessionApiProfileSummary(session) {
   const recorded = session.apiProfile || session.runtime?.apiProfile || null;
   const effectiveRecorded = recorded || runtimeRecorded;
   if (effectiveRecorded?.label || effectiveRecorded?.profileId || effectiveRecorded?.provider || effectiveRecorded?.baseUrl) {
-    const recordedRuntimeKey = apiConfigFingerprint({
-      provider: effectiveRecorded.provider || '',
-      baseUrl: effectiveRecorded.baseUrl || '',
-      profileId: effectiveRecorded.profileId || '',
-      label: effectiveRecorded.label || '',
-    });
-    const mappedRuntimeKey = apiConfigFingerprint({
-      provider: mapped?.provider || '',
-      baseUrl: mapped?.baseUrl || '',
-      profileId: mapped?.profileId || '',
-      label: mapped?.label || '',
-    });
     const label = effectiveRecorded.label || effectiveRecorded.profileId || effectiveRecorded.provider || 'API profile';
     const details = [
       effectiveRecorded.provider ? `Provider: ${effectiveRecorded.provider}` : '',
       effectiveRecorded.baseUrl ? `Base URL: ${effectiveRecorded.baseUrl}` : '',
       effectiveRecorded.profileId ? `Profile ID: ${effectiveRecorded.profileId}` : '',
-      mapped && mappedRuntimeKey !== recordedRuntimeKey ? `Current host mapping: ${mappedLabel}${mapped.baseUrl ? ` (${mapped.baseUrl})` : ''}` : '',
     ].filter(Boolean).join('\n');
-    if (session.live && mapped && mappedRuntimeKey !== recordedRuntimeKey) {
-      return {
-        label: `API: ${label} (restart for ${mappedLabel})`,
-        title: `${details}\nRestart this live managed session to use the current host API mapping.`.trim(),
-        source: 'stale',
-      };
-    }
     return {
       label: `API: ${label}`,
-      title: details || 'API profile recorded when this session started.',
-      source: 'recorded',
-    };
-  }
-
-  if (session.live && session.runtime && mappedHasRuntimeConfig) {
-    return {
-      label: `API: default (restart for ${mappedLabel})`,
-      title: `This live managed session was started with the host default API environment.\nCurrent host mapping: ${mappedLabel}${mapped.baseUrl ? ` (${mapped.baseUrl})` : ''}\nRestart this session to use the mapped API profile.`,
-      source: 'stale',
-    };
-  }
-
-  if (mapped) {
-    return {
-      label: `API: ${mapped.label || mapped.provider || 'Default'}`,
-      title: 'No profile was recorded on this session yet; showing the current host/default mapping.',
-      source: 'mapped',
+      title: details || 'Legacy API profile recorded when this Session started.',
+      source: 'legacy-recorded',
     };
   }
 
   return {
-    label: 'API: default',
-    title: 'No API profile is configured; Codex will use the host environment.',
-    source: 'default',
+    label: 'API: unknown',
+    title: 'No Session API binding has been recorded. The browser Host default applies only to new Sessions.',
+    source: 'unknown',
   };
 }
 
@@ -1302,6 +1580,12 @@ async function fetchJson(url, options = {}) {
     error.status = response.status;
     error.body = body;
     error.url = url;
+    error.code = body.code || null;
+    error.stage = body.stage || null;
+    error.sessionBinding = body.sessionBinding || null;
+    error.submittedBinding = body.submittedBinding || null;
+    error.canRebind = Boolean(body.canRebind);
+    error.canTranscriptFallback = Boolean(body.canTranscriptFallback);
     if (response.status === 401 && body?.authRequired && !options.skipAuthHandling) {
       requireRelayLogin(error.message);
     }
@@ -1400,6 +1684,7 @@ function requireRelayLogin(message = '') {
   state.auth.authenticated = false;
   state.auth.error = message || 'Relay login is required.';
   closeStream();
+  closeSkillsInventoryEvents();
   renderAuthGate();
 }
 
@@ -1413,6 +1698,9 @@ function applyAuthConfig(config = {}) {
   state.auth.tokenHint = config.tokenHint || '';
   state.auth.tokenFile = config.tokenFile || 'tmp/relay-auth-token.txt';
   state.auth.accountFile = config.accountFile || 'tmp/relay-auth-account.json';
+  if (!state.auth.authenticated) {
+    closeSkillsInventoryEvents();
+  }
 }
 
 async function refreshAuthState() {
@@ -1472,6 +1760,7 @@ async function logoutRelay() {
   state.auth.accountOpen = false;
   state.auth.error = 'Logged out.';
   closeStream();
+  closeSkillsInventoryEvents();
   renderAuthGate();
 }
 
@@ -1481,6 +1770,44 @@ function makeSessionKey(hostId, sessionId) {
 
 function getSessionKey(session) {
   return session ? makeSessionKey(session.hostId, session.sessionId) : null;
+}
+
+function rememberActivityCanonicalKey(canonicalKey, ...identities) {
+  const normalized = String(canonicalKey || '').trim();
+  if (!normalized) {
+    return '';
+  }
+  for (const identity of identities) {
+    const hostId = identity?.hostId;
+    for (const sessionId of [
+      identity?.sessionId,
+      identity?.bridgeSessionId,
+      identity?.nativeThreadId,
+      identity?.sourceSessionId,
+      identity?.originSessionId,
+    ]) {
+      if (hostId && sessionId) {
+        state.activityCanonicalKeysBySession.set(makeSessionKey(hostId, sessionId), normalized);
+      }
+    }
+  }
+  return normalized;
+}
+
+function getActivityCanonicalKeyForSession(session) {
+  if (!session) {
+    return '';
+  }
+  const remembered = state.activityCanonicalKeysBySession.get(getSessionKey(session));
+  if (remembered) {
+    return remembered;
+  }
+  const explicit = String(session.canonicalConversationKey || '').trim();
+  if (explicit) {
+    return rememberActivityCanonicalKey(explicit, session);
+  }
+  const identity = session.nativeThreadId || session.conversationKey || session.sessionId;
+  return session.hostId && identity ? `${session.hostId}::${identity}` : '';
 }
 
 function getWatchClientId() {
@@ -1862,11 +2189,9 @@ function formatThinkingValue(value, depth = 0) {
   }
 
   if (Array.isArray(value)) {
-    return value
+    return joinThinkingTextParts(value
       .map((item) => formatThinkingValue(item, depth + 1))
-      .filter(Boolean)
-      .join('\n')
-      .trim();
+      .filter(Boolean));
   }
 
   if (typeof value === 'object') {
@@ -1901,6 +2226,20 @@ function formatThinkingValue(value, depth = 0) {
   }
 
   return String(value).trim();
+}
+
+function joinThinkingTextParts(parts) {
+  const values = (Array.isArray(parts) ? parts : [])
+    .map((part) => String(part || '').trim())
+    .filter(Boolean);
+  if (!values.length) {
+    return '';
+  }
+  if (values.some((part) => /\r?\n/.test(part))) {
+    return values.join('\n').trim();
+  }
+  const looksTokenized = values.length >= 4 && values.every((part) => part.length <= 32 && !/[.!?。！？:：;；]$/.test(part));
+  return values.join(looksTokenized ? ' ' : '\n').replace(/[ \t]+\n/g, '\n').trim();
 }
 
 function normalizeThinkingMessage(entry) {
@@ -2054,6 +2393,38 @@ function buildThinkingActivityEntries(diagnostics) {
   return merged;
 }
 
+function getProjectedThinkingActivities(session) {
+  const canonicalKey = getActivityCanonicalKeyForSession(session);
+  if (!canonicalKey || !state.activityProjection) {
+    return [];
+  }
+  return state.activityProjection.activitiesFor(canonicalKey).map((activity) => ({
+    activityKey: String(activity.activityKey || ''),
+    activityRevision: Number(activity.activityRevision || 0),
+    kind: activity.kind || 'reasoning',
+    method: activity.method || null,
+    text: String(activity.text == null ? '' : activity.text),
+    timestamp: activity.timestamp || activity.updatedAt || null,
+    turnId: activity.turnId || null,
+    itemId: activity.itemId || null,
+    final: activity.final === true,
+    fileChanges: [],
+  }));
+}
+
+function mergeProjectedThinkingEntries(diagnostics, projected) {
+  const projectedEntries = Array.isArray(projected) ? projected : [];
+  const projectedReasoning = projectedEntries.some((entry) => entry.kind === 'reasoning');
+  const diagnosticEntries = buildThinkingActivityEntries((diagnostics || []).filter((entry) => (
+    !projectedReasoning || String(entry?.kind || '').toLowerCase() !== 'reasoning'
+  )));
+  return [...diagnosticEntries, ...projectedEntries]
+    .sort((left, right) => (
+      Date.parse(left.timestamp || 0) - Date.parse(right.timestamp || 0)
+      || String(left.activityKey || '').localeCompare(String(right.activityKey || ''))
+    ));
+}
+
 function isUserSuitableThinkingText(text, entry = {}) {
   const value = String(text || '').trim();
   if (!value) {
@@ -2086,7 +2457,15 @@ function buildLiveActivitySegment(session, latestUserEntry = null, diagnostics =
       return Number.isFinite(diagTime) && diagTime >= startTime - startGraceMs;
     })
     .sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
-  const activity = buildThinkingActivityEntries(entries).slice(-12);
+  const projected = getProjectedThinkingActivities(session).filter((entry) => {
+    if (!Number.isFinite(startTime)) {
+      return true;
+    }
+    const activityTime = Date.parse(entry.timestamp || '');
+    return Number.isFinite(activityTime) && activityTime >= startTime - startGraceMs;
+  });
+  const activity = mergeProjectedThinkingEntries(entries, projected)
+    .slice(-LIVE_THINKING_ACTIVITY_ENTRY_LIMIT);
   if (!activity.length) {
     return null;
   }
@@ -2138,6 +2517,7 @@ function buildThinkingEntriesForSession(session, options = {}) {
   const thinkingDiagnostics = Array.isArray(options.diagnostics)
     ? options.diagnostics
     : getThinkingDiagnosticsForSession(session);
+  const projectedActivities = getProjectedThinkingActivities(session);
 
   const transcriptTimes = transcript.map((entry) => Date.parse(entry.timestamp || '')).map((value) => (Number.isFinite(value) ? value : null));
   const segments = [];
@@ -2180,7 +2560,11 @@ function buildThinkingEntriesForSession(session, options = {}) {
       })
       .sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
 
-    const merged = buildThinkingActivityEntries(windowEntries.slice(-80));
+    const windowActivities = projectedActivities.filter((activity) => {
+      const activityTime = Date.parse(activity.timestamp || '');
+      return Number.isFinite(activityTime) && activityTime >= startTime - startGraceMs && activityTime <= replyTime;
+    });
+    const merged = mergeProjectedThinkingEntries(windowEntries.slice(-80), windowActivities);
 
     if (merged.length) {
       segments.push({
@@ -2301,7 +2685,7 @@ function renderTranscriptSearchNavigator(session, matches = [], activeIndex = 0)
   close.type = 'button';
   close.className = 'secondary-button transcript-search-close-button';
   close.dataset.transcriptSearchNav = 'clear';
-  close.textContent = '×';
+  close.textContent = '\u00d7';
   container.append(label, queryText, previous, next, close);
 }
 
@@ -3653,6 +4037,252 @@ function mergeSession(session) {
   return state.sessions[index];
 }
 
+function structuredSessionError(error) {
+  if (!error) {
+    return null;
+  }
+  return {
+    code: error.code || error.body?.code || 'session_request_failed',
+    error: error.message || error.body?.error || 'Session request failed.',
+    stage: error.stage || error.body?.stage || null,
+    sessionBinding: error.sessionBinding || error.body?.sessionBinding || null,
+    submittedBinding: error.submittedBinding || error.body?.submittedBinding || null,
+    canRebind: Boolean(error.canRebind || error.body?.canRebind),
+    canTranscriptFallback: Boolean(error.canTranscriptFallback || error.body?.canTranscriptFallback),
+  };
+}
+
+function sessionRuntimeProjectionRunId(session) {
+  return String(
+    session?.runtimeConfig?.runId
+    || session?.runtimeConfig?.activeRunId
+    || session?.activeRunId
+    || session?.runId
+    || ''
+  ).trim();
+}
+
+function runtimeConfigResponseRunId(response) {
+  const runId = String(response?.runId || '').trim();
+  if (runId) {
+    return runId;
+  }
+  return response?.runStatus === 'live'
+    ? String(response?.activeRunId || '').trim()
+    : '';
+}
+
+function isTerminalSessionLifecycleState(session) {
+  const stateText = String(session?.state || '').trim().toLowerCase();
+  return Boolean(
+    session
+    && session.live !== true
+    && (
+      session.resumeError
+      || /^(?:failed(?::|$)|exited(?::|$)|history-only$|stopped$|closed$)/.test(stateText)
+    )
+  );
+}
+
+function canApplyCanonicalRuntimeFallback(target, response, expectedRunId, options = {}) {
+  if (!expectedRunId) {
+    return false;
+  }
+  const pendingRun = response?.pendingRun || null;
+  if (pendingRun?.status === 'pending') {
+    return false;
+  }
+  if (isTerminalSessionLifecycleState(target)) {
+    return true;
+  }
+  if (options.allowRebindFallback !== true || response?.canRebind !== true) {
+    return false;
+  }
+  const projectedBinding = target?.runtimeConfig && Object.prototype.hasOwnProperty.call(target.runtimeConfig, 'apiBinding')
+    ? target.runtimeConfig.apiBinding
+    : target?.runtimeConfig?.sessionBinding || target?.apiBinding || null;
+  return target?.live === true
+    && !projectedBinding?.bindingFingerprint
+    && Boolean(runtimeConfigResponseRunId(response))
+    && Boolean(String(response?.runStatus || '').trim());
+}
+
+function applySessionRuntimeConfig(requestSessionKey, response, expectedRunId = '', options = {}) {
+  const target = state.sessions.find((session) => getSessionKey(session) === requestSessionKey) || null;
+  if (!target || !response || typeof response !== 'object') {
+    return null;
+  }
+  if (expectedRunId && sessionRuntimeProjectionRunId(target) !== expectedRunId) {
+    return null;
+  }
+  if (
+    expectedRunId
+    && runtimeConfigResponseRunId(response) !== expectedRunId
+    && !canApplyCanonicalRuntimeFallback(target, response, expectedRunId, options)
+  ) {
+    return null;
+  }
+  const apiBinding = Object.prototype.hasOwnProperty.call(response, 'apiBinding')
+    ? response.apiBinding ?? null
+    : Object.prototype.hasOwnProperty.call(response, 'sessionBinding')
+      ? response.sessionBinding ?? null
+      : target.runtimeConfig?.apiBinding ?? target.runtimeConfig?.sessionBinding ?? null;
+  const responseSessionBinding = Object.prototype.hasOwnProperty.call(response, 'sessionBinding')
+    ? response.sessionBinding ?? null
+    : apiBinding;
+  return mergeSession({
+    ...target,
+    runtimeConfig: {
+      ...response,
+      apiBinding,
+      sessionBinding: responseSessionBinding,
+    },
+    runtimeConfigError: null,
+    apiBinding,
+    activeRunId: Object.prototype.hasOwnProperty.call(response, 'activeRunId')
+      ? response.activeRunId ?? null
+      : target.activeRunId ?? null,
+    latestSuccessfulRunId: Object.prototype.hasOwnProperty.call(response, 'latestSuccessfulRunId')
+      ? response.latestSuccessfulRunId ?? null
+      : target.latestSuccessfulRunId ?? null,
+    runId: Object.prototype.hasOwnProperty.call(response, 'runId')
+      ? response.runId ?? null
+      : target.runId ?? null,
+    requestedSelection: Object.prototype.hasOwnProperty.call(response, 'requestedSelection')
+      ? response.requestedSelection ?? null
+      : target.requestedSelection ?? null,
+    effectiveSelection: Object.prototype.hasOwnProperty.call(response, 'effectiveSelection')
+      ? response.effectiveSelection ?? null
+      : target.effectiveSelection ?? null,
+  });
+}
+
+function sessionWithInvalidatedRuntimeConfig(session, patch = {}) {
+  const next = {
+    ...(session || {}),
+    ...(patch || {}),
+  };
+  if (!Object.prototype.hasOwnProperty.call(patch || {}, 'runtimeConfig')) {
+    next.runtimeConfig = null;
+  }
+  next.runtimeConfigError = null;
+  return next;
+}
+
+function captureSessionLifecycleExpectation(session) {
+  const runtimeConfig = session?.runtimeConfig && typeof session.runtimeConfig === 'object'
+    ? session.runtimeConfig
+    : null;
+  const binding = runtimeConfig && Object.prototype.hasOwnProperty.call(runtimeConfig, 'apiBinding')
+    ? runtimeConfig.apiBinding
+    : runtimeConfig?.sessionBinding || null;
+  return {
+    sessionKey: getSessionKey(session),
+    hostId: String(session?.hostId || ''),
+    sessionId: String(session?.sessionId || ''),
+    expectedRunId: String(runtimeConfig?.runId || '').trim() || null,
+    expectedRunStatus: String(runtimeConfig?.runStatus || '').trim() || null,
+    expectedBindingFingerprint: String(binding?.bindingFingerprint || '').trim() || null,
+  };
+}
+
+async function loadCanonicalSessionForLifecycleMutation(session) {
+  const sessionKey = getSessionKey(session);
+  const current = state.sessions.find((candidate) => getSessionKey(candidate) === sessionKey) || session;
+  const canonical = await loadSessionRuntimeConfigForSession(current);
+  if (!canonical) {
+    throw sessionContractError(
+      'session_run_state_conflict',
+      'Canonical Session runtime configuration changed before the lifecycle request could start.'
+    );
+  }
+  return canonical;
+}
+
+function applyRebindLaunchResponse(expectation, response, fallbackSession = null) {
+  if (
+    !expectation?.sessionKey
+    || !response
+    || String(response.sessionId || '') !== expectation.sessionId
+    || (response.hostId && String(response.hostId) !== expectation.hostId)
+  ) {
+    return null;
+  }
+  const responseRunId = String(response.runId || '').trim();
+  if (!responseRunId) {
+    return null;
+  }
+  const current = state.sessions.find((candidate) => getSessionKey(candidate) === expectation.sessionKey)
+    || fallbackSession;
+  if (!current || getSessionKey(current) !== expectation.sessionKey) {
+    return null;
+  }
+  const currentRunId = String(
+    current.runtimeConfig?.runId
+    || current.activeRunId
+    || current.runId
+    || ''
+  ).trim();
+  if (currentRunId && currentRunId !== expectation.expectedRunId) {
+    return currentRunId === responseRunId ? current : null;
+  }
+  return mergeSession(sessionWithInvalidatedRuntimeConfig(current, {
+    state: 'starting',
+    live: false,
+    runId: responseRunId,
+    activeRunId: responseRunId,
+    apiBinding: response.sessionBinding || current.apiBinding || null,
+    requestedSelection: response.requestedSelection || current.requestedSelection || null,
+    resumeError: null,
+  }));
+}
+
+function applyConfirmedSessionStarted(payload, fallbackSession = null) {
+  const hostId = payload?.hostId || fallbackSession?.hostId || '';
+  const sessionId = payload?.sessionId || fallbackSession?.sessionId || '';
+  const requestSessionKey = getSessionKey({ hostId, sessionId });
+  const current = state.sessions.find((candidate) => getSessionKey(candidate) === requestSessionKey)
+    || fallbackSession
+    || {};
+  const started = mergeSession(sessionWithInvalidatedRuntimeConfig(current, {
+    ...(payload || {}),
+    hostId,
+    sessionId,
+  }));
+  if (started?.hostId && started?.sessionId) {
+    void loadSessionRuntimeConfigForSession(started).catch(() => {});
+  }
+  return started;
+}
+
+async function loadSessionRuntimeConfigForSession(session, options = {}) {
+  const requestSessionKey = getSessionKey(session);
+  const expectedRunId = sessionRuntimeProjectionRunId(session);
+  if (!requestSessionKey || !session?.hostId || !session?.sessionId) {
+    return null;
+  }
+  try {
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
+    const updated = applySessionRuntimeConfig(requestSessionKey, response, expectedRunId, options);
+    if (updated && getSessionKey(getSelectedSession()) === requestSessionKey) {
+      renderSessionDetails();
+      renderSessionApiControls(updated);
+    }
+    return updated;
+  } catch (error) {
+    const target = state.sessions.find((candidate) => getSessionKey(candidate) === requestSessionKey) || null;
+    const requestStillCurrent = target
+      && (!expectedRunId || sessionRuntimeProjectionRunId(target) === expectedRunId);
+    if (requestStillCurrent) {
+      mergeSession({ ...target, runtimeConfigError: structuredSessionError(error) });
+    }
+    if (requestStillCurrent && getSessionKey(getSelectedSession()) === requestSessionKey) {
+      renderSessionApiControls(target);
+    }
+    throw error;
+  }
+}
+
 function setTranscriptForSession(hostId, sessionId, transcript) {
   const key = makeSessionKey(hostId, sessionId);
   state.transcripts.set(key, dedupeTranscript(transcript));
@@ -3664,143 +4294,798 @@ function appendTranscriptEntry(hostId, sessionId, entry) {
   state.transcripts.set(key, dedupeTranscript([...existing, entry]));
 }
 
-function simpleMessageHash(value) {
-  const text = String(value || '');
-  let hash = 5381;
-  for (let index = 0; index < text.length; index += 1) {
-    hash = ((hash << 5) + hash) ^ text.charCodeAt(index);
-  }
-  return (hash >>> 0).toString(36);
-}
-
-function isAssistantTranscriptEntry(entry) {
-  return Boolean(entry && (entry.speaker === 'agent' || entry.speaker === 'assistant') && String(entry.text || '').trim());
-}
-
-function getLatestAssistantMessageMarker(session) {
-  if (!session) {
-    return null;
-  }
-  const transcript = getTranscriptForSession(session).filter(isAssistantTranscriptEntry);
-  const latest = transcript[transcript.length - 1] || null;
-  if (latest) {
-    return {
-      key: [
-        latest.timestamp || '',
-        latest.speaker || 'assistant',
-        simpleMessageHash(latest.text),
-      ].join('|'),
-      timestamp: latest.timestamp || session.lastUpdatedAt || session.updatedAt || '',
-      text: latest.text || '',
-      source: 'transcript',
-    };
-  }
-
-  const fallback = String(session.latestAgentMessage || '').trim();
-  if (!fallback || fallback === '[object Object]' || /^\s*[\[{]/.test(fallback)) {
-    return null;
-  }
+function normalizeAssistantProjection(projection = {}, fallbackCanonicalKey = '') {
+  const messages = Array.isArray(projection.messages)
+    ? projection.messages.filter((message) => message?.assistantMessageId)
+    : [];
   return {
-    key: [
-      session.lastUpdatedAt || session.updatedAt || '',
-      'summary',
-      Number(session.messageCount || 0),
-      simpleMessageHash(fallback),
-    ].join('|'),
-    timestamp: session.lastUpdatedAt || session.updatedAt || '',
-    text: fallback,
-    source: 'summary',
+    canonicalConversationKey: String(
+      projection.canonicalConversationKey || fallbackCanonicalKey || ''
+    ).trim(),
+    latestAssistantSeq: Math.max(0, Number(projection.latestAssistantSeq || 0)),
+    latestAssistantId: projection.latestAssistantId || null,
+    latestAssistantAt: projection.latestAssistantAt || null,
+    projectionRevision: Math.max(0, Number(projection.projectionRevision || 0)),
+    cursorUnknown: projection.cursorUnknown === true,
+    sequenceAliases: projection.sequenceAliases && typeof projection.sequenceAliases === 'object'
+      ? { ...projection.sequenceAliases }
+      : {},
+    aliases: [...new Set((projection.aliases || []).map((value) => String(value || '').trim()).filter(Boolean))],
+    messages,
+    hasMore: projection.hasMore === true,
+    nextAfterSeq: Math.max(0, Number(projection.nextAfterSeq || 0)),
   };
 }
 
-function markSessionMessagesRead(sessionOrHostId, sessionId = null) {
-  const session = typeof sessionOrHostId === 'object'
-    ? sessionOrHostId
-    : state.sessions.find((item) => item.hostId === sessionOrHostId && item.sessionId === sessionId);
-  const key = typeof sessionOrHostId === 'object'
-    ? getSessionKey(session)
-    : makeSessionKey(sessionOrHostId, sessionId);
-  if (!key || !session) {
-    return;
+function mergeAssistantProjection(currentValue, incomingValue) {
+  const incoming = normalizeAssistantProjection(incomingValue);
+  if (!currentValue || typeof currentValue !== 'object') {
+    return incoming;
   }
-  const marker = getLatestAssistantMessageMarker(session);
-  if (!marker?.key) {
-    state.messageUnread.delete(key);
-    return;
+  const current = normalizeAssistantProjection(currentValue, incoming.canonicalConversationKey);
+  if (
+    current.canonicalConversationKey
+    && incoming.canonicalConversationKey
+    && current.canonicalConversationKey !== incoming.canonicalConversationKey
+  ) {
+    return incoming;
   }
-  state.messageReadReceipts.set(key, {
-    lastReadMessageKey: marker.key,
-    lastReadAt: new Date().toISOString(),
+  if (incoming.projectionRevision < current.projectionRevision) {
+    return current;
+  }
+  if (incoming.projectionRevision > current.projectionRevision) {
+    return incoming;
+  }
+  const messages = new Map();
+  for (const message of [...current.messages, ...incoming.messages]) {
+    messages.set(message.assistantMessageId, { ...(messages.get(message.assistantMessageId) || {}), ...message });
+  }
+  return {
+    canonicalConversationKey: incoming.canonicalConversationKey || current.canonicalConversationKey,
+    latestAssistantSeq: Math.max(current.latestAssistantSeq, incoming.latestAssistantSeq),
+    latestAssistantId: incoming.latestAssistantId || current.latestAssistantId,
+    latestAssistantAt: incoming.latestAssistantAt || current.latestAssistantAt,
+    projectionRevision: Math.max(current.projectionRevision, incoming.projectionRevision),
+    cursorUnknown: incoming.cursorUnknown && current.cursorUnknown,
+    sequenceAliases: { ...current.sequenceAliases, ...incoming.sequenceAliases },
+    aliases: [...new Set([...current.aliases, ...incoming.aliases])],
+    messages: [...messages.values()].sort((left, right) => (
+      Number(left.assistantSeq || 0) - Number(right.assistantSeq || 0)
+      || String(left.assistantMessageId).localeCompare(String(right.assistantMessageId))
+    )),
+    hasMore: incoming.hasMore,
+    nextAfterSeq: Math.max(current.nextAfterSeq, incoming.nextAfterSeq),
+  };
+}
+
+function getAssistantProjectionForSession(session) {
+  if (!session) return null;
+  const sessionKey = getSessionKey(session);
+  const canonicalKey = state.assistantCanonicalKeysBySession.get(sessionKey)
+    || session.assistantProjection?.canonicalConversationKey
+    || '';
+  const retained = canonicalKey ? state.assistantProjections.get(canonicalKey) : null;
+  if (retained) return retained;
+  if (session.assistantProjection?.canonicalConversationKey) {
+    return normalizeAssistantProjection(session.assistantProjection);
+  }
+  return null;
+}
+
+function rememberAssistantProjection(session, projectionValue) {
+  const projection = normalizeAssistantProjection(projectionValue);
+  const canonicalKey = projection.canonicalConversationKey;
+  const sessionKey = getSessionKey(session);
+  if (!canonicalKey || !sessionKey) return projection;
+  const merged = mergeAssistantProjection(state.assistantProjections.get(canonicalKey), projection);
+  state.assistantProjections.set(canonicalKey, merged);
+  state.assistantCanonicalKeysBySession.set(sessionKey, canonicalKey);
+  return merged;
+}
+
+function messageReceiptKeys(session, projection) {
+  return [...new Set([
+    projection?.canonicalConversationKey,
+    ...(projection?.aliases || []),
+    getSessionKey(session),
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function receiptForAssistantProjection(session, projection) {
+  const client = window.MessageNotificationClient;
+  const store = state.messageReceiptStore;
+  const canonicalKey = projection?.canonicalConversationKey || '';
+  if (!client || !store || !canonicalKey) return null;
+  const keys = messageReceiptKeys(session, projection);
+  const stored = keys.filter((key) => store.has(key)).map((key) => store.get(key));
+  if (!stored.length) {
+    const legacy = keys.map((key) => state.legacyMessageReadReceipts?.[key]).find(Boolean);
+    if (legacy) {
+      return client.migrateLegacyReceipt(legacy, {
+        canonicalConversationKey: canonicalKey,
+        messages: projection.messages,
+        baselineHighWater: projection.latestAssistantSeq,
+      });
+    }
+    return store.get(canonicalKey);
+  }
+  return client.mergeAliasReceipts({
+    canonicalConversationKey: canonicalKey,
+    receipts: stored,
+    messages: projection.messages,
+    sequenceAliases: projection.sequenceAliases,
   });
-  state.messageUnread.delete(key);
-  persistMessageReadReceipts();
 }
 
-function updateMessageUnreadForSession(hostId, sessionId) {
-  const key = makeSessionKey(hostId, sessionId);
-  const session = state.sessions.find((item) => makeSessionKey(item.hostId, item.sessionId) === key) || { hostId, sessionId };
-  const marker = getLatestAssistantMessageMarker(session);
-  if (!marker?.key) {
-    state.messageUnread.delete(key);
-    return false;
+function persistAssistantReceipt(receipt, projection, session = null) {
+  const store = state.messageReceiptStore;
+  if (!store || !receipt?.canonicalConversationKey) return receipt;
+  let saved = null;
+  const persist = () => {
+    saved = store.set(receipt);
+    const aliases = [...new Set([...(projection?.aliases || []), getSessionKey(session)].filter(Boolean))];
+    for (const alias of aliases) {
+      if (!alias || alias === saved.canonicalConversationKey || !store.has(alias)) continue;
+      store.set({ ...saved, canonicalConversationKey: alias });
+    }
+  };
+  if (typeof store.batch === 'function') {
+    store.batch(persist);
+  } else {
+    persist();
   }
-  const receipt = state.messageReadReceipts.get(key);
-  if (receipt?.lastReadMessageKey === marker.key) {
-    state.messageUnread.delete(key);
-    return false;
-  }
-  state.messageUnread.add(key);
-  return true;
+  return saved;
 }
 
-function markSessionMessageNotificationChanged(hostId, sessionId) {
-  const key = makeSessionKey(hostId, sessionId);
-  const wasUnread = state.messageUnread.has(key);
-  const changed = updateMessageUnreadForSession(hostId, sessionId);
-  const isUnread = state.messageUnread.has(key);
-  if (changed || wasUnread !== isUnread) {
+function broadcastMessageNotificationState(type, payload = {}) {
+  state.messageNotificationChannel?.postMessage?.({ type, ...payload });
+}
+
+function openMessageNotificationLockDb() {
+  if (state.messageNotificationLockDbPromise) return state.messageNotificationLockDbPromise;
+  const indexedDb = window.indexedDB;
+  if (!indexedDb?.open) return Promise.resolve(null);
+  state.messageNotificationLockDbPromise = new Promise((resolve, reject) => {
+    let request = null;
+    try {
+      request = indexedDb.open(MESSAGE_NOTIFICATION_LOCK_DB_NAME, 1);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(MESSAGE_NOTIFICATION_LOCK_STORE_NAME)) {
+        db.createObjectStore(MESSAGE_NOTIFICATION_LOCK_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Notification lock database failed to open'));
+    request.onblocked = () => reject(new Error('Notification lock database upgrade is blocked'));
+  }).catch((error) => {
+    state.messageNotificationLockDbPromise = null;
+    reportError(error);
+    return null;
+  });
+  return state.messageNotificationLockDbPromise;
+}
+
+async function runMessageNotificationStorageTransaction(key, callback) {
+  if (window.navigator?.locks?.request) {
+    return window.navigator.locks.request(key, { mode: 'exclusive' }, callback);
+  }
+  const db = await openMessageNotificationLockDb();
+  if (!db) return callback();
+  return new Promise((resolve, reject) => {
+    let transaction = null;
+    let result;
+    let failure = null;
+    try {
+      transaction = db.transaction(MESSAGE_NOTIFICATION_LOCK_STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(MESSAGE_NOTIFICATION_LOCK_STORE_NAME);
+      const request = store.get(key);
+      request.onsuccess = () => {
+        try {
+          result = callback();
+          if (result && typeof result.then === 'function') {
+            throw new TypeError('Notification storage critical sections must be synchronous');
+          }
+          store.put(Date.now(), key);
+        } catch (error) {
+          failure = error;
+          transaction.abort();
+        }
+      };
+      request.onerror = () => {
+        failure = request.error || new Error('Notification storage lock request failed');
+        transaction.abort();
+      };
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    transaction.oncomplete = () => resolve(result);
+    transaction.onabort = () => reject(
+      failure || transaction.error || new Error('Notification storage transaction aborted')
+    );
+  });
+}
+
+function scheduleMessageNotificationStoreRetry(kind) {
+  const isReceipt = kind === 'receipt';
+  const timerField = isReceipt ? 'messageReceiptPersistRetryTimer' : 'messageOutboxPersistRetryTimer';
+  const attemptField = isReceipt ? 'messageReceiptPersistRetryAttempt' : 'messageOutboxPersistRetryAttempt';
+  if (state[timerField]) return;
+  const attempt = Math.max(0, Number(state[attemptField] || 0));
+  const delayMs = Math.min(10000, 250 * (2 ** Math.min(attempt, 6)));
+  state[attemptField] = attempt + 1;
+  state[timerField] = window.setTimeout(async () => {
+    state[timerField] = null;
+    const store = isReceipt ? state.messageReceiptStore : state.messageNotificationOutbox;
+    try {
+      await Promise.resolve(store?.flush?.());
+      if (!isReceipt) void requestMessageNotificationOutboxDrain();
+    } catch (error) {
+      reportError(error);
+      scheduleMessageNotificationStoreRetry(kind);
+    }
+  }, delayMs);
+}
+
+function resetMessageNotificationStoreRetry(kind) {
+  const isReceipt = kind === 'receipt';
+  const timerField = isReceipt ? 'messageReceiptPersistRetryTimer' : 'messageOutboxPersistRetryTimer';
+  const attemptField = isReceipt ? 'messageReceiptPersistRetryAttempt' : 'messageOutboxPersistRetryAttempt';
+  if (state[timerField]) window.clearTimeout(state[timerField]);
+  state[timerField] = null;
+  state[attemptField] = 0;
+}
+
+function scheduleMessageNotificationBroadcastFlush(type = '') {
+  const normalizedType = String(type || '').trim();
+  if (normalizedType === 'receipts-changed' || normalizedType === 'outbox-changed') {
+    state.messageNotificationBroadcastTypes.add(normalizedType);
+  } else {
+    state.messageNotificationBroadcastTypes.add('receipts-changed');
+    state.messageNotificationBroadcastTypes.add('outbox-changed');
+  }
+  if (state.messageNotificationBroadcastTimer) return;
+  state.messageNotificationBroadcastTimer = window.setTimeout(() => {
+    state.messageNotificationBroadcastTimer = null;
+    const changedTypes = new Set(state.messageNotificationBroadcastTypes);
+    state.messageNotificationBroadcastTypes.clear();
+    if (changedTypes.has('receipts-changed')) {
+      state.messageReceiptStore?.reload?.();
+      refreshMessageUnreadState();
+      queuedUiRenders.messageNotificationBell = true;
+      queuedUiRenders.conversationNav = true;
+      scheduleQueuedUiFlush();
+    }
+    if (changedTypes.has('outbox-changed')) {
+      state.messageNotificationOutbox?.reload?.();
+      void requestMessageNotificationOutboxDrain();
+    }
+  }, MESSAGE_NOTIFICATION_BROADCAST_DEBOUNCE_MS);
+}
+
+function notificationOutboxPresenters() {
+  const sessionsByKey = new Map((state.sessions || []).map((session) => [
+    getSessionKey(session),
+    session,
+  ]));
+  const advanceNotifiedItem = (item) => {
+    const client = window.MessageNotificationClient;
+    const projection = state.assistantProjections.get(item.canonicalConversationKey)
+      || normalizeAssistantProjection({ canonicalConversationKey: item.canonicalConversationKey });
+    const receipt = state.messageReceiptStore?.get(item.canonicalConversationKey);
+    if (!client || !receipt) return;
+    const session = sessionsByKey.get(makeSessionKey(item.hostId, item.sessionId)) || null;
+    persistAssistantReceipt(client.advanceNotifiedReceipt(receipt, projection, item), projection, session);
+  };
+  return {
+    presentInApp: async (item) => {
+      appendAlertForSession(item.hostId, item.sessionId, {
+        alertId: item.alertId,
+        assistantMessageId: item.assistantMessageId,
+        assistantSeq: item.assistantSeq,
+        canonicalConversationKey: item.canonicalConversationKey,
+        severity: 'info',
+        source: 'assistant-message',
+        message: item.previewText || 'New Codex message',
+        timestamp: item.assistantAt || item.updatedAt || new Date().toISOString(),
+      });
+      queuedUiRenders.alertsWindow = true;
+      queuedUiRenders.sessionDetails = true;
+      scheduleQueuedUiFlush();
+    },
+    presentSystem: async (item) => {
+      const NotificationApi = window.Notification;
+      if (!NotificationApi || NotificationApi.permission !== 'granted') {
+        return { explicitlyUnavailable: true };
+      }
+      try {
+        const session = sessionsByKey.get(makeSessionKey(item.hostId, item.sessionId)) || null;
+        new NotificationApi(session?.title || 'Codex message', {
+          body: item.previewText || 'Codex completed a message.',
+          tag: item.alertId,
+          renotify: false,
+        });
+        return { presented: true };
+      } catch (_) {
+        return { presented: false };
+      }
+    },
+    advanceNotified: async (item) => {
+      advanceNotifiedItem(item);
+      await state.messageReceiptStore?.whenIdle?.();
+    },
+    advanceNotifiedBatch: async (items) => {
+      const advance = () => {
+        for (const item of items || []) advanceNotifiedItem(item);
+      };
+      if (typeof state.messageReceiptStore?.batch === 'function') {
+        state.messageReceiptStore.batch(advance);
+      } else {
+        advance();
+      }
+      await state.messageReceiptStore?.whenIdle?.();
+    },
+  };
+}
+
+function drainMessageNotificationOutbox() {
+  const client = window.MessageNotificationClient;
+  if (!client || !state.messageNotificationOutbox) return Promise.resolve(false);
+  if (state.messageNotificationDrainPromise) {
+    state.messageNotificationDrainRequested = true;
+    return state.messageNotificationDrainPromise;
+  }
+  state.messageNotificationDrainRequested = false;
+  const cycle = client.drainOutboxWithElection({
+    navigator: window.navigator,
+    storage: window.localStorage,
+    ownerId: state.messageNotificationTabId,
+    leaseKey: MESSAGE_NOTIFICATION_LEASE_STORAGE_KEY,
+    reload: true,
+    outbox: state.messageNotificationOutbox,
+    presenters: notificationOutboxPresenters(),
+  });
+  let chain = null;
+  chain = cycle.then(
+    (result) => {
+      if (!state.messageNotificationDrainRequested) return result;
+      state.messageNotificationDrainRequested = false;
+      state.messageNotificationDrainPromise = null;
+      return drainMessageNotificationOutbox();
+    },
+    (error) => {
+      const retryRequested = state.messageNotificationDrainRequested;
+      state.messageNotificationDrainRequested = false;
+      state.messageNotificationDrainPromise = null;
+      if (retryRequested) {
+        window.setTimeout(() => void requestMessageNotificationOutboxDrain(), 0);
+      }
+      throw error;
+    }
+  ).finally(() => {
+    if (state.messageNotificationDrainPromise === chain) {
+      state.messageNotificationDrainPromise = null;
+    }
+  });
+  state.messageNotificationDrainPromise = chain;
+  return state.messageNotificationDrainPromise;
+}
+
+function requestMessageNotificationOutboxDrain() {
+  const drain = drainMessageNotificationOutbox();
+  if (state.messageNotificationObservedDrainPromise === drain) return drain;
+  state.messageNotificationObservedDrainPromise = drain;
+  drain.then(
+    () => {
+      if (state.messageNotificationObservedDrainPromise === drain) {
+        state.messageNotificationObservedDrainPromise = null;
+      }
+    },
+    (error) => {
+      if (state.messageNotificationObservedDrainPromise === drain) {
+        state.messageNotificationObservedDrainPromise = null;
+      }
+      reportError(error);
+    }
+  );
+  return drain;
+}
+
+function enqueueAssistantProjectionAlerts(session, projection, receipt) {
+  const outbox = state.messageNotificationOutbox;
+  if (!outbox || !receipt) return;
+  const pendingIds = new Set(receipt.unnotifiedAssistantIds || []);
+  let enqueued = false;
+  for (const message of projection.messages || []) {
+    if (message.notifiable === false || !pendingIds.has(message.assistantMessageId)) continue;
+    const queued = outbox.enqueue({
+      ...message,
+      canonicalConversationKey: projection.canonicalConversationKey,
+      hostId: session.hostId,
+      sessionId: session.sessionId,
+    });
+    enqueued = queued.changed === true || enqueued;
+  }
+  if (enqueued) {
+    void requestMessageNotificationOutboxDrain();
+  }
+}
+
+function applyAssistantProjectionForSession(session, projectionValue, options = {}) {
+  const client = window.MessageNotificationClient;
+  if (!client || !session || !projectionValue?.canonicalConversationKey) return null;
+  const projection = rememberAssistantProjection(session, projectionValue);
+  const receipt = receiptForAssistantProjection(session, projection);
+  if (!receipt) return null;
+  const applied = client.applyAssistantProjection(receipt, projection);
+  persistAssistantReceipt(applied.receipt, projection, session);
+  enqueueAssistantProjectionAlerts(session, projection, applied.receipt);
+  if (!options.deferUnreadRefresh) {
+    refreshMessageUnreadState();
+  }
+  if (!options.deferUi) {
     queuedUiRenders.messageNotificationBell = true;
     queuedUiRenders.conversationNav = true;
     scheduleQueuedUiFlush();
   }
-  return changed;
+  return { ...applied, projection };
 }
 
-function initializeMessageReadReceiptsForExistingSessions() {
-  if (state.messageReadReceiptsInitializedAt) {
-    return;
-  }
-  if (state.messageReadReceipts.size > 0) {
-    state.messageReadReceiptsInitializedAt = new Date().toISOString();
-    return;
-  }
-  let changed = false;
-  for (const session of state.sessions || []) {
-    const key = getSessionKey(session);
-    if (!key || state.messageReadReceipts.has(key)) {
-      continue;
-    }
-    const marker = getLatestAssistantMessageMarker(session);
-    if (!marker?.key) {
-      continue;
-    }
-    state.messageReadReceipts.set(key, {
-      lastReadMessageKey: marker.key,
-      lastReadAt: new Date().toISOString(),
+function finishAssistantProjectionCatchUp(session, projection, options = {}) {
+  return options.deferApply
+    ? { projection }
+    : applyAssistantProjectionForSession(session, projection);
+}
+
+function assistantProjectionFetchStart(session, projection) {
+  const receipt = receiptForAssistantProjection(session, projection);
+  const legacyPending = messageReceiptKeys(session, projection)
+    .some((key) => Boolean(state.legacyMessageReadReceipts?.[key]))
+    && !state.messageReceiptStore?.has(projection.canonicalConversationKey);
+  const aliasReceipts = messageReceiptKeys(session, projection)
+    .some((key) => key !== projection.canonicalConversationKey && state.messageReceiptStore?.has(key));
+  if (legacyPending || aliasReceipts || projection.cursorUnknown) return 0;
+  return Math.min(
+    Number(receipt?.readThroughAssistantSeq || 0),
+    Number(receipt?.notifiedThroughAssistantSeq || 0)
+  );
+}
+
+async function catchUpAssistantProjection(session, seedProjection = null, options = {}) {
+  if (!session?.hostId || !session?.sessionId) return null;
+  const sessionKey = getSessionKey(session);
+  const seed = seedProjection || session.assistantProjection || null;
+  if (!seed?.canonicalConversationKey) return null;
+  const existingRequest = state.messageProjectionRequests.get(sessionKey);
+  if (existingRequest) {
+    return existingRequest.then((result) => {
+      const requestedRevision = Number(seed.projectionRevision || 0);
+      if (requestedRevision > Number(result?.projection?.projectionRevision || 0)) {
+        return catchUpAssistantProjection(session, seed, options);
+      }
+      if (!options.deferApply && result?.projection && !result.receipt) {
+        return applyAssistantProjectionForSession(session, result.projection);
+      }
+      return result;
     });
-    changed = true;
   }
-  state.messageReadReceiptsInitializedAt = new Date().toISOString();
-  if (changed) {
-    persistMessageReadReceipts();
+
+  const request = (async () => {
+    let projection = rememberAssistantProjection(session, seed);
+    const startAfter = assistantProjectionFetchStart(session, projection);
+    const cachedMax = Math.max(0, ...projection.messages.map((message) => Number(message.assistantSeq || 0)));
+    const needsFetch = options.force === true
+      || projection.cursorUnknown
+      || projection.hasMore
+      || (projection.latestAssistantSeq > startAfter && cachedMax < projection.latestAssistantSeq);
+    if (!needsFetch) return finishAssistantProjectionCatchUp(session, projection, options);
+
+    let afterSeq = startAfter;
+    let candidate = null;
+    let candidateIdentity = '';
+    let restartCount = 0;
+    const restartPagination = () => {
+      restartCount += 1;
+      if (restartCount > ASSISTANT_PROJECTION_MAX_RESTARTS) {
+        const error = new Error('Assistant projection changed too often during pagination.');
+        error.code = 'assistant_projection_unstable';
+        throw error;
+      }
+      afterSeq = 0;
+      candidate = null;
+      candidateIdentity = '';
+    };
+    try {
+      while (true) {
+        const params = new URLSearchParams({
+          hostId: session.hostId,
+          afterSeq: String(afterSeq),
+          limit: String(ASSISTANT_PROJECTION_PAGE_LIMIT),
+        });
+        const pageValue = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/assistant-messages?${params.toString()}`);
+        const page = normalizeAssistantProjection(pageValue);
+        if (!page.canonicalConversationKey) {
+          throw new Error('Assistant projection page is missing its canonical conversation key.');
+        }
+        const pageIdentity = `${page.canonicalConversationKey}\0${page.projectionRevision}`;
+        if (candidateIdentity && pageIdentity !== candidateIdentity) {
+          restartPagination();
+          continue;
+        }
+        candidate = candidate
+          ? mergeAssistantProjection(candidate, page)
+          : page;
+        candidateIdentity = pageIdentity;
+        if (!page.hasMore) {
+          const current = getAssistantProjectionForSession(session);
+          const currentCanonicalKey = String(current?.canonicalConversationKey || '').trim();
+          const currentRevision = Number(current?.projectionRevision || 0);
+          if (
+            currentCanonicalKey
+            && (
+              (
+                currentCanonicalKey === page.canonicalConversationKey
+                && currentRevision > page.projectionRevision
+              )
+              || (
+                currentCanonicalKey !== page.canonicalConversationKey
+                && currentCanonicalKey !== projection.canonicalConversationKey
+              )
+            )
+          ) {
+            restartPagination();
+            continue;
+          }
+          projection = rememberAssistantProjection(session, candidate);
+          break;
+        }
+        const nextAfter = Number(pageValue?.nextAfterSeq);
+        if (!Number.isSafeInteger(nextAfter) || nextAfter <= afterSeq) {
+          const error = new Error('Assistant projection pagination cursor did not advance.');
+          error.code = 'assistant_projection_cursor_stalled';
+          throw error;
+        }
+        afterSeq = nextAfter;
+      }
+    } catch (error) {
+      throw error;
+    }
+    return finishAssistantProjectionCatchUp(session, projection, options);
+  })().finally(() => {
+    if (state.messageProjectionRequests.get(sessionKey) === request) {
+      state.messageProjectionRequests.delete(sessionKey);
+    }
+  });
+  state.messageProjectionRequests.set(sessionKey, request);
+  return request;
+}
+
+async function settleWithConcurrency(items, worker, concurrency = 6) {
+  const values = Array.isArray(items) ? items : [];
+  const results = new Array(values.length);
+  let nextIndex = 0;
+  const run = async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        results[index] = { status: 'fulfilled', value: await worker(values[index], index) };
+      } catch (reason) {
+        results[index] = { status: 'rejected', reason };
+      }
+    }
+  };
+  const workerCount = Math.min(values.length, Math.max(1, Number(concurrency) || 1));
+  await Promise.all(Array.from({ length: workerCount }, () => run()));
+  return results;
+}
+
+async function syncAssistantProjectionsForSessions(sessions = state.sessions, options = {}) {
+  const candidates = (sessions || []).filter((session) => (
+    session?.assistantProjection?.canonicalConversationKey
+  ));
+  const settled = await settleWithConcurrency(candidates, (session) => (
+    catchUpAssistantProjection(session, session.assistantProjection, { deferApply: true })
+  ), options.concurrency || 6);
+  const failures = [];
+  const applyResults = () => {
+    candidates.forEach((session, index) => {
+      const result = settled[index];
+      const projection = result?.status === 'fulfilled'
+        ? result.value?.projection
+        : getAssistantProjectionForSession(session) || session.assistantProjection;
+      if (result?.status === 'rejected') failures.push(result.reason);
+      if (!projection?.canonicalConversationKey) return;
+      try {
+        applyAssistantProjectionForSession(session, projection, {
+          deferUnreadRefresh: true,
+          deferUi: true,
+        });
+      } catch (error) {
+        failures.push(error);
+      }
+    });
+  };
+  const applyReceiptBatch = () => {
+    if (typeof state.messageReceiptStore?.batch === 'function') {
+      state.messageReceiptStore.batch(applyResults);
+    } else {
+      applyResults();
+    }
+  };
+  if (typeof state.messageNotificationOutbox?.batch === 'function') {
+    state.messageNotificationOutbox.batch(applyReceiptBatch);
+  } else {
+    applyReceiptBatch();
   }
+  await Promise.all([
+    state.messageReceiptStore?.whenIdle?.(),
+    state.messageNotificationOutbox?.whenIdle?.(),
+  ]);
+  refreshMessageUnreadState();
+  if (!options.deferUi) {
+    queuedUiRenders.messageNotificationBell = true;
+    queuedUiRenders.conversationNav = true;
+    scheduleQueuedUiFlush();
+  }
+  if (failures.length) {
+    const error = failures[0] instanceof Error ? failures[0] : new Error(String(failures[0] || 'projection sync failed'));
+    error.message = `${error.message} (${failures.length} assistant projection sync failure${failures.length === 1 ? '' : 's'})`;
+    throw error;
+  }
+  return { candidateCount: candidates.length };
+}
+
+function scheduleAssistantProjectionSync(sessions = state.sessions) {
+  if (state.messageProjectionSyncPromise) return state.messageProjectionSyncPromise;
+  const snapshot = [...(sessions || [])];
+  state.messageProjectionSyncPromise = new Promise((resolve) => window.setTimeout(resolve, 0))
+    .then(() => syncAssistantProjectionsForSessions(snapshot))
+    .catch(reportError)
+    .finally(() => {
+      state.messageProjectionSyncPromise = null;
+    });
+  return state.messageProjectionSyncPromise;
+}
+
+function markSessionMessagesRead(sessionOrHostId, sessionId = null, options = {}) {
+  const session = typeof sessionOrHostId === 'object'
+    ? sessionOrHostId
+    : state.sessions.find((item) => item.hostId === sessionOrHostId && item.sessionId === sessionId);
+  const projection = getAssistantProjectionForSession(session);
+  const client = window.MessageNotificationClient;
+  if (!session || !projection || !client || !state.messageReceiptStore) return false;
+  const receipt = receiptForAssistantProjection(session, projection);
+  persistAssistantReceipt(client.advanceReadReceipt(receipt, projection, {
+    clearAllUnread: options.clearAllUnread === true,
+  }), projection, session);
+  if (!options.deferUnreadRefresh) {
+    refreshMessageUnreadState();
+  }
+  return true;
+}
+
+function updateMessageUnreadForSession(sessionOrHostId, sessionId = null) {
+  const session = sessionOrHostId && typeof sessionOrHostId === 'object'
+    ? sessionOrHostId
+    : state.sessions.find((item) => (
+      item.hostId === sessionOrHostId && item.sessionId === sessionId
+    )) || null;
+  const key = getSessionKey(session) || makeSessionKey(sessionOrHostId, sessionId);
+  const projection = getAssistantProjectionForSession(session);
+  const client = window.MessageNotificationClient;
+  if (!projection || !client || !state.messageReceiptStore) {
+    state.messageUnread.delete(key);
+    return false;
+  }
+  const receipt = receiptForAssistantProjection(session, projection);
+  const unread = client.applyAssistantProjection(receipt, projection).unread;
+  state.messageUnread[unread ? 'add' : 'delete'](key);
+  return unread;
+}
+
+function markSessionMessageNotificationChanged(hostId, sessionId, projection = null) {
+  const session = state.sessions.find((item) => getSessionKey(item) === makeSessionKey(hostId, sessionId))
+    || { hostId, sessionId, assistantProjection: projection };
+  const seed = projection || session.assistantProjection;
+  if (!seed?.canonicalConversationKey) return false;
+  void catchUpAssistantProjection(session, seed).catch(() => {});
+  return true;
 }
 
 function refreshMessageUnreadState() {
   state.messageUnread.clear();
   for (const session of state.sessions || []) {
-    updateMessageUnreadForSession(session.hostId, session.sessionId);
+    updateMessageUnreadForSession(session);
   }
+}
+
+function getMessageReadGate(session = getSelectedSession()) {
+  const key = getSessionKey(session);
+  const ClientGate = window.MessageNotificationClient?.ReadEligibilityGate;
+  if (!key || !ClientGate) return null;
+  if (!state.messageReadGates.has(key)) {
+    state.messageReadGates.set(key, new ClientGate());
+  }
+  return state.messageReadGates.get(key);
+}
+
+function establishMessageReadFollow(session, reason) {
+  return getMessageReadGate(session)?.establishFollow(reason, { trusted: true }) === true;
+}
+
+function noteMessageReadProgrammaticScroll(session = getSelectedSession()) {
+  getMessageReadGate(session)?.noteProgrammaticScroll();
+}
+
+function noteMessageReadThinkingScroll(session = getSelectedSession()) {
+  getMessageReadGate(session)?.noteThinkingScroll();
+}
+
+async function maybeAdvanceReadReceipt(session = getSelectedSession(), expectedRenderVersion = null) {
+  const key = getSessionKey(session);
+  if (!key || key !== getSessionKey(getSelectedSession())) return false;
+  const log = el('session-log');
+  const renderVersion = Number(state.transcriptNotificationRenderVersions.get(key) || 0);
+  if (
+    !state.messageReadRenderReady.has(key)
+    || log?.dataset?.sessionKey !== key
+    || (expectedRenderVersion != null && renderVersion !== expectedRenderVersion)
+  ) return false;
+
+  const projection = getAssistantProjectionForSession(session);
+  if (projection?.canonicalConversationKey) {
+    await catchUpAssistantProjection(session, projection).catch(() => null);
+  }
+  if (
+    key !== getSessionKey(getSelectedSession())
+    || Number(state.transcriptNotificationRenderVersions.get(key) || 0) !== renderVersion
+  ) return false;
+  const currentProjection = getAssistantProjectionForSession(session);
+  const renderedAssistantSeq = Number(state.transcriptNotificationRenderedAssistantSeq.get(key) || 0);
+  if (Number(currentProjection?.latestAssistantSeq || 0) > renderedAssistantSeq) return false;
+
+  const gate = getMessageReadGate(session);
+  const gateState = gate?.state?.() || {};
+  const machine = getTranscriptScrollMachine();
+  const eligible = gate?.canAdvance({
+    selected: true,
+    visible: state.messageDocumentVisible && (!document.visibilityState || document.visibilityState === 'visible'),
+    focused: state.messageWindowFocused && (typeof document.hasFocus !== 'function' || document.hasFocus()),
+    renderCurrent: log?.dataset?.sessionKey === key,
+    atReadingBoundary: machine?.state().mode === 'follow' && isTranscriptPinnedAcrossScrollTargets(),
+    outerScrollSource: gateState.lastSource === 'user' ? 'user' : 'programmatic',
+  });
+  if (!eligible) return false;
+  const changed = markSessionMessagesRead(session);
+  if (changed) {
+    renderConversationNav();
+    renderMessageNotificationBell();
+  }
+  return changed;
+}
+
+function completeTranscriptNotificationRender(session) {
+  const key = getSessionKey(session);
+  if (!key) return;
+  const version = Number(state.transcriptNotificationRenderVersions.get(key) || 0) + 1;
+  state.transcriptNotificationRenderVersions.set(key, version);
+  state.transcriptNotificationRenderedAssistantSeq.set(
+    key,
+    Number(getAssistantProjectionForSession(session)?.latestAssistantSeq || 0)
+  );
+  const log = el('session-log');
+  if (log?.dataset?.sessionKey === key) {
+    log.dataset.notificationRenderVersion = String(version);
+  }
+  window.requestAnimationFrame(() => {
+    void maybeAdvanceReadReceipt(session, version);
+  });
 }
 
 function hasUnreadMessagesForSession(session) {
@@ -3813,26 +5098,46 @@ function hasUnreadMessagesForGroup(group) {
 }
 
 function getUnreadMessageNotifications() {
-  return (state.sessions || [])
-    .filter(hasUnreadMessagesForSession)
-    .map((session) => {
-      const marker = getLatestAssistantMessageMarker(session);
-      return {
-        session,
-        key: getSessionKey(session),
-        title: session.title || session.conversationKey || session.sessionId,
-        hostLabel: getHost(session.hostId)?.label || session.hostId,
-        text: marker?.text || session.latestAgentMessage || '',
-        timestamp: marker?.timestamp || session.lastUpdatedAt || session.updatedAt || '',
-      };
-    })
+  const byCanonical = new Map();
+  for (const session of state.sessions || []) {
+    if (!hasUnreadMessagesForSession(session)) continue;
+    const projection = getAssistantProjectionForSession(session);
+    const canonicalKey = projection?.canonicalConversationKey || getSessionKey(session);
+    const latest = projection?.messages?.find((message) => (
+      message.assistantMessageId === projection.latestAssistantId
+    )) || projection?.messages?.at(-1) || null;
+    const candidate = {
+      session,
+      key: canonicalKey,
+      title: session.title || session.conversationKey || session.sessionId,
+      hostLabel: getHost(session.hostId)?.label || session.hostId,
+      text: latest?.previewText || '',
+      timestamp: projection?.latestAssistantAt || latest?.assistantAt || '',
+    };
+    const current = byCanonical.get(canonicalKey);
+    if (!current || Date.parse(candidate.timestamp || '') > Date.parse(current.timestamp || '')) {
+      byCanonical.set(canonicalKey, candidate);
+    }
+  }
+  return [...byCanonical.values()]
     .sort((a, b) => Date.parse(b.timestamp || '') - Date.parse(a.timestamp || ''));
 }
 
 function markAllMessageNotificationsRead() {
-  for (const notification of getUnreadMessageNotifications()) {
-    markSessionMessagesRead(notification.session);
+  const markAll = () => {
+    for (const notification of getUnreadMessageNotifications()) {
+      markSessionMessagesRead(notification.session, null, {
+        clearAllUnread: true,
+        deferUnreadRefresh: true,
+      });
+    }
+  };
+  if (typeof state.messageReceiptStore?.batch === 'function') {
+    state.messageReceiptStore.batch(markAll);
+  } else {
+    markAll();
   }
+  refreshMessageUnreadState();
   state.messageNotificationOpen = false;
   renderMessageNotificationBell();
   renderConversationNav();
@@ -3877,10 +5182,9 @@ function renderMessageNotificationBell() {
       <span class="message-notification-meta">${escapeHtml(notification.hostLabel)} | ${notification.session.live ? 'live' : 'history'} | ${escapeHtml(formatTime(notification.timestamp) || 'new')}</span>
       <span class="message-notification-preview">${escapeHtml(truncatePreview(notification.text || 'New Codex message'))}</span>
     `;
-    item.onclick = async () => {
+    item.onclick = async (event) => {
       state.messageNotificationOpen = false;
-      markSessionMessagesRead(notification.session);
-      await selectSession(notification.session);
+      await selectSession(notification.session, { trusted: event?.isTrusted === true });
       renderMessageNotificationBell();
       renderConversationNav();
     };
@@ -3898,6 +5202,10 @@ function dedupeAlerts(entries) {
     }
 
     const normalized = {
+      alertId: entry.alertId || null,
+      assistantMessageId: entry.assistantMessageId || null,
+      assistantSeq: Number(entry.assistantSeq || 0) || null,
+      canonicalConversationKey: entry.canonicalConversationKey || null,
       timestamp: entry.timestamp || null,
       severity: entry.severity || 'warning',
       source: entry.source || 'runtime',
@@ -3905,7 +5213,8 @@ function dedupeAlerts(entries) {
       sessionId: entry.sessionId || null,
       hostId: entry.hostId || null,
     };
-    const key = `${normalized.severity}|${normalized.timestamp || ''}|${normalized.message}`;
+    const key = normalized.alertId
+      || `${normalized.severity}|${normalized.timestamp || ''}|${normalized.message}`;
     if (seen.has(key)) {
       continue;
     }
@@ -3918,7 +5227,8 @@ function dedupeAlerts(entries) {
 
 function setAlertsForSession(hostId, sessionId, alerts) {
   const key = makeSessionKey(hostId, sessionId);
-  state.alerts.set(key, dedupeAlerts(alerts));
+  const retainedAssistantAlerts = (state.alerts.get(key) || []).filter((alert) => alert.alertId);
+  state.alerts.set(key, dedupeAlerts([...(alerts || []), ...retainedAssistantAlerts]));
 }
 
 function appendAlertForSession(hostId, sessionId, alert) {
@@ -3928,6 +5238,7 @@ function appendAlertForSession(hostId, sessionId, alert) {
 }
 
 function alertFingerprint(entry) {
+  if (entry?.alertId) return entry.alertId;
   return [
     entry?.severity || 'warning',
     entry?.source || 'runtime',
@@ -4011,12 +5322,242 @@ function isTranscriptPinnedToBottom(log) {
   return distanceFromBottom < 96;
 }
 
+function getScrollableDistance(node) {
+  if (!node) {
+    return 0;
+  }
+  return Math.max(0, (node.scrollHeight || 0) - (node.clientHeight || 0));
+}
+
+function shouldUsePageTranscriptScroll() {
+  return Boolean(window.matchMedia?.('(max-width: 980px), (pointer: coarse), (hover: none)').matches);
+}
+
+function getDocumentScrollOwner() {
+  return document.scrollingElement || document.documentElement || document.body;
+}
+
+function getTranscriptScrollOwner() {
+  return shouldUsePageTranscriptScroll() ? getDocumentScrollOwner() : el('session-log');
+}
+
+function getTranscriptScrollTargets() {
+  const owner = getTranscriptScrollOwner();
+  if (!owner) {
+    return [];
+  }
+  return [owner];
+}
+
+function isDocumentScrollOwner(node) {
+  return Boolean(node && (node === document.scrollingElement || node === document.documentElement || node === document.body));
+}
+
+function scrollOwnerTo(node, top, behavior = 'auto') {
+  if (!node) {
+    return;
+  }
+  if (isDocumentScrollOwner(node) && typeof window.scrollTo === 'function') {
+    window.scrollTo({ top, behavior });
+    return;
+  }
+  if (typeof node.scrollTo === 'function') {
+    node.scrollTo({ top, behavior });
+  } else {
+    node.scrollTop = top;
+  }
+}
+
+function getScrollOwnerViewportRect(node) {
+  if (!node) {
+    return null;
+  }
+  if (isDocumentScrollOwner(node)) {
+    const height = window.innerHeight || document.documentElement?.clientHeight || node.clientHeight || 0;
+    return { top: 0, bottom: height };
+  }
+  const rect = node.getBoundingClientRect();
+  return { top: rect.top, bottom: rect.bottom };
+}
+
+function getScrollOwnerAnchorRoot(node) {
+  if (isDocumentScrollOwner(node)) {
+    return el('session-log') || document;
+  }
+  return node;
+}
+
+function getTranscriptScrollMachine(node = getTranscriptScrollOwner()) {
+  if (!node || !window.RemoteCodexTranscriptScroll?.createScrollMachine) {
+    return null;
+  }
+  let machine = state.transcriptScrollMachines.get(node);
+  if (machine) {
+    return machine;
+  }
+  machine = window.RemoteCodexTranscriptScroll.createScrollMachine(node, {
+    initialMode: isTranscriptUserDetached() ? 'detached' : 'follow',
+    anchorSelector: '[data-viewport-key]',
+    anchorDatasetKey: 'viewportKey',
+    bottomTolerance: 8,
+    anchorRoot: () => getScrollOwnerAnchorRoot(node),
+    getViewportRect: () => getScrollOwnerViewportRect(node),
+    getScrollTop: () => Number(node.scrollTop || 0),
+    setScrollTop: (_, top) => scrollOwnerTo(node, top),
+    getScrollHeight: () => isDocumentScrollOwner(node)
+      ? Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0)
+      : Number(node.scrollHeight || 0),
+    getClientHeight: () => isDocumentScrollOwner(node)
+      ? Number(window.innerHeight || document.documentElement?.clientHeight || 0)
+      : Number(node.clientHeight || 0),
+  });
+  state.transcriptScrollMachines.set(node, machine);
+  return machine;
+}
+
+function datasetKeyToAttributeName(key) {
+  return String(key || '').replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+}
+
+function captureViewportAnchor(node, selector = '[data-viewport-key]', datasetKey = 'viewportKey') {
+  const viewport = getScrollOwnerViewportRect(node);
+  const root = getScrollOwnerAnchorRoot(node);
+  if (!viewport || !root?.querySelectorAll) {
+    return null;
+  }
+  let best = null;
+  for (const candidate of root.querySelectorAll(selector)) {
+    const key = candidate.dataset?.[datasetKey] || '';
+    if (!key) {
+      continue;
+    }
+    const rect = candidate.getBoundingClientRect();
+    if (rect.bottom <= viewport.top + 1 || rect.top >= viewport.bottom - 1) {
+      continue;
+    }
+    const distance = Math.abs(rect.top - viewport.top);
+    if (!best || distance < best.distance) {
+      best = {
+        key,
+        datasetKey,
+        offset: rect.top - viewport.top,
+        distance,
+      };
+    }
+  }
+  if (!best) {
+    return null;
+  }
+  return {
+    key: best.key,
+    datasetKey: best.datasetKey,
+    offset: best.offset,
+  };
+}
+
+function restoreViewportAnchor(node, anchor) {
+  if (!node || !anchor?.key) {
+    return false;
+  }
+  const viewport = getScrollOwnerViewportRect(node);
+  const root = getScrollOwnerAnchorRoot(node);
+  if (!viewport || !root?.querySelector) {
+    return false;
+  }
+  const attributeName = datasetKeyToAttributeName(anchor.datasetKey || 'viewportKey');
+  const target = root.querySelector(`[data-${attributeName}="${cssEscape(anchor.key)}"]`);
+  if (!target) {
+    return false;
+  }
+  const rect = target.getBoundingClientRect();
+  const delta = (rect.top - viewport.top) - (Number(anchor.offset) || 0);
+  if (Math.abs(delta) < 0.5) {
+    return true;
+  }
+  const maxScrollTop = getScrollableDistance(node);
+  scrollOwnerTo(node, Math.min(Math.max(0, (node.scrollTop || 0) + delta), maxScrollTop));
+  return true;
+}
+
+function transcriptScrollTargetPinned(node) {
+  if (!node || getScrollableDistance(node) <= 4) {
+    return true;
+  }
+  return isTranscriptPinnedToBottom(node);
+}
+
+function isTranscriptPinnedAcrossScrollTargets() {
+  return getTranscriptScrollTargets().every(transcriptScrollTargetPinned);
+}
+
+function captureTranscriptScrollSnapshot() {
+  return getTranscriptScrollTargets().map((node) => {
+    const machine = getTranscriptScrollMachine(node);
+    const machineSnapshot = machine?.capture() || null;
+    return {
+      node,
+      machine,
+      machineSnapshot,
+      scrollTop: node.scrollTop || 0,
+      bottomOffset: Math.max(0, (node.scrollHeight || 0) - (node.scrollTop || 0) - (node.clientHeight || 0)),
+      anchor: captureViewportAnchor(node),
+    };
+  });
+}
+
+function restoreTranscriptRawSnapshot(item) {
+  noteMessageReadProgrammaticScroll();
+  if (item.machine && item.machineSnapshot && item.machine.restore(item.machineSnapshot)) {
+    return;
+  }
+  const maxScrollTop = getScrollableDistance(item.node);
+  const nextScrollTop = Number.isFinite(item.scrollTop)
+    ? Math.min(Math.max(0, item.scrollTop), maxScrollTop)
+    : Math.max(0, maxScrollTop - (item.bottomOffset || 0));
+  scrollOwnerTo(item.node, nextScrollTop);
+  restoreViewportAnchor(item.node, item.anchor);
+}
+
+function restoreTranscriptScrollSnapshot(snapshot = []) {
+  if (!Array.isArray(snapshot) || !snapshot.length) {
+    return;
+  }
+  for (const item of snapshot) {
+    if (!item?.node || getScrollableDistance(item.node) <= 4) {
+      continue;
+    }
+    restoreTranscriptRawSnapshot(item);
+  }
+}
+
+function restoreTranscriptScrollTargetsToBottom() {
+  noteMessageReadProgrammaticScroll();
+  for (const node of getTranscriptScrollTargets()) {
+    if (!node || getScrollableDistance(node) <= 4) {
+      continue;
+    }
+    const machine = getTranscriptScrollMachine(node);
+    machine?.establishFollow();
+    if (machine) {
+      machine.withProgrammaticScroll(() => scrollOwnerTo(node, getScrollableDistance(node)));
+    } else {
+      scrollOwnerTo(node, getScrollableDistance(node));
+    }
+  }
+}
+
 function restoreTranscriptScroll(log, options = {}) {
   if (!log) {
     return;
   }
+  noteMessageReadProgrammaticScroll();
   if (options.forceScroll || options.shouldStickToBottom) {
-    log.scrollTop = log.scrollHeight;
+    restoreTranscriptScrollTargetsToBottom();
+    return;
+  }
+  if (options.preserveScroll && Number.isFinite(options.scrollTop)) {
+    const maxScrollTop = Math.max(0, log.scrollHeight - log.clientHeight);
+    log.scrollTop = Math.min(Math.max(0, options.scrollTop), maxScrollTop);
     return;
   }
   if (options.preserveScroll && Number.isFinite(options.bottomOffset)) {
@@ -4065,82 +5606,117 @@ function isTranscriptUserDetached(key = getSessionKey(getSelectedSession()) || '
   return Boolean(key && state.transcriptUserDetached.has(key));
 }
 
-function scrollTranscriptTo(position) {
+function handleTranscriptScrollDetach() {
+  const key = getSessionKey(getSelectedSession()) || '';
+  const machine = getTranscriptScrollMachine();
+  if (machine?.state().mode === 'follow' && isTranscriptPinnedAcrossScrollTargets()) {
+    setTranscriptUserDetached(key, false);
+    clearTranscriptUnread(key);
+    void maybeAdvanceReadReceipt(getSelectedSession());
+  } else if (machine?.state().mode === 'detached') {
+    setTranscriptUserDetached(key, true);
+  }
+}
+
+function recordTranscriptTrustedInteraction(event) {
+  if (event?.isTrusted !== true || event?.target?.closest?.('.thinking-content')) {
+    return;
+  }
+  const target = event.target;
   const log = el('session-log');
-  const main = document.querySelector('.main');
-  if (!log && !main) {
+  const documentTarget = target === document.body || target === document.documentElement;
+  const transcriptTarget = target === log
+    || log?.contains?.(target)
+    || Boolean(target?.closest?.('#session-log'));
+  if (!documentTarget && !transcriptTarget) {
+    return;
+  }
+  const owner = getTranscriptScrollOwner();
+  const machine = getTranscriptScrollMachine(owner);
+  if (!machine) {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    if (!machine.recordTrustedInteraction()) return;
+    if (machine.state().mode === 'follow' && isTranscriptPinnedAcrossScrollTargets()) {
+      establishMessageReadFollow(getSelectedSession(), 'outer-user-boundary');
+    } else {
+      getMessageReadGate()?.detachByUser();
+    }
+    handleTranscriptScrollDetach();
+  });
+}
+
+function getTranscriptJumpTargets() {
+  const targets = [];
+  const seen = new Set();
+  const add = (node) => {
+    if (!node || seen.has(node)) {
+      return;
+    }
+    seen.add(node);
+    targets.push(node);
+  };
+
+  const log = el('session-log');
+  add(getTranscriptScrollOwner());
+  add(el('session-log'));
+  add(document.querySelector('.main'));
+
+  let node = log?.parentElement;
+  while (node && node !== document.body) {
+    const style = window.getComputedStyle(node);
+    if (/(auto|scroll|overlay)/.test(style.overflowY) || getScrollableDistance(node) > 4) {
+      add(node);
+    }
+    node = node.parentElement;
+  }
+
+  add(document.scrollingElement);
+  add(document.documentElement);
+  add(document.body);
+  return targets;
+}
+
+function scrollTranscriptTo(position, options = {}) {
+  if (!getTranscriptScrollOwner()) {
     return;
   }
   const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
-  const scrollNode = (node, top) => {
-    if (!node) {
-      return;
-    }
-    if (typeof node.scrollTo === 'function') {
-      node.scrollTo({ top, behavior });
-    } else {
-      node.scrollTop = top;
-    }
-  };
-  const maxScrollTop = (node) => Math.max(0, (node?.scrollHeight || 0) - (node?.clientHeight || 0));
-  const scrollElement = (node) => {
-    if (!node) {
-      return;
-    }
-    scrollNode(node, position === 'top' ? 0 : maxScrollTop(node));
-  };
-  const collectScrollableTargets = () => {
-    const targets = [];
-    const seen = new Set();
-    const add = (node) => {
-      if (!node || seen.has(node)) {
-        return;
-      }
-      seen.add(node);
-      targets.push(node);
-    };
-
-    add(log);
-    add(main);
-    let node = log?.parentElement;
-    while (node && node !== document.body) {
-      const style = window.getComputedStyle(node);
-      const canScroll = /(auto|scroll|overlay)/.test(style.overflowY)
-        || maxScrollTop(node) > 4;
-      if (canScroll) {
-        add(node);
-      }
-      node = node.parentElement;
-    }
-    add(document.scrollingElement);
-    add(document.documentElement);
-    add(document.body);
-    return targets;
-  };
   const applyScroll = () => {
     const key = getSessionKey(getSelectedSession()) || '';
-    for (const target of collectScrollableTargets()) {
-      scrollElement(target);
+    const machine = getTranscriptScrollMachine();
+    if (position === 'bottom') {
+      machine?.establishFollow();
+      if (options.trusted === true) {
+        establishMessageReadFollow(getSelectedSession(), 'outer-user-boundary');
+      }
+    } else {
+      machine?.detach();
+      if (options.trusted === true) {
+        getMessageReadGate()?.detachByUser();
+      }
+    }
+    for (const target of getTranscriptJumpTargets()) {
+      const top = position === 'top' ? 0 : getScrollableDistance(target);
+      scrollOwnerTo(target, top, behavior);
+    }
+    if (typeof window.scrollTo === 'function') {
+      const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+      const documentTop = position === 'top'
+        ? 0
+        : Math.max(
+          0,
+          Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0) - viewportHeight
+        );
+      window.scrollTo({ top: documentTop, behavior });
     }
     if (position === 'bottom') {
       setTranscriptUserDetached(key, false);
       clearTranscriptUnread();
-      markSessionMessagesRead(getSelectedSession());
-      renderConversationNav();
-      renderMessageNotificationBell();
+      void maybeAdvanceReadReceipt(getSelectedSession());
     } else if (position === 'top') {
       setTranscriptUserDetached(key, true);
-    }
-    if (typeof window.scrollTo === 'function') {
-      const top = position === 'top'
-        ? 0
-        : Math.max(
-          document.body?.scrollHeight || 0,
-          document.documentElement?.scrollHeight || 0,
-          main?.scrollHeight || 0,
-          log?.scrollHeight || 0
-        );
-      window.scrollTo({ top, behavior });
     }
   };
 
@@ -4254,6 +5830,15 @@ function isInternalTranscriptText(value) {
 
 function canonicalTranscriptText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function transcriptViewportKey(entry, index) {
+  return [
+    'transcript',
+    Number.isFinite(index) ? index : '',
+    entry?.speaker || '',
+    entry?.timestamp || '',
+  ].join('|');
 }
 
 function setRuntimeForSession(hostId, sessionId, runtime) {
@@ -4564,6 +6149,8 @@ function syncModalBodyState() {
     || state.statusWindowOpen
     || state.sessionDetailsOpen
     || state.settingsOpen
+    || state.apiProfileBackup.open
+    || state.skillsManager.open
     || state.imagePreview.open
     || state.sessionActionDialog.open
     || state.exportDialog.open
@@ -4699,99 +6286,6 @@ function sessionPlatformLabel(session) {
   const hostLabel = host?.label || session?.hostId || 'unknown host';
   const platform = host?.platform || session?.platform || 'unknown';
   return `${hostLabel} | ${platform}`;
-}
-
-function apiConfigFingerprint(config) {
-  if (!config) {
-    return '';
-  }
-  return JSON.stringify({
-    provider: String(config.provider || ''),
-    baseUrl: String(config.baseUrl || '').replace(/\/+$/, ''),
-    apiKey: String(config.apiKey || ''),
-    profileId: String(config.profileId || ''),
-    label: String(config.label || ''),
-  });
-}
-
-function apiProfileDisplayFingerprint(config) {
-  if (!config) {
-    return '';
-  }
-  return JSON.stringify({
-    provider: String(config.provider || ''),
-    baseUrl: String(config.baseUrl || '').replace(/\/+$/, ''),
-    profileId: String(config.profileId || ''),
-    label: String(config.label || ''),
-  });
-}
-
-function getSessionRecordedApiProfile(session) {
-  if (!session) {
-    return null;
-  }
-  const recorded = session.apiProfile || session.runtime?.apiProfile || null;
-  if (recorded?.label || recorded?.profileId || recorded?.provider || recorded?.baseUrl) {
-    return recorded;
-  }
-  if (
-    session.runtime?.apiProfileLabel
-    || session.runtime?.apiProfileId
-    || session.runtime?.apiProvider
-    || session.runtime?.apiBaseUrl
-  ) {
-    return {
-      label: session.runtime.apiProfileLabel || session.runtime.apiProfileId || session.runtime.apiProvider || 'API profile',
-      profileId: session.runtime.apiProfileId || '',
-      provider: session.runtime.apiProvider || '',
-      baseUrl: session.runtime.apiBaseUrl || '',
-    };
-  }
-  return null;
-}
-
-function isLiveSessionApiMappingStale(session) {
-  if (!session?.live || session.source !== 'managed') {
-    return false;
-  }
-  const mapped = getApiProfileForHost(session.hostId);
-  if (!mapped || (!mapped.baseUrl && !mapped.apiKey)) {
-    return false;
-  }
-  const recorded = getSessionRecordedApiProfile(session);
-  if (!recorded) {
-    return Boolean(session.runtime);
-  }
-  return apiProfileDisplayFingerprint(recorded) !== apiProfileDisplayFingerprint(mapped);
-}
-
-function snapshotHostApiFingerprints() {
-  const snapshots = {};
-  for (const host of state.hosts) {
-    snapshots[host.hostId] = apiConfigFingerprint(getApiRequestConfig(host.hostId));
-  }
-  return snapshots;
-}
-
-function getApiChangedLiveSessions(previousSnapshot = {}) {
-  const changedHosts = [];
-  for (const host of state.hosts) {
-    const before = previousSnapshot?.[host.hostId] || '';
-    const after = apiConfigFingerprint(getApiRequestConfig(host.hostId));
-    if (before !== after) {
-      changedHosts.push(host.hostId);
-    }
-  }
-  const sessionsByKey = new Map();
-  if (changedHosts.length) {
-    for (const session of getRelayManagedLiveSessions(changedHosts)) {
-      sessionsByKey.set(getSessionKey(session), session);
-    }
-  }
-  for (const session of getRelayManagedLiveSessions().filter(isLiveSessionApiMappingStale)) {
-    sessionsByKey.set(getSessionKey(session), session);
-  }
-  return Array.from(sessionsByKey.values());
 }
 
 function getApiProfileForHostSelection(hostId, profileId = '') {
@@ -5180,7 +6674,13 @@ function isLocalAgentCandidate(host) {
   if (!host?.hostId) {
     return false;
   }
-  if (host.localAgent || host.relayLocal) {
+  if (host.localAgent) {
+    return true;
+  }
+  if (host.localAgentStartEnabled === false) {
+    return false;
+  }
+  if (host.relayLocal) {
     return true;
   }
   const relayPlatform = state.stats?.relay?.platform || '';
@@ -5534,7 +7034,7 @@ function renderVariantButtons(container, conversation, selectedSessionId) {
     button.title = `${session.title || session.sessionId}\n${session.sessionId}`;
     button.onclick = (event) => {
       event.stopPropagation();
-      selectSession(session).catch(reportError);
+      selectSession(session, { trusted: event.isTrusted === true }).catch(reportError);
     };
     container.appendChild(button);
   }
@@ -5957,9 +7457,9 @@ function renderConversationNav() {
     }
     item.appendChild(actions);
 
-    item.onclick = () => {
+    item.onclick = (event) => {
       if (!group.collectionOnly) {
-        selectConversation(group).catch(reportError);
+        selectConversation(group, { trusted: event.isTrusted === true }).catch(reportError);
       }
     };
     list.appendChild(item);
@@ -6008,8 +7508,133 @@ function renderConversationSearchHits(group, results) {
   return box;
 }
 
+function modelCatalogRunId(session) {
+  const runtimeConfig = session?.runtimeConfig || {};
+  return String(runtimeConfig.runId
+    || runtimeConfig.activeRunId
+    || session?.activeRunId
+    || session?.runId
+    || session?.nativeThreadId
+    || 'history');
+}
+
 function modelCacheKey(session) {
-  return getSessionKey(session) || 'none';
+  const bindingFingerprint = sessionApiBinding(session)?.bindingFingerprint || 'unknown';
+  return [
+    session?.hostId || 'none',
+    session?.sessionId || 'none',
+    bindingFingerprint,
+    modelCatalogRunId(session),
+  ].map((value) => encodeURIComponent(String(value))).join('::');
+}
+
+function localConfigRevision(value) {
+  const text = String(value || '');
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}-${(hash >>> 0).toString(36)}`;
+}
+
+function rebindProfilePreviewIdentity(profile) {
+  const config = apiProfileRequestConfig(profile) || {};
+  return [
+    config.profileId || '',
+    String(config.provider || 'OpenAI').trim().toLowerCase(),
+    normalizeApiIdentityBaseUrl(config.baseUrl),
+    localConfigRevision(config.apiKey),
+  ].map((value) => encodeURIComponent(String(value))).join(':');
+}
+
+function rebindTargetValue(session = getSelectedSession()) {
+  const sessionKey = getSessionKey(session);
+  if (!sessionKey) {
+    return '';
+  }
+  if (state.codexControls.rebindTargetProfileBySession.has(sessionKey)) {
+    return String(state.codexControls.rebindTargetProfileBySession.get(sessionKey) || '');
+  }
+  return '';
+}
+
+function selectedRebindProfileId(session = getSelectedSession()) {
+  const profileId = rebindTargetValue(session).trim();
+  return profileId && profileId !== '__host_environment__' ? profileId : '';
+}
+
+function getSelectedRebindProfile(session = getSelectedSession()) {
+  const profileId = selectedRebindProfileId(session);
+  return (state.ui.apiProfiles || []).find((profile) => profile.profileId === profileId) || null;
+}
+
+function canPreviewRebindModels(session) {
+  const profile = getSelectedRebindProfile(session);
+  return Boolean(
+    session?.hostId
+    && session?.sessionId
+    && profile
+    && (
+      !sessionApiBinding(session)?.bindingFingerprint
+      || !apiBindingMatchesProfileIdentity(sessionApiBinding(session), profile)
+    )
+  );
+}
+
+function rebindModelPreviewKey(session) {
+  const profile = getSelectedRebindProfile(session);
+  const sessionKey = getSessionKey(session);
+  if (!profile || !sessionKey) {
+    return '';
+  }
+  return `rebind-preview::${encodeURIComponent(sessionKey)}::${rebindProfilePreviewIdentity(profile)}`;
+}
+
+function activeModelCatalogKey(session) {
+  return canPreviewRebindModels(session) ? rebindModelPreviewKey(session) : modelCacheKey(session);
+}
+
+function captureModelCatalogRequest(session) {
+  return {
+    key: modelCacheKey(session),
+    sessionKey: getSessionKey(session),
+    hostId: String(session?.hostId || ''),
+    sessionId: String(session?.sessionId || ''),
+    runId: modelCatalogRunId(session),
+    bindingFingerprint: String(sessionApiBinding(session)?.bindingFingerprint || ''),
+  };
+}
+
+function modelCatalogResponseMatchesRequest(request, response) {
+  if (!request || !response || typeof response !== 'object') {
+    return false;
+  }
+  return String(response.hostId || '') === request.hostId
+    && String(response.sessionId || '') === request.sessionId
+    && String(response.runId || '') === request.runId
+    && String(response.sessionBinding?.bindingFingerprint || '') === request.bindingFingerprint;
+}
+
+function applyModelCatalogResponse(request, response) {
+  const current = state.sessions.find((session) => getSessionKey(session) === request?.sessionKey) || null;
+  if (!current || modelCacheKey(current) !== request.key) {
+    return null;
+  }
+  if (!modelCatalogResponseMatchesRequest(request, response)) {
+    if (!state.codexControls.modelOptionsRetryAfterBySession.has(request.key)) {
+      deferAutoLoadOptions(state.codexControls.modelOptionsRetryAfterBySession, request.key);
+    }
+    return null;
+  }
+  const catalog = {
+    ...response,
+    models: Array.isArray(response.models) ? response.models : [],
+    sources: Array.isArray(response.sources) ? response.sources : [],
+  };
+  state.codexControls.modelCatalogByKey.set(request.key, catalog);
+  state.codexControls.modelOptionsRetryAfterBySession.delete(request.key);
+  return catalog;
 }
 
 function formatBytes(value) {
@@ -6137,6 +7762,17 @@ function extractFileRefsFromText(text) {
   const explicitPattern = /remote-codex-file:([^\s"'<>`]+)/g;
   while ((match = explicitPattern.exec(source))) {
     addRef(match[1]);
+  }
+
+  // Assistants commonly put output paths in inline code instead of Markdown
+  // links. Bare names stay ambiguous; only paths with directory context become
+  // file cards.
+  const inlineCodePattern = /`([^`\r\n]+)`/g;
+  while ((match = inlineCodePattern.exec(source))) {
+    const pathValue = decodePathCandidate(match[1]);
+    if (!isBareDownloadableFilename(pathValue)) {
+      addRef(pathValue);
+    }
   }
 
   const extensionPattern = Array.from(DOWNLOADABLE_FILE_EXTENSIONS).join('|');
@@ -6285,23 +7921,6 @@ function buildReceivedFileUrl(file, inline = false) {
   return `/api/received-files/${encodeURIComponent(file.fileId)}${params.toString() ? `?${params.toString()}` : ''}`;
 }
 
-const FALLBACK_REASONING_EFFORTS = [
-  { value: 'minimal', label: 'Minimal / 最小' },
-  { value: 'low', label: 'Low / 低' },
-  { value: 'medium', label: 'Medium / 中' },
-  { value: 'high', label: 'High / 高' },
-  { value: 'xhigh', label: 'XHigh / 超高' },
-];
-
-const REASONING_EFFORT_LABELS = {
-  none: 'None / 关闭',
-  minimal: 'Minimal / 最小',
-  low: 'Low / 低',
-  medium: 'Medium / 中',
-  high: 'High / 高',
-  xhigh: 'XHigh / 超高',
-};
-
 function normalizeModelOption(model) {
   const modelId = String(model?.model || model?.id || '').trim();
   if (!modelId) {
@@ -6314,11 +7933,16 @@ function normalizeModelOption(model) {
     displayName: String(model?.displayName || modelId).trim(),
     description: String(model?.description || '').trim(),
     inputModalities: Array.isArray(model?.inputModalities) ? model.inputModalities.map(String) : [],
-    supportedReasoningEfforts: Array.isArray(model?.supportedReasoningEfforts)
-      ? model.supportedReasoningEfforts
+    reasoningLevels: Array.isArray(model?.reasoningLevels)
+      ? model.reasoningLevels.map((value) => String(value || '').trim()).filter(Boolean)
       : [],
+    capabilityKnown: model?.capabilityKnown === true,
+    selectable: model?.selectable !== false,
+    availability: String(model?.availability || 'unknown'),
+    cliSupported: model?.cliSupported ?? 'unknown',
+    providerAdvertised: model?.providerAdvertised ?? 'unknown',
     defaultReasoningEffort: String(model?.defaultReasoningEffort || '').trim(),
-    hidden: Boolean(model?.hidden),
+    hidden: model?.visible === false || Boolean(model?.hidden),
     isDefault: Boolean(model?.isDefault),
     supportsPersonality: model?.supportsPersonality === true,
   };
@@ -6327,7 +7951,8 @@ function normalizeModelOption(model) {
 function getModelOptions(session) {
   const seen = new Set();
   const models = [];
-  for (const rawModel of state.codexControls.modelOptionsBySession.get(modelCacheKey(session)) || []) {
+  const catalog = state.codexControls.modelCatalogByKey.get(activeModelCatalogKey(session));
+  for (const rawModel of catalog?.models || []) {
     const model = normalizeModelOption(rawModel);
     if (!model || seen.has(model.model)) {
       continue;
@@ -6432,6 +8057,7 @@ function renderComposerModelOptions(session) {
       const option = document.createElement('option');
       option.value = model.model;
       option.textContent = modelSelectLabel(model);
+      option.disabled = model.selectable === false;
       group.appendChild(option);
     }
     select.appendChild(group);
@@ -6441,8 +8067,11 @@ function renderComposerModelOptions(session) {
 }
 
 function supportedEffortValues(model) {
-  return (model?.supportedReasoningEfforts || [])
-    .map((effort) => String(effort?.reasoningEffort || effort || '').trim())
+  if (model?.capabilityKnown !== true) {
+    return [];
+  }
+  return (model.reasoningLevels || [])
+    .map((effort) => String(effort || '').trim())
     .filter(Boolean);
 }
 
@@ -6455,16 +8084,14 @@ function renderReasoningEffortOptions(session) {
   const current = select.value;
   const selectedModel = findModelOption(session, el('codex-model-input')?.value.trim());
   const supported = selectedModel ? supportedEffortValues(selectedModel) : [];
-  const options = supported.length
-    ? supported.map((value) => ({ value, label: REASONING_EFFORT_LABELS[value] || value }))
-    : FALLBACK_REASONING_EFFORTS;
+  const options = supported.map((value) => ({ value, label: value }));
 
   select.innerHTML = '';
   const defaultOption = document.createElement('option');
   defaultOption.value = '';
   defaultOption.textContent = selectedModel?.defaultReasoningEffort
-    ? `Effort: model default (${selectedModel.defaultReasoningEffort})`
-    : 'Effort: default';
+    ? `Auto / model default (${selectedModel.defaultReasoningEffort})`
+    : 'Auto / model default';
   select.appendChild(defaultOption);
 
   for (const optionSpec of options) {
@@ -6475,6 +8102,37 @@ function renderReasoningEffortOptions(session) {
   }
 
   select.value = options.some((optionSpec) => optionSpec.value === current) ? current : '';
+}
+
+function assertModelSelectionIsSelectable(session, modelId) {
+  const selectedModelId = String(modelId || '').trim();
+  if (!selectedModelId) {
+    return;
+  }
+  const model = findModelOption(session, selectedModelId);
+  const catalog = state.codexControls.modelCatalogByKey.get(activeModelCatalogKey(session));
+  const authoritativeAbsence = !model && (catalog?.sources || []).some((source) => (
+    source?.authority === 'authoritative'
+    && source?.complete === true
+    && source?.truncated !== true
+    && !source?.nextCursor
+    && source?.stale !== true
+    && !source?.error
+  ));
+  if (authoritativeAbsence) {
+    throw sessionContractError(
+      'session_model_unavailable',
+      `Model "${selectedModelId}" is not available for this Session.`,
+      { sessionBinding: sessionApiBinding(session), canRebind: true }
+    );
+  }
+  if (model?.selectable === false) {
+    throw sessionContractError(
+      model.availability === 'unavailable' ? 'session_model_unavailable' : 'session_model_unsupported',
+      `Model "${selectedModelId}" is not available for this Session.`,
+      { sessionBinding: sessionApiBinding(session), canRebind: true }
+    );
+  }
 }
 
 function normalizeComposerOptionValues(options = {}) {
@@ -6496,11 +8154,7 @@ function normalizeComposerOptionValues(options = {}) {
 function inferComposerOptionsFromText(text) {
   const source = String(text || '');
   const inferred = {};
-  const modelMatch = source.match(/\bmodel\s*[:=]\s*([A-Za-z0-9._/-]+)/i);
-  if (modelMatch) {
-    inferred.model = modelMatch[1];
-  }
-  const effortMatch = source.match(/\b(?:effort|reasoning(?: effort)?)\s*[:=]\s*(minimal|low|medium|high|xhigh)\b/i);
+  const effortMatch = source.match(/\b(?:effort|reasoning(?: effort)?)\s*[:=]\s*([a-z][a-z0-9_-]*)\b/i);
   if (effortMatch) {
     inferred.effort = effortMatch[1].toLowerCase();
   }
@@ -6531,7 +8185,7 @@ function inferComposerOptionsFromSession(session) {
     ...textInferred,
     ...(session.codexOptions || {}),
     ...(latestTurnControl?.data || {}),
-    model: runtime.model || latestTurnControl?.data?.model || session.codexOptions?.model || textInferred.model || '',
+    model: runtime.model || latestTurnControl?.data?.model || session.codexOptions?.model || '',
     effort: runtime.effort || latestTurnControl?.data?.effort || session.codexOptions?.effort || textInferred.effort || '',
     summary: runtime.summary || latestTurnControl?.data?.summary || session.codexOptions?.summary || '',
     approvalPolicy: runtime.approvalPolicy || latestTurnControl?.data?.approvalPolicy || session.codexOptions?.approvalPolicy || '',
@@ -7006,8 +8660,12 @@ function renderComposerControls(session, disabled) {
   const modelButton = el('codex-model-refresh-button');
   if (modelButton) {
     const loadingModels = isModelOptionsLoading(session);
-    modelButton.disabled = disabled || submitting || !session?.live || loadingModels;
-    modelButton.textContent = loadingModels ? 'Loading...' : 'Refresh';
+    const canLoadModels = Boolean(sessionApiBinding(session)?.bindingFingerprint)
+      || canPreviewRebindModels(session);
+    modelButton.disabled = disabled || submitting || !session || !canLoadModels || loadingModels;
+    modelButton.textContent = loadingModels
+      ? 'Loading...'
+      : canPreviewRebindModels(session) ? 'Load models' : 'Refresh';
   }
 
   const reviewButton = el('codex-review-button');
@@ -7126,7 +8784,7 @@ function summarizeQueuedPayload(payload) {
   if (payload?.mode && payload.mode !== 'default') {
     pieces.push(payload.mode);
   }
-  return pieces.join(' · ');
+  return pieces.join(' | ');
 }
 
 function getFirstQueuedPrompt(session = getSelectedSession()) {
@@ -7205,7 +8863,7 @@ function renderComposerTurnNotice() {
 
     const label = document.createElement('div');
     label.className = 'steer-queue-item-label';
-    label.textContent = `#${index + 1} · ${getQueueStatusLabel(item)}`;
+    label.textContent = `#${index + 1} | ${getQueueStatusLabel(item)}`;
     header.appendChild(label);
 
     const meta = summarizeQueuedPayload(item.payload);
@@ -7598,39 +9256,15 @@ const SLASH_COMMANDS = [
     run: async () => setStatusWindowOpen(true),
   },
   {
-    id: 'model-gpt-55',
-    command: '/gpt-5.5',
-    title: 'Model: GPT-5.5',
-    category: 'Model',
-    description: 'Use GPT-5.5 for the next turn.',
-    keywords: ['模型', 'model', 'gpt'],
-    run: async () => {
-      setInputValue('codex-model-input', 'gpt-5.5');
-      focusComposerInput();
-    },
-  },
-  {
     id: 'models',
     command: '/models',
     title: 'Open Model List',
     category: 'Model',
-    description: 'Load available model IDs from the selected live session.',
+    description: 'Load model IDs available to the selected Session.',
     keywords: ['model list', '模型列表'],
     run: async () => {
-      await loadModelOptionsForSelectedSession();
+      await loadModelOptionsForSession(getSelectedSession(), { force: true });
       el('codex-model-select')?.focus();
-    },
-  },
-  {
-    id: 'reasoning-xhigh',
-    command: '/reasoning',
-    title: 'Reasoning: XHigh',
-    category: 'Model',
-    description: 'Set reasoning effort to xhigh for the next turn.',
-    keywords: ['推理', '超高', 'think', 'ultrathink'],
-    run: async () => {
-      setSelectValue('codex-effort-select', 'xhigh');
-      focusComposerInput();
     },
   },
   {
@@ -7738,7 +9372,34 @@ const SLASH_COMMANDS = [
 ];
 
 function skillCacheKey(session) {
-  return modelCacheKey(session);
+  return getSessionKey(session) || 'none';
+}
+
+function clearSkillOptionsCacheForHosts(hostIds = []) {
+  const affectedHosts = new Set(Array.from(hostIds || []).map((hostId) => String(hostId || '').trim()).filter(Boolean));
+  if (!affectedHosts.size) {
+    return;
+  }
+  for (const hostId of affectedHosts) {
+    state.codexControls.recentSkillChangesByHost.add(hostId);
+  }
+  for (const key of Array.from(state.codexControls.skillOptionsBySession.keys())) {
+    const hostId = String(key).split('::')[0] || '';
+    if (!affectedHosts.has(hostId)) {
+      continue;
+    }
+    state.codexControls.skillOptionsBySession.delete(key);
+    state.codexControls.skillOptionsRetryAfterBySession.delete(key);
+  }
+}
+
+function consumeRecentSkillChangeForSession(session) {
+  const hostId = String(session?.hostId || '').trim();
+  if (!hostId || !state.codexControls.recentSkillChangesByHost.has(hostId)) {
+    return false;
+  }
+  state.codexControls.recentSkillChangesByHost.delete(hostId);
+  return true;
 }
 
 function formatSkillScopeLabel(scope) {
@@ -7987,7 +9648,8 @@ function updateSlashMenuFromInput() {
   state.slashMenu.open = true;
   state.slashMenu.query = match.query;
   state.slashMenu.match = match;
-  requestSkillOptionsForSession(getSelectedSession());
+  const forceSkillReload = consumeRecentSkillChangeForSession(getSelectedSession());
+  requestSkillOptionsForSession(getSelectedSession(), { force: forceSkillReload });
   const commands = getFilteredSlashCommands();
   state.slashMenu.selectedIndex = Math.min(state.slashMenu.selectedIndex, Math.max(0, commands.length - 1));
   renderSlashMenu();
@@ -8711,6 +10373,7 @@ async function handleComposerDrop(event) {
 
 function renderSessionDetails() {
   const session = getSelectedSession();
+  renderSessionApiControls(session);
   if (!session && state.sessionDetailsOpen) {
     state.sessionDetailsOpen = false;
   }
@@ -8880,7 +10543,7 @@ function renderSessionDetails() {
     resumeButton.classList.toggle('danger-button', Boolean(session.live));
     resumeButton.classList.toggle('secondary-button', !session.live);
     if (session.live) {
-      resumeButton.disabled = isEnding || Boolean(launchBusy);
+      resumeButton.disabled = isEnding || Boolean(launchBusy) || isSessionApiRebindBusy(session);
       resumeButton.textContent = isEnding ? 'Stopping Session...' : 'Stop Session';
     } else if (launchBusy) {
       resumeButton.disabled = true;
@@ -8902,7 +10565,10 @@ function renderSessionDetails() {
       : session.live ? 'Fork Running Session' : 'Fork New Branch';
   }
 
-  const composerDisabled = !session || Boolean(launchBusy) || (!session.live && !canActivateHistory);
+  const composerDisabled = !session
+    || Boolean(launchBusy)
+    || isSessionApiRebindBusy(session)
+    || (!session.live && !canActivateHistory);
   composer.classList.toggle('disabled', composerDisabled);
   input.disabled = composerDisabled;
   renderComposerControls(session, composerDisabled);
@@ -9146,7 +10812,12 @@ function renderThinkingPanel() {
     return;
   }
 
-  existingMessage.replaceWith(buildThinkingMessageElement(session, liveSegment, runtime, stream, !liveSegment));
+  const scrollSnapshot = captureTranscriptScrollSnapshot();
+  patchThinkingMessageElement(
+    existingMessage,
+    buildThinkingMessageElement(session, liveSegment, runtime, stream, !liveSegment)
+  );
+  restoreTranscriptScrollSnapshot(scrollSnapshot);
 }
 
 function renderAlertsWindow() {
@@ -9341,6 +11012,25 @@ async function respondToSessionRequest(session, request, response) {
       response,
     }),
   });
+}
+
+async function setGoalAutoApproveForSession(session, enabled, request = null) {
+  if (!session?.sessionId || !session?.hostId) {
+    throw new Error('No selected session is available for goal auto-approve.');
+  }
+  return fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/goal-auto-approve`, {
+    method: 'POST',
+    body: JSON.stringify({
+      hostId: session.hostId,
+      enabled: enabled !== false,
+      requestId: request?.requestId || null,
+    }),
+  });
+}
+
+async function approveAndEnableGoalAutoApprove(session, request) {
+  await setGoalAutoApproveForSession(session, true, request);
+  await respondToSessionRequest(session, request, { decision: 'accept', autoApproveGoal: true });
 }
 
 function buildToolAnswerResponse(questionId, answerLabel) {
@@ -9693,6 +11383,9 @@ function renderApprovalPopup() {
     appendApprovalPopupButton(actions, 'Approve', '', async () => {
       await respondToSessionRequest(session, request, { decision: 'accept' });
     });
+    appendApprovalPopupButton(actions, 'Auto Approve Goal', '', async () => {
+      await approveAndEnableGoalAutoApprove(session, request);
+    });
     appendApprovalPopupButton(actions, 'Decline', 'secondary-button', async () => {
       await respondToSessionRequest(session, request, { decision: 'decline' });
     });
@@ -9762,17 +11455,9 @@ async function compactCurrentThread() {
     return;
   }
 
-  const apiConfig = getApiRequestConfig(session.hostId);
-  const body = {
-    hostId: session.hostId,
-  };
-  if (apiConfig) {
-    body.apiConfig = apiConfig;
-  }
-
   await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/compact`, {
     method: 'POST',
-    body: JSON.stringify(body),
+    body: JSON.stringify({ hostId: session.hostId }),
   });
 }
 
@@ -9781,6 +11466,9 @@ async function endCurrentSession() {
   if (!session) {
     return;
   }
+  if (isSessionApiRebindBusy(session)) {
+    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
+  }
   if (!session.live) {
     throw new Error(t('session.endAlreadyClosed'));
   }
@@ -9788,7 +11476,13 @@ async function endCurrentSession() {
     return;
   }
 
-  patchRuntimeForSession(session.hostId, session.sessionId, {
+  const canonicalSession = await loadCanonicalSessionForLifecycleMutation(session);
+  if (isSessionApiRebindBusy(session)) {
+    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
+  }
+  const expectation = captureSessionLifecycleExpectation(canonicalSession);
+
+  patchRuntimeForSession(canonicalSession.hostId, canonicalSession.sessionId, {
     phase: 'ending',
     connection: 'closing',
     busy: false,
@@ -9799,14 +11493,17 @@ async function endCurrentSession() {
   renderAll();
 
   try {
-    await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/stop`, {
+    await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/stop`, {
       method: 'POST',
       body: JSON.stringify({
-        hostId: session.hostId,
+        hostId: canonicalSession.hostId,
+        expectedRunId: expectation.expectedRunId,
+        expectedRunStatus: expectation.expectedRunStatus,
+        expectedBindingFingerprint: expectation.expectedBindingFingerprint,
       }),
     });
   } catch (error) {
-    patchRuntimeForSession(session.hostId, session.sessionId, {
+    patchRuntimeForSession(canonicalSession.hostId, canonicalSession.sessionId, {
       phase: 'error',
       connection: 'ready',
       lastError: error.message,
@@ -9899,7 +11596,15 @@ function renderSessionActionDialog() {
 }
 
 async function stopManagedSession(session) {
-  patchRuntimeForSession(session.hostId, session.sessionId, {
+  if (isSessionApiRebindBusy(session)) {
+    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
+  }
+  const canonicalSession = await loadCanonicalSessionForLifecycleMutation(session);
+  if (isSessionApiRebindBusy(session)) {
+    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
+  }
+  const expectation = captureSessionLifecycleExpectation(canonicalSession);
+  patchRuntimeForSession(canonicalSession.hostId, canonicalSession.sessionId, {
     phase: 'ending',
     connection: 'closing',
     busy: false,
@@ -9907,9 +11612,14 @@ async function stopManagedSession(session) {
     waitingOnApproval: false,
     waitingOnUserInput: false,
   });
-  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/stop`, {
+  await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/stop`, {
     method: 'POST',
-    body: JSON.stringify({ hostId: session.hostId }),
+    body: JSON.stringify({
+      hostId: canonicalSession.hostId,
+      expectedRunId: expectation.expectedRunId,
+      expectedRunStatus: expectation.expectedRunStatus,
+      expectedBindingFingerprint: expectation.expectedBindingFingerprint,
+    }),
   });
 }
 
@@ -10285,6 +11995,7 @@ function renderStatusWindow() {
             const options = [
               ['Accept', { decision: 'accept' }],
               ['Allow This Session', { decision: 'acceptForSession' }],
+              ['Auto Approve This Goal', { decision: 'accept', autoApproveGoal: true }],
               ['Decline', { decision: 'decline' }],
               ['Cancel Turn', { decision: 'cancel' }],
             ];
@@ -10295,6 +12006,9 @@ function renderStatusWindow() {
               button.textContent = label;
               button.onclick = async () => {
                 try {
+                  if (response.autoApproveGoal) {
+                    await setGoalAutoApproveForSession(session, true, request);
+                  }
                   await respondToSessionRequest(session, request, response);
                 } catch (error) {
                   reportError(error);
@@ -10614,6 +12328,15 @@ function isThinkingContentPinnedToBottom(scroller) {
   return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
 }
 
+function thinkingEntryViewportKey(entry, index) {
+  return [
+    'thinking',
+    Number.isFinite(index) ? index : '',
+    entry?.kind || '',
+    entry?.timestamp || '',
+  ].join('|');
+}
+
 function hasDetachedThinkingScroller(container = el('session-log')) {
   if (!container) {
     return false;
@@ -10622,17 +12345,45 @@ function hasDetachedThinkingScroller(container = el('session-log')) {
     .some((scroller) => !isThinkingContentPinnedToBottom(scroller));
 }
 
+function getThinkingScrollMachine(stateKey, scroller) {
+  if (!stateKey || !scroller || !window.RemoteCodexTranscriptScroll?.createScrollMachine) {
+    return null;
+  }
+  const current = state.thinkingScrollMachines.get(stateKey);
+  if (current?.node === scroller) {
+    return current.machine;
+  }
+  const saved = state.thinkingScrollPositions.get(stateKey);
+  const snapshot = saved?.machineSnapshot || null;
+  const machine = window.RemoteCodexTranscriptScroll.createScrollMachine(scroller, {
+    initialMode: snapshot?.mode || (saved?.atBottom === false ? 'detached' : 'follow'),
+    initialUserRevision: snapshot?.userRevision || 0,
+    initialProgrammaticRevision: snapshot?.programmaticRevision || 0,
+    anchorSelector: '[data-thinking-viewport-key]',
+    anchorDatasetKey: 'thinkingViewportKey',
+    bottomTolerance: 8,
+  });
+  state.thinkingScrollMachines.set(stateKey, { node: scroller, machine });
+  return machine;
+}
+
 function updateThinkingScrollState(stateKey, scroller) {
   if (!stateKey || !scroller) {
     return;
   }
+  noteMessageReadThinkingScroll();
+  const machine = getThinkingScrollMachine(stateKey, scroller);
+  const machineSnapshot = machine?.capture() || null;
+  state.thinkingScrollVersions.set(stateKey, machineSnapshot?.userRevision || 0);
   const atBottom = isThinkingContentPinnedToBottom(scroller);
   state.thinkingScrollPositions.set(stateKey, {
     scrollTop: scroller.scrollTop,
     bottomOffset: Math.max(0, scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight),
+    anchor: captureViewportAnchor(scroller, '[data-thinking-viewport-key]', 'thinkingViewportKey'),
+    machineSnapshot,
     atBottom,
   });
-  if (atBottom) {
+  if (atBottom && machine?.state().mode === 'follow') {
     state.thinkingUnread.delete(stateKey);
   }
   refreshThinkingUnreadButtons(scroller.closest('.thinking-card'), stateKey);
@@ -10653,19 +12404,45 @@ function refreshThinkingUnreadButtons(details, stateKey) {
     });
 }
 
-function restoreThinkingScrollState(stateKey, scroller) {
+function restoreThinkingScrollState(stateKey, scroller, options = {}) {
   if (!stateKey || !scroller) {
     return;
   }
-  window.requestAnimationFrame(() => {
-    const saved = state.thinkingScrollPositions.get(stateKey);
-    if (saved) {
-      if (saved.atBottom) {
-        scroller.scrollTop = scroller.scrollHeight;
-      } else {
-        scroller.scrollTop = Math.min(saved.scrollTop || 0, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
-      }
+  const saved = state.thinkingScrollPositions.get(stateKey);
+  const machine = getThinkingScrollMachine(stateKey, scroller);
+  const expectedUserRevision = machine?.state().userRevision || 0;
+  const restore = () => {
+    if (machine && machine.state().userRevision !== expectedUserRevision) {
+      return;
     }
+    if (saved?.machineSnapshot && machine) {
+      machine.restore(saved.machineSnapshot);
+    } else if (saved) {
+      scroller.scrollTop = Math.min(saved.scrollTop || 0, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
+      restoreViewportAnchor(scroller, saved.anchor);
+    } else if (options.preserveDetached) {
+      scroller.scrollTop = Math.min(scroller.scrollTop || 0, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
+    }
+    updateThinkingScrollState(stateKey, scroller);
+  };
+  if (options.immediate) {
+    restore();
+  } else {
+    window.requestAnimationFrame(restore);
+  }
+}
+
+function recordThinkingTrustedInteraction(stateKey, scroller, event) {
+  if (event?.isTrusted !== true) {
+    return;
+  }
+  noteMessageReadThinkingScroll();
+  const machine = getThinkingScrollMachine(stateKey, scroller);
+  if (!machine) {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    machine.recordTrustedInteraction();
     updateThinkingScrollState(stateKey, scroller);
   });
 }
@@ -10676,6 +12453,13 @@ function captureThinkingScrollStates(container) {
   }
   container.querySelectorAll('.thinking-content[data-thinking-state-key]')
     .forEach((scroller) => updateThinkingScrollState(scroller.dataset.thinkingStateKey || '', scroller));
+}
+
+function preserveThinkingViewportForPatch(stateKey, scroller) {
+  if (!stateKey || !scroller) {
+    return;
+  }
+  updateThinkingScrollState(stateKey, scroller);
 }
 
 function createThinkingScrollActions(details, target, position = 'top', stateKey = '') {
@@ -10704,26 +12488,34 @@ function createThinkingScrollActions(details, target, position = 'top', stateKey
       event.stopPropagation();
       const scroller = details.querySelector('.thinking-content');
       if (scroller) {
-        scroller.scrollTo({
-          top: block === 'end' ? scroller.scrollHeight : 0,
-          behavior: 'smooth',
-        });
+        const machine = getThinkingScrollMachine(stateKey, scroller);
+        if (isBottom) {
+          machine?.establishFollow();
+        } else {
+          machine?.detach();
+        }
+        const top = block === 'end'
+          ? Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+          : 0;
+        const scroll = () => scroller.scrollTo({ top, behavior: 'smooth' });
+        if (machine) machine.withProgrammaticScroll(scroll);
+        else scroll();
         if (isBottom) {
           state.thinkingUnread.delete(stateKey);
           refreshThinkingUnreadButtons(details, stateKey);
           window.setTimeout(() => updateThinkingScrollState(stateKey, scroller), 250);
         }
       }
-      (block === 'end' ? target : details).scrollIntoView({
-        behavior: 'smooth',
-        block,
-      });
     };
     return button;
   };
 
   row.append(makeButton('Top', 'start'), makeButton('Bottom', 'end'));
   return row;
+}
+
+function createThinkingScrollRail(details, stateKey = '') {
+  return createThinkingScrollActions(details, null, 'rail', stateKey);
 }
 
 function isMarkdownMathToken(token) {
@@ -10808,12 +12600,26 @@ function appendMarkdownTable(container, table) {
 }
 
 function scheduleMathTypeset(container) {
-  const run = () => window.MathJax?.typesetPromise?.([container]).catch(() => {});
+  const run = () => {
+    const scrollSnapshot = captureTranscriptScrollSnapshot();
+    const promise = window.MathJax?.typesetPromise?.([container]);
+    if (!promise?.then) {
+      restoreTranscriptScrollSnapshot(scrollSnapshot);
+      return;
+    }
+    promise
+      .then(() => restoreTranscriptScrollSnapshot(scrollSnapshot))
+      .catch(() => {});
+  };
   if (!window.MathJax?.typesetPromise) {
     window.setTimeout(run, 1200);
     return;
   }
-  run();
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(run);
+  } else {
+    window.setTimeout(run, 0);
+  }
 }
 
 function renderInlineMarkdown(parent, text) {
@@ -10903,169 +12709,20 @@ function appendCodeBlock(container, codeText, language = '') {
 }
 
 function renderMarkdown(container, text) {
-  container.innerHTML = '';
-  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
-  let paragraph = [];
-  let listItems = [];
-  let orderedListItems = [];
-  let blockquote = [];
-  let codeLines = [];
-  let inCode = false;
-  let codeLanguage = '';
-
-  function flushParagraph() {
-    if (paragraph.length) {
-      appendMarkdownParagraph(container, paragraph.join('\n'));
-      paragraph = [];
-    }
+  const renderer = window.RemoteCodexMarkdownRenderer;
+  if (!renderer?.render) {
+    container.replaceChildren();
+    container.classList.add('markdown-plain-fallback');
+    container.textContent = String(text == null ? '' : text);
+    return;
   }
-
-  function flushLists() {
-    if (listItems.length) {
-      appendMarkdownList(container, listItems, false);
-      listItems = [];
-    }
-    if (orderedListItems.length) {
-      appendMarkdownList(container, orderedListItems, true);
-      orderedListItems = [];
-    }
+  try {
+    renderer.render(container, text);
+  } catch (_) {
+    container.replaceChildren();
+    container.classList.add('markdown-plain-fallback');
+    container.textContent = String(text == null ? '' : text);
   }
-
-  function flushBlockquote() {
-    if (!blockquote.length) {
-      return;
-    }
-    const quote = document.createElement('blockquote');
-    renderInlineMarkdown(quote, blockquote.join('\n'));
-    container.appendChild(quote);
-    blockquote = [];
-  }
-
-  function flushCode() {
-    appendCodeBlock(container, codeLines.join('\n'), codeLanguage);
-    codeLines = [];
-    codeLanguage = '';
-  }
-
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-    const line = lines[lineIndex];
-    const fence = line.match(/^```([A-Za-z0-9_-]+)?\s*$/);
-    if (fence) {
-      if (inCode) {
-        inCode = false;
-        flushCode();
-      } else {
-        flushParagraph();
-        flushLists();
-        flushBlockquote();
-        inCode = true;
-        codeLanguage = fence[1] || '';
-        codeLines = [];
-      }
-      continue;
-    }
-
-    if (inCode) {
-      codeLines.push(line);
-      continue;
-    }
-
-    const mathDelimiter = line.trim() === '$$' ? '$$' : line.trim() === '\\[' ? '\\[' : '';
-    if (mathDelimiter) {
-      flushParagraph();
-      flushLists();
-      flushBlockquote();
-      const closeDelimiter = mathDelimiter === '$$' ? '$$' : '\\]';
-      const mathLines = [];
-      let closed = false;
-      for (let mathIndex = lineIndex + 1; mathIndex < lines.length; mathIndex += 1) {
-        if (lines[mathIndex].trim() === closeDelimiter) {
-          lineIndex = mathIndex;
-          closed = true;
-          break;
-        }
-        mathLines.push(lines[mathIndex]);
-      }
-      if (closed) {
-        appendMathBlock(container, mathLines.join('\n'), mathDelimiter);
-        continue;
-      }
-      paragraph.push(line, ...mathLines);
-      break;
-    }
-
-    if (!line.trim()) {
-      flushParagraph();
-      flushLists();
-      flushBlockquote();
-      continue;
-    }
-
-    const table = readMarkdownTable(lines, lineIndex);
-    if (table) {
-      flushParagraph();
-      flushLists();
-      flushBlockquote();
-      appendMarkdownTable(container, table);
-      lineIndex = table.nextIndex - 1;
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
-      flushParagraph();
-      flushLists();
-      flushBlockquote();
-      const level = Math.min(4, heading[1].length + 1);
-      const node = document.createElement(`h${level}`);
-      renderInlineMarkdown(node, heading[2]);
-      container.appendChild(node);
-      continue;
-    }
-
-    const unordered = line.match(/^\s*[-*]\s+(.+)$/);
-    if (unordered) {
-      flushParagraph();
-      flushBlockquote();
-      if (orderedListItems.length) {
-        appendMarkdownList(container, orderedListItems, true);
-        orderedListItems = [];
-      }
-      listItems.push(unordered[1]);
-      continue;
-    }
-
-    const ordered = line.match(/^\s*\d+\.\s+(.+)$/);
-    if (ordered) {
-      flushParagraph();
-      flushBlockquote();
-      if (listItems.length) {
-        appendMarkdownList(container, listItems, false);
-        listItems = [];
-      }
-      orderedListItems.push(ordered[1]);
-      continue;
-    }
-
-    const quote = line.match(/^\s*>\s?(.+)$/);
-    if (quote) {
-      flushParagraph();
-      flushLists();
-      blockquote.push(quote[1]);
-      continue;
-    }
-
-    flushLists();
-    flushBlockquote();
-    paragraph.push(line);
-  }
-
-  if (inCode) {
-    flushCode();
-  }
-  flushParagraph();
-  flushLists();
-  flushBlockquote();
   scheduleMathTypeset(container);
 }
 
@@ -11123,7 +12780,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   const entries = Array.isArray(segment?.entries) ? segment.entries : [];
   const previousEntryCount = state.thinkingEntryCounts.get(stateKey) || 0;
   const savedScroll = state.thinkingScrollPositions.get(stateKey);
-  if (entries.length > previousEntryCount && savedScroll && !savedScroll.atBottom && details.open) {
+  if (entries.length > previousEntryCount && savedScroll && details.open) {
     state.thinkingUnread.add(stateKey);
   }
   state.thinkingEntryCounts.set(stateKey, entries.length);
@@ -11148,16 +12805,21 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   const content = document.createElement('div');
   content.className = 'thinking-content';
   content.dataset.thinkingStateKey = stateKey;
+  content.tabIndex = 0;
   const contentBottomAnchor = document.createElement('div');
   contentBottomAnchor.className = 'thinking-bottom-anchor';
-  content.appendChild(createThinkingScrollActions(details, contentBottomAnchor, 'top', stateKey));
 
   if (entries.length) {
     const history = document.createElement('div');
     history.className = 'thinking-history-list';
-    for (const entry of entries) {
+    for (const [index, entry] of entries.entries()) {
       const item = document.createElement('div');
       item.className = 'thinking-history-item';
+      item.dataset.thinkingViewportKey = thinkingEntryViewportKey(entry, index);
+      if (entry.activityKey) {
+        item.dataset.thinkingActivityKey = entry.activityKey;
+        item.dataset.activityRevision = String(entry.activityRevision || 0);
+      }
       item.innerHTML = `
         <div class="thinking-history-top">
           <span class="thinking-history-kind">${prettyStatusLabel(entry.kind || 'thinking')}</span>
@@ -11165,6 +12827,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
         </div>
         <div class="thinking-history-text">${escapeHtml(entry.text || '')}</div>
       `;
+      item.querySelector('.thinking-history-text').textContent = String(entry.text == null ? '' : entry.text);
       if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
         item.appendChild(renderFileChangeDetails(entry.fileChanges));
       }
@@ -11186,12 +12849,23 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
     content.appendChild(block);
   }
 
-  content.appendChild(createThinkingScrollActions(details, contentBottomAnchor, 'bottom', stateKey));
   content.appendChild(contentBottomAnchor);
   content.addEventListener('scroll', () => {
+    noteMessageReadThinkingScroll(session);
     updateThinkingScrollState(stateKey, content);
   }, { passive: true });
+  for (const eventName of ['wheel', 'touchend', 'pointerup']) {
+    content.addEventListener(eventName, (event) => {
+      recordThinkingTrustedInteraction(stateKey, content, event);
+    }, { passive: true });
+  }
+  content.addEventListener('keydown', (event) => {
+    if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+      recordThinkingTrustedInteraction(stateKey, content, event);
+    }
+  });
   details.appendChild(content);
+  details.appendChild(createThinkingScrollRail(details, stateKey));
   restoreThinkingScrollState(stateKey, content);
   const collapseRail = document.createElement('button');
   collapseRail.type = 'button';
@@ -11208,6 +12882,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
 
   const wrapper = document.createElement('div');
   wrapper.className = 'message thinking';
+  wrapper.dataset.viewportKey = stateKey;
 
   const metaEl = document.createElement('div');
   metaEl.className = 'message-meta';
@@ -11215,6 +12890,36 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   wrapper.appendChild(metaEl);
   wrapper.appendChild(details);
   return wrapper;
+}
+
+function patchThinkingMessageElement(existingMessage, nextMessage) {
+  if (!existingMessage || !nextMessage) {
+    return;
+  }
+  const existingCard = existingMessage.querySelector('.thinking-card');
+  const nextCard = nextMessage.querySelector('.thinking-card');
+  const existingStateKey = existingCard?.dataset?.thinkingStateKey || '';
+  const existingScroller = existingMessage.querySelector('.thinking-content[data-thinking-state-key]');
+  if (existingStateKey && existingScroller) {
+    preserveThinkingViewportForPatch(existingStateKey, existingScroller);
+  }
+  const keepOpen = existingCard ? existingCard.open : null;
+
+  existingMessage.className = nextMessage.className;
+  existingMessage.replaceChildren(...Array.from(nextMessage.childNodes));
+
+  const patchedCard = existingMessage.querySelector('.thinking-card');
+  const patchedStateKey = patchedCard?.dataset?.thinkingStateKey || nextCard?.dataset?.thinkingStateKey || existingStateKey;
+  if (patchedCard && keepOpen !== null) {
+    patchedCard.open = keepOpen;
+    if (patchedStateKey) {
+      state.thinkingPanels.set(patchedStateKey, keepOpen);
+    }
+  }
+  const patchedScroller = existingMessage.querySelector('.thinking-content[data-thinking-state-key]');
+  if (patchedStateKey && patchedScroller) {
+    restoreThinkingScrollState(patchedStateKey, patchedScroller, { preserveDetached: true, immediate: true });
+  }
 }
 
 function renderFileCards(container, session, entry) {
@@ -11353,7 +13058,7 @@ function selectTranscriptRenderWindow(visibleTranscript, desiredLimit, options =
   const limitedEntries = baseLimit && entries.length > baseLimit
     ? entries.slice(-baseLimit)
     : entries.slice();
-  if (!options.enforceBudget || limitedEntries.length <= TRANSCRIPT_RENDER_MIN_WINDOW) {
+  if (options.preserveRequestedLimit || !options.enforceBudget || limitedEntries.length <= TRANSCRIPT_RENDER_MIN_WINDOW) {
     return {
       hiddenTranscriptCount: Math.max(0, entries.length - limitedEntries.length),
       renderedTranscript: limitedEntries,
@@ -11397,16 +13102,17 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   const previousKey = log.dataset.sessionKey || '';
   captureThinkingScrollStates(log);
   const switchingSession = previousKey !== key;
-  const pinnedToBottom = isTranscriptPinnedToBottom(log);
-  const thinkingReaderDetached = !switchingSession && hasDetachedThinkingScroller(log);
+  const pinnedToBottom = isTranscriptPinnedAcrossScrollTargets();
   const userDetached = !switchingSession && isTranscriptUserDetached(key);
   const shouldForceScroll = Boolean(options.forceScroll && !userDetached);
-  const shouldStickToBottom = switchingSession || shouldForceScroll || (!userDetached && !thinkingReaderDetached && pinnedToBottom);
+  const shouldStickToBottom = switchingSession || shouldForceScroll || (!userDetached && pinnedToBottom);
   if (switchingSession && key) {
     setTranscriptUserDetached(key, false);
+    getTranscriptScrollMachine()?.establishFollow();
   }
   const previousScrollTop = log.scrollTop;
   const bottomOffset = log.scrollHeight - log.scrollTop - log.clientHeight;
+  const scrollSnapshot = captureTranscriptScrollSnapshot();
   log.innerHTML = '';
   log.dataset.sessionKey = key;
 
@@ -11452,22 +13158,24 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       visibleTranscript.length - focusIndex
     ));
   }
+  const explicitVisibleLimit = key ? Number(state.transcriptVisibleLimits.get(key) || 0) : 0;
   const requestedVisibleLimit = isOptimizeSpeedMode()
-    ? Math.max(TRANSCRIPT_RENDER_WINDOW, Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW))
+    ? Math.max(TRANSCRIPT_RENDER_WINDOW, explicitVisibleLimit || TRANSCRIPT_RENDER_WINDOW)
     : visibleTranscript.length;
   const renderWindow = selectTranscriptRenderWindow(visibleTranscript, requestedVisibleLimit, {
     enforceBudget: Boolean(isOptimizeSpeedMode() && !focus && !state.sessionSearchQuery.trim()),
+    preserveRequestedLimit: explicitVisibleLimit > 0,
   });
   const hiddenTranscriptCount = renderWindow.hiddenTranscriptCount;
   const renderedTranscript = renderWindow.renderedTranscript;
   const thinkingSegments = buildThinkingEntriesForSession(session, {
-    transcriptEntries: renderedTranscript,
+    transcriptEntries: visibleTranscript,
   });
   const renderedEntryCount = visibleTranscript.length
     + thinkingSegments.reduce((total, segment) => total + (Array.isArray(segment.entries) ? segment.entries.length : 0), 0);
   const previousRenderedEntryCount = state.transcriptEntryCounts.get(key) || 0;
   if (key) {
-    if (previousKey === key && renderedEntryCount > previousRenderedEntryCount && (!shouldStickToBottom || thinkingReaderDetached)) {
+    if (previousKey === key && renderedEntryCount > previousRenderedEntryCount && !shouldStickToBottom) {
       state.transcriptUnread.add(key);
     }
     if (shouldStickToBottom) {
@@ -11500,8 +13208,12 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       scrollTop: previousScrollTop,
       bottomOffset,
     });
+    if (!shouldStickToBottom && !focus) {
+      restoreTranscriptScrollSnapshot(scrollSnapshot);
+    }
     updateTranscriptUnreadButton(key);
     renderTranscriptSearchNavigator(session, [], 0);
+    completeTranscriptNotificationRender(session);
     return;
   }
 
@@ -11526,6 +13238,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     message.className = `message ${speaker || 'agent'}`;
     message.title = entry.timestamp ? `Sent ${formatTime(entry.timestamp)}` : '';
     const fullEntryIndex = renderedStartIndex + renderedIndex;
+    message.dataset.viewportKey = transcriptViewportKey(entry, fullEntryIndex);
     const isFocused = focus && (
       (focusIndex >= 0 && fullEntryIndex === focusIndex)
       || transcriptEntryMatchesSearchMatch(entry, focus)
@@ -11592,6 +13305,12 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     scrollTop: previousScrollTop,
     bottomOffset,
   });
+  if (shouldStickToBottom && !focus) {
+    restoreTranscriptScrollTargetsToBottom();
+  }
+  if (!shouldStickToBottom && !focus) {
+    restoreTranscriptScrollSnapshot(scrollSnapshot);
+  }
   if (focus) {
     window.setTimeout(() => {
       const target = document.getElementById('focused-transcript-entry');
@@ -11600,13 +13319,10 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
         state.pendingTranscriptFocus = null;
       }
     }, 80);
-  } else if (activeSearchMatch) {
-    window.setTimeout(() => {
-      document.getElementById('focused-transcript-entry')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    }, 80);
   }
-  updateTranscriptUnreadButton(key);
-}
+    updateTranscriptUnreadButton(key);
+    completeTranscriptNotificationRender(session);
+  }
 
 function renderLocaleLabels() {
   document.documentElement.lang = currentLocale();
@@ -11758,6 +13474,253 @@ function formatApiPingResult(result, host = null) {
   return [prefix, status, latency, detail].filter(Boolean).join(' | ');
 }
 
+function apiProfileBackupPayload() {
+  const settings = normalizeUiSettings(state.ui);
+  return {
+    apiProfiles: settings.apiProfiles.map((profile) => ({
+      profileId: profile.profileId,
+      label: profile.label,
+      provider: profile.provider,
+      baseUrl: profile.baseUrl || '',
+      apiKey: profile.apiKey || '',
+    })),
+    selectedApiProfileId: settings.selectedApiProfileId,
+    defaultApiProfileId: settings.defaultApiProfileId,
+    hostApiProfiles: { ...settings.hostApiProfiles },
+  };
+}
+
+function resetApiProfileBackupState(mode = 'export') {
+  state.apiProfileBackup = {
+    open: true,
+    mode: mode === 'import' ? 'import' : 'export',
+    busy: false,
+    fileText: '',
+    importedPayload: null,
+    preview: null,
+    conflicts: [],
+    status: '',
+    error: '',
+  };
+}
+
+function openApiProfileBackupDialog(mode) {
+  saveActiveApiProfileFromSettingsForm();
+  resetApiProfileBackupState(mode);
+  for (const id of ['api-profile-backup-password', 'api-profile-backup-password-confirm']) {
+    const input = el(id);
+    if (input) input.value = '';
+  }
+  if (el('api-profile-backup-file')) el('api-profile-backup-file').value = '';
+  if (el('api-profile-backup-use-defaults')) el('api-profile-backup-use-defaults').checked = false;
+  renderApiProfileBackupDialog();
+}
+
+function closeApiProfileBackupDialog() {
+  state.apiProfileBackup = {
+    ...state.apiProfileBackup,
+    open: false,
+    busy: false,
+    fileText: '',
+    importedPayload: null,
+    preview: null,
+    conflicts: [],
+    error: '',
+  };
+  for (const id of ['api-profile-backup-password', 'api-profile-backup-password-confirm']) {
+    const input = el(id);
+    if (input) input.value = '';
+  }
+  if (el('api-profile-backup-file')) el('api-profile-backup-file').value = '';
+  renderApiProfileBackupDialog();
+}
+
+function renderApiProfileBackupPreview(container, preview) {
+  container.replaceChildren();
+  if (!preview) return;
+  const summary = document.createElement('div');
+  summary.className = 'api-profile-backup-preview-summary';
+  summary.textContent = `${preview.apiProfiles.length} profile${preview.apiProfiles.length === 1 ? '' : 's'} | ${Object.keys(preview.hostApiProfiles || {}).length} Host mapping${Object.keys(preview.hostApiProfiles || {}).length === 1 ? '' : 's'}`;
+  container.appendChild(summary);
+  const list = document.createElement('div');
+  list.className = 'api-profile-backup-preview-list';
+  for (const profile of preview.apiProfiles) {
+    const row = document.createElement('div');
+    row.className = 'api-profile-backup-preview-row';
+    const identity = document.createElement('span');
+    identity.textContent = `${profile.label} | ${profile.provider}${profile.baseUrl ? ` | ${profile.baseUrl}` : ''}`;
+    const credential = document.createElement('strong');
+    credential.textContent = profile.hasCredential ? 'Credential included' : 'No credential';
+    row.append(identity, credential);
+    list.appendChild(row);
+  }
+  container.appendChild(list);
+}
+
+function renderApiProfileBackupConflicts(container, conflicts) {
+  container.replaceChildren();
+  for (const conflict of conflicts || []) {
+    const row = document.createElement('label');
+    row.className = 'api-profile-backup-conflict-row';
+    const label = document.createElement('span');
+    const local = getApiProfile(conflict.profileId);
+    label.textContent = conflict.type === 'identity'
+      ? `${local?.label || conflict.profileId}: profile ID conflict`
+      : `${local?.label || conflict.profileId}: credential conflict`;
+    const select = document.createElement('select');
+    select.dataset.apiProfileConflictType = conflict.type;
+    select.dataset.apiProfileConflictId = conflict.profileId;
+    const choices = conflict.type === 'identity'
+      ? [['copy', 'Keep both'], ['replace', 'Replace local profile']]
+      : [['local', 'Keep local credential'], ['backup', 'Use backup credential']];
+    for (const [value, text] of choices) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      select.appendChild(option);
+    }
+    row.append(label, select);
+    container.appendChild(row);
+  }
+}
+
+function renderApiProfileBackupDialog() {
+  const dialog = el('api-profile-backup-dialog');
+  if (!dialog) return;
+  const backup = state.apiProfileBackup;
+  const importing = backup.mode === 'import';
+  dialog.classList.toggle('hidden', !backup.open);
+  dialog.setAttribute('aria-hidden', backup.open ? 'false' : 'true');
+  el('api-profile-backup-title').textContent = importing ? 'Import encrypted profiles' : 'Export encrypted profiles';
+  el('api-profile-backup-file-row').classList.toggle('hidden', !importing);
+  el('api-profile-backup-confirm-row').classList.toggle('hidden', importing);
+  const error = el('api-profile-backup-error');
+  error.textContent = backup.error || '';
+  error.classList.toggle('hidden', !backup.error);
+  el('api-profile-backup-status').textContent = backup.status || '';
+  const preview = el('api-profile-backup-preview');
+  preview.classList.toggle('hidden', !backup.preview);
+  renderApiProfileBackupPreview(preview, backup.preview);
+  const conflicts = el('api-profile-backup-conflicts');
+  conflicts.classList.toggle('hidden', !backup.conflicts.length);
+  renderApiProfileBackupConflicts(conflicts, backup.conflicts);
+  el('api-profile-backup-defaults-row').classList.toggle('hidden', !importing || !backup.preview);
+  const primary = el('api-profile-backup-primary-button');
+  primary.textContent = importing ? 'Decrypt and preview' : 'Create backup';
+  primary.disabled = backup.busy;
+  primary.setAttribute('aria-busy', backup.busy ? 'true' : 'false');
+  const apply = el('api-profile-backup-apply-button');
+  apply.classList.toggle('hidden', !importing || !backup.importedPayload);
+  apply.disabled = backup.busy || !backup.importedPayload;
+  syncModalBodyState();
+}
+
+function apiProfileBackupPassword() {
+  return String(el('api-profile-backup-password')?.value || '');
+}
+
+function requireApiProfileBackupPassword(confirm = false) {
+  const password = apiProfileBackupPassword();
+  if (password.length < 8) {
+    throw new Error('Use a password with at least 8 characters.');
+  }
+  if (confirm && password !== String(el('api-profile-backup-password-confirm')?.value || '')) {
+    throw new Error('The passwords do not match.');
+  }
+  return password;
+}
+
+function downloadApiProfileBackup(envelope) {
+  const blob = new Blob([`${JSON.stringify(envelope, null, 2)}\n`], { type: 'application/json' });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const day = new Date().toISOString().slice(0, 10);
+  link.href = url;
+  link.download = `remote-codex-api-profiles-${day}.rcapi`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => window.URL.revokeObjectURL(url), 0);
+}
+
+async function exportEncryptedApiProfiles() {
+  const backupApi = window.RemoteCodexApiProfileBackup;
+  if (!backupApi?.encryptBackup) throw new Error('Encrypted backup support is unavailable.');
+  const password = requireApiProfileBackupPassword(true);
+  state.apiProfileBackup.busy = true;
+  state.apiProfileBackup.error = '';
+  renderApiProfileBackupDialog();
+  try {
+    const envelope = await backupApi.encryptBackup(apiProfileBackupPayload(), password);
+    downloadApiProfileBackup(envelope);
+    state.apiProfileBackup.status = 'Encrypted backup downloaded.';
+    el('api-profile-backup-password').value = '';
+    el('api-profile-backup-password-confirm').value = '';
+  } finally {
+    state.apiProfileBackup.busy = false;
+    renderApiProfileBackupDialog();
+  }
+}
+
+async function previewEncryptedApiProfiles() {
+  const backupApi = window.RemoteCodexApiProfileBackup;
+  if (!backupApi?.decryptBackup) throw new Error('Encrypted backup support is unavailable.');
+  if (!state.apiProfileBackup.fileText) throw new Error('Choose an encrypted backup file.');
+  const password = requireApiProfileBackupPassword(false);
+  state.apiProfileBackup.busy = true;
+  state.apiProfileBackup.error = '';
+  state.apiProfileBackup.importedPayload = null;
+  renderApiProfileBackupDialog();
+  try {
+    const payload = await backupApi.decryptBackup(state.apiProfileBackup.fileText, password);
+    const merge = backupApi.planSafeMerge(apiProfileBackupPayload(), payload, {
+      makeProfileId: makeApiProfileId,
+    });
+    state.apiProfileBackup.importedPayload = payload;
+    state.apiProfileBackup.preview = backupApi.previewPayload(payload);
+    state.apiProfileBackup.conflicts = merge.conflicts || [];
+    state.apiProfileBackup.status = 'Backup decrypted. Review conflicts before applying.';
+  } finally {
+    state.apiProfileBackup.busy = false;
+    renderApiProfileBackupDialog();
+  }
+}
+
+function selectedApiProfileConflictOptions() {
+  const identityConflicts = {};
+  const keyConflicts = {};
+  for (const select of el('api-profile-backup-conflicts').querySelectorAll('[data-api-profile-conflict-type]')) {
+    const type = select.dataset.apiProfileConflictType;
+    const profileId = select.dataset.apiProfileConflictId;
+    if (type === 'identity') identityConflicts[profileId] = select.value;
+    if (type === 'credential') keyConflicts[profileId] = select.value;
+  }
+  return { identityConflicts, keyConflicts };
+}
+
+function commitImportedApiProfiles() {
+  const backupApi = window.RemoteCodexApiProfileBackup;
+  const importedPayload = state.apiProfileBackup.importedPayload;
+  if (!backupApi?.planSafeMerge || !importedPayload) throw new Error('Decrypt the backup before applying it.');
+  const conflicts = selectedApiProfileConflictOptions();
+  const merge = backupApi.planSafeMerge(apiProfileBackupPayload(), importedPayload, {
+    ...conflicts,
+    useImportedDefaults: Boolean(el('api-profile-backup-use-defaults')?.checked),
+    makeProfileId: makeApiProfileId,
+  });
+  const nextUi = normalizeUiSettings({ ...state.ui, ...merge.payload });
+  const storedValue = uiSettingsStorageValue(nextUi);
+  if (!window.localStorage?.setItem) throw new Error('Browser local storage is unavailable.');
+  window.localStorage.setItem(UI_SETTINGS_STORAGE_KEY, JSON.stringify(storedValue));
+  Object.assign(state.ui, normalizeUiSettings(storedValue));
+  state.apiProfileBackup.importedPayload = null;
+  state.apiProfileBackup.status = 'Imported profiles saved in this browser.';
+  state.apiProfileBackup.conflicts = [];
+  el('api-profile-backup-password').value = '';
+  populateSettingsForm();
+  renderApiProfileBackupDialog();
+}
+
 function populateSettingsForm() {
   const settings = normalizeUiSettings(state.ui);
   state.ui.locale = settings.locale;
@@ -11775,8 +13738,159 @@ function populateSettingsForm() {
   el('settings-default-api-profile').value = settings.defaultApiProfileId;
   populateApiProfileEditor(getSelectedApiProfile());
   renderHostApiProfileList();
+  renderSessionApiControls(getSelectedSession());
   renderSoftwareUpdatePanel();
   applyStaticLocalization(el('settings-dialog'));
+}
+
+function sessionApiRebindBusyKey(session) {
+  return session?.hostId && session?.sessionId ? getSessionKey(session) : '';
+}
+
+function isSessionApiRebindBusy(session) {
+  const key = sessionApiRebindBusyKey(session);
+  return Boolean(key && state.sessionApiRebindBusyKeys.has(key));
+}
+
+function setSessionApiRebindBusy(session, busy) {
+  const key = sessionApiRebindBusyKey(session);
+  if (!key) {
+    return false;
+  }
+  if (busy) {
+    state.sessionApiRebindBusyKeys.add(key);
+  } else {
+    state.sessionApiRebindBusyKeys.delete(key);
+  }
+  return true;
+}
+
+function sessionTranscriptFallbackBusyKey(session) {
+  return session?.hostId && session?.sessionId ? getSessionKey(session) : '';
+}
+
+function isSessionTranscriptFallbackBusy(session) {
+  const key = sessionTranscriptFallbackBusyKey(session);
+  return Boolean(key && state.sessionTranscriptFallbackBusyKeys.has(key));
+}
+
+function setSessionTranscriptFallbackBusy(session, busy) {
+  const key = sessionTranscriptFallbackBusyKey(session);
+  if (!key) {
+    return false;
+  }
+  if (busy) {
+    state.sessionTranscriptFallbackBusyKeys.add(key);
+  } else {
+    state.sessionTranscriptFallbackBusyKeys.delete(key);
+  }
+  return true;
+}
+
+function rebindTargetIdentity(targetValue) {
+  const value = String(targetValue || '').trim();
+  if (value === '__host_environment__') {
+    return 'host_environment';
+  }
+  const profile = (state.ui.apiProfiles || []).find((candidate) => candidate.profileId === value) || null;
+  return profile ? `profile:${rebindProfilePreviewIdentity(profile)}` : `missing:${value}`;
+}
+
+function clearComposerModelSelection(session) {
+  const sessionKey = getSessionKey(session);
+  if (!sessionKey) {
+    return;
+  }
+  const options = getComposerOptionsForSession(session);
+  state.codexControls.sessionOptionsByKey.set(sessionKey, normalizeComposerOptionValues({
+    ...options,
+    model: '',
+    effort: '',
+  }));
+  persistComposerSessionOptions();
+}
+
+function rememberRebindTarget(session, targetValue) {
+  const sessionKey = getSessionKey(session);
+  if (!sessionKey) {
+    return;
+  }
+  const value = String(targetValue || '__host_environment__');
+  const identity = rebindTargetIdentity(value);
+  const previousIdentity = state.codexControls.rebindTargetIdentityBySession.get(sessionKey);
+  state.codexControls.rebindTargetProfileBySession.set(sessionKey, value);
+  state.codexControls.rebindTargetIdentityBySession.set(sessionKey, identity);
+  if (previousIdentity !== undefined && previousIdentity !== identity) {
+    clearComposerModelSelection(session);
+  }
+}
+
+function renderSessionApiControls(session) {
+  const bindingLabel = el('session-api-binding-label');
+  const hostDefaultLabel = el('session-host-default-label');
+  const catalogStatus = el('session-catalog-status');
+  const rebindSelect = el('session-api-rebind-select');
+  const rebindButton = el('session-api-rebind-button');
+  const fallbackButton = el('session-transcript-fallback-button');
+  if (!bindingLabel || !hostDefaultLabel || !catalogStatus || !rebindSelect || !rebindButton || !fallbackButton) {
+    return;
+  }
+
+  const binding = sessionApiBinding(session);
+  const hostDefault = session ? getApiProfileForHost(session.hostId) : null;
+  const hostDefaultConfig = session ? getApiRequestConfig(session.hostId) : null;
+  if (binding?.kind === 'profile') {
+    bindingLabel.textContent = binding.label || binding.profileId || 'API profile unavailable';
+  } else if (binding?.kind === 'host_environment') {
+    bindingLabel.textContent = binding.label || binding.provider || 'Host environment';
+  } else {
+    bindingLabel.textContent = session ? 'Unknown / rebind required' : 'No Session selected';
+  }
+  hostDefaultLabel.textContent = hostDefaultConfig
+    ? (hostDefault?.label || hostDefault?.provider || 'API profile')
+    : 'Host environment';
+
+  rebindSelect.innerHTML = '';
+  const hostEnvironmentOption = document.createElement('option');
+  hostEnvironmentOption.value = '__host_environment__';
+  hostEnvironmentOption.textContent = 'Host environment';
+  rebindSelect.appendChild(hostEnvironmentOption);
+  for (const profile of state.ui.apiProfiles || []) {
+    const option = document.createElement('option');
+    option.value = profile.profileId;
+    option.textContent = profile.label || profile.provider || profile.profileId;
+    rebindSelect.appendChild(option);
+  }
+  const availableValues = new Set(Array.from(rebindSelect.options).map((option) => option.value));
+  const rememberedSelection = state.codexControls.rebindTargetProfileBySession.get(getSessionKey(session));
+  const preferredValue = availableValues.has(rememberedSelection)
+    ? rememberedSelection
+    : binding?.kind === 'profile' && availableValues.has(binding.profileId)
+      ? binding.profileId
+      : '__host_environment__';
+  rebindSelect.value = preferredValue;
+  rememberRebindTarget(session, preferredValue);
+  const catalog = session ? state.codexControls.modelCatalogByKey.get(activeModelCatalogKey(session)) : null;
+  if (catalog) {
+    const sourceNames = (catalog.sources || []).map((source) => source?.source).filter(Boolean);
+    const freshness = catalog.cacheState || ((catalog.sources || []).some((source) => source?.stale) ? 'stale' : 'fresh');
+    catalogStatus.textContent = `${catalog.models?.length || 0} models | ${freshness}${sourceNames.length ? ` | ${sourceNames.join(' + ')}` : ''}`;
+  } else if (session?.runtimeConfigError) {
+    catalogStatus.textContent = `Runtime config unavailable: ${session.runtimeConfigError.code || 'request failed'}`;
+  } else {
+    catalogStatus.textContent = session ? 'Not loaded' : 'No Session selected';
+  }
+  const rebindBusy = isSessionApiRebindBusy(session);
+  const modelCatalogBusy = isModelOptionsLoading(session);
+  rebindSelect.disabled = !session || rebindBusy || modelCatalogBusy;
+  rebindButton.disabled = !session || rebindBusy || modelCatalogBusy;
+  rebindButton.setAttribute('aria-busy', rebindBusy ? 'true' : 'false');
+
+  const resumeError = session?.resumeError || null;
+  const fallbackBusy = isSessionTranscriptFallbackBusy(session);
+  fallbackButton.classList.toggle('hidden', !resumeError?.canTranscriptFallback);
+  fallbackButton.disabled = !session || !resumeError?.canTranscriptFallback || fallbackBusy;
+  fallbackButton.setAttribute('aria-busy', fallbackBusy ? 'true' : 'false');
 }
 
 function formatSoftwareUpdateSummary(update) {
@@ -11830,7 +13944,8 @@ function renderSoftwareUpdatePanel() {
   const busy = Boolean(state.softwareUpdate.busy);
 
   if (summary) {
-    summary.textContent = busy ? 'Working on software update...' : formatSoftwareUpdateSummary(update);
+    summary.textContent = state.softwareUpdate.message
+      || (busy ? 'Working on software update...' : formatSoftwareUpdateSummary(update));
   }
   if (details) {
     details.innerHTML = '';
@@ -11859,6 +13974,14 @@ function renderSoftwareUpdatePanel() {
   }
 }
 
+function reportSoftwareUpdateError(error) {
+  const message = String(error?.message || error || 'Unknown error').trim();
+  state.softwareUpdate.status = null;
+  state.softwareUpdate.busy = false;
+  state.softwareUpdate.message = `Software update unavailable: ${message}`;
+  renderSoftwareUpdatePanel();
+}
+
 async function refreshSoftwareUpdateStatus(options = {}) {
   state.softwareUpdate.busy = true;
   state.softwareUpdate.message = 'Checking for updates...';
@@ -11877,7 +14000,8 @@ async function refreshSoftwareUpdateStatus(options = {}) {
 async function applySoftwareUpdate() {
   const update = state.softwareUpdate.status;
   if (update?.dirty) {
-    reportError(new Error('Tracked local changes block one-click update. Commit or stash them first.'));
+    state.softwareUpdate.message = 'Tracked local changes block one-click update. Commit or stash them first.';
+    renderSoftwareUpdatePanel();
     return;
   }
   if (!update?.updateAvailable) {
@@ -11930,23 +14054,2429 @@ function renderSettingsDialog() {
   }
   dialog.classList.toggle('hidden', !state.settingsOpen);
   dialog.setAttribute('aria-hidden', state.settingsOpen ? 'false' : 'true');
+  if (state.settingsOpen) {
+    renderSessionApiControls(getSelectedSession());
+  }
   syncModalBodyState();
 }
 
 function openSettingsDialog() {
-  state.settingsApiSnapshot = snapshotHostApiFingerprints();
   state.settingsOpen = true;
   populateSettingsForm();
   renderSettingsDialog();
   renderLocaleLabels();
   if (!state.softwareUpdate.status && authAllowsRequests()) {
-    refreshSoftwareUpdateStatus({ fetch: false }).catch(reportError);
+    refreshSoftwareUpdateStatus({ fetch: false }).catch(reportSoftwareUpdateError);
   }
 }
 
 function closeSettingsDialog() {
   state.settingsOpen = false;
   renderSettingsDialog();
+}
+
+function skillsRegistryResponseRevision(response) {
+  const rawRevision = response?.registryRevision ?? response?.registry?.revision;
+  if (rawRevision == null || rawRevision === '') {
+    return null;
+  }
+  const revision = Number(rawRevision);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
+function skillsRegistryPayloadCanApply(response) {
+  const revision = skillsRegistryResponseRevision(response);
+  return revision == null || revision >= Number(state.skillsManager.registryRevision || 0);
+}
+
+function advanceSkillsRegistryRevision(rawRevision) {
+  const revision = skillsRegistryResponseRevision({ registryRevision: rawRevision });
+  if (revision != null && revision >= Number(state.skillsManager.registryRevision || 0)) {
+    state.skillsManager.registryRevision = revision;
+  }
+}
+
+async function loadSkillsManager(options = {}) {
+  const deploymentVersionAtStart = state.skillsManager.deploymentVersion;
+  const desiredVersionAtStart = state.skillsManager.desiredVersion;
+  state.skillsManager.dirty = false;
+  state.skillsManager.loading = true;
+  renderSkillsManager();
+  try {
+    const response = await fetchJson('/api/skills');
+    const responseRegistryRevision = skillsRegistryResponseRevision(response);
+    const applyRegistryPayload = skillsRegistryPayloadCanApply(response);
+    state.skillsManager.hosts = Array.isArray(response.hosts) ? response.hosts : [];
+    state.skillsManager.installed = Array.isArray(response.installed) ? response.installed : [];
+    state.skillsManager.instances = Array.isArray(response.instances) ? response.instances : [];
+    state.skillsManager.inventories = Array.isArray(response.inventories) ? response.inventories : [];
+    state.skillsManager.favorites = Array.isArray(response.favorites) ? response.favorites : [];
+    if (applyRegistryPayload) {
+      state.skillsManager.catalog = Array.isArray(response.catalog) ? response.catalog : [];
+      state.skillsManager.sources = Array.isArray(response.sources) ? response.sources : [];
+      state.skillsManager.skillLibrary = Array.isArray(response.skillLibrary) ? response.skillLibrary : [];
+      state.skillsManager.artifacts = Array.isArray(response.artifacts) ? response.artifacts : [];
+      if (responseRegistryRevision != null) {
+        state.skillsManager.registryRevision = responseRegistryRevision;
+      }
+      state.skillsManager.dailySkillDigest = response.dailySkillDigest || null;
+    }
+    state.skillsManager.adoptions = Array.isArray(response.adoptions) ? response.adoptions : [];
+    state.skillsManager.imports = Array.isArray(response.imports) ? response.imports : [];
+    const responseDeployments = Array.isArray(response.deployments) ? response.deployments : [];
+    const responseDesiredSkillStates = Array.isArray(response.desiredSkillStates)
+      ? response.desiredSkillStates
+      : [];
+    state.skillsManager.appliedSkillStates = Array.isArray(response.appliedSkillStates)
+      ? response.appliedSkillStates
+      : [];
+    state.skillsManager.desiredSkillStates = state.skillsManager.desiredVersion === desiredVersionAtStart
+      ? responseDesiredSkillStates
+      : mergeSkillsDesiredStateLists(responseDesiredSkillStates, state.skillsManager.desiredSkillStates);
+    state.skillsManager.deployments = state.skillsManager.deploymentVersion === deploymentVersionAtStart
+      ? boundSkillsDeployments(responseDeployments, state.skillsManager.desiredSkillStates)
+      : mergeSkillsDeploymentLists(
+        responseDeployments,
+        state.skillsManager.deployments,
+        state.skillsManager.desiredSkillStates
+      );
+    state.skillsManager.refreshingHostIds = new Set(
+      state.skillsManager.inventories
+        .filter((inventory) => inventory?.refreshing)
+        .map((inventory) => String(inventory.hostId || '').trim())
+        .filter(Boolean)
+    );
+    state.skillsManager.loadError = '';
+    const knownSkillsHostIds = new Set(
+      state.skillsManager.hosts
+        .map((host) => String(host.hostId || host.id || '').trim())
+        .filter(Boolean)
+    );
+    const previousSelectedHostKey = JSON.stringify(Array.from(state.skillsManager.selectedHostIds).sort());
+    state.skillsManager.selectedHostIds = new Set(
+      Array.from(state.skillsManager.selectedHostIds)
+        .filter((hostId) => knownSkillsHostIds.has(hostId))
+    );
+    if (!state.skillsManager.selectedHostIds.size) {
+      const selected = knownSkillsHostIds.has(state.selectedHostId)
+        ? state.selectedHostId
+        : state.skillsManager.hosts[0]?.hostId || '';
+      if (selected) {
+        state.skillsManager.selectedHostIds.add(selected);
+      }
+    }
+    const nextSelectedHostKey = JSON.stringify(Array.from(state.skillsManager.selectedHostIds).sort());
+    if (previousSelectedHostKey !== nextSelectedHostKey) {
+      resetSkillsProjectWriteConfirmation();
+    }
+    state.skillsManager.selectedSkillIds = new Set(
+      Array.from(state.skillsManager.selectedSkillIds)
+        .filter((skillId) => latestRegistryArtifactForSkill(skillId))
+    );
+    const cleanupRows = skillsManagedReferenceRows();
+    state.skillsManager.selectedCleanupKeys = new Set(
+      Array.from(state.skillsManager.selectedCleanupKeys)
+        .filter((key) => skillsCleanupRowCanDeploy(cleanupRows.get(key)))
+    );
+    state.skillsManager.actionSummary = options.message || state.skillsManager.actionSummary || '';
+  } catch (error) {
+    state.skillsManager.dirty = true;
+    state.skillsManager.loadError = `Unable to load skills: ${error.message}`;
+  } finally {
+    state.skillsManager.loading = false;
+    renderSkillsManager();
+  }
+}
+
+function skillsInventoryInstanceRowKey(instance) {
+  const skillId = String(instance?.skillId || '').trim().toLowerCase();
+  const observedHash = String(instance?.observedHash || '').trim().toLowerCase();
+  if (skillId && /^sha256:[a-f0-9]{64}$/.test(observedHash)) {
+    return `logical:${JSON.stringify([skillId, observedHash])}`;
+  }
+  return `instance:${JSON.stringify([
+    skillId,
+    String(instance?.sourceId || '').trim(),
+    String(instance?.scope || '').trim(),
+    String(instance?.scopeId || '').trim(),
+    String(instance?.activationPath || '').trim(),
+  ])}`;
+}
+
+function skillsInventorySourceSummary(instances) {
+  const labelOrder = ['Local', 'Project', 'Shared', 'CC Switch', 'GitHub', 'Plugin', 'System'];
+  const scopeOrder = ['user', 'project', 'shared', 'cc-switch', 'plugin', 'system'];
+  const labels = new Set();
+  const scopes = new Set();
+  const sourceDetails = new Set();
+  for (const instance of Array.isArray(instances) ? instances : []) {
+    const sourceKind = String(instance?.sourceKind || '').trim().toLowerCase();
+    const scope = String(instance?.scope || '').trim().toLowerCase();
+    let label = 'Local';
+    if (sourceKind === 'cc-switch') {
+      label = 'CC Switch';
+    } else if (sourceKind === 'github') {
+      label = 'GitHub';
+    } else if (sourceKind === 'plugin') {
+      label = 'Plugin';
+    } else if (sourceKind === 'system') {
+      label = 'System';
+    } else if (scope === 'project') {
+      label = 'Project';
+    } else if (scope === 'shared') {
+      label = 'Shared';
+    }
+    labels.add(label);
+    if (scope) {
+      scopes.add(scope);
+    }
+    const locator = String(
+      instance?.sourceLocator || instance?.activationPath || instance?.sourceId || ''
+    ).trim();
+    if (locator) {
+      sourceDetails.add(`${label}: ${locator}`);
+    }
+  }
+  const sortedLabels = Array.from(labels).sort((left, right) => (
+    labelOrder.indexOf(left) - labelOrder.indexOf(right) || left.localeCompare(right)
+  ));
+  const sortedScopes = Array.from(scopes).sort((left, right) => {
+    const leftIndex = scopeOrder.indexOf(left);
+    const rightIndex = scopeOrder.indexOf(right);
+    return (leftIndex < 0 ? scopeOrder.length : leftIndex)
+      - (rightIndex < 0 ? scopeOrder.length : rightIndex)
+      || left.localeCompare(right);
+  });
+  return {
+    label: sortedLabels.join(' + ') || 'Local',
+    title: Array.from(sourceDetails).sort().join('\n'),
+    scopeLabel: sortedScopes.join(' + ') || 'unknown',
+  };
+}
+
+function preferredSkillInstance(instances) {
+  const candidates = Array.isArray(instances) ? instances.filter(Boolean) : [];
+  if (!candidates.length) {
+    return null;
+  }
+  const scopeOrder = ['user', 'project', 'shared', 'cc-switch', 'plugin', 'system'];
+  const ordered = [...candidates].sort((left, right) => {
+    const leftScope = String(left?.scope || '').trim().toLowerCase();
+    const rightScope = String(right?.scope || '').trim().toLowerCase();
+    const leftIndex = scopeOrder.indexOf(leftScope);
+    const rightIndex = scopeOrder.indexOf(rightScope);
+    return (leftIndex < 0 ? scopeOrder.length : leftIndex)
+      - (rightIndex < 0 ? scopeOrder.length : rightIndex)
+      || String(left?.instanceId || '').localeCompare(String(right?.instanceId || ''));
+  });
+  const writable = (instance) => !instance.readonly && instance.effective !== false;
+  const enabled = (instance) => {
+    const stateName = String(instance?.state || '').trim().toLowerCase();
+    return stateName ? stateName === 'enabled' : instance?.enabled !== false;
+  };
+  return ordered.find((instance) => instance.effective === true)
+    || ordered.find((instance) => writable(instance) && instance.managed)
+    || ordered.find((instance) => writable(instance) && enabled(instance))
+    || ordered.find(writable)
+    || ordered.find((instance) => !instance.readonly && instance.managed)
+    || ordered.find((instance) => !instance.readonly && enabled(instance))
+    || ordered.find((instance) => !instance.readonly)
+    || ordered[0];
+}
+
+function skillsInventoryHostStatus(host, inventory, manager) {
+  const hostId = String(host?.hostId || host?.id || '').trim();
+  if (!host?.online) {
+    return { label: 'Offline', className: 'offline' };
+  }
+  if (manager.refreshingHostIds.has(hostId) || inventory?.refreshing) {
+    return { label: 'Refreshing', className: 'refreshing' };
+  }
+  if (Array.isArray(inventory?.scanErrors) && inventory.scanErrors.length) {
+    return { label: 'Error', className: 'error' };
+  }
+  if (!inventory || inventory.stale) {
+    return { label: 'Stale', className: 'stale' };
+  }
+  return { label: 'Fresh', className: 'fresh' };
+}
+
+function skillsInventoryCellStatus(host, inventory, instances, manager) {
+  const hostId = String(host?.hostId || host?.id || '').trim();
+  if (!host?.online) {
+    return { label: 'Offline', className: 'offline' };
+  }
+  const instance = preferredSkillInstance(instances);
+  if (!instance) {
+    if (manager.refreshingHostIds.has(hostId) || inventory?.refreshing) {
+      return { label: 'Pending', className: 'pending' };
+    }
+    return { label: 'Missing', className: 'missing' };
+  }
+  if (instance.readonly) {
+    return { label: 'Readonly', className: 'readonly' };
+  }
+  const stateName = String(instance.state || '').trim().toLowerCase();
+  if (instance.effective === false && stateName === 'enabled') {
+    return { label: 'Shadowed', className: 'shadowed' };
+  }
+  const knownStates = {
+    enabled: 'Enabled',
+    disabled: 'Disabled',
+    missing: 'Missing',
+    pending: 'Pending',
+    queued: 'Queued',
+    running: 'Running',
+    failed: 'Failed',
+    drifted: 'Drifted',
+    shadowed: 'Shadowed',
+    conflict: 'Conflict',
+  };
+  const label = knownStates[stateName] || (instance.enabled === false ? 'Disabled' : 'Enabled');
+  return { label, className: label.toLowerCase() };
+}
+
+function latestSkillAdoption(instance) {
+  if (!instance) {
+    return null;
+  }
+  return state.skillsManager.adoptions
+    .filter((adoption) => (
+      adoption?.hostId === instance.hostId
+      && adoption?.instanceId === instance.instanceId
+    ))
+    .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')))[0] || null;
+}
+
+function canAdoptSkillInstance(host, instance) {
+  if (!host?.online || !host.capabilities?.hostSkillArtifactsV1 || !instance) {
+    return false;
+  }
+  const scope = String(instance.scope || '').trim().toLowerCase();
+  return !instance.managed
+    && !instance.readonly
+    && scope !== 'plugin'
+    && scope !== 'system';
+}
+
+function registeredSkillArtifactForInstance(instance) {
+  if (!instance?.observedHash || !instance?.sourceId || !instance?.skillId) {
+    return null;
+  }
+  return state.skillsManager.artifacts.find((artifact) => {
+    const skillIds = Array.isArray(artifact?.skillIds)
+      ? artifact.skillIds
+      : [artifact?.skillId].filter(Boolean);
+    return artifact?.contentHash === instance.observedHash
+      && skillIds.includes(instance.skillId)
+      && (artifact.sources || []).some((source) => source?.sourceId === instance.sourceId);
+  }) || null;
+}
+
+function libraryRecordArtifactIds(libraryRecord) {
+  if (!libraryRecord || typeof libraryRecord !== 'object') {
+    return new Set();
+  }
+  return new Set([
+    ...(Array.isArray(libraryRecord.versions)
+      ? libraryRecord.versions.map((version) => String(version?.artifactId || '').trim())
+      : []),
+    ...(Array.isArray(libraryRecord.artifactIds)
+      ? libraryRecord.artifactIds.map((artifactId) => String(artifactId || '').trim())
+      : []),
+  ].filter(Boolean));
+}
+
+function libraryRecordArtifactStorageState(libraryRecord) {
+  const artifactIds = libraryRecordArtifactIds(libraryRecord);
+  const associatedArtifacts = new Map(
+    state.skillsManager.artifacts
+      .filter((artifact) => artifactIds.has(String(artifact?.artifactId || '').trim()))
+      .map((artifact) => [String(artifact?.artifactId || '').trim(), artifact])
+  );
+  if (libraryRecord?.archived === true) {
+    const skillId = String(libraryRecord?.skillId || '').trim();
+    for (const artifact of state.skillsManager.artifacts) {
+      const storageState = String(artifact?.storageState || '').trim().toLowerCase();
+      const skillIds = Array.isArray(artifact?.skillIds)
+        ? artifact.skillIds
+        : [artifact?.skillId].filter(Boolean);
+      const associatedTombstone = skillId
+        && (storageState === 'gc-pending' || storageState === 'collected')
+        && skillIds.some((candidate) => String(candidate || '').trim() === skillId);
+      if (associatedTombstone) {
+        associatedArtifacts.set(String(artifact?.artifactId || '').trim(), artifact);
+      }
+    }
+  }
+  const states = Array.from(associatedArtifacts.values())
+    .map((artifact) => String(artifact?.storageState || 'available').trim().toLowerCase());
+  if (states.includes('gc-pending')) {
+    return 'gc-pending';
+  }
+  if (states.includes('available')) {
+    return 'available';
+  }
+  if (states.length && states.every((storageState) => storageState === 'collected')) {
+    return 'collected';
+  }
+  return 'unavailable';
+}
+
+function libraryRecordHasAvailableArtifact(libraryRecord) {
+  const artifactIds = libraryRecordArtifactIds(libraryRecord);
+  return state.skillsManager.artifacts.some((artifact) => (
+    artifactIds.has(String(artifact?.artifactId || '').trim())
+    && String(artifact?.storageState || 'available').trim().toLowerCase() === 'available'
+  ));
+}
+
+function latestRegistryArtifactForSkill(skillId) {
+  const normalizedSkillId = String(skillId || '').trim();
+  if (!normalizedSkillId) {
+    return null;
+  }
+  const libraryRecord = state.skillsManager.skillLibrary.find((record) => (
+    String(record?.skillId || '').trim() === normalizedSkillId
+  )) || null;
+  if (!libraryRecord || libraryRecord.archived === true) {
+    return null;
+  }
+  const artifactId = String(libraryRecord?.latestArtifactId || '').trim();
+  if (!artifactId) {
+    return null;
+  }
+  const libraryVersion = (Array.isArray(libraryRecord.versions) ? libraryRecord.versions : [])
+    .find((version) => String(version?.artifactId || '').trim() === artifactId) || null;
+  if (!libraryVersion || libraryVersion.archived === true) {
+    return null;
+  }
+  const artifact = state.skillsManager.artifacts.find((candidate) => (
+    candidate?.artifactId === artifactId
+      && candidate?.trustState === 'validated'
+  )) || null;
+  if (
+    !artifact
+    || String(artifact?.storageState || 'available').trim().toLowerCase() !== 'available'
+  ) {
+    return null;
+  }
+  const supportedSkillIds = Array.isArray(artifact.skillIds)
+    ? artifact.skillIds
+    : [artifact.skillId].filter(Boolean);
+  if (!supportedSkillIds.includes(normalizedSkillId)) {
+    return null;
+  }
+  return {
+    skillId: normalizedSkillId,
+    artifactId,
+    artifact,
+    libraryRecord,
+  };
+}
+
+function instanceMatchesRegistryArtifact(instance, artifactId) {
+  const expectedArtifactId = String(artifactId || '').trim().toLowerCase();
+  if (!instance || !expectedArtifactId) {
+    return false;
+  }
+  const desiredArtifactId = String(instance.desiredArtifactId || '').trim().toLowerCase();
+  const observedHash = String(instance.observedHash || '').trim().toLowerCase();
+  return instance.managed
+    ? (desiredArtifactId || observedHash) === expectedArtifactId
+    : observedHash === expectedArtifactId;
+}
+
+function skillsDesiredRowKey(desired) {
+  return `desired:${JSON.stringify([
+    String(desired?.skillId || '').trim(),
+    String(desired?.artifactId || '').trim(),
+    String(desired?.scope || 'user').trim(),
+    String(desired?.scopeId || 'user').trim(),
+  ])}`;
+}
+
+function skillsManagedReferenceRows(
+  desiredStates = state.skillsManager.desiredSkillStates,
+  appliedStates = state.skillsManager.appliedSkillStates,
+  deployments = state.skillsManager.deployments
+) {
+  const normalizedDesiredStates = Array.isArray(desiredStates) ? desiredStates : [];
+  const normalizedAppliedStates = Array.isArray(appliedStates) ? appliedStates : [];
+  const normalizedDeployments = Array.isArray(deployments) ? deployments : [];
+  const referenceIdentity = (reference) => {
+    const scope = String(reference?.scope || reference?.targetScope || 'user').trim().toLowerCase();
+    return {
+      hostId: String(reference?.hostId || '').trim(),
+      skillId: String(reference?.skillId || '').trim(),
+      artifactId: String(reference?.artifactId || '').trim(),
+      scope,
+      scopeId: scope === 'project'
+        ? String(reference?.scopeId || reference?.cwd || '').trim()
+        : 'user',
+    };
+  };
+  const sameReference = (left, right) => (
+    left.hostId === right.hostId
+    && left.skillId === right.skillId
+    && left.artifactId === right.artifactId
+    && left.scope === right.scope
+    && left.scopeId === right.scopeId
+  );
+  const sameActivationTarget = (left, right) => (
+    left.hostId === right.hostId
+    && left.skillId === right.skillId
+    && left.scope === right.scope
+    && left.scopeId === right.scopeId
+  );
+  const desiredMissingIsSettled = (reference, identity) => {
+    const appliedMissing = normalizedAppliedStates.find((candidate) => (
+      String(candidate?.appliedState || '').trim().toLowerCase() === 'missing'
+      && sameActivationTarget(identity, referenceIdentity(candidate))
+    )) || null;
+    if (appliedMissing) {
+      return !(Array.isArray(appliedMissing.uncertainArtifactIds)
+        && appliedMissing.uncertainArtifactIds.length)
+        && appliedMissing.skillWideUncertain !== true;
+    }
+    const deploymentId = String(reference?.deploymentId || '').trim();
+    if (!deploymentId) {
+      return false;
+    }
+    const deployment = normalizedDeployments.find((candidate) => {
+      if (
+        String(candidate?.deploymentId || '').trim() !== deploymentId
+        || String(candidate?.action || '').trim().toLowerCase() !== 'remove'
+      ) {
+        return false;
+      }
+      const deploymentIdentity = referenceIdentity({
+        ...candidate,
+        hostId: identity.hostId,
+      });
+      return sameReference(identity, deploymentIdentity)
+        && Array.isArray(candidate.targetHostIds)
+        && candidate.targetHostIds.some((hostId) => String(hostId || '').trim() === identity.hostId);
+    }) || null;
+    const result = deployment?.results?.find((candidate) => (
+      String(candidate?.hostId || '').trim() === identity.hostId
+    )) || null;
+    return String(result?.state || '').trim().toLowerCase() === 'succeeded';
+  };
+  const availableArtifactIdsForSkill = (skillId) => {
+    const libraryRecord = state.skillsManager.skillLibrary.find((candidate) => (
+      String(candidate?.skillId || '').trim() === skillId
+    )) || null;
+    const libraryArtifactIds = libraryRecordArtifactIds(libraryRecord);
+    return state.skillsManager.artifacts
+      .filter((artifact) => {
+        const artifactId = String(artifact?.artifactId || '').trim();
+        const skillIds = Array.isArray(artifact?.skillIds)
+          ? artifact.skillIds
+          : [artifact?.skillId].filter(Boolean);
+        return libraryArtifactIds.has(artifactId)
+          && skillIds.some((candidate) => String(candidate || '').trim() === skillId)
+          && String(artifact?.storageState || 'available').trim().toLowerCase() === 'available';
+      })
+      .map((artifact) => String(artifact.artifactId || '').trim());
+  };
+  const appliedEntries = [];
+  for (const reference of normalizedAppliedStates) {
+    appliedEntries.push({ kind: 'applied', reference });
+    for (const artifactId of Array.isArray(reference?.uncertainArtifactIds)
+      ? reference.uncertainArtifactIds
+      : []) {
+      appliedEntries.push({
+        kind: 'applied-uncertain',
+        reference: { ...reference, artifactId },
+      });
+    }
+    const appliedState = String(reference?.appliedState || '').trim().toLowerCase();
+    if (reference?.skillWideUncertain === true || appliedState === 'unknown') {
+      const skillId = String(reference?.skillId || '').trim();
+      for (const artifactId of availableArtifactIdsForSkill(skillId)) {
+        appliedEntries.push({
+          kind: 'applied-uncertain',
+          reference: { ...reference, artifactId },
+        });
+      }
+    }
+  }
+  const rows = new Map();
+  for (const entry of [
+    ...normalizedDesiredStates.map((reference) => ({ kind: 'desired', reference })),
+    ...appliedEntries,
+  ]) {
+    const { reference } = entry;
+    const { skillId, artifactId, hostId, scope, scopeId } = referenceIdentity(reference);
+    const referenceState = String(
+      entry.kind === 'desired' ? reference?.desiredState : reference?.appliedState
+    ).trim().toLowerCase();
+    const settledDesiredMissing = entry.kind === 'desired'
+      && referenceState === 'missing'
+      && desiredMissingIsSettled(reference, { skillId, artifactId, hostId, scope, scopeId });
+    if (
+      !skillId
+      || !artifactId
+      || !hostId
+      || (entry.kind === 'applied' && referenceState === 'missing')
+      || settledDesiredMissing
+      || (scope !== 'user' && scope !== 'project')
+      || (scope === 'project' && !scopeId)
+    ) {
+      continue;
+    }
+    const key = skillsDesiredRowKey({ skillId, artifactId, scope, scopeId });
+    const row = rows.get(key) || {
+      key,
+      skillId,
+      artifactId,
+      scope,
+      scopeId,
+      referenceHostIds: new Set(),
+    };
+    row.referenceHostIds.add(hostId);
+    rows.set(key, row);
+  }
+  return rows;
+}
+
+function skillsCleanupRowCanDeploy(row) {
+  if (!row?.skillId || !row?.artifactId || !row?.referenceHostIds?.size) {
+    return false;
+  }
+  const activeArtifact = latestRegistryArtifactForSkill(row.skillId);
+  const artifact = state.skillsManager.artifacts.find((candidate) => (
+    String(candidate?.artifactId || '').trim() === row.artifactId
+  )) || null;
+  const libraryRecord = state.skillsManager.skillLibrary.find((candidate) => (
+    String(candidate?.skillId || '').trim() === row.skillId
+  )) || null;
+  return Boolean(
+    activeArtifact?.artifactId !== row.artifactId
+    && artifact?.trustState === 'validated'
+    && String(artifact?.storageState || 'available').trim().toLowerCase() === 'available'
+    && libraryRecordArtifactIds(libraryRecord).has(row.artifactId)
+  );
+}
+
+function skillsDeploymentSnapshotsForAction(actionName, requestedHostIds) {
+  const manager = state.skillsManager;
+  const targetHostIds = Array.from(new Set(
+    (Array.isArray(requestedHostIds) ? requestedHostIds : [])
+      .map((hostId) => String(hostId || '').trim())
+      .filter(Boolean)
+  ));
+  const targetScope = manager.deploymentScope === 'project' ? 'project' : 'user';
+  const scopeId = targetScope === 'project' ? manager.projectCwd : 'user';
+  const snapshots = Array.from(manager.selectedSkillIds)
+    .map((skillId) => latestRegistryArtifactForSkill(skillId))
+    .filter(Boolean)
+    .map((entry) => ({
+      skillId: entry.skillId,
+      artifactId: entry.artifactId,
+      targetHostIds,
+      targetScope,
+      scopeId,
+      cwd: targetScope === 'project' ? scopeId : null,
+    }));
+  if (actionName === 'enable') {
+    return snapshots;
+  }
+
+  const cleanupRows = skillsManagedReferenceRows();
+  for (const key of manager.selectedCleanupKeys) {
+    const row = cleanupRows.get(key);
+    if (
+      !skillsCleanupRowCanDeploy(row)
+      || row.scope !== targetScope
+      || (targetScope === 'project' && row.scopeId !== scopeId)
+    ) {
+      continue;
+    }
+    const eligibleHostIds = targetHostIds.filter((hostId) => row.referenceHostIds.has(hostId));
+    if (!eligibleHostIds.length) {
+      continue;
+    }
+    snapshots.push({
+      skillId: row.skillId,
+      artifactId: row.artifactId,
+      targetHostIds: eligibleHostIds,
+      targetScope: row.scope,
+      scopeId: row.scopeId,
+      cwd: row.scope === 'project' ? row.scopeId : null,
+    });
+  }
+  return snapshots;
+}
+
+function desiredSkillsRowKeyForInstance(instance, desiredStates) {
+  const hostId = String(instance?.hostId || '').trim();
+  const skillId = String(instance?.skillId || '').trim();
+  const scope = String(instance?.scope || '').trim();
+  const scopeId = String(instance?.scopeId || '').trim();
+  const desired = (Array.isArray(desiredStates) ? desiredStates : [])
+    .filter((candidate) => (
+      String(candidate?.hostId || '').trim() === hostId
+      && String(candidate?.skillId || '').trim() === skillId
+      && String(candidate?.scope || 'user').trim() === scope
+      && String(candidate?.scopeId || 'user').trim() === scopeId
+      && instanceMatchesRegistryArtifact(instance, candidate?.artifactId)
+    ))
+    .sort((left, right) => (
+      String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''))
+      || String(right.deploymentId || '').localeCompare(String(left.deploymentId || ''))
+    ))[0] || null;
+  return desired ? skillsDesiredRowKey(desired) : '';
+}
+
+function latestSkillDeploymentForHost(
+  skillId,
+  hostId,
+  artifactId = '',
+  targetScope = '',
+  scopeId = ''
+) {
+  const expectedArtifactId = String(artifactId || '').trim();
+  const expectedScope = String(targetScope || '').trim();
+  const expectedScopeId = String(scopeId || '').trim();
+  return state.skillsManager.deployments
+    .filter((deployment) => (
+      deployment?.skillId === skillId
+      && (!expectedArtifactId || deployment?.artifactId === expectedArtifactId)
+      && (!expectedScope || deployment?.targetScope === expectedScope)
+      && (!expectedScopeId || deployment?.scopeId === expectedScopeId)
+      && Array.isArray(deployment.targetHostIds)
+      && deployment.targetHostIds.includes(hostId)
+    ))
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0] || null;
+}
+
+function skillsDeploymentCellStatus(
+  skillId,
+  host,
+  fallback,
+  artifactId = '',
+  targetScope = '',
+  scopeId = ''
+) {
+  const hostId = String(host?.hostId || host?.id || '').trim();
+  const deployment = latestSkillDeploymentForHost(
+    skillId,
+    hostId,
+    artifactId,
+    targetScope,
+    scopeId
+  );
+  const result = deployment?.results?.find((entry) => entry?.hostId === hostId) || null;
+  if (!deployment || !result || result.state === 'superseded') {
+    return fallback;
+  }
+  const resultState = String(result.state || '').trim().toLowerCase();
+  if (!host?.online && (resultState === 'pending' || resultState === 'queued' || resultState === 'running')) {
+    return { label: 'Pending', className: 'pending', error: result.error || '' };
+  }
+  if (resultState === 'pending' || resultState === 'queued' || resultState === 'running' || resultState === 'failed') {
+    const labels = {
+      pending: 'Pending',
+      queued: 'Queued',
+      running: 'Running',
+      failed: 'Failed',
+    };
+    return { label: labels[resultState], className: resultState, error: result.error || '' };
+  }
+  if (resultState === 'succeeded') {
+    if (deployment.action === 'enable' || deployment.action === 'remove') {
+      return fallback;
+    }
+    if (deployment.action === 'disable' && fallback.className === 'missing') {
+      return { label: 'Disabled', className: 'disabled', error: '' };
+    }
+    return fallback;
+  }
+  return fallback;
+}
+
+function skillsProjectWorkspaceOptions(hostIds = Array.from(state.skillsManager.selectedHostIds)) {
+  const targets = Array.from(new Set(hostIds.map((hostId) => String(hostId || '').trim()).filter(Boolean)));
+  if (!targets.length) {
+    return [];
+  }
+  const rootsByHost = targets.map((hostId) => new Set(
+    getSessionsForHost(hostId)
+      .map((session) => String(session?.cwd || '').trim())
+      .filter(Boolean)
+  ));
+  const [first, ...rest] = rootsByHost;
+  return Array.from(first || [])
+    .filter((cwd) => rest.every((roots) => roots.has(cwd)))
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function skillsProjectConfirmationKey(hostIds, cwd = state.skillsManager.projectCwd) {
+  const normalizedHostIds = Array.from(new Set(
+    (Array.isArray(hostIds) ? hostIds : [])
+      .map((hostId) => String(hostId || '').trim())
+      .filter(Boolean)
+  )).sort();
+  return JSON.stringify([normalizedHostIds, String(cwd || '').trim()]);
+}
+
+function resetSkillsProjectWriteConfirmation() {
+  state.skillsManager.confirmProjectWrite = false;
+  state.skillsManager.projectWriteConfirmationKey = '';
+}
+
+function clearSkillsCleanupSelection() {
+  state.skillsManager.selectedCleanupKeys.clear();
+}
+
+function deploymentStateLabel(stateName) {
+  const normalized = String(stateName || '').trim().toLowerCase();
+  return {
+    pending: 'Pending',
+    queued: 'Queued',
+    running: 'Running',
+    succeeded: 'Succeeded',
+    failed: 'Failed',
+    superseded: 'Superseded',
+  }[normalized] || 'Pending';
+}
+
+function renderSkillsDeploymentProgress() {
+  const container = el('skills-deployment-progress');
+  if (!container) {
+    return;
+  }
+  const hostById = new Map(
+    state.skillsManager.hosts
+      .map((host) => [String(host.hostId || host.id || ''), host])
+  );
+  const deployments = [...state.skillsManager.deployments]
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))
+    .slice(0, 6);
+  container.innerHTML = deployments.map((deployment) => {
+    const results = Array.isArray(deployment.results) ? deployment.results : [];
+    return `
+      <div class="skills-deployment-progress-row">
+        <div class="skills-deployment-progress-copy">
+          <strong>${escapeHtml(deployment.skillId || 'Skill')}</strong>
+          <small>${escapeHtml(`${deployment.action || 'enable'} / ${deployment.targetScope || 'user'}`)}</small>
+        </div>
+        <div class="skills-deployment-progress-results">
+          ${results.map((result) => {
+            const host = hostById.get(String(result.hostId || '')) || {};
+            const stateName = String(result.state || 'pending').toLowerCase();
+            const title = result.error || `${host.label || result.hostId}: ${deploymentStateLabel(stateName)}`;
+            return `<span class="skills-deployment-result state-${escapeHtml(stateName)}" title="${escapeHtml(title)}">${escapeHtml(host.label || result.hostId)}: ${escapeHtml(deploymentStateLabel(stateName))}</span>`;
+          }).join('')}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderSkillAdoptionAction(host, instance) {
+  if (!instance) {
+    return '';
+  }
+  const manager = state.skillsManager;
+  const adoption = latestSkillAdoption(instance);
+  const busy = manager.busyInstanceIds.has(instance.instanceId);
+  if (registeredSkillArtifactForInstance(instance)) {
+    return '<span class="skills-adoption-state">Adopted</span>';
+  }
+  if (
+    adoption?.state === 'completed'
+    && adoption?.artifactId
+    && adoption?.expectedHash === instance.observedHash
+  ) {
+    return '<span class="skills-adoption-state">Adopted</span>';
+  }
+  if (adoption?.state === 'queued' || adoption?.state === 'uploading') {
+    const label = adoption.state === 'uploading' ? 'Uploading' : 'Queued';
+    return `<span class="skills-adoption-state">${escapeHtml(label)}</span>`;
+  }
+  if (!canAdoptSkillInstance(host, instance)) {
+    return '';
+  }
+  const error = adoption?.state === 'failed' ? String(adoption.error || 'Adoption failed') : '';
+  return `
+    <button
+      type="button"
+      class="secondary-button skills-adopt-button"
+      data-skills-adopt-instance-id="${escapeHtml(instance.instanceId || '')}"
+      data-skills-adopt-host-id="${escapeHtml(instance.hostId || '')}"
+      title="${escapeHtml(error || 'Adopt complete Skill directory')}"
+      ${busy ? 'disabled' : ''}
+    >${busy ? 'Queueing' : adoption?.state === 'failed' ? 'Retry Adopt' : 'Adopt'}</button>
+  `;
+}
+
+function renderSkillsInventoryMatrix() {
+  const manager = state.skillsManager;
+  const matrix = el('skills-inventory-matrix');
+  const summary = el('skills-inventory-summary');
+  const toolbar = summary?.parentElement || null;
+  if (!matrix) {
+    return;
+  }
+  const visible = manager.tab === 'installed';
+  matrix.classList.toggle('hidden', !visible);
+  toolbar?.classList.toggle('hidden', !visible);
+  if (!visible) {
+    return;
+  }
+
+  const hosts = manager.hosts;
+  const inventoryByHost = new Map(manager.inventories.map((inventory) => [inventory.hostId, inventory]));
+  const rowsByKey = new Map();
+  for (const libraryRecord of manager.skillLibrary) {
+    const artifactRef = latestRegistryArtifactForSkill(libraryRecord?.skillId);
+    if (!artifactRef) {
+      continue;
+    }
+    const latestVersion = (libraryRecord.versions || []).find((version) => (
+      version.artifactId === artifactRef.artifactId
+    )) || libraryRecord.versions?.[libraryRecord.versions.length - 1] || null;
+    const rowKey = `registry:${artifactRef.skillId}`;
+    rowsByKey.set(rowKey, {
+      key: rowKey,
+      skillId: artifactRef.skillId,
+      name: String(libraryRecord.name || artifactRef.skillId),
+      sourceId: String(latestVersion?.sourceId || artifactRef.artifact.sourceId || 'registry'),
+      sourceLocator: String(latestVersion?.sourceLocator || artifactRef.artifact.sourceLocator || ''),
+      scope: 'registry',
+      scopeId: '',
+      artifactId: artifactRef.artifactId,
+      deployable: true,
+      byHost: new Map(),
+    });
+  }
+  for (const referenceRow of skillsManagedReferenceRows().values()) {
+    const { skillId, artifactId } = referenceRow;
+    if (!skillId || !artifactId || rowsByKey.get(`registry:${skillId}`)?.artifactId === artifactId) {
+      continue;
+    }
+    const artifact = manager.artifacts.find((candidate) => candidate?.artifactId === artifactId) || null;
+    const libraryRecord = manager.skillLibrary.find((candidate) => candidate?.skillId === skillId) || null;
+    const key = referenceRow.key;
+    if (!rowsByKey.has(key)) {
+      rowsByKey.set(key, {
+        key,
+        skillId,
+        name: String(libraryRecord?.name || skillId),
+        sourceId: String(artifact?.sourceId || 'managed-desired-state'),
+        sourceLocator: String(artifact?.sourceLocator || ''),
+        scope: referenceRow.scope,
+        scopeId: referenceRow.scopeId,
+        artifactId,
+        deployable: false,
+        managedReference: true,
+        cleanupSelectable: skillsCleanupRowCanDeploy(referenceRow),
+        referenceHostIds: new Set(referenceRow.referenceHostIds),
+        byHost: new Map(),
+      });
+    }
+  }
+  for (const instance of manager.instances) {
+    const skillId = String(instance?.skillId || '').trim();
+    const hostId = String(instance?.hostId || '').trim();
+    if (!skillId || !hostId) {
+      continue;
+    }
+    const registryKey = `registry:${skillId}`;
+    const registryRow = rowsByKey.get(registryKey) || null;
+    const desiredKey = desiredSkillsRowKeyForInstance(instance, manager.desiredSkillStates);
+    const key = registryRow && instanceMatchesRegistryArtifact(instance, registryRow.artifactId)
+      ? registryKey
+      : desiredKey && rowsByKey.has(desiredKey)
+        ? desiredKey
+        : skillsInventoryInstanceRowKey(instance);
+    const row = rowsByKey.get(key) || {
+      key,
+      skillId,
+      name: String(instance.name || skillId),
+      sourceId: String(instance.sourceId || instance.sourceKind || ''),
+      sourceLocator: String(instance.sourceLocator || ''),
+      scope: String(instance.scope || ''),
+      scopeId: String(instance.scopeId || ''),
+      artifactId: '',
+      deployable: false,
+      byHost: new Map(),
+    };
+    const hostInstances = row.byHost.get(hostId) || [];
+    hostInstances.push(instance);
+    row.byHost.set(hostId, hostInstances);
+    rowsByKey.set(key, row);
+  }
+  const rows = Array.from(rowsByKey.values()).sort((left, right) => (
+    left.name.localeCompare(right.name) || left.skillId.localeCompare(right.skillId)
+  ));
+  matrix.style.setProperty('--skills-host-count', String(Math.max(1, hosts.length)));
+
+  const cells = ['<div class="skills-inventory-cell skills-inventory-corner" role="columnheader">Skill</div>'];
+  for (const host of hosts) {
+    const hostId = String(host.hostId || host.id || '');
+    const inventory = inventoryByHost.get(hostId) || null;
+    const status = skillsInventoryHostStatus(host, inventory, manager);
+    const errors = (inventory?.scanErrors || []).map((item) => String(item.message || '')).filter(Boolean).join('\n');
+    cells.push(`
+      <div class="skills-inventory-cell skills-inventory-host" role="columnheader" title="${escapeHtml(errors)}">
+        <strong>${escapeHtml(host.label || hostId)}</strong>
+        <span class="skills-inventory-status state-${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
+      </div>
+    `);
+  }
+  if (!rows.length) {
+    cells.push('<div class="skills-inventory-empty" role="cell">No discovered or registered skills.</div>');
+  }
+  for (const row of rows) {
+    const rowInstances = Array.from(row.byHost.values()).flat();
+    const sourceSummary = row.deployable || row.managedReference
+      ? null
+      : skillsInventorySourceSummary(rowInstances);
+    const source = sourceSummary?.label || row.sourceLocator || row.sourceId || 'local-host';
+    const sourceTitle = sourceSummary?.title || row.sourceLocator || row.sourceId || '';
+    const scope = sourceSummary?.scopeLabel || (
+      row.scopeId && row.scopeId !== row.scope
+        ? `${row.scope || 'unknown'}: ${row.scopeId}`
+        : row.scope || 'unknown'
+    );
+    cells.push(`
+      <div class="skills-inventory-cell skills-inventory-skill" role="rowheader">
+        <label class="skills-inventory-skill-select">
+          ${row.deployable
+            ? `<input type="checkbox" data-skills-deploy-skill-id="${escapeHtml(row.skillId)}" ${manager.selectedSkillIds.has(row.skillId) ? 'checked' : ''} />`
+            : row.cleanupSelectable
+              ? `<input type="checkbox" data-skills-cleanup-row-key="${escapeHtml(row.key)}" ${manager.selectedCleanupKeys.has(row.key) ? 'checked' : ''} />`
+              : '<span aria-hidden="true"></span>'}
+          <strong>${escapeHtml(row.name || row.skillId)}</strong>
+        </label>
+        <span title="${escapeHtml(sourceTitle)}">${escapeHtml(source)}</span>
+        <small>${escapeHtml(row.deployable
+          ? `Artifact ${String(row.artifactId || '').slice(7, 19)}`
+          : row.managedReference
+            ? `${scope} / Artifact ${String(row.artifactId || '').slice(7, 19)}`
+            : scope)}</small>
+      </div>
+    `);
+    for (const host of hosts) {
+      const hostId = String(host.hostId || host.id || '');
+      const inventory = inventoryByHost.get(hostId) || null;
+      const hostInstances = row.byHost.get(hostId) || [];
+      const observedStatus = skillsInventoryCellStatus(host, inventory, hostInstances, manager);
+      const status = row.deployable || row.managedReference
+        ? skillsDeploymentCellStatus(
+          row.skillId,
+          host,
+          observedStatus,
+          row.artifactId,
+          row.managedReference ? row.scope : '',
+          row.managedReference ? row.scopeId : ''
+        )
+        : observedStatus;
+      const instance = preferredSkillInstance(hostInstances);
+      cells.push(`
+        <div class="skills-inventory-cell skills-inventory-state state-${escapeHtml(status.className)}" role="cell" title="${escapeHtml(status.error || '')}">
+          <span>${escapeHtml(status.label)}</span>
+          ${renderSkillAdoptionAction(host, instance)}
+        </div>
+      `);
+    }
+  }
+  matrix.innerHTML = cells.join('');
+  if (summary) {
+    summary.textContent = manager.loadError || `${rows.length} skill(s) across ${hosts.length} host(s)`;
+  }
+  const refreshSelected = el('skills-refresh-selected-button');
+  if (refreshSelected) {
+    refreshSelected.disabled = manager.loading || !manager.selectedHostIds.size;
+  }
+}
+
+function skillsDeploymentWorkspaceReady(hostIds) {
+  const manager = state.skillsManager;
+  if (manager.deploymentScope !== 'project') {
+    return true;
+  }
+  const projectOptions = skillsProjectWorkspaceOptions(hostIds);
+  return Boolean(manager.projectCwd && projectOptions.includes(manager.projectCwd));
+}
+
+function skillsDeploymentScopeReady(hostIds, authorization = null) {
+  const manager = state.skillsManager;
+  if (manager.deploymentScope !== 'project') {
+    return true;
+  }
+  const confirmationKey = authorization?.confirmationKey
+    ?? manager.projectWriteConfirmationKey;
+  const confirmedProjectWrite = authorization == null
+    ? manager.confirmProjectWrite
+    : authorization.confirmProjectWrite === true;
+  return Boolean(
+    confirmedProjectWrite
+    && skillsDeploymentWorkspaceReady(hostIds)
+    && confirmationKey === skillsProjectConfirmationKey(hostIds, manager.projectCwd)
+  );
+}
+
+function confirmSkillsAllHostsProjectWrite(hostIds) {
+  const manager = state.skillsManager;
+  const targets = Array.from(new Set(
+    (Array.isArray(hostIds) ? hostIds : [])
+      .map((hostId) => String(hostId || '').trim())
+      .filter(Boolean)
+  ));
+  if (
+    manager.deploymentScope !== 'project'
+    || !targets.length
+    || !skillsDeploymentWorkspaceReady(targets)
+  ) {
+    return null;
+  }
+  const cwd = String(manager.projectCwd || '').trim();
+  if (!window.confirm(
+    `Enable selected Registry Skills in project workspace "${cwd}" on all ${targets.length} Hosts?`
+  )) {
+    return null;
+  }
+  return {
+    confirmProjectWrite: true,
+    confirmationKey: skillsProjectConfirmationKey(targets, cwd),
+  };
+}
+
+function renderSkillsDeploymentControls() {
+  const manager = state.skillsManager;
+  const controls = el('skills-deployment-controls');
+  const progress = el('skills-deployment-progress');
+  const visible = manager.tab !== 'sources';
+  controls?.classList.toggle('hidden', !visible);
+  progress?.classList.toggle('hidden', !visible);
+  if (!visible) {
+    return;
+  }
+
+  document.querySelectorAll('[data-skills-scope]').forEach((button) => {
+    const active = button.getAttribute('data-skills-scope') === manager.deploymentScope;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+
+  const selectedHostIds = Array.from(manager.selectedHostIds);
+  const allHostIds = manager.hosts
+    .map((host) => String(host.hostId || host.id || '').trim())
+    .filter(Boolean);
+  const projectOptions = skillsProjectWorkspaceOptions(selectedHostIds);
+  if (!projectOptions.includes(manager.projectCwd)) {
+    const nextProjectCwd = projectOptions[0] || '';
+    if (manager.projectCwd !== nextProjectCwd) {
+      resetSkillsProjectWriteConfirmation();
+      manager.projectCwd = nextProjectCwd;
+    }
+  }
+  const projectMode = manager.deploymentScope === 'project';
+  const cwdSelect = el('skills-project-cwd-select');
+  if (cwdSelect) {
+    cwdSelect.classList.toggle('hidden', !projectMode);
+    cwdSelect.disabled = !projectMode || !projectOptions.length || manager.deploying;
+    cwdSelect.innerHTML = projectOptions.length
+      ? projectOptions.map((cwd) => `<option value="${escapeHtml(cwd)}" ${cwd === manager.projectCwd ? 'selected' : ''}>${escapeHtml(cwd)}</option>`).join('')
+      : '<option value="">No shared workspace</option>';
+  }
+  const confirmation = el('skills-project-confirmation');
+  confirmation?.classList.toggle('hidden', !projectMode);
+  const confirmInput = el('skills-confirm-project-write');
+  if (confirmInput) {
+    confirmInput.checked = manager.confirmProjectWrite;
+    confirmInput.disabled = !projectMode || !projectOptions.length || manager.deploying;
+  }
+
+  const enableSnapshots = skillsDeploymentSnapshotsForAction('enable', selectedHostIds);
+  const cleanupSnapshots = skillsDeploymentSnapshotsForAction('disable', selectedHostIds);
+  const hasEnableTargets = enableSnapshots.length > 0;
+  const hasCleanupTargets = cleanupSnapshots.length > 0;
+  const enableSelectedReady = hasEnableTargets
+    && selectedHostIds.length > 0
+    && skillsDeploymentScopeReady(selectedHostIds)
+    && !manager.deploying;
+  const enableAllReady = skillsDeploymentSnapshotsForAction('enable', allHostIds).length > 0
+    && allHostIds.length > 0
+    && skillsDeploymentWorkspaceReady(allHostIds)
+    && !manager.deploying;
+  const cleanupSelectedReady = hasCleanupTargets
+    && selectedHostIds.length > 0
+    && skillsDeploymentScopeReady(selectedHostIds)
+    && !manager.deploying;
+  const enableSelected = el('skills-enable-selected-button');
+  const enableAll = el('skills-enable-all-hosts-button');
+  const disableSelected = el('skills-disable-selected-button');
+  const removeHost = el('skills-remove-host-button');
+  if (enableSelected) {
+    enableSelected.disabled = !enableSelectedReady;
+  }
+  if (enableAll) {
+    enableAll.disabled = !enableAllReady;
+    enableAll.title = projectMode
+      ? skillsDeploymentWorkspaceReady(allHostIds)
+        ? `Confirm project write to ${manager.projectCwd} on all Hosts`
+        : 'Choose a project workspace shared by all Hosts'
+      : 'Enable selected Registry Skills on all Hosts';
+  }
+  if (disableSelected) {
+    disableSelected.disabled = !cleanupSelectedReady;
+  }
+  if (removeHost) {
+    removeHost.disabled = !cleanupSelectedReady;
+  }
+  renderSkillsDeploymentProgress();
+}
+
+function renderSkillsManager() {
+  const overlay = el('skills-manager-overlay');
+  if (!overlay) {
+    return;
+  }
+  const manager = state.skillsManager;
+  overlay.classList.toggle('hidden', !manager.open);
+  overlay.setAttribute('aria-hidden', manager.open ? 'false' : 'true');
+  if (!manager.open) {
+    syncModalBodyState();
+    return;
+  }
+  el('skills-actions-bar')?.classList.toggle('hidden', manager.tab === 'sources');
+
+  const hostList = el('skills-host-list');
+  if (hostList) {
+    hostList.innerHTML = '';
+    const hosts = manager.hosts;
+    if (!hosts.length) {
+      hostList.innerHTML = '<div class="empty-state">No hosts available.</div>';
+    }
+    for (const host of hosts) {
+      const hostId = host.hostId || host.id || '';
+      if (!hostId) {
+        continue;
+      }
+      const row = document.createElement('label');
+      row.className = 'skills-host-row';
+      row.innerHTML = `
+        <input type="checkbox" data-skills-host-id="${escapeHtml(hostId)}" ${manager.selectedHostIds.has(hostId) ? 'checked' : ''} />
+        <span>
+          <strong>${escapeHtml(host.label || hostId)}</strong>
+          <small>${escapeHtml(host.codexHome || host.runtime?.codexHome || '')}</small>
+        </span>
+      `;
+      hostList.appendChild(row);
+    }
+  }
+
+  const list = el('skills-list');
+  if (list) {
+    list.classList.toggle('hidden', manager.tab === 'installed' || manager.tab === 'sources');
+    list.innerHTML = '';
+    const query = String(manager.query || '').trim().toLowerCase();
+    const sourceItems = manager.tab === 'installed'
+      ? manager.installed
+      : manager.tab === 'favorites'
+        ? [...manager.installed, ...manager.catalog].filter((skill) => manager.favorites.includes(skill.skillId))
+        : manager.tab === 'trending'
+          ? manager.catalog.filter((skill) => skill.trending)
+          : manager.tab === 'sources'
+            ? []
+            : manager.catalog;
+    const items = sourceItems
+      .filter((skill) => !query || `${skill.name || ''} ${skill.description || ''} ${skill.skillId || ''}`.toLowerCase().includes(query));
+    if (manager.loading) {
+      list.innerHTML = '<div class="empty-state">Loading skills...</div>';
+    } else if (!items.length) {
+      list.innerHTML = '<div class="empty-state">No skills to show.</div>';
+    }
+    for (const skill of items) {
+      const skillId = skill.skillId || skill.id || skill.name || '';
+      const artifactRef = latestRegistryArtifactForSkill(skillId);
+      const retireBusy = artifactRef
+        ? manager.lifecycleBusyKeys.has(`library:${skillId}:retire`)
+        : false;
+      const row = document.createElement('article');
+      row.className = 'skills-row';
+      row.innerHTML = `
+        <label class="skills-row-select">
+          ${artifactRef ? `<input type="checkbox" data-skills-deploy-skill-id="${escapeHtml(skillId)}" ${manager.selectedSkillIds.has(skillId) ? 'checked' : ''} />` : '<span aria-hidden="true"></span>'}
+        </label>
+        <div class="skills-row-copy">
+          <strong>${escapeHtml(skill.name || skillId || 'Skill')}</strong>
+          <span>${escapeHtml(skill.description || skill.source || 'No description.')}</span>
+          <small>${escapeHtml(skill.sourceUrl || skill.hostId || skill.source || '')}</small>
+        </div>
+        <div class="skills-row-actions">
+          <button type="button" class="secondary-button" data-skills-favorite-id="${escapeHtml(skillId)}">${manager.favorites.includes(skillId) ? 'Saved' : 'Favorite'}</button>
+          ${artifactRef ? `
+            <button
+              type="button"
+              class="danger-button"
+              data-skills-retire-library-id="${escapeHtml(skillId)}"
+              ${retireBusy ? 'disabled' : ''}
+              aria-busy="${retireBusy ? 'true' : 'false'}"
+            >${retireBusy ? 'Retiring...' : 'Retire from Library'}</button>
+          ` : ''}
+        </div>
+      `;
+      list.appendChild(row);
+    }
+  }
+
+  const summary = el('skills-action-summary');
+  if (summary) {
+    summary.textContent = manager.loadError || manager.actionSummary || '';
+  }
+
+  renderSkillsDeploymentControls();
+  renderSkillsInventoryMatrix();
+  renderSkillsSources();
+
+  document.querySelectorAll('[data-skills-tab]').forEach((button) => {
+    button.classList.toggle('active', button.getAttribute('data-skills-tab') === manager.tab);
+  });
+
+  applyStaticLocalization(overlay);
+  syncModalBodyState();
+}
+
+function activeSkillSourceRefresh(sourceId, imports = state.skillsManager.imports) {
+  const normalizedSourceId = String(sourceId || '').trim();
+  return (Array.isArray(imports) ? imports : []).find((operation) => (
+    String(operation?.refreshSourceId || '').trim() === normalizedSourceId
+    && ['queued', 'downloading', 'validating'].includes(
+      String(operation?.state || '').trim().toLowerCase()
+    )
+  )) || null;
+}
+
+function normalizeSkillSourceRefreshPolicy(value) {
+  const policy = String(value || '').trim().toLowerCase();
+  return ['manual', 'hourly', 'daily', 'weekly'].includes(policy) ? policy : 'manual';
+}
+
+function normalizeSkillSourceRolloutPolicy(value) {
+  return String(value || '').trim().toLowerCase() === 'enabled-hosts'
+    ? 'enabled-hosts'
+    : 'manual';
+}
+
+function skillSourceAutomationDraft(source) {
+  const sourceId = String(source?.sourceId || '').trim();
+  const saved = state.skillsManager.sourceAutomationDrafts.get(sourceId);
+  return saved || {
+    refreshPolicy: normalizeSkillSourceRefreshPolicy(source?.refreshPolicy),
+    rolloutPolicy: normalizeSkillSourceRolloutPolicy(source?.rolloutPolicy),
+    dirty: false,
+  };
+}
+
+function renderSkillsAudit() {
+  const manager = state.skillsManager;
+  const section = el('skills-audit-section');
+  const button = el('skills-load-audit-button');
+  const error = el('skills-audit-error');
+  const list = el('skills-audit-list');
+  const visible = manager.tab === 'sources';
+  section?.classList.toggle('hidden', !visible);
+  if (button) {
+    button.disabled = manager.auditLoading;
+    button.textContent = manager.auditLoading
+      ? 'Loading...'
+      : manager.auditLoaded ? 'Refresh audit' : 'Load recent';
+  }
+  if (error) {
+    error.textContent = manager.auditError || '';
+    error.classList.toggle('hidden', !manager.auditError);
+  }
+  if (!list || !visible) return;
+  list.innerHTML = '';
+  if (!manager.auditLoaded && !manager.auditLoading) {
+    list.innerHTML = '<div class="empty-state">Load the recent durable Skills audit when needed.</div>';
+    return;
+  }
+  if (!manager.auditEvents.length && !manager.auditLoading) {
+    list.innerHTML = '<div class="empty-state">No Skills audit events have been recorded.</div>';
+    return;
+  }
+  for (const event of [...manager.auditEvents].reverse()) {
+    const item = document.createElement('article');
+    item.className = 'skills-audit-item';
+    const policySummary = event?.data?.refreshPolicy || event?.data?.rolloutPolicy
+      ? `${event.data.refreshPolicy || 'manual'} / ${event.data.rolloutPolicy || 'manual'}`
+      : '';
+    item.innerHTML = `
+      <div class="skills-audit-item-top">
+        <strong>${escapeHtml(event.type || 'skills.event')}</strong>
+        <span>#${Number(event.sequence || 0)} | ${escapeHtml(formatTime(event.timestamp))}</span>
+      </div>
+      <span>${escapeHtml(event.subject || event.actor || 'relay')}</span>
+      ${policySummary ? `<small>${escapeHtml(policySummary)}</small>` : ''}
+    `;
+    list.appendChild(item);
+  }
+}
+
+function renderSkillsSources() {
+  const manager = state.skillsManager;
+  const digest = el('skills-daily-digest');
+  if (digest) {
+    const recommendations = Array.isArray(manager.dailySkillDigest?.recommendations)
+      ? manager.dailySkillDigest.recommendations
+      : [];
+    digest.classList.toggle('hidden', manager.tab !== 'trending' && manager.tab !== 'browse');
+    digest.innerHTML = recommendations.length
+      ? `<strong>${escapeHtml(manager.dailySkillDigest?.title || 'Daily skills picks')}</strong><span>${escapeHtml(recommendations.map((skill) => skill.name).join(' | '))}</span>`
+      : '<strong>Daily skills picks</strong><span>No recommendations yet.</span>';
+  }
+
+  const editor = el('skills-source-editor');
+  const githubEditor = el('skills-github-import-editor');
+  const lifecycleToolbar = el('skills-library-lifecycle-toolbar');
+  const lifecycleList = el('skills-library-lifecycle-list');
+  const configuredSourcesTitle = el('skills-configured-sources-title');
+  const sourceList = el('skills-source-list');
+  renderSkillsAudit();
+  if (editor) {
+    editor.classList.toggle('hidden', manager.tab !== 'sources');
+  }
+  if (githubEditor) {
+    githubEditor.classList.toggle('hidden', manager.tab !== 'sources' && manager.tab !== 'browse');
+  }
+  lifecycleToolbar?.classList.toggle('hidden', manager.tab !== 'sources');
+  lifecycleList?.classList.toggle('hidden', manager.tab !== 'sources');
+  configuredSourcesTitle?.classList.toggle('hidden', manager.tab !== 'sources');
+  const importButton = el('skills-import-github-button');
+  if (importButton) {
+    importButton.disabled = manager.importingGithub;
+    importButton.textContent = manager.importingGithub ? 'Importing...' : 'Import GitHub';
+  }
+  const collectButton = el('skills-collect-unused-button');
+  if (collectButton) {
+    collectButton.disabled = manager.collectingArtifacts;
+    collectButton.textContent = manager.collectingArtifacts ? 'Collecting...' : 'Collect unused';
+    collectButton.setAttribute('aria-busy', manager.collectingArtifacts ? 'true' : 'false');
+  }
+  if (lifecycleList) {
+    lifecycleList.innerHTML = '';
+    if (manager.tab === 'sources') {
+      const libraryRecords = manager.skillLibrary.filter((record) => (
+        record?.registry === true || Boolean(record?.latestArtifactId)
+      ));
+      if (!libraryRecords.length) {
+        lifecycleList.innerHTML = '<div class="empty-state">No Registry Library skills.</div>';
+      }
+      for (const record of libraryRecords) {
+        const skillId = String(record?.skillId || '').trim();
+        if (!skillId) {
+          continue;
+        }
+        const archived = record.archived === true;
+        const storageState = libraryRecordArtifactStorageState(record);
+        const restoreAvailable = !archived || storageState === 'available';
+        const action = archived ? 'restore' : 'retire';
+        const busyKey = `library:${skillId}:${action}`;
+        const busy = manager.lifecycleBusyKeys.has(busyKey);
+        const row = document.createElement('article');
+        row.className = `skills-source-row skills-library-row${archived ? ' archived' : ''}`;
+        row.innerHTML = `
+          <div>
+            <strong>${escapeHtml(record.name || skillId)}</strong>
+            <span>${escapeHtml(record.sourceUrl || record.source || 'registry')}</span>
+            <small>${archived
+              ? storageState === 'available'
+                ? `Retired${record.retiredAt ? ` ${escapeHtml(formatTime(record.retiredAt))}` : ''}`
+                : storageState === 'gc-pending'
+                  ? 'Collection pending'
+                  : storageState === 'collected'
+                    ? 'Collected'
+                    : 'Unavailable'
+              : 'Active'}</small>
+          </div>
+          <div class="skills-source-actions">
+            ${restoreAvailable ? `
+              <button
+                type="button"
+                class="${archived ? 'secondary-button' : 'danger-button'} skills-library-action"
+                data-skills-${action}-library-id="${escapeHtml(skillId)}"
+                ${busy ? 'disabled' : ''}
+                aria-busy="${busy ? 'true' : 'false'}"
+              >${busy ? (archived ? 'Restoring...' : 'Retiring...') : (archived ? 'Restore' : 'Retire from Library')}</button>
+            ` : '<span class="skills-adoption-state">Unavailable</span>'}
+          </div>
+        `;
+        lifecycleList.appendChild(row);
+      }
+    }
+  }
+  if (!sourceList) {
+    return;
+  }
+  sourceList.classList.toggle('hidden', manager.tab !== 'sources');
+  sourceList.innerHTML = '';
+  if (manager.tab !== 'sources') {
+    return;
+  }
+  if (!manager.sources.length) {
+    sourceList.innerHTML = '<div class="empty-state">No custom skill sources yet.</div>';
+    return;
+  }
+  for (const source of manager.sources) {
+    const row = document.createElement('article');
+    row.className = 'skills-source-row';
+    const sourceId = String(source?.sourceId || '').trim();
+    const canRefresh = source.registry && String(source.kind || '').trim().toLowerCase() === 'github';
+    const canAutomate = canRefresh;
+    const refreshOperation = activeSkillSourceRefresh(sourceId);
+    const refreshBusy = manager.lifecycleBusyKeys.has(`source:${sourceId}:refresh`) || Boolean(refreshOperation);
+    const refreshDisabled = refreshBusy || source.enabled === false;
+    const automationBusy = manager.lifecycleBusyKeys.has(`source:${sourceId}:automation`);
+    const automationDraft = skillSourceAutomationDraft(source);
+    const automationStatus = manager.sourceAutomationStatus.get(sourceId) || null;
+    const sourceRefreshPolicy = normalizeSkillSourceRefreshPolicy(source.refreshPolicy);
+    const sourceRolloutPolicy = normalizeSkillSourceRolloutPolicy(source.rolloutPolicy);
+    const automationDirty = automationDraft.refreshPolicy !== sourceRefreshPolicy
+      || automationDraft.rolloutPolicy !== sourceRolloutPolicy;
+    const sourceAction = source.registry
+      ? `
+        <div class="skills-source-actions">
+          <span class="skills-adoption-state">Registry</span>
+          ${canRefresh ? `
+            <button
+              type="button"
+              class="secondary-button"
+              data-skills-refresh-source-id="${escapeHtml(sourceId)}"
+              ${refreshDisabled ? 'disabled' : ''}
+              aria-busy="${refreshBusy ? 'true' : 'false'}"
+              title="${escapeHtml(source.enabled === false ? 'Enable this source before refreshing.' : '')}"
+            >${refreshBusy ? 'Refreshing...' : 'Refresh'}</button>
+          ` : ''}
+        </div>
+      `
+      : `<div class="skills-source-actions"><button type="button" class="danger-button" data-skills-remove-source-id="${escapeHtml(sourceId)}">Remove</button></div>`;
+    const revision = String(source.revision || `${Number((source.skills || []).length)} skill(s)`);
+    const sourceRevision = `<small title="${escapeHtml(revision)}">${escapeHtml(shortId(revision))}</small>`;
+    const sourceError = source.lastError
+      ? `<small class="skills-source-status-error" title="${escapeHtml(source.lastError)}">${escapeHtml(limitText(source.lastError, 320))}</small>`
+      : '';
+    const automationStatusHtml = automationStatus?.message
+      ? `<small class="skills-source-automation-status ${automationStatus.tone === 'error' ? 'error' : 'success'}">${escapeHtml(automationStatus.message)}</small>`
+      : '';
+    row.innerHTML = `
+      <div class="skills-source-main">
+        <strong>${escapeHtml(source.name || 'Skill source')}</strong>
+        <span>${escapeHtml(source.url || source.locator || source.kind || 'manual')}</span>
+        ${sourceRevision}
+        ${sourceError}
+        <div class="skills-source-automation" data-skills-source-automation-id="${escapeHtml(sourceId)}">
+          <label>
+            <span>Refresh</span>
+            <select
+              data-skills-source-refresh-policy="${escapeHtml(sourceId)}"
+              aria-label="Refresh policy for ${escapeHtml(source.name || sourceId)}"
+              ${!canAutomate || automationBusy ? 'disabled' : ''}
+            >
+              <option value="manual" ${automationDraft.refreshPolicy === 'manual' ? 'selected' : ''}>Manual</option>
+              <option value="hourly" ${automationDraft.refreshPolicy === 'hourly' ? 'selected' : ''}>Hourly</option>
+              <option value="daily" ${automationDraft.refreshPolicy === 'daily' ? 'selected' : ''}>Daily</option>
+              <option value="weekly" ${automationDraft.refreshPolicy === 'weekly' ? 'selected' : ''}>Weekly</option>
+            </select>
+          </label>
+          <label>
+            <span>Rollout</span>
+            <select
+              data-skills-source-rollout-policy="${escapeHtml(sourceId)}"
+              aria-label="Rollout policy for ${escapeHtml(source.name || sourceId)}"
+              ${!canAutomate || automationBusy ? 'disabled' : ''}
+            >
+              <option value="manual" ${automationDraft.rolloutPolicy === 'manual' ? 'selected' : ''}>Manual</option>
+              <option value="enabled-hosts" ${automationDraft.rolloutPolicy === 'enabled-hosts' ? 'selected' : ''}>Enabled hosts</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            class="secondary-button"
+            data-skills-save-source-automation-id="${escapeHtml(sourceId)}"
+            ${!canAutomate || automationBusy || !automationDirty ? 'disabled' : ''}
+            aria-busy="${automationBusy ? 'true' : 'false'}"
+          >${automationBusy ? 'Saving...' : 'Save policy'}</button>
+          ${!canAutomate ? '<small>Automation is available for GitHub Registry sources.</small>' : automationStatusHtml}
+        </div>
+      </div>
+      ${sourceAction}
+    `;
+    sourceList.appendChild(row);
+  }
+}
+
+function closeSkillsInventoryEvents() {
+  const manager = state.skillsManager;
+  if (manager.events) {
+    manager.events.close();
+    manager.events = null;
+  }
+  if (manager.eventsRetryTimer) {
+    window.clearTimeout(manager.eventsRetryTimer);
+    manager.eventsRetryTimer = null;
+  }
+  if (manager.reloadTimer) {
+    window.clearTimeout(manager.reloadTimer);
+    manager.reloadTimer = null;
+  }
+  if (manager.renderTimer) {
+    window.clearTimeout(manager.renderTimer);
+    manager.renderTimer = null;
+  }
+}
+
+function scheduleSkillsManagerReload() {
+  const manager = state.skillsManager;
+  manager.dirty = true;
+  if (!manager.open || !authAllowsRequests() || manager.reloadTimer) {
+    return;
+  }
+  manager.reloadTimer = window.setTimeout(() => {
+    manager.reloadTimer = null;
+    if (!manager.open || !authAllowsRequests() || !manager.dirty) {
+      return;
+    }
+    if (manager.loading) {
+      scheduleSkillsManagerReload();
+      return;
+    }
+    loadSkillsManager().catch(reportError);
+  }, 100);
+}
+
+function scheduleSkillsManagerRender() {
+  const manager = state.skillsManager;
+  if (!manager.open || manager.renderTimer) {
+    return;
+  }
+  manager.renderTimer = window.setTimeout(() => {
+    manager.renderTimer = null;
+    if (manager.open) {
+      renderSkillsManager();
+    }
+  }, 50);
+}
+
+function scheduleSkillsInventoryEventsReconnect() {
+  const manager = state.skillsManager;
+  if (!authAllowsRequests() || manager.events || manager.eventsRetryTimer) {
+    return;
+  }
+  const delayMs = Math.min(15000, Math.max(1000, Number(manager.eventsRetryDelayMs || 1000)));
+  manager.eventsRetryDelayMs = Math.min(15000, delayMs * 2);
+  manager.eventsRetryTimer = window.setTimeout(() => {
+    manager.eventsRetryTimer = null;
+    openSkillsInventoryEvents();
+  }, delayMs);
+}
+
+function openSkillsInventoryEvents() {
+  const manager = state.skillsManager;
+  if (!authAllowsRequests() || manager.events || typeof EventSource === 'undefined') {
+    return;
+  }
+  if (manager.eventsRetryTimer) {
+    window.clearTimeout(manager.eventsRetryTimer);
+    manager.eventsRetryTimer = null;
+  }
+  const source = new EventSource('/api/skills/events');
+  manager.events = source;
+  source.onopen = () => {
+    if (manager.events === source) {
+      manager.eventsRetryDelayMs = 1000;
+      clearSkillOptionsCacheForHosts(
+        state.hosts.map((host) => String(host.hostId || host.id || '').trim()).filter(Boolean)
+      );
+      const selected = getSelectedSession();
+      if (selected?.live) {
+        loadSkillOptionsForSession(selected, { force: true }).catch(reportError);
+      }
+      scheduleSkillsManagerReload();
+    }
+  };
+  source.addEventListener('skills.inventory.updated', (event) => {
+    let payload = null;
+    try {
+      payload = JSON.parse(event.data || '{}');
+    } catch (_) {
+      return;
+    }
+    const hostId = String(payload?.hostId || '').trim();
+    if (hostId) {
+      manager.refreshingHostIds.delete(hostId);
+      clearSkillOptionsCacheForHosts([hostId]);
+    }
+    scheduleSkillsManagerReload();
+  });
+  source.addEventListener('skills.library.updated', (event) => {
+    let payload = null;
+    try {
+      payload = JSON.parse(event.data || '{}');
+    } catch (_) {
+      return;
+    }
+    manager.actionSummary = skillsLibraryEventSummary(payload, manager.actionSummary);
+    scheduleSkillsManagerReload();
+  });
+  source.addEventListener('skills.deployment.updated', (event) => {
+    let payload = null;
+    try {
+      payload = JSON.parse(event.data || '{}');
+    } catch (_) {
+      return;
+    }
+    mergeSkillsDeploymentUpdate(payload);
+    const hostId = String(payload?.hostId || '').trim();
+    const resultState = String(payload?.result?.state || '').trim().toLowerCase();
+    if (hostId && resultState === 'succeeded') {
+      clearSkillOptionsCacheForHosts([hostId]);
+      const selected = getSelectedSession();
+      if (selected?.live && selected.hostId === hostId) {
+        loadSkillOptionsForSession(selected, { force: true }).catch(reportError);
+      }
+    }
+    manager.actionSummary = resultState === 'failed'
+      ? `${payload?.deployment?.skillId || 'Skill'} failed on ${hostId || 'Host'}: ${payload?.result?.error || 'deployment failed'}`
+      : manager.actionSummary;
+    scheduleSkillsManagerRender();
+  });
+  source.onerror = async () => {
+    if (manager.events !== source) {
+      return;
+    }
+    source.close();
+    manager.events = null;
+    try {
+      const authenticated = await refreshAuthState();
+      if (authenticated) {
+        scheduleSkillsInventoryEventsReconnect();
+      }
+    } catch (_) {
+      scheduleSkillsInventoryEventsReconnect();
+    }
+  };
+}
+
+async function refreshSkillsInventory(hostIds) {
+  const targets = Array.from(new Set(
+    (Array.isArray(hostIds) ? hostIds : [])
+      .map((hostId) => String(hostId || '').trim())
+      .filter(Boolean)
+  ));
+  state.skillsManager.actionSummary = targets.length
+    ? `Queueing refresh for ${targets.length} host(s)...`
+    : 'Queueing refresh for all hosts...';
+  renderSkillsManager();
+  try {
+    const response = await fetchJson('/api/skills/refresh', {
+      method: 'POST',
+      body: JSON.stringify({ hostIds: targets }),
+    });
+    state.skillsManager.refreshingHostIds = new Set(
+      (response.hosts || [])
+        .filter((host) => host.state === 'queued')
+        .map((host) => String(host.hostId || '').trim())
+        .filter(Boolean)
+    );
+    await loadSkillsManager({ message: 'Skills refresh queued.' });
+  } catch (error) {
+    state.skillsManager.actionSummary = `Skills refresh failed: ${error.message}`;
+    renderSkillsManager();
+  }
+}
+
+function openSkillsManager() {
+  state.skillsManager.open = true;
+  renderSkillsManager();
+  openSkillsInventoryEvents();
+  loadSkillsManager().catch(reportError);
+}
+
+function closeSkillsManager() {
+  state.skillsManager.open = false;
+  clearSkillsCleanupSelection();
+  resetSkillsProjectWriteConfirmation();
+  renderSkillsManager();
+}
+
+async function toggleSkillFavorite(skillId) {
+  const id = String(skillId || '').trim();
+  if (!id) {
+    return;
+  }
+  const favorite = !state.skillsManager.favorites.includes(id);
+  const response = await fetchJson('/api/skills/favorites', {
+    method: 'POST',
+    body: JSON.stringify({ skillId: id, favorite }),
+  });
+  state.skillsManager.favorites = Array.isArray(response.favorites) ? response.favorites : state.skillsManager.favorites;
+  renderSkillsManager();
+}
+
+async function adoptSkillInstance(hostId, instanceId) {
+  const normalizedHostId = String(hostId || '').trim();
+  const normalizedInstanceId = String(instanceId || '').trim();
+  if (!normalizedHostId || !normalizedInstanceId) {
+    return;
+  }
+  const manager = state.skillsManager;
+  manager.busyInstanceIds.add(normalizedInstanceId);
+  manager.actionSummary = 'Queueing Skill adoption...';
+  renderSkillsManager();
+  try {
+    const response = await fetchJson('/api/skills/adopt', {
+      method: 'POST',
+      body: JSON.stringify({
+        hostId: normalizedHostId,
+        instanceId: normalizedInstanceId,
+      }),
+    });
+    manager.adoptions = [
+      ...manager.adoptions.filter((item) => item.adoptionId !== response.adoptionId),
+      response,
+    ];
+    manager.actionSummary = response.reused ? 'Skill adoption is already queued.' : 'Skill adoption queued.';
+    await loadSkillsManager();
+  } catch (error) {
+    manager.actionSummary = `Skill adoption failed: ${error.message}`;
+  } finally {
+    manager.busyInstanceIds.delete(normalizedInstanceId);
+    renderSkillsManager();
+  }
+}
+
+async function importGithubSkill() {
+  const locatorInput = el('skills-github-locator-input');
+  const refInput = el('skills-github-ref-input');
+  const subpathInput = el('skills-github-subpath-input');
+  const locator = String(locatorInput?.value || '').trim();
+  const ref = String(refInput?.value || '').trim() || 'main';
+  const subpath = String(subpathInput?.value || '').trim();
+  if (!locator) {
+    state.skillsManager.actionSummary = 'Enter a GitHub repository.';
+    renderSkillsManager();
+    return;
+  }
+  state.skillsManager.importingGithub = true;
+  state.skillsManager.actionSummary = 'Queueing GitHub Skill import...';
+  renderSkillsManager();
+  try {
+    const response = await fetchJson('/api/skills/import', {
+      method: 'POST',
+      body: JSON.stringify({
+        source: {
+          kind: 'github',
+          locator,
+          ref,
+          subpath,
+        },
+      }),
+    });
+    state.skillsManager.imports = [
+      ...state.skillsManager.imports.filter((item) => item.importId !== response.importId),
+      response,
+    ];
+    state.skillsManager.actionSummary = 'GitHub Skill import queued.';
+    if (locatorInput) {
+      locatorInput.value = '';
+    }
+    if (subpathInput) {
+      subpathInput.value = '';
+    }
+    await loadSkillsManager();
+  } catch (error) {
+    state.skillsManager.actionSummary = `GitHub Skill import failed: ${error.message}`;
+  } finally {
+    state.skillsManager.importingGithub = false;
+    renderSkillsManager();
+  }
+}
+
+async function refreshGithubSkillSource(sourceId) {
+  const normalizedSourceId = String(sourceId || '').trim();
+  const manager = state.skillsManager;
+  const source = manager.sources.find((candidate) => candidate?.sourceId === normalizedSourceId) || null;
+  if (
+    !normalizedSourceId
+    || !source?.registry
+    || String(source.kind || '').trim().toLowerCase() !== 'github'
+  ) {
+    return;
+  }
+  const busyKey = `source:${normalizedSourceId}:refresh`;
+  if (manager.lifecycleBusyKeys.has(busyKey)) {
+    return;
+  }
+  manager.lifecycleBusyKeys.add(busyKey);
+  manager.actionSummary = `Refreshing ${source.name || normalizedSourceId}...`;
+  renderSkillsManager();
+  try {
+    const response = await fetchJson(`/api/skills/sources/${encodeURIComponent(normalizedSourceId)}/refresh`, {
+      method: 'POST',
+      body: JSON.stringify({ expectedRevision: manager.registryRevision }),
+    });
+    advanceSkillsRegistryRevision(response.registryRevision ?? response.revision);
+    const imported = response.import || response;
+    if (imported?.importId) {
+      manager.imports = [
+        ...manager.imports.filter((item) => item.importId !== imported.importId),
+        imported,
+      ];
+    }
+    manager.actionSummary = response.reused
+      ? 'Source refresh is already running.'
+      : 'Source refresh queued.';
+    await loadSkillsManager({ message: manager.actionSummary });
+  } catch (error) {
+    advanceSkillsRegistryRevision(error.body?.revision);
+    manager.actionSummary = `Source refresh failed: ${error.message}`;
+    await loadSkillsManager({ message: manager.actionSummary });
+  } finally {
+    manager.lifecycleBusyKeys.delete(busyKey);
+    renderSkillsManager();
+  }
+}
+
+async function updateSkillSourceAutomation(sourceId, policies = null) {
+  const normalizedSourceId = String(sourceId || '').trim();
+  const manager = state.skillsManager;
+  const source = manager.sources.find((candidate) => candidate?.sourceId === normalizedSourceId) || null;
+  const canAutomate = source?.registry === true
+    && String(source.kind || '').trim().toLowerCase() === 'github';
+  if (!normalizedSourceId || !canAutomate) return false;
+  const busyKey = `source:${normalizedSourceId}:automation`;
+  if (manager.lifecycleBusyKeys.has(busyKey)) return false;
+  const draft = policies || skillSourceAutomationDraft(source);
+  const refreshPolicy = normalizeSkillSourceRefreshPolicy(draft.refreshPolicy);
+  const rolloutPolicy = normalizeSkillSourceRolloutPolicy(draft.rolloutPolicy);
+  manager.lifecycleBusyKeys.add(busyKey);
+  manager.sourceAutomationStatus.delete(normalizedSourceId);
+  manager.actionSummary = `Saving automation policy for ${source.name || normalizedSourceId}...`;
+  renderSkillsManager();
+  try {
+    const response = await fetchJson(`/api/skills/sources/${encodeURIComponent(normalizedSourceId)}/automation`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expectedRevision: manager.registryRevision,
+        refreshPolicy,
+        rolloutPolicy,
+      }),
+    });
+    advanceSkillsRegistryRevision(response.revision ?? response.registryRevision);
+    const updatedSource = response.source || {};
+    manager.sources = manager.sources.map((candidate) => (
+      candidate?.sourceId === normalizedSourceId
+        ? { ...candidate, ...updatedSource, registry: true }
+        : candidate
+    ));
+    manager.sourceAutomationDrafts.delete(normalizedSourceId);
+    const message = response.idempotent
+      ? 'Automation policy already matched.'
+      : 'Automation policy saved.';
+    manager.sourceAutomationStatus.set(normalizedSourceId, { tone: 'success', message });
+    manager.actionSummary = message;
+    return true;
+  } catch (error) {
+    advanceSkillsRegistryRevision(error.body?.revision);
+    const message = `Automation policy failed: ${error.message}`;
+    manager.sourceAutomationStatus.set(normalizedSourceId, { tone: 'error', message });
+    manager.actionSummary = message;
+    return false;
+  } finally {
+    manager.lifecycleBusyKeys.delete(busyKey);
+    renderSkillsManager();
+  }
+}
+
+async function loadSkillsAudit() {
+  const manager = state.skillsManager;
+  if (manager.auditLoading) return false;
+  manager.auditLoading = true;
+  manager.auditError = '';
+  renderSkillsAudit();
+  try {
+    let response = await fetchJson('/api/skills/audit?limit=50');
+    const latestSequence = Math.max(0, Number(response.latestSequence || 0));
+    if (response.hasMore === true && latestSequence > Number(response.nextAfterSequence || 0)) {
+      const afterSequence = Math.max(0, latestSequence - 50);
+      response = await fetchJson(`/api/skills/audit?afterSequence=${afterSequence}&limit=50`);
+    }
+    manager.auditEvents = Array.isArray(response.events) ? response.events : [];
+    manager.auditLatestSequence = Math.max(latestSequence, Number(response.latestSequence || 0));
+    manager.auditLoaded = true;
+    return true;
+  } catch (error) {
+    manager.auditError = `Unable to load Skills audit: ${error.message}`;
+    manager.auditLoaded = true;
+    return false;
+  } finally {
+    manager.auditLoading = false;
+    renderSkillsAudit();
+  }
+}
+
+async function updateSkillLibraryLifecycle(skillId, requestedAction) {
+  const normalizedSkillId = String(skillId || '').trim();
+  const action = requestedAction === 'restore' ? 'restore' : 'retire';
+  if (!normalizedSkillId) {
+    return;
+  }
+  if (
+    action === 'retire'
+    && !window.confirm(`Retire "${normalizedSkillId}" from the Registry Library?`)
+  ) {
+    return;
+  }
+  const manager = state.skillsManager;
+  const busyKey = `library:${normalizedSkillId}:${action}`;
+  if (manager.lifecycleBusyKeys.has(busyKey)) {
+    return;
+  }
+  manager.lifecycleBusyKeys.add(busyKey);
+  manager.actionSummary = action === 'restore' ? 'Restoring Library Skill...' : 'Retiring Library Skill...';
+  renderSkillsManager();
+  try {
+    const response = await fetchJson(`/api/skills/library/${encodeURIComponent(normalizedSkillId)}/${action}`, {
+      method: 'POST',
+      body: JSON.stringify({ expectedRevision: manager.registryRevision }),
+    });
+    advanceSkillsRegistryRevision(response.registryRevision ?? response.revision);
+    manager.selectedSkillIds.delete(normalizedSkillId);
+    const message = action === 'restore'
+      ? `${normalizedSkillId} restored to the Library.`
+      : `${normalizedSkillId} retired from the Library.`;
+    manager.actionSummary = message;
+    await loadSkillsManager({ message });
+  } catch (error) {
+    advanceSkillsRegistryRevision(error.body?.revision);
+    manager.actionSummary = `${action === 'restore' ? 'Restore' : 'Retire'} failed: ${error.message}`;
+    await loadSkillsManager({ message: manager.actionSummary });
+  } finally {
+    manager.lifecycleBusyKeys.delete(busyKey);
+    renderSkillsManager();
+  }
+}
+
+function skillsLibraryEventSummary(payload, currentSummary = '') {
+  const stateLabel = String(payload?.state || '').trim();
+  const skillLabel = String(payload?.skillId || 'Skill').trim();
+  if (stateLabel === 'failed') {
+    return `${skillLabel}: ${String(payload?.error || 'operation failed')}`;
+  }
+  if (stateLabel === 'completed') {
+    return `${skillLabel} added to the library.`;
+  }
+  return String(currentSummary || '');
+}
+
+function skillArtifactCollectionMessage(result) {
+  const collectedCount = Array.isArray(result?.collectedArtifactIds)
+    ? result.collectedArtifactIds.length
+    : Array.isArray(result?.collected) ? result.collected.length : Number(result?.collectedCount || 0);
+  const pendingCount = Array.isArray(result?.pendingArtifactIds)
+    ? result.pendingArtifactIds.length
+    : 0;
+  const errorCount = Array.isArray(result?.errors) ? result.errors.length : 0;
+  if (result?.ok === false || pendingCount || errorCount) {
+    return `Collection incomplete: ${collectedCount} collected, ${pendingCount} pending, ${errorCount} error(s).`;
+  }
+  return collectedCount
+    ? `Collected ${collectedCount} unused Artifact(s).`
+    : 'No unused Artifacts were collected.';
+}
+
+async function collectUnusedSkillArtifacts() {
+  const manager = state.skillsManager;
+  if (manager.collectingArtifacts) {
+    return;
+  }
+  if (!window.confirm('Collect archive bytes for retired Library versions that are no longer referenced?')) {
+    return;
+  }
+  manager.collectingArtifacts = true;
+  manager.actionSummary = 'Collecting unused Artifacts...';
+  renderSkillsManager();
+  try {
+    const response = await fetchJson('/api/skills/artifacts/gc', {
+      method: 'POST',
+      body: JSON.stringify({ expectedRevision: manager.registryRevision }),
+    });
+    const result = response.result || response;
+    advanceSkillsRegistryRevision(result.registryRevision ?? result.revision);
+    const message = skillArtifactCollectionMessage(result);
+    manager.actionSummary = message;
+    await loadSkillsManager({ message });
+  } catch (error) {
+    advanceSkillsRegistryRevision(error.body?.revision);
+    manager.actionSummary = `Artifact collection failed: ${error.message}`;
+    await loadSkillsManager({ message: manager.actionSummary });
+  } finally {
+    manager.collectingArtifacts = false;
+    renderSkillsManager();
+  }
+}
+
+async function saveSkillsSources(sources) {
+  const response = await fetchJson('/api/skills/sources', {
+    method: 'POST',
+    body: JSON.stringify({ sources }),
+  });
+  state.skillsManager.sources = Array.isArray(response.sources) ? response.sources : [];
+  state.skillsManager.catalog = Array.isArray(response.catalog) ? response.catalog : state.skillsManager.catalog;
+  state.skillsManager.dailySkillDigest = response.dailySkillDigest || state.skillsManager.dailySkillDigest;
+  renderSkillsManager();
+}
+
+async function saveSkillLibrary(skills) {
+  const response = await fetchJson('/api/skills/library', {
+    method: 'POST',
+    body: JSON.stringify({ skills }),
+  });
+  state.skillsManager.skillLibrary = Array.isArray(response.skills) ? response.skills : state.skillsManager.skillLibrary;
+  state.skillsManager.catalog = Array.isArray(response.catalog) ? response.catalog : state.skillsManager.catalog;
+  state.skillsManager.dailySkillDigest = response.dailySkillDigest || state.skillsManager.dailySkillDigest;
+  renderSkillsManager();
+}
+
+const skillsDeploymentActions = Object.freeze({
+  enable: Object.freeze({ action: 'enable', label: 'Enabling' }),
+  disable: Object.freeze({ action: 'disable', label: 'Disabling' }),
+  remove: Object.freeze({ action: 'remove', label: 'Removing from host' }),
+});
+
+function skillsDeploymentNewestFirst(left, right) {
+  return String(right.createdAt || '').localeCompare(String(left.createdAt || ''))
+    || String(right.deploymentId || '').localeCompare(String(left.deploymentId || ''));
+}
+
+function skillsDesiredStateKey(desired) {
+  return String(desired?.desiredKey || '') || JSON.stringify([
+    String(desired?.hostId || '').trim(),
+    String(desired?.skillId || '').trim(),
+    String(desired?.scope || 'user').trim(),
+    String(desired?.scopeId || 'user').trim(),
+  ]);
+}
+
+function skillsDesiredStatesFromDeployment(deployment) {
+  if (!deployment?.deploymentId || !deployment?.skillId || !deployment?.artifactId) {
+    return [];
+  }
+  const scope = String(deployment.targetScope || 'user').trim();
+  const scopeId = String(deployment.scopeId || (scope === 'user' ? 'user' : '')).trim();
+  const desiredState = String(deployment.desiredState || ({
+    enable: 'enabled',
+    disable: 'disabled',
+    remove: 'missing',
+  }[deployment.action] || '')).trim();
+  if (!scopeId || !desiredState) {
+    return [];
+  }
+  return (Array.isArray(deployment.targetHostIds) ? deployment.targetHostIds : [])
+    .map((hostId) => String(hostId || '').trim())
+    .filter(Boolean)
+    .map((hostId) => {
+      const desiredKey = JSON.stringify([hostId, deployment.skillId, scope, scopeId]);
+      return {
+        desiredKey,
+        deploymentId: deployment.deploymentId,
+        hostId,
+        skillId: deployment.skillId,
+        artifactId: deployment.artifactId,
+        scope,
+        scopeId,
+        cwd: deployment.cwd || null,
+        desiredState,
+        updatedAt: deployment.createdAt || deployment.updatedAt || '',
+      };
+    });
+}
+
+function mergeSkillsDesiredStateLists(primary, secondary) {
+  const byKey = new Map();
+  for (const desired of [...(primary || []), ...(secondary || [])]) {
+    const key = skillsDesiredStateKey(desired);
+    if (!key || !desired?.deploymentId) {
+      continue;
+    }
+    const previous = byKey.get(key);
+    const previousUpdatedAt = String(previous?.updatedAt || '');
+    const nextUpdatedAt = String(desired.updatedAt || '');
+    if (!previous || nextUpdatedAt >= previousUpdatedAt) {
+      byKey.set(key, desired);
+    }
+  }
+  return Array.from(byKey.values()).sort((left, right) => (
+    skillsDesiredStateKey(left).localeCompare(skillsDesiredStateKey(right))
+  ));
+}
+
+function boundSkillsDeployments(deployments, desiredStates = []) {
+  const combined = Array.from(new Map(
+    (Array.isArray(deployments) ? deployments : [])
+      .filter((deployment) => deployment?.deploymentId)
+      .map((deployment) => [deployment.deploymentId, deployment])
+  ).values()).sort(skillsDeploymentNewestFirst);
+  const terminalStates = new Set(['succeeded', 'failed', 'superseded']);
+  const activeDeployments = combined.filter((item) => {
+    const results = Array.isArray(item?.results) ? item.results : [];
+    return !results.length || results.some((result) => !terminalStates.has(String(result?.state || '').toLowerCase()));
+  });
+  const activeDeploymentIds = new Set(activeDeployments.map((item) => item.deploymentId));
+  const desiredDeploymentIds = new Set(
+    (Array.isArray(desiredStates) ? desiredStates : [])
+      .map((desired) => String(desired?.deploymentId || '').trim())
+      .filter(Boolean)
+  );
+  const protectedDeployments = combined.filter((item) => (
+    activeDeploymentIds.has(item.deploymentId) || desiredDeploymentIds.has(item.deploymentId)
+  ));
+  const protectedDeploymentIds = new Set(protectedDeployments.map((item) => item.deploymentId));
+  const terminalDeployments = combined.filter((item) => !protectedDeploymentIds.has(item.deploymentId));
+  const retainedTerminalCount = Math.max(0, SKILLS_DEPLOYMENT_SUMMARY_LIMIT - protectedDeployments.length);
+  return [
+    ...protectedDeployments,
+    ...terminalDeployments.slice(0, retainedTerminalCount),
+  ].sort(skillsDeploymentNewestFirst);
+}
+
+function mergeSkillsDeploymentRecord(current, incoming) {
+  if (!current) {
+    return incoming;
+  }
+  if (!incoming) {
+    return current;
+  }
+  const currentUpdatedAt = String(current.updatedAt || current.createdAt || '');
+  const incomingUpdatedAt = String(incoming.updatedAt || incoming.createdAt || '');
+  const base = incomingUpdatedAt >= currentUpdatedAt
+    ? { ...current, ...incoming }
+    : { ...incoming, ...current };
+  const resultByHost = new Map();
+  for (const result of [...(current.results || []), ...(incoming.results || [])]) {
+    const hostId = String(result?.hostId || '').trim();
+    if (!hostId) {
+      continue;
+    }
+    const previous = resultByHost.get(hostId);
+    const previousUpdatedAt = String(previous?.updatedAt || '');
+    const nextUpdatedAt = String(result?.updatedAt || '');
+    if (!previous || nextUpdatedAt >= previousUpdatedAt) {
+      resultByHost.set(hostId, result);
+    }
+  }
+  return {
+    ...base,
+    results: Array.from(resultByHost.values()).sort((left, right) => (
+      String(left.hostId || '').localeCompare(String(right.hostId || ''))
+    )),
+  };
+}
+
+function mergeSkillsDeploymentLists(primary, secondary, desiredStates = []) {
+  const byId = new Map();
+  for (const deployment of [...(primary || []), ...(secondary || [])]) {
+    if (!deployment?.deploymentId) {
+      continue;
+    }
+    byId.set(
+      deployment.deploymentId,
+      mergeSkillsDeploymentRecord(byId.get(deployment.deploymentId), deployment)
+    );
+  }
+  return boundSkillsDeployments(Array.from(byId.values()), desiredStates);
+}
+
+function upsertSkillsDeployment(deployment) {
+  if (!deployment?.deploymentId) {
+    return;
+  }
+  const manager = state.skillsManager;
+  manager.deploymentVersion += 1;
+  const incomingDesiredStates = skillsDesiredStatesFromDeployment(deployment);
+  if (incomingDesiredStates.length) {
+    manager.desiredVersion += 1;
+    manager.desiredSkillStates = mergeSkillsDesiredStateLists(
+      manager.desiredSkillStates,
+      incomingDesiredStates
+    );
+  }
+  const current = manager.deployments.find((item) => (
+    item.deploymentId === deployment.deploymentId
+  )) || null;
+  manager.deployments = boundSkillsDeployments([
+    mergeSkillsDeploymentRecord(current, deployment),
+    ...manager.deployments.filter((item) => item.deploymentId !== deployment.deploymentId),
+  ].sort((left, right) => (
+    String(right.createdAt || '').localeCompare(String(left.createdAt || ''))
+    || String(right.deploymentId || '').localeCompare(String(left.deploymentId || ''))
+  )), manager.desiredSkillStates);
+}
+
+function mergeSkillsDeploymentUpdate(payload) {
+  const deploymentId = String(payload?.deploymentId || payload?.deployment?.deploymentId || '').trim();
+  if (!deploymentId) {
+    return false;
+  }
+  if (payload?.deployment) {
+    upsertSkillsDeployment(payload.deployment);
+    return true;
+  }
+  const current = state.skillsManager.deployments.find((item) => item.deploymentId === deploymentId) || null;
+  if (!current) {
+    state.skillsManager.deploymentVersion += 1;
+    scheduleSkillsManagerReload();
+    return false;
+  }
+  const hostId = String(payload?.hostId || payload?.result?.hostId || '').trim();
+  const nextResults = hostId && payload?.result
+    ? [
+      ...current.results.filter((result) => String(result?.hostId || '') !== hostId),
+      payload.result,
+    ]
+    : current.results;
+  upsertSkillsDeployment({
+    ...current,
+    updatedAt: payload?.result?.updatedAt || current.updatedAt,
+    results: nextResults,
+  });
+  return true;
+}
+
+async function deploySelectedSkills(actionName, options = {}) {
+  const manager = state.skillsManager;
+  const actionConfig = skillsDeploymentActions[actionName];
+  if (!actionConfig || manager.deploying) {
+    return;
+  }
+  const availableHosts = manager.hosts;
+  const availableHostIds = new Set(
+    availableHosts.map((host) => String(host.hostId || host.id || '').trim()).filter(Boolean)
+  );
+  const requestedHostIds = options.allHosts
+    ? availableHosts.map((host) => String(host.hostId || host.id || '').trim()).filter(Boolean)
+    : Array.from(manager.selectedHostIds).filter((hostId) => availableHostIds.has(hostId));
+  const targetHostIds = Object.freeze(Array.from(new Set(requestedHostIds)));
+  const skillSnapshots = skillsDeploymentSnapshotsForAction(actionName, targetHostIds)
+    .map((entry) => Object.freeze({
+      ...entry,
+      targetHostIds: Object.freeze(Array.from(entry.targetHostIds)),
+    }));
+  if (!targetHostIds.length || !skillSnapshots.length) {
+    manager.actionSummary = 'Select at least one Host and one Registry Skill.';
+    renderSkillsManager();
+    return;
+  }
+  const allHostsProjectAuthorization = options.allHosts && manager.deploymentScope === 'project'
+    ? confirmSkillsAllHostsProjectWrite(targetHostIds)
+    : null;
+  if (options.allHosts && manager.deploymentScope === 'project' && !allHostsProjectAuthorization) {
+    return;
+  }
+  if (!skillsDeploymentScopeReady(targetHostIds, allHostsProjectAuthorization)) {
+    manager.actionSummary = manager.deploymentScope === 'project'
+      ? 'Select a shared project workspace and confirm the project write.'
+      : 'Deployment scope is incomplete.';
+    renderSkillsManager();
+    return;
+  }
+  const deploymentScope = manager.deploymentScope;
+  const projectCwd = manager.projectCwd;
+  const confirmedProjectWrite = deploymentScope === 'project' && (
+    allHostsProjectAuthorization?.confirmProjectWrite === true
+    || (!options.allHosts && manager.confirmProjectWrite)
+  );
+  if (actionName === 'remove' && !window.confirm(`Remove ${skillSnapshots.length} managed Skill(s) from ${targetHostIds.length} Host(s)?`)) {
+    return;
+  }
+
+  manager.deploying = true;
+  manager.deploymentSequence += 1;
+  const batchId = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${manager.deploymentSequence.toString(36)}`;
+  manager.actionSummary = `${actionConfig.label} ${skillSnapshots.length} Skill(s) on ${targetHostIds.length} Host(s)...`;
+  renderSkillsManager();
+  try {
+    const outcomes = await Promise.allSettled(skillSnapshots.map(async (skill, index) => {
+      const project = skill.targetScope === 'project';
+      const response = await fetchJson('/api/skills/deployments', {
+        method: 'POST',
+        body: JSON.stringify({
+          requestId: `skills:${batchId}:${actionName}:${index}:${skill.skillId}`,
+          skillId: skill.skillId,
+          artifactId: skill.artifactId,
+          action: actionConfig.action,
+          targetHostIds: skill.targetHostIds,
+          targetScope: skill.targetScope,
+          scopeId: skill.scopeId,
+          cwd: project ? skill.cwd : null,
+          confirmProjectWrite: confirmedProjectWrite,
+        }),
+      });
+      upsertSkillsDeployment(response.deployment);
+      return response;
+    }));
+    const failed = outcomes.filter((outcome) => outcome.status === 'rejected');
+    manager.actionSummary = failed.length
+      ? `${outcomes.length - failed.length}/${outcomes.length} deployment(s) queued; ${failed.length} failed.`
+      : `${outcomes.length} deployment(s) queued.`;
+    if (outcomes.some((outcome) => outcome.status === 'fulfilled')) {
+      resetSkillsProjectWriteConfirmation();
+    }
+  } catch (error) {
+    manager.actionSummary = `Skill deployment failed: ${error.message}`;
+  } finally {
+    manager.deploying = false;
+    renderSkillsManager();
+  }
+}
+
+async function runSkillsManagerAction(action) {
+  const hostIds = Array.from(state.skillsManager.selectedHostIds);
+  const skillIds = Array.from(state.skillsManager.selectedSkillIds);
+  if (!hostIds.length || !skillIds.length) {
+    state.skillsManager.actionSummary = 'Select at least one host and one skill.';
+    renderSkillsManager();
+    return;
+  }
+  state.skillsManager.loading = true;
+  state.skillsManager.actionSummary = `${action === 'uninstall' ? 'Uninstalling' : 'Installing'} ${skillIds.length} skill(s) on ${hostIds.length} host(s)...`;
+  renderSkillsManager();
+  try {
+    const response = await fetchJson('/api/skills/actions', {
+      method: 'POST',
+      body: JSON.stringify({ action, hostIds, skillIds }),
+    });
+    state.skillsManager.hosts = Array.isArray(response.hosts) ? response.hosts : state.skillsManager.hosts;
+    state.skillsManager.catalog = Array.isArray(response.catalog) ? response.catalog : state.skillsManager.catalog;
+    state.skillsManager.installed = Array.isArray(response.installed) ? response.installed : state.skillsManager.installed;
+    state.skillsManager.instances = Array.isArray(response.instances) ? response.instances : state.skillsManager.instances;
+    state.skillsManager.inventories = Array.isArray(response.inventories) ? response.inventories : state.skillsManager.inventories;
+    state.skillsManager.favorites = Array.isArray(response.favorites) ? response.favorites : state.skillsManager.favorites;
+    clearSkillOptionsCacheForHosts(hostIds);
+    const selected = getSelectedSession();
+    if (selected?.live && hostIds.includes(selected.hostId)) {
+      loadSkillOptionsForSession(selected, { force: true }).catch(reportError);
+    }
+    const results = Array.isArray(response.results) ? response.results : [];
+    const failed = results.filter((result) => !result.ok).length;
+    state.skillsManager.actionSummary = failed
+      ? `${results.length - failed}/${results.length} completed; ${failed} failed.`
+      : `${results.length} operation(s) completed.`;
+  } catch (error) {
+    state.skillsManager.actionSummary = `Skills action failed: ${error.message}`;
+  } finally {
+    state.skillsManager.loading = false;
+    renderSkillsManager();
+  }
 }
 
 function renderAll() {
@@ -11980,6 +16510,7 @@ function renderAll() {
   renderExportDialog();
   renderSlashMenu();
   renderSettingsDialog();
+  renderSkillsManager();
   renderImagePreview();
   renderLocaleLabels();
 }
@@ -12188,6 +16719,85 @@ function updateSelectedViews(session) {
   renderExportDialog();
 }
 
+function rememberSessionStreamEvent(session, event, payload = null) {
+  const canonicalKey = rememberActivityCanonicalKey(
+    payload?.canonicalConversationKey || getActivityCanonicalKeyForSession(session),
+    session,
+    payload
+  );
+  const cursor = String(event?.lastEventId || '').trim();
+  if (canonicalKey && cursor) {
+    state.eventCursorByCanonical.set(canonicalKey, cursor);
+  }
+  return canonicalKey;
+}
+
+function patchProjectedThinkingActivity(canonicalKey, activity) {
+  const selected = getSelectedSession();
+  if (!selected || getActivityCanonicalKeyForSession(selected) !== canonicalKey) {
+    return false;
+  }
+  const log = el('session-log');
+  const item = log?.querySelector(
+    `[data-thinking-activity-key="${cssEscape(activity.activityKey || '')}"]`
+  );
+  if (!item) {
+    return false;
+  }
+  const outerSnapshot = captureTranscriptScrollSnapshot();
+  const scroller = item.closest('.thinking-content[data-thinking-state-key]');
+  const stateKey = scroller?.dataset?.thinkingStateKey || '';
+  if (scroller && stateKey) {
+    preserveThinkingViewportForPatch(stateKey, scroller);
+  }
+  item.dataset.activityRevision = String(activity.activityRevision || 0);
+  const textNode = item.querySelector('.thinking-history-text');
+  if (textNode) {
+    textNode.textContent = String(activity.text == null ? '' : activity.text);
+  }
+  if (scroller && stateKey) {
+    restoreThinkingScrollState(stateKey, scroller, { preserveDetached: true, immediate: true });
+  }
+  restoreTranscriptScrollSnapshot(outerSnapshot);
+  return true;
+}
+
+function applyActivityEvent(session, event, payload) {
+  const canonicalKey = rememberSessionStreamEvent(session, event, payload);
+  if (!canonicalKey || !state.activityProjection?.applyActivity(canonicalKey, payload)) {
+    return false;
+  }
+  if (!patchProjectedThinkingActivity(canonicalKey, payload)) {
+    const selected = getSelectedSession();
+    if (selected && getActivityCanonicalKeyForSession(selected) === canonicalKey) {
+      scheduleTranscriptRender({ preserveScroll: true });
+    }
+  }
+  return true;
+}
+
+function applySessionStreamReset(session, event, payload) {
+  const canonicalKey = rememberSessionStreamEvent(session, event, payload);
+  if (!canonicalKey) {
+    return false;
+  }
+  if (payload.session) {
+    mergeSession(payload.session);
+  }
+  state.activityProjection?.applyReset(canonicalKey, {
+    streamEpoch: payload.streamEpoch,
+    activities: payload.activities || [],
+  });
+  if (payload.assistantProjection?.canonicalConversationKey) {
+    void catchUpAssistantProjection(session, payload.assistantProjection, { force: true }).catch(() => {});
+  }
+  const selected = getSelectedSession();
+  if (selected && getActivityCanonicalKeyForSession(selected) === canonicalKey) {
+    scheduleTranscriptRender({ preserveScroll: true });
+  }
+  return true;
+}
+
 function subscribeSession(session) {
   const key = getSessionKey(session);
   if (!key || state.eventSourceKey === key) {
@@ -12199,6 +16809,16 @@ function subscribeSession(session) {
   const eventParams = new URLSearchParams({ hostId: session.hostId });
   if (!isOptimizeSpeedMode()) {
     eventParams.set('full', '1');
+  }
+  const canonicalKey = getActivityCanonicalKeyForSession(session);
+  const resumeCursor = state.eventCursorByCanonical.get(canonicalKey);
+  if (resumeCursor) {
+    eventParams.set('lastEventId', resumeCursor);
+  }
+  const assistantProjection = getAssistantProjectionForSession(session);
+  if (assistantProjection?.canonicalConversationKey && state.messageReceiptStore) {
+    const receipt = receiptForAssistantProjection(session, assistantProjection);
+    eventParams.set('assistantAfter', String(receipt?.notifiedThroughAssistantSeq || 0));
   }
   const url = `/api/sessions/${encodeURIComponent(session.sessionId)}/events?${eventParams.toString()}`;
   state.eventSource = new EventSource(url);
@@ -12234,6 +16854,46 @@ function subscribeSession(session) {
     scheduleQueuedUiFlush();
   });
 
+  const cursorEvents = [
+    'stream.reset',
+    'session.snapshot',
+    'session.started',
+    'session.state_changed',
+    'session.transcript',
+    'session.alert',
+    'session.runtime',
+    'session.runtime_updated',
+    'session.diagnostic',
+    'session.request',
+    'session.request.resolved',
+    'session.activity',
+    'session.assistant_projection',
+  ];
+  for (const eventName of cursorEvents) {
+    state.eventSource.addEventListener(eventName, (event) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (_) {
+        // Cursor retention does not depend on parsing the payload.
+      }
+      rememberSessionStreamEvent(session, event, payload);
+    });
+  }
+
+  state.eventSource.addEventListener('stream.reset', (event) => {
+    applySessionStreamReset(session, event, JSON.parse(event.data));
+  });
+
+  state.eventSource.addEventListener('session.activity', (event) => {
+    applyActivityEvent(session, event, JSON.parse(event.data));
+  });
+
+  state.eventSource.addEventListener('session.assistant_projection', (event) => {
+    const projection = JSON.parse(event.data);
+    void catchUpAssistantProjection(session, projection, { force: true }).catch(() => {});
+  });
+
   state.eventSource.addEventListener('error', () => {
     setStreamStatusForSession(session.hostId, session.sessionId, {
       connection: session.live ? 'reconnecting' : 'disconnected',
@@ -12244,7 +16904,11 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.snapshot', (event) => {
     const payload = JSON.parse(event.data);
     mergeSession(payload);
-    markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
+    markSessionMessageNotificationChanged(
+      payload.hostId || session.hostId,
+      payload.sessionId || session.sessionId,
+      payload.assistantProjection
+    );
     if (payload.bridgeSessionId && state.selectedSessionId === payload.bridgeSessionId) {
       state.selectedSessionId = payload.sessionId;
     }
@@ -12255,8 +16919,12 @@ function subscribeSession(session) {
 
   state.eventSource.addEventListener('session.started', (event) => {
     const payload = JSON.parse(event.data);
-    mergeSession(payload);
-    markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
+    const started = applyConfirmedSessionStarted(payload, session);
+    markSessionMessageNotificationChanged(
+      started?.hostId || session.hostId,
+      started?.sessionId || session.sessionId,
+      started?.assistantProjection || payload.assistantProjection
+    );
     if (payload.bridgeSessionId && state.selectedSessionId === payload.bridgeSessionId) {
       state.selectedSessionId = payload.sessionId;
     }
@@ -12265,8 +16933,15 @@ function subscribeSession(session) {
 
   state.eventSource.addEventListener('session.state_changed', (event) => {
     const payload = JSON.parse(event.data);
-    mergeSession(payload);
-    markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
+    const changed = mergeSession(payload);
+    if (isTerminalSessionLifecycleState(changed)) {
+      void loadSessionRuntimeConfigForSession(changed).catch(() => {});
+    }
+    markSessionMessageNotificationChanged(
+      payload.hostId || session.hostId,
+      payload.sessionId || session.sessionId,
+      changed?.assistantProjection || payload.assistantProjection
+    );
     scheduleRenderAll();
   });
 
@@ -12274,7 +16949,6 @@ function subscribeSession(session) {
     const payload = JSON.parse(event.data);
     appendTranscriptEntry(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
     if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
-      markSessionMessageNotificationChanged(payload.hostId || session.hostId, payload.sessionId || session.sessionId);
       clearActiveDraftForSession({
         hostId: payload.hostId || session.hostId,
         sessionId: payload.sessionId || session.sessionId,
@@ -12359,7 +17033,7 @@ function subscribeSession(session) {
     if (isSelectedSession) {
       state.statusWindowOpen = false;
       state.sessionDetailsOpen = true;
-      scheduleTranscriptRender();
+      scheduleTranscriptRender({ preserveScroll: true });
       queuedUiRenders.thinkingPanel = true;
       queuedUiRenders.sessionDetails = true;
       queuedUiRenders.approvalPopup = true;
@@ -12379,7 +17053,7 @@ function subscribeSession(session) {
     resolveRequestForSession(eventHostId, eventSessionId, payload);
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === eventSessionKey) {
-      scheduleTranscriptRender();
+      scheduleTranscriptRender({ preserveScroll: true });
       queuedUiRenders.thinkingPanel = true;
       queuedUiRenders.sessionDetails = true;
       queuedUiRenders.approvalPopup = true;
@@ -12402,9 +17076,11 @@ async function showSession(session = getSelectedSession(), options = {}) {
     return;
   }
 
+  void loadSessionRuntimeConfigForSession(session).catch(() => {});
+
   setHistoryLoading(session, true);
   const initialTranscriptRenderOptions = {
-    forceScroll: !options.preserveScroll,
+    forceScroll: !options.preserveScroll && !options.focus,
     preserveScroll: Boolean(options.preserveScroll),
     focus: options.focus || null,
   };
@@ -12416,10 +17092,12 @@ async function showSession(session = getSelectedSession(), options = {}) {
     const shouldFetchDetail = shouldFetchSessionDetailOnOpen(session, options);
     if (!shouldFetchDetail) {
       setHistoryLoading(session, false);
+      state.messageReadRenderReady.add(getSessionKey(session));
       renderSessionDetails();
       renderRuntimePanel();
       renderThinkingPanel();
       renderTranscript(session, {
+        forceScroll: !options.preserveScroll && !options.focus,
         focus: options.focus || null,
         preserveScroll: Boolean(options.preserveScroll),
       });
@@ -12463,13 +17141,14 @@ async function showSession(session = getSelectedSession(), options = {}) {
     setRequestsForSession(detailHostId, detailSessionId, detail.requests || []);
     setHistoryLoading(session, false);
     setHistoryLoading(detailSession, false);
+    state.messageReadRenderReady.add(detailSessionKey);
     loadReceivedFilesForSession(detailSession).then((files) => {
       if (!files.length) {
         return;
       }
       const selected = getSelectedSession();
       if (selected && getSessionKey(selected) === getSessionKey(detailSession)) {
-        renderTranscript(selected);
+        renderTranscript(selected, { preserveScroll: true });
         renderStatusWindow();
       }
     }).catch(reportError);
@@ -12481,17 +17160,11 @@ async function showSession(session = getSelectedSession(), options = {}) {
       renderThinkingPanel();
       renderAlertsWindow();
       renderStatusWindow();
-      const navigatorTarget = !options.focus && getTranscriptSearchTarget(selected);
-      const navigatorFocus = navigatorTarget?.match
-        ? {
-          hostId: selected.hostId,
-          sessionId: selected.sessionId,
-          entryIndex: navigatorTarget.match.entryIndex,
-          timestamp: navigatorTarget.match.timestamp || null,
-          snippet: '',
-        }
-        : null;
-      renderTranscript(selected, { focus: options.focus || navigatorFocus || null });
+    renderTranscript(selected, {
+      forceScroll: !options.preserveScroll && !options.focus,
+      focus: options.focus || null,
+      preserveScroll: Boolean(options.preserveScroll),
+    });
     }
   } catch (error) {
     setHistoryLoading(session, false);
@@ -13953,7 +18626,7 @@ function toggleSessionSortDirection() {
   renderAll();
 }
 
-async function selectConversation(conversation) {
+async function selectConversation(conversation, options = {}) {
   if (!conversation) {
     return;
   }
@@ -13966,13 +18639,18 @@ async function selectConversation(conversation) {
   state.selectedConversationKey = conversation.conversationKey;
   state.selectedSessionId = conversation.preferredSession?.sessionId || null;
   if (conversation.preferredSession) {
-    markSessionMessagesRead(conversation.preferredSession);
+    state.messageReadRenderReady.delete(getSessionKey(conversation.preferredSession));
+    if (options.trusted === true) {
+      establishMessageReadFollow(conversation.preferredSession, 'session-selection');
+    } else {
+      getMessageReadGate(conversation.preferredSession)?.detachByUser();
+    }
   }
   renderAll();
   showSession().catch(reportError);
 }
 
-async function selectSession(session) {
+async function selectSession(session, options = {}) {
   if (!session) {
     return;
   }
@@ -13984,15 +18662,86 @@ async function selectSession(session) {
   state.selectedHostId = session.hostId;
   state.selectedConversationKey = getSessionConversationKey(session);
   state.selectedSessionId = session.sessionId;
-  markSessionMessagesRead(session);
+  state.messageReadRenderReady.delete(getSessionKey(session));
+  if (options.trusted === true) {
+    establishMessageReadFollow(session, 'session-selection');
+  } else {
+    getMessageReadGate(session)?.detachByUser();
+  }
   renderAll();
   showSession(session).catch(reportError);
 }
 
-async function refresh() {
+function reconcileRefreshedSessions(incomingSessions, baselineSessions = new Map()) {
+  const incomingByKey = new Map();
+  for (const session of incomingSessions || []) {
+    if (!session?.hostId || !session?.sessionId) {
+      continue;
+    }
+    incomingByKey.set(makeSessionKey(session.hostId, session.sessionId), applyManualSessionTitle(session));
+  }
+
+  const currentByKey = new Map((state.sessions || []).map((session) => [
+    makeSessionKey(session.hostId, session.sessionId),
+    session,
+  ]));
+  const reconciled = [];
+  for (const [key, incoming] of incomingByKey.entries()) {
+    const current = currentByKey.get(key) || null;
+    const baseline = baselineSessions.get(key) || null;
+    const changedDuringRefresh = Boolean(current && current !== baseline);
+    if (!changedDuringRefresh) {
+      reconciled.push(incoming);
+      continue;
+    }
+    const incomingIsNewer = parseSessionTime(incoming) > parseSessionTime(current);
+    reconciled.push(applyManualSessionTitle(incomingIsNewer
+      ? { ...current, ...incoming }
+      : { ...incoming, ...current }));
+  }
+
+  for (const [key, current] of currentByKey.entries()) {
+    if (incomingByKey.has(key)) {
+      continue;
+    }
+    const baseline = baselineSessions.get(key) || null;
+    if (!baseline || current !== baseline) {
+      reconciled.push(current);
+    }
+  }
+  state.sessions = reconciled;
+  return reconciled;
+}
+
+function refresh() {
+  if (state.refreshPromise) {
+    return state.refreshPromise;
+  }
+  const requestId = ++state.refreshRequestId;
+  const baselineSessions = new Map((state.sessions || []).map((session) => [
+    makeSessionKey(session.hostId, session.sessionId),
+    session,
+  ]));
+  let trackedPromise;
+  trackedPromise = performRefresh(requestId, baselineSessions).finally(() => {
+    if (state.refreshPromise === trackedPromise) {
+      state.refreshPromise = null;
+    }
+  });
+  state.refreshPromise = trackedPromise;
+  return trackedPromise;
+}
+
+async function performRefresh(requestId, baselineSessions) {
   if (!authAllowsRequests()) {
+    closeSkillsInventoryEvents();
     renderAuthGate();
     return;
+  }
+
+  openSkillsInventoryEvents();
+  if (state.skillsManager.open && state.skillsManager.dirty) {
+    scheduleSkillsManagerReload();
   }
 
   const previousKey = getSessionKey(getSelectedSession());
@@ -14004,8 +18753,13 @@ async function refresh() {
     fetchJson('/api/session-collections'),
   ]);
 
+  if (requestId !== state.refreshRequestId) {
+    return;
+  }
+
   state.stats = stats;
-  state.hosts = hostsResponse.hosts || [];
+  const refreshedHosts = hostsResponse.hosts || [];
+  state.hosts = refreshedHosts;
   state.dismissedHosts = hostsResponse.dismissedHosts || [];
   state.connectors = connectorsResponse.connectors || [];
   state.sessionCollections = collectionsResponse.collections || [];
@@ -14014,14 +18768,18 @@ async function refresh() {
   }
 
   const sessionResponses = await Promise.all(
-    state.hosts.map((host) => fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/sessions?${sessionListQuery({ refresh: '1' })}`))
+    refreshedHosts.map((host) => fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/sessions?${sessionListQuery()}`))
   );
 
-  state.sessions = [];
+  if (requestId !== state.refreshRequestId) {
+    return;
+  }
+
+  const refreshedSessions = [];
   sessionResponses.forEach((response) => {
-    (response.sessions || []).forEach((session) => state.sessions.push(applyManualSessionTitle(session)));
+    (response.sessions || []).forEach((session) => refreshedSessions.push(session));
   });
-  initializeMessageReadReceiptsForExistingSessions();
+  reconcileRefreshedSessions(refreshedSessions, baselineSessions);
   refreshMessageUnreadState();
 
   if (state.connectorEditorId && !getConnector(state.connectorEditorId)) {
@@ -14030,6 +18788,7 @@ async function refresh() {
 
   ensureSelections();
   renderAll();
+  scheduleAssistantProjectionSync(state.sessions);
 
   if (state.directoryPicker.open && !getHost(state.selectedHostId || '')) {
     setDirectoryPickerState({
@@ -14819,17 +19578,163 @@ function toggleStatusWindow() {
   renderStatusWindow();
 }
 
-async function joinLiveSession() {
+async function joinLiveSession(options = {}) {
   const conversation = getSelectedConversation();
   const liveSession = getLiveSessionForConversation(conversation);
   if (!liveSession) {
     return;
   }
-  await selectSession(liveSession);
+  await selectSession(liveSession, options);
+}
+
+function sessionSelectionRequestBody(session) {
+  const options = getComposerOptionsForSession(session);
+  assertModelSelectionIsSelectable(session, options.model);
+  const selection = {};
+  if (options.model) {
+    selection.model = options.model;
+  }
+  if (options.effort) {
+    selection.effort = options.effort;
+  }
+  return selection;
+}
+
+async function rebindSessionApi(session, profileId, selectionSnapshot = null, apiConfigSnapshot = undefined) {
+  if (!session?.hostId || !session?.sessionId) {
+    throw new Error('Select a Session before rebinding its API.');
+  }
+  const requestSessionKey = getSessionKey(session);
+  const currentSession = state.sessions.find((candidate) => getSessionKey(candidate) === requestSessionKey) || session;
+  const canonicalSession = await loadSessionRuntimeConfigForSession(currentSession, {
+    allowRebindFallback: true,
+  });
+  if (!canonicalSession) {
+    throw sessionContractError(
+      'session_run_state_conflict',
+      'Canonical Session runtime configuration changed before Rebind could start.'
+    );
+  }
+  const expectation = captureSessionLifecycleExpectation(canonicalSession);
+  const selectedProfileId = String(profileId || '').trim();
+  const explicitProfileId = selectedProfileId === '__host_environment__' ? '' : selectedProfileId;
+  let apiConfig = null;
+  if (selectedProfileId !== '__host_environment__') {
+    if (!explicitProfileId) {
+      throw sessionContractError('session_api_binding_unavailable', 'Choose an API profile before rebinding.', { canRebind: true });
+    }
+    if (apiConfigSnapshot !== undefined) {
+      apiConfig = apiConfigSnapshot ? { ...apiConfigSnapshot } : null;
+      if (!apiConfig || String(apiConfig.profileId || '') !== explicitProfileId) {
+        throw sessionContractError(
+          'session_api_binding_unavailable',
+          'The captured API profile no longer matches the Rebind target.',
+          { canRebind: true }
+        );
+      }
+      validateApiConfigForRequest(apiConfig, canonicalSession.hostId);
+    } else {
+      ({ apiConfig } = resolveLaunchApiConfig({
+        hostId: canonicalSession.hostId,
+        sourceSession: canonicalSession,
+        explicitProfileId,
+      }));
+    }
+  }
+
+  await verifyHostAvailable(canonicalSession.hostId);
+  const selection = selectionSnapshot && typeof selectionSnapshot === 'object'
+    ? { ...selectionSnapshot }
+    : sessionSelectionRequestBody(canonicalSession);
+  const body = {
+    hostId: canonicalSession.hostId,
+    ...selection,
+    expectedRunId: expectation.expectedRunId,
+    expectedRunStatus: expectation.expectedRunStatus,
+    expectedBindingFingerprint: expectation.expectedBindingFingerprint,
+  };
+  if (apiConfig) {
+    body.apiConfig = apiConfig;
+  }
+  try {
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/rebind`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    applyRebindLaunchResponse(expectation, response, canonicalSession);
+    renderAll();
+    return response;
+  } catch (error) {
+    const latest = state.sessions.find((candidate) => getSessionKey(candidate) === expectation.sessionKey) || canonicalSession;
+    const latestRunId = String(latest?.runId || latest?.activeRunId || latest?.runtimeConfig?.runId || '').trim();
+    if (!latestRunId || latestRunId === expectation.expectedRunId) {
+      mergeSession({ ...latest, resumeError: latest.resumeError || structuredSessionError(error) });
+    }
+    renderAll();
+    throw error;
+  }
+}
+
+async function startTranscriptFallback(session) {
+  if (!session?.resumeError?.canTranscriptFallback) {
+    throw sessionContractError(
+      'session_transcript_fallback_unavailable',
+      'Transcript fallback is not available for this Session.'
+    );
+  }
+  if (!window.confirm('Start a new Session from the saved transcript? The original native thread and history will remain unchanged.')) {
+    return null;
+  }
+
+  const canonicalSession = await loadCanonicalSessionForLifecycleMutation(session);
+  const expectation = captureSessionLifecycleExpectation(canonicalSession);
+  const { apiConfig } = resolveLaunchApiConfig({
+    hostId: canonicalSession.hostId,
+    sourceSession: canonicalSession,
+  });
+  const body = {
+    hostId: canonicalSession.hostId,
+    ...sessionSelectionRequestBody(canonicalSession),
+    expectedRunId: expectation.expectedRunId,
+    expectedRunStatus: expectation.expectedRunStatus,
+    expectedBindingFingerprint: expectation.expectedBindingFingerprint,
+  };
+  if (apiConfig) {
+    body.apiConfig = apiConfig;
+  }
+  const response = await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/transcript-fallback`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  const derived = mergeSession({
+    ...canonicalSession,
+    sessionId: response.sessionId,
+    bridgeSessionId: response.bridgeSessionId || response.sessionId,
+    nativeThreadId: response.nativeThreadId || null,
+    sourceSessionId: response.sourceSessionId || canonicalSession.sessionId,
+    originSessionId: response.originSessionId || getOriginSessionId(canonicalSession),
+    conversationKey: response.conversationKey || getSessionConversationKey(canonicalSession),
+    launchMode: 'transcript_fallback',
+    runId: response.runId || null,
+    activeRunId: response.runId || null,
+    runtimeConfig: null,
+    runtimeConfigError: null,
+    apiBinding: response.sessionBinding || sessionApiBinding(canonicalSession),
+    requestedSelection: response.requestedSelection || null,
+    effectiveSelection: null,
+    resumeError: null,
+    state: 'starting',
+    live: false,
+  });
+  state.selectedHostId = derived.hostId;
+  state.selectedConversationKey = getSessionConversationKey(derived);
+  state.selectedSessionId = derived.sessionId;
+  renderAll();
+  return response;
 }
 
 async function startManagedSession(options = {}) {
-  const sourceSession = Object.prototype.hasOwnProperty.call(options, 'session')
+  let sourceSession = Object.prototype.hasOwnProperty.call(options, 'session')
     ? options.session
     : getSelectedSession();
   const conversation = getSelectedConversation();
@@ -14872,13 +19777,27 @@ async function startManagedSession(options = {}) {
     await ensureHostAvailableForSessionStart(hostId);
     updateSessionLaunchBusy(launchBusyId, { stage: 'queueing-start' });
 
+    if (sourceSession && launchMode !== 'fresh') {
+      const currentSource = state.sessions.find((session) => getSessionKey(session) === sourceSessionKey) || sourceSession;
+      sourceSession = await loadSessionRuntimeConfigForSession(currentSource);
+      if (!sourceSession) {
+        throw sessionContractError(
+          'session_history_unavailable',
+          'Canonical Session runtime configuration is unavailable.'
+        );
+      }
+    }
+
     const body = {
       cwd,
       label: label || cwd,
       launchMode,
+      ...(sourceSession && launchMode !== 'fresh' ? sessionSelectionRequestBody(sourceSession) : {}),
     };
-    const apiConfig = getApiRequestConfig(hostId);
-    validateApiConfigForRequest(apiConfig, hostId);
+    const { apiConfig } = resolveLaunchApiConfig({
+      hostId,
+      sourceSession: launchMode === 'fresh' ? null : sourceSession,
+    });
     if (apiConfig) {
       body.apiConfig = apiConfig;
     }
@@ -14912,8 +19831,7 @@ async function startManagedSession(options = {}) {
       sessionKey: makeSessionKey(hostId, response.sessionId || sourceSession?.sessionId || ''),
     });
     if (response.sessionId) {
-      const startingSession = mergeSession({
-        ...(sourceSession || {}),
+      const startingSession = mergeSession(sessionWithInvalidatedRuntimeConfig(sourceSession, {
         hostId,
         sessionId: response.sessionId,
         title: label || sourceSession?.title || cwd,
@@ -14928,8 +19846,10 @@ async function startManagedSession(options = {}) {
         bridgeSessionId: response.bridgeSessionId || response.sessionId,
         runId: response.runId || null,
         nativeThreadId: response.nativeThreadId || body.nativeThreadId || response.sessionId,
+        apiBinding: response.sessionBinding || sourceSession?.apiBinding || null,
+        requestedSelection: response.requestedSelection || sourceSession?.requestedSelection || null,
         apiProfile: apiConfig ? summarizeApiConfigForDisplay(apiConfig) : sourceSession?.apiProfile || null,
-      });
+      }));
       if (startingSession && options.selectAfterStart !== false) {
         state.selectedHostId = hostId;
         state.selectedConversationKey = getSessionConversationKey(startingSession);
@@ -14943,7 +19863,22 @@ async function startManagedSession(options = {}) {
       launchResponse: response,
     });
     if (!startedSession.live) {
+      if (startedSession.resumeError) {
+        const resumeFailure = sessionContractError(
+          startedSession.resumeError.code || 'session_spawn_failed',
+          startedSession.resumeError.error || 'Managed Session failed to resume.',
+          startedSession.resumeError
+        );
+        throw resumeFailure;
+      }
       const detail = await fetchJson(`/api/sessions/${encodeURIComponent(startedSession.sessionId)}/detail?hostId=${encodeURIComponent(hostId)}`).catch(() => null);
+      if (detail?.session?.resumeError) {
+        throw sessionContractError(
+          detail.session.resumeError.code || 'session_spawn_failed',
+          detail.session.resumeError.error || 'Managed Session failed to resume.',
+          detail.session.resumeError
+        );
+      }
       const alertMessage = Array.isArray(detail?.alerts) ? [...detail.alerts].reverse().find((entry) => entry && entry.message)?.message : null;
       const transcript = Array.isArray(detail?.transcript) ? [...detail.transcript].reverse() : [];
       const systemMessage = transcript.find((entry) => entry.speaker === 'system' && entry.text && !String(entry.text).startsWith('State changed:'))?.text
@@ -14964,6 +19899,19 @@ async function startManagedSession(options = {}) {
       await sendInputToSession(next, options.initialText || '', options.initialInputOptions || {});
     }
     return next;
+  } catch (error) {
+    if (sourceSessionKey) {
+      const latest = state.sessions.find((session) => getSessionKey(session) === sourceSessionKey) || sourceSession;
+      const resumeError = latest?.resumeError || structuredSessionError(error);
+      if (latest) {
+        mergeSession({ ...latest, resumeError });
+        state.selectedHostId = latest.hostId;
+        state.selectedConversationKey = getSessionConversationKey(latest);
+        state.selectedSessionId = latest.sessionId;
+        renderAll();
+      }
+    }
+    throw error;
   } finally {
     clearSessionLaunchBusy(launchBusyId);
   }
@@ -15134,8 +20082,7 @@ async function sendInputToSession(session, text, options = {}) {
   }
 
   await verifyHostAvailable(session.hostId);
-  const apiConfig = options.apiConfig || getApiRequestConfig(session.hostId);
-  validateApiConfigForRequest(apiConfig, session.hostId);
+  assertModelSelectionIsSelectable(session, options.model);
   const body = {
     hostId: session.hostId,
     clientRequestId: options.clientRequestId || null,
@@ -15155,9 +20102,6 @@ async function sendInputToSession(session, text, options = {}) {
     serviceTier: options.serviceTier || null,
     personality: options.personality || null,
   };
-  if (apiConfig) {
-    body.apiConfig = apiConfig;
-  }
 
   try {
     await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
@@ -15522,7 +20466,7 @@ async function interruptAndSendPendingPrompt() {
 }
 
 function isModelOptionsLoading(session) {
-  return state.codexControls.modelOptionsLoadingKeys.has(modelCacheKey(session));
+  return state.codexControls.modelOptionsLoadingKeys.has(activeModelCatalogKey(session));
 }
 
 function isSkillOptionsLoading(session) {
@@ -15547,32 +20491,40 @@ function deferAutoLoadOptions(retryMap, key) {
 }
 
 async function loadModelOptionsForSession(session, options = {}) {
-  if (!session?.live) {
-    throw new Error('Select a live managed session before loading models.');
-  }
-  const host = getHost(session.hostId);
-  if (!host?.capabilities?.modelList) {
-    throw new Error(`${host?.label || session.hostId} does not support model listing yet. Restart its host-agent if needed.`);
+  if (!session?.hostId || !session?.sessionId) {
+    throw new Error('Select a Session before loading models.');
   }
 
-  const key = modelCacheKey(session);
-  if (!options.force && state.codexControls.modelOptionsBySession.has(key)) {
-    return state.codexControls.modelOptionsBySession.get(key) || [];
+  const request = captureModelCatalogRequest(session);
+  const key = request.key;
+  const refresh = options.refresh === true;
+  if (!options.force && !refresh && state.codexControls.modelCatalogByKey.has(key)) {
+    return state.codexControls.modelCatalogByKey.get(key) || null;
   }
   if (state.codexControls.modelOptionsLoadingKeys.has(key)) {
-    return state.codexControls.modelOptionsBySession.get(key) || [];
+    return state.codexControls.modelCatalogByKey.get(key) || null;
   }
 
   state.codexControls.modelOptionsLoadingKeys.add(key);
   state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
   renderSessionDetails();
   try {
-    await verifyHostAvailable(session.hostId);
-    const includeHidden = options.includeHidden === true ? '&includeHidden=true' : '';
-    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models?hostId=${encodeURIComponent(session.hostId)}&limit=100${includeHidden}`);
-    state.codexControls.modelOptionsBySession.set(modelCacheKey(session), Array.isArray(response.models) ? response.models : []);
-    state.codexControls.modelOptionsRetryAfterBySession.delete(key);
-    return state.codexControls.modelOptionsBySession.get(key) || [];
+    let response;
+    if (refresh) {
+      await verifyHostAvailable(session.hostId);
+      const launchApi = resolveLaunchApiConfig({ hostId: session.hostId, sourceSession: session });
+      const body = { hostId: session.hostId };
+      if (launchApi.apiConfig) {
+        body.apiConfig = launchApi.apiConfig;
+      }
+      response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models/refresh`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    } else {
+      response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models?hostId=${encodeURIComponent(session.hostId)}`);
+    }
+    return applyModelCatalogResponse(request, response);
   } finally {
     state.codexControls.modelOptionsLoadingKeys.delete(key);
     state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
@@ -15580,16 +20532,114 @@ async function loadModelOptionsForSession(session, options = {}) {
   }
 }
 
+async function loadRebindProfileModelOptions(session) {
+  if (!canPreviewRebindModels(session)) {
+    throw sessionContractError(
+      'session_api_binding_unavailable',
+      'Choose an API profile before loading models for Rebind.',
+      { canRebind: true }
+    );
+  }
+
+  const profileId = selectedRebindProfileId(session);
+  const profile = getSelectedRebindProfile(session);
+  const request = {
+    key: rebindModelPreviewKey(session),
+    sessionKey: getSessionKey(session),
+    hostId: String(session.hostId || ''),
+    sessionId: String(session.sessionId || ''),
+    runId: modelCatalogRunId(session),
+    profileId,
+    profileIdentity: rebindProfilePreviewIdentity(profile),
+  };
+  if (state.codexControls.modelOptionsLoadingKeys.has(request.key)) {
+    return state.codexControls.modelCatalogByKey.get(request.key) || null;
+  }
+
+  const { apiConfig } = resolveLaunchApiConfig({
+    hostId: request.hostId,
+    sourceSession: session,
+    explicitProfileId: profileId,
+  });
+  state.codexControls.modelOptionsLoadingKeys.add(request.key);
+  state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
+  renderSessionDetails();
+  try {
+    await verifyHostAvailable(request.hostId);
+    const response = await fetchJson(`/api/hosts/${encodeURIComponent(request.hostId)}/api-test`, {
+      method: 'POST',
+      body: JSON.stringify({ apiConfig }),
+    });
+    const current = state.sessions.find((candidate) => getSessionKey(candidate) === request.sessionKey) || null;
+    if (
+      !current
+      || rebindModelPreviewKey(current) !== request.key
+      || selectedRebindProfileId(current) !== request.profileId
+      || rebindProfilePreviewIdentity(getSelectedRebindProfile(current)) !== request.profileIdentity
+    ) {
+      return null;
+    }
+    const result = response?.result || null;
+    if (!result?.ok) {
+      throw new Error(result?.error || result?.message || 'The selected API profile could not list models.');
+    }
+    const page = result.modelPage;
+    if (!page || !Array.isArray(page.models)) {
+      throw new Error('The selected API returned no recognizable model catalog.');
+    }
+    const fetchedAt = response.timestamp || result.testedAt || new Date().toISOString();
+    const source = {
+      source: 'provider',
+      authority: page.authority || 'authoritative',
+      complete: page.complete === true,
+      truncated: page.truncated === true,
+      nextCursor: page.nextCursor || null,
+      stale: false,
+      error: null,
+      fetchedAt,
+    };
+    const catalog = {
+      hostId: request.hostId,
+      sessionId: request.sessionId,
+      runId: request.runId,
+      previewProfileId: request.profileId,
+      previewProfileIdentity: request.profileIdentity,
+      cacheState: 'profile preview',
+      fetchedAt,
+      models: page.models
+        .map((model) => String(model?.id || model?.model || '').trim())
+        .filter(Boolean)
+        .map((id) => ({
+          id,
+          displayName: id,
+          reasoningLevels: [],
+          capabilityKnown: false,
+          selectable: true,
+          availability: 'available',
+          cliSupported: 'unknown',
+          providerAdvertised: true,
+          visible: true,
+        })),
+      sources: [source],
+    };
+    state.codexControls.modelCatalogByKey.set(request.key, catalog);
+    state.codexControls.modelOptionsRetryAfterBySession.delete(request.key);
+    return catalog;
+  } finally {
+    state.codexControls.modelOptionsLoadingKeys.delete(request.key);
+    state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
+    renderSessionDetails();
+  }
+}
+
 function requestModelOptionsForSession(session) {
-  if (!session?.live) {
+  if (!session?.hostId || !session?.sessionId || !sessionApiBinding(session)?.bindingFingerprint) {
     return;
   }
-  const host = getHost(session.hostId);
   const key = modelCacheKey(session);
   if (
-    !host?.capabilities?.modelList
-    || state.codexControls.modelOptionsBySession.has(key)
-    || isModelOptionsLoading(session)
+    state.codexControls.modelCatalogByKey.has(key)
+    || state.codexControls.modelOptionsLoadingKeys.has(key)
     || !shouldAutoLoadOptions(state.codexControls.modelOptionsRetryAfterBySession, key)
   ) {
     return;
@@ -15602,7 +20652,11 @@ function requestModelOptionsForSession(session) {
 }
 
 async function loadModelOptionsForSelectedSession() {
-  return loadModelOptionsForSession(getSelectedSession(), { force: true });
+  const session = getSelectedSession();
+  if (canPreviewRebindModels(session)) {
+    return loadRebindProfileModelOptions(session);
+  }
+  return loadModelOptionsForSession(session, { force: true, refresh: true });
 }
 
 async function loadSkillOptionsForSession(session, options = {}) {
@@ -15638,7 +20692,7 @@ async function loadSkillOptionsForSession(session, options = {}) {
   }
 }
 
-function requestSkillOptionsForSession(session) {
+function requestSkillOptionsForSession(session, options = {}) {
   if (!session?.live) {
     return;
   }
@@ -15646,13 +20700,13 @@ function requestSkillOptionsForSession(session) {
   const key = skillCacheKey(session);
   if (
     !host?.capabilities?.skillList
-    || state.codexControls.skillOptionsBySession.has(key)
+    || (!options.force && state.codexControls.skillOptionsBySession.has(key))
     || isSkillOptionsLoading(session)
-    || !shouldAutoLoadOptions(state.codexControls.skillOptionsRetryAfterBySession, key)
+    || (!options.force && !shouldAutoLoadOptions(state.codexControls.skillOptionsRetryAfterBySession, key))
   ) {
     return;
   }
-  loadSkillOptionsForSession(session).catch((error) => {
+  loadSkillOptionsForSession(session, { force: Boolean(options.force) }).catch((error) => {
     if (!/skill listing|session is not live|no live session|not live on this host-agent/i.test(error.message || '')) {
       deferAutoLoadOptions(state.codexControls.skillOptionsRetryAfterBySession, key);
     }
@@ -15869,6 +20923,68 @@ el('close-settings-button').addEventListener('click', () => {
   closeSettingsDialog();
 });
 
+el('export-api-profiles-button')?.addEventListener('click', () => {
+  openApiProfileBackupDialog('export');
+});
+
+el('import-api-profiles-button')?.addEventListener('click', () => {
+  openApiProfileBackupDialog('import');
+});
+
+for (const id of ['api-profile-backup-close-button', 'api-profile-backup-cancel-button']) {
+  el(id)?.addEventListener('click', () => closeApiProfileBackupDialog());
+}
+
+el('api-profile-backup-dialog')?.addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) closeApiProfileBackupDialog();
+});
+
+el('api-profile-backup-file')?.addEventListener('change', async (event) => {
+  const file = event.target.files?.[0] || null;
+  state.apiProfileBackup.error = '';
+  state.apiProfileBackup.status = '';
+  state.apiProfileBackup.fileText = '';
+  state.apiProfileBackup.importedPayload = null;
+  state.apiProfileBackup.preview = null;
+  state.apiProfileBackup.conflicts = [];
+  try {
+    const maximum = window.RemoteCodexApiProfileBackup?.MAX_FILE_BYTES || 1024 * 1024;
+    if (!file) throw new Error('Choose an encrypted backup file.');
+    if (file.size > maximum) throw new Error('The backup file is too large.');
+    const fileText = await file.text();
+    if (new TextEncoder().encode(fileText).length > maximum) throw new Error('The backup file is too large.');
+    state.apiProfileBackup.fileText = fileText;
+    state.apiProfileBackup.status = `${file.name} selected.`;
+  } catch (error) {
+    state.apiProfileBackup.error = error.message || 'Unable to read the backup file.';
+  }
+  renderApiProfileBackupDialog();
+});
+
+el('api-profile-backup-primary-button')?.addEventListener('click', async () => {
+  state.apiProfileBackup.error = '';
+  try {
+    if (state.apiProfileBackup.mode === 'import') await previewEncryptedApiProfiles();
+    else await exportEncryptedApiProfiles();
+  } catch (error) {
+    state.apiProfileBackup.error = error?.code === window.RemoteCodexApiProfileBackup?.PUBLIC_ERROR
+      ? 'The password is incorrect or the backup is damaged.'
+      : error.message || 'Encrypted backup failed.';
+    state.apiProfileBackup.busy = false;
+    renderApiProfileBackupDialog();
+  }
+});
+
+el('api-profile-backup-apply-button')?.addEventListener('click', () => {
+  state.apiProfileBackup.error = '';
+  try {
+    commitImportedApiProfiles();
+  } catch (error) {
+    state.apiProfileBackup.error = error.message || 'Import failed.';
+    renderApiProfileBackupDialog();
+  }
+});
+
 el('settings-dialog').addEventListener('click', (event) => {
   if (event.target === event.currentTarget) {
     closeSettingsDialog();
@@ -15907,15 +21023,15 @@ el('settings-theme-select').addEventListener('change', (event) => {
 });
 
 el('check-update-button')?.addEventListener('click', () => {
-  refreshSoftwareUpdateStatus().catch(reportError);
+  refreshSoftwareUpdateStatus().catch(reportSoftwareUpdateError);
 });
 
 el('apply-update-button')?.addEventListener('click', () => {
-  applySoftwareUpdate().catch(reportError);
+  applySoftwareUpdate().catch(reportSoftwareUpdateError);
 });
 
 el('restart-after-update-button')?.addEventListener('click', () => {
-  restartAfterSoftwareUpdate().catch(reportError);
+  restartAfterSoftwareUpdate().catch(reportSoftwareUpdateError);
 });
 
 el('settings-add-api-profile-button').addEventListener('click', () => {
@@ -15993,7 +21109,6 @@ el('settings-host-api-list').addEventListener('click', (event) => {
 
 el('settings-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  const beforeApiSnapshot = { ...(state.settingsApiSnapshot || {}) };
   const beforeOptimizeSpeedMode = isOptimizeSpeedMode();
   state.ui.locale = el('settings-language-select').value === 'en' ? 'en' : 'zh-CN';
   state.ui.theme = el('settings-theme-select').value === 'dark-tech' ? 'dark-tech' : 'minimal-light';
@@ -16010,7 +21125,6 @@ el('settings-form').addEventListener('submit', (event) => {
   }
   persistUiSettings();
   const optimizeSpeedModeChanged = beforeOptimizeSpeedMode !== isOptimizeSpeedMode();
-  const restartCandidates = getApiChangedLiveSessions(beforeApiSnapshot);
   closeSettingsDialog();
   renderAll();
   if (optimizeSpeedModeChanged) {
@@ -16018,15 +21132,6 @@ el('settings-form').addEventListener('submit', (event) => {
     window.alert(isOptimizeSpeedMode()
       ? 'Performance mode is on. Refresh pages and restart relay if you need server-side list trimming everywhere.'
       : 'Performance mode is off. Refresh pages and restart relay if you need full session-list payloads everywhere.');
-  }
-  if (restartCandidates.length) {
-    openSessionActionDialog({
-      mode: 'restart',
-      title: 'Restart sessions using changed API settings?',
-      subtitle: 'These live managed sessions are running on hosts whose API profile changed. Restarting means stop session + resume history with the new API environment.',
-      actionLabel: 'Restart selected',
-      sessions: restartCandidates,
-    });
   }
 });
 
@@ -16137,9 +21242,9 @@ el('import-selected-host-button').addEventListener('click', async () => {
   }
 });
 
-el('join-session-button').addEventListener('click', async () => {
+el('join-session-button').addEventListener('click', async (event) => {
   try {
-    await joinLiveSession();
+    await joinLiveSession({ trusted: event.isTrusted === true });
   } catch (error) {
     reportError(error);
   }
@@ -16414,7 +21519,10 @@ el('export-dialog-confirm-button')?.addEventListener('click', () => {
 });
 
 document.addEventListener('visibilitychange', () => {
+  state.messageDocumentVisible = document.visibilityState === 'visible';
   if (document.visibilityState === 'visible') {
+    void maybeAdvanceReadReceipt(getSelectedSession());
+    void requestMessageNotificationOutboxDrain();
     resumeSelectedSessionRealtime().catch(reportError);
   }
 });
@@ -16424,7 +21532,14 @@ window.addEventListener('pageshow', () => {
 });
 
 window.addEventListener('focus', () => {
+  state.messageWindowFocused = true;
+  void maybeAdvanceReadReceipt(getSelectedSession());
+  void requestMessageNotificationOutboxDrain();
   resumeSelectedSessionRealtime().catch(reportError);
+});
+
+window.addEventListener('blur', () => {
+  state.messageWindowFocused = false;
 });
 
 el('rename-session-button')?.addEventListener('click', async () => {
@@ -16756,30 +21871,334 @@ el('mark-all-message-notifications-read-button')?.addEventListener('click', (eve
   markAllMessageNotificationsRead();
 });
 
+el('open-skills-manager-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  openSkillsManager();
+});
+
+el('close-skills-manager-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  closeSkillsManager();
+});
+
+el('skills-search-input')?.addEventListener('input', (event) => {
+  state.skillsManager.query = event.target.value || '';
+  renderSkillsManager();
+});
+
+el('skills-refresh-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  refreshSkillsInventory([]).catch(reportError);
+});
+
+el('skills-refresh-selected-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  const hostIds = Array.from(state.skillsManager.selectedHostIds);
+  if (!hostIds.length) {
+    state.skillsManager.actionSummary = 'Select at least one host to refresh.';
+    renderSkillsManager();
+    return;
+  }
+  refreshSkillsInventory(hostIds).catch(reportError);
+});
+
+document.querySelectorAll('[data-skills-tab]').forEach((button) => {
+  button.addEventListener('click', (event) => {
+    event.preventDefault();
+    const nextTab = button.getAttribute('data-skills-tab') || 'installed';
+    if (state.skillsManager.tab !== nextTab) {
+      clearSkillsCleanupSelection();
+      state.skillsManager.tab = nextTab;
+    }
+    renderSkillsManager();
+  });
+});
+
+document.querySelectorAll('[data-skills-scope]').forEach((button) => {
+  button.addEventListener('click', (event) => {
+    event.preventDefault();
+    const nextScope = button.getAttribute('data-skills-scope') === 'project'
+      ? 'project'
+      : 'user';
+    if (state.skillsManager.deploymentScope !== nextScope) {
+      resetSkillsProjectWriteConfirmation();
+      state.skillsManager.deploymentScope = nextScope;
+    }
+    renderSkillsManager();
+  });
+});
+
+el('skills-project-cwd-select')?.addEventListener('change', (event) => {
+  const nextProjectCwd = String(event.target.value || '').trim();
+  if (state.skillsManager.projectCwd !== nextProjectCwd) {
+    resetSkillsProjectWriteConfirmation();
+    state.skillsManager.projectCwd = nextProjectCwd;
+  }
+  renderSkillsManager();
+});
+
+el('skills-confirm-project-write')?.addEventListener('change', (event) => {
+  resetSkillsProjectWriteConfirmation();
+  if (event.target.checked) {
+    state.skillsManager.confirmProjectWrite = true;
+    state.skillsManager.projectWriteConfirmationKey = skillsProjectConfirmationKey(
+      Array.from(state.skillsManager.selectedHostIds),
+      state.skillsManager.projectCwd
+    );
+  }
+  renderSkillsManager();
+});
+
+el('skills-host-list')?.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-skills-host-id]');
+  if (!checkbox) {
+    return;
+  }
+  const hostId = checkbox.getAttribute('data-skills-host-id') || '';
+  if (checkbox.checked) {
+    state.skillsManager.selectedHostIds.add(hostId);
+  } else {
+    state.skillsManager.selectedHostIds.delete(hostId);
+  }
+  resetSkillsProjectWriteConfirmation();
+  renderSkillsManager();
+});
+
+el('skills-list')?.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-skills-deploy-skill-id]');
+  if (!checkbox) {
+    return;
+  }
+  const skillId = checkbox.getAttribute('data-skills-deploy-skill-id') || '';
+  if (checkbox.checked) {
+    state.skillsManager.selectedSkillIds.add(skillId);
+  } else {
+    state.skillsManager.selectedSkillIds.delete(skillId);
+  }
+  renderSkillsManager();
+});
+
+el('skills-inventory-matrix')?.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-skills-deploy-skill-id], [data-skills-cleanup-row-key]');
+  if (!checkbox) {
+    return;
+  }
+  const cleanupKey = checkbox.getAttribute('data-skills-cleanup-row-key') || '';
+  if (cleanupKey) {
+    if (checkbox.checked) {
+      state.skillsManager.selectedCleanupKeys.add(cleanupKey);
+    } else {
+      state.skillsManager.selectedCleanupKeys.delete(cleanupKey);
+    }
+    renderSkillsManager();
+    return;
+  }
+  const skillId = checkbox.getAttribute('data-skills-deploy-skill-id') || '';
+  if (checkbox.checked) {
+    state.skillsManager.selectedSkillIds.add(skillId);
+  } else {
+    state.skillsManager.selectedSkillIds.delete(skillId);
+  }
+  renderSkillsManager();
+});
+
+el('skills-list')?.addEventListener('click', (event) => {
+  const retireButton = event.target.closest('[data-skills-retire-library-id]');
+  if (retireButton) {
+    event.preventDefault();
+    updateSkillLibraryLifecycle(
+      retireButton.getAttribute('data-skills-retire-library-id') || '',
+      'retire'
+    ).catch(reportError);
+    return;
+  }
+  const favoriteButton = event.target.closest('[data-skills-favorite-id]');
+  if (!favoriteButton) {
+    return;
+  }
+  event.preventDefault();
+  toggleSkillFavorite(favoriteButton.getAttribute('data-skills-favorite-id')).catch(reportError);
+});
+
+el('skills-inventory-matrix')?.addEventListener('click', (event) => {
+  const adoptButton = event.target.closest('[data-skills-adopt-instance-id]');
+  if (!adoptButton) {
+    return;
+  }
+  event.preventDefault();
+  adoptSkillInstance(
+    adoptButton.getAttribute('data-skills-adopt-host-id'),
+    adoptButton.getAttribute('data-skills-adopt-instance-id')
+  ).catch(reportError);
+});
+
+el('skills-install-selected-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  runSkillsManagerAction('install').catch(reportError);
+});
+
+el('skills-uninstall-selected-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  runSkillsManagerAction('uninstall').catch(reportError);
+});
+
+el('skills-enable-selected-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  deploySelectedSkills('enable').catch(reportError);
+});
+
+el('skills-enable-all-hosts-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  deploySelectedSkills('enable', { allHosts: true }).catch(reportError);
+});
+
+el('skills-disable-selected-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  deploySelectedSkills('disable').catch(reportError);
+});
+
+el('skills-remove-host-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  deploySelectedSkills('remove').catch(reportError);
+});
+
+el('skills-add-source-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  const nameInput = el('skills-source-name-input');
+  const urlInput = el('skills-source-url-input');
+  const name = String(nameInput?.value || '').trim();
+  const url = String(urlInput?.value || '').trim();
+  if (!name && !url) {
+    state.skillsManager.actionSummary = 'Enter a source name or URL/path.';
+    renderSkillsManager();
+    return;
+  }
+  const sourceId = `source-${Date.now().toString(36)}`;
+  const nextSources = [
+    ...state.skillsManager.sources,
+    {
+      sourceId,
+      name: name || url || 'Skill source',
+      url,
+      enabled: true,
+      kind: 'manual',
+      skills: [],
+    },
+  ];
+  if (nameInput) {
+    nameInput.value = '';
+  }
+  if (urlInput) {
+    urlInput.value = '';
+  }
+  saveSkillsSources(nextSources).catch(reportError);
+});
+
+el('skills-import-github-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  importGithubSkill().catch(reportError);
+});
+
+el('skills-collect-unused-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  collectUnusedSkillArtifacts().catch(reportError);
+});
+
+el('skills-load-audit-button')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  loadSkillsAudit().catch(reportError);
+});
+
+el('skills-library-lifecycle-list')?.addEventListener('click', (event) => {
+  const restoreButton = event.target.closest('[data-skills-restore-library-id]');
+  const retireButton = event.target.closest('[data-skills-retire-library-id]');
+  const actionButton = restoreButton || retireButton;
+  if (!actionButton) {
+    return;
+  }
+  event.preventDefault();
+  updateSkillLibraryLifecycle(
+    actionButton.getAttribute(
+      restoreButton ? 'data-skills-restore-library-id' : 'data-skills-retire-library-id'
+    ),
+    restoreButton ? 'restore' : 'retire'
+  ).catch(reportError);
+});
+
+el('skills-source-list')?.addEventListener('change', (event) => {
+  const refreshSelect = event.target.closest('[data-skills-source-refresh-policy]');
+  const rolloutSelect = event.target.closest('[data-skills-source-rollout-policy]');
+  const select = refreshSelect || rolloutSelect;
+  if (!select) return;
+  const sourceId = select.getAttribute(
+    refreshSelect ? 'data-skills-source-refresh-policy' : 'data-skills-source-rollout-policy'
+  ) || '';
+  const source = state.skillsManager.sources.find((candidate) => candidate?.sourceId === sourceId) || null;
+  if (!source) return;
+  const current = skillSourceAutomationDraft(source);
+  state.skillsManager.sourceAutomationDrafts.set(sourceId, {
+    ...current,
+    refreshPolicy: refreshSelect
+      ? normalizeSkillSourceRefreshPolicy(select.value)
+      : current.refreshPolicy,
+    rolloutPolicy: rolloutSelect
+      ? normalizeSkillSourceRolloutPolicy(select.value)
+      : current.rolloutPolicy,
+    dirty: true,
+  });
+  state.skillsManager.sourceAutomationStatus.delete(sourceId);
+  renderSkillsManager();
+});
+
+el('skills-source-list')?.addEventListener('click', (event) => {
+  const automationButton = event.target.closest('[data-skills-save-source-automation-id]');
+  if (automationButton) {
+    event.preventDefault();
+    updateSkillSourceAutomation(
+      automationButton.getAttribute('data-skills-save-source-automation-id') || ''
+    ).catch(reportError);
+    return;
+  }
+  const refreshButton = event.target.closest('[data-skills-refresh-source-id]');
+  if (refreshButton) {
+    event.preventDefault();
+    refreshGithubSkillSource(
+      refreshButton.getAttribute('data-skills-refresh-source-id') || ''
+    ).catch(reportError);
+    return;
+  }
+  const removeButton = event.target.closest('[data-skills-remove-source-id]');
+  if (!removeButton) {
+    return;
+  }
+  event.preventDefault();
+  const sourceId = removeButton.getAttribute('data-skills-remove-source-id') || '';
+  const nextSources = state.skillsManager.sources.filter((source) => source.sourceId !== sourceId);
+  saveSkillsSources(nextSources).catch(reportError);
+});
+
 el('scroll-transcript-top-button')?.addEventListener('click', (event) => {
   event.preventDefault();
   event.stopPropagation();
-  scrollTranscriptTo('top');
+  scrollTranscriptTo('top', { trusted: event.isTrusted === true });
 });
 
 el('scroll-transcript-bottom-button')?.addEventListener('click', (event) => {
   event.preventDefault();
   event.stopPropagation();
-  scrollTranscriptTo('bottom');
+  scrollTranscriptTo('bottom', { trusted: event.isTrusted === true });
 });
 
-el('session-log')?.addEventListener('scroll', () => {
-  const log = el('session-log');
-  if (isTranscriptPinnedToBottom(log)) {
-    setTranscriptUserDetached();
-    clearTranscriptUnread();
-    markSessionMessagesRead(getSelectedSession());
-    renderConversationNav();
-    renderMessageNotificationBell();
-  } else {
-    setTranscriptUserDetached(undefined, true);
+el('session-log')?.addEventListener('scroll', handleTranscriptScrollDetach, { passive: true });
+window.addEventListener('scroll', handleTranscriptScrollDetach, { passive: true });
+for (const eventName of ['wheel', 'touchend', 'pointerup']) {
+  window.addEventListener(eventName, recordTranscriptTrustedInteraction, { passive: true });
+}
+window.addEventListener('keydown', (event) => {
+  if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+    recordTranscriptTrustedInteraction(event);
   }
-}, { passive: true });
+});
 
 el('close-sidebar-navigator-button')?.addEventListener('click', () => {
   closeMobileSelectMenus();
@@ -16957,6 +22376,69 @@ el('codex-model-refresh-button').addEventListener('click', async () => {
     await loadModelOptionsForSelectedSession();
   } catch (error) {
     reportError(error);
+  }
+});
+
+el('session-api-rebind-button')?.addEventListener('click', async () => {
+  const session = getSelectedSession();
+  if (!session || isSessionApiRebindBusy(session)) {
+    return;
+  }
+  const targetProfile = String(el('session-api-rebind-select')?.value || '__host_environment__');
+  rememberRebindTarget(session, targetProfile);
+  let selectionSnapshot;
+  let apiConfigSnapshot;
+  try {
+    if (targetProfile !== '__host_environment__') {
+      ({ apiConfig: apiConfigSnapshot } = resolveLaunchApiConfig({
+        hostId: session.hostId,
+        sourceSession: session,
+        explicitProfileId: targetProfile,
+      }));
+      apiConfigSnapshot = apiConfigSnapshot ? { ...apiConfigSnapshot } : null;
+    } else {
+      apiConfigSnapshot = null;
+    }
+    selectionSnapshot = sessionSelectionRequestBody(session);
+  } catch (error) {
+    reportError(error);
+    return;
+  }
+  setSessionApiRebindBusy(session, true);
+  renderSessionDetails();
+  try {
+    await rebindSessionApi(session, targetProfile, selectionSnapshot, apiConfigSnapshot);
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setSessionApiRebindBusy(session, false);
+    renderSessionDetails();
+  }
+});
+
+el('session-api-rebind-select')?.addEventListener('change', () => {
+  const session = getSelectedSession();
+  if (!session) {
+    return;
+  }
+  rememberRebindTarget(session, el('session-api-rebind-select')?.value || '__host_environment__');
+  renderSessionDetails();
+});
+
+el('session-transcript-fallback-button')?.addEventListener('click', async () => {
+  const session = getSelectedSession();
+  if (!session || isSessionTranscriptFallbackBusy(session)) {
+    return;
+  }
+  setSessionTranscriptFallbackBusy(session, true);
+  renderSessionApiControls(getSelectedSession());
+  try {
+    await startTranscriptFallback(session);
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setSessionTranscriptFallbackBusy(session, false);
+    renderSessionApiControls(getSelectedSession());
   }
 });
 
@@ -17351,6 +22833,10 @@ document.addEventListener('keydown', (event) => {
 
   if (state.settingsOpen) {
     closeSettingsDialog();
+  }
+
+  if (state.skillsManager.open) {
+    closeSkillsManager();
   }
 
   if (state.imagePreview.open) {

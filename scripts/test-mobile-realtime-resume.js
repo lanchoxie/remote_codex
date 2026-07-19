@@ -17,19 +17,20 @@ const renderTranscriptBody = app.slice(renderTranscriptStart, renderTranscriptEn
 
 assertContains(
   app,
-  'function hasDetachedThinkingScroller',
-  'UI should detect when the user is reading inside a thinking scroller'
+  'function getThinkingScrollMachine',
+  'thinking scrollers should retain their own independent scroll machines'
 );
 assertContains(
   renderTranscriptBody,
-  'thinkingReaderDetached',
-  'transcript rendering should account for nested thinking scroll position'
+  'isTranscriptPinnedAcrossScrollTargets()',
+  'transcript rendering should evaluate the outer transcript boundary'
 );
 assertContains(
-  renderTranscriptBody,
-  '|| thinkingReaderDetached',
-  'thinking readers should prevent transcript auto-stick-to-bottom'
+  app,
+  'noteMessageReadThinkingScroll(session);',
+  'thinking movement should be isolated from message read eligibility'
 );
+assert(!renderTranscriptBody.includes('thinkingReaderDetached'), 'thinking scroll must not detach the outer transcript reader');
 
 assertContains(
   app,

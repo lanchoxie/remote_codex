@@ -19,6 +19,14 @@ This directory separates product architecture, implementation modules, validatio
 - [Codex Capability Inventory](codex-capability-inventory.md): known Codex app-server and CLI capabilities.
 - [MVP Plan](mvp-plan.md): first milestone scope and success criteria.
 - [Large File Transfer Design](large-file-transfer-design.md): chunked upload and download design for files that should not travel through JSON/base64.
+- [Multi-Host Skills Registry Design](superpowers/specs/2026-07-12-multi-host-skills-registry-design.md): host-specific skill states, central downloadable sources, Adopt, complete-directory distribution, and composer `/` integration.
+- [Multi-Host Skills Phase 1 Plan](superpowers/plans/2026-07-12-multi-host-skills-phase-1.md): cached multi-scope Host inventory, asynchronous refresh, Skills SSE, and the read-only status matrix.
+- [Multi-Host Skills Phase 2 Plan](superpowers/plans/2026-07-13-multi-host-skills-phase-2.md): complete-directory artifacts, persistent registry, Host Adopt, bounded GitHub import, and manager actions.
+- [Multi-Host Skills Phase 3 Plan](superpowers/plans/2026-07-13-multi-host-skills-phase-3.md): durable desired state, safe Host activation, offline reconciliation, explicit per-Host actions, and deployment progress.
+
+## Operational analyses
+
+- [Realtime Session Sync Performance Fix](realtime-session-sync-performance.md): reproduction, root causes, batching and idempotency design, performance results, and remaining P1 work for the 14-second sync incident.
 
 ## Module developer docs
 

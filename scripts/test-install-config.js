@@ -4,9 +4,11 @@ const fs = require('fs');
 assert(fs.existsSync('config/remote-codex.defaults.json'), 'install helper defaults should exist');
 
 const defaults = JSON.parse(fs.readFileSync('config/remote-codex.defaults.json', 'utf8'));
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 
 assert.strictEqual(defaults.runtimeReleaseRepo, 'lanchoxie/remote_codex', 'defaults should point to the release repo');
 assert(/^v\d+\.\d+\.\d+$/.test(defaults.runtimeReleaseTag), 'defaults should include a stable runtime release tag');
+assert.strictEqual(defaults.runtimeReleaseTag, `v${pkg.version}`, 'default runtime release tag should match package.json version');
 assert(defaults.localCodexHome.includes('.codex'), 'defaults should include local CODEX_HOME');
 assert(defaults.remoteCodexHome.includes('.codex'), 'defaults should include remote CODEX_HOME');
 assert(Array.isArray(defaults.remoteCodexBinHints), 'defaults should include remote Codex binary hints');

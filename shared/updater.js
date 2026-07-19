@@ -18,8 +18,13 @@ function cleanRootDir(rootDir = process.cwd()) {
   return path.resolve(String(rootDir || process.cwd()));
 }
 
+function gitArgsForRoot(rootDir, args) {
+  const safeRoot = cleanRootDir(rootDir).replace(/\\/g, '/');
+  return ['-c', `safe.directory=${safeRoot}`, ...args];
+}
+
 function runGit(rootDir, args, options = {}) {
-  const result = spawnSync('git', args, {
+  const result = spawnSync('git', gitArgsForRoot(rootDir, args), {
     cwd: cleanRootDir(rootDir),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -144,7 +149,7 @@ function isAncestor(rootDir, olderRef, newerRef) {
   if (!olderRef || !newerRef) {
     return false;
   }
-  const result = spawnSync('git', ['merge-base', '--is-ancestor', olderRef, newerRef], {
+  const result = spawnSync('git', gitArgsForRoot(rootDir, ['merge-base', '--is-ancestor', olderRef, newerRef]), {
     cwd: cleanRootDir(rootDir),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],

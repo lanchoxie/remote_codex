@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "grill-me": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grill-me/SKILL.md",
+      "computedHash": "67e31b63e6e9e454cc2f51cd85b9cf1396ee46379a87c07a1450f33c47c1276a"
+    }
+  }
+}

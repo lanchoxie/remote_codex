@@ -132,6 +132,14 @@ assertContains(
   'PATH="$PATH" CODEX_BIN="$CODEX_BIN"',
   'the default host-agent launch should pass the resolver-adjusted PATH and CODEX_BIN into the process'
 );
+assert(
+  !relay.includes('deploy: deployment'),
+  'non-bootstrap connector actions must not read an undefined deployment result'
+);
+assert(
+  !relay.includes('actionMultiplexFallback'),
+  'disabled SSH multiplexing must not leave connector action fallback state'
+);
 
 assert.strictEqual(
   packageJson.scripts['test:remote-codex-env'],

@@ -1,0 +1,80 @@
+const assert = require('assert');
+const {
+  ThinkingActivityAggregator,
+  makeActivityKey,
+} = require('../shared/thinking-activity');
+
+async function main() {
+  const emitted = [];
+  const timers = [];
+  const aggregator = new ThinkingActivityAggregator({
+    canonicalConversationKey: 'host-a::conversation-a',
+    runId: 'run-1',
+    flushDelayMs: 75,
+    emitSnapshot: async (snapshot) => emitted.push(snapshot),
+    setTimer(fn, delay) {
+      const timer = { fn, delay, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer(timer) {
+      timer.cancelled = true;
+    },
+    now: () => '2026-07-16T00:00:00.000Z',
+  });
+  const item = {
+    turnId: 'turn-1',
+    itemId: 'reasoning-1',
+    summaryIndex: 0,
+    kind: 'reasoning',
+  };
+
+  assert.strictEqual(
+    makeActivityKey({
+      canonicalConversationKey: 'host-a::conversation-a',
+      runId: 'run-1',
+      ...item,
+    }),
+    '["host-a::conversation-a","run-1","turn-1","reasoning-1",0]'
+  );
+
+  aggregator.appendDelta(item, '  First');
+  aggregator.appendDelta(item, ' word,');
+  aggregator.appendDelta(item, ' then second.  ');
+  assert.strictEqual(timers.length, 1, 'rapid deltas should share one timer');
+  assert.strictEqual(timers[0].delay, 75, 'the coalescing window should be exactly 75 ms');
+
+  await timers[0].fn();
+  assert.strictEqual(emitted.length, 1);
+  assert.strictEqual(emitted[0].text, '  First word, then second.  ');
+  assert.strictEqual(emitted[0].activityRevision, 1);
+  assert.strictEqual(emitted[0].final, false);
+  assert.strictEqual(emitted[0].timestamp, '2026-07-16T00:00:00.000Z');
+
+  await aggregator.flush(item);
+  assert.strictEqual(emitted.length, 1, 'an unchanged non-final snapshot should be idempotent');
+
+  aggregator.appendDelta(item, 'Next');
+  assert.strictEqual(timers.length, 2);
+  await aggregator.flush(item, { final: true });
+  assert.strictEqual(timers[1].cancelled, true, 'a forced flush should cancel the pending timer');
+  assert.strictEqual(emitted.length, 2);
+  assert.strictEqual(emitted[1].text, '  First word, then second.  Next');
+  assert.strictEqual(emitted[1].final, true);
+  assert.strictEqual(emitted[1].activityRevision, 2);
+
+  const replacement = { ...item, itemId: 'reasoning-2', summaryIndex: 1 };
+  aggregator.replaceSnapshot(replacement, ' replacement\ntext ');
+  await aggregator.flushAll({ final: true });
+  const replacementSnapshot = emitted.find((snapshot) => snapshot.itemId === 'reasoning-2');
+  assert.strictEqual(replacementSnapshot.text, ' replacement\ntext ');
+  assert.strictEqual(replacementSnapshot.activityRevision, 1);
+  assert.strictEqual(replacementSnapshot.final, true);
+
+  console.log('thinking activity aggregator assertions passed');
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

@@ -92,6 +92,43 @@ function testStatusReportsLatestStableTag() {
   assert.strictEqual(status.dirty, false);
 }
 
+function testDifferentOwnerRepositoryUsesCommandScopedTrust() {
+  const root = initRepo();
+  const isolatedGlobalConfig = path.join(root, 'isolated-global-gitconfig');
+  fs.writeFileSync(isolatedGlobalConfig, '', 'utf8');
+  const previousAssumeOwner = process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+  const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = '1';
+  process.env.GIT_CONFIG_GLOBAL = isolatedGlobalConfig;
+
+  try {
+    const untrusted = spawnSync('git', ['status', '--short'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    assert.notStrictEqual(untrusted.status, 0, 'test setup must reproduce dubious ownership');
+    assert.match(String(untrusted.stderr || ''), /dubious ownership/i);
+
+    const status = updater.getLocalUpdateStatus({ rootDir: root, fetch: false });
+    assert.strictEqual(status.currentVersion, '2.4.3');
+    assert.strictEqual(status.updateAvailable, true);
+    assert.strictEqual(fs.readFileSync(isolatedGlobalConfig, 'utf8'), '', 'updater must not mutate global Git config');
+  } finally {
+    if (previousAssumeOwner === undefined) {
+      delete process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+    } else {
+      process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = previousAssumeOwner;
+    }
+    if (previousGlobalConfig === undefined) {
+      delete process.env.GIT_CONFIG_GLOBAL;
+    } else {
+      process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+    }
+  }
+}
+
 function testCleanHeadAheadOfLatestStableDoesNotDowngrade() {
   const root = initRepo();
   run('git', ['checkout', 'v2.4.4'], root);
@@ -161,11 +198,18 @@ function testSettingsUpdateUiExists() {
   assert.match(appSource, /\/api\/update\/status/);
   assert.match(appSource, /\/api\/update\/apply/);
   assert.match(appSource, /\/api\/update\/restart/);
+  assert.match(appSource, /function reportSoftwareUpdateError/);
+  assert.strictEqual(
+    (appSource.match(/\.catch\(reportSoftwareUpdateError\)/g) || []).length,
+    4,
+    'software update failures must stay in the settings panel instead of becoming Session errors',
+  );
   assert.match(cssSource, /settings-update-section/);
 }
 
 testStableTagsIgnorePrerelease();
 testStatusReportsLatestStableTag();
+testDifferentOwnerRepositoryUsesCommandScopedTrust();
 testCleanHeadAheadOfLatestStableDoesNotDowngrade();
 testDirtyTrackedFilesBlockUpdate();
 testUpdateBacksUpDataBeforeCheckout();

@@ -74,7 +74,7 @@ function resolveManagedRuntime(command = {}, defaults = {}) {
   };
 }
 
-function startProcessManagedRuntimeSession({
+async function startProcessManagedRuntimeSession({
   runtime,
   hostId,
   sessionId,
@@ -89,22 +89,35 @@ function startProcessManagedRuntimeSession({
   bootstrap,
   postEvent,
   onTerminated,
+  onRunnerCreated,
+  spawnProcess = spawn,
+  stopGraceTimeoutMs = 5000,
+  stopKillTimeoutMs = 1000,
 }) {
   const createdAt = nowIso();
   const command = runtime.command;
   const args = normalizeRuntimeArgs(runtime.args);
-  const child = spawn(command, args, {
-    cwd,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    shell: false,
-    windowsHide: true,
-    env: {
-      ...process.env,
-      ...buildApiEnvironment(apiConfig),
-      DEMO_BOOTSTRAP_JSON: JSON.stringify(bootstrap || null),
-      DEMO_SESSION_LABEL: String(title || cwd || sessionId),
-    },
+  let child = null;
+  let spawned = false;
+  let spawnFailed = false;
+  let runtimeError = null;
+  let resolveTerminalCompletion;
+  const terminalCompletion = new Promise((resolve) => {
+    resolveTerminalCompletion = resolve;
   });
+
+  async function waitForTerminal(timeoutMs) {
+    let timer = null;
+    const completed = await Promise.race([
+      terminalCompletion.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    return completed;
+  }
 
   const runner = {
     kind: runtime.kind || 'process',
@@ -117,6 +130,9 @@ function startProcessManagedRuntimeSession({
     sourceSessionId: sourceSessionId || null,
     conversationKey: conversationKey || originSessionId || sessionId,
     launchMode: launchMode || null,
+    stopRequested: false,
+    startCompleted: false,
+    suppressTerminalEvent: false,
     runtime: {
       kind: 'child_process',
       adapterId: runtime.kind || 'process',
@@ -128,12 +144,146 @@ function startProcessManagedRuntimeSession({
       cwd,
     },
     async sendInput(text) {
+      if (!child?.stdin) throw new Error('Managed process is not running.');
       child.stdin.write(`${String(text || '')}\n`);
     },
-    async stop() {
-      child.kill();
+    async stop(options = {}) {
+      if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
+        runner.suppressTerminalEvent = true;
+      }
+      runner.stopRequested = true;
+      if (!child) {
+        await finalizeTerminal(null, null, {
+          terminalState: 'failed:start-cancelled',
+        });
+        return;
+      }
+      if (spawnFailed && terminalPromise) {
+        await terminalPromise;
+        return;
+      }
+      if (child.exitCode !== null || child.signalCode !== null) {
+        if (!terminalPromise) finalizeTerminal(child.exitCode, child.signalCode);
+        await terminalPromise;
+        return;
+      }
+      try {
+        child.kill();
+      } catch (error) {
+        runtimeError = runtimeError || error;
+        forwardRuntimeError(error);
+      }
+      if (!(await waitForTerminal(Math.max(1, Number(stopGraceTimeoutMs) || 5000)))) {
+        try {
+          child.kill('SIGKILL');
+        } catch (error) {
+          runtimeError = runtimeError || error;
+          forwardRuntimeError(error);
+        }
+        await waitForTerminal(Math.max(1, Number(stopKillTimeoutMs) || 1000));
+      }
+      if (!terminalPromise) {
+        const error = new Error(
+          `Managed process did not confirm exit after ${Math.max(1, Number(stopGraceTimeoutMs) || 5000) + Math.max(1, Number(stopKillTimeoutMs) || 1000)}ms.`
+        );
+        error.code = 'session_stop_timeout';
+        error.processTreeFallbackRequired = true;
+        throw error;
+      }
+      await terminalPromise;
     },
   };
+
+  let terminalPromise = null;
+  async function forwardRuntimeError(error) {
+    try {
+      await postEvent({
+        type: 'session.error',
+        hostId,
+        sessionId,
+        runId: runner.runId,
+        message: `managed session error: ${error.message}`,
+        timestamp: nowIso(),
+      });
+    } catch (postError) {
+      console.error('[agent] failed to forward runtime error', postError.message);
+    }
+  }
+
+  function finalizeTerminal(code, signal, options = {}) {
+    if (terminalPromise) return terminalPromise;
+    terminalPromise = (async () => {
+      if (typeof onTerminated === 'function') {
+        try {
+          onTerminated(code, signal);
+        } catch (error) {
+          console.error('[agent] managed runtime termination callback failed', error.message);
+        }
+      }
+      if (options.error) await forwardRuntimeError(options.error);
+      if (!runner.suppressTerminalEvent) {
+        try {
+          await postEvent({
+            type: 'session.state_changed',
+            hostId,
+            sessionId,
+            runId: runner.runId,
+            state: options.terminalState
+              || (runner.stopRequested
+                ? (runner.startCompleted ? 'history-only' : 'failed:start-cancelled')
+                : runtimeError
+                  ? 'failed:runtime-error'
+                  : `exited:${code ?? 'null'}:${signal ?? 'null'}`),
+            live: false,
+            timestamp: nowIso(),
+          });
+        } catch (postError) {
+          const retryError = postError instanceof Error
+            ? postError
+            : new Error(String(postError || 'Session terminal state delivery failed.'));
+          retryError.retryCommand = true;
+          throw retryError;
+        }
+      }
+    })().finally(() => {
+      resolveTerminalCompletion();
+    });
+    return terminalPromise;
+  }
+
+  try {
+    if (typeof onRunnerCreated === 'function') onRunnerCreated(runner);
+  } catch (error) {
+    await runner.stop(runner.stopRequested ? {} : { suppressTerminalEvent: true }).catch(() => {});
+    throw error;
+  }
+
+  if (runner.stopRequested) {
+    const error = new Error('Managed process startup was cancelled before spawn.');
+    error.code = 'session_start_cancelled';
+    error.failureState = 'failed:start-cancelled';
+    throw error;
+  }
+
+  try {
+    child = spawnProcess(command, args, {
+      cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        ...buildApiEnvironment(apiConfig),
+        DEMO_BOOTSTRAP_JSON: JSON.stringify(bootstrap || null),
+        DEMO_SESSION_LABEL: String(title || cwd || sessionId),
+      },
+    });
+  } catch (error) {
+    runtimeError = error;
+    if (!runner.stopRequested) runner.suppressTerminalEvent = true;
+    await finalizeTerminal(null, null, { error, terminalState: 'failed:runtime-error' });
+    throw error;
+  }
 
   const stdout = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
   const stderr = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
@@ -166,49 +316,40 @@ function startProcessManagedRuntimeSession({
     });
   });
 
+  const spawnHandshake = new Promise((resolve, reject) => {
+    child.once('spawn', () => {
+      spawned = true;
+      resolve();
+    });
+    child.once('error', reject);
+  });
+
   child.on('error', (error) => {
-    if (typeof onTerminated === 'function') {
-      onTerminated();
+    runtimeError = runtimeError || error;
+    if (spawned) {
+      forwardRuntimeError(error);
     }
-    postEvent({
-      type: 'session.error',
-      hostId,
-      sessionId,
-      message: `managed session error: ${error.message}`,
-      timestamp: nowIso(),
-    }).catch((postError) => {
-      console.error('[agent] failed to forward runtime error', postError.message);
-    });
-    postEvent({
-      type: 'session.state_changed',
-      hostId,
-      sessionId,
-      runId: runner.runId,
-      state: 'failed:runtime-error',
-      live: false,
-      timestamp: nowIso(),
-    }).catch((postError) => {
-      console.error('[agent] failed to forward runtime state', postError.message);
-    });
   });
-
   child.on('exit', (code, signal) => {
-    if (typeof onTerminated === 'function') {
-      onTerminated();
-    }
-    postEvent({
-      type: 'session.state_changed',
-      hostId,
-      sessionId,
-      runId: runner.runId,
-      state: `exited:${code ?? 'null'}:${signal ?? 'null'}`,
-      live: false,
-      timestamp: nowIso(),
-    }).catch((error) => {
-      console.error('[agent] failed to forward exit state', error.message);
-    });
+    finalizeTerminal(code, signal).catch(() => {});
   });
 
+  try {
+    await spawnHandshake;
+  } catch (error) {
+    spawnFailed = true;
+    runtimeError = runtimeError || error;
+    if (!runner.stopRequested) runner.suppressTerminalEvent = true;
+    await finalizeTerminal(null, null, { error, terminalState: 'failed:runtime-error' });
+    throw error;
+  }
+  if (terminalPromise || child.exitCode !== null || child.signalCode !== null) {
+    if (terminalPromise) await terminalPromise;
+    const error = runtimeError || new Error('Managed process exited during startup.');
+    error.code = error.code || 'session_process_exited_during_start';
+    throw error;
+  }
+  runner.startCompleted = true;
   return runner;
 }
 
@@ -226,12 +367,15 @@ async function startManagedRuntimeSession(options) {
       nativeThreadId: options.nativeThreadId || null,
       codexHome: options.codexHome,
       apiConfig: options.apiConfig,
+      apiBinding: options.apiBinding,
       bootstrap: options.bootstrap,
       originSessionId: options.originSessionId || null,
       sourceSessionId: options.sourceSessionId || null,
       conversationKey: options.conversationKey || null,
       postEvent: options.postEvent,
       onTerminated: options.onTerminated,
+      onRunnerCreated: options.onRunnerCreated,
+      spawnProcess: options.spawnProcess,
     });
   }
 

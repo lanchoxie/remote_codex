@@ -3,6 +3,7 @@ const os = require('os');
 const path = require('path');
 const { readJsonLines, readJsonLinesTail } = require('./jsonl');
 const { pick } = require('./protocol');
+const { normalizeAssistantObservation } = require('./assistant-message-identity');
 
 const TRANSCRIPT_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_READ_LIMIT || 12000);
 const TRANSCRIPT_HEAD_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_HEAD_READ_LIMIT || 500);
@@ -436,32 +437,32 @@ function makeTranscriptEntry(row, options = {}) {
     };
   }
 
-  if (payload.type === 'task_complete' && payload.last_agent_message) {
-    const text = cleanTranscriptText(payload.last_agent_message, 'agent', options);
-    if (!text) {
-      return null;
-    }
-    return {
-      speaker: 'agent',
-      text,
-      timestamp,
-    };
-  }
-
   return null;
 }
 
-function makeCodexRowEvents(row) {
+function makeCodexRowEvents(row, context = {}) {
   const events = [];
   if (!row || typeof row !== 'object') {
     return events;
   }
 
-  const transcript = makeTranscriptEntry(row);
+  const isTaskComplete = row.type === 'event_msg' && row.payload?.type === 'task_complete';
+  const transcript = isTaskComplete ? null : makeTranscriptEntry(row);
   if (transcript) {
+    const assistantObservation = normalizeAssistantObservation({
+      ...context,
+      representation: 'rollout',
+      row,
+      role: transcript.speaker,
+      text: transcript.text,
+      sourceTimestamp: row.timestamp,
+      finalized: true,
+    });
     events.push({
       type: 'session.transcript',
-      entry: transcript,
+      entry: assistantObservation
+        ? { ...transcript, assistantObservation }
+        : transcript,
     });
   }
 
@@ -836,10 +837,9 @@ function extractStructuredText(value) {
     return value;
   }
   if (Array.isArray(value)) {
-    return value
+    return joinStructuredTextParts(value
       .map(extractStructuredText)
-      .filter(Boolean)
-      .join('\n');
+      .filter(Boolean));
   }
   if (typeof value !== 'object') {
     return String(value);
@@ -851,6 +851,20 @@ function extractStructuredText(value) {
     || value.output_text
     || value.input_text
     || '';
+}
+
+function joinStructuredTextParts(parts) {
+  const values = (Array.isArray(parts) ? parts : [])
+    .map((part) => String(part || '').trim())
+    .filter(Boolean);
+  if (!values.length) {
+    return '';
+  }
+  if (values.some((part) => /\r?\n/.test(part))) {
+    return values.join('\n').trim();
+  }
+  const looksTokenized = values.length >= 4 && values.every((part) => part.length <= 32 && !/[.!?。！？:：;；]$/.test(part));
+  return values.join(looksTokenized ? ' ' : '\n').replace(/[ \t]+\n/g, '\n').trim();
 }
 
 function parseJsonObject(value) {

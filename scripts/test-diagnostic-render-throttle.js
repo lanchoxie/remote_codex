@@ -71,8 +71,12 @@ assert(
   'recent history diagnostics should not create or refresh live thinking UI'
 );
 assert(
-  thinkingPanel.includes('replaceWith('),
+  thinkingPanel.includes('patchThinkingMessageElement('),
   'renderThinkingPanel should patch the existing thinking card instead of adding a duplicate one'
+);
+assert(
+  !thinkingPanel.includes('existingMessage.replaceWith('),
+  'renderThinkingPanel should not replace the whole thinking message on each diagnostic update'
 );
 
 assert(

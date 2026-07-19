@@ -6,17 +6,52 @@ const path = require('path');
 const readline = require('readline');
 const { nowIso } = require('../../shared/protocol');
 const {
-  apiConfigsRuntimeEqual,
+  ThinkingActivityAggregator,
+  makeActivityKey,
+} = require('../../shared/thinking-activity');
+const {
   buildApiEnvironment,
   describeApiConfig,
   normalizeApiConfig,
 } = require('./runtime-utils');
+const {
+  assertRunBinding,
+  classifyNativeThreadError,
+  deriveRunBinding,
+  modelCapabilitiesFromList,
+  normalizeReasoningEffort,
+  resumeStrategyForLaunchMode,
+  validateModelSelection: validateRuntimeModelSelection,
+} = require('./session-api-runtime');
 
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_REQUEST_TIMEOUT_MS || 15000);
 const LIST_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_LIST_REQUEST_TIMEOUT_MS || 30000);
 const INITIALIZE_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_INITIALIZE_TIMEOUT_MS || 60000);
 const THREAD_OPEN_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_THREAD_OPEN_TIMEOUT_MS || 120000);
 const TURN_START_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_TURN_START_TIMEOUT_MS || 120000);
+const MANAGED_OVERLAY_MARKER_KIND = 'remote-codex-managed-overlay';
+const MANAGED_OVERLAY_MARKER_VERSION = 1;
+const MANAGED_OVERLAY_MARKER_NAME = '.remote-codex-owner';
+
+function retryableTerminalDeliveryError(error) {
+  const result = error instanceof Error
+    ? error
+    : new Error(String(error || 'Session terminal state delivery failed.'));
+  result.retryCommand = true;
+  return result;
+}
+
+function throwTerminalErrors(errors, message) {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    const aggregate = new AggregateError(errors, message);
+    if (errors.some((error) => error?.retryCommand === true)) aggregate.retryCommand = true;
+    if (errors.some((error) => error?.processTreeFallbackRequired === true)) {
+      aggregate.processTreeFallbackRequired = true;
+    }
+    throw aggregate;
+  }
+}
 
 function stripAnsi(value) {
   return String(value || '').replace(/\x1b\[[0-9;]*m/g, '');
@@ -189,6 +224,10 @@ function isExecutableFile(filePath) {
   } catch {
     return false;
   }
+}
+
+function shouldSpawnCodexThroughShell(codexBin) {
+  return process.platform === 'win32' && /\.(cmd|bat)$/i.test(String(codexBin || ''));
 }
 
 function pushUnique(list, seen, value) {
@@ -451,8 +490,230 @@ function copyFileIfExists(source, target) {
   if (!fs.existsSync(source)) {
     return;
   }
-  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   fs.copyFileSync(source, target);
+  try {
+    fs.chmodSync(target, 0o600);
+  } catch {
+    // Windows only exposes a subset of POSIX mode semantics.
+  }
+}
+
+function ensurePrivateDirectory(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // Windows only exposes a subset of POSIX mode semantics.
+  }
+}
+
+function writePrivateFile(filePath, contents) {
+  fs.writeFileSync(filePath, contents, { encoding: 'utf8', mode: 0o600, flag: 'w' });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // Windows only exposes a subset of POSIX mode semantics.
+  }
+}
+
+function writeManagedOverlayOwnerMarker(ownerMarkerPath, contents) {
+  const directory = path.dirname(ownerMarkerPath);
+  const tempPath = path.join(
+    directory,
+    `${MANAGED_OVERLAY_MARKER_NAME}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`
+  );
+  const data = Buffer.from(String(contents), 'utf8');
+  let fd = null;
+  try {
+    fd = fs.openSync(tempPath, 'wx', 0o600);
+    let offset = 0;
+    while (offset < data.length) {
+      const written = fs.writeSync(fd, data, offset, data.length - offset, null);
+      if (!Number.isInteger(written) || written <= 0) {
+        throw new Error('owner marker temp write made no progress');
+      }
+      offset += written;
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tempPath, ownerMarkerPath);
+    try {
+      fs.chmodSync(ownerMarkerPath, 0o600);
+    } catch {
+      // Windows only exposes a subset of POSIX mode semantics.
+    }
+    let directoryFd = null;
+    try {
+      directoryFd = fs.openSync(directory, 'r');
+      fs.fsyncSync(directoryFd);
+    } catch {
+      // Directory fsync is unsupported on some Windows/filesystem combinations.
+    } finally {
+      if (directoryFd !== null) {
+        try {
+          fs.closeSync(directoryFd);
+        } catch {
+          // The marker file was already atomically replaced and flushed.
+        }
+      }
+    }
+  } catch (error) {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Best effort before removing the incomplete temp file.
+      }
+    }
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // The authoritative marker is unchanged even if temp cleanup must be retried later.
+    }
+    throw error;
+  }
+}
+
+function managedOverlayPid(value) {
+  const pid = Number(value);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+function readManagedOverlayOwnerMarker(markerPath) {
+  try {
+    const stats = fs.lstatSync(markerPath);
+    if (!stats.isFile() || stats.isSymbolicLink()) return null;
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    if (
+      !marker
+      || marker.kind !== MANAGED_OVERLAY_MARKER_KIND
+      || marker.version !== MANAGED_OVERLAY_MARKER_VERSION
+      || !/^[a-f0-9]{32}$/i.test(String(marker.ownerToken || ''))
+      || !managedOverlayPid(marker.ownerPid)
+    ) {
+      return null;
+    }
+    return {
+      ...marker,
+      ownerPid: managedOverlayPid(marker.ownerPid),
+      childPid: managedOverlayPid(marker.childPid),
+      childState: String(marker.childState || '').trim() || 'unknown',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readLegacyManagedOverlayOwnerToken(markerPath) {
+  try {
+    const stats = fs.lstatSync(markerPath);
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 128) return null;
+    const markerText = fs.readFileSync(markerPath, 'utf8').trim();
+    return /^[a-f0-9]{32}$/i.test(markerText) ? markerText : null;
+  } catch {
+    return null;
+  }
+}
+
+function updateApiProfileCodexHomeOwnership(cleanupOwner, patch = {}) {
+  if (!cleanupOwner || typeof cleanupOwner !== 'object') return false;
+  const profileHomeDir = path.resolve(String(cleanupOwner.profileHomeDir || ''));
+  const ownerMarkerPath = path.resolve(String(cleanupOwner.ownerMarkerPath || ''));
+  if (ownerMarkerPath !== path.join(profileHomeDir, MANAGED_OVERLAY_MARKER_NAME)) return false;
+  const marker = readManagedOverlayOwnerMarker(ownerMarkerPath);
+  if (!marker || marker.ownerToken !== cleanupOwner.ownerToken) return false;
+  const childState = Object.prototype.hasOwnProperty.call(patch, 'childState')
+    ? String(patch.childState || '').trim()
+    : marker.childState;
+  if (!['not-started', 'spawning', 'running', 'exited', 'spawn-failed'].includes(childState)) {
+    return false;
+  }
+  let childPid = marker.childPid;
+  if (Object.prototype.hasOwnProperty.call(patch, 'childPid')) {
+    childPid = patch.childPid == null ? null : managedOverlayPid(patch.childPid);
+    if (patch.childPid != null && !childPid) return false;
+  }
+  writeManagedOverlayOwnerMarker(ownerMarkerPath, `${JSON.stringify({
+    ...marker,
+    childPid,
+    childState,
+    updatedAt: nowIso(),
+  }, null, 2)}\n`);
+  return true;
+}
+
+function isProcessAlive(pid) {
+  const normalizedPid = managedOverlayPid(pid);
+  if (!normalizedPid) return false;
+  try {
+    process.kill(normalizedPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function managedOverlayPathIdentity(value) {
+  const normalized = path.normalize(String(value || ''));
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function managedOverlayRealPath(value) {
+  const resolver = typeof fs.realpathSync.native === 'function'
+    ? fs.realpathSync.native
+    : fs.realpathSync;
+  return resolver(value);
+}
+
+function inspectManagedOverlayDirectory(managedRootReal, directory) {
+  const stats = fs.lstatSync(directory);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error('managed Codex overlay directory is a link or is not a directory');
+  }
+  const real = managedOverlayRealPath(directory);
+  if (
+    managedOverlayPathIdentity(path.dirname(real))
+    !== managedOverlayPathIdentity(managedRootReal)
+  ) {
+    throw new Error('managed Codex overlay real path escapes its managed root');
+  }
+  return real;
+}
+
+function ensureManagedOverlayRoot(baseHome, managedRoot) {
+  const resolvedBaseHome = path.resolve(baseHome);
+  if (!fs.existsSync(resolvedBaseHome)) {
+    fs.mkdirSync(resolvedBaseHome, { recursive: true, mode: 0o700 });
+  }
+  const baseHomeStats = fs.statSync(resolvedBaseHome);
+  if (!baseHomeStats.isDirectory()) {
+    throw new Error('base Codex home is not a directory');
+  }
+  const baseHomeReal = managedOverlayRealPath(resolvedBaseHome);
+  try {
+    fs.mkdirSync(managedRoot, { recursive: false, mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+  const managedRootStats = fs.lstatSync(managedRoot);
+  if (!managedRootStats.isDirectory() || managedRootStats.isSymbolicLink()) {
+    throw new Error('managed Codex overlay root is a link or is not a directory');
+  }
+  const managedRootReal = managedOverlayRealPath(managedRoot);
+  if (
+    managedOverlayPathIdentity(managedRootReal)
+    !== managedOverlayPathIdentity(path.join(baseHomeReal, '.remote-codex-managed'))
+  ) {
+    throw new Error('managed Codex overlay root real path is unsafe');
+  }
+  try {
+    fs.chmodSync(managedRoot, 0o700);
+  } catch {
+    // Windows only exposes a subset of POSIX mode semantics.
+  }
+  return managedRootReal;
 }
 
 function linkSharedCodexHomeEntry(baseHome, overlayHome, name) {
@@ -509,48 +770,311 @@ function prepareApiProfileCodexHome(baseHome, apiConfig, options = {}) {
   const hash = config ? hashApiConfig(config) : 'host-env';
   const segment = safeProfileSegment(config?.profileId || config?.label || config?.provider || 'host-env');
   const sessionSegment = safeProfileSegment(options.sessionId || options.bridgeSessionId || 'session');
-  const profileHomeDir = path.join(baseHome, '.remote-codex-managed', `${sessionSegment}-${segment}-${hash}`);
+  const ownerToken = crypto.randomBytes(16).toString('hex');
+  const runSegment = safeProfileSegment(options.runId || ownerToken.slice(0, 12));
+  const managedRoot = path.join(baseHome, '.remote-codex-managed');
+  const profileHomeDir = path.join(managedRoot, `${sessionSegment}-${segment}-${hash}-${runSegment}-${ownerToken.slice(0, 12)}`);
   // Keep every managed session in its own HOME. This prevents our app-server
   // from sharing Codex SQLite state with an interactive Codex running on HPC.
   const overlayHome = path.join(profileHomeDir, '.codex');
-  fs.mkdirSync(overlayHome, { recursive: true });
-
-  const baseAuthPath = path.join(baseHome, 'auth.json');
-  const overlayAuthPath = path.join(overlayHome, 'auth.json');
-  let auth = {};
+  const ownerMarkerPath = path.join(profileHomeDir, MANAGED_OVERLAY_MARKER_NAME);
+  let profileHomeCreated = false;
+  let managedRootReal = null;
   try {
-    auth = JSON.parse(fs.readFileSync(baseAuthPath, 'utf8'));
-  } catch {
-    auth = {};
-  }
-  if (config?.apiKey) {
-    auth.OPENAI_API_KEY = config.apiKey;
-  }
-  fs.writeFileSync(overlayAuthPath, `${JSON.stringify(auth, null, 2)}\n`, 'utf8');
+    managedRootReal = ensureManagedOverlayRoot(baseHome, managedRoot);
+    fs.mkdirSync(profileHomeDir, { recursive: false, mode: 0o700 });
+    profileHomeCreated = true;
+    inspectManagedOverlayDirectory(managedRootReal, profileHomeDir);
+    ensurePrivateDirectory(overlayHome);
+    writeManagedOverlayOwnerMarker(ownerMarkerPath, `${JSON.stringify({
+      kind: MANAGED_OVERLAY_MARKER_KIND,
+      version: MANAGED_OVERLAY_MARKER_VERSION,
+      ownerToken,
+      ownerPid: process.pid,
+      childPid: null,
+      childState: 'not-started',
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    }, null, 2)}\n`);
 
-  const baseConfigPath = path.join(baseHome, 'config.toml');
-  const overlayConfigPath = path.join(overlayHome, 'config.toml');
-  let baseConfig = '';
+    const baseAuthPath = path.join(baseHome, 'auth.json');
+    const overlayAuthPath = path.join(overlayHome, 'auth.json');
+    let auth = {};
+    try {
+      auth = JSON.parse(fs.readFileSync(baseAuthPath, 'utf8'));
+    } catch {
+      auth = {};
+    }
+    if (config?.apiKey) {
+      auth.OPENAI_API_KEY = config.apiKey;
+    }
+    writePrivateFile(overlayAuthPath, `${JSON.stringify(auth, null, 2)}\n`);
+
+    const baseConfigPath = path.join(baseHome, 'config.toml');
+    const overlayConfigPath = path.join(overlayHome, 'config.toml');
+    let baseConfig = '';
+    try {
+      baseConfig = fs.readFileSync(baseConfigPath, 'utf8');
+    } catch {
+      baseConfig = '';
+    }
+    const providerKey = config ? `remote_codex_${hash}` : null;
+    writePrivateFile(
+      overlayConfigPath,
+      config ? rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) : baseConfig
+    );
+
+    for (const name of ['installation_id', 'cap_sid', 'session_index.jsonl', '.personality_migration']) {
+      copyFileIfExists(path.join(baseHome, name), path.join(overlayHome, name));
+    }
+    for (const name of ['sessions', 'skills', 'rules', 'memories', 'generated_images']) {
+      linkSharedCodexHomeEntry(baseHome, overlayHome, name);
+    }
+
+    return {
+      codexHome: overlayHome,
+      profileHome: Boolean(config),
+      isolatedHome: true,
+      profileHomeDir,
+      providerKey,
+      cleanupOwner: { baseHome, managedRoot, profileHomeDir, ownerMarkerPath, ownerToken },
+    };
+  } catch (error) {
+    if (profileHomeCreated) {
+      try {
+        if (
+          managedRootReal
+          && managedOverlayPathIdentity(inspectManagedOverlayDirectory(managedRootReal, profileHomeDir))
+            === managedOverlayPathIdentity(managedOverlayRealPath(profileHomeDir))
+        ) {
+          fs.rmSync(profileHomeDir, { recursive: true, force: true });
+        }
+      } catch {
+        // Preserve the constructor failure; the startup janitor can retry owned cleanup.
+      }
+    }
+    throw error;
+  }
+}
+
+function cleanupApiProfileCodexHome(cleanupOwner) {
+  if (!cleanupOwner || typeof cleanupOwner !== 'object') return false;
+  const baseHome = path.resolve(String(cleanupOwner.baseHome || ''));
+  const managedRoot = path.resolve(String(cleanupOwner.managedRoot || ''));
+  const profileHomeDir = path.resolve(String(cleanupOwner.profileHomeDir || ''));
+  const ownerMarkerPath = path.resolve(String(cleanupOwner.ownerMarkerPath || ''));
+  const expectedManagedRoot = path.join(baseHome, '.remote-codex-managed');
+  const expectedOwnerMarkerPath = path.join(profileHomeDir, MANAGED_OVERLAY_MARKER_NAME);
+  if (
+    managedRoot !== expectedManagedRoot
+    || path.dirname(profileHomeDir) !== managedRoot
+    || ownerMarkerPath !== expectedOwnerMarkerPath
+    || profileHomeDir === managedRoot
+    || managedRoot === baseHome
+  ) {
+    return false;
+  }
   try {
-    baseConfig = fs.readFileSync(baseConfigPath, 'utf8');
+    const managedRootStats = fs.lstatSync(managedRoot);
+    const markerStats = fs.lstatSync(ownerMarkerPath);
+    if (
+      !managedRootStats.isDirectory()
+      || managedRootStats.isSymbolicLink()
+      || !markerStats.isFile()
+      || markerStats.isSymbolicLink()
+    ) {
+      return false;
+    }
+    const baseHomeReal = managedOverlayRealPath(baseHome);
+    const managedRootReal = managedOverlayRealPath(managedRoot);
+    if (
+      managedOverlayPathIdentity(managedRootReal)
+      !== managedOverlayPathIdentity(path.join(baseHomeReal, '.remote-codex-managed'))
+    ) {
+      return false;
+    }
+    inspectManagedOverlayDirectory(managedRootReal, profileHomeDir);
   } catch {
-    baseConfig = '';
+    return false;
   }
-  const providerKey = config ? `remote_codex_${hash}` : null;
-  fs.writeFileSync(
-    overlayConfigPath,
-    config ? rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) : baseConfig,
-    'utf8'
-  );
+  let markerToken = '';
+  try {
+    const markerText = fs.readFileSync(ownerMarkerPath, 'utf8').trim();
+    try {
+      const marker = JSON.parse(markerText);
+      if (
+        marker?.kind !== MANAGED_OVERLAY_MARKER_KIND
+        || marker?.version !== MANAGED_OVERLAY_MARKER_VERSION
+      ) {
+        return false;
+      }
+      markerToken = String(marker.ownerToken || '').trim();
+    } catch {
+      // Runners created by the immediately previous version used the token as the marker body.
+      markerToken = markerText;
+    }
+  } catch {
+    return false;
+  }
+  if (!markerToken || markerToken !== cleanupOwner.ownerToken) return false;
+  fs.rmSync(profileHomeDir, { recursive: true, force: true });
+  return true;
+}
 
-  for (const name of ['installation_id', 'cap_sid', 'session_index.jsonl', '.personality_migration']) {
-    copyFileIfExists(path.join(baseHome, name), path.join(overlayHome, name));
+function cleanupStaleApiProfileCodexHomes(baseHome, options = {}) {
+  const normalizedBaseHome = String(baseHome || '').trim();
+  const result = {
+    scanned: 0,
+    removed: 0,
+    preserved: 0,
+    legacyUnattributed: 0,
+    legacyRemoved: 0,
+    legacyPreserved: 0,
+    diagnostics: [],
+    errors: [],
+  };
+  if (!normalizedBaseHome) return result;
+  const resolvedBaseHome = path.resolve(normalizedBaseHome);
+  const managedRoot = path.join(resolvedBaseHome, '.remote-codex-managed');
+  let managedRootReal = null;
+  let entries = [];
+  try {
+    const managedRootStats = fs.lstatSync(managedRoot);
+    if (!managedRootStats.isDirectory() || managedRootStats.isSymbolicLink()) {
+      result.errors.push('managed Codex overlay root is a link or is not a directory; cleanup was skipped');
+      return result;
+    }
+    const baseHomeReal = managedOverlayRealPath(resolvedBaseHome);
+    managedRootReal = managedOverlayRealPath(managedRoot);
+    if (
+      managedOverlayPathIdentity(managedRootReal)
+      !== managedOverlayPathIdentity(path.join(baseHomeReal, '.remote-codex-managed'))
+    ) {
+      result.errors.push('managed Codex overlay root real path is unsafe; cleanup was skipped');
+      return result;
+    }
+    entries = fs.readdirSync(managedRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code !== 'ENOENT') result.errors.push(String(error.message || error));
+    return result;
   }
-  for (const name of ['sessions', 'skills', 'rules', 'memories', 'generated_images']) {
-    linkSharedCodexHomeEntry(baseHome, overlayHome, name);
-  }
+  const processIsAlive = typeof options.isProcessAlive === 'function'
+    ? options.isProcessAlive
+    : isProcessAlive;
+  const legacyOverlayIsInactive = typeof options.legacyOverlayIsInactive === 'function'
+    ? options.legacyOverlayIsInactive
+    : null;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    result.scanned += 1;
+    const profileHomeDir = path.join(managedRoot, entry.name);
+    let profileHomeReal = null;
+    try {
+      profileHomeReal = inspectManagedOverlayDirectory(managedRootReal, profileHomeDir);
+    } catch {
+      result.preserved += 1;
+      result.errors.push('managed Codex overlay entry has an unsafe link or real path; cleanup was skipped');
+      continue;
+    }
+    const ownerMarkerPath = path.join(profileHomeDir, MANAGED_OVERLAY_MARKER_NAME);
+    const marker = readManagedOverlayOwnerMarker(ownerMarkerPath);
+    if (!marker) {
+      const legacyOwnerToken = readLegacyManagedOverlayOwnerToken(ownerMarkerPath);
+      if (!legacyOwnerToken) {
+        result.preserved += 1;
+        continue;
+      }
 
-  return { codexHome: overlayHome, profileHome: Boolean(config), isolatedHome: true, profileHomeDir, providerKey };
+      result.legacyUnattributed += 1;
+      let inactiveAttested = false;
+      if (legacyOverlayIsInactive) {
+        try {
+          inactiveAttested = legacyOverlayIsInactive(Object.freeze({
+            baseHome: path.resolve(normalizedBaseHome),
+            managedRoot,
+            profileHomeDir,
+            codexHome: path.join(profileHomeDir, '.codex'),
+          })) === true;
+        } catch {
+          result.errors.push('legacy managed Codex overlay liveness attestation failed');
+        }
+      }
+      if (!inactiveAttested) {
+        result.preserved += 1;
+        result.legacyPreserved += 1;
+        continue;
+      }
+
+      // Re-read the token immediately before removal so a concurrent marker
+      // replacement cannot turn an operator attestation into foreign cleanup.
+      if (readLegacyManagedOverlayOwnerToken(ownerMarkerPath) !== legacyOwnerToken) {
+        result.preserved += 1;
+        result.legacyPreserved += 1;
+        result.errors.push('legacy managed Codex overlay ownership changed during cleanup');
+        continue;
+      }
+      try {
+        if (
+          managedOverlayPathIdentity(inspectManagedOverlayDirectory(managedRootReal, profileHomeDir))
+          !== managedOverlayPathIdentity(profileHomeReal)
+        ) {
+          throw new Error('managed Codex overlay ownership path changed during cleanup');
+        }
+        fs.rmSync(profileHomeDir, { recursive: true, force: true });
+        result.removed += 1;
+        result.legacyRemoved += 1;
+      } catch {
+        result.preserved += 1;
+        result.legacyPreserved += 1;
+        result.errors.push('legacy managed Codex overlay cleanup failed after liveness attestation');
+      }
+      continue;
+    }
+    if (processIsAlive(marker.ownerPid)) {
+      result.preserved += 1;
+      continue;
+    }
+    let childIsConfirmedDead = false;
+    if (marker.childPid) {
+      childIsConfirmedDead = !processIsAlive(marker.childPid);
+    } else if (['not-started', 'exited', 'spawn-failed'].includes(marker.childState)) {
+      childIsConfirmedDead = true;
+    }
+    if (!childIsConfirmedDead) {
+      result.preserved += 1;
+      continue;
+    }
+    try {
+      if (
+        managedOverlayPathIdentity(inspectManagedOverlayDirectory(managedRootReal, profileHomeDir))
+        !== managedOverlayPathIdentity(profileHomeReal)
+      ) {
+        throw new Error('managed Codex overlay ownership path changed during cleanup');
+      }
+      fs.rmSync(profileHomeDir, { recursive: true, force: true });
+      result.removed += 1;
+    } catch (error) {
+      result.preserved += 1;
+      result.errors.push(`${entry.name}: ${String(error.message || error)}`);
+    }
+  }
+  if (result.legacyPreserved > 0) {
+    result.diagnostics.push({
+      severity: 'warning',
+      code: 'legacy_overlay_preserved_unattributed',
+      count: result.legacyPreserved,
+      message: `Preserved ${result.legacyPreserved} unattributed legacy managed Codex overlay(s). Confirm that no old Host Agent or app-server uses this CODEX_HOME before enabling the one-time legacy cleanup attestation.`,
+    });
+  }
+  if (result.legacyRemoved > 0) {
+    result.diagnostics.push({
+      severity: 'info',
+      code: 'legacy_overlay_removed_by_attestation',
+      count: result.legacyRemoved,
+      message: `Removed ${result.legacyRemoved} legacy managed Codex overlay(s) after explicit operator liveness attestation.`,
+    });
+  }
+  return result;
 }
 
 function quarantineCodexStateDatabases(codexHome, reason = 'startup') {
@@ -593,12 +1117,12 @@ function summarizeValue(value, depth = 0) {
 
   if (Array.isArray(value)) {
     const items = value.slice(0, 4).map((item) => summarizeValue(item, depth + 1));
-    return `[${items.join(', ')}${value.length > 4 ? ', …' : ''}]`;
+    return `[${items.join(', ')}${value.length > 4 ? ', ...' : ''}]`;
   }
 
   if (typeof value === 'object') {
     const entries = Object.entries(value).slice(0, 6).map(([key, item]) => `${key}: ${summarizeValue(item, depth + 1)}`);
-    return `{ ${entries.join(', ')}${Object.keys(value).length > 6 ? ', …' : ''} }`;
+    return `{ ${entries.join(', ')}${Object.keys(value).length > 6 ? ', ...' : ''} }`;
   }
 
   return JSON.stringify(value);
@@ -677,6 +1201,16 @@ function mergeThinkingBuffer(previous, chunk) {
   return `${left}\n${right}`.trim();
 }
 
+function persistedReasoningSummaryText(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (value && typeof value === 'object' && typeof value.text === 'string') {
+    return value.text;
+  }
+  return String(value ?? '');
+}
+
 function notificationPhase(params = {}) {
   return String(
     params.phase
@@ -698,7 +1232,6 @@ function notificationDeltaText(params = {}) {
   );
 }
 
-const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const REASONING_SUMMARIES = new Set(['auto', 'concise', 'detailed', 'none']);
 const APPROVAL_POLICIES = new Set(['untrusted', 'on-failure', 'on-request', 'never']);
 const APPROVAL_REVIEWERS = new Set(['user', 'auto_review', 'guardian_subagent']);
@@ -819,7 +1352,7 @@ function normalizeTurnStartParams(threadId, cwd, text, options = {}) {
     params.model = model;
   }
 
-  const effort = pickAllowedString(options.effort, REASONING_EFFORTS);
+  const effort = normalizeReasoningEffort(options.effort);
   if (effort) {
     params.effort = effort;
   }
@@ -1141,6 +1674,13 @@ class CodexAppServerRunner {
     this.postEvent = options.postEvent;
     this.onTerminated = options.onTerminated || null;
     this.apiConfig = normalizeApiConfig(options.apiConfig);
+    this.apiBinding = deriveRunBinding({
+      apiBinding: options.apiBinding,
+      apiConfig: this.apiConfig,
+      env: options.env || process.env,
+      codexHome: options.codexHome,
+      allowUnavailable: true,
+    });
     this.baseCodexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     const preparedCodexHome = prepareApiProfileCodexHome(this.baseCodexHome, this.apiConfig, {
       sessionId: this.sessionId,
@@ -1149,62 +1689,277 @@ class CodexAppServerRunner {
       sourceSessionId: this.sourceSessionId,
       originSessionId: this.originSessionId,
       conversationKey: this.conversationKey,
-    });
-    this.codexHome = preparedCodexHome.codexHome;
-    this.apiProfileHome = preparedCodexHome.profileHome;
-    this.isolatedCodexHome = preparedCodexHome.isolatedHome;
-    this.profileHomeDir = preparedCodexHome.profileHomeDir || null;
-    this.apiProviderKey = preparedCodexHome.providerKey || null;
-    this.codexBin = options.codexBin || resolveDefaultCodexBin(this.baseCodexHome);
-    this.child = null;
-    this.rpc = null;
-    this.threadId = null;
-    this.nativeThreadId = options.nativeThreadId || null;
-    this.activeTurnId = null;
-    this.turnBuffers = new Map();
-    this.turnModes = new Map();
-    this.planBuffers = new Map();
-    this.reasoningBuffers = new Map();
-    this.pendingRequests = new Map();
-    this.resumePrelude = buildResumePrelude(this.bootstrap);
-    this.resumePreludeUsed = !this.resumePrelude;
-    this.runtime = {
-      kind: 'codex_app_server',
-      adapterId: 'codex-app-server',
-      runtimeId: 'codex-app-server',
       runId: this.runId,
-      runtimeLabel: 'Codex app-server',
-      command: this.codexBin,
-      args: ['app-server'],
-      cwd: this.cwd,
-      codexHome: this.codexHome,
-      nativeThreadId: this.nativeThreadId || null,
-      launchMode: this.launchMode,
-      codexHomeProfile: this.apiProfileHome ? 'api-profile-isolated' : 'managed-isolated',
-      apiProfileId: this.apiConfig?.profileId || null,
-      apiProfileLabel: this.apiConfig?.label || null,
-      apiProvider: this.apiConfig?.provider || null,
-      apiBaseUrl: this.apiConfig?.baseUrl || null,
-      apiProviderKey: this.apiProviderKey,
-      resumeStrategy: 'fresh',
-      connection: 'starting',
-      phase: 'starting',
-      startupStep: 'starting',
-      busy: false,
-      waitingOnApproval: false,
-      waitingOnUserInput: false,
-      updatedAt: nowIso(),
+    });
+    try {
+      this.codexHome = preparedCodexHome.codexHome;
+      this.apiProfileHome = preparedCodexHome.profileHome;
+      this.isolatedCodexHome = preparedCodexHome.isolatedHome;
+      this.profileHomeDir = preparedCodexHome.profileHomeDir || null;
+      this.apiProfileCleanupOwner = preparedCodexHome.cleanupOwner || null;
+      this.apiProviderKey = preparedCodexHome.providerKey || null;
+      this.spawnProcess = typeof options.spawnProcess === 'function' ? options.spawnProcess : spawn;
+      this.codexBin = options.codexBin || resolveDefaultCodexBin(this.baseCodexHome);
+      this.codexArgs = Array.isArray(options.codexArgs) && options.codexArgs.length
+        ? options.codexArgs.map((value) => String(value))
+        : ['app-server'];
+      this.child = null;
+      this.rpc = null;
+      this.stopRequested = false;
+      this.stopGraceTimeoutMs = Math.max(1, Number(options.stopGraceTimeoutMs || 5000) || 5000);
+      this.stopKillTimeoutMs = Math.max(1, Number(options.stopKillTimeoutMs || 1000) || 1000);
+      this.suppressTerminalEvent = false;
+      this.terminationPromise = null;
+      this.startCompleted = false;
+      this.childExitConfirmed = false;
+      this.startupRetryExit = null;
+      this.startupRetryExitResolver = null;
+      this.startRetryPending = false;
+      this.startRetryFailure = null;
+      this.processTreeFallbackRequired = false;
+      this.overlayCleaned = false;
+      this.threadId = null;
+      this.nativeThreadId = options.nativeThreadId || null;
+      this.activeTurnId = null;
+      this.turnBuffers = new Map();
+      this.turnModes = new Map();
+      this.planBuffers = new Map();
+      this.reasoningBuffers = new Map();
+      this.notificationHandlers = new Set();
+      this.initializeThinkingActivity();
+      this.pendingRequests = new Map();
+      this.modelCapabilities = new Map();
+      this.resumePrelude = buildResumePrelude(this.bootstrap);
+      this.resumePreludeUsed = !this.resumePrelude;
+      this.runtime = {
+        kind: 'codex_app_server',
+        adapterId: 'codex-app-server',
+        runtimeId: 'codex-app-server',
+        runId: this.runId,
+        runtimeLabel: 'Codex app-server',
+        command: this.codexBin,
+        args: this.codexArgs,
+        cwd: this.cwd,
+        codexHome: this.codexHome,
+        nativeThreadId: this.nativeThreadId || null,
+        launchMode: this.launchMode,
+        codexHomeProfile: this.apiProfileHome ? 'api-profile-isolated' : 'managed-isolated',
+        apiProfileId: this.apiConfig?.profileId || null,
+        apiProfileLabel: this.apiConfig?.label || null,
+        apiProvider: this.apiConfig?.provider || null,
+        apiBaseUrl: this.apiConfig?.baseUrl || null,
+        apiProviderKey: this.apiProviderKey,
+        apiBinding: this.apiBinding,
+        resumeStrategy: 'fresh',
+        connection: 'starting',
+        phase: 'starting',
+        startupStep: 'starting',
+        busy: false,
+        waitingOnApproval: false,
+        waitingOnUserInput: false,
+        updatedAt: nowIso(),
+      };
+    } catch (error) {
+      try {
+        cleanupApiProfileCodexHome(preparedCodexHome.cleanupOwner);
+      } catch {
+        // Preserve the constructor error; the startup janitor can retry owned cleanup.
+      }
+      throw error;
+    }
+  }
+
+  assertCommandBinding(explicitBinding) {
+    if (!this.apiBinding && !explicitBinding) {
+      return null;
+    }
+    return assertRunBinding(this.apiBinding, explicitBinding);
+  }
+
+  validateModelSelection(model, effort) {
+    return validateRuntimeModelSelection(this.modelCapabilities, model, effort);
+  }
+
+  enqueueNotification(message) {
+    if (!this.notificationHandlers) this.notificationHandlers = new Set();
+    const handling = this.handleNotification(message)
+      .catch((error) => {
+        console.error(`[codex-runner] notification failed: ${error.message || error}`);
+      });
+    this.notificationHandlers.add(handling);
+    handling.finally(() => this.notificationHandlers.delete(handling));
+    return handling;
+  }
+
+  async drainNotifications() {
+    while (this.notificationHandlers?.size) {
+      await Promise.all(Array.from(this.notificationHandlers));
+    }
+  }
+
+  activityCanonicalConversationKey() {
+    const hostId = String(this.hostId || '').trim();
+    const conversationKey = String(
+      this.conversationKey
+        || this.originSessionId
+        || this.nativeThreadId
+        || this.bridgeSessionId
+        || this.sessionId
+        || ''
+    ).trim();
+    if (!hostId) return conversationKey;
+    return conversationKey.startsWith(`${hostId}::`)
+      ? conversationKey
+      : `${hostId}::${conversationKey}`;
+  }
+
+  initializeThinkingActivity(options = {}) {
+    this.thinkingActivities = new Map();
+    this.activitySnapshotDelivery = Promise.resolve();
+    this.activitySnapshotDeliveryErrors = new Map();
+    this.thinkingActivityAggregator = new ThinkingActivityAggregator({
+      canonicalConversationKey: this.activityCanonicalConversationKey(),
+      runId: this.runId,
+      flushDelayMs: 75,
+      emitSnapshot: (snapshot) => this.emitActivitySnapshot(snapshot),
+      setTimer: options.setTimer,
+      clearTimer: options.clearTimer,
+      now: options.now,
+    });
+  }
+
+  ensureThinkingActivityAggregator() {
+    if (!this.thinkingActivityAggregator) {
+      this.initializeThinkingActivity();
+    }
+    return this.thinkingActivityAggregator;
+  }
+
+  normalizeThinkingIdentity(identity = {}) {
+    const turnId = String(identity.turnId || '').trim();
+    const itemId = String(identity.itemId || '').trim();
+    if (!turnId || !itemId) return null;
+    const summaryIndex = Number(identity.summaryIndex ?? 0);
+    return {
+      turnId,
+      itemId,
+      summaryIndex: Number.isFinite(summaryIndex) ? summaryIndex : 0,
+      kind: 'reasoning',
     };
   }
 
+  trackThinkingActivity(identity) {
+    const normalized = this.normalizeThinkingIdentity(identity);
+    if (!normalized) return null;
+    const activityKey = makeActivityKey({
+      canonicalConversationKey: this.activityCanonicalConversationKey(),
+      runId: this.runId,
+      ...normalized,
+    });
+    let tracked = this.thinkingActivities.get(activityKey);
+    if (!tracked) {
+      tracked = { activityKey, identity: normalized, finalized: false };
+      this.thinkingActivities.set(activityKey, tracked);
+    }
+    return tracked;
+  }
+
+  appendThinkingDelta(identity, delta) {
+    const tracked = this.trackThinkingActivity(identity);
+    if (!tracked) return null;
+    tracked.finalized = false;
+    this.ensureThinkingActivityAggregator().appendDelta(tracked.identity, String(delta ?? ''));
+    return tracked;
+  }
+
+  replaceThinkingSnapshot(identity, text) {
+    const tracked = this.trackThinkingActivity(identity);
+    if (!tracked) return null;
+    tracked.finalized = false;
+    this.ensureThinkingActivityAggregator().replaceSnapshot(tracked.identity, String(text ?? ''));
+    return tracked;
+  }
+
+  emitActivitySnapshot(snapshot) {
+    const event = {
+      type: 'session.activity_snapshot',
+      hostId: this.hostId,
+      sessionId: this.currentSessionId(),
+      conversationKey: this.conversationKey || null,
+      bridgeSessionId: this.bridgeSessionId || null,
+      nativeThreadId: this.nativeThreadId || null,
+      originSessionId: this.originSessionId || null,
+      sourceSessionId: this.sourceSessionId || null,
+      ...snapshot,
+    };
+    const activityKey = String(snapshot.activityKey || '');
+    const delivery = this.activitySnapshotDelivery.then(async () => {
+      try {
+        await this.postEvent(event);
+        this.activitySnapshotDeliveryErrors.delete(activityKey);
+      } catch (error) {
+        this.activitySnapshotDeliveryErrors.set(activityKey, error);
+      }
+    });
+    this.activitySnapshotDelivery = delivery;
+    return delivery;
+  }
+
+  async finalizeThinkingActivities(filter = {}) {
+    if (!this.thinkingActivityAggregator) return [];
+    const selected = Array.from(this.thinkingActivities.values()).filter((tracked) => {
+      if (tracked.finalized) return false;
+      if (filter.turnId != null && tracked.identity.turnId !== String(filter.turnId)) return false;
+      if (filter.itemId != null && tracked.identity.itemId !== String(filter.itemId)) return false;
+      return true;
+    });
+    for (const tracked of selected) tracked.finalized = true;
+
+    const snapshots = [];
+    for (const tracked of selected) {
+      snapshots.push(await this.thinkingActivityAggregator.flush(tracked.identity, { final: true }));
+    }
+    await this.activitySnapshotDelivery;
+
+    const failures = selected
+      .map((tracked) => this.activitySnapshotDeliveryErrors.get(tracked.activityKey))
+      .filter(Boolean);
+    if (failures.length) {
+      for (const tracked of selected) tracked.finalized = false;
+      if (failures.length === 1) throw failures[0];
+      throw new AggregateError(failures, 'Thinking activity snapshot delivery failed.');
+    }
+    return snapshots;
+  }
+
   async start() {
+    if (this.stopRequested) {
+      const error = new Error('Managed Codex startup was cancelled before spawn.');
+      error.code = 'session_start_cancelled';
+      error.failureState = 'failed:start-cancelled';
+      throw error;
+    }
     for (let attempt = 0; attempt < 2; attempt += 1) {
       this.startupStateDbError = false;
       try {
         await this.startOnce();
+        if (this.stopRequested) {
+          const error = new Error('Managed Codex startup was cancelled before confirmation.');
+          error.code = 'session_start_cancelled';
+          error.failureState = 'failed:start-cancelled';
+          throw error;
+        }
+        this.startCompleted = true;
         return;
       } catch (error) {
         if (attempt === 0 && this.startupStateDbError) {
+          try {
+            await this.stopChildForStartupRetry();
+          } catch (stopError) {
+            this.startupStateDbError = false;
+            stopError.cause = stopError.cause || error;
+            throw stopError;
+          }
           const repair = quarantineCodexStateDatabases(this.codexHome, 'startup');
           await this.emitDiagnostic({
             severity: repair.moved.length ? 'warning' : 'error',
@@ -1216,37 +1971,160 @@ class CodexAppServerRunner {
             data: repair,
           }).catch(() => {});
           if (repair.moved.length) {
-            this.child = null;
-            this.rpc = null;
             continue;
           }
         }
+        this.startupStateDbError = false;
         throw error;
       }
     }
   }
 
+  async stopChildForStartupRetry() {
+    if (this.terminationPromise || this.overlayCleaned) {
+      const error = new Error('Codex startup retry cannot reuse a finalized managed overlay.');
+      error.code = 'session_start_retry_overlay_finalized';
+      throw error;
+    }
+    const child = this.child;
+    if (!child) {
+      this.rpc = null;
+      return;
+    }
+
+    let resolveExitConfirmation;
+    const exitConfirmation = new Promise((resolve) => {
+      resolveExitConfirmation = resolve;
+    });
+    const onExit = (code, signal) => {
+      resolveExitConfirmation();
+      this.handleExit(code, signal).catch(() => {});
+    };
+    child.once('exit', onExit);
+    this.startupRetryExitResolver = resolveExitConfirmation;
+    if (
+      this.startupRetryExit
+      || child.exitCode !== null
+      || child.signalCode !== null
+    ) {
+      resolveExitConfirmation();
+    }
+    const waitForExit = async (timeoutMs) => {
+      let timer = null;
+      const confirmed = await Promise.race([
+        exitConfirmation.then(() => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      return confirmed;
+    };
+
+    try {
+      let confirmed = Boolean(
+        this.startupRetryExit
+        || child.exitCode !== null
+        || child.signalCode !== null
+      );
+      if (!confirmed) {
+        try {
+          child.kill();
+        } catch {
+          // The exit confirmation below remains authoritative.
+        }
+        confirmed = await waitForExit(this.stopGraceTimeoutMs);
+      }
+      if (!confirmed) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // The bounded confirmation below decides whether retry is safe.
+        }
+        confirmed = await waitForExit(this.stopKillTimeoutMs);
+      }
+      if (!confirmed) {
+        const error = new Error(
+          `Codex app-server did not confirm exit before SQLite retry after ${this.stopGraceTimeoutMs + this.stopKillTimeoutMs}ms.`
+        );
+        error.code = 'session_stop_timeout';
+        error.processTreeFallbackRequired = true;
+        throw error;
+      }
+    } finally {
+      child.off('exit', onExit);
+      this.startupRetryExitResolver = null;
+    }
+
+    if (this.terminationPromise || this.overlayCleaned) {
+      const error = new Error('Codex startup retry overlay was finalized while stopping the first child.');
+      error.code = 'session_start_retry_overlay_finalized';
+      throw error;
+    }
+    if (!updateApiProfileCodexHomeOwnership(this.apiProfileCleanupOwner, {
+      childPid: child.pid || null,
+      childState: 'exited',
+    })) {
+      const error = new Error('Managed Codex overlay ownership could not confirm the first retry child exit.');
+      error.code = 'session_overlay_ownership_update_failed';
+      throw error;
+    }
+    this.child = null;
+    this.rpc = null;
+    this.childExitConfirmed = false;
+    this.startupRetryExit = null;
+  }
+
   async startOnce() {
     const processHome = this.profileHomeDir || path.dirname(this.baseCodexHome);
     const threadApiParams = this.apiProviderKey ? { modelProvider: this.apiProviderKey } : {};
-    this.child = spawn(this.codexBin, ['app-server'], {
-      cwd: this.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: false,
-      windowsHide: true,
-      env: {
-        ...process.env,
-        ...buildApiEnvironment(this.apiConfig),
-        CODEX_HOME: this.codexHome,
-        PATH: buildCodexProcessPath(this.codexBin),
-        HOME: processHome,
-        USERPROFILE: processHome,
-        HOMEDRIVE: (path.parse(processHome).root || process.env.HOMEDRIVE || '').replace(/\\$/, ''),
-        HOMEPATH: processHome.replace(/^[A-Za-z]:/, '') || process.env.HOMEPATH || '',
-      },
-    });
-
+    if (!updateApiProfileCodexHomeOwnership(this.apiProfileCleanupOwner, {
+      childPid: null,
+      childState: 'spawning',
+    })) {
+      const error = new Error('Managed Codex overlay ownership could not enter spawning state.');
+      error.code = 'session_overlay_ownership_update_failed';
+      throw error;
+    }
+    try {
+      this.child = this.spawnProcess(this.codexBin, this.codexArgs, {
+        cwd: this.cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: shouldSpawnCodexThroughShell(this.codexBin),
+        windowsHide: true,
+        env: {
+          ...process.env,
+          ...buildApiEnvironment(this.apiConfig),
+          CODEX_HOME: this.codexHome,
+          PATH: buildCodexProcessPath(this.codexBin),
+          HOME: processHome,
+          USERPROFILE: processHome,
+          HOMEDRIVE: (path.parse(processHome).root || process.env.HOMEDRIVE || '').replace(/\\$/, ''),
+          HOMEPATH: processHome.replace(/^[A-Za-z]:/, '') || process.env.HOMEPATH || '',
+        },
+      });
+    } catch (error) {
+      updateApiProfileCodexHomeOwnership(this.apiProfileCleanupOwner, {
+        childPid: null,
+        childState: 'spawn-failed',
+      });
+      throw error;
+    }
     let spawnError = null;
+    let earlyExitError = null;
+    let spawnHandshakeSettled = false;
+    let resolveSpawnHandshake;
+    let rejectSpawnHandshake;
+    const spawnHandshake = new Promise((resolve, reject) => {
+      resolveSpawnHandshake = resolve;
+      rejectSpawnHandshake = reject;
+    });
+    const settleSpawnHandshake = (settle, value) => {
+      if (spawnHandshakeSettled) return;
+      spawnHandshakeSettled = true;
+      settle(value);
+    };
     const onEarlyError = (error) => {
       spawnError = error;
       this.emitAlert({
@@ -1254,8 +2132,43 @@ class CodexAppServerRunner {
         source: 'runtime',
         message: `codex app-server failed to start: ${formatCodexStartError(error)}`,
       }).catch(() => {});
+      settleSpawnHandshake(rejectSpawnHandshake, error);
+    };
+    const onEarlyExit = (code, signal) => {
+      earlyExitError = new Error(`codex app-server exited early: ${code ?? 'null'} / ${signal ?? 'null'}`);
+      settleSpawnHandshake(rejectSpawnHandshake, earlyExitError);
+      this.handleExit(code, signal).catch(() => {});
+    };
+    const onSpawned = () => {
+      try {
+        if (!this.child.pid) {
+          const error = new Error('Codex app-server spawn did not provide a child PID.');
+          error.code = 'session_spawn_pid_missing';
+          throw error;
+        }
+        if (!updateApiProfileCodexHomeOwnership(this.apiProfileCleanupOwner, {
+          childPid: this.child.pid,
+          childState: 'running',
+        })) {
+          const error = new Error('Managed Codex overlay ownership could not record the spawned child.');
+          error.code = 'session_overlay_ownership_update_failed';
+          throw error;
+        }
+        settleSpawnHandshake(resolveSpawnHandshake);
+      } catch (error) {
+        settleSpawnHandshake(rejectSpawnHandshake, error);
+      }
     };
     this.child.once('error', onEarlyError);
+    this.child.once('exit', onEarlyExit);
+    this.child.once('spawn', onSpawned);
+
+    try {
+      await spawnHandshake;
+    } catch (error) {
+      if (error === spawnError) throw new Error(formatCodexStartError(error));
+      throw error;
+    }
 
     await this.emitRuntime({
       connection: 'connecting',
@@ -1263,10 +2176,8 @@ class CodexAppServerRunner {
       startupStep: 'spawned-app-server',
       busy: true,
     });
-    if (spawnError) {
-      this.child.off('error', onEarlyError);
-      throw new Error(formatCodexStartError(spawnError));
-    }
+    if (spawnError) throw new Error(formatCodexStartError(spawnError));
+    if (earlyExitError) throw earlyExitError;
 
     const stderr = readline.createInterface({
       input: this.child.stderr,
@@ -1314,9 +2225,7 @@ class CodexAppServerRunner {
 
     this.rpc = new JsonRpcSession(this.child, {
       onNotification: (message) => {
-        this.handleNotification(message).catch((error) => {
-          console.error(`[codex-runner] notification failed: ${error.message || error}`);
-        });
+        this.enqueueNotification(message);
       },
       onServerRequest: (message) => this.handleServerRequest(message),
       onRawStdout: () => {},
@@ -1332,6 +2241,9 @@ class CodexAppServerRunner {
       },
     });
     this.child.off('error', onEarlyError);
+    this.child.off('exit', onEarlyExit);
+    if (spawnError) throw new Error(formatCodexStartError(spawnError));
+    if (earlyExitError) throw earlyExitError;
 
     await this.emitRuntime({
       connection: 'connecting',
@@ -1425,14 +2337,15 @@ class CodexAppServerRunner {
         personality: 'friendly',
         ...threadApiParams,
       }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
-      this.runtime.resumeStrategy = this.launchMode === 'resume' || this.launchMode === 'fork'
-        ? 'transcript_fallback'
-        : 'fresh';
+      this.runtime.resumeStrategy = resumeStrategyForLaunchMode(this.launchMode);
       return fallbackThread;
     };
 
     let thread = null;
-    if (this.launchMode === 'resume' && this.nativeThreadId) {
+    if (this.launchMode === 'resume') {
+      if (!this.nativeThreadId) {
+        throw classifyNativeThreadError('resume', new Error('native thread id is missing'));
+      }
       try {
         await this.emitRuntime({
           connection: 'ready',
@@ -1461,9 +2374,12 @@ class CodexAppServerRunner {
         }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
         this.runtime.resumeStrategy = 'native_resume';
       } catch (error) {
-        thread = await startTranscriptFallbackThread(error);
+        throw classifyNativeThreadError('resume', error);
       }
-    } else if (this.launchMode === 'fork' && this.nativeThreadId) {
+    } else if (this.launchMode === 'fork') {
+      if (!this.nativeThreadId) {
+        throw classifyNativeThreadError('fork', new Error('native thread id is missing'));
+      }
       try {
         await this.emitRuntime({
           connection: 'ready',
@@ -1493,8 +2409,15 @@ class CodexAppServerRunner {
         }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
         this.runtime.resumeStrategy = 'native_fork';
       } catch (error) {
-        thread = await startTranscriptFallbackThread(error);
+        throw classifyNativeThreadError('fork', error);
       }
+    } else if (this.launchMode === 'transcript_fallback') {
+      if (!this.resumePrelude) {
+        const error = new Error('Transcript fallback requires non-empty bounded history.');
+        error.code = 'session_history_unavailable';
+        throw error;
+      }
+      thread = await startTranscriptFallbackThread(new Error('Explicit transcript fallback requested.'));
     } else {
       thread = await startTranscriptFallbackThread();
     }
@@ -1520,13 +2443,11 @@ class CodexAppServerRunner {
       throw new Error('codex thread is not ready yet');
     }
 
-    const requestedApiConfig = normalizeApiConfig(options.apiConfig);
-    if (requestedApiConfig && !apiConfigsRuntimeEqual(this.apiConfig, requestedApiConfig)) {
-      throw new Error(
-        `API profile changed from ${describeApiConfig(this.apiConfig)} to ${describeApiConfig(requestedApiConfig)}. `
-        + 'Codex app-server reads API settings at process startup; restart this managed session to use the new host API mapping.'
-      );
-    }
+    const explicitBinding = options.apiBinding || (options.apiConfig
+      ? deriveRunBinding({ apiConfig: options.apiConfig, allowUnavailable: true })
+      : null);
+    this.assertCommandBinding(explicitBinding);
+    this.validateModelSelection(options.model, options.effort);
 
     if (this.activeTurnId) {
       throw new Error('Codex is still working on the previous turn.');
@@ -1700,6 +2621,16 @@ class CodexAppServerRunner {
         planSummary: null,
       });
     }
+    await this.postEvent({
+      type: 'session.selection_confirmed',
+      hostId: this.hostId,
+      sessionId: this.currentSessionId(),
+      runId: this.runId,
+      model: params.model || null,
+      effort: params.effort || null,
+      effectiveBinding: this.apiBinding,
+      timestamp: nowIso(),
+    }).catch(() => {});
     return turnId;
   }
 
@@ -1731,6 +2662,13 @@ class CodexAppServerRunner {
       includeHidden: options.includeHidden === true ? true : null,
       limit: Number(options.limit || 80) || 80,
     }, LIST_REQUEST_TIMEOUT_MS);
+    const pageCapabilities = modelCapabilitiesFromList(response?.data || []);
+    if (!options.cursor) {
+      this.modelCapabilities.clear();
+    }
+    for (const [model, metadata] of pageCapabilities) {
+      this.modelCapabilities.set(model, metadata);
+    }
     await this.emitDiagnostic({
       severity: 'info',
       source: 'codex',
@@ -1741,7 +2679,11 @@ class CodexAppServerRunner {
         nextCursor: response?.nextCursor || null,
       },
     });
-    return response || { data: [], nextCursor: null };
+    return {
+      ...(response || { data: [], nextCursor: null }),
+      bindingFingerprint: this.apiBinding?.bindingFingerprint || null,
+      runId: this.runId,
+    };
   }
 
   async listSkills(options = {}) {
@@ -1821,9 +2763,60 @@ class CodexAppServerRunner {
     return response;
   }
 
-  async stop() {
+  cleanupManagedOverlay() {
+    if (this.overlayCleaned) return false;
+    const cleaned = cleanupApiProfileCodexHome(this.apiProfileCleanupOwner);
+    if (cleaned) this.overlayCleaned = true;
+    return cleaned;
+  }
+
+  async stop(options = {}) {
+    if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
+      this.suppressTerminalEvent = true;
+    }
+    this.stopRequested = true;
+    const terminalErrors = [];
+    let activityFlushError = null;
+    try {
+      await this.drainNotifications();
+      await this.finalizeThinkingActivities();
+    } catch (error) {
+      activityFlushError = error;
+    }
+    const finishStop = () => {
+      if (
+        activityFlushError
+        && this.activitySnapshotDeliveryErrors?.size
+        && !terminalErrors.includes(activityFlushError)
+      ) {
+        terminalErrors.push(activityFlushError);
+      }
+      throwTerminalErrors(terminalErrors, 'Codex runner stop did not complete cleanly.');
+    };
     const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
+    if (!child) {
+      if (!this.terminationPromise) {
+        this.terminationPromise = this.finalizePreSpawnCancellation();
+      }
+      try {
+        await this.terminationPromise;
+      } catch (error) {
+        terminalErrors.push(error);
+      }
+      finishStop();
+      return;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      try {
+        if (this.terminationPromise) {
+          await this.terminationPromise;
+        } else {
+          await this.handleExit(child.exitCode, child.signalCode);
+        }
+      } catch (error) {
+        terminalErrors.push(error);
+      }
+      finishStop();
       return;
     }
     await new Promise((resolve) => {
@@ -1838,7 +2831,7 @@ class CodexAppServerRunner {
         child.off('error', finish);
         resolve();
       };
-      const timer = setTimeout(finish, 5000);
+      const timer = setTimeout(finish, this.stopGraceTimeoutMs);
       if (typeof timer.unref === 'function') {
         timer.unref();
       }
@@ -1848,6 +2841,49 @@ class CodexAppServerRunner {
         child.kill();
       }
     });
+    if (
+      !this.terminationPromise
+      && child.exitCode === null
+      && child.signalCode === null
+    ) {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          child.off('exit', finish);
+          child.off('error', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, this.stopKillTimeoutMs);
+        timer.unref?.();
+        child.once('exit', finish);
+        child.once('error', finish);
+        child.kill('SIGKILL');
+      });
+    }
+    if (this.terminationPromise) {
+      try {
+        await this.terminationPromise;
+      } catch (error) {
+        terminalErrors.push(error);
+      }
+    } else if (child.exitCode !== null || child.signalCode !== null) {
+      try {
+        await this.handleExit(child.exitCode, child.signalCode);
+      } catch (error) {
+        terminalErrors.push(error);
+      }
+    } else {
+      const error = new Error(
+        `Codex app-server did not confirm exit after ${this.stopGraceTimeoutMs + this.stopKillTimeoutMs}ms.`
+      );
+      error.code = 'session_stop_timeout';
+      error.processTreeFallbackRequired = true;
+      terminalErrors.push(error);
+    }
+    finishStop();
   }
 
   async interruptTurn() {
@@ -1865,6 +2901,13 @@ class CodexAppServerRunner {
       threadId: this.threadId,
       turnId: interruptedTurnId,
     });
+    let activityFlushError = null;
+    try {
+      await this.drainNotifications();
+      await this.finalizeThinkingActivities({ turnId: interruptedTurnId });
+    } catch (error) {
+      activityFlushError = error;
+    }
     if (this.activeTurnId === interruptedTurnId) {
       this.activeTurnId = null;
       this.turnBuffers.delete(interruptedTurnId);
@@ -1891,6 +2934,7 @@ class CodexAppServerRunner {
       phase: 'interrupted',
       currentTurnStatus: 'interrupted',
     });
+    if (activityFlushError) throw activityFlushError;
     return true;
   }
 
@@ -1939,13 +2983,10 @@ class CodexAppServerRunner {
       throw new Error('No thread is available to compact.');
     }
 
-    const requestedApiConfig = normalizeApiConfig(options.apiConfig);
-    if (requestedApiConfig && !apiConfigsRuntimeEqual(this.apiConfig, requestedApiConfig)) {
-      throw new Error(
-        `API profile changed from ${describeApiConfig(this.apiConfig)} to ${describeApiConfig(requestedApiConfig)}. `
-        + 'Codex app-server reads API settings at process startup; restart this managed session before compacting with the new host API mapping.'
-      );
-    }
+    const explicitBinding = options.apiBinding || (options.apiConfig
+      ? deriveRunBinding({ apiConfig: options.apiConfig, allowUnavailable: true })
+      : null);
+    this.assertCommandBinding(explicitBinding);
 
     await this.emitRuntime({
       busy: true,
@@ -2112,7 +3153,10 @@ class CodexAppServerRunner {
       requestId: key,
       method: pending.method,
       summary: pending.summary,
-      response: response || null,
+      response: response ? {
+        ...response,
+        autoApproved: Boolean(response?.autoApproved),
+      } : null,
     });
 
     await this.emitRuntime({
@@ -2310,11 +3354,16 @@ class CodexAppServerRunner {
 
     if (method === 'item/reasoning/summaryTextDelta') {
       const turnId = params.turnId || this.activeTurnId;
-      const reasoningChunk = normalizeThinkingText(params.delta || '');
+      const reasoningChunk = String(params.delta ?? '');
       const isActiveTurn = turnId && turnId === this.activeTurnId;
+      this.appendThinkingDelta({
+        turnId,
+        itemId: params.itemId,
+        summaryIndex: params.summaryIndex ?? 0,
+      }, reasoningChunk);
       if (turnId) {
         const previous = this.reasoningBuffers.get(turnId) || '';
-        this.reasoningBuffers.set(turnId, mergeThinkingBuffer(previous, reasoningChunk));
+        this.reasoningBuffers.set(turnId, `${previous}${reasoningChunk}`);
       }
       if (isActiveTurn) {
         await this.emitRuntime({
@@ -2419,8 +3468,24 @@ class CodexAppServerRunner {
       return;
     }
 
+    if (method === 'item/completed' && params.item?.type === 'reasoning') {
+      const turnId = params.turnId || this.activeTurnId;
+      const itemId = params.item.id || params.itemId;
+      const summaries = Array.isArray(params.item.summary) ? params.item.summary : [];
+      summaries.forEach((summary, summaryIndex) => {
+        this.replaceThinkingSnapshot({ turnId, itemId, summaryIndex }, persistedReasoningSummaryText(summary));
+      });
+      await this.finalizeThinkingActivities({ turnId, itemId });
+    }
+
     if (method === 'turn/completed') {
       const turnId = params.turn?.id || params.turnId || this.activeTurnId;
+      let activityFlushError = null;
+      try {
+        await this.finalizeThinkingActivities({ turnId });
+      } catch (error) {
+        activityFlushError = error;
+      }
       const text = turnId ? (this.turnBuffers.get(turnId) || '').trim() : '';
       if (text) {
         await this.emitOutput(text, 'stdout');
@@ -2458,6 +3523,7 @@ class CodexAppServerRunner {
         message: `Turn completed: ${params.turn?.status?.type || 'completed'}`,
         data: params.turn || null,
       });
+      if (activityFlushError) throw activityFlushError;
       return;
     }
 
@@ -2486,6 +3552,7 @@ class CodexAppServerRunner {
       }
       const text = pieces.filter(Boolean).join('\n');
       const codexError = describeCodexError(params.error?.codexErrorInfo || null);
+      let activityFlushError = null;
       if (params.willRetry) {
         await this.emitRuntime({
           phase: String(codexError || '').startsWith('responseStreamDisconnected') ? 'reconnecting' : 'retrying',
@@ -2498,6 +3565,11 @@ class CodexAppServerRunner {
           message: text,
         });
       } else {
+        try {
+          await this.finalizeThinkingActivities({ turnId });
+        } catch (error) {
+          activityFlushError = error;
+        }
         await this.resolvePendingRequestsForClosedTurn(
           'failed',
           'Request closed because the Codex turn failed.'
@@ -2529,6 +3601,7 @@ class CodexAppServerRunner {
       if (turnId && !params.willRetry) {
         this.turnBuffers.delete(turnId);
       }
+      if (activityFlushError) throw activityFlushError;
       return;
     }
 
@@ -2690,35 +3763,144 @@ class CodexAppServerRunner {
   }
 
   async handleExit(code, signal) {
+    this.childExitConfirmed = true;
+    if (
+      this.startupStateDbError
+      && !this.startCompleted
+      && !this.stopRequested
+      && !this.terminationPromise
+    ) {
+      this.startupRetryExit = { code, signal };
+      if (typeof this.startupRetryExitResolver === 'function') {
+        this.startupRetryExitResolver();
+      }
+      return;
+    }
+    if (!this.terminationPromise) {
+      this.terminationPromise = this.finalizeExit(code, signal);
+    }
+    return this.terminationPromise;
+  }
+
+  async finalizeExit(code, signal) {
+    const terminalErrors = [];
+    try {
+      await this.drainNotifications();
+      await this.finalizeThinkingActivities();
+    } catch (error) {
+      terminalErrors.push(error);
+    }
+    let overlayCleanupError = null;
+    try {
+      updateApiProfileCodexHomeOwnership(this.apiProfileCleanupOwner, {
+        childPid: this.child?.pid || null,
+        childState: 'exited',
+      });
+    } catch {
+      // Ownership metadata is advisory once the child has confirmed exit.
+      // Cleanup still verifies the original owner token before removal.
+    }
+    try {
+      if (!this.cleanupManagedOverlay() && this.apiProfileCleanupOwner) {
+        overlayCleanupError = new Error('Owned Codex overlay could not be removed after process exit.');
+        overlayCleanupError.code = 'session_overlay_cleanup_failed';
+      }
+    } catch (error) {
+      overlayCleanupError = error;
+    }
     this.activeTurnId = null;
     this.turnBuffers.clear();
     this.turnModes.clear();
     this.planBuffers.clear();
     this.reasoningBuffers.clear();
-    await this.resolvePendingRequestsForClosedTurn(
-      'cancelled',
-      'Request closed because the Codex app-server exited.'
-    );
-    await this.emitRuntime({
-      connection: 'closed',
-      busy: false,
-      waitingOnApproval: false,
-      waitingOnUserInput: false,
-      activeTurnId: null,
-      phase: 'closed',
-    });
-    if (typeof this.onTerminated === 'function') {
-      this.onTerminated(code, signal);
+    try {
+      await this.resolvePendingRequestsForClosedTurn(
+        'cancelled',
+        'Request closed because the Codex app-server exited.'
+      );
+    } catch (error) {
+      terminalErrors.push(error);
     }
-    await this.postEvent({
-      type: 'session.state_changed',
-      hostId: this.hostId,
-      sessionId: this.currentSessionId(),
-      runId: this.runId,
-      state: `exited:${code ?? 'null'}:${signal ?? 'null'}`,
-      live: false,
-      timestamp: nowIso(),
-    });
+    try {
+      await this.emitRuntime({
+        connection: 'closed',
+        busy: false,
+        waitingOnApproval: false,
+        waitingOnUserInput: false,
+        activeTurnId: null,
+        phase: 'closed',
+      }).catch(() => {});
+      if (typeof this.onTerminated === 'function') {
+        try {
+          this.onTerminated(code, signal);
+        } catch (error) {
+          terminalErrors.push(error);
+        }
+      }
+      if (!this.suppressTerminalEvent) {
+        try {
+          await this.postEvent({
+            type: 'session.state_changed',
+            hostId: this.hostId,
+            sessionId: this.currentSessionId(),
+            runId: this.runId,
+            state: this.stopRequested
+              ? (this.startCompleted ? 'history-only' : 'failed:start-cancelled')
+              : `exited:${code ?? 'null'}:${signal ?? 'null'}`,
+            live: false,
+            timestamp: nowIso(),
+          });
+        } catch (error) {
+          terminalErrors.push(retryableTerminalDeliveryError(error));
+        }
+      }
+    } finally {
+      if (!this.overlayCleaned) {
+        try {
+          if (this.cleanupManagedOverlay()) overlayCleanupError = null;
+        } catch (error) {
+          overlayCleanupError = error;
+        }
+      }
+    }
+    if (overlayCleanupError) terminalErrors.push(overlayCleanupError);
+    throwTerminalErrors(terminalErrors, 'Codex runner termination did not complete cleanly.');
+  }
+
+  async finalizePreSpawnCancellation() {
+    const terminalErrors = [];
+    try {
+      if (!this.overlayCleaned && !this.cleanupManagedOverlay() && this.apiProfileCleanupOwner) {
+        const error = new Error('Owned Codex overlay could not be removed after startup cancellation.');
+        error.code = 'session_overlay_cleanup_failed';
+        terminalErrors.push(error);
+      }
+    } catch (error) {
+      terminalErrors.push(error);
+    }
+    if (typeof this.onTerminated === 'function') {
+      try {
+        this.onTerminated(null, null);
+      } catch (error) {
+        terminalErrors.push(error);
+      }
+    }
+    if (!this.suppressTerminalEvent) {
+      try {
+        await this.postEvent({
+          type: 'session.state_changed',
+          hostId: this.hostId,
+          sessionId: this.currentSessionId(),
+          runId: this.runId,
+          state: 'failed:start-cancelled',
+          live: false,
+          timestamp: nowIso(),
+        });
+      } catch (error) {
+        terminalErrors.push(retryableTerminalDeliveryError(error));
+      }
+    }
+    throwTerminalErrors(terminalErrors, 'Codex startup cancellation did not complete cleanly.');
   }
 
   async emitOutput(text, stream) {
@@ -2821,13 +4003,54 @@ class CodexAppServerRunner {
 
 async function startCodexAppServerSession(options) {
   const runner = new CodexAppServerRunner(options);
-  await runner.start();
-  return runner;
+  try {
+    if (typeof options.onRunnerCreated === 'function') options.onRunnerCreated(runner);
+    await runner.start();
+    return runner;
+  } catch (error) {
+    let failure = error;
+    try {
+      await runner.stop(runner.stopRequested ? {} : { suppressTerminalEvent: true });
+    } catch (stopError) {
+      stopError.cause = stopError.cause || error;
+      failure = stopError;
+    }
+    if (error?.processTreeFallbackRequired === true) {
+      failure.processTreeFallbackRequired = true;
+    }
+    if (
+      !runner.overlayCleaned
+      && (!runner.child || runner.childExitConfirmed)
+    ) {
+      runner.cleanupManagedOverlay();
+    }
+    if (
+      failure?.processTreeFallbackRequired === true
+      && runner.child
+      && !runner.childExitConfirmed
+      && !runner.overlayCleaned
+    ) {
+      failure.retryCommand = true;
+      runner.startRetryPending = true;
+      runner.processTreeFallbackRequired = true;
+      runner.startRetryFailure = {
+        code: failure.code || 'session_stop_timeout',
+        message: failure.message || 'Managed Codex startup could not confirm that its child exited.',
+        processTreeFallbackRequired: true,
+      };
+    }
+    throw failure;
+  }
 }
 
 module.exports = {
+  CodexAppServerRunner,
+  cleanupApiProfileCodexHome,
+  cleanupStaleApiProfileCodexHomes,
   normalizeAppServerFileChanges,
+  normalizeTurnStartParams,
   prepareApiProfileCodexHome,
   resolveDefaultCodexBin,
   startCodexAppServerSession,
+  updateApiProfileCodexHomeOwnership,
 };

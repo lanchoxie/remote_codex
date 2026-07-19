@@ -1,18 +1,46 @@
 {
   "name": "mobile-codex-remote",
   "private": true,
-  "version": "2.4.7",
+  "version": "2.4.8",
   "description": "Mobile control plane for Codex sessions on PCs and HPC hosts.",
   "type": "commonjs",
   "scripts": {
     "dev": "node scripts/dev.js",
+    "dev:isolated": "node scripts/dev.js",
     "relay": "node apps/relay/server.js",
     "agent": "node apps/host-agent/agent.js",
     "test:managed": "node scripts/test-managed-session.js",
+    "test:session-record-store": "node scripts/test-session-record-store.js",
+    "test:session-api-model:unit": "node scripts/test-session-record-store.js && node scripts/test-session-provenance.js && node scripts/test-model-catalog-service.js && node scripts/test-jsonl-utf8-chunks.js",
+    "test:session-api-model:integration": "node scripts/test-session-api-host-runner.js && node scripts/test-session-api-relay.js && node scripts/test-relay-state-lock.js && node scripts/test-session-api-ui.js && node scripts/test-local-agent-graceful-shutdown.js && node scripts/test-target-session-reconstruction.js",
+    "test:session-api-model": "npm run test:session-api-model:unit && npm run test:session-api-model:integration",
     "test:export-dialog": "node scripts/test-export-dialog.js",
     "test:codex-preflight": "node scripts/test-codex-preflight.js",
     "test:install-config": "node scripts/test-install-config.js",
     "test:remote-codex-env": "node scripts/test-remote-codex-env-resolution.js",
-    "test:start-windows": "node scripts/test-start-windows-script.js"
+    "test:realtime-sync": "node scripts/test-coalesced-async-task.js && node scripts/test-discovery-coalescing.js && node scripts/test-agent-event-batch-transport.js && node scripts/test-session-watch-batching.js && node scripts/test-realtime-session-sync-performance.js",
+    "test:skills-inventory": "node scripts/test-skill-inventory-discovery.js && node scripts/test-host-skill-inventory-service.js && node scripts/test-skills-inventory-api.js",
+    "test:skills-phase2": "node scripts/test-skill-artifact.js && node scripts/test-skill-registry-service.js && node scripts/test-host-skill-adopt.js && node scripts/test-skills-adopt-api.js && node scripts/test-github-skill-import.js && node scripts/test-skills-manager-ui.js",
+    "test:skills-phase3": "node scripts/test-skill-artifact.js && node scripts/test-skill-deployment-service.js && node scripts/test-host-skill-deployment.js && node scripts/test-host-agent-skills-manager.js && node scripts/test-skills-deployment-api.js && node scripts/test-skills-manager-ui.js && node scripts/test-slash-skills-cache.js",
+    "test:skills-phase4a": "node scripts/test-skill-registry-service.js && node scripts/test-skill-deployment-service.js && node scripts/test-host-skill-deployment.js && node scripts/test-skills-lifecycle-api.js && node scripts/test-github-skill-import.js && node scripts/test-skills-manager-api.js && node scripts/test-skills-manager-ui.js && node scripts/test-skills-manager-library.js && node scripts/test-skills-manager-sources.js",
+    "test:skills-phase5": "node scripts/test-skill-phase5-automation.js && node scripts/test-skill-registry-service.js && node scripts/test-skills-lifecycle-api.js && node scripts/test-github-skill-import.js && node scripts/test-skills-deployment-api.js && node scripts/test-skills-manager-sources.js && node scripts/test-skills-manager-automation-ui.js",
+    "build:mobile-vendor": "node scripts/build-mobile-vendor.js",
+    "test:transcript:unit": "node scripts/test-thinking-activity-aggregator.js && node scripts/test-runner-thinking-snapshots.js && node scripts/test-activity-snapshot-store.js && node scripts/test-relay-thinking-activity.js && node scripts/test-transcript-state.js && node scripts/test-transcript-scroll-state.js && node scripts/test-markdown-renderer.js && node scripts/test-transcript-file-refs.js",
+    "test:transcript": "npm run build:mobile-vendor && npm run test:transcript:unit && node scripts/test-mobile-thinking-scroll-stability.js && node scripts/test-diagnostic-render-throttle.js && node scripts/test-transcript-render-performance-budget.js",
+    "test:transcript-markdown": "node scripts/test-markdown-renderer.js",
+    "test:notifications:identity": "node scripts/test-assistant-message-identity.js && node scripts/test-assistant-notification-ledger.js && node scripts/test-codex-assistant-cursor.js",
+    "test:notifications:relay": "node scripts/test-session-notification-relay.js && node scripts/test-session-notification-sse.js",
+    "test:notifications:browser": "node scripts/test-message-notification-client.js && node scripts/test-message-notification-outbox.js && node scripts/test-session-message-notifications.js",
+    "test:notifications": "npm run test:notifications:identity && npm run test:notifications:relay && npm run test:notifications:browser && npm run test:realtime-sync",
+    "test:api-profile-backup": "node scripts/test-api-profile-backup.js && node scripts/test-api-profile-backup-ui.js",
+    "test:start-windows": "node scripts/test-start-windows-script.js && node scripts/test-dev-instance-isolation.js && node scripts/test-dev-relay-local-agent-guard.js && node scripts/test-relay-lifecycle.js"
+  },
+  "dependencies": {
+    "dompurify": "3.2.6",
+    "markdown-it": "14.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.54.1",
+    "jsdom": "26.1.0"
   }
 }

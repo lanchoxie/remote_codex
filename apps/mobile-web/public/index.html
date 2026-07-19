@@ -149,8 +149,18 @@
 
         <section class="settings-section session-defaults-section">
           <div>
-            <div class="settings-section-title" data-i18n-key="settings.sessionDefaultsTitle">Session defaults</div>
-            <div class="settings-section-copy" data-i18n-key="settings.sessionDefaultsCopy">These controls are remembered per selected session. Switching sessions restores that session's model, effort, reviewer, sandbox, and personality choices.</div>
+            <div class="settings-section-title" data-i18n-key="settings.sessionDefaultsTitle">Selected Session</div>
+            <div class="settings-section-copy" data-i18n-key="settings.sessionDefaultsCopy">Model and runtime controls target the selected Session. The browser default below is used only for new Sessions.</div>
+          </div>
+          <div class="session-api-context" role="group" aria-label="Session API and models">
+            <div><span>Session API</span><strong id="session-api-binding-label">Unknown</strong></div>
+            <div><span>New Session default (this browser)</span><strong id="session-host-default-label">Not configured</strong></div>
+            <div><span>Model catalog</span><strong id="session-catalog-status">Not loaded</strong></div>
+            <div class="session-api-actions">
+              <select id="session-api-rebind-select" aria-label="API profile for explicit Session rebind"></select>
+              <button id="session-api-rebind-button" type="button" class="secondary-button">Rebind and resume</button>
+              <button id="session-transcript-fallback-button" type="button" class="secondary-button hidden">Start transcript fallback</button>
+            </div>
           </div>
           <div class="composer-control-grid settings-control-grid">
             <input id="codex-model-input" type="hidden" autocomplete="off" />
@@ -160,12 +170,7 @@
             </select>
             <button id="codex-model-refresh-button" type="button" class="secondary-button">Models</button>
             <select id="codex-effort-select" aria-label="Reasoning effort">
-              <option value="">Effort: default</option>
-              <option value="minimal">Minimal</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="xhigh">XHigh</option>
+              <option value="">Auto / model default</option>
             </select>
             <select id="codex-summary-select" aria-label="Reasoning summary">
               <option value="">Summary: default</option>
@@ -205,7 +210,7 @@
         <section class="settings-section api-settings-section">
           <div>
             <div class="settings-section-title" data-i18n-key="settings.apiTitle">API profiles</div>
-            <div class="settings-section-copy" data-i18n-key="settings.apiCopy">Create multiple API profiles and choose which host uses which key. Changes apply when starting or restarting Codex app-server sessions.</div>
+            <div class="settings-section-copy" data-i18n-key="settings.apiCopy">Create API profiles and choose the browser default for each Host's new Sessions.</div>
           </div>
           <div class="settings-profile-toolbar">
             <label>
@@ -233,7 +238,7 @@
               <input id="settings-api-key" type="password" placeholder="sk-..." autocomplete="off" />
             </label>
           </div>
-          <div class="settings-warning" data-i18n-key="settings.apiRestartTip">After changing an API key or Base URL, restart the affected conversation/managed session. Running Codex app-server processes keep the API environment they started with.</div>
+          <div class="settings-warning" data-i18n-key="settings.apiRestartTip">Host mappings are defaults for new Sessions only. Existing Sessions keep their run binding; use Session Rebind to change provider or Base URL.</div>
           <div class="settings-profile-toolbar">
             <label>
               <span data-i18n-key="settings.defaultProfile">Default API profile</span>
@@ -244,6 +249,10 @@
             <div class="settings-section-title" data-i18n-key="settings.hostMappingTitle">Host API mapping</div>
             <div class="settings-section-copy" data-i18n-key="settings.hostMappingCopy">A host can use the default profile or a dedicated profile.</div>
             <div id="settings-host-api-list" class="settings-host-api-list"></div>
+          </div>
+          <div class="settings-inline-actions api-profile-backup-actions">
+            <button id="export-api-profiles-button" type="button" class="secondary-button">Export encrypted</button>
+            <button id="import-api-profiles-button" type="button" class="secondary-button">Import encrypted</button>
           </div>
           <div class="settings-warning" data-i18n-key="settings.apiWarning">Do not use this on an untrusted relay or shared browser. The key is sent through your relay when starting a session.</div>
         </section>
@@ -264,6 +273,45 @@
           <button type="submit" data-i18n-key="common.save">Save settings</button>
         </div>
       </form>
+    </div>
+
+    <div id="api-profile-backup-dialog" class="choice-dialog-overlay hidden" aria-hidden="true">
+      <section class="choice-dialog-modal api-profile-backup-modal" role="dialog" aria-modal="true" aria-labelledby="api-profile-backup-title">
+        <div class="choice-dialog-header">
+          <div>
+            <div class="eyebrow">API Profiles</div>
+            <h2 id="api-profile-backup-title">Encrypted backup</h2>
+          </div>
+          <button id="api-profile-backup-close-button" type="button" class="secondary-button">Close</button>
+        </div>
+        <label id="api-profile-backup-file-row" class="api-profile-backup-file-row hidden">
+          <span>Backup file</span>
+          <input id="api-profile-backup-file" type="file" accept=".rcapi,application/json" />
+        </label>
+        <div class="settings-field-grid api-profile-backup-passwords">
+          <label>
+            <span>Password</span>
+            <input id="api-profile-backup-password" type="password" autocomplete="new-password" />
+          </label>
+          <label id="api-profile-backup-confirm-row">
+            <span>Confirm password</span>
+            <input id="api-profile-backup-password-confirm" type="password" autocomplete="new-password" />
+          </label>
+        </div>
+        <div id="api-profile-backup-error" class="auth-error hidden" role="alert"></div>
+        <div id="api-profile-backup-status" class="choice-summary"></div>
+        <div id="api-profile-backup-preview" class="api-profile-backup-preview hidden"></div>
+        <div id="api-profile-backup-conflicts" class="api-profile-backup-conflicts hidden"></div>
+        <label id="api-profile-backup-defaults-row" class="settings-checkbox hidden">
+          <input id="api-profile-backup-use-defaults" type="checkbox" />
+          <span>Use imported selected/default profile</span>
+        </label>
+        <div class="choice-dialog-actions">
+          <button id="api-profile-backup-cancel-button" type="button" class="secondary-button">Cancel</button>
+          <button id="api-profile-backup-primary-button" type="button">Export</button>
+          <button id="api-profile-backup-apply-button" type="button" class="hidden">Apply import</button>
+        </div>
+      </section>
     </div>
 
     <div class="shell navigator-collapsed">
@@ -372,6 +420,7 @@
             <button id="toggle-navigator-button" type="button" class="secondary-button navigator-toggle-button">Navigator</button>
             <button id="toggle-language-button" type="button" class="secondary-button">中文</button>
             <button id="open-settings-button" type="button" class="secondary-button">Settings</button>
+            <button id="open-skills-manager-button" type="button" class="secondary-button">Skills</button>
             <div class="message-notification-anchor">
               <button id="message-notification-button" type="button" class="secondary-button message-notification-button" aria-expanded="false" aria-controls="message-notification-panel" title="No unread Codex messages">
                 <span class="message-notification-icon" aria-hidden="true">&#128276;</span>
@@ -396,11 +445,14 @@
             <button id="toggle-alerts-button" type="button" class="secondary-button">Alerts</button>
             <button id="rename-session-button" type="button" class="secondary-button">Rename</button>
             <button id="export-session-button" type="button" class="secondary-button">Export</button>
-            <button id="join-session-button" type="button" class="secondary-button">Join Running Session</button>
             <button id="resume-session-button" type="button" class="secondary-button">Resume From History</button>
-            <button id="fork-session-button" type="button">Fork New Branch</button>
           </div>
         </header>
+
+        <div id="advanced-session-actions" class="hidden" hidden aria-hidden="true">
+          <button id="join-session-button" type="button" class="secondary-button">Join Running Session</button>
+          <button id="fork-session-button" type="button">Fork New Branch</button>
+        </div>
 
         <section id="session-detail-panel" class="panel detail-panel compact-detail-panel unified-session-panel">
           <div class="compact-detail-main unified-session-main" aria-hidden="true">
@@ -561,6 +613,94 @@
       <div id="alerts-empty" class="empty-state">No important warnings or errors for this session.</div>
       <div id="alerts-list" class="alerts-list"></div>
     </aside>
+
+    <div id="skills-manager-overlay" class="skills-manager-overlay hidden" aria-hidden="true">
+      <section id="skills-manager" class="skills-manager-modal" role="dialog" aria-modal="true" aria-labelledby="skills-manager-title">
+        <div class="skills-manager-header">
+          <div>
+            <div class="eyebrow">Codex Skills</div>
+            <h2 id="skills-manager-title">Skills Manager</h2>
+            <div id="skills-manager-subtitle" class="meta">Host Skill Registry</div>
+          </div>
+          <button id="close-skills-manager-button" type="button" class="secondary-button">Close</button>
+        </div>
+        <div class="skills-manager-tabs" role="tablist" aria-label="Skills views">
+          <button type="button" class="skills-tab active" data-skills-tab="installed">Installed</button>
+          <button type="button" class="skills-tab" data-skills-tab="browse">Browse</button>
+          <button type="button" class="skills-tab" data-skills-tab="favorites">Favorites</button>
+          <button type="button" class="skills-tab" data-skills-tab="trending">Trending</button>
+          <button type="button" class="skills-tab" data-skills-tab="sources">Sources</button>
+        </div>
+        <div class="skills-manager-grid">
+          <aside class="skills-host-panel">
+            <div class="skills-panel-title">Hosts</div>
+            <div id="skills-host-list" class="skills-host-list"></div>
+          </aside>
+          <section class="skills-main-panel">
+            <div id="skills-actions-bar" class="skills-actions-bar">
+              <input id="skills-search-input" placeholder="Search skills..." autocomplete="off" />
+              <button id="skills-refresh-button" type="button" class="secondary-button">Refresh</button>
+              <button id="skills-install-selected-button" type="button" class="hidden" hidden aria-hidden="true">Install selected</button>
+              <button id="skills-uninstall-selected-button" type="button" class="hidden" hidden aria-hidden="true">Uninstall selected</button>
+            </div>
+            <div id="skills-daily-digest" class="skills-daily-digest"></div>
+            <div id="skills-source-editor" class="skills-source-editor">
+              <input id="skills-source-name-input" placeholder="Source name" autocomplete="off" />
+              <input id="skills-source-url-input" placeholder="Source URL or path" autocomplete="off" />
+              <button id="skills-add-source-button" type="button" class="secondary-button">Add source</button>
+            </div>
+            <div id="skills-github-import-editor" class="skills-github-import-editor">
+              <input id="skills-github-locator-input" placeholder="owner/repository or GitHub URL" autocomplete="off" />
+              <input id="skills-github-ref-input" value="main" placeholder="Ref" autocomplete="off" />
+              <input id="skills-github-subpath-input" placeholder="Skill directory path" autocomplete="off" />
+              <button id="skills-import-github-button" type="button" class="secondary-button">Import GitHub</button>
+            </div>
+            <div id="skills-library-lifecycle-toolbar" class="skills-library-lifecycle-toolbar">
+              <strong>Registry Library</strong>
+              <button id="skills-collect-unused-button" type="button" class="danger-button">Collect unused</button>
+            </div>
+            <div id="skills-library-lifecycle-list" class="skills-source-list"></div>
+            <div id="skills-configured-sources-title" class="skills-source-section-title">Configured Sources</div>
+            <div id="skills-source-list" class="skills-source-list"></div>
+            <section id="skills-audit-section" class="skills-audit-section hidden" aria-label="Recent Skills audit">
+              <div class="skills-audit-toolbar">
+                <strong>Recent Audit</strong>
+                <button id="skills-load-audit-button" type="button" class="secondary-button">Load recent</button>
+              </div>
+              <div id="skills-audit-error" class="skills-source-status-error hidden" role="status"></div>
+              <div id="skills-audit-list" class="skills-audit-list"></div>
+            </section>
+            <div id="skills-action-summary" class="skills-action-summary"></div>
+            <div id="skills-deployment-controls" class="skills-deployment-controls">
+              <div class="skills-deployment-options">
+                <div id="skills-deployment-scope" class="skills-scope-segment" role="group" aria-label="Deployment scope">
+                  <button type="button" class="active" data-skills-scope="user" aria-pressed="true">User</button>
+                  <button type="button" data-skills-scope="project" aria-pressed="false">Project</button>
+                </div>
+                <select id="skills-project-cwd-select" class="hidden" aria-label="Project workspace"></select>
+                <label id="skills-project-confirmation" class="skills-project-confirmation hidden">
+                  <input id="skills-confirm-project-write" type="checkbox" />
+                  <span>Confirm project write</span>
+                </label>
+              </div>
+              <div class="skills-deployment-actions">
+                <button id="skills-enable-selected-button" type="button">Enable</button>
+                <button id="skills-enable-all-hosts-button" type="button" class="secondary-button">Enable on all hosts</button>
+                <button id="skills-disable-selected-button" type="button" class="secondary-button">Disable</button>
+                <button id="skills-remove-host-button" type="button" class="danger-button">Remove from host</button>
+              </div>
+            </div>
+            <div id="skills-deployment-progress" class="skills-deployment-progress" role="status" aria-live="polite"></div>
+            <div class="skills-inventory-toolbar">
+              <button id="skills-refresh-selected-button" type="button" class="secondary-button">Refresh selected</button>
+              <span id="skills-inventory-summary" role="status"></span>
+            </div>
+            <div id="skills-inventory-matrix" class="skills-inventory-matrix" role="table" aria-label="Skills by host"></div>
+            <div id="skills-list" class="skills-list"></div>
+          </section>
+        </div>
+      </section>
+    </div>
 
     <div id="status-window-overlay" class="status-window-overlay hidden">
       <section id="status-window" class="status-window-modal" role="dialog" aria-modal="true" aria-labelledby="status-window-title">
@@ -957,6 +1097,13 @@
       </div>
     </section>
 
+    <script src="/vendor/markdown-it-14.1.0.min.js"></script>
+    <script src="/vendor/dompurify-3.2.6.min.js"></script>
+    <script src="/markdown-renderer.js"></script>
+    <script src="/transcript-state.js"></script>
+    <script src="/transcript-scroll.js"></script>
+    <script src="/message-notification-client.js"></script>
+    <script src="/api-profile-backup.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

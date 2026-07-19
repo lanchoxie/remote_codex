@@ -2,22 +2,19 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const {
+  buildAgentEnvironment,
+  buildRelayEnvironment,
+  resolveDevInstanceConfig,
+} = require('./dev-instance-config');
 
 const root = path.join(__dirname, '..');
+const config = resolveDevInstanceConfig({ root });
+const relayAuthTokenPath = config.relayAuthTokenPath;
 const relayAuthToken = getRelayAuthToken();
 
-function truthyEnv(value) {
-  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
-}
-
 function getRelayAuthToken() {
-  if (truthyEnv(process.env.RELAY_AUTH_DISABLED)) {
-    return '';
-  }
-  if (String(process.env.RELAY_AUTH_TOKEN || '').trim()) {
-    return String(process.env.RELAY_AUTH_TOKEN).trim();
-  }
-  const tokenPath = path.join(root, 'tmp', 'relay-auth-token.txt');
+  const tokenPath = relayAuthTokenPath;
   try {
     const saved = fs.readFileSync(tokenPath, 'utf8').trim();
     if (saved) {
@@ -34,37 +31,32 @@ function getRelayAuthToken() {
 
 const relay = spawn(process.execPath, [path.join(__dirname, '..', 'apps', 'relay', 'server.js')], {
   stdio: 'inherit',
-  env: {
-    ...process.env,
-    ...(relayAuthToken ? { RELAY_AUTH_TOKEN: relayAuthToken } : {}),
-  },
+  env: buildRelayEnvironment(config, process.env, relayAuthToken),
 });
 
-const agent = spawn(process.execPath, [path.join(__dirname, '..', 'apps', 'host-agent', 'agent.js')], {
-  stdio: 'inherit',
-  env: {
-    ...process.env,
-    ...(relayAuthToken ? { RELAY_AUTH_TOKEN: relayAuthToken } : {}),
-    RELAY_URL: process.env.RELAY_URL || 'http://127.0.0.1:8787',
-    HOST_ID: process.env.HOST_ID || 'local-demo',
-    HOST_LABEL: process.env.HOST_LABEL || 'Local Demo',
-    AUTO_START_SESSION: process.env.AUTO_START_SESSION || 'true',
-    MANAGED_COMMAND: process.env.MANAGED_COMMAND || 'codex-app-server',
-  },
-});
+const agent = config.withAgent
+  ? spawn(process.execPath, [path.join(__dirname, '..', 'apps', 'host-agent', 'agent.js')], {
+    stdio: 'inherit',
+    env: buildAgentEnvironment(config, process.env, relayAuthToken),
+  })
+  : null;
+
+console.log(`[dev] URL: ${config.relayUrl}`);
+console.log(`[dev] state: ${config.relayStateRoot}`);
+console.log(`[dev] agent: ${config.withAgent ? `${config.hostId} (${config.codexHome})` : 'disabled'}`);
 
 function shutdown(code) {
   if (!relay.killed) {
     relay.kill();
   }
-  if (!agent.killed) {
+  if (agent && !agent.killed) {
     agent.kill();
   }
   process.exit(code);
 }
 
 relay.on('exit', (code) => shutdown(code || 0));
-agent.on('exit', (code) => shutdown(code || 0));
+agent?.on('exit', (code) => shutdown(code || 0));
 
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));

@@ -32,25 +32,150 @@ const {
   getLocalUpdateStatus,
   scheduleWindowsRestart,
 } = require('../../shared/updater');
+const { createSkillArtifactArchive } = require('../../shared/skill-artifact');
+const { normalizePortableSkillId } = require('../../shared/skill-id');
+const { parseSkillMarkdown } = require('../../shared/skill-inventory');
+const { redactSecretText, stripSecrets } = require('../../shared/secret-redaction');
+const { ActivitySnapshotStore } = require('../../shared/activity-snapshot-store');
+const {
+  canonicalPhysicalPath,
+  comparablePhysicalPath,
+  physicalPathIsInside,
+} = require('../../shared/physical-path');
+const {
+  bindingsEqual,
+  makeProfileBinding,
+  publicBinding,
+} = require('../../shared/api-binding');
+const { downloadGithubSkill, normalizeGithubSkillSource } = require('./github-skill-source');
+const { ModelCatalogError, ModelCatalogService } = require('./model-catalog-service');
+const {
+  emptyNotificationState,
+  ingestAssistantObservation,
+  projectAssistantState,
+} = require('./assistant-notification-ledger');
+const { acquireRelayStateLock } = require('./relay-state-lock');
+const { SessionEventStream } = require('./session-event-stream');
+const { SessionContractError, SessionProvenanceService } = require('./session-provenance-service');
+const { SessionRecordStore } = require('./session-record-store');
+const { SkillAuditLog } = require('./skill-audit-log');
+const { SkillAutomationService } = require('./skill-automation-service');
+const { SkillDeploymentService } = require('./skill-deployment-service');
+const { SkillRegistryService } = require('./skill-registry-service');
 
 const PORT = Number(process.env.PORT || 8787);
+const RELAY_INSTANCE_ID = crypto.randomUUID();
+const SESSION_EVENT_RING_SIZE = Math.max(
+  1,
+  Math.min(4096, Number(process.env.SESSION_EVENT_RING_SIZE || 512) || 512)
+);
+const PRIMARY_RELAY_PORT = 8797;
+function enabledEnvironmentFlag(name, defaultValue) {
+  const value = process.env[name];
+  if (value == null || String(value).trim() === '') {
+    return Boolean(defaultValue);
+  }
+  return !/^(0|false|no|off)$/i.test(String(value).trim());
+}
+
+const RUN_ID_REQUIRED_SESSION_EVENT_TYPES = new Set([
+  'session.command_failed',
+  'session.output',
+  'session.runtime_updated',
+  'session.selection_confirmed',
+  'session.started',
+  'session.state_changed',
+]);
+const EXPLICIT_RELAY_STATE_ROOT = String(process.env.RELAY_STATE_ROOT || '').trim();
+if (PORT !== PRIMARY_RELAY_PORT && !EXPLICIT_RELAY_STATE_ROOT) {
+  throw new Error(
+    `Relay port ${PORT} requires an explicit RELAY_STATE_ROOT to avoid sharing primary state.`
+  );
+}
+const RELAY_STATE_ROOT = canonicalPhysicalPath(
+  EXPLICIT_RELAY_STATE_ROOT
+  || path.join(process.cwd(), 'tmp')
+);
+// Runtime bundles are read-only inputs, so keep the downloader's legacy cache
+// available without treating it as a Relay state location.
+const LEGACY_RUNTIME_CACHE_ROOT = path.resolve(process.cwd(), 'tmp');
 const PUBLIC_DIR = path.join(__dirname, '..', 'mobile-web', 'public');
-const SESSION_COLLECTIONS_PATH = process.env.SESSION_COLLECTIONS_PATH || path.join(process.cwd(), 'tmp', 'session-collections.json');
-const SESSION_METADATA_PATH = process.env.SESSION_METADATA_PATH || path.join(process.cwd(), 'tmp', 'session-metadata.json');
-const SESSION_LOGS_PATH = process.env.SESSION_LOGS_PATH || path.join(process.cwd(), 'tmp', 'session-logs.json');
-const SESSION_DIAGNOSTICS_PATH = process.env.SESSION_DIAGNOSTICS_PATH || path.join(process.cwd(), 'tmp', 'session-diagnostics.json');
-const RECEIVED_FILES_ROOT = path.join(process.cwd(), 'tmp', 'received-files');
+
+function relayOwnedStatePath(name, value) {
+  const resolved = canonicalPhysicalPath(value);
+  if (!physicalPathIsInside(RELAY_STATE_ROOT, resolved)) {
+    throw new Error(`${name} must resolve within RELAY_STATE_ROOT: ${RELAY_STATE_ROOT}`);
+  }
+  return resolved;
+}
+
+const SESSION_COLLECTIONS_PATH = relayOwnedStatePath('SESSION_COLLECTIONS_PATH', process.env.SESSION_COLLECTIONS_PATH || path.join(RELAY_STATE_ROOT, 'session-collections.json'));
+const SESSION_METADATA_PATH = relayOwnedStatePath('SESSION_METADATA_PATH', process.env.SESSION_METADATA_PATH || path.join(RELAY_STATE_ROOT, 'session-metadata.json'));
+const SESSION_RECORD_STORE_ROOT = relayOwnedStatePath('SESSION_RECORD_STORE_ROOT', process.env.SESSION_RECORD_STORE_ROOT || path.join(RELAY_STATE_ROOT, 'session-record-store'));
+if (comparablePhysicalPath(SESSION_RECORD_STORE_ROOT) === comparablePhysicalPath(RELAY_STATE_ROOT)) {
+  throw new Error('SESSION_RECORD_STORE_ROOT must be a child directory of RELAY_STATE_ROOT.');
+}
+const SESSION_LOGS_PATH = relayOwnedStatePath('SESSION_LOGS_PATH', process.env.SESSION_LOGS_PATH || path.join(RELAY_STATE_ROOT, 'session-logs.json'));
+const SESSION_DIAGNOSTICS_PATH = relayOwnedStatePath('SESSION_DIAGNOSTICS_PATH', process.env.SESSION_DIAGNOSTICS_PATH || path.join(RELAY_STATE_ROOT, 'session-diagnostics.json'));
+const CONNECTORS_PATH = relayOwnedStatePath('CONNECTORS_PATH', process.env.CONNECTORS_PATH || path.join(RELAY_STATE_ROOT, 'connectors.json'));
+const CONNECTOR_SECRETS_PATH = relayOwnedStatePath('CONNECTOR_SECRETS_PATH', process.env.CONNECTOR_SECRETS_PATH || path.join(RELAY_STATE_ROOT, 'connector-secrets.json'));
+const SKILL_FAVORITES_PATH = relayOwnedStatePath('SKILL_FAVORITES_PATH', process.env.SKILL_FAVORITES_PATH || path.join(RELAY_STATE_ROOT, 'skill-favorites.json'));
+const SKILL_SOURCES_PATH = relayOwnedStatePath('SKILL_SOURCES_PATH', process.env.SKILL_SOURCES_PATH || path.join(RELAY_STATE_ROOT, 'skill-sources.json'));
+const SKILL_LIBRARY_PATH = relayOwnedStatePath('SKILL_LIBRARY_PATH', process.env.SKILL_LIBRARY_PATH || path.join(RELAY_STATE_ROOT, 'skill-library.json'));
+const SKILL_INVENTORIES_PATH = relayOwnedStatePath('SKILL_INVENTORIES_PATH', process.env.SKILL_INVENTORIES_PATH || path.join(RELAY_STATE_ROOT, 'skill-inventories.json'));
+const SKILL_REGISTRY_PATH = relayOwnedStatePath('SKILL_REGISTRY_PATH', process.env.SKILL_REGISTRY_PATH || path.join(RELAY_STATE_ROOT, 'skill-registry.json'));
+const SKILL_ARTIFACT_ROOT = relayOwnedStatePath('SKILL_ARTIFACT_ROOT', process.env.SKILL_ARTIFACT_ROOT || path.join(RELAY_STATE_ROOT, 'skill-artifacts'));
+const SKILL_DEPLOYMENTS_PATH = relayOwnedStatePath('SKILL_DEPLOYMENTS_PATH', process.env.SKILL_DEPLOYMENTS_PATH || path.join(RELAY_STATE_ROOT, 'skill-deployments.json'));
+const SKILL_AUDIT_PATH = relayOwnedStatePath('SKILL_AUDIT_PATH', process.env.SKILL_AUDIT_PATH || path.join(RELAY_STATE_ROOT, 'skill-audit.jsonl'));
+const SSH_KNOWN_HOSTS_PATH = relayOwnedStatePath('SSH_KNOWN_HOSTS_PATH', process.env.SSH_KNOWN_HOSTS_PATH || path.join(RELAY_STATE_ROOT, 'ssh', 'known_hosts'));
+const SKILL_GITHUB_API_BASE_URL = process.env.SKILL_GITHUB_API_BASE_URL || 'https://api.github.com';
+const SKILL_GITHUB_TOKEN = process.env.REMOTE_CODEX_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
+const RECEIVED_FILES_ROOT = path.join(RELAY_STATE_ROOT, 'received-files');
 const RECEIVED_FILES_MANIFEST_PATH = path.join(RECEIVED_FILES_ROOT, 'manifest.json');
-const LOCAL_AGENT_LOG_ROOT = path.join(process.cwd(), 'tmp', 'local-agents');
-const RELAY_AUTH_TOKEN_PATH = process.env.RELAY_AUTH_TOKEN_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-token.txt');
-const RELAY_AUTH_ACCOUNT_PATH = process.env.RELAY_AUTH_ACCOUNT_PATH || path.join(process.cwd(), 'tmp', 'relay-auth-account.json');
-const RELAY_AUTH_COOKIE_NAME = 'remote_codex_auth';
+const LOCAL_AGENT_LOG_ROOT = path.join(RELAY_STATE_ROOT, 'local-agents');
+const RELAY_OWNER_PATH = path.join(RELAY_STATE_ROOT, 'relay-owner.json');
+const RELAY_REPO_ROOT = canonicalPhysicalPath(path.join(__dirname, '..', '..'));
+const RELAY_AUTH_TOKEN_PATH = relayOwnedStatePath('RELAY_AUTH_TOKEN_PATH', process.env.RELAY_AUTH_TOKEN_PATH || path.join(RELAY_STATE_ROOT, 'relay-auth-token.txt'));
+const RELAY_AUTH_ACCOUNT_PATH = relayOwnedStatePath('RELAY_AUTH_ACCOUNT_PATH', process.env.RELAY_AUTH_ACCOUNT_PATH || path.join(RELAY_STATE_ROOT, 'relay-auth-account.json'));
+const RELAY_CONTROL_TOKEN_PATH = relayOwnedStatePath('RELAY_CONTROL_TOKEN_PATH', process.env.RELAY_CONTROL_TOKEN_PATH || path.join(RELAY_STATE_ROOT, 'relay-control-token.txt'));
+const RELAY_AUTH_COOKIE_NAME = PORT === PRIMARY_RELAY_PORT
+  ? 'remote_codex_auth'
+  : `remote_codex_auth_${PORT}`;
 const DEFAULT_COLLECTION_ID = 'default';
 const TRASH_COLLECTION_ID = 'trash';
 const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
 const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 192 * 1024 * 1024);
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
 const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
+const SKILL_ARTIFACT_MAX_UPLOAD_BYTES = Math.max(
+  1,
+  Math.trunc(Number(process.env.SKILL_ARTIFACT_MAX_UPLOAD_BYTES || 272 * 1024 * 1024)) || 272 * 1024 * 1024
+);
+const SKILL_MAX_ACTIVE_ADOPTIONS = Math.max(
+  1,
+  Math.min(1000, Math.trunc(Number(process.env.SKILL_MAX_ACTIVE_ADOPTIONS || 100)) || 100)
+);
+const SKILL_GITHUB_MAX_CONCURRENT_IMPORTS = Math.max(
+  1,
+  Math.min(16, Math.trunc(Number(process.env.SKILL_GITHUB_MAX_CONCURRENT_IMPORTS || 2)) || 2)
+);
+const SKILL_OPERATION_HISTORY_LIMIT = Math.max(
+  100,
+  Math.min(10000, Math.trunc(Number(process.env.SKILL_OPERATION_HISTORY_LIMIT || 1000)) || 1000)
+);
+const SKILL_DEPLOYMENT_SUMMARY_LIMIT = 100;
+const SKILL_DEPLOYMENT_HISTORY_LIMIT = Math.max(
+  1,
+  Math.min(
+    10000,
+    Math.trunc(Number(process.env.SKILL_DEPLOYMENT_HISTORY_LIMIT || SKILL_OPERATION_HISTORY_LIMIT))
+      || SKILL_OPERATION_HISTORY_LIMIT
+  )
+);
+const SKILL_AUTOMATION_TICK_MS = Math.max(
+  1000,
+  Number(process.env.SKILL_AUTOMATION_TICK_MS || 5 * 60 * 1000) || 5 * 60 * 1000
+);
 const FILE_TRANSFER_CHUNK_BYTES = Number(process.env.RELAY_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
 const CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES = Number(process.env.RELAY_CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES || 16 * 1024 * 1024);
 const CHUNKED_FILE_CACHE_MAX_BYTES = Number(process.env.RELAY_CHUNKED_FILE_CACHE_MAX_BYTES || MAX_FILE_TRANSFER_BYTES);
@@ -66,16 +191,69 @@ const RESUME_TRANSCRIPT_MAX_ENTRIES = Number(process.env.RELAY_RESUME_TRANSCRIPT
 const RESUME_TRANSCRIPT_MAX_ENTRY_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_ENTRY_CHARS || 12000);
 const RESUME_TRANSCRIPT_MAX_TOTAL_CHARS = Number(process.env.RELAY_RESUME_TRANSCRIPT_MAX_TOTAL_CHARS || 240000);
 const STALE_MANAGED_SESSION_GRACE_MS = Number(process.env.RELAY_STALE_MANAGED_SESSION_GRACE_MS || 2 * 60 * 1000);
+const MISSING_MANAGED_DISCOVERY_CONFIRMATION_MS = Math.max(
+  0,
+  Number(process.env.RELAY_MISSING_MANAGED_DISCOVERY_CONFIRMATION_MS || 5000) || 5000
+);
+const TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS = truthyEnv(process.env.RELAY_TEST_CONTROL_ENABLED)
+  ? Math.max(0, Number(process.env.RELAY_TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS || 0) || 0)
+  : 0;
+const SESSION_STOP_FALLBACK_MS = Number(process.env.RELAY_SESSION_STOP_FALLBACK_MS || 15000);
 const INPUT_REQUEST_DEDUPE_TTL_MS = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_TTL_MS || 2 * 60 * 1000);
 const INPUT_REQUEST_DEDUPE_LIMIT = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_LIMIT || 500);
-const LOCAL_AGENT_WATCHDOG_ENABLED = String(process.env.RELAY_LOCAL_AGENT_WATCHDOG_ENABLED || 'true').trim().toLowerCase() !== 'false';
+const AGENT_EVENT_BATCH_DEDUPE_LIMIT = Math.max(1, Number(process.env.RELAY_AGENT_EVENT_BATCH_DEDUPE_LIMIT || 10000) || 10000);
+const LOCAL_AGENT_WATCHDOG_ENABLED = enabledEnvironmentFlag(
+  'RELAY_LOCAL_AGENT_WATCHDOG_ENABLED',
+  PORT === PRIMARY_RELAY_PORT
+);
+const LOCAL_AGENT_START_ENABLED = enabledEnvironmentFlag(
+  'RELAY_LOCAL_AGENT_START_ENABLED',
+  PORT === PRIMARY_RELAY_PORT
+);
+if (PORT !== PRIMARY_RELAY_PORT && LOCAL_AGENT_START_ENABLED) {
+  if (!String(process.env.RELAY_LOCAL_HOST_ID || '').trim()) {
+    throw new Error('Non-primary Relay local Agent opt-in requires RELAY_LOCAL_HOST_ID.');
+  }
+  for (const name of [
+    'LOCAL_CODEX_HOME',
+    'REMOTE_CODEX_STATE_ROOT',
+    'AGENTS_HOME',
+    'CC_SWITCH_HOME',
+    'SKILL_ARTIFACT_TEMP_ROOT',
+  ]) {
+    const value = String(process.env[name] || '').trim();
+    if (!value) {
+      throw new Error(`Non-primary Relay local Agent opt-in requires ${name}.`);
+    }
+    if (!physicalPathIsInside(RELAY_STATE_ROOT, value)) {
+      throw new Error(`${name} must resolve within RELAY_STATE_ROOT for a non-primary local Agent.`);
+    }
+  }
+}
 const LOCAL_AGENT_WATCHDOG_INTERVAL_MS = Number(process.env.RELAY_LOCAL_AGENT_WATCHDOG_INTERVAL_MS || 5000);
+const HOST_SESSION_DISCOVERY_REQUEST_COOLDOWN_MS = Math.max(
+  20000,
+  Number(process.env.RELAY_HOST_SESSION_DISCOVERY_REQUEST_COOLDOWN_MS || 60000) || 60000
+);
 const LOCAL_AGENT_OFFLINE_RESTART_MS = Number(process.env.RELAY_LOCAL_AGENT_OFFLINE_RESTART_MS || 45000);
 const LOCAL_AGENT_STARTUP_GRACE_MS = Number(process.env.RELAY_LOCAL_AGENT_STARTUP_GRACE_MS || 5 * 60 * 1000);
 const LOCAL_AGENT_RESTART_COOLDOWN_MS = Number(process.env.RELAY_LOCAL_AGENT_RESTART_COOLDOWN_MS || 10000);
 const LOCAL_AGENT_EXIT_RESTART_DELAY_MS = Number(process.env.RELAY_LOCAL_AGENT_EXIT_RESTART_DELAY_MS || 2000);
+const LOCAL_AGENT_SHUTDOWN_GRACE_MS = Math.max(
+  1000,
+  Number(process.env.RELAY_LOCAL_AGENT_SHUTDOWN_GRACE_MS || 12000) || 12000
+);
+const LOCAL_AGENT_EXIT_POLL_MS = Math.max(
+  50,
+  Number(process.env.RELAY_LOCAL_AGENT_EXIT_POLL_MS || 100) || 100
+);
+const LOCAL_AGENT_FORCE_EXIT_WAIT_MS = Math.max(
+  1000,
+  Number(process.env.RELAY_LOCAL_AGENT_FORCE_EXIT_WAIT_MS || 5000) || 5000
+);
 const COMMAND_QUEUE_TTL_MS = Number(process.env.RELAY_COMMAND_QUEUE_TTL_MS || 10 * 60 * 1000);
 const COMMAND_QUEUE_MAX_LENGTH = Number(process.env.RELAY_COMMAND_QUEUE_MAX_LENGTH || 1000);
+const SKILL_ADOPTION_RETENTION_MS = Number(process.env.SKILL_ADOPTION_RETENTION_MS || 60 * 60 * 1000);
 const COMMAND_PRIORITY = Object.freeze({
   high: 0,
   normal: 10,
@@ -97,8 +275,18 @@ const HIGH_PRIORITY_COMMAND_TYPES = new Set([
   'session.steer',
   'session.request.respond',
 ]);
-const RELAY_AUTH_TOKEN = loadRelayAuthToken();
-let relayAuthAccount = loadRelayAuthAccount();
+let RELAY_AUTH_TOKEN = '';
+let RELAY_CONTROL_TOKEN = '';
+let relayAuthAccount = null;
+let localAgentWatchdogTimer = null;
+let relayShutdownPromise = null;
+let relayShutdownContext = null;
+let relayStateLock = null;
+let relayReady = false;
+let relayStopping = false;
+let relayOwnerMarkerWritten = false;
+const relayBackgroundTasks = new Set();
+const stopFallbackTimers = new Set();
 
 function truthyEnv(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
@@ -130,11 +318,12 @@ function summarizeApiConfig(apiConfig) {
   if (!config) {
     return null;
   }
+  const binding = makeProfileBinding(config);
   return {
     profileId: config.profileId || null,
     label: config.label || config.provider || 'API profile',
     provider: config.provider || null,
-    baseUrl: config.baseUrl || null,
+    baseUrl: binding.normalizedBaseUrl || null,
   };
 }
 
@@ -166,6 +355,81 @@ function loadRelayAuthToken() {
     const saved = fs.readFileSync(RELAY_AUTH_TOKEN_PATH, 'utf8').trim();
     return saved || token;
   }
+}
+
+function loadRelayControlToken() {
+  try {
+    const saved = fs.readFileSync(RELAY_CONTROL_TOKEN_PATH, 'utf8').trim();
+    if (saved) {
+      return saved;
+    }
+  } catch (_) {
+    // Missing control token is expected on first start.
+  }
+
+  const token = crypto.randomBytes(32).toString('base64url');
+  fs.mkdirSync(path.dirname(RELAY_CONTROL_TOKEN_PATH), { recursive: true });
+  try {
+    fs.writeFileSync(RELAY_CONTROL_TOKEN_PATH, `${token}\n`, { encoding: 'utf8', flag: 'wx' });
+    return token;
+  } catch (_) {
+    const saved = fs.readFileSync(RELAY_CONTROL_TOKEN_PATH, 'utf8').trim();
+    if (!saved) {
+      throw new Error('Relay control token file is empty.');
+    }
+    return saved;
+  }
+}
+
+function writeRelayOwnerMarker() {
+  const marker = {
+    kind: 'remote-codex-relay-owner',
+    version: 1,
+    instanceId: RELAY_INSTANCE_ID,
+    pid: process.pid,
+    port: PORT,
+    repoRoot: RELAY_REPO_ROOT,
+    stateRoot: RELAY_STATE_ROOT,
+    startedAt: nowIso(),
+  };
+  fs.mkdirSync(path.dirname(RELAY_OWNER_PATH), { recursive: true });
+  const tempPath = `${RELAY_OWNER_PATH}.${process.pid}.${RELAY_INSTANCE_ID}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(marker, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    try {
+      fs.renameSync(tempPath, RELAY_OWNER_PATH);
+    } catch (error) {
+      if (!['EEXIST', 'EPERM', 'ENOTEMPTY'].includes(error.code)) {
+        throw error;
+      }
+      fs.unlinkSync(RELAY_OWNER_PATH);
+      fs.renameSync(tempPath, RELAY_OWNER_PATH);
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+async function removeRelayOwnerMarker() {
+  let marker;
+  try {
+    marker = JSON.parse(await fs.promises.readFile(RELAY_OWNER_PATH, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  if (
+    marker?.kind !== 'remote-codex-relay-owner'
+    || marker.instanceId !== RELAY_INSTANCE_ID
+    || Number(marker.pid) !== process.pid
+  ) {
+    throw new Error('Relay ownership marker changed before cleanup.');
+  }
+  await fs.promises.unlink(RELAY_OWNER_PATH);
 }
 
 function loadRelayAuthAccount() {
@@ -512,6 +776,336 @@ function saveSessionCollections(collections) {
   }, null, 2), 'utf8');
 }
 
+function loadSkillFavorites() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SKILL_FAVORITES_PATH, 'utf8'));
+    const favorites = Array.isArray(parsed.favorites) ? parsed.favorites : [];
+    return new Set(favorites.map((entry) => String(entry || '').trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+function saveSkillFavorites(favorites) {
+  fs.mkdirSync(path.dirname(SKILL_FAVORITES_PATH), { recursive: true });
+  fs.writeFileSync(SKILL_FAVORITES_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    favorites: Array.from(favorites || []).sort(),
+  }, null, 2), 'utf8');
+}
+
+function normalizeSkillSource(input = {}) {
+  const sourceId = String(input.sourceId || input.id || makeId()).trim();
+  const name = String(input.name || input.label || '').trim() || 'Skill source';
+  const url = String(input.url || input.path || '').trim();
+  const enabled = input.enabled !== false;
+  const skills = (Array.isArray(input.skills) ? input.skills : [])
+    .map((skill) => normalizeCatalogSkill(skill, sourceId))
+    .filter(Boolean);
+  return {
+    sourceId,
+    name,
+    url,
+    enabled,
+    kind: String(input.kind || 'manual').trim() || 'manual',
+    skills,
+    createdAt: input.createdAt || nowIso(),
+    updatedAt: input.updatedAt || nowIso(),
+  };
+}
+
+function loadSkillSources() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SKILL_SOURCES_PATH, 'utf8'));
+    const sources = Array.isArray(parsed.sources) ? parsed.sources : [];
+    return sources.map(normalizeSkillSource);
+  } catch {
+    return [];
+  }
+}
+
+function saveSkillSources(sources) {
+  fs.mkdirSync(path.dirname(SKILL_SOURCES_PATH), { recursive: true });
+  fs.writeFileSync(SKILL_SOURCES_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    sources: sources.map(normalizeSkillSource),
+  }, null, 2), 'utf8');
+}
+
+function inferSkillIdFromUrl(url, fallback = '') {
+  const text = String(url || '').trim();
+  const cleanFallback = String(fallback || '').trim();
+  try {
+    const parsed = new URL(text);
+    const parts = parsed.pathname.split('/').map((part) => part.trim()).filter(Boolean);
+    const last = parts[parts.length - 1] || cleanFallback;
+    return last.replace(/\.git$/i, '').replace(/\.(md|json)$/i, '') || cleanFallback || makeId();
+  } catch {
+    return cleanFallback || makeId();
+  }
+}
+
+function normalizeSkillLibraryRecord(input = {}) {
+  const sourceUrl = String(input.sourceUrl || input.url || '').trim();
+  const skillId = String(input.skillId || input.id || inferSkillIdFromUrl(sourceUrl, input.name)).trim();
+  if (!skillId || skillId.includes('/') || skillId.includes('\\')) {
+    return null;
+  }
+  const name = String(input.name || skillId).trim() || skillId;
+  const description = String(input.description || '').trim();
+  const lastInstalledHostIds = Array.from(new Set(
+    (Array.isArray(input.lastInstalledHostIds) ? input.lastInstalledHostIds : [])
+      .map((hostId) => String(hostId || '').trim())
+      .filter(Boolean)
+  ));
+  return {
+    skillId,
+    name,
+    description,
+    sourceUrl,
+    source: String(input.source || input.sourceName || sourceUrl || 'user-link').trim() || 'user-link',
+    installed: false,
+    readonly: false,
+    archived: input.archived === true,
+    lastInstalledHostIds,
+    createdAt: input.createdAt || nowIso(),
+    updatedAt: input.updatedAt || nowIso(),
+  };
+}
+
+function loadSkillLibrary() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SKILL_LIBRARY_PATH, 'utf8'));
+    const skills = Array.isArray(parsed.skills) ? parsed.skills : [];
+    return skills.map(normalizeSkillLibraryRecord).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function saveSkillLibrary(skills) {
+  fs.mkdirSync(path.dirname(SKILL_LIBRARY_PATH), { recursive: true });
+  fs.writeFileSync(SKILL_LIBRARY_PATH, JSON.stringify({
+    savedAt: nowIso(),
+    skills: skills.map(normalizeSkillLibraryRecord).filter(Boolean),
+  }, null, 2), 'utf8');
+}
+
+const SKILL_INSTANCE_STATES = new Set([
+  'enabled',
+  'disabled',
+  'missing',
+  'pending',
+  'drifted',
+  'conflict',
+  'shadowed',
+]);
+
+function skillInventoryText(value, maxLength = 4096) {
+  return String(value == null ? '' : value).trim().slice(0, maxLength);
+}
+
+function normalizeHostSkillInstance(input, expectedHostId) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('skill inventory instance must be an object');
+  }
+  const hostId = skillInventoryText(input.hostId || expectedHostId, 160);
+  if (!hostId || hostId !== expectedHostId) {
+    throw new Error('skill inventory instance hostId does not match inventory host');
+  }
+  const skillId = skillInventoryText(input.skillId, 240);
+  const instanceId = skillInventoryText(input.instanceId, 8192);
+  const activationPath = skillInventoryText(input.activationPath || input.installPath, 8192);
+  if (!skillId || !instanceId || !activationPath) {
+    throw new Error('skill inventory instance requires instanceId, skillId, and activationPath');
+  }
+  const stateName = skillInventoryText(input.state, 40).toLowerCase();
+  const observedHash = skillInventoryText(input.observedHash, 96).toLowerCase();
+  const desiredArtifactId = skillInventoryText(input.desiredArtifactId, 96).toLowerCase();
+  if (!/^sha256:[a-f0-9]{64}$/.test(observedHash)) {
+    throw new Error('skill inventory instance observedHash must be a sha256 digest');
+  }
+  if (desiredArtifactId && !/^sha256:[a-f0-9]{64}$/.test(desiredArtifactId)) {
+    throw new Error('skill inventory instance desiredArtifactId must be a sha256 digest');
+  }
+  return {
+    instanceId,
+    hostId,
+    skillId,
+    name: skillInventoryText(input.name || skillId, 512) || skillId,
+    description: skillInventoryText(input.description, 4096),
+    scope: skillInventoryText(input.scope || 'user', 80) || 'user',
+    scopeId: skillInventoryText(input.scopeId || input.scope || 'user', 8192) || 'user',
+    cwd: input.cwd ? skillInventoryText(input.cwd, 8192) : null,
+    sourceId: skillInventoryText(input.sourceId || `local-host:${hostId}:${activationPath}`, 8192),
+    sourceKind: skillInventoryText(input.sourceKind || 'local-host', 80) || 'local-host',
+    sourceLocator: skillInventoryText(input.sourceLocator || activationPath, 8192),
+    sourceRef: input.sourceRef ? skillInventoryText(input.sourceRef, 512) : null,
+    sourcePath: input.sourcePath ? skillInventoryText(input.sourcePath, 8192) : null,
+    activationPath,
+    realPath: skillInventoryText(input.realPath || activationPath, 8192),
+    observedHash,
+    desiredArtifactId: desiredArtifactId || null,
+    enabled: input.enabled !== false,
+    effective: typeof input.effective === 'boolean' ? input.effective : null,
+    managed: Boolean(input.managed),
+    readonly: Boolean(input.readonly),
+    state: SKILL_INSTANCE_STATES.has(stateName)
+      ? stateName
+      : input.enabled === false ? 'disabled' : 'enabled',
+  };
+}
+
+function normalizeSkillScanError(input, hostId) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return null;
+  }
+  const message = skillInventoryText(input.message || input.error, 4096);
+  if (!message) {
+    return null;
+  }
+  return {
+    hostId,
+    scope: skillInventoryText(input.scope, 80),
+    scopeId: skillInventoryText(input.scopeId, 8192),
+    rootPath: skillInventoryText(input.rootPath, 8192),
+    path: skillInventoryText(input.path || input.rootPath, 8192),
+    message,
+  };
+}
+
+function normalizeHostSkillInventory(input, expectedHostId, receivedAt = nowIso()) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('skill inventory must be an object');
+  }
+  const hostId = skillInventoryText(input.hostId || expectedHostId, 160);
+  if (!hostId || hostId !== expectedHostId) {
+    throw new Error('skill inventory hostId does not match its cache key');
+  }
+  const revision = skillInventoryText(input.revision, 96).toLowerCase();
+  if (!/^sha256:[a-f0-9]{64}$/.test(revision)) {
+    throw new Error('skill inventory revision must be a sha256 digest');
+  }
+  const scannedAt = skillInventoryText(input.scannedAt, 80);
+  if (!scannedAt || !Number.isFinite(Date.parse(scannedAt))) {
+    throw new Error('skill inventory scannedAt must be a timestamp');
+  }
+  if (!Array.isArray(input.instances)) {
+    throw new Error('skill inventory instances must be an array');
+  }
+  if (!Array.isArray(input.scanErrors)) {
+    throw new Error('skill inventory scanErrors must be an array');
+  }
+  const rawInstances = input.instances;
+  if (rawInstances.length > 100000) {
+    throw new Error('skill inventory contains too many instances');
+  }
+  const normalizedReceivedAt = Number.isFinite(Date.parse(receivedAt)) ? receivedAt : nowIso();
+  const instances = rawInstances.map((instance) => normalizeHostSkillInstance(instance, hostId));
+  const scanErrors = input.scanErrors.map((error) => {
+    const normalized = normalizeSkillScanError(error, hostId);
+    if (!normalized) {
+      throw new Error('skill inventory scanErrors contains an invalid entry');
+    }
+    return normalized;
+  });
+  const rawReferenceInstances = Array.isArray(input.referenceInstances)
+    ? input.referenceInstances
+    : rawInstances;
+  if (rawReferenceInstances.length > 100000) {
+    throw new Error('skill inventory contains too many retained reference instances');
+  }
+  return {
+    hostId,
+    revision,
+    scannedAt,
+    receivedAt: normalizedReceivedAt,
+    instances,
+    referenceInstances: rawReferenceInstances.map((instance) => (
+      normalizeHostSkillInstance(instance, hostId)
+    )),
+    scanErrors,
+    incomplete: input.incomplete === true || scanErrors.length > 0,
+  };
+}
+
+function loadSkillInventories() {
+  const inventories = new Map();
+  let source;
+  try {
+    source = fs.readFileSync(SKILL_INVENTORIES_PATH, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return inventories;
+    }
+    throw new Error(`failed to read persisted Skill inventories: ${error.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(source);
+  } catch (error) {
+    throw new Error(`invalid persisted Skill inventory JSON: ${error.message}`);
+  }
+  if (
+    !parsed
+    || parsed.version !== 1
+    || !parsed.inventories
+    || typeof parsed.inventories !== 'object'
+    || Array.isArray(parsed.inventories)
+  ) {
+    throw new Error('invalid persisted Skill inventory schema or version');
+  }
+  for (const [hostId, rawInventory] of Object.entries(parsed.inventories)) {
+    try {
+      const normalizedHostId = skillInventoryText(hostId, 160);
+      if (!normalizedHostId || rawInventory?.hostId !== normalizedHostId) {
+        throw new Error('inventory hostId does not match its persisted key');
+      }
+      inventories.set(normalizedHostId, normalizeHostSkillInventory(
+        rawInventory,
+        normalizedHostId,
+        rawInventory.receivedAt
+      ));
+    } catch (error) {
+      throw new Error(`invalid persisted Skill inventory for ${hostId}: ${error.message}`);
+    }
+  }
+  return inventories;
+}
+
+function saveSkillInventories(inventories) {
+  fs.mkdirSync(path.dirname(SKILL_INVENTORIES_PATH), { recursive: true });
+  const serialized = {};
+  for (const [hostId, inventory] of inventories.entries()) {
+    serialized[hostId] = inventory;
+  }
+  const tempPath = `${SKILL_INVENTORIES_PATH}.${process.pid}.${makeId()}.tmp`;
+  let fd = null;
+  try {
+    fd = fs.openSync(tempPath, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({
+      version: 1,
+      savedAt: nowIso(),
+      inventories: serialized,
+    }, null, 2), 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tempPath, SKILL_INVENTORIES_PATH);
+  } finally {
+    if (fd != null) {
+      fs.closeSync(fd);
+    }
+    try {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+      }
+    } catch (_) {
+      // The completed target remains valid even if temp cleanup is unavailable.
+    }
+  }
+}
+
 function ensureTrashCollection() {
   const existing = state.sessionCollections.get(TRASH_COLLECTION_ID);
   if (existing) {
@@ -714,6 +1308,13 @@ function loadSessionMetadata() {
 }
 
 function saveSessionMetadata() {
+  if (
+    state.sessionRecordStore
+    || fs.existsSync(path.join(SESSION_RECORD_STORE_ROOT, 'snapshot-current.json'))
+    || fs.existsSync(path.join(SESSION_RECORD_STORE_ROOT, 'wal-current.jsonl'))
+  ) {
+    return;
+  }
   fs.mkdirSync(path.dirname(SESSION_METADATA_PATH), { recursive: true });
   const entries = Array.from(state.sessionMetadata.values())
     .map(normalizeSessionMetadataEntry)
@@ -776,12 +1377,22 @@ function normalizeStoredTranscriptEntry(entry) {
   if (!text && !files.length) {
     return null;
   }
+  const assistantSeq = Number(entry.assistantSeq);
+  const assistantMessageId = String(entry.assistantMessageId || '').trim();
   return {
     timestamp: entry.timestamp || nowIso(),
     speaker,
     text,
     stream: entry.stream || null,
     files,
+    ...(assistantMessageId ? {
+      assistantMessageId,
+      assistantSeq: Number.isSafeInteger(assistantSeq) && assistantSeq >= 0
+        ? assistantSeq
+        : 0,
+      assistantAt: entry.assistantAt || null,
+      notifiable: entry.notifiable === true,
+    } : {}),
   };
 }
 
@@ -1038,20 +1649,26 @@ function normalizeStoredSessionDiagnostic(entry) {
   if (!entry || typeof entry !== 'object') {
     return null;
   }
-  const message = String(entry.message || '').trim();
+  const message = redactSecretText(entry.message || '').trim();
   if (!message) {
     return null;
   }
+  const data = entry.data == null ? null : stripSecrets(entry.data);
+  const detail = entry.detail == null
+    ? null
+    : typeof entry.detail === 'string'
+      ? redactSecretText(entry.detail)
+      : stripSecrets(entry.detail);
   return {
     timestamp: entry.timestamp || nowIso(),
     severity: entry.severity || 'info',
     source: entry.source || 'codex',
     kind: entry.kind || 'event',
-    method: entry.method || null,
+    method: entry.method ? redactSecretText(entry.method) : null,
     message,
-    detail: entry.detail || null,
-    data: entry.data || null,
-    turnId: entry.turnId || entry.data?.turnId || null,
+    detail,
+    data,
+    turnId: entry.turnId || data?.turnId || null,
   };
 }
 
@@ -1076,7 +1693,7 @@ function loadSessionDiagnostics() {
       }
     }
     if (changed) {
-      void writeSessionDiagnosticsSnapshot(persistedDiagnostics);
+      sessionDiagnosticsNeedsNormalization = true;
     }
     return diagnostics;
   } catch {
@@ -1113,6 +1730,8 @@ let sessionLogsSaveTimer = null;
 let sessionDiagnosticsSaveTimer = null;
 let sessionDiagnosticsSaveInFlight = null;
 let sessionDiagnosticsSavePending = false;
+let sessionDiagnosticsSaveError = null;
+let sessionDiagnosticsNeedsNormalization = false;
 
 function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
   if (sessionLogsSaveTimer) {
@@ -1154,7 +1773,12 @@ async function flushSessionDiagnosticsSave() {
   }
   sessionDiagnosticsSavePending = false;
   sessionDiagnosticsSaveInFlight = saveSessionDiagnostics()
+    .then(() => {
+      sessionDiagnosticsSaveError = null;
+      sessionDiagnosticsNeedsNormalization = false;
+    })
     .catch((error) => {
+      sessionDiagnosticsSaveError = error;
       console.warn(`[relay] failed to save session diagnostics: ${error.message}`);
     })
     .finally(() => {
@@ -1172,55 +1796,162 @@ const state = {
   sessionAliases: new Map(),
   commandQueues: new Map(),
   subscribers: new Map(),
+  sessionEventStream: new SessionEventStream({
+    epoch: RELAY_INSTANCE_ID,
+    ringSize: SESSION_EVENT_RING_SIZE,
+  }),
+  activitySnapshots: new ActivitySnapshotStore(),
   dismissedHosts: new Set(),
-  sessionLogs: loadSessionLogs(),
+  sessionLogs: new Map(),
   sessionAlerts: new Map(),
   sessionRuntime: new Map(),
-  sessionDiagnostics: loadSessionDiagnostics(),
+  sessionDiagnostics: new Map(),
   sessionRequests: new Map(),
   pendingDirectoryRequests: new Map(),
   pendingHostProbes: new Map(),
   pendingApiTestRequests: new Map(),
+  pendingApiCatalogRequests: new Map(),
+  pendingBindingPreflightRequests: new Map(),
   pendingModelRequests: new Map(),
   pendingSkillRequests: new Map(),
+  pendingHostSkillRequests: new Map(),
   pendingGoalRequests: new Map(),
+  goalAutoApproveRequests: new Map(),
   pendingSessionDetailRequests: new Map(),
   pendingSessionSearchRequests: new Map(),
   pendingFileRequests: new Map(),
   chunkedUploads: new Map(),
   sessionDiscoveryRequests: new Map(),
+  missingManagedDiscoveryRuns: new Map(),
   inputRequestCache: new Map(),
+  appliedAgentEventBatches: new Map(),
+  pendingAgentEventBatches: new Map(),
   pendingUserTranscriptEchoes: new Map(),
   localAgents: new Map(),
   askpassActions: new Map(),
-  sshMultiplexDisabled: new Map(),
   connectors: new Map(),
-  connectorSecrets: loadConnectorSecrets(),
+  connectorSecrets: new Map(),
   sessionCollections: new Map(),
-  sessionMetadata: loadSessionMetadata(),
-  receivedFiles: loadReceivedFiles(),
+  skillFavorites: new Map(),
+  skillSources: new Map(),
+  skillLibrary: new Map(),
+  skillInventories: new Map(),
+  skillRegistry: null,
+  skillDeployments: null,
+  skillAdoptions: new Map(),
+  skillImports: new Map(),
+  skillRefreshes: new Map(),
+  skillSubscribers: new Set(),
+  skillAudit: null,
+  skillAutomation: null,
+  sessionRecordStore: null,
+  provenance: null,
+  modelCatalog: null,
+  sessionMetadata: new Map(),
+  receivedFiles: new Map(),
   // Agents keep their last command id in memory across relay restarts, so use
   // a monotonic-ish epoch instead of restarting command ids at 1.
   nextCommandId: Date.now(),
 };
 
-for (const connector of loadConnectors()) {
-  state.connectors.set(connector.connectorId, connector);
+function loadPersistedRelayState() {
+  state.sessionLogs = loadSessionLogs();
+  state.sessionDiagnostics = loadSessionDiagnostics();
+  state.connectorSecrets = loadConnectorSecrets(CONNECTOR_SECRETS_PATH);
+  state.skillFavorites = loadSkillFavorites();
+  state.skillSources = loadSkillSources();
+  state.skillLibrary = loadSkillLibrary();
+  state.skillInventories = loadSkillInventories();
+  state.skillRegistry = new SkillRegistryService({
+    registryPath: SKILL_REGISTRY_PATH,
+    artifactRoot: SKILL_ARTIFACT_ROOT,
+    now: nowIso,
+  });
+  state.skillDeployments = new SkillDeploymentService({
+    statePath: SKILL_DEPLOYMENTS_PATH,
+    now: nowIso,
+    historyLimit: SKILL_DEPLOYMENT_HISTORY_LIMIT,
+  });
+  state.sessionMetadata = loadSessionMetadata();
+  state.receivedFiles = loadReceivedFiles();
+
+  state.connectors.clear();
+  for (const connector of loadConnectors(CONNECTORS_PATH)) {
+    state.connectors.set(connector.connectorId, connector);
+  }
+
+  state.sessionCollections.clear();
+  for (const collection of loadSessionCollections()) {
+    state.sessionCollections.set(collection.collectionId, collection);
+  }
+  if (!state.sessionCollections.has(DEFAULT_COLLECTION_ID)) {
+    state.sessionCollections.set(DEFAULT_COLLECTION_ID, normalizeSessionCollection({
+      collectionId: DEFAULT_COLLECTION_ID,
+      name: 'Default',
+      system: true,
+      items: [],
+    }));
+  }
+  ensureTrashCollection();
+  seedSessionMetadataFromCollections();
 }
 
-for (const collection of loadSessionCollections()) {
-  state.sessionCollections.set(collection.collectionId, collection);
+function normalizeCatalogSkill(input = {}, sourceId = '') {
+  const skillId = String(input.skillId || input.id || input.name || '').trim();
+  if (!skillId || skillId.includes('/') || skillId.includes('\\')) {
+    return null;
+  }
+  const name = String(input.name || skillId).trim() || skillId;
+  const description = String(input.description || '').trim();
+  const source = String(input.source || sourceId || 'custom').trim() || 'custom';
+  const markdown = String(input.markdown || input.content || '').trim();
+  return {
+    skillId,
+    name,
+    description,
+    source,
+    sourceId: sourceId || input.sourceId || source,
+    installed: false,
+    readonly: false,
+    trending: Boolean(input.trending),
+    score: Number(input.score || input.trendingScore || 0) || 0,
+    markdown: markdown || [
+      '---',
+      `name: ${skillId}`,
+      `description: ${description}`,
+      '---',
+      '',
+      `# ${name}`,
+      '',
+      description || 'Installed from Remote Codex Skills Manager.',
+      '',
+    ].join('\n'),
+  };
 }
-if (!state.sessionCollections.has(DEFAULT_COLLECTION_ID)) {
-  state.sessionCollections.set(DEFAULT_COLLECTION_ID, normalizeSessionCollection({
-    collectionId: DEFAULT_COLLECTION_ID,
-    name: 'Default',
-    system: true,
-    items: [],
-  }));
-}
-ensureTrashCollection();
-seedSessionMetadataFromCollections();
+
+const BUILTIN_SKILL_CATALOG = [
+  {
+    skillId: 'systematic-debugging',
+    name: 'Systematic Debugging',
+    description: 'A disciplined workflow for investigating bugs before changing code.',
+    source: 'builtin',
+    trending: true,
+  },
+  {
+    skillId: 'test-driven-development',
+    name: 'Test Driven Development',
+    description: 'Write a failing test first, then implement the minimal passing code.',
+    source: 'builtin',
+    trending: true,
+  },
+  {
+    skillId: 'verification-before-completion',
+    name: 'Verification Before Completion',
+    description: 'Run checks and gather evidence before claiming work is done.',
+    source: 'builtin',
+    trending: true,
+  },
+].map((skill) => normalizeCatalogSkill(skill, 'builtin')).filter(Boolean);
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload, null, 2);
@@ -1412,6 +2143,21 @@ function authorizeRequest(req, res, url) {
   return false;
 }
 
+function requestHasLocalRelayControlToken(req) {
+  const remoteAddress = String(req.socket?.remoteAddress || '').toLowerCase();
+  const loopback = remoteAddress === '127.0.0.1'
+    || remoteAddress === '::1'
+    || remoteAddress === '::ffff:127.0.0.1';
+  if (!loopback || !RELAY_CONTROL_TOKEN) {
+    return false;
+  }
+  const token = String(req.headers['x-relay-control-token'] || '').trim();
+  if (!token) {
+    return false;
+  }
+  return constantTimeEqual(token, RELAY_CONTROL_TOKEN);
+}
+
 function hostOnline(host) {
   if (!host) {
     return false;
@@ -1473,9 +2219,9 @@ function normalizeClientRequestId(value) {
   return /^[A-Za-z0-9._:-]+$/.test(text) ? text : '';
 }
 
-function inputRequestCacheKey(hostId, sessionId, clientRequestId) {
+function inputRequestCacheKey(hostId, sessionId, clientRequestId, runId = '') {
   const requestId = normalizeClientRequestId(clientRequestId);
-  return requestId ? `${hostId}::${sessionId}::${requestId}` : '';
+  return requestId ? `${hostId}::${sessionId}::${runId || '-'}::${requestId}` : '';
 }
 
 function pruneInputRequestCache() {
@@ -1545,9 +2291,1716 @@ function getHostList() {
   return Array.from(state.hosts.values()).map((host) => ({
     ...host,
     online: hostOnline(host),
+    localAgentStartEnabled: LOCAL_AGENT_START_ENABLED,
     localAgent: publicLocalAgentRecord(state.localAgents.get(host.hostId)),
     sessionCount: Array.from(state.sessions.values()).filter((session) => session.hostId === host.hostId).length,
   })).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function publicSkillHostRecord(host) {
+  return {
+    hostId: host.hostId,
+    label: host.label || host.hostId,
+    online: hostOnline(host),
+    codexHome: host.codexHome || host.runtime?.codexHome || '',
+    skillsRevision: host.skillsRevision || state.skillInventories.get(host.hostId)?.revision || null,
+    capabilities: host.capabilities || {},
+  };
+}
+
+function buildSkillCatalogFromSources() {
+  const byId = new Map();
+  for (const skill of BUILTIN_SKILL_CATALOG) {
+    byId.set(skill.skillId, skill);
+  }
+  for (const source of state.skillSources.values ? state.skillSources.values() : state.skillSources) {
+    if (!source?.enabled) {
+      continue;
+    }
+    for (const skill of source.skills || []) {
+      const normalized = normalizeCatalogSkill(skill, source.sourceId);
+      if (!normalized) {
+        continue;
+      }
+      byId.set(normalized.skillId, {
+        ...normalized,
+        source: source.name || normalized.source,
+        sourceId: source.sourceId,
+      });
+    }
+  }
+  return Array.from(byId.values())
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || String(a.name).localeCompare(String(b.name)));
+}
+
+function skillRegistrySnapshot() {
+  return state.skillRegistry.snapshot({ includeManifest: false });
+}
+
+function combinedSkillSources(registrySnapshot = skillRegistrySnapshot()) {
+  const byId = new Map();
+  for (const source of state.skillSources.values ? state.skillSources.values() : state.skillSources) {
+    if (source?.sourceId) {
+      byId.set(source.sourceId, { ...source });
+    }
+  }
+  for (const source of registrySnapshot.sources || []) {
+    if (!source?.sourceId) {
+      continue;
+    }
+    byId.set(source.sourceId, {
+      ...(byId.get(source.sourceId) || {}),
+      ...source,
+      url: source.locator || byId.get(source.sourceId)?.url || '',
+      skills: byId.get(source.sourceId)?.skills || [],
+      registry: true,
+    });
+  }
+  return Array.from(byId.values()).sort((left, right) => (
+    String(left.name || left.sourceId).localeCompare(String(right.name || right.sourceId))
+  ));
+}
+
+function combinedSkillLibrary(registrySnapshot = skillRegistrySnapshot()) {
+  const byId = new Map();
+  for (const record of state.skillLibrary || []) {
+    if (record?.skillId) {
+      byId.set(record.skillId, { ...record });
+    }
+  }
+  for (const record of registrySnapshot.library || []) {
+    if (!record?.skillId) {
+      continue;
+    }
+    const existing = byId.get(record.skillId) || {};
+    const latestVersion = (record.versions || []).find((version) => (
+      version.artifactId === record.latestArtifactId
+    )) || record.versions?.[record.versions.length - 1] || null;
+    byId.set(record.skillId, {
+      ...existing,
+      ...record,
+      source: latestVersion?.sourceKind || existing.source || 'registry',
+      sourceUrl: latestVersion?.sourceLocator || existing.sourceUrl || '',
+      installed: false,
+      readonly: false,
+      archived: record.archived === true,
+      retiredAt: record.retiredAt || null,
+      registry: true,
+    });
+  }
+  return Array.from(byId.values()).sort((left, right) => (
+    String(left.name || left.skillId).localeCompare(String(right.name || right.skillId))
+  ));
+}
+
+function compareSkillArtifactReferences(left, right) {
+  return String(left.artifactId || '').localeCompare(String(right.artifactId || ''))
+    || String(left.kind || '').localeCompare(String(right.kind || ''))
+    || String(left.skillId || '').localeCompare(String(right.skillId || ''))
+    || String(left.hostId || '').localeCompare(String(right.hostId || ''))
+    || String(left.scope || '').localeCompare(String(right.scope || ''))
+    || String(left.scopeId || '').localeCompare(String(right.scopeId || ''))
+    || String(left.deploymentId || '').localeCompare(String(right.deploymentId || ''))
+    || String(left.state || '').localeCompare(String(right.state || ''));
+}
+
+function canonicalInventorySkillId(value) {
+  try {
+    return normalizePortableSkillId(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+function collectSkillArtifactReferences(registrySnapshot = skillRegistrySnapshot()) {
+  const artifacts = Array.isArray(registrySnapshot.artifacts) ? registrySnapshot.artifacts : [];
+  const artifactsById = new Map(artifacts.map((artifact) => [artifact.artifactId, artifact]));
+  const references = [];
+  for (const reference of state.skillDeployments.artifactReferences()) {
+    if (reference.artifactId) {
+      references.push({ ...reference });
+      continue;
+    }
+    for (const artifact of artifacts) {
+      const skillIds = Array.isArray(artifact.skillIds)
+        ? artifact.skillIds
+        : [artifact.skillId].filter(Boolean);
+      if (skillIds.includes(reference.skillId)) {
+        references.push({ ...reference, artifactId: artifact.artifactId });
+      }
+    }
+  }
+  for (const inventory of state.skillInventories.values()) {
+    if (inventory?.incomplete) {
+      for (const artifact of artifacts) {
+        if (artifact.storageState === 'collected') {
+          continue;
+        }
+        references.push({
+          kind: 'inventory-uncertain',
+          artifactId: artifact.artifactId,
+          skillId: null,
+          hostId: inventory.hostId,
+          scope: null,
+          scopeId: null,
+          deploymentId: null,
+          state: 'scan-error',
+        });
+      }
+    }
+    const referenceInstances = Array.isArray(inventory?.referenceInstances)
+      ? inventory.referenceInstances
+      : Array.isArray(inventory?.instances) ? inventory.instances : [];
+    for (const instance of referenceInstances) {
+      const desiredArtifactId = String(instance?.desiredArtifactId || '').trim().toLowerCase();
+      const observedHash = String(instance?.observedHash || '').trim().toLowerCase();
+      const artifactIds = Array.from(new Set(
+        (instance?.managed ? [desiredArtifactId, observedHash] : [observedHash])
+          .filter((artifactId) => /^sha256:[a-f0-9]{64}$/.test(artifactId))
+      ));
+      for (const artifactId of artifactIds) {
+        const artifact = artifactsById.get(artifactId);
+        if (!artifact) {
+          continue;
+        }
+        const instanceSkillId = canonicalInventorySkillId(instance.skillId);
+        const skillIds = Array.isArray(artifact.skillIds)
+          ? artifact.skillIds
+          : [artifact.skillId].filter(Boolean);
+        const matchedSkillId = skillIds.find((skillId) => skillId === instanceSkillId) || null;
+        if (!instance.managed && !(artifact.sources || []).some((source) => (
+          source?.sourceId === instance.sourceId
+        ))) {
+          continue;
+        }
+        references.push({
+          kind: 'host-inventory',
+          artifactId,
+          skillId: matchedSkillId,
+          hostId: instance.hostId || inventory.hostId,
+          scope: instance.scope,
+          scopeId: instance.scopeId,
+          deploymentId: null,
+          state: instance.state || (instance.enabled === false ? 'disabled' : 'enabled'),
+        });
+      }
+    }
+  }
+  const deduplicated = new Map();
+  for (const reference of references) {
+    const key = JSON.stringify([
+      reference.artifactId || '',
+      reference.kind || '',
+      reference.skillId || '',
+      reference.hostId || '',
+      reference.scope || '',
+      reference.scopeId || '',
+      reference.deploymentId || '',
+      reference.state || '',
+    ]);
+    deduplicated.set(key, reference);
+  }
+  return Array.from(deduplicated.values()).sort(compareSkillArtifactReferences);
+}
+
+function publicSkillArtifact(record) {
+  if (!record) {
+    return null;
+  }
+  const { archivePath, ...publicRecord } = record;
+  return publicRecord;
+}
+
+function publicSkillAdoption(record) {
+  if (!record) {
+    return null;
+  }
+  const { uploadToken, ...publicRecord } = record;
+  return { ...publicRecord };
+}
+
+function publicSkillImport(record) {
+  return record ? { ...record } : null;
+}
+
+function pruneSkillAdoptions() {
+  const cutoff = Date.now() - SKILL_ADOPTION_RETENTION_MS;
+  for (const [adoptionId, adoption] of state.skillAdoptions.entries()) {
+    const updatedAt = Date.parse(adoption.updatedAt || adoption.createdAt || '');
+    if (
+      adoption.state !== 'queued'
+      && adoption.state !== 'uploading'
+      && Number.isFinite(updatedAt)
+      && updatedAt < cutoff
+    ) {
+      state.skillAdoptions.delete(adoptionId);
+    }
+  }
+  while (state.skillAdoptions.size > SKILL_OPERATION_HISTORY_LIMIT) {
+    const removable = Array.from(state.skillAdoptions.entries()).find(([, adoption]) => (
+      adoption.state !== 'queued' && adoption.state !== 'uploading'
+    ));
+    if (!removable) {
+      break;
+    }
+    state.skillAdoptions.delete(removable[0]);
+  }
+}
+
+function publicSkillAdoptions() {
+  pruneSkillAdoptions();
+  return Array.from(state.skillAdoptions.values())
+    .map(publicSkillAdoption)
+    .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
+}
+
+function pruneSkillImports() {
+  const cutoff = Date.now() - SKILL_ADOPTION_RETENTION_MS;
+  for (const [importId, record] of state.skillImports.entries()) {
+    const updatedAt = Date.parse(record.updatedAt || record.createdAt || '');
+    if (
+      record.state !== 'queued'
+      && record.state !== 'downloading'
+      && record.state !== 'validating'
+      && Number.isFinite(updatedAt)
+      && updatedAt < cutoff
+    ) {
+      state.skillImports.delete(importId);
+    }
+  }
+  while (state.skillImports.size > SKILL_OPERATION_HISTORY_LIMIT) {
+    const removable = Array.from(state.skillImports.entries()).find(([, record]) => (
+      record.state !== 'queued' && record.state !== 'downloading' && record.state !== 'validating'
+    ));
+    if (!removable) {
+      break;
+    }
+    state.skillImports.delete(removable[0]);
+  }
+}
+
+function publicSkillImports() {
+  pruneSkillImports();
+  return Array.from(state.skillImports.values())
+    .map(publicSkillImport)
+    .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
+}
+
+function mergeSkillLibraryWithCatalog(catalog, registrySnapshot = null) {
+  const byId = new Map((catalog || []).map((skill) => [skill.skillId, skill]));
+  for (const record of combinedSkillLibrary(registrySnapshot || skillRegistrySnapshot())) {
+    if (!record?.skillId) {
+      continue;
+    }
+    if (record.archived) {
+      byId.delete(record.skillId);
+      continue;
+    }
+    const existing = byId.get(record.skillId) || {};
+    byId.set(record.skillId, {
+      ...record,
+      ...existing,
+      skillId: record.skillId,
+      name: existing.name || record.name,
+      description: existing.description || record.description,
+      sourceUrl: existing.sourceUrl || record.sourceUrl,
+      source: existing.source || record.source,
+      lastInstalledHostIds: record.lastInstalledHostIds || [],
+      library: true,
+    });
+  }
+  return Array.from(byId.values())
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || String(a.name).localeCompare(String(b.name)));
+}
+
+function dailySkillDigest(catalog) {
+  const today = new Date().toISOString().slice(0, 10);
+  const recommendations = (catalog || [])
+    .filter((skill) => skill.trending || Number(skill.score || 0) > 0)
+    .slice(0, 5)
+    .map((skill) => ({
+      skillId: skill.skillId,
+      name: skill.name,
+      description: skill.description,
+      source: skill.source,
+      score: Number(skill.score || 0) || 0,
+    }));
+  return {
+    date: today,
+    title: recommendations.length ? 'Daily skills picks' : 'No skills picks yet',
+    recommendations,
+  };
+}
+
+async function requestHostSkillsList(hostId) {
+  const host = state.hosts.get(hostId);
+  if (!host || !hostOnline(host)) {
+    return [];
+  }
+  if (!host.capabilities?.hostSkills) {
+    return [];
+  }
+  const requestId = makeId();
+  enqueueCommand(hostId, {
+    type: 'host.skills.list',
+    requestId,
+  });
+  const result = await awaitHostSkillRequest(requestId, 12000);
+  return Array.isArray(result.skills) ? result.skills : [];
+}
+
+async function buildSkillsManagerPayload() {
+  const hosts = getHostList().map(publicSkillHostRecord);
+  const favorites = Array.from(state.skillFavorites);
+  const favoriteSet = new Set(favorites);
+  const registrySnapshot = skillRegistrySnapshot();
+  const catalog = mergeSkillLibraryWithCatalog(buildSkillCatalogFromSources(), registrySnapshot);
+  const decorate = (skill) => ({
+    ...skill,
+    favorite: favoriteSet.has(skill.skillId),
+  });
+  const cachedInstances = [];
+  const inventories = hosts.map((host) => {
+    const cached = state.skillInventories.get(host.hostId) || null;
+    if (cached) {
+      cachedInstances.push(...cached.instances.map((instance) => ({ ...instance })));
+    }
+    const receivedAtMs = cached?.receivedAt ? Date.parse(cached.receivedAt) : Number.NaN;
+    return {
+      hostId: host.hostId,
+      revision: cached?.revision || null,
+      scannedAt: cached?.scannedAt || null,
+      receivedAt: cached?.receivedAt || null,
+      stale: !cached || !Number.isFinite(receivedAtMs) || Date.now() - receivedAtMs > 60000,
+      incomplete: cached?.incomplete === true,
+      refreshing: hasPendingSkillRefresh(host.hostId),
+      scanErrors: cached?.scanErrors || [],
+    };
+  });
+  const hostById = new Map(hosts.map((host) => [host.hostId, host]));
+  const legacyInstalledProjection = cachedInstances
+    .filter((instance) => instance.scope === 'user' && instance.enabled !== false)
+    .map((instance) => {
+      const host = hostById.get(instance.hostId) || {};
+      return decorate({
+        ...instance,
+        installed: true,
+        installPath: instance.activationPath,
+        codexHome: host.codexHome || '',
+        source: instance.sourceKind || instance.sourceId || 'host-inventory',
+      });
+    });
+  return {
+    hosts,
+    inventories,
+    instances: cachedInstances.map(decorate),
+    installed: legacyInstalledProjection,
+    catalog: catalog.map(decorate),
+    favorites,
+    sources: combinedSkillSources(registrySnapshot),
+    skillLibrary: combinedSkillLibrary(registrySnapshot),
+    registryRevision: registrySnapshot.revision,
+    artifacts: (registrySnapshot.artifacts || []).map(publicSkillArtifact),
+    adoptions: publicSkillAdoptions(),
+    imports: publicSkillImports(),
+    deployments: state.skillDeployments.deploymentSummaries(SKILL_DEPLOYMENT_SUMMARY_LIMIT),
+    desiredSkillStates: state.skillDeployments.desiredStates(),
+    appliedSkillStates: state.skillDeployments.appliedStates(),
+    dailySkillDigest: dailySkillDigest(catalog),
+  };
+}
+
+function hasPendingSkillRefresh(hostId) {
+  const pending = state.skillRefreshes.get(hostId);
+  if (!pending) {
+    return false;
+  }
+  if (Date.now() - pending.queuedAtMs > 60000) {
+    state.skillRefreshes.delete(hostId);
+    return false;
+  }
+  return true;
+}
+
+function knownSkillWorkspaceRoots(hostId) {
+  const roots = [];
+  const seen = new Set();
+  for (const session of state.sessions.values()) {
+    if (session?.hostId !== hostId) {
+      continue;
+    }
+    const cwd = String(session.cwd || '').trim();
+    if (!cwd || seen.has(cwd)) {
+      continue;
+    }
+    seen.add(cwd);
+    roots.push(cwd);
+  }
+  return roots.sort();
+}
+
+function skillArtifactSupportsSkill(artifact, skillId) {
+  const supported = new Set([
+    artifact?.skillId,
+    ...(Array.isArray(artifact?.skillIds) ? artifact.skillIds : []),
+  ].map((value) => String(value || '').trim()).filter(Boolean));
+  return supported.has(String(skillId || '').trim());
+}
+
+function queuedSkillDeploymentCommand(hostId, deploymentId) {
+  return (state.commandQueues.get(hostId) || []).find((command) => (
+    command?.type === 'host.skills.deployment.apply'
+    && command.deploymentId === deploymentId
+  )) || null;
+}
+
+function acknowledgeQueuedSkillDeploymentCommand(hostId, deploymentId) {
+  const queue = state.commandQueues.get(hostId) || [];
+  const next = queue.filter((command) => !(
+    command?.type === 'host.skills.deployment.apply'
+    && command.deploymentId === deploymentId
+  ));
+  state.commandQueues.set(hostId, next);
+  return Math.max(0, queue.length - next.length);
+}
+
+function broadcastSkillDeploymentUpdated(deploymentId, hostId, result, extra = {}) {
+  const deployment = state.skillDeployments.getDeployment(deploymentId);
+  if (!deployment && !result) {
+    return;
+  }
+  const { includeDeployment = false, ...eventExtra } = extra;
+  broadcastSkillsEvent('skills.deployment.updated', {
+    deploymentId,
+    hostId,
+    result: result || deployment?.results?.find((item) => item.hostId === hostId) || null,
+    ...(includeDeployment && deployment ? { deployment } : {}),
+    ...eventExtra,
+  });
+}
+
+function queueSkillDeploymentForHost(deploymentId, hostId, options = {}) {
+  const deployment = state.skillDeployments.getDeployment(deploymentId);
+  const result = deployment?.results?.find((item) => item.hostId === hostId) || null;
+  if (!deployment || !result) {
+    throw skillApiError(404, 'Skill deployment result was not found');
+  }
+  if (result.state !== 'pending' && result.state !== 'queued') {
+    return result;
+  }
+  const host = state.hosts.get(hostId);
+  if (!host || !hostOnline(host) || !host.capabilities?.hostSkillDeploymentV1) {
+    return result;
+  }
+  if (queuedSkillDeploymentCommand(hostId, deploymentId)) {
+    return result;
+  }
+
+  const queued = state.skillDeployments.markQueued(deploymentId, hostId);
+  if (queued.state !== 'queued') {
+    return queued;
+  }
+  enqueueCommand(hostId, {
+    type: 'host.skills.deployment.apply',
+    requestId: makeId(),
+    deploymentId,
+    action: deployment.action,
+    skillId: deployment.skillId,
+    artifactId: deployment.artifactId,
+    expectedHash: deployment.artifactId,
+    downloadPath: `/api/agent/skills/artifacts/${encodeURIComponent(deployment.artifactId)}`,
+    targetScope: deployment.targetScope,
+    scopeId: deployment.scopeId,
+    cwd: deployment.cwd,
+    confirmProjectWrite: deployment.confirmProjectWrite,
+  });
+  if (options.broadcast !== false) {
+    broadcastSkillDeploymentUpdated(deploymentId, hostId, queued);
+  }
+  return queued;
+}
+
+function queueSkillDeploymentTargets(deploymentId, options = {}) {
+  const deployment = state.skillDeployments.getDeployment(deploymentId);
+  if (!deployment) {
+    throw skillApiError(404, 'Skill deployment was not found');
+  }
+  const queueableHostIds = [];
+  for (const hostId of deployment.targetHostIds) {
+    const result = deployment.results.find((item) => item.hostId === hostId) || null;
+    const host = state.hosts.get(hostId);
+    if (
+      result
+      && (result.state === 'pending' || result.state === 'queued')
+      && host
+      && hostOnline(host)
+      && host.capabilities?.hostSkillDeploymentV1
+      && !queuedSkillDeploymentCommand(hostId, deploymentId)
+    ) {
+      queueableHostIds.push(hostId);
+    }
+  }
+  const queuedResults = queueableHostIds.length
+    ? state.skillDeployments.markQueuedMany(deploymentId, queueableHostIds)
+    : [];
+  for (const queued of queuedResults) {
+    if (queued.state !== 'queued') {
+      continue;
+    }
+    enqueueCommand(queued.hostId, {
+      type: 'host.skills.deployment.apply',
+      requestId: makeId(),
+      deploymentId,
+      action: deployment.action,
+      skillId: deployment.skillId,
+      artifactId: deployment.artifactId,
+      expectedHash: deployment.artifactId,
+      downloadPath: `/api/agent/skills/artifacts/${encodeURIComponent(deployment.artifactId)}`,
+      targetScope: deployment.targetScope,
+      scopeId: deployment.scopeId,
+      cwd: deployment.cwd,
+      confirmProjectWrite: deployment.confirmProjectWrite,
+    });
+    if (options.broadcast !== false) {
+      broadcastSkillDeploymentUpdated(deploymentId, queued.hostId, queued);
+    }
+  }
+  return state.skillDeployments.getDeployment(deploymentId);
+}
+
+function reconcileSkillDeploymentsForHost(hostId, options = {}) {
+  const host = state.hosts.get(hostId);
+  if (!host || !hostOnline(host) || !host.capabilities?.hostSkillDeploymentV1) {
+    return;
+  }
+  const pendingDeployments = state.skillDeployments.pendingForHost(hostId, {
+    includeRunning: options.includeRunning === true,
+  })
+    .filter((pending) => !queuedSkillDeploymentCommand(hostId, pending.deploymentId));
+  if (!pendingDeployments.length) {
+    return;
+  }
+  const queuedEntries = state.skillDeployments.markQueuedBatch(
+    pendingDeployments.map((pending) => ({ deploymentId: pending.deploymentId, hostId }))
+  );
+  for (const entry of queuedEntries) {
+    if (entry.result.state !== 'queued') {
+      continue;
+    }
+    const deployment = state.skillDeployments.getDeployment(entry.deploymentId);
+    if (!deployment) {
+      continue;
+    }
+    enqueueCommand(hostId, {
+      type: 'host.skills.deployment.apply',
+      requestId: makeId(),
+      deploymentId: deployment.deploymentId,
+      action: deployment.action,
+      skillId: deployment.skillId,
+      artifactId: deployment.artifactId,
+      expectedHash: deployment.artifactId,
+      downloadPath: `/api/agent/skills/artifacts/${encodeURIComponent(deployment.artifactId)}`,
+      targetScope: deployment.targetScope,
+      scopeId: deployment.scopeId,
+      cwd: deployment.cwd,
+      confirmProjectWrite: deployment.confirmProjectWrite,
+    });
+    broadcastSkillDeploymentUpdated(deployment.deploymentId, hostId, entry.result);
+  }
+}
+
+function markDeliveredSkillDeploymentCommands(hostId, commands) {
+  const targets = [];
+  for (const command of Array.isArray(commands) ? commands : []) {
+    if (command?.type !== 'host.skills.deployment.apply' || !command.deploymentId) {
+      continue;
+    }
+    const deployment = state.skillDeployments.getDeployment(command.deploymentId);
+    const result = deployment?.results?.find((entry) => entry.hostId === hostId);
+    if (result?.state === 'queued') {
+      targets.push({ deploymentId: command.deploymentId, hostId });
+    }
+  }
+  if (!targets.length) {
+    return;
+  }
+  const runningEntries = state.skillDeployments.markRunningBatch(targets);
+  for (const entry of runningEntries) {
+    if (entry.result.state === 'running') {
+      broadcastSkillDeploymentUpdated(entry.deploymentId, entry.hostId, entry.result, {
+        reason: 'running',
+      });
+    }
+  }
+}
+
+function retiredSkillCleanupIsAuthorized(input, artifact) {
+  const skillId = String(input?.skillId || '').trim().toLowerCase();
+  const targetScope = String(input?.targetScope || 'user').trim().toLowerCase();
+  const scopeId = targetScope === 'project'
+    ? String(input?.scopeId || input?.cwd || '').trim()
+    : 'user';
+  const targetHostIds = Array.from(new Set(
+    (Array.isArray(input?.targetHostIds) ? input.targetHostIds : [])
+      .map((hostId) => String(hostId || '').trim())
+      .filter(Boolean)
+  ));
+  if (!targetHostIds.length) {
+    return false;
+  }
+  const references = collectSkillArtifactReferences().filter((reference) => (
+    reference.artifactId === artifact.artifactId
+    && reference.skillId === skillId
+    && reference.scope === targetScope
+    && reference.scopeId === scopeId
+    && (
+      reference.kind === 'desired'
+      || reference.kind === 'applied'
+      || reference.kind === 'applied-uncertain'
+    )
+  ));
+  return targetHostIds.every((hostId) => references.some((reference) => (
+    reference.hostId === hostId
+  )));
+}
+
+function submitSkillDeploymentRequest(input) {
+  let created;
+  try {
+    created = state.skillDeployments.createDeployment({
+      ...input,
+      createdBy: input.createdBy || 'relay-api',
+    });
+  } catch (error) {
+    throw skillApiError(error.statusCode || 400, error.message);
+  }
+  for (const superseded of created.superseded || []) {
+    acknowledgeQueuedSkillDeploymentCommand(superseded.hostId, superseded.deploymentId);
+    broadcastSkillDeploymentUpdated(
+      superseded.deploymentId,
+      superseded.hostId,
+      superseded.result,
+      { reason: 'superseded' }
+    );
+  }
+  const deployment = queueSkillDeploymentTargets(created.deployment.deploymentId, { broadcast: false });
+  if (!created.reused) {
+    broadcastSkillDeploymentUpdated(deployment.deploymentId, null, null, {
+      reason: 'created',
+      includeDeployment: true,
+    });
+  }
+  recordSkillAudit('skills.deployment.accepted', {
+    deploymentId: deployment.deploymentId,
+    requestId: deployment.requestId,
+    skillId: deployment.skillId,
+    artifactId: deployment.artifactId,
+    action: deployment.action,
+    targetHostIds: deployment.targetHostIds,
+    targetScope: deployment.targetScope,
+    scopeId: deployment.scopeId,
+    reused: created.reused,
+  }, {
+    actor: input.createdBy || 'relay-api',
+    subject: deployment.skillId,
+  });
+  return {
+    reused: created.reused,
+    deployment,
+  };
+}
+
+function createSkillDeployment(input) {
+  if (state.skillDeployments.hasRequestId(input?.requestId)) {
+    return submitSkillDeploymentRequest(input);
+  }
+  let artifact;
+  try {
+    artifact = state.skillRegistry.getArtifact(input?.artifactId);
+  } catch (error) {
+    throw skillApiError(400, error.message);
+  }
+  if (
+    !artifact
+    || artifact.trustState !== 'validated'
+    || artifact.storageState !== 'available'
+  ) {
+    throw skillApiError(404, 'Validated Skill Artifact was not found');
+  }
+  if (!skillArtifactSupportsSkill(artifact, input?.skillId)) {
+    throw skillApiError(409, 'Skill Artifact does not belong to the requested skillId');
+  }
+  const action = String(input?.action || '').trim().toLowerCase();
+  const activeLibraryArtifact = state.skillRegistry.isActiveLibraryArtifact(
+    input?.skillId,
+    artifact.artifactId
+  );
+  if (action === 'enable' && !activeLibraryArtifact) {
+    throw skillApiError(409, 'Retired Library Skills cannot be enabled');
+  }
+  if (
+    (action === 'disable' || action === 'remove')
+    && !activeLibraryArtifact
+    && (
+      !state.skillRegistry.libraryHasArtifact(input?.skillId, artifact.artifactId)
+      || !retiredSkillCleanupIsAuthorized(input, artifact)
+    )
+  ) {
+    throw skillApiError(409, 'Retired Library Skill cleanup requires an existing Host reference');
+  }
+  if (String(input?.targetScope || 'user').trim().toLowerCase() === 'project') {
+    const cwd = String(input?.cwd || input?.scopeId || '').trim();
+    if (input?.confirmProjectWrite !== true) {
+      throw skillApiError(400, 'project deployment requires confirmProjectWrite confirmation');
+    }
+    const targetHostIds = Array.isArray(input?.targetHostIds) ? input.targetHostIds : [];
+    for (const hostId of targetHostIds) {
+      if (!knownSkillWorkspaceRoots(String(hostId || '').trim()).includes(cwd)) {
+        throw skillApiError(409, `project cwd is not an exact known workspace for Host ${hostId}`);
+      }
+    }
+  }
+
+  return submitSkillDeploymentRequest(input);
+}
+
+function validateHostSkillDeploymentResult(event, deployment) {
+  const expected = {
+    skillId: deployment.skillId,
+    artifactId: deployment.artifactId,
+    action: deployment.action,
+    targetScope: deployment.targetScope,
+    scopeId: deployment.scopeId,
+  };
+  for (const [name, value] of Object.entries(expected)) {
+    if (String(event[name] == null ? '' : event[name]).trim() !== String(value)) {
+      throw new Error(`Skill deployment result ${name} does not match its deployment`);
+    }
+  }
+  if (typeof event.ok !== 'boolean') {
+    throw new Error('Skill deployment result ok must be a boolean');
+  }
+  if (event.ok) {
+    const expectedHostState = {
+      enable: 'enabled',
+      disable: 'disabled',
+      remove: 'missing',
+    }[deployment.action];
+    if (String(event.state || '').trim() !== expectedHostState) {
+      throw new Error(`Skill deployment result state must be ${expectedHostState}`);
+    }
+    if (
+      deployment.action === 'enable'
+      && String(event.observedHash || '').trim() !== deployment.artifactId
+    ) {
+      throw new Error('Skill deployment result observedHash does not match its Artifact');
+    }
+  }
+}
+
+function applyHostSkillDeploymentResult(event) {
+  const deploymentId = String(event.deploymentId || '').trim();
+  const hostId = String(event.hostId || '').trim();
+  const host = state.hosts.get(hostId);
+  if (!hostId || !host || !host.capabilities?.hostSkillDeploymentV1) {
+    throw new Error('Skill deployment result Host is not registered for deployment');
+  }
+  const deployment = state.skillDeployments.getDeployment(deploymentId);
+  if (!deployment) {
+    const tombstone = state.skillDeployments.getPrunedDeployment(deploymentId, hostId);
+    if (!tombstone) {
+      throw new Error('Skill deployment result was not found');
+    }
+    validateHostSkillDeploymentResult(event, tombstone);
+    const recordedState = tombstone.resultStates?.[hostId];
+    const replayedState = event.ok === false ? 'failed' : 'succeeded';
+    if (recordedState !== 'superseded' && recordedState !== replayedState) {
+      throw new Error(`Skill deployment result conflicts with pruned terminal ${recordedState || 'unknown'} state`);
+    }
+    acknowledgeQueuedSkillDeploymentCommand(hostId, deploymentId);
+    return {
+      deploymentId,
+      hostId,
+      state: 'ignored',
+      pruned: true,
+    };
+  }
+  const previousResult = deployment.results.find((result) => result.hostId === hostId);
+  if (!previousResult) {
+    throw new Error('Skill deployment result was not found');
+  }
+  validateHostSkillDeploymentResult(event, deployment);
+  const result = state.skillDeployments.applyResult(event);
+  acknowledgeQueuedSkillDeploymentCommand(hostId, deploymentId);
+  const newlySucceeded = previousResult.state !== 'succeeded' && result.state === 'succeeded';
+  const newlyFailedCleanup = previousResult.state !== 'failed'
+    && result.state === 'failed'
+    && (deployment.action === 'disable' || deployment.action === 'remove');
+  let refresh = null;
+  if (newlySucceeded || newlyFailedCleanup) {
+    refresh = queueSkillInventoryRefreshes([hostId]);
+  }
+  broadcastSkillDeploymentUpdated(deploymentId, hostId, result, {
+    invalidateHostId: newlySucceeded ? hostId : null,
+    refresh,
+  });
+  recordSkillAudit('skills.deployment.host_result', {
+    deploymentId,
+    hostId,
+    skillId: deployment.skillId,
+    artifactId: deployment.artifactId,
+    action: deployment.action,
+    state: result.state,
+    error: result.error || '',
+    observedHash: result.observedHash || null,
+  }, { actor: `host:${hostId}`, subject: deployment.skillId });
+  return result;
+}
+
+async function streamSkillArtifactDownload(req, res, artifactId) {
+  const hostId = String(req.headers['x-remote-codex-host-id'] || '').trim();
+  const host = state.hosts.get(hostId);
+  if (!hostId || !host) {
+    throw skillApiError(403, 'registered Host identity is required for Skill Artifact download');
+  }
+  if (!host.capabilities?.hostSkillDeploymentV1) {
+    throw skillApiError(409, 'Host does not support Skill deployment');
+  }
+  let artifact;
+  try {
+    artifact = state.skillRegistry.getArtifact(artifactId);
+  } catch (error) {
+    throw skillApiError(400, error.message);
+  }
+  if (
+    !artifact
+    || artifact.trustState !== 'validated'
+    || artifact.storageState !== 'available'
+  ) {
+    throw skillApiError(404, 'Validated Skill Artifact was not found');
+  }
+  const authorized = state.skillDeployments.pendingForHost(hostId).some((deployment) => (
+    deployment.artifactId === artifact.artifactId
+    && deployment.action === 'enable'
+  ));
+  if (!authorized) {
+    throw skillApiError(403, 'Host has no pending deployment for this Skill Artifact');
+  }
+  const expectedPath = path.resolve(state.skillRegistry.artifactPath(artifact.artifactId));
+  if (path.resolve(artifact.archivePath) !== expectedPath) {
+    throw skillApiError(500, 'Skill Artifact registry path is invalid');
+  }
+  let stats;
+  try {
+    stats = await fs.promises.stat(expectedPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      throw skillApiError(404, 'Skill Artifact archive is missing');
+    }
+    throw error;
+  }
+  if (!stats.isFile() || stats.size <= 0 || stats.size !== Number(artifact.archiveBytes)) {
+    throw skillApiError(500, 'Skill Artifact archive size does not match the Registry');
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.remote-codex.skill-artifact',
+    'Content-Length': stats.size,
+    'Content-Disposition': `attachment; filename="${artifact.artifactId.slice(7)}.rcskill"`,
+    'Cache-Control': 'private, max-age=31536000, immutable',
+    'X-Remote-Codex-Artifact-Id': artifact.artifactId,
+    'Access-Control-Allow-Origin': '*',
+  });
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(expectedPath);
+    stream.on('error', reject);
+    stream.on('end', resolve);
+    req.on('aborted', () => stream.destroy());
+    stream.pipe(res);
+  });
+}
+
+function queueSkillInventoryRefreshes(requestedHostIds) {
+  const refreshId = makeId();
+  const requested = Array.isArray(requestedHostIds)
+    ? requestedHostIds.map((hostId) => String(hostId || '').trim()).filter(Boolean)
+    : [];
+  const hostIds = Array.from(new Set(requested.length
+    ? requested
+    : getHostList().map((host) => host.hostId)));
+  const hosts = [];
+  for (const hostId of hostIds) {
+    const host = state.hosts.get(hostId);
+    if (!host || !hostOnline(host)) {
+      hosts.push({
+        hostId,
+        state: 'offline',
+        error: host ? `host ${host.label || hostId} is offline` : 'host not found',
+      });
+      continue;
+    }
+    if (!host.capabilities?.hostSkillInventoryV2) {
+      hosts.push({
+        hostId,
+        state: 'unsupported',
+        error: 'host agent does not support skill inventory v2',
+      });
+      continue;
+    }
+    if (hasPendingSkillRefresh(hostId)) {
+      const pending = state.skillRefreshes.get(hostId);
+      hosts.push({
+        hostId,
+        state: 'queued',
+        error: '',
+        reused: true,
+        refreshId: pending.refreshId,
+        requestId: pending.requestId,
+      });
+      continue;
+    }
+    const requestId = makeId();
+    const workspaceRoots = knownSkillWorkspaceRoots(hostId);
+    enqueueCommand(hostId, {
+      type: 'host.skills.inventory.refresh',
+      requestId,
+      refreshId,
+      workspaceRoots,
+    });
+    state.skillRefreshes.set(hostId, {
+      hostId,
+      refreshId,
+      requestId,
+      queuedAt: nowIso(),
+      queuedAtMs: Date.now(),
+    });
+    hosts.push({ hostId, state: 'queued', error: '' });
+  }
+  return { ok: true, refreshId, hosts };
+}
+
+function writeSkillsEvent(res, eventName, payload) {
+  res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+function broadcastSkillsEvent(eventName, payload) {
+  for (const res of Array.from(state.skillSubscribers)) {
+    if (!res || res.destroyed || res.writableEnded) {
+      state.skillSubscribers.delete(res);
+      continue;
+    }
+    try {
+      writeSkillsEvent(res, eventName, payload);
+    } catch (_) {
+      state.skillSubscribers.delete(res);
+    }
+  }
+}
+
+function broadcastSkillsInventoryUpdated(payload) {
+  broadcastSkillsEvent('skills.inventory.updated', payload);
+}
+
+function broadcastSkillsLibraryUpdated(payload) {
+  broadcastSkillsEvent('skills.library.updated', payload);
+}
+
+function recordSkillAudit(type, data = {}, options = {}) {
+  if (!state.skillAudit) {
+    return null;
+  }
+  return state.skillAudit.append(type, data, options);
+}
+
+function applyHostSkillInventoryEvent(event) {
+  const hostId = skillInventoryText(event.hostId, 160);
+  if (!hostId || !state.hosts.has(hostId)) {
+    throw new Error('skill inventory event host is not registered');
+  }
+  const receivedAt = nowIso();
+  const previousInventory = state.skillInventories.get(hostId) || null;
+  const inventory = normalizeHostSkillInventory(event, hostId, receivedAt);
+  if (
+    previousInventory
+    && Date.parse(inventory.scannedAt) <= Date.parse(previousInventory.scannedAt)
+  ) {
+    const ignoredPayload = {
+      hostId,
+      revision: previousInventory.revision,
+      scannedAt: previousInventory.scannedAt,
+      receivedAt: previousInventory.receivedAt,
+      instanceCount: previousInventory.instances.length,
+      scanErrors: previousInventory.scanErrors,
+      incomplete: previousInventory.incomplete,
+      ignored: true,
+      reason: 'stale-inventory',
+    };
+    broadcastSkillsInventoryUpdated(ignoredPayload);
+    return ignoredPayload;
+  }
+  if (inventory.incomplete) {
+    const retained = new Map();
+    for (const instance of [
+      ...(previousInventory?.referenceInstances || previousInventory?.instances || []),
+      ...inventory.referenceInstances,
+    ]) {
+      const key = JSON.stringify([
+        instance.instanceId,
+        instance.observedHash,
+        instance.desiredArtifactId,
+        instance.activationPath,
+      ]);
+      retained.set(key, instance);
+    }
+    inventory.referenceInstances = Array.from(retained.values());
+  }
+  const nextInventories = new Map(state.skillInventories);
+  nextInventories.set(hostId, inventory);
+  const pendingRefresh = state.skillRefreshes.get(hostId);
+  if (!pendingRefresh || !event.requestId || pendingRefresh.requestId === event.requestId) {
+    state.skillRefreshes.delete(hostId);
+  }
+  const host = state.hosts.get(hostId);
+  host.skillsRevision = inventory.revision;
+  host.lastSeenAt = receivedAt;
+  state.hosts.set(hostId, host);
+  saveSkillInventories(nextInventories);
+  state.skillInventories = nextInventories;
+  const payload = {
+    hostId,
+    revision: inventory.revision,
+    scannedAt: inventory.scannedAt,
+    receivedAt: inventory.receivedAt,
+    instanceCount: inventory.instances.length,
+    scanErrors: inventory.scanErrors,
+    incomplete: inventory.incomplete,
+  };
+  broadcastSkillsInventoryUpdated(payload);
+  return payload;
+}
+
+function skillApiError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function findCachedSkillInstance(hostId, instanceId) {
+  const inventory = state.skillInventories.get(hostId) || null;
+  if (!inventory) {
+    throw skillApiError(409, 'Host has no authoritative Skill inventory yet');
+  }
+  const matches = inventory.instances.filter((instance) => instance.instanceId === instanceId);
+  if (!matches.length) {
+    throw skillApiError(404, 'Skill instance was not found in the cached Host inventory');
+  }
+  if (matches.length !== 1) {
+    throw skillApiError(409, 'Skill instanceId is ambiguous in the cached Host inventory');
+  }
+  return matches[0];
+}
+
+function updateSkillAdoption(adoptionId, patch) {
+  const existing = state.skillAdoptions.get(adoptionId);
+  if (!existing) {
+    return null;
+  }
+  const next = {
+    ...existing,
+    ...patch,
+    updatedAt: nowIso(),
+  };
+  state.skillAdoptions.set(adoptionId, next);
+  return next;
+}
+
+function queueSkillAdoption(input = {}) {
+  pruneSkillAdoptions();
+  const hostId = skillInventoryText(input.hostId, 160);
+  const instanceId = skillInventoryText(input.instanceId, 8192);
+  if (!hostId || !instanceId) {
+    throw skillApiError(400, 'hostId and instanceId are required');
+  }
+  const host = state.hosts.get(hostId);
+  if (!host) {
+    throw skillApiError(404, 'Host was not found');
+  }
+  if (!hostOnline(host)) {
+    throw skillApiError(409, 'Host is offline');
+  }
+  if (!host.capabilities?.hostSkillArtifactsV1) {
+    throw skillApiError(409, 'Host agent does not support complete Skill artifacts');
+  }
+  const instance = findCachedSkillInstance(hostId, instanceId);
+  const scope = String(instance.scope || '').trim().toLowerCase();
+  if (instance.readonly || scope === 'plugin' || scope === 'system') {
+    throw skillApiError(409, `${scope || 'readonly'} owned Skill instances cannot be adopted`);
+  }
+  if (!/^sha256:[a-f0-9]{64}$/.test(String(instance.observedHash || '').toLowerCase())) {
+    throw skillApiError(409, 'Skill instance has no trusted observed hash');
+  }
+  const existing = Array.from(state.skillAdoptions.values()).find((adoption) => (
+    adoption.hostId === hostId
+    && adoption.instanceId === instanceId
+    && adoption.expectedHash === instance.observedHash
+    && (adoption.state === 'queued' || adoption.state === 'uploading')
+  ));
+  if (existing) {
+    return { adoption: existing, reused: true };
+  }
+  const activeAdoptions = Array.from(state.skillAdoptions.values()).filter((adoption) => (
+    adoption.state === 'queued' || adoption.state === 'uploading'
+  )).length;
+  if (activeAdoptions >= SKILL_MAX_ACTIVE_ADOPTIONS) {
+    throw skillApiError(429, 'Too many Skill adoptions are already in progress');
+  }
+
+  const adoptionId = makeId();
+  const uploadToken = crypto.randomBytes(32).toString('base64url');
+  const timestamp = nowIso();
+  const adoption = {
+    adoptionId,
+    hostId,
+    instanceId,
+    skillId: instance.skillId,
+    name: instance.name || instance.skillId,
+    description: instance.description || '',
+    sourceId: instance.sourceId,
+    sourceKind: instance.sourceKind || 'local-host',
+    sourceLocator: instance.sourceLocator || instance.activationPath,
+    sourceRef: instance.sourceRef || null,
+    sourcePath: instance.sourcePath || null,
+    scope: instance.scope,
+    scopeId: instance.scopeId,
+    expectedHash: instance.observedHash,
+    state: 'queued',
+    artifactId: null,
+    error: '',
+    uploadToken,
+    uploadPath: `/api/agent/skills/adoptions/${encodeURIComponent(adoptionId)}/artifact`,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  state.skillAdoptions.set(adoptionId, adoption);
+  enqueueCommand(hostId, {
+    type: 'host.skills.artifact.export',
+    adoptionId,
+    instanceId,
+    expectedHash: adoption.expectedHash,
+    uploadPath: adoption.uploadPath,
+    uploadToken,
+  });
+  return { adoption, reused: false };
+}
+
+async function streamSkillArtifactUpload(req, targetPath, expectedBytes) {
+  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+  const output = await fs.promises.open(targetPath, 'wx');
+  let totalBytes = 0;
+  try {
+    for await (const chunk of req) {
+      totalBytes += chunk.length;
+      if (totalBytes > SKILL_ARTIFACT_MAX_UPLOAD_BYTES || totalBytes > expectedBytes) {
+        throw skillApiError(413, 'Skill artifact upload exceeds the declared or configured size limit');
+      }
+      let offset = 0;
+      while (offset < chunk.length) {
+        const { bytesWritten } = await output.write(chunk, offset, chunk.length - offset, null);
+        if (!bytesWritten) {
+          throw new Error('Unable to write complete Skill artifact upload');
+        }
+        offset += bytesWritten;
+      }
+    }
+    if (totalBytes !== expectedBytes) {
+      throw skillApiError(400, `Skill artifact upload length mismatch: expected ${expectedBytes}, received ${totalBytes}`);
+    }
+    await output.sync();
+  } finally {
+    await output.close();
+  }
+  return totalBytes;
+}
+
+async function handleSkillArtifactUpload(req, adoptionId) {
+  const adoption = state.skillAdoptions.get(adoptionId);
+  if (!adoption) {
+    throw skillApiError(404, 'Skill adoption was not found or has expired');
+  }
+  if (adoption.state !== 'queued') {
+    throw skillApiError(409, `Skill adoption is already ${adoption.state}`);
+  }
+  const uploadToken = String(req.headers['x-remote-codex-upload-token'] || '').trim();
+  const hostId = skillInventoryText(req.headers['x-remote-codex-host-id'], 160);
+  const instanceDigest = String(req.headers['x-remote-codex-instance-digest'] || '').trim().toLowerCase();
+  const expectedInstanceDigest = crypto.createHash('sha256').update(adoption.instanceId).digest('hex');
+  if (!constantTimeEqual(uploadToken, adoption.uploadToken)) {
+    throw skillApiError(403, 'Invalid or expired Skill artifact upload token');
+  }
+  if (
+    hostId !== adoption.hostId
+    || !/^[a-f0-9]{64}$/.test(instanceDigest)
+    || !constantTimeEqual(instanceDigest, expectedInstanceDigest)
+  ) {
+    throw skillApiError(403, 'Skill artifact upload does not match its Host adoption request');
+  }
+  const contentType = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (contentType !== 'application/vnd.remote-codex.skill-artifact') {
+    throw skillApiError(415, 'Skill artifact upload requires the Remote Codex artifact content type');
+  }
+  const contentLength = Number(req.headers['content-length']);
+  if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+    throw skillApiError(411, 'Skill artifact upload requires a positive Content-Length');
+  }
+  if (contentLength > SKILL_ARTIFACT_MAX_UPLOAD_BYTES) {
+    throw skillApiError(413, 'Skill artifact upload exceeds the configured size limit');
+  }
+
+  updateSkillAdoption(adoptionId, { state: 'uploading', error: '' });
+  const incomingRoot = path.join(SKILL_ARTIFACT_ROOT, '.incoming');
+  const tempPath = path.join(incomingRoot, `${adoptionId}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  try {
+    await streamSkillArtifactUpload(req, tempPath, contentLength);
+    const imported = await state.skillRegistry.importArchive(tempPath, {
+      skillId: adoption.skillId,
+      name: adoption.name,
+      description: adoption.description,
+      sourceId: adoption.sourceId,
+      sourceKind: adoption.sourceKind,
+      sourceLocator: adoption.sourceLocator,
+      sourceRef: adoption.sourceRef,
+      sourcePath: adoption.sourcePath,
+      expectedHash: adoption.expectedHash,
+    });
+    const completed = updateSkillAdoption(adoptionId, {
+      state: 'completed',
+      artifactId: imported.artifact.artifactId,
+      error: '',
+      completedAt: nowIso(),
+    });
+    broadcastSkillsLibraryUpdated({
+      adoptionId,
+      hostId: adoption.hostId,
+      instanceId: adoption.instanceId,
+      skillId: adoption.skillId,
+      artifactId: imported.artifact.artifactId,
+      state: 'completed',
+      deduplicated: imported.deduplicated,
+      updatedAt: completed.updatedAt,
+    });
+    return imported;
+  } catch (error) {
+    const failed = updateSkillAdoption(adoptionId, {
+      state: 'failed',
+      error: error.message,
+      failedAt: nowIso(),
+    });
+    broadcastSkillsLibraryUpdated({
+      adoptionId,
+      hostId: adoption.hostId,
+      instanceId: adoption.instanceId,
+      skillId: adoption.skillId,
+      state: 'failed',
+      error: error.message,
+      updatedAt: failed.updatedAt,
+    });
+    throw error;
+  } finally {
+    await fs.promises.unlink(tempPath).catch((error) => {
+      if (error.code !== 'ENOENT') {
+        console.warn(`[relay] failed to clean Skill artifact upload ${tempPath}: ${error.message}`);
+      }
+    });
+  }
+}
+
+function applyHostSkillArtifactResult(event) {
+  const adoptionId = skillInventoryText(event.adoptionId, 240);
+  const adoption = state.skillAdoptions.get(adoptionId);
+  if (
+    !adoption
+    || adoption.hostId !== event.hostId
+    || adoption.instanceId !== skillInventoryText(event.instanceId, 8192)
+  ) {
+    return;
+  }
+  if (event.ok !== false || adoption.state === 'completed') {
+    return;
+  }
+  const failed = updateSkillAdoption(adoptionId, {
+    state: 'failed',
+    error: skillInventoryText(event.error, 4096) || 'Host failed to export the Skill artifact',
+    failedAt: event.timestamp || nowIso(),
+  });
+  broadcastSkillsLibraryUpdated({
+    adoptionId,
+    hostId: adoption.hostId,
+    instanceId: adoption.instanceId,
+    skillId: adoption.skillId,
+    state: 'failed',
+    error: failed.error,
+    updatedAt: failed.updatedAt,
+  });
+}
+
+function updateSkillImport(importId, patch) {
+  const existing = state.skillImports.get(importId);
+  if (!existing) {
+    return null;
+  }
+  const next = {
+    ...existing,
+    ...patch,
+    updatedAt: nowIso(),
+  };
+  state.skillImports.set(importId, next);
+  return next;
+}
+
+async function readImportedSkillMetadata(skillRoot) {
+  const markdownPath = path.join(skillRoot, 'SKILL.md');
+  const stats = await fs.promises.stat(markdownPath);
+  if (!stats.isFile() || stats.size > 1024 * 1024) {
+    throw new Error('Imported SKILL.md must be a regular file no larger than 1 MiB');
+  }
+  return parseSkillMarkdown(await fs.promises.readFile(markdownPath, 'utf8'));
+}
+
+function trackRelayBackgroundTask(task) {
+  const tracked = Promise.resolve(task).finally(() => {
+    relayBackgroundTasks.delete(tracked);
+  });
+  relayBackgroundTasks.add(tracked);
+  return tracked;
+}
+
+async function runGithubSkillImport(importId) {
+  const record = state.skillImports.get(importId);
+  if (!record) {
+    return;
+  }
+  const stagingRoot = path.join(SKILL_ARTIFACT_ROOT, '.imports');
+  const destination = path.join(stagingRoot, `${importId}-content`);
+  const archivePath = path.join(stagingRoot, `${importId}.rcskill`);
+  try {
+    updateSkillImport(importId, { state: 'downloading', error: '' });
+    const downloaded = await downloadGithubSkill({
+      locator: record.locator,
+      ref: record.ref,
+      subpath: record.subpath,
+      destination,
+      apiBaseUrl: SKILL_GITHUB_API_BASE_URL,
+      token: SKILL_GITHUB_TOKEN,
+    });
+    updateSkillImport(importId, { state: 'validating' });
+    const metadata = await readImportedSkillMetadata(destination);
+    const artifact = await createSkillArtifactArchive(destination, archivePath);
+    const skillId = path.posix.basename(downloaded.subpath || downloaded.repo);
+    const previousArtifactId = state.skillRegistry.getLibraryRecord(skillId)?.latestArtifactId || null;
+    const imported = await state.skillRegistry.importArchive(archivePath, {
+      skillId,
+      name: metadata.name || skillId,
+      description: metadata.description || '',
+      sourceId: downloaded.sourceId,
+      sourceKind: 'github',
+      sourceLocator: downloaded.locator,
+      sourceRef: downloaded.ref,
+      sourcePath: downloaded.sourcePath,
+      expectedHash: artifact.contentHash,
+    });
+    const completed = updateSkillImport(importId, {
+      state: 'completed',
+      skillId,
+      artifactId: imported.artifact.artifactId,
+      sourceId: downloaded.sourceId,
+      error: '',
+      completedAt: nowIso(),
+    });
+    broadcastSkillsLibraryUpdated({
+      importId,
+      skillId,
+      artifactId: imported.artifact.artifactId,
+      sourceId: downloaded.sourceId,
+      state: 'completed',
+      deduplicated: imported.deduplicated,
+      updatedAt: completed.updatedAt,
+    });
+    recordSkillAudit('skills.source.refresh_completed', {
+      importId,
+      sourceId: downloaded.sourceId,
+      skillId,
+      previousArtifactId,
+      artifactId: imported.artifact.artifactId,
+      changed: previousArtifactId !== imported.artifact.artifactId,
+      deduplicated: imported.deduplicated,
+    }, { subject: downloaded.sourceId });
+    if (previousArtifactId !== imported.artifact.artifactId) {
+      await state.skillAutomation?.rolloutAfterRefresh({
+        source: state.skillRegistry.getSource(downloaded.sourceId),
+        skillId,
+        artifactId: imported.artifact.artifactId,
+      });
+    }
+  } catch (error) {
+    const refreshSourceId = state.skillImports.get(importId)?.refreshSourceId
+      || record.refreshSourceId;
+    if (refreshSourceId) {
+      await state.skillRegistry.markSourceRefreshFailed(
+        refreshSourceId,
+        error.message
+      ).catch((refreshError) => {
+        console.warn(
+          `[relay] failed to persist GitHub Skill refresh error for ${refreshSourceId}: ${refreshError.message}`
+        );
+      });
+    }
+    const failed = updateSkillImport(importId, {
+      state: 'failed',
+      error: skillInventoryText(error.message, 4096) || 'GitHub Skill import failed',
+      failedAt: nowIso(),
+    });
+    broadcastSkillsLibraryUpdated({
+      importId,
+      state: 'failed',
+      error: failed.error,
+      updatedAt: failed.updatedAt,
+    });
+    recordSkillAudit('skills.source.refresh_failed', {
+      importId,
+      sourceId: refreshSourceId || record.sourceId,
+      error: failed.error,
+    }, { subject: refreshSourceId || record.sourceId });
+  } finally {
+    await fs.promises.unlink(archivePath).catch((error) => {
+      if (error.code !== 'ENOENT') {
+        console.warn(`[relay] failed to clean GitHub Skill archive ${archivePath}: ${error.message}`);
+      }
+    });
+    await fs.promises.rm(destination, { recursive: true, force: true }).catch((error) => {
+      console.warn(`[relay] failed to clean GitHub Skill staging ${destination}: ${error.message}`);
+    });
+  }
+}
+
+function queueGithubSkillImport(rawSource, options = {}) {
+  if (relayStopping) {
+    throw skillApiError(503, 'Relay is shutting down and cannot start a Skill import.');
+  }
+  pruneSkillImports();
+  const source = normalizeGithubSkillSource(rawSource);
+  const existing = Array.from(state.skillImports.values()).find((record) => (
+    record.sourceId === source.sourceId
+    && (record.state === 'queued' || record.state === 'downloading' || record.state === 'validating')
+  ));
+  if (existing) {
+    if (options.refreshSourceId) {
+      existing.refreshSourceId = options.refreshSourceId;
+    }
+    if (options.automated) {
+      existing.automated = true;
+    }
+    return { ...existing, reused: true };
+  }
+  const activeImports = Array.from(state.skillImports.values()).filter((record) => (
+    record.state === 'queued' || record.state === 'downloading' || record.state === 'validating'
+  )).length;
+  if (activeImports >= SKILL_GITHUB_MAX_CONCURRENT_IMPORTS) {
+    throw skillApiError(429, 'Too many concurrent GitHub Skill imports are already in progress');
+  }
+  const importId = makeId();
+  const timestamp = nowIso();
+  const record = {
+    importId,
+    kind: 'github',
+    locator: source.locator,
+    ref: source.ref,
+    subpath: source.subpath,
+    sourceId: source.sourceId,
+    sourcePath: source.sourcePath,
+    refreshSourceId: options.refreshSourceId || null,
+    automated: options.automated === true,
+    state: 'queued',
+    skillId: null,
+    artifactId: null,
+    error: '',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    reused: false,
+  };
+  state.skillImports.set(importId, record);
+  setImmediate(() => {
+    if (relayStopping) {
+      return;
+    }
+    trackRelayBackgroundTask(runGithubSkillImport(importId)).catch((error) => {
+      console.warn(`[relay] unhandled GitHub Skill import failure: ${error.message}`);
+    });
+  });
+  return record;
+}
+
+async function queueRegistrySkillSourceRefresh(sourceId, options = {}) {
+  const source = state.skillRegistry.getSource(sourceId);
+  if (!source) {
+    throw skillApiError(404, 'Registry Skill source was not found');
+  }
+  if (source.kind !== 'github') {
+    throw skillApiError(409, 'Only GitHub Registry sources support refresh');
+  }
+  if (source.enabled === false) {
+    throw skillApiError(409, 'Disabled Registry Skill sources cannot be refreshed');
+  }
+  const normalizedSource = normalizeGithubSkillSource({
+    kind: 'github',
+    locator: source.locator,
+    ref: source.ref,
+    subpath: source.subpath,
+  });
+  if (normalizedSource.sourceId !== source.sourceId) {
+    throw skillApiError(409, 'Registry GitHub source identity is not canonical');
+  }
+  let refreshStarted = false;
+  try {
+    await state.skillRegistry.markSourceRefreshStarted(sourceId, {
+      expectedRevision: options.expectedRevision,
+    });
+    refreshStarted = true;
+    const queued = queueGithubSkillImport(normalizedSource, {
+      refreshSourceId: sourceId,
+      automated: options.automated === true,
+    });
+    recordSkillAudit('skills.source.refresh_queued', {
+      sourceId,
+      importId: queued.importId,
+      automated: options.automated === true,
+      reused: queued.reused === true,
+      refreshPolicy: source.refreshPolicy || 'manual',
+      rolloutPolicy: source.rolloutPolicy || 'manual',
+    }, {
+      actor: options.automated ? 'skill-automation' : 'relay-api',
+      subject: sourceId,
+    });
+    return queued;
+  } catch (error) {
+    if (refreshStarted) {
+      await state.skillRegistry.markSourceRefreshFailed(sourceId, error.message).catch((refreshError) => {
+        console.warn(`[relay] failed to persist GitHub Skill refresh queue error for ${sourceId}: ${refreshError.message}`);
+      });
+      error.revision = state.skillRegistry.snapshot({ includeManifest: false }).revision;
+    }
+    recordSkillAudit('skills.source.refresh_queue_failed', {
+      sourceId,
+      automated: options.automated === true,
+      error: error.message,
+    }, {
+      actor: options.automated ? 'skill-automation' : 'relay-api',
+      subject: sourceId,
+    });
+    throw error;
+  }
+}
+
+function findCatalogSkill(skillId) {
+  const id = String(skillId || '').trim();
+  return mergeSkillLibraryWithCatalog(buildSkillCatalogFromSources()).find((skill) => skill.skillId === id) || null;
+}
+
+function upsertSkillLibraryRecord(input) {
+  const record = normalizeSkillLibraryRecord(input);
+  if (!record) {
+    throw new Error('invalid skill library record');
+  }
+  const existing = (state.skillLibrary || []).find((skill) => skill.skillId === record.skillId) || null;
+  const next = {
+    ...existing,
+    ...record,
+    lastInstalledHostIds: Array.from(new Set([
+      ...(existing?.lastInstalledHostIds || []),
+      ...(record.lastInstalledHostIds || []),
+    ])),
+    createdAt: existing?.createdAt || record.createdAt || nowIso(),
+    updatedAt: nowIso(),
+  };
+  state.skillLibrary = [
+    ...(state.skillLibrary || []).filter((skill) => skill.skillId !== next.skillId),
+    next,
+  ].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  saveSkillLibrary(state.skillLibrary);
+  return next;
+}
+
+async function runSkillsBatchAction(action, hostIds, skillIds) {
+  const results = [];
+  for (const hostId of hostIds) {
+    const hostError = getHostCapabilityError(
+      hostId,
+      'hostSkills',
+      'this host agent needs to be restarted before it can manage skills'
+    );
+    if (hostError) {
+      for (const skillId of skillIds) {
+        results.push({
+          ok: false,
+          action,
+          hostId,
+          skillId,
+          error: hostError.error,
+        });
+      }
+      continue;
+    }
+    const requestId = makeId();
+    const skills = skillIds.map((skillId) => findCatalogSkill(skillId) || { skillId });
+    for (const skill of skills) {
+      if (skill?.skillId) {
+        upsertSkillLibraryRecord({
+          ...skill,
+          lastInstalledHostIds: action === 'install' ? [hostId] : (skill.lastInstalledHostIds || []),
+        });
+      }
+    }
+    if (action === 'install') {
+      enqueueCommand(hostId, {
+        type: 'host.skills.install',
+        requestId,
+        skills,
+      });
+    } else {
+      enqueueCommand(hostId, {
+        type: 'host.skills.uninstall',
+        requestId,
+        skills,
+      });
+    }
+    try {
+      const result = await awaitHostSkillRequest(requestId, 60000);
+      const hostResults = Array.isArray(result.results) ? result.results : [];
+      if (hostResults.length) {
+        results.push(...hostResults);
+      } else {
+        for (const skillId of skillIds) {
+          results.push({
+            ok: Boolean(result.ok),
+            action,
+            hostId,
+            skillId,
+            error: result.error || '',
+          });
+        }
+      }
+    } catch (error) {
+      for (const skillId of skillIds) {
+        results.push({
+          ok: false,
+          action,
+          hostId,
+          skillId,
+          error: error.message,
+        });
+      }
+    }
+  }
+  return results;
 }
 
 function getSessionsForHost(hostId, options = {}) {
@@ -1555,7 +4008,9 @@ function getSessionsForHost(hostId, options = {}) {
   const sessions = Array.from(state.sessions.values())
     .filter((session) => session.hostId === hostId)
     .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
-  return optimize ? sessions.map(publicSessionListRecord) : sessions;
+  return optimize
+    ? sessions.map(publicSessionListRecord)
+    : sessions.map(sessionWithAssistantProjection);
 }
 
 function normalizeSearchTerms(query) {
@@ -1886,8 +4341,9 @@ function publicSessionListRecord(session) {
   if (!session || typeof session !== 'object') {
     return session;
   }
+  const projected = sessionWithAssistantProjection(session);
   return {
-    ...session,
+    ...projected,
     latestUserMessage: limitListText(session.latestUserMessage || '', SESSION_LIST_LATEST_TEXT_LIMIT) || null,
     latestAgentMessage: limitListText(session.latestAgentMessage || '', SESSION_LIST_LATEST_TEXT_LIMIT) || null,
     transcriptPreview: publicTranscriptPreview(session.transcriptPreview),
@@ -1902,7 +4358,7 @@ function requestHostSessionDiscovery(hostId) {
 
   const now = Date.now();
   const lastRequested = state.sessionDiscoveryRequests.get(hostId) || 0;
-  if (now - lastRequested < 20000) {
+  if (now - lastRequested < HOST_SESSION_DISCOVERY_REQUEST_COOLDOWN_MS) {
     return false;
   }
 
@@ -1944,7 +4400,7 @@ function enqueueSessionUnwatch(hostId, sessionId, body = {}) {
 }
 
 function getLocalRelayHostId() {
-  return safeLocalAgentId(process.env.RELAY_LOCAL_HOST_ID || process.env.HOST_ID || os.hostname() || 'local')
+  return legacySafeLocalAgentId(process.env.RELAY_LOCAL_HOST_ID || process.env.HOST_ID || os.hostname() || 'local')
     .toLowerCase();
 }
 
@@ -1990,11 +4446,474 @@ function ensureLocalRelayHost() {
   return host;
 }
 
-function safeLocalAgentId(value) {
+function legacySafeLocalAgentId(value) {
   return String(value || 'local')
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 80) || 'local';
+}
+
+function safeLocalAgentId(value) {
+  const hostId = String(value || 'local');
+  const readable = legacySafeLocalAgentId(hostId).slice(0, 56);
+  const digest = crypto.createHash('sha256').update(hostId, 'utf8').digest('hex').slice(0, 16);
+  return `${readable}-${digest}`;
+}
+
+function localAgentOwnershipMarkerPath(hostId) {
+  return path.join(LOCAL_AGENT_LOG_ROOT, `${safeLocalAgentId(hostId)}.owner.json`);
+}
+
+function localAgentOwnershipMarkerPaths(hostId) {
+  const current = localAgentOwnershipMarkerPath(hostId);
+  const legacy = path.join(LOCAL_AGENT_LOG_ROOT, `${legacySafeLocalAgentId(hostId)}.owner.json`);
+  return current === legacy ? [current] : [current, legacy];
+}
+
+function normalizeLocalAgentProcessMetadata(input) {
+  if (!input || input.relayManaged !== true) return null;
+  const pid = Math.trunc(Number(input.pid || 0));
+  const parentPid = Math.trunc(Number(input.parentPid || 0));
+  const instanceId = String(input.instanceId || '').trim();
+  const ownershipToken = String(input.ownershipToken || '').trim();
+  const relayUrl = String(input.relayUrl || '').trim();
+  if (pid <= 0 || !instanceId || !ownershipToken || relayUrl !== getLocalRelayUrl()) {
+    return null;
+  }
+  return {
+    relayManaged: true,
+    pid,
+    parentPid: parentPid > 0 ? parentPid : null,
+    instanceId,
+    ownershipToken,
+    relayUrl,
+    startedAt: String(input.startedAt || '').trim() || null,
+  };
+}
+
+function readLocalAgentOwnershipMarker(hostId) {
+  for (const markerPath of localAgentOwnershipMarkerPaths(hostId)) {
+    try {
+      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+      if (
+        marker?.kind === 'remote-codex-local-agent-owner'
+        && Number(marker.version) === 1
+        && String(marker.hostId || '') === String(hostId || '')
+      ) {
+        return { ...marker, markerPath };
+      }
+    } catch (_) {
+      // Try the legacy collision-prone basename before treating ownership as absent.
+    }
+  }
+  return null;
+}
+
+function writeLocalAgentOwnershipMarker(record) {
+  const markerPath = localAgentOwnershipMarkerPath(record.hostId);
+  const existing = readLocalAgentOwnershipMarker(record.hostId);
+  if (existing) {
+    if (processIsAlive(existing.pid)) {
+      if (
+        String(existing.instanceId || '') !== String(record.instanceId || '')
+        || String(existing.ownershipToken || '') !== String(record.ownershipToken || '')
+      ) {
+        throw new Error(`live local agent ownership marker already exists for ${record.hostId}`);
+      }
+    } else {
+      fs.rmSync(existing.markerPath, { force: true });
+    }
+  }
+  const marker = {
+    kind: 'remote-codex-local-agent-owner',
+    version: 1,
+    hostId: record.hostId,
+    pid: record.pid,
+    instanceId: record.instanceId,
+    ownershipToken: record.ownershipToken,
+    ownerRelayPid: process.pid,
+    relayUrl: record.relayUrl,
+    startedAt: record.startedAt,
+  };
+  fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+  const tempPath = `${markerPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(marker, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.renameSync(tempPath, markerPath);
+  } catch (error) {
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch (_) {
+      // Best effort cleanup of an incomplete marker write.
+    }
+    throw error;
+  }
+  record.ownershipMarkerPath = markerPath;
+  return markerPath;
+}
+
+function removeLocalAgentOwnershipMarker(record) {
+  if (!record?.hostId) return false;
+  const marker = readLocalAgentOwnershipMarker(record.hostId);
+  if (!marker) return false;
+  if (
+    String(marker.instanceId || '') !== String(record.instanceId || '')
+    || String(marker.ownershipToken || '') !== String(record.ownershipToken || '')
+    || Number(marker.pid || 0) !== Number(record.pid || record.lastPid || 0)
+  ) {
+    return false;
+  }
+  try {
+    fs.rmSync(marker.markerPath, { force: true });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function processIsAlive(pid) {
+  const normalizedPid = Math.trunc(Number(pid || 0));
+  if (normalizedPid <= 0) return false;
+  try {
+    process.kill(normalizedPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function localAgentProcessIsAlive(record) {
+  if (!record) return false;
+  if (
+    record.process
+    && record.process.exitCode === null
+    && record.process.signalCode === null
+  ) {
+    return true;
+  }
+  return processIsAlive(record.pid);
+}
+
+function spawnAndWait(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout?.on('data', (chunk) => stdout.push(chunk));
+    child.stderr?.on('data', (chunk) => stderr.push(chunk));
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({
+      code,
+      signal,
+      stdout: Buffer.concat(stdout).toString('utf8').trim().slice(-2000),
+      stderr: Buffer.concat(stderr).toString('utf8').trim().slice(-2000),
+    }));
+  });
+}
+
+function posixProcessTreePids(rootPid) {
+  const result = spawnSync('ps', ['-eo', 'pid=,ppid='], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) return [rootPid];
+  const children = new Map();
+  for (const line of String(result.stdout || '').split(/\r?\n/)) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const parentPid = Number(match[2]);
+    const list = children.get(parentPid) || [];
+    list.push(pid);
+    children.set(parentPid, list);
+  }
+  const ordered = [];
+  const visit = (pid) => {
+    for (const childPid of children.get(pid) || []) visit(childPid);
+    ordered.push(pid);
+  };
+  visit(rootPid);
+  return ordered;
+}
+
+async function forceKillProcessTree(pid) {
+  const normalizedPid = Math.trunc(Number(pid || 0));
+  if (normalizedPid <= 0 || !processIsAlive(normalizedPid)) return true;
+  let terminationFailure = '';
+  if (process.platform === 'win32') {
+    const taskkill = String(process.env.RELAY_LOCAL_AGENT_TASKKILL_PATH || '').trim()
+      || path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+    const result = await spawnAndWait(taskkill, ['/PID', String(normalizedPid), '/T', '/F']);
+    if (result.code !== 0) {
+      const detail = String(result.stderr || result.stdout || '').replace(/\s+/g, ' ').trim();
+      terminationFailure = `taskkill exited with code ${result.code}${detail ? `: ${detail}` : ''}`;
+    }
+  } else {
+    for (const targetPid of posixProcessTreePids(normalizedPid)) {
+      try {
+        process.kill(targetPid, 'SIGKILL');
+      } catch (error) {
+        if (error?.code !== 'ESRCH') throw error;
+      }
+    }
+  }
+  const deadline = Date.now() + LOCAL_AGENT_FORCE_EXIT_WAIT_MS;
+  while (processIsAlive(normalizedPid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, LOCAL_AGENT_EXIT_POLL_MS));
+  }
+  if (processIsAlive(normalizedPid)) {
+    throw new Error(
+      terminationFailure
+      || `process ${normalizedPid} remained alive after process-tree termination`
+    );
+  }
+  return true;
+}
+
+function localAgentHasAuthoritativeProcessIdentity(record) {
+  return Boolean(
+    record?.process
+    && Number(record.process.pid || 0) > 0
+    && Number(record.process.pid) === Number(record.pid || 0)
+    && record.process.exitCode === null
+    && record.process.signalCode === null
+  );
+}
+
+function forceKillLocalAgentRecord(record) {
+  if (!localAgentHasAuthoritativeProcessIdentity(record)) {
+    const error = new Error(
+      'Relay cannot force-kill a recovered local Agent without authoritative ChildProcess identity.'
+    );
+    error.code = 'local_agent_process_identity_unverified';
+    return Promise.reject(error);
+  }
+  return forceKillProcessTree(record.pid);
+}
+
+function localAgentMarkerMatchesMetadata(hostId, metadata) {
+  const marker = readLocalAgentOwnershipMarker(hostId);
+  return Boolean(
+    marker
+    && Number(marker.pid || 0) === metadata.pid
+    && String(marker.instanceId || '') === metadata.instanceId
+    && String(marker.ownershipToken || '') === metadata.ownershipToken
+    && String(marker.relayUrl || '') === metadata.relayUrl
+  );
+}
+
+function createRecoveredLocalAgentRecord(hostId, label, metadata, existing = null) {
+  const safeId = safeLocalAgentId(hostId);
+  const record = {
+    hostId,
+    label: String(label || hostId).trim() || hostId,
+    status: 'running',
+    startedAt: metadata.startedAt || nowIso(),
+    updatedAt: nowIso(),
+    registeredAt: nowIso(),
+    process: null,
+    pid: metadata.pid,
+    parentPid: metadata.parentPid,
+    instanceId: metadata.instanceId,
+    ownershipToken: metadata.ownershipToken,
+    ownershipMarkerPath: localAgentOwnershipMarkerPath(hostId),
+    relayUrl: metadata.relayUrl,
+    logPath: path.join(LOCAL_AGENT_LOG_ROOT, `${safeId}.out.log`),
+    errorLogPath: path.join(LOCAL_AGENT_LOG_ROOT, `${safeId}.err.log`),
+    message: 'recovered Relay-managed local host-agent',
+    desiredState: 'running',
+    autoRestart: true,
+    restartCount: existing?.restartCount || 0,
+    lastRestartAt: existing?.lastRestartAt || null,
+    nextRestartAt: null,
+    restartReason: null,
+    restartTimer: null,
+    restartAfterStop: false,
+    shutdownTimer: null,
+    shutdownPollTimer: null,
+    shutdownCommandId: null,
+    forceKillPromise: null,
+    exitCompletionPromise: null,
+    recovered: true,
+  };
+  state.localAgents.set(hostId, record);
+  return record;
+}
+
+function trackLocalAgentForRelayShutdown(record, signal = 'shutdown') {
+  if (!relayShutdownContext || !localAgentProcessIsAlive(record)) return false;
+  const added = !relayShutdownContext.records.has(record);
+  relayShutdownContext.records.add(record);
+  if (added) {
+    relayShutdownContext.deadline = Math.max(
+      relayShutdownContext.deadline,
+      Date.now() + LOCAL_AGENT_SHUTDOWN_GRACE_MS + LOCAL_AGENT_FORCE_EXIT_WAIT_MS + 2000
+    );
+  }
+  stopLocalAgent(record.hostId, {
+    disableAutoRestart: true,
+    reason: `Relay ${signal} shutdown`,
+  });
+  return true;
+}
+
+function reconcileRegisteredLocalAgent(hostId, label, input) {
+  const existing = state.localAgents.get(hostId);
+  if (!input || input.relayManaged !== true) {
+    if (
+      localAgentProcessIsAlive(existing)
+      || inspectUnclaimedLocalAgentOwnershipMarker(hostId)
+    ) {
+      return {
+        ok: false,
+        code: 'local_agent_ownership_required',
+        message: `Relay-managed Agent ownership attestation is required for ${hostId}.`,
+      };
+    }
+    return { ok: true, adopted: false };
+  }
+  const metadata = normalizeLocalAgentProcessMetadata(input);
+  if (!metadata || !localAgentMarkerMatchesMetadata(hostId, metadata)) {
+    return {
+      ok: false,
+      code: 'local_agent_ownership_mismatch',
+      message: `Relay-managed Agent ownership attestation did not match ${hostId}.`,
+    };
+  }
+  if (relayShutdownPromise && !localAgentProcessIsAlive(existing)) {
+    const record = createRecoveredLocalAgentRecord(hostId, label, metadata, existing);
+    trackLocalAgentForRelayShutdown(record);
+    return {
+      ok: false,
+      code: 'local_agent_ownership_mismatch',
+      message: `Relay shutdown has revoked managed Agent ownership for ${hostId}.`,
+    };
+  }
+  if (
+    existing
+    && existing.instanceId !== metadata.instanceId
+    && localAgentProcessIsAlive(existing)
+  ) {
+    return {
+      ok: false,
+      code: 'local_agent_instance_conflict',
+      message: `A different Relay-managed Agent instance is already active for ${hostId}.`,
+    };
+  }
+  if (existing?.instanceId === metadata.instanceId) {
+    existing.pid = metadata.pid;
+    existing.parentPid = metadata.parentPid;
+    existing.registeredAt = nowIso();
+    existing.updatedAt = existing.registeredAt;
+    existing.status = existing.desiredState === 'stopped'
+      ? (existing.status === 'error' ? 'error' : 'stopping')
+      : ['stopping', 'restarting'].includes(existing.status)
+        ? existing.status
+        : 'running';
+    return { ok: true, adopted: false, record: existing };
+  }
+
+  const record = createRecoveredLocalAgentRecord(hostId, label, metadata, existing);
+  return { ok: true, adopted: true, record };
+}
+
+function inspectUnclaimedLocalAgentOwnershipMarker(hostId) {
+  const marker = readLocalAgentOwnershipMarker(hostId);
+  if (!marker) return null;
+  if (!processIsAlive(marker.pid)) {
+    try {
+      fs.rmSync(marker.markerPath, { force: true });
+    } catch (_) {
+      // A stale marker cannot justify adopting or killing a process.
+    }
+    return null;
+  }
+  return marker;
+}
+
+function agentPollOwnershipAttestation(req) {
+  const relayManaged = String(req.headers['x-remote-codex-agent-managed'] || '').trim() === '1';
+  if (!relayManaged) return null;
+  return {
+    pid: Math.trunc(Number(req.headers['x-remote-codex-agent-pid'] || 0)),
+    instanceId: String(req.headers['x-remote-codex-agent-instance'] || '').trim(),
+    ownershipToken: String(req.headers['x-remote-codex-agent-token'] || '').trim(),
+  };
+}
+
+function authorizeAgentCommandPoll(hostId, req) {
+  const existing = state.localAgents.get(hostId);
+  const marker = inspectUnclaimedLocalAgentOwnershipMarker(hostId);
+  const hasLiveRecord = localAgentProcessIsAlive(existing);
+  const hasLiveOwnership = hasLiveRecord || Boolean(marker);
+  const attestation = agentPollOwnershipAttestation(req);
+  if (!hasLiveOwnership) {
+    return attestation
+      ? {
+        ok: false,
+        code: 'local_agent_ownership_mismatch',
+        message: `Relay-managed Agent ownership is no longer active for ${hostId}.`,
+      }
+      : { ok: true };
+  }
+  if (!attestation) {
+    return {
+      ok: false,
+      code: 'local_agent_ownership_required',
+      message: `Relay-managed Agent ownership attestation is required for ${hostId}.`,
+    };
+  }
+  const expected = hasLiveRecord ? existing : marker;
+  const expectedMarker = readLocalAgentOwnershipMarker(hostId);
+  const matches = attestation.pid > 0
+    && attestation.pid === Number(expected.pid || 0)
+    && attestation.instanceId === String(expected.instanceId || '')
+    && constantTimeEqual(attestation.ownershipToken, expected.ownershipToken)
+    && expectedMarker
+    && Number(expectedMarker.pid || 0) === attestation.pid
+    && String(expectedMarker.instanceId || '') === attestation.instanceId
+    && constantTimeEqual(attestation.ownershipToken, expectedMarker.ownershipToken);
+  return matches
+    ? { ok: true }
+    : {
+      ok: false,
+      code: 'local_agent_ownership_mismatch',
+      message: `Relay-managed Agent ownership attestation did not match ${hostId}.`,
+    };
+}
+
+function validateAgentEventBatchScope(events) {
+  if (!Array.isArray(events) || events.length === 0) {
+    return {
+      ok: false,
+      code: 'agent_event_batch_empty',
+      message: 'Agent event batch must contain at least one event.',
+    };
+  }
+  const hostIds = events.map((event) => String(event?.hostId || '').trim());
+  if (hostIds.some((hostId) => !hostId)) {
+    return {
+      ok: false,
+      code: 'agent_event_host_required',
+      message: 'Every Agent event must include hostId.',
+    };
+  }
+  const uniqueHostIds = new Set(hostIds);
+  if (uniqueHostIds.size !== 1) {
+    return {
+      ok: false,
+      code: 'agent_event_host_mismatch',
+      message: 'Every event in an Agent batch must use the same hostId.',
+    };
+  }
+  return { ok: true, hostId: hostIds[0] };
+}
+
+function authorizeAgentEventBatch(hostId, req) {
+  return authorizeAgentCommandPoll(hostId, req);
 }
 
 function getLocalRelayUrl() {
@@ -2017,7 +4936,8 @@ function localAgentTimestampMs(value) {
 
 function shouldAutoRestartLocalAgent(record) {
   return Boolean(
-    LOCAL_AGENT_WATCHDOG_ENABLED
+    LOCAL_AGENT_START_ENABLED
+      && LOCAL_AGENT_WATCHDOG_ENABLED
       && record
       && record.autoRestart !== false
       && record.desiredState !== 'stopped'
@@ -2066,14 +4986,86 @@ function markLocalAgentExited(hostId, code, signal) {
   if (!record) {
     return;
   }
+  clearLocalAgentShutdownTimer(record);
+  record.lastPid = record.pid || record.process?.pid || record.lastPid || null;
+  removeLocalAgentOwnershipMarker(record);
   record.process = null;
   record.pid = null;
-  record.status = record.status === 'stopping' || record.desiredState === 'stopped' ? 'stopped' : 'exited';
+  record.status = ['stopping', 'restarting'].includes(record.status) || record.desiredState === 'stopped'
+    ? 'stopped'
+    : 'exited';
   record.exitCode = code;
   record.signal = signal || null;
   record.exitedAt = nowIso();
   record.updatedAt = record.exitedAt;
   record.message = signal ? `local agent exited with signal ${signal}` : `local agent exited with code ${code}`;
+}
+
+function clearLocalAgentShutdownTimer(record) {
+  if (!record) return;
+  if (record.shutdownTimer) {
+    clearTimeout(record.shutdownTimer);
+    record.shutdownTimer = null;
+  }
+  if (record.shutdownPollTimer) {
+    clearInterval(record.shutdownPollTimer);
+    record.shutdownPollTimer = null;
+  }
+}
+
+function completeLocalAgentExit(record, code, signal) {
+  if (!record || record.exitCompletionPromise) {
+    return record?.exitCompletionPromise || Promise.resolve();
+  }
+  record.exitCompletionPromise = Promise.resolve().then(async () => {
+    let forceKillError = null;
+    if (record.forceKillPromise) {
+      forceKillError = await record.forceKillPromise;
+    }
+    if (state.localAgents.get(record.hostId) !== record) return;
+    if (record.shutdownCommandId) {
+      removeQueuedCommandById(record.hostId, record.shutdownCommandId, 'host.shutdown');
+      record.shutdownCommandId = null;
+    }
+    const restartAfterStop = record.restartAfterStop === true;
+    const restartReason = record.restartReason || 'manual restart';
+    const shouldRestart = shouldAutoRestartLocalAgent(record)
+      && !['stopping', 'restarting'].includes(record.status);
+    markLocalAgentExited(record.hostId, code, signal);
+    if (forceKillError) {
+      record.status = 'error';
+      record.message = `local agent exited but process-tree termination failed: ${forceKillError.message || forceKillError}`;
+      record.updatedAt = nowIso();
+      record.restartAfterStop = false;
+      return;
+    }
+    if (restartAfterStop) {
+      record.restartAfterStop = false;
+      startLocalAgent({
+        hostId: record.hostId,
+        label: record.label,
+        restart: true,
+        reason: restartReason,
+      });
+    } else if (shouldRestart) {
+      scheduleLocalAgentRestart(record.hostId, record.message, LOCAL_AGENT_EXIT_RESTART_DELAY_MS);
+    }
+  });
+  return record.exitCompletionPromise;
+}
+
+function monitorLocalAgentExit(record) {
+  if (!record || record.shutdownPollTimer) return;
+  record.shutdownPollTimer = setInterval(() => {
+    if (state.localAgents.get(record.hostId) !== record) {
+      clearLocalAgentShutdownTimer(record);
+      return;
+    }
+    if (!localAgentProcessIsAlive(record)) {
+      void completeLocalAgentExit(record, record.process?.exitCode ?? null, record.process?.signalCode || null);
+    }
+  }, LOCAL_AGENT_EXIT_POLL_MS);
+  record.shutdownPollTimer.unref?.();
 }
 
 function scheduleLocalAgentRestart(hostId, reason, delayMs = 0) {
@@ -2108,37 +5100,88 @@ function scheduleLocalAgentRestart(hostId, reason, delayMs = 0) {
 function stopLocalAgent(hostId, options = {}) {
   const record = state.localAgents.get(hostId);
   const disableAutoRestart = options.disableAutoRestart !== false;
+  const restartAfterStop = options.restartAfterStop === true;
   if (record) {
     clearLocalAgentRestartTimer(record);
     if (disableAutoRestart) {
       record.desiredState = 'stopped';
       record.autoRestart = false;
+      record.restartAfterStop = false;
+    } else if (restartAfterStop) {
+      record.desiredState = 'running';
+      record.autoRestart = true;
+      record.restartAfterStop = true;
+      record.restartReason = String(options.reason || 'manual restart');
     }
   }
-  if (!record?.process || record.process.killed) {
+  if (!localAgentProcessIsAlive(record)) {
     if (record) {
+      removeLocalAgentOwnershipMarker(record);
+      record.process = null;
+      record.lastPid = record.pid || record.lastPid || null;
+      record.pid = null;
       record.status = 'stopped';
       record.updatedAt = nowIso();
-      record.message = 'local agent is not running under this relay';
+      record.message = 'local agent is not running';
     }
     return {
       ok: true,
       hostId,
       status: 'stopped',
-      message: 'No relay-managed local agent process is running for this host.',
+      message: 'No Relay-managed local agent process is running for this host.',
       localAgent: publicLocalAgentRecord(record),
     };
   }
 
-  record.status = 'stopping';
+  if (record.shutdownTimer) {
+    return {
+      ok: true,
+      hostId,
+      status: record.status,
+      message: 'Local host-agent graceful shutdown is already pending.',
+      localAgent: publicLocalAgentRecord(record),
+    };
+  }
+
+  record.status = restartAfterStop ? 'restarting' : 'stopping';
   record.updatedAt = nowIso();
-  record.message = 'stopping local agent';
-  record.process.kill();
+  record.message = restartAfterStop
+    ? 'gracefully stopping local agent before restart'
+    : 'gracefully stopping local agent';
+  const command = enqueueCommand(hostId, {
+    type: 'host.shutdown',
+    reason: String(options.reason || (restartAfterStop ? 'relay-managed restart' : 'relay-managed stop')),
+  });
+  record.shutdownCommandId = command.id;
+  const expectedPid = Number(record.pid || record.process?.pid || 0);
+  const expectedInstanceId = record.instanceId;
+  record.shutdownTimer = setTimeout(() => {
+    const current = state.localAgents.get(hostId);
+    if (
+      current !== record
+      || current.instanceId !== expectedInstanceId
+      || Number(current.pid || current.process?.pid || 0) !== expectedPid
+      || !localAgentProcessIsAlive(current)
+    ) {
+      return;
+    }
+    current.message = `graceful shutdown timed out after ${LOCAL_AGENT_SHUTDOWN_GRACE_MS}ms; forcing local agent exit`;
+    current.updatedAt = nowIso();
+    current.forceKillPromise = forceKillLocalAgentRecord(current).then(() => null, (error) => {
+      current.status = 'error';
+      current.message = `failed to force local agent process tree exit: ${error.message || error}`;
+      current.updatedAt = nowIso();
+      return error;
+    });
+  }, LOCAL_AGENT_SHUTDOWN_GRACE_MS);
+  record.shutdownTimer.unref?.();
+  monitorLocalAgentExit(record);
   return {
     ok: true,
     hostId,
-    status: 'stopping',
-    message: 'Local host-agent stop signal sent.',
+    status: record.status,
+    message: 'Local host-agent graceful shutdown requested.',
+    command,
     localAgent: publicLocalAgentRecord(record),
   };
 }
@@ -2148,12 +5191,34 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
   if (!normalizedHostId) {
     return { ok: false, status: 'invalid_host', message: 'hostId is required' };
   }
+  if (!LOCAL_AGENT_START_ENABLED) {
+    return {
+      ok: false,
+      status: 'local_agent_start_disabled',
+      message: 'This Relay instance is not allowed to start a local Agent.',
+    };
+  }
+  if (relayShutdownPromise) {
+    return { ok: false, status: 'relay_stopping', message: 'Relay is shutting down.' };
+  }
 
   const existing = state.localAgents.get(normalizedHostId);
+  if (!existing) {
+    const unclaimedMarker = inspectUnclaimedLocalAgentOwnershipMarker(normalizedHostId);
+    if (unclaimedMarker) {
+      return {
+        ok: true,
+        hostId: normalizedHostId,
+        status: 'ownership_pending',
+        message: 'A live ownership marker is waiting for its Agent register/heartbeat handshake.',
+        localAgent: null,
+      };
+    }
+  }
   if (existing) {
     clearLocalAgentRestartTimer(existing);
   }
-  if (existing?.process && !existing.process.killed) {
+  if (localAgentProcessIsAlive(existing)) {
     if (!restart) {
       return {
         ok: true,
@@ -2163,34 +5228,54 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
         localAgent: publicLocalAgentRecord(existing),
       };
     }
-    stopLocalAgent(normalizedHostId, { disableAutoRestart: false });
+    return stopLocalAgent(normalizedHostId, {
+      disableAutoRestart: false,
+      restartAfterStop: true,
+      reason: reason || 'manual restart',
+    });
   }
 
   fs.mkdirSync(LOCAL_AGENT_LOG_ROOT, { recursive: true });
   const safeId = safeLocalAgentId(normalizedHostId);
   const logPath = path.join(LOCAL_AGENT_LOG_ROOT, `${safeId}.out.log`);
   const errorLogPath = path.join(LOCAL_AGENT_LOG_ROOT, `${safeId}.err.log`);
-  const stdout = fs.createWriteStream(logPath, { flags: 'a' });
-  const stderr = fs.createWriteStream(errorLogPath, { flags: 'a' });
   const relayUrl = getLocalRelayUrl();
-  const child = spawn(process.execPath, [path.join(__dirname, '..', 'host-agent', 'agent.js')], {
-    cwd: process.cwd(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-    env: {
-      ...process.env,
-      RELAY_URL: relayUrl,
-      ...(RELAY_AUTH_TOKEN ? { RELAY_AUTH_TOKEN } : {}),
-      HOST_ID: normalizedHostId,
-      HOST_LABEL: String(label || normalizedHostId).trim() || normalizedHostId,
-      CODEX_HOME: process.env.LOCAL_CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
-      AUTO_START_SESSION: process.env.LOCAL_AGENT_AUTO_START_SESSION || process.env.AUTO_START_SESSION || 'false',
-      MANAGED_COMMAND: process.env.LOCAL_AGENT_MANAGED_COMMAND || process.env.MANAGED_COMMAND || 'codex-app-server',
-    },
-  });
-
-  child.stdout.pipe(stdout);
-  child.stderr.pipe(stderr);
+  const instanceId = crypto.randomUUID();
+  const ownershipToken = crypto.randomBytes(32).toString('hex');
+  const ownershipMarkerPath = localAgentOwnershipMarkerPath(normalizedHostId);
+  const stdoutFd = fs.openSync(logPath, 'a');
+  const stderrFd = fs.openSync(errorLogPath, 'a');
+  let child;
+  try {
+    child = spawn(process.execPath, [path.join(__dirname, '..', 'host-agent', 'agent.js')], {
+      cwd: process.cwd(),
+      stdio: ['ignore', stdoutFd, stderrFd],
+      detached: process.platform === 'win32',
+      windowsHide: true,
+      env: {
+        ...process.env,
+        RELAY_URL: relayUrl,
+        ...(RELAY_AUTH_TOKEN ? { RELAY_AUTH_TOKEN } : {}),
+        HOST_ID: normalizedHostId,
+        HOST_LABEL: String(label || normalizedHostId).trim() || normalizedHostId,
+        CODEX_HOME: process.env.LOCAL_CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
+        AUTO_START_SESSION: process.env.LOCAL_AGENT_AUTO_START_SESSION || process.env.AUTO_START_SESSION || 'false',
+        MANAGED_COMMAND: process.env.LOCAL_AGENT_MANAGED_COMMAND || process.env.MANAGED_COMMAND || 'codex-app-server',
+        AGENT_SHUTDOWN_GRACE_MS: String(Math.max(
+          Number(process.env.AGENT_SHUTDOWN_GRACE_MS || 0) || 0,
+          LOCAL_AGENT_SHUTDOWN_GRACE_MS + LOCAL_AGENT_FORCE_EXIT_WAIT_MS
+        )),
+        RELAY_MANAGED_LOCAL_AGENT: 'true',
+        RELAY_MANAGED_AGENT_INSTANCE_ID: instanceId,
+        RELAY_MANAGED_AGENT_TOKEN: ownershipToken,
+        RELAY_MANAGED_MARKER_PATH: ownershipMarkerPath,
+        RELAY_MANAGED_OWNER_PID: String(process.pid),
+      },
+    });
+  } finally {
+    fs.closeSync(stdoutFd);
+    fs.closeSync(stderrFd);
+  }
 
   const previousRestartCount = existing?.restartCount || 0;
   const record = {
@@ -2201,6 +5286,10 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
     updatedAt: nowIso(),
     process: child,
     pid: child.pid,
+    parentPid: process.pid,
+    instanceId,
+    ownershipToken,
+    ownershipMarkerPath,
     relayUrl,
     logPath,
     errorLogPath,
@@ -2212,8 +5301,30 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
     nextRestartAt: null,
     restartReason: restart ? reason || 'manual restart' : existing?.restartReason || null,
     restartTimer: null,
+    restartAfterStop: false,
+    shutdownTimer: null,
+    shutdownPollTimer: null,
+    shutdownCommandId: null,
+    forceKillPromise: null,
+    exitCompletionPromise: null,
+    recovered: false,
   };
   state.localAgents.set(normalizedHostId, record);
+  try {
+    writeLocalAgentOwnershipMarker(record);
+  } catch (error) {
+    record.status = 'error';
+    record.message = `failed to persist local agent ownership: ${error.message || error}`;
+    record.updatedAt = nowIso();
+    void forceKillProcessTree(child.pid).catch(() => {});
+    return {
+      ok: false,
+      hostId: normalizedHostId,
+      status: 'ownership_error',
+      message: record.message,
+      localAgent: publicLocalAgentRecord(record),
+    };
+  }
 
   child.on('spawn', () => {
     record.status = 'running';
@@ -2227,16 +5338,10 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
     scheduleLocalAgentRestart(normalizedHostId, `process error: ${record.message}`, LOCAL_AGENT_EXIT_RESTART_DELAY_MS);
   });
   child.on('exit', (code, signal) => {
-    stdout.end();
-    stderr.end();
     if (state.localAgents.get(normalizedHostId) !== record) {
       return;
     }
-    const shouldRestart = shouldAutoRestartLocalAgent(record) && record.status !== 'stopping';
-    markLocalAgentExited(normalizedHostId, code, signal);
-    if (shouldRestart) {
-      scheduleLocalAgentRestart(normalizedHostId, record.message, LOCAL_AGENT_EXIT_RESTART_DELAY_MS);
-    }
+    void completeLocalAgentExit(record, code, signal);
   });
 
   const host = state.hosts.get(normalizedHostId) || {
@@ -2269,7 +5374,7 @@ function localAgentWatchdogTick() {
     if (!shouldAutoRestartLocalAgent(record) || record.restartTimer) {
       continue;
     }
-    const processDead = !record.process || record.process.killed || ['exited', 'error', 'stopped'].includes(record.status);
+    const processDead = !localAgentProcessIsAlive(record) || ['exited', 'error', 'stopped'].includes(record.status);
     if (processDead) {
       scheduleLocalAgentRestart(record.hostId, `watchdog saw ${record.status || 'missing process'}`);
       continue;
@@ -2313,7 +5418,10 @@ function rememberSessionAlias(hostId, aliasSessionId, canonicalSessionId) {
   const aliasKey = sessionKey(hostId, alias);
   const canonicalKey = resolveSessionKey(hostId, canonical);
   if (aliasKey !== canonicalKey) {
+    const previousRealtimeKey = resolveCanonicalConversationKey(hostId, alias);
     state.sessionAliases.set(aliasKey, canonicalKey);
+    const nextRealtimeKey = resolveCanonicalConversationKey(hostId, canonical);
+    mergeCanonicalRealtimeKeys(previousRealtimeKey, nextRealtimeKey);
   }
 }
 
@@ -2325,16 +5433,276 @@ function rememberSessionIdentityAliases(hostId, session) {
   rememberSessionAlias(hostId, session.nativeThreadId, session.sessionId);
 }
 
-function sessionIdentityValues(session = {}) {
+function sessionIdentity(hostId, input = {}) {
+  return {
+    hostId,
+    conversationKey: input.conversationKey || null,
+    sessionId: input.sessionId || input.nativeThreadId || input.bridgeSessionId || null,
+    bridgeSessionId: input.bridgeSessionId || null,
+    nativeThreadId: input.nativeThreadId || null,
+    originSessionId: input.originSessionId || null,
+    sourceSessionId: input.sourceSessionId || null,
+  };
+}
+
+function resolveCanonicalConversationKey(hostId, input = {}) {
+  const identity = typeof input === 'string'
+    ? sessionIdentity(hostId, { sessionId: input })
+    : sessionIdentity(hostId, input);
+  const durable = state.sessionRecordStore?.resolveCanonicalKey(identity);
+  if (durable) return durable;
+  const sessionId = identity.sessionId || identity.nativeThreadId || identity.bridgeSessionId;
+  return sessionId ? resolveSessionKey(hostId, sessionId) : '';
+}
+
+function canonicalAliasesFor(identity, canonicalKey) {
+  const aliases = state.sessionRecordStore?.readAliasesForCanonicalKey(
+    canonicalKey || identity
+  ) || [];
+  return [...new Set(aliases.filter(Boolean))];
+}
+
+function mergeCanonicalRealtimeKeys(loserKey, winnerKey) {
+  if (!loserKey || !winnerKey || loserKey === winnerKey) return;
+  state.activitySnapshots.mergeCanonicalKey(
+    state.sessionEventStream.epoch,
+    loserKey,
+    winnerKey
+  );
+  state.sessionEventStream.mergeCanonicalKey(loserKey, winnerKey);
+}
+
+function compactAssistantProjection(projection) {
+  if (!projection) return null;
+  return {
+    canonicalConversationKey: projection.canonicalConversationKey,
+    latestAssistantSeq: Number(projection.latestAssistantSeq || 0),
+    latestAssistantId: projection.latestAssistantId || null,
+    latestAssistantAt: projection.latestAssistantAt || null,
+    projectionRevision: Number(projection.projectionRevision || 0),
+    cursorUnknown: projection.cursorUnknown === true,
+    aliases: Array.isArray(projection.aliases) ? projection.aliases : [],
+  };
+}
+
+function assistantProjectionForIdentity(hostId, input = {}, options = {}) {
+  const identity = sessionIdentity(hostId, input);
+  const canonicalKey = resolveCanonicalConversationKey(hostId, identity);
+  if (!canonicalKey) return null;
+  const record = state.sessionRecordStore?.readRecord(identity) || {
+    hostId,
+    conversationKey: canonicalKey.slice(`${hostId}::`.length),
+    notification: emptyNotificationState(nowIso()),
+  };
+  return projectAssistantState(record, {
+    canonicalKey,
+    aliases: canonicalAliasesFor(identity, canonicalKey),
+    afterSeq: options.afterSeq,
+    limit: options.limit,
+  });
+}
+
+function sessionWithAssistantProjection(session) {
+  if (!session || typeof session !== 'object') return session;
+  const projection = assistantProjectionForIdentity(session.hostId, session, {
+    afterSeq: Number.MAX_SAFE_INTEGER,
+    limit: 1,
+  });
+  return {
+    ...session,
+    assistantProjection: compactAssistantProjection(projection),
+  };
+}
+
+function ensureCursorNotificationState(record, baselineAt) {
+  const empty = emptyNotificationState(baselineAt);
+  const existing = record.notification && typeof record.notification === 'object'
+    ? record.notification
+    : {};
+  record.notification = {
+    ...empty,
+    ...existing,
+    ledger: existing.ledger && typeof existing.ledger === 'object'
+      ? existing.ledger
+      : {},
+    sequenceAliases: existing.sequenceAliases && typeof existing.sequenceAliases === 'object'
+      ? existing.sequenceAliases
+      : {},
+    cursorSources: existing.cursorSources && typeof existing.cursorSources === 'object'
+      ? existing.cursorSources
+      : {},
+  };
+  return record.notification;
+}
+
+function applyAssistantCursorState(tx, canonicalKey, record, cursor, baselineAt) {
+  if (!cursor || typeof cursor !== 'object') return false;
+  const notification = ensureCursorNotificationState(record, baselineAt);
+  const fileIdentity = String(cursor.fileIdentity || '').trim();
+  const projectionRevision = Number(cursor.projectionRevision);
+  const validRevision = Number.isSafeInteger(projectionRevision) && projectionRevision >= 0;
+  let changed = false;
+
+  if (!fileIdentity || !validRevision) {
+    if (cursor.cursorUnknown === true && notification.cursorUnknown !== true) {
+      notification.cursorUnknown = true;
+      notification.unscopedCursorUnknown = true;
+      changed = true;
+    }
+  } else {
+    const current = notification.cursorSources[fileIdentity] || null;
+    const currentRevision = Number(current?.projectionRevision);
+    const stale = Number.isSafeInteger(currentRevision) && projectionRevision < currentRevision;
+    if (!stale) {
+      const incomingUnknown = cursor.cursorUnknown === true;
+      const sameRevisionCompleteWins = current
+        && currentRevision === projectionRevision
+        && current.cursorUnknown === false
+        && incomingUnknown;
+      if (!sameRevisionCompleteWins) {
+        const next = {
+          projectionRevision,
+          cursorUnknown: incomingUnknown,
+          cursorOffset: Number.isSafeInteger(Number(cursor.cursorOffset))
+            ? Number(cursor.cursorOffset)
+            : null,
+          updatedAt: nowIso(),
+        };
+        if (
+          !current
+          || current.projectionRevision !== next.projectionRevision
+          || current.cursorUnknown !== next.cursorUnknown
+        ) {
+          notification.cursorSources[fileIdentity] = next;
+          changed = true;
+        }
+      }
+    }
+    const cursorUnknown = notification.unscopedCursorUnknown === true
+      || Object.values(notification.cursorSources).some((source) => source?.cursorUnknown === true);
+    if (notification.cursorUnknown !== cursorUnknown) {
+      notification.cursorUnknown = cursorUnknown;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    notification.projectionRevision = Number(notification.projectionRevision || 0) + 1;
+    tx.markDirty(canonicalKey);
+  }
+  return changed;
+}
+
+function assistantCursorNeedsMutation(record, cursor) {
+  if (!cursor || typeof cursor !== 'object') return false;
+  const notification = record?.notification || {};
+  const fileIdentity = String(cursor.fileIdentity || '').trim();
+  const projectionRevision = Number(cursor.projectionRevision);
+  const validRevision = Number.isSafeInteger(projectionRevision) && projectionRevision >= 0;
+  if (!fileIdentity || !validRevision) {
+    return cursor.cursorUnknown === true && notification.cursorUnknown !== true;
+  }
+  const current = notification.cursorSources?.[fileIdentity] || null;
+  if (!current) return true;
+  const currentRevision = Number(current.projectionRevision);
+  if (projectionRevision < currentRevision) return false;
+  if (
+    projectionRevision === currentRevision
+    && current.cursorUnknown === false
+    && cursor.cursorUnknown === true
+  ) {
+    return false;
+  }
+  return projectionRevision !== currentRevision
+    || current.cursorUnknown !== (cursor.cursorUnknown === true);
+}
+
+async function assignAssistantObservations(hostId, input = {}, observations = [], cursor = null) {
+  if (!state.sessionRecordStore) {
+    throw new Error('Session record store is unavailable');
+  }
+  const identity = sessionIdentity(hostId, input);
+  if (!identity.sessionId && !identity.nativeThreadId && !identity.bridgeSessionId) {
+    throw new TypeError('Assistant observation requires a Session identity');
+  }
+  const values = (Array.isArray(observations) ? observations : [observations])
+    .filter((observation) => observation && typeof observation === 'object');
+  const currentRecord = state.sessionRecordStore.readRecord(identity);
+  const cursorNeedsMutation = assistantCursorNeedsMutation(currentRecord, cursor);
+  if (!values.length && !cursor) {
+    return {
+      canonicalKey: resolveCanonicalConversationKey(hostId, identity),
+      entries: [],
+      projection: assistantProjectionForIdentity(hostId, identity),
+      changed: false,
+    };
+  }
+  if (!values.length && !cursorNeedsMutation) {
+    return {
+      canonicalKey: resolveCanonicalConversationKey(hostId, identity),
+      entries: [],
+      projection: assistantProjectionForIdentity(hostId, identity),
+      changed: false,
+    };
+  }
+
+  const committed = await state.sessionRecordStore.transact(
+    'assistant.observations.ingested',
+    (tx) => {
+      const canonicalKey = tx.resolveCanonicalKey(identity);
+      let record = tx.getRecord(canonicalKey);
+      const baselineAt = record?.notification?.migrationBaselineAt
+        || record?.updatedAt
+        || values[0]?.firstObservedAt
+        || nowIso();
+      const entries = [];
+      for (const observation of values) {
+        const result = ingestAssistantObservation(tx, {
+          canonicalKey,
+          lineageKey: `${hostId}::${input.sessionId || input.nativeThreadId || input.bridgeSessionId}`,
+          observation,
+          baselineAt,
+        });
+        record = tx.getRecord(canonicalKey);
+        entries.push({
+          assistantMessageId: result.entry.assistantMessageId,
+          assistantSeq: result.entry.assistantSeq,
+          assistantAt: result.entry.assistantAt || null,
+          notifiable: result.entry.notifiable === true,
+          created: result.created === true,
+          updated: result.updated === true,
+        });
+      }
+      record ||= tx.ensureRecord(canonicalKey, {
+        hostId,
+        conversationKey: input.conversationKey || input.sessionId,
+        updatedAt: baselineAt,
+      });
+      const cursorChanged = applyAssistantCursorState(
+        tx,
+        canonicalKey,
+        record,
+        cursor,
+        baselineAt
+      );
+      return {
+        canonicalKey,
+        entries,
+        changed: cursorChanged || entries.some((entry) => entry.created || entry.updated),
+      };
+    }
+  );
+  return {
+    ...committed,
+    projection: assistantProjectionForIdentity(hostId, identity),
+  };
+}
+
+function sessionOwnershipIdentityValues(session = {}) {
   return [
     session.sessionId,
     session.bridgeSessionId,
-    session.runId,
-    session.runtime?.runId,
     session.nativeThreadId,
-    session.originSessionId,
-    session.sourceSessionId,
-    session.conversationKey,
   ]
     .map((value) => String(value || '').trim())
     .filter(Boolean);
@@ -2353,7 +5721,7 @@ function findManagedLiveSessionByIdentities(hostId, identities = []) {
     if (session.hostId !== hostId || session.source !== 'managed' || !session.live) {
       continue;
     }
-    const values = sessionIdentityValues(session);
+    const values = sessionOwnershipIdentityValues(session);
     if (values.some((value) => candidates.has(value))) {
       return session;
     }
@@ -2486,6 +5854,80 @@ function compactSessionDiagnostics(entries, options = {}) {
     normalized.push(entry);
   }
   return Number.isFinite(limit) && limit > 0 ? normalized.slice(-limit) : normalized;
+}
+
+const sessionDiagnosticKeyIndexes = new WeakMap();
+
+function sessionDiagnosticCompactionKey(entry) {
+  return `${entry?.timestamp || ''}|${entry?.kind || ''}|${entry?.method || ''}|${canonicalTranscriptText(entry?.message || '')}|${entry?.turnId || ''}`;
+}
+
+function getSessionDiagnosticKeyIndex(entries) {
+  let index = sessionDiagnosticKeyIndexes.get(entries);
+  if (!index) {
+    index = new Map();
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      const key = sessionDiagnosticCompactionKey(entry);
+      index.set(key, (index.get(key) || 0) + 1);
+    }
+    sessionDiagnosticKeyIndexes.set(entries, index);
+  }
+  return index;
+}
+
+function diagnosticsAreNearDuplicates(previous, entry) {
+  if (!previous || !entry) {
+    return false;
+  }
+  const previousTime = Date.parse(previous.timestamp || '');
+  const entryTime = Date.parse(entry.timestamp || '');
+  return Number.isFinite(previousTime)
+    && Number.isFinite(entryTime)
+    && Math.abs(entryTime - previousTime) <= 2000
+    && String(previous.kind || '') === String(entry.kind || '')
+    && canonicalTranscriptText(previous.message) === canonicalTranscriptText(entry.message);
+}
+
+function appendCompactedSessionDiagnostic(entries, entry, limit = SESSION_DIAGNOSTIC_ENTRY_LIMIT) {
+  const existing = Array.isArray(entries) ? entries : [];
+  if (!entry || !canonicalTranscriptText(entry.message || '')) {
+    return existing;
+  }
+  const previous = existing[existing.length - 1] || null;
+  const previousTime = Date.parse(previous?.timestamp || '');
+  const entryTime = Date.parse(entry?.timestamp || '');
+  const canAppendInOrder = !previous
+    || (Number.isFinite(previousTime) && Number.isFinite(entryTime) && entryTime >= previousTime);
+
+  if (!canAppendInOrder) {
+    return compactSessionDiagnostics(mergeByFingerprint(
+      [...existing, entry],
+      diagnosticFingerprint,
+      limit
+    ), { limit });
+  }
+
+  const index = getSessionDiagnosticKeyIndex(existing);
+  const key = sessionDiagnosticCompactionKey(entry);
+  if (index.has(key) || diagnosticsAreNearDuplicates(previous, entry)) {
+    return existing;
+  }
+
+  existing.push(entry);
+  index.set(key, (index.get(key) || 0) + 1);
+  if (Number.isFinite(limit) && limit > 0 && existing.length > limit) {
+    const removed = existing.splice(0, existing.length - limit);
+    for (const item of removed) {
+      const removedKey = sessionDiagnosticCompactionKey(item);
+      const remaining = (index.get(removedKey) || 0) - 1;
+      if (remaining > 0) {
+        index.set(removedKey, remaining);
+      } else {
+        index.delete(removedKey);
+      }
+    }
+  }
+  return existing;
 }
 
 function loadSessionTranscriptFromRollout(session) {
@@ -2631,7 +6073,7 @@ function getSessionDetail(hostId, sessionId, options = {}) {
       url: `/api/received-files/${encodeURIComponent(file.fileId)}`,
     }));
   return {
-    session,
+    session: sessionWithAssistantProjection(session),
     transcript,
     alerts,
     runtime,
@@ -2639,6 +6081,15 @@ function getSessionDetail(hostId, sessionId, options = {}) {
     requests,
     receivedFiles,
   };
+}
+
+function hasUsableLocalSessionTranscriptDetail(detail) {
+  const transcript = Array.isArray(detail?.transcript) ? detail.transcript : [];
+  return transcript.some((entry) => (
+    entry
+    && ['user', 'agent', 'assistant'].includes(String(entry.speaker || '').toLowerCase())
+    && (entry.text || (Array.isArray(entry.files) && entry.files.length))
+  ));
 }
 
 function shouldRequestRemoteSessionDetail(host, detail, options = {}) {
@@ -2649,6 +6100,14 @@ function shouldRequestRemoteSessionDetail(host, detail, options = {}) {
     return false;
   }
   const session = detail?.session || {};
+  if (
+    !options.fullTranscript
+    && !options.fullDiagnostics
+    && !options.forceRemoteDetail
+    && hasUsableLocalSessionTranscriptDetail(detail)
+  ) {
+    return false;
+  }
   if (options.forceRemoteDetail || options.fullTranscript || options.fullDiagnostics) {
     return true;
   }
@@ -2737,7 +6196,9 @@ function mergeRemoteSessionDetail(hostId, sessionId, detail, remoteDetail, optio
 
   return {
     ...detail,
-    session: getSession(hostId, effectiveSessionId) || detail.session,
+    session: sessionWithAssistantProjection(
+      getSession(hostId, effectiveSessionId) || detail.session
+    ),
     transcript,
     diagnostics,
     remoteDetail: {
@@ -3744,7 +7205,7 @@ function setSessionRuntime(hostId, sessionId, runtime) {
 function appendSessionDiagnostic(hostId, sessionId, entry) {
   const key = resolveSessionKey(hostId, sessionId);
   const existing = state.sessionDiagnostics.get(key) || [];
-  const nextEntry = {
+  const nextEntry = normalizeStoredSessionDiagnostic({
     timestamp: entry.timestamp || nowIso(),
     severity: entry.severity || 'info',
     source: entry.source || 'codex',
@@ -3754,16 +7215,11 @@ function appendSessionDiagnostic(hostId, sessionId, entry) {
     detail: entry.detail || null,
     data: entry.data || null,
     turnId: entry.turnId || entry.data?.turnId || null,
-  };
-  existing.push(nextEntry);
-  state.sessionDiagnostics.set(
-    key,
-    compactSessionDiagnostics(mergeByFingerprint(
-      existing,
-      diagnosticFingerprint,
-      SESSION_DIAGNOSTIC_ENTRY_LIMIT
-    ))
-  );
+  });
+  if (!nextEntry) {
+    return null;
+  }
+  state.sessionDiagnostics.set(key, appendCompactedSessionDiagnostic(existing, nextEntry));
   scheduleSessionDiagnosticsSave();
   return nextEntry;
 }
@@ -3771,6 +7227,9 @@ function appendSessionDiagnostic(hostId, sessionId, entry) {
 function emitSessionDiagnostic(hostId, sessionId, entry) {
   const effectiveSessionId = resolveSessionId(hostId, sessionId);
   const nextEntry = appendSessionDiagnostic(hostId, effectiveSessionId, entry);
+  if (!nextEntry) {
+    return null;
+  }
   const payload = {
     ...nextEntry,
     hostId,
@@ -3841,6 +7300,92 @@ function emitSessionRequest(hostId, sessionId, entry) {
   };
   broadcastSessionEvent(hostId, sessionId, 'session.request', payload);
   return payload;
+}
+
+function goalAutoApproveKey(hostId, sessionId) {
+  return sessionKey(hostId, resolveSessionId(hostId, sessionId));
+}
+
+function getGoalAutoApproveState(hostId, sessionId) {
+  return state.goalAutoApproveRequests.get(goalAutoApproveKey(hostId, sessionId)) || null;
+}
+
+function isGoalAutoApproveEnabled(hostId, sessionId) {
+  const stored = getGoalAutoApproveState(hostId, sessionId);
+  if (!stored?.enabled) {
+    return false;
+  }
+  const runtime = state.sessionRuntime.get(goalAutoApproveKey(hostId, sessionId)) || {};
+  const goal = runtime.goal || null;
+  const goalStatus = String(goal?.status || '').toLowerCase();
+  return Boolean(goal && !['complete', 'completed', 'blocked', 'cancelled', 'canceled'].includes(goalStatus));
+}
+
+function setGoalAutoApproveState(hostId, sessionId, patch = {}) {
+  const key = goalAutoApproveKey(hostId, sessionId);
+  const previous = state.goalAutoApproveRequests.get(key) || {};
+  const next = {
+    enabled: Boolean(patch.enabled),
+    updatedAt: patch.updatedAt || nowIso(),
+    scope: 'goal',
+    requestId: patch.requestId || previous.requestId || null,
+  };
+  if (!next.enabled) {
+    state.goalAutoApproveRequests.delete(key);
+    return { ...next, enabled: false };
+  }
+  state.goalAutoApproveRequests.set(key, next);
+  return next;
+}
+
+function clearGoalAutoApproveState(hostId, sessionId) {
+  state.goalAutoApproveRequests.delete(goalAutoApproveKey(hostId, sessionId));
+}
+
+function maybeClearGoalAutoApproveForRuntime(hostId, sessionId, runtime = {}) {
+  const goal = runtime?.goal;
+  const goalStatus = String(goal?.status || '').toLowerCase();
+  if (goal === null || ['complete', 'completed', 'blocked', 'cancelled', 'canceled'].includes(goalStatus)) {
+    clearGoalAutoApproveState(hostId, sessionId);
+  }
+}
+
+function sessionIdentityPatch(hostId, sessionId) {
+  const session = getSession(hostId, sessionId);
+  return {
+    nativeThreadId: session?.nativeThreadId || null,
+    bridgeSessionId: session?.bridgeSessionId || null,
+    originSessionId: session?.originSessionId || null,
+    sourceSessionId: session?.sourceSessionId || null,
+    conversationKey: session?.conversationKey || null,
+    runId: session?.runId || null,
+  };
+}
+
+function maybeAutoApproveSessionRequest(hostId, sessionId, requestEntry) {
+  if (!isGoalAutoApproveEnabled(hostId, sessionId)) {
+    return false;
+  }
+  const method = String(requestEntry?.method || '');
+  if (method !== 'item/commandExecution/requestApproval' && method !== 'item/fileChange/requestApproval') {
+    return false;
+  }
+  const requestId = String(requestEntry?.requestId || '').trim();
+  if (!requestId) {
+    return false;
+  }
+  enqueueCommand(hostId, {
+    type: 'session.request.respond',
+    sessionId,
+    requestId,
+    response: {
+      decision: 'accept',
+      autoApproved: true,
+      scope: 'goal',
+    },
+    ...sessionIdentityPatch(hostId, sessionId),
+  });
+  return true;
 }
 
 function resolveSessionRequest(hostId, sessionId, requestId, patch = {}) {
@@ -4304,11 +7849,11 @@ function migrateSessionIdentity(hostId, fromSessionId, toSessionId, patch = {}) 
 }
 
 function persistConnectors() {
-  saveConnectors(Array.from(state.connectors.values()));
+  saveConnectors(Array.from(state.connectors.values()), CONNECTORS_PATH);
 }
 
 function persistConnectorSecrets() {
-  saveConnectorSecrets(state.connectorSecrets);
+  saveConnectorSecrets(state.connectorSecrets, CONNECTOR_SECRETS_PATH);
 }
 
 function persistSessionCollections() {
@@ -4343,6 +7888,17 @@ function findSessionMetadataTitle(hostId, identities = []) {
 
 function findSessionMetadataEntry(hostId, identities = []) {
   for (const identity of identities) {
+    const record = state.provenance?.getSessionRecord({ hostId, sessionId: identity });
+    if (record?.title && isMeaningfulSessionTitle(record.title, identities)) {
+      return {
+        hostId,
+        identity,
+        title: record.title,
+        cwd: record.cwd || '',
+        source: record.source || 'metadata',
+        updatedAt: record.updatedAt || null,
+      };
+    }
     const entry = state.sessionMetadata.get(sessionMetadataKey(hostId, identity));
     if (entry?.title && isMeaningfulSessionTitle(entry.title, identities)) {
       return entry;
@@ -4386,6 +7942,57 @@ function rememberSessionTitle(hostId, identities = [], title, options = {}) {
     saveSessionMetadata();
   }
   return changed;
+}
+
+function persistSessionPresentation(hostId, session, options = {}) {
+  if (!state.sessionRecordStore || !session?.sessionId) {
+    return Promise.resolve(null);
+  }
+  return state.sessionRecordStore.transact('session.presentation.updated', (tx) => {
+    const concreteIdentity = {
+      hostId,
+      sessionId: session.sessionId,
+      bridgeSessionId: session.bridgeSessionId || null,
+      nativeThreadId: session.nativeThreadId || null,
+    };
+    const canonicalKey = tx.resolveCanonicalKey(concreteIdentity);
+    const record = tx.ensureRecord(canonicalKey, {
+      hostId,
+      conversationKey: session.conversationKey || session.sessionId,
+      source: session.source || options.source || 'metadata',
+    });
+    record.title = normalizeSessionTitle(session.title || record.title || '');
+    record.cwd = String(session.cwd || record.cwd || '').trim() || null;
+    record.bridgeSessionId ||= session.bridgeSessionId || null;
+    record.nativeThreadId ||= session.nativeThreadId || null;
+    record.originSessionId ||= session.originSessionId || null;
+    record.sourceSessionId ||= session.sourceSessionId || null;
+    if (!record.source || record.source === 'metadata') {
+      record.source = session.source || options.source || record.source || 'metadata';
+    }
+    record.updatedAt = nowIso();
+    for (const value of [
+      session.sessionId,
+      record.bridgeSessionId,
+      record.nativeThreadId,
+    ].filter(Boolean)) {
+      tx.setAlias(`${hostId}::${value}`, canonicalKey);
+    }
+    if (record.conversationKey) {
+      const conversationAlias = `${hostId}::${record.conversationKey}`;
+      const existingTarget = tx.aliasTarget(conversationAlias);
+      if (!existingTarget || existingTarget === canonicalKey) {
+        tx.setAlias(conversationAlias, canonicalKey);
+      }
+    }
+    tx.appendDomainEvent({
+      type: 'session.presentation.updated',
+      canonicalKey,
+      source: options.source || session.titleSource || session.source || null,
+    });
+    tx.markDirty(canonicalKey);
+    return structuredClone(record);
+  });
 }
 
 function resolveSessionTitle(hostId, existing, patch = {}) {
@@ -4556,10 +8163,14 @@ function maybeInferAndPersistSessionTitle(hostId, sessionId, transcript = []) {
     return session;
   }
 
-  return updateSessionTitle(hostId, sessionId, inferredTitle, {
+  const updated = updateSessionTitle(hostId, sessionId, inferredTitle, {
     source: 'inferred',
     touch: false,
   }) || session;
+  persistSessionPresentation(hostId, updated, { source: 'inferred' }).catch((error) => {
+    console.error(`[relay] failed to persist inferred Session title: ${error.message || error}`);
+  });
+  return updated;
 }
 
 function inferSessionTitleFromTranscript(session, transcript = []) {
@@ -5232,8 +8843,8 @@ function connectorUsesAskpass(connector, secret) {
 }
 
 function ensureAskpassHelper() {
-  const helperPath = path.join(process.cwd(), 'tmp', 'remote-codex-askpass.cmd');
-  const helperScriptPath = path.join(process.cwd(), 'tmp', 'remote-codex-askpass.ps1');
+  const helperPath = path.join(RELAY_STATE_ROOT, 'remote-codex-askpass.cmd');
+  const helperScriptPath = path.join(RELAY_STATE_ROOT, 'remote-codex-askpass.ps1');
   const psScript = [
     '$ErrorActionPreference = "SilentlyContinue"',
     '$promptText = [string]$env:RC_ASKPASS_PROMPT',
@@ -5311,7 +8922,7 @@ function buildAskpassEnv(connector, secret) {
   ].filter(Boolean);
   const firstResponse = responses[0] || '';
   const lastResponse = responses[responses.length - 1] || firstResponse;
-  const statePath = path.join(process.cwd(), 'tmp', `askpass-state-${connector.connectorId || makeId()}.txt`);
+  const statePath = path.join(RELAY_STATE_ROOT, `askpass-state-${connector.connectorId || makeId()}.txt`);
 
   try {
     fs.rmSync(statePath, { force: true });
@@ -5384,23 +8995,6 @@ function localScpPath(value) {
   return String(value || '').replace(/\\/g, '/');
 }
 
-function buildSshMultiplexOptions(connector) {
-  const safeId = String(connector?.connectorId || connector?.hostId || makeId())
-    .replace(/[^a-zA-Z0-9_.-]+/g, '-')
-    .slice(0, 48) || 'connector';
-  const controlRoot = process.platform === 'win32'
-    ? path.join('C:\\tmp', 'remote-codex-ssh-control')
-    : path.join(process.cwd(), 'tmp', 'ssh-control');
-  const controlPath = localScpPath(path.join(controlRoot, safeId));
-  fs.mkdirSync(path.dirname(controlPath), { recursive: true });
-  return {
-    controlMaster: 'auto',
-    controlPersist: '24h',
-    controlPath,
-    streamLocalBindUnlink: 'yes',
-  };
-}
-
 function sshRunText(run) {
   return [
     run?.stdout,
@@ -5409,56 +9003,6 @@ function sshRunText(run) {
     run?.message,
     run?.status,
   ].filter(Boolean).join('\n');
-}
-
-function isSshMultiplexSocketFailureText(text) {
-  return /getsockname failed|not a socket|controlpath|controlmaster|mux_client|stale control socket/i.test(String(text || ''));
-}
-
-function isSshMultiplexSocketFailureStep(step) {
-  return Boolean(step && (
-    isSshMultiplexSocketFailureText(sshRunText(step))
-    || (Number(step.exitCode) === 4294967295 && /unknown error|read from remote host/i.test(sshRunText(step)))
-  ));
-}
-
-function deploymentHasSshMultiplexSocketFailure(deployment) {
-  return Boolean(deployment?.steps?.some(isSshMultiplexSocketFailureStep));
-}
-
-function cleanupSshMultiplexOptions(sshOptions = {}) {
-  if (!sshOptions.controlPath) {
-    return;
-  }
-  try {
-    fs.rmSync(sshOptions.controlPath, { force: true });
-  } catch (_) {
-    // Best effort: a failed cleanup should not hide the real SSH result.
-  }
-}
-
-function connectorSshMultiplexDisabled(connector) {
-  return state.sshMultiplexDisabled.get(connector?.connectorId || connector?.hostId || '') || null;
-}
-
-function disableConnectorSshMultiplex(connector, reason) {
-  const key = connector?.connectorId || connector?.hostId || '';
-  if (!key) {
-    return;
-  }
-  state.sshMultiplexDisabled.set(key, {
-    reason: reason || 'ControlMaster socket failure',
-    disabledAt: nowIso(),
-  });
-}
-
-function getConnectorSshOptions(connector, action, secret) {
-  // Bootstrap now runs as one SSH tar stream, so ControlMaster is no longer on
-  // the critical path for MFA-heavy hosts or Windows OpenSSH clients.
-  void connector;
-  void action;
-  void secret;
-  return {};
 }
 
 function buildScpCommandParts(connector, localSources, remoteDirectory, options = {}) {
@@ -5472,6 +9016,9 @@ function buildScpCommandParts(connector, localSources, remoteDirectory, options 
   }
   if (options.strictHostKeyChecking) {
     args.push('-o', `StrictHostKeyChecking=${options.strictHostKeyChecking}`);
+  }
+  if (options.userKnownHostsFile) {
+    args.push('-o', `UserKnownHostsFile=${options.userKnownHostsFile}`);
   }
   if (options.numberOfPasswordPrompts) {
     args.push('-o', `NumberOfPasswordPrompts=${Math.max(1, Number(options.numberOfPasswordPrompts) || 1)}`);
@@ -5704,7 +9251,8 @@ function getLocalNodeRuntimeArchive() {
   const candidates = [
     process.env.CODEX_NODE_RUNTIME_ARCHIVE,
     path.join(process.cwd(), 'runtimes', 'node', archiveName),
-    path.join(process.cwd(), 'tmp', archiveName),
+    path.join(RELAY_STATE_ROOT, archiveName),
+    path.join(LEGACY_RUNTIME_CACHE_ROOT, archiveName),
   ].filter(Boolean);
 
   for (const candidate of candidates) {
@@ -5748,9 +9296,14 @@ function getLocalCodexLinuxSourceDir() {
     return bundledRuntime;
   }
 
-  const legacyStagedRuntime = path.join(process.cwd(), 'tmp', 'codex-linux-x86_64');
+  const legacyStagedRuntime = path.join(RELAY_STATE_ROOT, 'codex-linux-x86_64');
   if (fs.existsSync(path.join(legacyStagedRuntime, 'codex'))) {
     return legacyStagedRuntime;
+  }
+
+  const legacyWorkspaceRuntime = path.join(LEGACY_RUNTIME_CACHE_ROOT, 'codex-linux-x86_64');
+  if (fs.existsSync(path.join(legacyWorkspaceRuntime, 'codex'))) {
+    return legacyWorkspaceRuntime;
   }
 
   const cursorExtensions = path.join(os.homedir(), '.cursor', 'extensions');
@@ -5782,7 +9335,7 @@ function stageLocalCodexLinuxRuntime() {
 
   const sourceCodex = path.join(sourceDir, 'codex');
   const codexStat = fs.statSync(sourceCodex);
-  const tmpRoot = path.resolve(process.cwd(), 'tmp');
+  const tmpRoot = RELAY_STATE_ROOT;
   const stageDir = path.join(tmpRoot, 'codex-linux-x86_64');
   const markerPath = path.join(stageDir, '.source.json');
   const marker = {
@@ -5835,10 +9388,12 @@ function stageLocalCodexLinuxRuntime() {
 
 function buildSshActionOptions(connector, action, secret) {
   const useAskpass = connectorUsesAskpass(connector, secret);
+  fs.mkdirSync(path.dirname(SSH_KNOWN_HOSTS_PATH), { recursive: true });
   const options = {
     connectTimeout: action === 'bootstrap' ? 12 : 8,
     disableTty: true,
     strictHostKeyChecking: 'accept-new',
+    userKnownHostsFile: SSH_KNOWN_HOSTS_PATH,
   };
 
   if (useAskpass) {
@@ -6638,8 +10193,6 @@ async function runConnectorAction(connector, action, secretOverride = null) {
   const secret = secretOverride || state.connectorSecrets.get(connector.connectorId) || null;
   const manualCommand = decorated.plan.sshLoginCommand;
   const manualBootstrapCommand = decorated.plan.bootstrapCommand;
-  const sshOptions = getConnectorSshOptions(connector, action, secret);
-  let activeSshOptions = sshOptions;
 
   if (!['smoke_test', 'status', 'diagnose', 'logs', 'bootstrap', 'restart'].includes(action)) {
     return {
@@ -6693,7 +10246,7 @@ async function runConnectorAction(connector, action, secretOverride = null) {
     };
   }
 
-  const actionConfig = buildConnectorAction(connector, action, secret, activeSshOptions);
+  const actionConfig = buildConnectorAction(connector, action, secret);
   if (!actionConfig?.commandParts) {
     return {
       httpStatus: 200,
@@ -6708,7 +10261,7 @@ async function runConnectorAction(connector, action, secretOverride = null) {
     };
   }
 
-  let run = await runProcess(
+  const run = await runProcess(
     actionConfig.commandParts.command,
     actionConfig.commandParts.args,
     {
@@ -6716,26 +10269,6 @@ async function runConnectorAction(connector, action, secretOverride = null) {
       env: actionConfig.env || null,
     }
   );
-  let actionMultiplexFallback = null;
-  if (activeSshOptions.controlPath && isSshMultiplexSocketFailureStep(run)) {
-    disableConnectorSshMultiplex(connector, 'ControlMaster socket failure during action command');
-    cleanupSshMultiplexOptions(activeSshOptions);
-    const fallbackActionConfig = buildConnectorAction(connector, action, secret, {});
-    if (fallbackActionConfig?.commandParts) {
-      actionMultiplexFallback = {
-        controlPath: activeSshOptions.controlPath,
-        failedRun: run,
-      };
-      run = await runProcess(
-        fallbackActionConfig.commandParts.command,
-        fallbackActionConfig.commandParts.args,
-        {
-          timeoutMs: fallbackActionConfig.timeoutMs,
-          env: fallbackActionConfig.env || null,
-        }
-      );
-    }
-  }
   const classification = classifyConnectorAction(action, run);
   return {
     httpStatus: 200,
@@ -6751,8 +10284,7 @@ async function runConnectorAction(connector, action, secretOverride = null) {
       error: run.error,
       startedAt: run.startedAt,
       completedAt: run.completedAt,
-      deploy: deployment,
-      multiplexFallback: deployment?.multiplexFallback || actionMultiplexFallback,
+      multiplexFallback: null,
       expectedHostId: connector.hostId || null,
       connector: decorateSingleConnector(connector),
     },
@@ -6787,7 +10319,8 @@ function getStats() {
     relay: {
       platform: process.platform,
       hostname: os.hostname(),
-      localAgentSupported: true,
+      localAgentSupported: LOCAL_AGENT_START_ENABLED,
+      localAgentStartEnabled: LOCAL_AGENT_START_ENABLED,
       localRelayUrl: getLocalRelayUrl(),
     },
     summary: {
@@ -6888,6 +10421,28 @@ function awaitHostProbe(requestId, timeoutMs = 5000) {
   });
 }
 
+function awaitSessionApiRequest(pendingMap, requestId, label, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingMap.delete(requestId);
+      reject(new Error(`${label} timed out while waiting for host-agent`));
+    }, timeoutMs);
+
+    pendingMap.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        pendingMap.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        pendingMap.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
 function awaitModelListRequest(requestId, timeoutMs = 35000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -6908,6 +10463,24 @@ function awaitModelListRequest(requestId, timeoutMs = 35000) {
       },
     });
   });
+}
+
+function awaitApiCatalogRequest(requestId, timeoutMs = 20000) {
+  return awaitSessionApiRequest(
+    state.pendingApiCatalogRequests,
+    requestId,
+    'provider model catalog request',
+    timeoutMs
+  );
+}
+
+function awaitBindingPreflightRequest(requestId, timeoutMs = 12000) {
+  return awaitSessionApiRequest(
+    state.pendingBindingPreflightRequests,
+    requestId,
+    'Host API binding preflight',
+    timeoutMs
+  );
 }
 
 function awaitApiTestRequest(requestId, timeoutMs = 20000) {
@@ -6932,6 +10505,195 @@ function awaitApiTestRequest(requestId, timeoutMs = 20000) {
   });
 }
 
+function modelRequestSessionId(input = {}) {
+  return String(
+    input.sessionId
+    || input.identity?.sessionId
+    || input.nativeThreadId
+    || input.identity?.nativeThreadId
+    || ''
+  ).trim();
+}
+
+async function requestLiveModelPage(input = {}) {
+  const hostId = String(input.hostId || '').trim();
+  const sessionId = modelRequestSessionId(input);
+  const session = hostId && sessionId ? getSession(hostId, sessionId) : null;
+  const host = state.hosts.get(hostId);
+  if (!session || !sessionAcceptsLiveControl(hostId, session)) {
+    throw new Error('live model catalog is unavailable until the Session runner is active');
+  }
+  if (!host?.capabilities?.modelList) {
+    throw new Error('this Host agent does not support live model metadata');
+  }
+
+  const models = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  let complete = false;
+  let truncated = false;
+  for (let pageIndex = 0; pageIndex < 32; pageIndex += 1) {
+    const requestId = makeId();
+    const pending = awaitModelListRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'session.model_list',
+      sessionId: session.sessionId || sessionId,
+      requestId,
+      includeHidden: true,
+      cursor,
+      limit: 200,
+      bindingFingerprint: input.bindingFingerprint || null,
+      runId: input.runId || null,
+    });
+    const page = await pending;
+    if (
+      input.bindingFingerprint
+      && page.bindingFingerprint
+      && page.bindingFingerprint !== input.bindingFingerprint
+    ) {
+      throw new SessionContractError(
+        'session_api_binding_mismatch',
+        'Live model metadata belongs to a different Session API binding.',
+        { canRebind: true }
+      );
+    }
+    models.push(...(Array.isArray(page.models) ? page.models : []));
+    const nextCursor = String(page.nextCursor || '').trim() || null;
+    truncated ||= page.truncated === true;
+    if (!nextCursor) {
+      complete = page.complete !== false && !truncated;
+      break;
+    }
+    if (seenCursors.has(nextCursor)) {
+      truncated = true;
+      break;
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  if (cursor && !complete) {
+    truncated = true;
+  }
+  return {
+    source: 'live',
+    authority: 'authoritative',
+    complete,
+    truncated,
+    nextCursor: complete ? null : cursor,
+    stale: false,
+    fetchedAt: nowIso(),
+    models,
+  };
+}
+
+async function requestProviderModelPage(input = {}) {
+  const hostId = String(input.hostId || '').trim();
+  const host = state.hosts.get(hostId);
+  const apiConfig = normalizeApiConfig(input.apiConfig);
+  if (!apiConfig) {
+    throw new Error('provider model catalog requires the Session API profile credentials');
+  }
+  if (!host?.capabilities?.apiCatalog) {
+    throw new Error('this Host agent does not support provider model catalogs');
+  }
+
+  const models = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  let complete = false;
+  let truncated = false;
+  for (let pageIndex = 0; pageIndex < 32; pageIndex += 1) {
+    const requestId = makeId();
+    const pending = awaitApiCatalogRequest(requestId);
+    enqueueCommand(hostId, {
+      type: 'host.api_catalog',
+      requestId,
+      apiConfig,
+      bindingFingerprint: input.bindingFingerprint || null,
+      runId: input.runId || null,
+      cursor,
+      limit: 200,
+      timeoutMs: 15000,
+    });
+    const payload = await pending;
+    const result = payload.result || {};
+    if (!result.ok || !result.modelPage) {
+      const status = Number(result.statusCode || 0);
+      const error = new Error(result.error || result.message || `provider model catalog failed${status ? ` (${status})` : ''}`);
+      error.statusCode = status;
+      throw error;
+    }
+    const page = result.modelPage;
+    models.push(...(Array.isArray(page.models) ? page.models : []));
+    const nextCursor = String(page.nextCursor || '').trim() || null;
+    truncated ||= page.truncated === true;
+    if (!nextCursor) {
+      complete = page.complete === true && !truncated;
+      break;
+    }
+    if (seenCursors.has(nextCursor)) {
+      truncated = true;
+      break;
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  if (cursor && !complete) {
+    truncated = true;
+  }
+  return {
+    source: 'provider',
+    authority: 'authoritative',
+    complete,
+    truncated,
+    nextCursor: complete ? null : cursor,
+    stale: false,
+    fetchedAt: nowIso(),
+    models,
+  };
+}
+
+async function requestHostBindingPreflight(hostId, expectedBinding = null) {
+  const host = state.hosts.get(hostId);
+  if (!host?.capabilities?.bindingPreflight) {
+    throw new SessionContractError(
+      'session_api_binding_unavailable',
+      'This Host agent cannot attest its current API binding.',
+      { canRebind: true }
+    );
+  }
+  const requestId = makeId();
+  const pending = awaitBindingPreflightRequest(requestId);
+  enqueueCommand(hostId, {
+    type: 'host.binding_preflight',
+    requestId,
+    expectedBinding: publicBinding(expectedBinding),
+  });
+  const payload = await pending;
+  if (!payload.ok || !payload.binding?.bindingFingerprint) {
+    throw new SessionContractError(
+      payload.code || 'session_api_binding_unavailable',
+      payload.error || 'The Host API binding could not be verified.',
+      {
+        sessionBinding: publicBinding(expectedBinding),
+        submittedBinding: publicBinding(payload.binding),
+        canRebind: payload.canRebind !== false,
+      }
+    );
+  }
+  return publicBinding(payload.binding);
+}
+
+function publicModelCatalog(catalog) {
+  return {
+    models: Array.isArray(catalog?.models) ? catalog.models : [],
+    sources: Array.isArray(catalog?.sources) ? catalog.sources : [],
+    defaultModel: catalog?.defaultModel || null,
+    cacheState: catalog?.cacheState || 'miss',
+    savedAt: catalog?.savedAt || null,
+  };
+}
+
 function awaitSkillListRequest(requestId, timeoutMs = 35000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -6948,6 +10710,28 @@ function awaitSkillListRequest(requestId, timeoutMs = 35000) {
       reject: (error) => {
         clearTimeout(timer);
         state.pendingSkillRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function awaitHostSkillRequest(requestId, timeoutMs = 35000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingHostSkillRequests.delete(requestId);
+      reject(new Error('host skills request timed out while waiting for host-agent to respond'));
+    }, timeoutMs);
+
+    state.pendingHostSkillRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingHostSkillRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingHostSkillRequests.delete(requestId);
         reject(error);
       },
     });
@@ -7697,19 +11481,10 @@ function resolveSessionCreatedAt(existing, patch) {
 }
 
 function upsertSession(hostId, patch, options = {}) {
-  const identityValues = [
-    patch.sessionId,
-    patch.bridgeSessionId,
-    patch.runId,
-    patch.runtime?.runId,
-    patch.nativeThreadId,
-    patch.originSessionId,
-    patch.sourceSessionId,
-    patch.conversationKey,
-  ];
+  const ownershipIdentities = sessionOwnershipIdentityValues(patch);
   const preserveManagedLive = options.preserveManagedLive !== false;
   const managedLiveMatch = preserveManagedLive && patch.source !== 'managed' && patch.live !== true
-    ? findManagedLiveSessionByIdentities(hostId, identityValues)
+    ? findManagedLiveSessionByIdentities(hostId, ownershipIdentities)
     : null;
   const canonicalSessionId = managedLiveMatch?.sessionId || resolveSessionId(hostId, patch.sessionId) || patch.sessionId;
   if (managedLiveMatch && patch.sessionId !== canonicalSessionId) {
@@ -7832,6 +11607,15 @@ function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
 }
 
 function getCurrentSessionRunId(hostId, sessionId) {
+  const record = state.provenance?.getSessionRecord({ hostId, sessionId });
+  const publishedLive = publishedLiveSessionRun(hostId, sessionId, record);
+  if (publishedLive) {
+    return publishedLive.runId;
+  }
+  const durableRun = record?.activeRunId ? record.runs?.[record.activeRunId] : null;
+  if (durableRun && ['pending', 'live'].includes(durableRun.status)) {
+    return record.activeRunId;
+  }
   const session = getSession(hostId, sessionId);
   const runtime = state.sessionRuntime.get(sessionKey(hostId, sessionId))
     || state.sessionRuntime.get(resolveSessionKey(hostId, sessionId))
@@ -7847,57 +11631,421 @@ function isStaleSessionRunEvent(event, effectiveSessionId) {
   return Boolean(currentRunId && currentRunId !== event.runId);
 }
 
+function eventTargetsPublishedParentRun(event, effectiveSessionId) {
+  const eventRunId = String(event?.runId || '').trim();
+  if (!eventRunId) {
+    return false;
+  }
+  const record = state.provenance?.getSessionRecord({
+    hostId: event.hostId,
+    sessionId: effectiveSessionId,
+  });
+  const activeRunId = String(record?.activeRunId || '').trim();
+  const activeRun = activeRunId ? record?.runs?.[activeRunId] || null : null;
+  const projectedRunId = String(getSession(event.hostId, effectiveSessionId)?.runId || '').trim();
+  return Boolean(
+    activeRun?.status === 'pending'
+    && activeRun.parentRunId === eventRunId
+    && projectedRunId === activeRunId
+  );
+}
+
 function sessionAgeMs(session) {
   const timestamp = Date.parse(session?.lastUpdatedAt || session?.createdAt || '');
   return Number.isFinite(timestamp) ? Date.now() - timestamp : Infinity;
 }
 
-function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds) {
+async function stopSessionRunDurably(hostId, sessionId, runId = null, options = {}) {
+  if (!state.provenance) {
+    return false;
+  }
+  const session = getSession(hostId, sessionId);
+  const record = state.provenance.getSessionRecord({ hostId, sessionId });
+  const effectiveRunId = runId || session?.runId || record?.activeRunId || null;
+  if (!effectiveRunId) {
+    return false;
+  }
+  const run = record?.runs?.[effectiveRunId] || null;
+  if (!run || ['failed', 'stopped'].includes(run.status)) {
+    return false;
+  }
+  try {
+    const stopped = await state.provenance.stopRun({
+      identity: {
+        hostId,
+        sessionId: session?.bridgeSessionId || session?.sessionId || sessionId,
+      },
+      runId: effectiveRunId,
+      commitGuard: options.commitGuard,
+    });
+    return stopped.guardRejected !== true;
+  } catch (error) {
+    if (error?.code === 'session_run_not_found') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function closeMissingDiscoveredRun(hostId, sessionId, runId, run, closeToken) {
+  const expectedBindingFingerprint = run?.apiBinding?.bindingFingerprint || null;
+  try {
+    const stopped = await state.provenance.stopRun({
+      identity: { hostId, sessionId },
+      runId,
+      requireExpectedRun: true,
+      expectedRunId: runId,
+      expectedRunStatus: 'live',
+      expectedRunStatusProvided: true,
+      expectedBindingFingerprint,
+      expectedBindingProvided: Boolean(expectedBindingFingerprint),
+      commitGuard: () => claimManagedDiscoveryCloseToken(closeToken),
+    });
+    if (stopped.guardRejected === true) {
+      return false;
+    }
+  } catch (error) {
+    if ([
+      'session_run_changed',
+      'session_run_not_found',
+      'session_run_pending',
+      'session_run_state_conflict',
+      'session_run_stopping',
+    ].includes(error?.code)) {
+      return false;
+    }
+    throw error;
+  }
+
+  if (!managedDiscoveryCloseTokenIsCurrent(closeToken)) {
+    return false;
+  }
+  const currentRecord = state.provenance.getSessionRecord({ hostId, sessionId });
+  const currentRun = currentRecord?.runs?.[runId] || null;
+  if (currentRecord?.activeRunId || currentRun?.status !== 'stopped') {
+    return false;
+  }
+  const projected = getSession(hostId, sessionId);
+  if (projected?.runId && projected.runId !== runId) {
+    return false;
+  }
+  markSessionClosed(hostId, sessionId);
+  return true;
+}
+
+function managedDiscoveryRunKey(hostId, sessionId, runId) {
+  return `${hostId}\0${runId || `session:${sessionId}`}`;
+}
+
+function managedDiscoveryCloseTokenIsCurrent(token) {
+  return Boolean(
+    token?.kind === 'closing'
+    && token.key
+    && state.missingManagedDiscoveryRuns.get(token.key) === token
+  );
+}
+
+function claimManagedDiscoveryCloseToken(token) {
+  if (!managedDiscoveryCloseTokenIsCurrent(token)) {
+    return false;
+  }
+  token.commitStarted = true;
+  return true;
+}
+
+function invalidateManagedDiscoveryMissingRun(key) {
+  const current = state.missingManagedDiscoveryRuns.get(key) || null;
+  if (current?.kind === 'closing' && current.commitStarted === true) {
+    return false;
+  }
+  return state.missingManagedDiscoveryRuns.delete(key);
+}
+
+function releaseManagedDiscoveryCloseToken(token) {
+  if (managedDiscoveryCloseTokenIsCurrent(token)) {
+    state.missingManagedDiscoveryRuns.delete(token.key);
+  }
+}
+
+async function applyConfirmedManagedDiscoveryClose(token, operation) {
+  if (!managedDiscoveryCloseTokenIsCurrent(token)) {
+    return false;
+  }
+  if (TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS > 0) {
+    await new Promise((resolve) => setTimeout(resolve, TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS));
+  }
+  if (!managedDiscoveryCloseTokenIsCurrent(token)) {
+    return false;
+  }
+  try {
+    return await operation();
+  } finally {
+    releaseManagedDiscoveryCloseToken(token);
+  }
+}
+
+function noteManagedRunPresent(evaluation, key) {
+  evaluation.seen.add(key);
+  evaluation.decisions.set(key, null);
+  invalidateManagedDiscoveryMissingRun(key);
+}
+
+function confirmManagedRunMissing(evaluation, key, discoveryId = '') {
+  evaluation.seen.add(key);
+  if (evaluation.decisions.has(key)) return evaluation.decisions.get(key);
+  const now = Date.now();
+  const previous = state.missingManagedDiscoveryRuns.get(key) || null;
+  const normalizedDiscoveryId = String(discoveryId || '').trim().slice(0, 512);
+  if (previous?.kind === 'closing') {
+    evaluation.decisions.set(key, null);
+    return null;
+  }
+  const repeatedSnapshot = Boolean(
+    normalizedDiscoveryId
+    && previous?.discoveryId
+    && previous.discoveryId === normalizedDiscoveryId
+  );
+  const confirmed = Boolean(
+    previous
+    && !repeatedSnapshot
+    && now - Number(previous.lastMissingAt || 0) >= MISSING_MANAGED_DISCOVERY_CONFIRMATION_MS
+  );
+  let closeToken = null;
+  if (confirmed) {
+    closeToken = {
+      kind: 'closing',
+      key,
+      confirmedAt: now,
+      discoveryId: normalizedDiscoveryId || null,
+    };
+    state.missingManagedDiscoveryRuns.set(key, closeToken);
+  } else if (!previous) {
+    state.missingManagedDiscoveryRuns.set(key, {
+      kind: 'missing',
+      lastMissingAt: now,
+      discoveryId: normalizedDiscoveryId || null,
+    });
+  }
+  evaluation.decisions.set(key, closeToken);
+  return closeToken;
+}
+
+function pruneManagedDiscoveryMissingRuns(hostId, seen) {
+  const prefix = `${hostId}\0`;
+  for (const key of state.missingManagedDiscoveryRuns.keys()) {
+    if (key.startsWith(prefix) && !seen.has(key)) {
+      invalidateManagedDiscoveryMissingRun(key);
+    }
+  }
+}
+
+async function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds, options = {}) {
   let closedCount = 0;
+  const evaluation = { decisions: new Map(), seen: new Set() };
+  const discoveryId = String(options.discoveryId || '').trim();
   for (const session of Array.from(state.sessions.values())) {
     if (session.hostId !== hostId || session.source !== 'managed' || !session.live) {
       continue;
     }
-    if (sessionIdentityValues(session).some((identity) => liveSessionIds.has(identity))) {
+    const record = state.provenance?.getSessionRecord({ hostId, sessionId: session.sessionId });
+    const runId = String(session.runId || record?.activeRunId || '').trim();
+    const run = runId ? record?.runs?.[runId] || null : null;
+    const missingKey = managedDiscoveryRunKey(hostId, session.sessionId, runId);
+    if (sessionOwnershipIdentityValues(session).some((identity) => liveSessionIds.has(identity))) {
+      noteManagedRunPresent(evaluation, missingKey);
       continue;
     }
     if (session.state === 'starting' && sessionAgeMs(session) < STALE_MANAGED_SESSION_GRACE_MS) {
+      noteManagedRunPresent(evaluation, missingKey);
       continue;
     }
-    markSessionClosed(hostId, session.sessionId);
-    closedCount += 1;
+    const closeToken = confirmManagedRunMissing(evaluation, missingKey, discoveryId);
+    if (!closeToken) {
+      continue;
+    }
+    if (run?.status === 'live') {
+      const closed = await applyConfirmedManagedDiscoveryClose(closeToken, () => (
+        closeMissingDiscoveredRun(hostId, session.sessionId, runId, run, closeToken)
+      ));
+      if (closed) {
+        closedCount += 1;
+      }
+      continue;
+    }
+    const closed = await applyConfirmedManagedDiscoveryClose(closeToken, async () => {
+      const expectedProjection = session;
+      const stopped = await stopSessionRunDurably(hostId, session.sessionId, runId || null, {
+        commitGuard: () => claimManagedDiscoveryCloseToken(closeToken),
+      });
+      if (!managedDiscoveryCloseTokenIsCurrent(closeToken)) {
+        return false;
+      }
+      const currentRecord = state.provenance?.getSessionRecord({
+        hostId,
+        sessionId: session.sessionId,
+      });
+      const projected = getSession(hostId, session.sessionId);
+      if (runId && currentRecord?.activeRunId) {
+        return false;
+      }
+      if (runId && projected?.runId && projected.runId !== runId) {
+        return false;
+      }
+      if (!runId && projected !== expectedProjection) {
+        return false;
+      }
+      if (runId && !stopped && currentRecord?.runs?.[runId]?.status === 'live') {
+        return false;
+      }
+      markSessionClosed(hostId, session.sessionId);
+      return true;
+    });
+    if (closed) {
+      closedCount += 1;
+    }
   }
+  const snapshot = state.sessionRecordStore?.readSnapshot();
+  for (const [canonicalKey, record] of Object.entries(snapshot?.records || {})) {
+    if (record?.hostId !== hostId || record.source !== 'managed') {
+      continue;
+    }
+    const runId = String(record.activeRunId || '').trim();
+    const run = runId ? record.runs?.[runId] || null : null;
+    if (run?.status !== 'live') {
+      continue;
+    }
+    const prefix = `${hostId}::`;
+    const canonicalSessionId = canonicalKey.startsWith(prefix)
+      ? canonicalKey.slice(prefix.length)
+      : '';
+    const identities = [
+      record.bridgeSessionId,
+      record.nativeThreadId,
+      record.conversationKey,
+      canonicalSessionId,
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    if (identities.some((identity) => liveSessionIds.has(identity))) {
+      noteManagedRunPresent(evaluation, managedDiscoveryRunKey(hostId, canonicalSessionId, runId));
+      continue;
+    }
+    const sessionId = record.bridgeSessionId
+      || record.nativeThreadId
+      || record.conversationKey
+      || canonicalSessionId;
+    if (!sessionId) {
+      continue;
+    }
+    const missingKey = managedDiscoveryRunKey(hostId, canonicalSessionId || sessionId, runId);
+    const closeToken = confirmManagedRunMissing(evaluation, missingKey, discoveryId);
+    if (!closeToken) {
+      continue;
+    }
+    const closed = await applyConfirmedManagedDiscoveryClose(closeToken, () => (
+      closeMissingDiscoveredRun(hostId, sessionId, runId, run, closeToken)
+    ));
+    if (closed) {
+      closedCount += 1;
+    }
+  }
+  pruneManagedDiscoveryMissingRuns(hostId, evaluation.seen);
   if (closedCount > 0) {
     console.log(`[relay] closed ${closedCount} stale managed session(s) for ${hostId} after discovery`);
   }
 }
 
-function scheduleStopFallback(hostId, sessionId, delayMs = 4000) {
-  const expectedRunId = getSession(hostId, sessionId)?.runId || null;
+function scheduleStopFallback(hostId, sessionId, options = {}) {
+  if (relayStopping) {
+    return null;
+  }
+  const expectedRunId = String(options.runId || getSession(hostId, sessionId)?.runId || '').trim() || null;
+  const stopRequestId = String(options.stopRequestId || '').trim() || null;
+  const delayMs = Number(options.delayMs || SESSION_STOP_FALLBACK_MS);
   const timer = setTimeout(() => {
-    const session = getSession(hostId, sessionId);
-    const runtime = state.sessionRuntime.get(sessionKey(hostId, sessionId)) || null;
-    if (expectedRunId && session?.runId && session.runId !== expectedRunId) {
+    stopFallbackTimers.delete(timer);
+    if (relayStopping) {
       return;
     }
-    if (session?.live && (session.state === 'ending' || runtime?.phase === 'ending')) {
-      markSessionClosed(hostId, sessionId);
-    }
+    trackRelayBackgroundTask((async () => {
+      const session = getSession(hostId, sessionId);
+      const runtime = state.sessionRuntime.get(sessionKey(hostId, sessionId)) || null;
+      if (expectedRunId && session?.runId && session.runId !== expectedRunId) {
+        return;
+      }
+
+      const record = state.provenance?.getSessionRecord({ hostId, sessionId });
+      const run = expectedRunId ? record?.runs?.[expectedRunId] || null : null;
+      if (run?.status === 'stopped') {
+        markSessionClosed(hostId, sessionId);
+        return;
+      }
+      if (stopRequestId) {
+        const cancelled = await state.provenance.cancelStopRun({
+          identity: { hostId, sessionId },
+          runId: expectedRunId,
+          stopRequestId,
+        });
+        if (cancelled.transitioned !== true) {
+          return;
+        }
+      } else if (!session?.live || (session.state !== 'ending' && runtime?.phase !== 'ending')) {
+        return;
+      }
+
+      const restored = upsertSession(hostId, {
+        sessionId: session?.sessionId || sessionId,
+        state: options.previousState || 'running',
+        live: true,
+        runId: expectedRunId,
+        lastUpdatedAt: nowIso(),
+      }, { preserveManagedLive: false });
+      const runtimeBase = runtime || options.previousRuntime || {};
+      const restoredRuntime = setSessionRuntime(hostId, restored.sessionId, {
+        ...runtimeBase,
+        phase: runtimeBase.phase === 'ending'
+          ? options.previousRuntime?.phase || 'idle'
+          : runtimeBase.phase || options.previousRuntime?.phase || 'idle',
+        connection: runtimeBase.connection === 'closing'
+          ? options.previousRuntime?.connection || 'ready'
+          : runtimeBase.connection || options.previousRuntime?.connection || 'ready',
+        runId: expectedRunId,
+        updatedAt: nowIso(),
+      });
+      broadcastSessionEvent(hostId, restored.sessionId, 'session.runtime_updated', {
+        hostId,
+        sessionId: restored.sessionId,
+        patch: restoredRuntime,
+        timestamp: nowIso(),
+      });
+      broadcastSessionEvent(hostId, restored.sessionId, 'session.snapshot', restored);
+      emitSessionAlert(hostId, restored.sessionId, {
+        severity: 'warning',
+        source: 'relay',
+        message: 'Stop was not confirmed by the Host; the Session remains available for retry.',
+        timestamp: nowIso(),
+      });
+    })()).catch((error) => {
+      console.error(`[relay] failed to reconcile unconfirmed Stop for ${hostId}/${sessionId}: ${error.message || error}`);
+    });
   }, delayMs);
+  stopFallbackTimers.add(timer);
   if (typeof timer.unref === 'function') {
     timer.unref();
   }
+  return timer;
 }
 
-function beginSessionStop(hostId, sessionId) {
+function beginSessionStop(hostId, sessionId, options = {}) {
   const session = getSession(hostId, sessionId);
   const effectiveSessionId = session?.sessionId || sessionId;
+  const targetRunId = String(options.runId || session?.runId || '').trim() || null;
+  const previousRuntime = state.sessionRuntime.get(sessionKey(hostId, effectiveSessionId)) || null;
+  const previousState = session?.state || null;
   if (session) {
     const next = upsertSession(hostId, {
       sessionId: effectiveSessionId,
       state: 'ending',
       live: true,
-      runId: session.runId || null,
+      runId: targetRunId,
       lastUpdatedAt: nowIso(),
     });
     setSessionRuntime(hostId, effectiveSessionId, {
@@ -7905,7 +12053,7 @@ function beginSessionStop(hostId, sessionId) {
       connection: 'closing',
       busy: false,
       activeTurnId: null,
-      runId: session.runId || null,
+      runId: targetRunId,
       updatedAt: nowIso(),
     });
     broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', next);
@@ -7931,14 +12079,19 @@ function beginSessionStop(hostId, sessionId) {
     type: 'session.stop',
     sessionId: candidateSessionId,
     requestedSessionId: effectiveSessionId,
-    runId: session?.runId || null,
+    runId: targetRunId,
     bridgeSessionId: session?.bridgeSessionId || null,
     nativeThreadId: session?.nativeThreadId || null,
     originSessionId: session?.originSessionId || null,
     sourceSessionId: session?.sourceSessionId || null,
     conversationKey: session?.conversationKey || null,
   }));
-  scheduleStopFallback(hostId, effectiveSessionId);
+  scheduleStopFallback(hostId, effectiveSessionId, {
+    runId: targetRunId,
+    stopRequestId: options.stopRequestId || null,
+    previousState,
+    previousRuntime: previousRuntime ? { ...previousRuntime } : null,
+  });
   return {
     hostId,
     sessionId: effectiveSessionId,
@@ -7980,6 +12133,21 @@ function pruneCommandQueue(queue) {
   return fresh.slice(fresh.length - COMMAND_QUEUE_MAX_LENGTH);
 }
 
+function purgeLegacySkillMutationCommands(queue) {
+  return (Array.isArray(queue) ? queue : []).filter((command) => {
+    if (command?.type !== 'host.skills.install' && command?.type !== 'host.skills.uninstall') {
+      return true;
+    }
+    const pending = state.pendingHostSkillRequests.get(command.requestId);
+    if (pending) {
+      pending.reject(new Error(
+        'Legacy Skill mutation was cancelled because this Host now uses managed Artifact deployments'
+      ));
+    }
+    return false;
+  });
+}
+
 function ackCommands(hostId, throughId = 0) {
   const id = Number(throughId || 0) || 0;
   if (!hostId || id <= 0) {
@@ -7991,15 +12159,31 @@ function ackCommands(hostId, throughId = 0) {
   return Math.max(0, queue.length - next.length);
 }
 
-function sendSse(res, eventName, payload) {
+function removeQueuedCommandById(hostId, commandId, expectedType = '') {
+  const id = Number(commandId || 0) || 0;
+  if (!hostId || id <= 0) return 0;
+  const queue = state.commandQueues.get(hostId) || [];
+  let removed = 0;
+  const next = pruneCommandQueue(queue.filter((command) => {
+    const matches = Number(command?.id || 0) === id
+      && (!expectedType || command?.type === expectedType);
+    if (matches) removed += 1;
+    return !matches;
+  }));
+  state.commandQueues.set(hostId, next);
+  return removed;
+}
+
+function sendSessionSse(res, event) {
   if (!res || res.destroyed || res.writableEnded) {
     return false;
   }
   try {
-    const eventPayload = publicSessionEventPayload(eventName, payload, {
+    const eventPayload = publicSessionEventPayload(event.eventName, event.payload, {
       optimize: res.sessionPayloadOptimize !== false,
     });
-    res.write(`event: ${eventName}\n`);
+    res.write(`id: ${event.id}\n`);
+    res.write(`event: ${event.eventName}\n`);
     res.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
     return true;
   } catch (error) {
@@ -8020,63 +12204,46 @@ function publicSessionEventPayload(eventName, payload, options = {}) {
   return payload;
 }
 
-function broadcastSessionEvent(hostId, sessionId, eventName, payload) {
-  const keys = new Set([sessionKey(hostId, sessionId), resolveSessionKey(hostId, sessionId)]);
-  const subscribers = new Set();
-  for (const key of keys) {
-    for (const subscriber of state.subscribers.get(key) || []) {
-      subscribers.add(subscriber);
-    }
-  }
-  if (!subscribers) {
-    return;
-  }
-
-  const staleSubscribers = [];
-  for (const res of subscribers) {
-    if (!sendSse(res, eventName, payload)) {
-      staleSubscribers.push(res);
-    }
-  }
-
-  for (const res of staleSubscribers) {
-    for (const key of keys) {
-      const bucket = state.subscribers.get(key);
-      if (bucket) {
-        bucket.delete(res);
-        if (bucket.size === 0) {
-          state.subscribers.delete(key);
-        }
-      }
-    }
-  }
+function publishCanonicalSessionEvent(canonicalKey, eventName, payload) {
+  const projectedPayload = (
+    eventName === 'session.snapshot'
+    || eventName === 'session.started'
+    || eventName === 'session.state_changed'
+  ) ? sessionWithAssistantProjection(payload) : payload;
+  return state.sessionEventStream.publish(canonicalKey, eventName, projectedPayload);
 }
 
-function addSessionSubscriber(hostId, sessionId, res, options = {}) {
-  const key = sessionKey(hostId, sessionId);
-  const subscribers = state.subscribers.get(key) || new Set();
+function broadcastSessionEvent(hostId, sessionId, eventName, payload) {
+  const canonicalKey = resolveCanonicalConversationKey(hostId, {
+    ...(payload && typeof payload === 'object' ? payload : {}),
+    sessionId,
+  });
+  if (!canonicalKey) return null;
+  return publishCanonicalSessionEvent(canonicalKey, eventName, payload);
+}
+
+function addSessionSubscriber(canonicalKey, res, options = {}) {
   res.sessionPayloadOptimize = options.optimize !== false;
-  subscribers.add(res);
-  state.subscribers.set(key, subscribers);
+  const unsubscribe = state.sessionEventStream.subscribe({
+    canonicalKey,
+    cursor: options.cursor,
+    send: (event) => sendSessionSse(res, event),
+    makeReset: (currentCanonicalKey) => options.makeReset?.(currentCanonicalKey) || {},
+  });
+  res.sessionStreamUnsubscribe = unsubscribe;
   res.once('error', () => {
-    removeSessionSubscriber(hostId, sessionId, res);
+    removeSessionSubscriber(res);
   });
   res.once('close', () => {
-    removeSessionSubscriber(hostId, sessionId, res);
+    removeSessionSubscriber(res);
   });
+  return unsubscribe;
 }
 
-function removeSessionSubscriber(hostId, sessionId, res) {
-  const key = sessionKey(hostId, sessionId);
-  const subscribers = state.subscribers.get(key);
-  if (!subscribers) {
-    return;
-  }
-
-  subscribers.delete(res);
-  if (subscribers.size === 0) {
-    state.subscribers.delete(key);
-  }
+function removeSessionSubscriber(res) {
+  const unsubscribe = res?.sessionStreamUnsubscribe;
+  res.sessionStreamUnsubscribe = null;
+  unsubscribe?.();
 }
 
 function serveStatic(req, res, pathname) {
@@ -8110,14 +12277,544 @@ function serveStatic(req, res, pathname) {
   return true;
 }
 
+function sendSessionContractError(res, error, fallbackStage = 'session-launch') {
+  const known = error instanceof SessionContractError || error instanceof ModelCatalogError;
+  const statusCode = known ? Number(error.statusCode || 409) : 500;
+  sendJson(res, statusCode, {
+    code: known ? error.code : 'session_spawn_failed',
+    error: error?.message || 'Session launch failed.',
+    stage: String(error?.stage || fallbackStage),
+    sessionBinding: publicBinding(error?.sessionBinding) || null,
+    submittedBinding: publicBinding(error?.submittedBinding) || null,
+    expectedRunId: error?.expectedRunId || null,
+    expectedRunStatus: error?.expectedRunStatus || null,
+    expectedBindingFingerprint: error?.expectedBindingFingerprint || null,
+    currentRunId: error?.currentRunId || null,
+    currentRunStatus: error?.currentRunStatus || null,
+    currentBindingFingerprint: error?.currentBindingFingerprint || null,
+    canRebind: Boolean(error?.canRebind),
+  });
+}
+
+function stageSessionError(error, stage) {
+  if (error && !error.stage) {
+    error.stage = stage;
+  }
+  return error;
+}
+
+function publicQueuedCommand(command) {
+  if (!command) {
+    return null;
+  }
+  const result = { ...command };
+  delete result.apiConfig;
+  return result;
+}
+
+function makeSubmittedProfileBinding(apiConfig) {
+  if (!apiConfig) {
+    return null;
+  }
+  try {
+    return makeProfileBinding(apiConfig);
+  } catch (error) {
+    throw new SessionContractError(
+      'session_api_binding_unavailable',
+      `The submitted API profile is invalid: ${error.message}`,
+      { canRebind: true }
+    );
+  }
+}
+
+function sessionRunRecord(hostId, sessionId, options = {}) {
+  const record = state.provenance?.getSessionRecord({ hostId, sessionId });
+  if (!record) {
+    return { record: null, run: null, runId: null };
+  }
+  const activeRun = record.activeRunId ? record.runs?.[record.activeRunId] : null;
+  const successfulRun = record.latestSuccessfulRunId ? record.runs?.[record.latestSuccessfulRunId] : null;
+  const usePending = options.includePending === true;
+  const publishedLive = usePending && activeRun?.status === 'pending'
+    ? publishedLiveSessionRun(hostId, sessionId, record)
+    : null;
+  if (publishedLive) {
+    return { record, run: publishedLive.run, runId: publishedLive.runId };
+  }
+  const runId = activeRun && (activeRun.status === 'live' || usePending)
+    ? record.activeRunId
+    : record.latestSuccessfulRunId;
+  const run = runId ? record.runs?.[runId] || null : successfulRun || null;
+  return { record, run, runId };
+}
+
+function sessionCatalogRunRecord(hostId, sessionId) {
+  const resolved = sessionRunRecord(hostId, sessionId);
+  const record = resolved.record;
+  const pendingRunId = record?.activeRunId || null;
+  const pendingRun = pendingRunId ? record.runs?.[pendingRunId] || null : null;
+  const publishedSession = getSession(hostId, sessionId);
+  if (
+    pendingRun?.status === 'pending'
+    && String(publishedSession?.runId || '').trim() === pendingRunId
+  ) {
+    return {
+      record,
+      run: pendingRun,
+      runId: pendingRunId,
+      catalogRunId: pendingRun.parentRunId || pendingRunId,
+    };
+  }
+  return {
+    ...resolved,
+    catalogRunId: resolved.runId,
+  };
+}
+
+function sessionAcceptsLiveControl(hostId, session) {
+  const { run, runId } = sessionRunRecord(hostId, session?.sessionId, { includePending: true });
+  if (run?.stopRequestId) {
+    return false;
+  }
+  if (session?.state === 'ending') {
+    return false;
+  }
+  if (session?.live) {
+    return true;
+  }
+  const projectedRunId = String(session?.runId || '').trim();
+  return Boolean(
+    run?.status === 'live'
+    && runId
+    && (!projectedRunId || projectedRunId === runId)
+  );
+}
+
+function publishedLiveSessionRun(hostId, sessionId, record) {
+  if (!record?.runs) {
+    return null;
+  }
+  const session = getSession(hostId, sessionId);
+  const runtime = state.sessionRuntime.get(sessionKey(hostId, sessionId))
+    || state.sessionRuntime.get(resolveSessionKey(hostId, sessionId))
+    || null;
+  for (const runId of [session?.runId, runtime?.runId]) {
+    const normalizedRunId = String(runId || '').trim();
+    const run = normalizedRunId ? record.runs[normalizedRunId] : null;
+    if (run?.status === 'live') {
+      return { runId: normalizedRunId, run };
+    }
+  }
+  return null;
+}
+
+function sessionRuntimeConfig(hostId, sessionId) {
+  const { record, run, runId } = sessionRunRecord(hostId, sessionId);
+  if (!record) {
+    return null;
+  }
+  const pendingRun = record.activeRunId && record.activeRunId !== runId
+    ? record.runs?.[record.activeRunId] || null
+    : null;
+  return {
+    hostId,
+    sessionId,
+    canonicalSessionId: record.nativeThreadId || record.bridgeSessionId || record.conversationKey || sessionId,
+    runId: runId || null,
+    activeRunId: record.activeRunId || null,
+    latestSuccessfulRunId: record.latestSuccessfulRunId || null,
+    runStatus: run?.stopRequestId ? 'stopping' : run?.status || null,
+    apiBinding: publicBinding(run?.apiBinding) || null,
+    sessionBinding: publicBinding(run?.apiBinding) || null,
+    requestedSelection: run?.requestedSelection || null,
+    effectiveSelection: run?.effectiveSelection || null,
+    pendingRun: pendingRun ? {
+      runId: record.activeRunId,
+      status: pendingRun.status || null,
+      launchMode: pendingRun.launchMode || null,
+      sessionBinding: publicBinding(pendingRun.apiBinding),
+      requestedSelection: pendingRun.requestedSelection || null,
+    } : null,
+    provenance: {
+      source: record.source || null,
+      conversationKey: record.conversationKey || null,
+      bridgeSessionId: record.bridgeSessionId || null,
+      nativeThreadId: record.nativeThreadId || null,
+      originSessionId: record.originSessionId || null,
+      sourceSessionId: record.sourceSessionId || null,
+      cwd: record.cwd || null,
+      title: record.title || '',
+    },
+    canRebind: true,
+  };
+}
+
+function validateLiveCommandBinding(session, body = {}) {
+  const hostId = String(session?.hostId || body.hostId || '').trim();
+  const sessionId = String(session?.sessionId || body.sessionId || '').trim();
+  const { record, run, runId } = sessionRunRecord(hostId, sessionId, { includePending: true });
+  const sessionBinding = publicBinding(run?.apiBinding);
+  if (run?.stopRequestId) {
+    throw new SessionContractError(
+      'session_run_stopping',
+      `Run ${runId} already has a pending Stop request.`,
+      {
+        statusCode: 409,
+        currentRunId: runId,
+        currentRunStatus: 'stopping',
+        currentBindingFingerprint: sessionBinding?.bindingFingerprint || null,
+      }
+    );
+  }
+  const runtimeKind = String(session?.runtime?.adapterId || session?.runtime?.kind || '').trim();
+  if (runtimeKind && runtimeKind !== 'codex-app-server') {
+    return {
+      record,
+      run,
+      runId: session?.runId || runId || null,
+      binding: sessionBinding,
+      compatibilityRuntime: true,
+    };
+  }
+  if (!record || !run || run.status !== 'live' || !sessionBinding?.bindingFingerprint) {
+    const host = state.hosts.get(hostId);
+    if (host?.capabilities?.runApiBinding !== true) {
+      return {
+        record,
+        run,
+        runId: session?.runId || runId || null,
+        binding: null,
+        compatibilityRuntime: true,
+      };
+    }
+    throw new SessionContractError(
+      'session_api_binding_unavailable',
+      'The live Session run has no verifiable API binding.',
+      { sessionBinding, canRebind: true }
+    );
+  }
+  const apiConfig = normalizeApiConfig(body.apiConfig);
+  const submittedBinding = makeSubmittedProfileBinding(apiConfig);
+  if (submittedBinding && !bindingsEqual(sessionBinding, submittedBinding)) {
+    throw new SessionContractError(
+      'session_api_binding_mismatch',
+      'Command API differs from the live Session run.',
+      { sessionBinding, submittedBinding, canRebind: true }
+    );
+  }
+  return { record, run, runId, binding: sessionBinding };
+}
+
+async function recordLiveRequestedSelection(hostId, sessionId, runId, body = {}) {
+  const model = String(body.model || '').trim() || null;
+  const effort = String(body.effort || '').trim() || null;
+  if (!model && !effort) {
+    return null;
+  }
+  if (!runId) {
+    throw new SessionContractError(
+      'session_run_not_found',
+      'Requested selection has no matching Session run.',
+      { statusCode: 404 }
+    );
+  }
+  return state.provenance.recordRequestedSelection({
+    identity: { hostId, sessionId },
+    runId,
+    selection: { model, effort, source: 'user' },
+  });
+}
+
+async function validateLiveRequestedSelection(hostId, sessionId, liveRun, body = {}) {
+  const selection = {
+    model: String(body.model || '').trim() || null,
+    effort: String(body.effort || '').trim() || null,
+  };
+  if (!selection.model && !selection.effort) {
+    return null;
+  }
+  const catalog = await state.modelCatalog.get({
+    hostId,
+    identity: { hostId, sessionId },
+    sessionId,
+    nativeThreadId: liveRun.record?.nativeThreadId || null,
+    bindingFingerprint: liveRun.binding.bindingFingerprint,
+    runId: liveRun.runId,
+  });
+  return state.modelCatalog.validateSelection(catalog, selection);
+}
+
+async function resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind) {
+  if (apiConfig) {
+    return makeSubmittedProfileBinding(apiConfig);
+  }
+
+  const inheritedRunId = sourceRecord?.latestSuccessfulRunId || sourceRecord?.activeRunId || null;
+  const inheritedBinding = publicBinding(sourceRecord?.runs?.[inheritedRunId]?.apiBinding);
+  if (inheritedBinding?.kind === 'profile' && !explicitRebind) {
+    throw new SessionContractError(
+      'session_api_binding_unavailable',
+      'The API profile bound to this Session must be supplied before it can resume.',
+      { sessionBinding: inheritedBinding, canRebind: true }
+    );
+  }
+  if (inheritedBinding?.kind === 'unknown' && !explicitRebind) {
+    throw new SessionContractError(
+      'session_api_binding_unavailable',
+      'This Session has no verifiable API binding. Choose an API before resuming.',
+      { sessionBinding: inheritedBinding, canRebind: true }
+    );
+  }
+  return requestHostBindingPreflight(hostId, inheritedBinding?.kind === 'host_environment' ? inheritedBinding : null);
+}
+
+async function failPlannedRun(hostId, sessionId, runId, error) {
+  if (!state.provenance || !runId) {
+    return { transitioned: false, missing: true };
+  }
+  try {
+    return await state.provenance.failRun({
+      identity: { hostId, sessionId },
+      runId,
+      code: error?.code || 'session_spawn_failed',
+      message: error?.message || 'Session launch failed.',
+    });
+  } catch (failError) {
+    if (failError?.code === 'session_run_not_found') {
+      return { transitioned: false, missing: true };
+    }
+    console.error(`[relay] failed to persist failed run ${runId}: ${failError.message || failError}`);
+    return { transitioned: false, error: failError };
+  }
+}
+
+async function planManagedLaunch(hostId, body = {}, options = {}) {
+  const sourceSessionId = String(
+    options.sourceSessionId
+    || body.sourceSessionId
+    || body.originSessionId
+    || ''
+  ).trim() || null;
+  const launchMode = String(
+    options.launchMode
+    || body.launchMode
+    || (sourceSessionId ? 'resume' : 'fresh')
+  ).trim() || 'fresh';
+  const sourceDetail = sourceSessionId
+    ? getSessionDetail(hostId, sourceSessionId, {
+      skipDiagnostics: true,
+      skipRemoteDetail: true,
+    })
+    : null;
+  if (sourceSessionId && !sourceDetail?.session) {
+    throw stageSessionError(new SessionContractError(
+      'session_history_unavailable',
+      'Saved Session history is unavailable.',
+      { statusCode: 404 }
+    ), 'resolve-history');
+  }
+
+  const cwd = String(body.cwd || sourceDetail?.session?.cwd || '').trim();
+  if (!cwd) {
+    throw stageSessionError(new SessionContractError(
+      'session_cwd_unavailable',
+      'The Session working directory is unavailable.',
+      { statusCode: 422 }
+    ), 'resolve-cwd');
+  }
+
+  const targetSessionId = String(options.targetSessionId || body.sessionId || (
+    launchMode === 'resume' ? sourceSessionId : makeId()
+  )).trim();
+  const runId = String(body.runId || makeId()).trim();
+  const sourceSession = sourceDetail?.session || null;
+  const sourceRecord = sourceSessionId
+    ? state.provenance.getSessionRecord({ hostId, sessionId: sourceSessionId })
+    : null;
+  const apiConfig = normalizeApiConfig(body.apiConfig);
+  const explicitRebind = options.explicitRebind === true || body.explicitRebind === true;
+  const requireExpectedRun = explicitRebind || options.requireExpectedRun === true;
+
+  let submittedBinding;
+  try {
+    submittedBinding = await resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind);
+  } catch (error) {
+    throw stageSessionError(error, 'resolve-binding');
+  }
+
+  const conversationKey = String(
+    body.conversationKey
+    || sourceSession?.conversationKey
+    || sourceSession?.originSessionId
+    || sourceSessionId
+    || targetSessionId
+  ).trim();
+  const originSessionId = String(
+    body.originSessionId
+    || sourceSession?.originSessionId
+    || sourceSessionId
+    || ''
+  ).trim() || null;
+  const nativeThreadId = String(
+    body.nativeThreadId
+    || sourceSession?.nativeThreadId
+    || sourceSession?.sessionId
+    || ''
+  ).trim() || null;
+  const identity = {
+    hostId,
+    sessionId: targetSessionId,
+  };
+  const hasSubmittedSelection = Object.prototype.hasOwnProperty.call(body, 'model')
+    || Object.prototype.hasOwnProperty.call(body, 'effort');
+  const requestedSelection = hasSubmittedSelection ? {
+    model: String(body.model || '').trim() || null,
+    effort: String(body.effort || '').trim() || null,
+    source: String(body.selectionSource || 'user').trim() || 'user',
+  } : undefined;
+
+  let planned;
+  try {
+    planned = await state.provenance.planRun({
+      identity,
+      sourceIdentity: sourceSessionId ? { hostId, sessionId: sourceSessionId } : null,
+      conversationKey,
+      runId,
+      launchMode,
+      submittedBinding,
+      explicitRebind,
+      requireExpectedRun,
+      expectSourceRun: options.expectSourceRun === true,
+      expectedRunId: body.expectedRunId,
+      expectedBindingFingerprint: body.expectedBindingFingerprint,
+      expectedBindingProvided: Object.prototype.hasOwnProperty.call(
+        body,
+        'expectedBindingFingerprint'
+      ),
+      expectedRunStatus: body.expectedRunStatus,
+      expectedRunStatusProvided: Object.prototype.hasOwnProperty.call(body, 'expectedRunStatus'),
+      requestedSelection,
+    });
+  } catch (error) {
+    throw stageSessionError(error, 'plan-run');
+  }
+
+  let catalog;
+  try {
+    catalog = await state.modelCatalog.get({
+      hostId,
+      identity,
+      sessionId: targetSessionId,
+      nativeThreadId,
+      bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
+      runId: planned.run.parentRunId || runId,
+      apiConfig,
+      force: body.refreshModels === true,
+    });
+    state.modelCatalog.validateSelection(catalog, planned.run.requestedSelection);
+  } catch (error) {
+    await failPlannedRun(hostId, targetSessionId, runId, error);
+    throw stageSessionError(error, 'load-model-catalog');
+  }
+
+  return {
+    hostId,
+    targetSessionId,
+    sourceSessionId,
+    sourceDetail,
+    sourceSession,
+    cwd,
+    launchMode,
+    runId,
+    conversationKey,
+    originSessionId,
+    nativeThreadId,
+    apiConfig,
+    apiProfile: summarizeApiConfig(apiConfig),
+    planned,
+    catalog,
+    explicitRebind,
+  };
+}
+
+async function enqueueManagedLaunch(plan, body = {}) {
+  const createdAt = nowIso();
+  const resumeTranscript = plan.sourceDetail
+    ? buildResumeTranscript(plan.sourceDetail.transcript)
+    : [];
+  const requestedSelection = plan.planned.run.requestedSelection || {};
+  const parentRunId = String(plan.planned.run.parentRunId || '').trim() || null;
+  const parentRun = parentRunId ? plan.planned.record?.runs?.[parentRunId] || null : null;
+
+  if (parentRun?.status === 'live') {
+    beginSessionStop(plan.hostId, plan.targetSessionId, { runId: parentRunId });
+  } else if (plan.explicitRebind && getSession(plan.hostId, plan.targetSessionId)?.live) {
+    beginSessionStop(plan.hostId, plan.targetSessionId);
+  }
+
+  upsertSession(plan.hostId, {
+    sessionId: plan.targetSessionId,
+    cwd: plan.cwd,
+    title: body.label || plan.sourceSession?.title || plan.cwd || plan.targetSessionId,
+    source: 'managed',
+    state: 'starting',
+    live: false,
+    createdAt,
+    originSessionId: plan.originSessionId,
+    sourceSessionId: plan.sourceSessionId,
+    conversationKey: plan.conversationKey,
+    launchMode: plan.launchMode,
+    bridgeSessionId: plan.targetSessionId,
+    runId: plan.runId,
+    nativeThreadId: plan.launchMode === 'resume'
+      ? plan.nativeThreadId || plan.targetSessionId
+      : plan.targetSessionId,
+    messageCount: plan.sourceDetail?.transcript?.length || 0,
+    apiProfile: plan.apiProfile,
+    apiBinding: publicBinding(plan.planned.run.apiBinding),
+    requestedSelection,
+  });
+
+  if (plan.sourceDetail && Array.isArray(plan.sourceDetail.transcript)) {
+    setSessionLog(plan.hostId, plan.targetSessionId, plan.sourceDetail.transcript);
+  }
+
+  const command = enqueueCommand(plan.hostId, {
+    type: 'session.start',
+    sessionId: plan.targetSessionId,
+    bridgeSessionId: plan.targetSessionId,
+    runId: plan.runId,
+    cwd: plan.cwd,
+    label: body.label || plan.sourceSession?.title || plan.cwd || plan.targetSessionId,
+    command: body.command || null,
+    args: body.args || [],
+    createdAt,
+    originSessionId: plan.originSessionId,
+    sourceSessionId: plan.sourceSessionId,
+    conversationKey: plan.conversationKey,
+    launchMode: plan.launchMode,
+    resumeTranscript,
+    nativeThreadId: plan.nativeThreadId,
+    apiConfig: plan.apiConfig,
+    apiBinding: plan.planned.run.apiBinding?.kind === 'profile'
+      ? publicBinding(plan.planned.run.apiBinding)
+      : null,
+    expectedBinding: publicBinding(plan.planned.run.apiBinding),
+    model: requestedSelection.model || null,
+    effort: requestedSelection.effort || null,
+    requestedSelection,
+  });
+  return command;
+}
+
 async function handleRequest(req, res) {
   const url = parseUrl(req);
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Relay-Auth-Token',
+      'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Relay-Auth-Token, X-Remote-Codex-Upload-Token, X-Remote-Codex-Host-Id, X-Remote-Codex-Instance-Digest',
     });
     res.end();
     return;
@@ -8193,6 +12890,18 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/control/shutdown') {
+    if (!requestHasLocalRelayControlToken(req)) {
+      sendJson(res, 403, { ok: false, error: 'local Relay control token is required' });
+      return;
+    }
+    sendJson(res, 202, { ok: true, status: 'shutting_down' });
+    setImmediate(() => {
+      void shutdownRelay('api-control');
+    });
+    return;
+  }
+
   if (!authorizeRequest(req, res, url)) {
     return;
   }
@@ -8255,7 +12964,12 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    sendJson(res, 200, { ok: true, time: nowIso(), authRequired: Boolean(RELAY_AUTH_TOKEN) });
+    sendJson(res, 200, {
+      ok: true,
+      time: nowIso(),
+      authRequired: Boolean(RELAY_AUTH_TOKEN),
+      instanceId: RELAY_INSTANCE_ID,
+    });
     return;
   }
 
@@ -8674,6 +13388,487 @@ async function handleRequest(req, res) {
     } finally {
       closeAskpassAction(askpassRecord);
     }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/skills/events') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'X-Accel-Buffering': 'no',
+    });
+    writeSkillsEvent(res, 'ready', { ok: true, time: nowIso() });
+    state.skillSubscribers.add(res);
+    const ping = setInterval(() => {
+      if (res.destroyed || res.writableEnded) {
+        state.skillSubscribers.delete(res);
+        clearInterval(ping);
+        return;
+      }
+      try {
+        writeSkillsEvent(res, 'ping', { time: nowIso() });
+      } catch (_) {
+        state.skillSubscribers.delete(res);
+        clearInterval(ping);
+      }
+    }, 20000);
+    ping.unref?.();
+    req.on('close', () => {
+      clearInterval(ping);
+      state.skillSubscribers.delete(res);
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/skills') {
+    try {
+      sendJson(res, 200, await buildSkillsManagerPayload());
+    } catch (error) {
+      sendJson(res, 500, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/skills/audit') {
+    try {
+      sendJson(res, 200, state.skillAudit.query({
+        afterSequence: url.searchParams.get('afterSequence'),
+        limit: url.searchParams.get('limit'),
+        type: url.searchParams.get('type'),
+      }));
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/deployments') {
+    const body = await readBody(req);
+    try {
+      const created = createSkillDeployment(body);
+      sendJson(res, created.reused ? 200 : 202, {
+        ok: true,
+        reused: created.reused,
+        deployment: created.deployment,
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return;
+  }
+
+  const skillDeploymentStatusMatch = url.pathname.match(/^\/api\/skills\/deployments\/([^/]+)$/);
+  if (req.method === 'GET' && skillDeploymentStatusMatch) {
+    const deploymentId = decodeURIComponent(skillDeploymentStatusMatch[1]);
+    const deployment = state.skillDeployments.getDeployment(deploymentId);
+    if (!deployment) {
+      sendJson(res, 404, { error: 'Skill deployment was not found' });
+      return;
+    }
+    sendJson(res, 200, { deployment });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/adopt') {
+    const body = await readBody(req);
+    try {
+      const queued = queueSkillAdoption(body);
+      sendJson(res, 202, {
+        ok: true,
+        reused: queued.reused,
+        ...publicSkillAdoption(queued.adoption),
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/import') {
+    const body = await readBody(req);
+    const source = body.source && typeof body.source === 'object' ? body.source : body;
+    const kind = String(source.kind || (body.hostId ? 'local-host' : '')).trim().toLowerCase();
+    try {
+      if (kind === 'github') {
+        const queued = queueGithubSkillImport(source);
+        sendJson(res, 202, { ok: true, ...publicSkillImport(queued) });
+      } else if (kind === 'local-host' || kind === 'cc-switch') {
+        const queued = queueSkillAdoption({
+          hostId: body.hostId || source.hostId,
+          instanceId: body.instanceId || source.instanceId,
+        });
+        sendJson(res, 202, {
+          ok: true,
+          importId: queued.adoption.adoptionId,
+          kind,
+          delegatedTo: 'adoption',
+          reused: queued.reused,
+          ...publicSkillAdoption(queued.adoption),
+        });
+      } else {
+        throw skillApiError(400, 'source.kind must be github, local-host, or cc-switch');
+      }
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return;
+  }
+
+  const skillImportStatusMatch = url.pathname.match(/^\/api\/skills\/imports\/([^/]+)$/);
+  if (req.method === 'GET' && skillImportStatusMatch) {
+    const importId = decodeURIComponent(skillImportStatusMatch[1]);
+    const record = state.skillImports.get(importId);
+    if (!record) {
+      sendJson(res, 404, { error: 'Skill import was not found or has expired' });
+      return;
+    }
+    sendJson(res, 200, { import: publicSkillImport(record) });
+    return;
+  }
+
+  const skillAdoptionStatusMatch = url.pathname.match(/^\/api\/skills\/adoptions\/([^/]+)$/);
+  if (req.method === 'GET' && skillAdoptionStatusMatch) {
+    const adoptionId = decodeURIComponent(skillAdoptionStatusMatch[1]);
+    const adoption = state.skillAdoptions.get(adoptionId);
+    if (!adoption) {
+      sendJson(res, 404, { error: 'Skill adoption was not found or has expired' });
+      return;
+    }
+    sendJson(res, 200, { adoption: publicSkillAdoption(adoption) });
+    return;
+  }
+
+  const skillArtifactUploadMatch = url.pathname.match(/^\/api\/agent\/skills\/adoptions\/([^/]+)\/artifact$/);
+  if (req.method === 'PUT' && skillArtifactUploadMatch) {
+    const adoptionId = decodeURIComponent(skillArtifactUploadMatch[1]);
+    try {
+      const imported = await handleSkillArtifactUpload(req, adoptionId);
+      sendJson(res, 201, {
+        ok: true,
+        adoptionId,
+        artifactId: imported.artifact.artifactId,
+        deduplicated: imported.deduplicated,
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return;
+  }
+
+  const skillArtifactDownloadMatch = url.pathname.match(/^\/api\/agent\/skills\/artifacts\/([^/]+)$/);
+  if (req.method === 'GET' && skillArtifactDownloadMatch) {
+    try {
+      await streamSkillArtifactDownload(req, res, decodeURIComponent(skillArtifactDownloadMatch[1]));
+    } catch (error) {
+      if (!res.headersSent) {
+        sendJson(res, error.statusCode || 500, { error: error.message });
+      } else if (!res.destroyed) {
+        res.destroy(error);
+      }
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/refresh') {
+    const body = await readBody(req);
+    if (body.hostIds != null && !Array.isArray(body.hostIds)) {
+      sendJson(res, 400, { error: 'hostIds must be an array' });
+      return;
+    }
+    sendJson(res, 202, queueSkillInventoryRefreshes(body.hostIds));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/favorites') {
+    const body = await readBody(req);
+    const skillId = String(body.skillId || '').trim();
+    if (!skillId) {
+      sendJson(res, 400, { error: 'skillId is required' });
+      return;
+    }
+    const favorite = body.favorite !== false;
+    if (favorite) {
+      state.skillFavorites.add(skillId);
+    } else {
+      state.skillFavorites.delete(skillId);
+    }
+    saveSkillFavorites(state.skillFavorites);
+    sendJson(res, 200, {
+      ok: true,
+      skillId,
+      favorite,
+      favorites: Array.from(state.skillFavorites).sort(),
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/skills/sources') {
+    const registrySnapshot = skillRegistrySnapshot();
+    sendJson(res, 200, {
+      sources: combinedSkillSources(registrySnapshot),
+      catalog: buildSkillCatalogFromSources(),
+      dailySkillDigest: dailySkillDigest(buildSkillCatalogFromSources()),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/sources') {
+    const body = await readBody(req);
+    const sources = (Array.isArray(body.sources) ? body.sources : [])
+      .map(normalizeSkillSource);
+    state.skillSources = sources;
+    saveSkillSources(state.skillSources);
+    const catalog = buildSkillCatalogFromSources();
+    sendJson(res, 200, {
+      ok: true,
+      sources: state.skillSources,
+      catalog,
+      dailySkillDigest: dailySkillDigest(catalog),
+    });
+    return;
+  }
+
+  const skillSourceRefreshMatch = url.pathname.match(
+    /^\/api\/skills\/sources\/([^/]+)\/refresh$/
+  );
+  if (req.method === 'POST' && skillSourceRefreshMatch) {
+    const body = await readBody(req);
+    try {
+      const sourceId = decodeURIComponent(skillSourceRefreshMatch[1]);
+      const queued = await queueRegistrySkillSourceRefresh(sourceId, {
+        expectedRevision: body.expectedRevision,
+      });
+      sendJson(res, 202, {
+        ok: true,
+        ...publicSkillImport(queued),
+        registryRevision: state.skillRegistry.snapshot({ includeManifest: false }).revision,
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, {
+        error: error.message,
+        ...(error.revision == null ? {} : { revision: error.revision }),
+      });
+    }
+    return;
+  }
+
+  const skillSourceAutomationMatch = url.pathname.match(
+    /^\/api\/skills\/sources\/([^/]+)\/automation$/
+  );
+  if (req.method === 'POST' && skillSourceAutomationMatch) {
+    const body = await readBody(req);
+    try {
+      const sourceId = decodeURIComponent(skillSourceAutomationMatch[1]);
+      const updated = await state.skillRegistry.updateSourceAutomation(sourceId, {
+        expectedRevision: body.expectedRevision,
+        refreshPolicy: body.refreshPolicy,
+        rolloutPolicy: body.rolloutPolicy,
+      });
+      recordSkillAudit('skills.source.automation_updated', {
+        sourceId,
+        refreshPolicy: updated.source.refreshPolicy,
+        rolloutPolicy: updated.source.rolloutPolicy,
+        revision: updated.revision,
+        idempotent: updated.idempotent,
+      }, { actor: 'relay-api', subject: sourceId });
+      broadcastSkillsLibraryUpdated({
+        sourceId,
+        reason: 'automation-policy',
+        refreshPolicy: updated.source.refreshPolicy,
+        rolloutPolicy: updated.source.rolloutPolicy,
+        registryRevision: updated.revision,
+        updatedAt: updated.source.updatedAt,
+      });
+      sendJson(res, 200, { ok: true, ...updated });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, {
+        error: error.message,
+        ...(error.revision == null ? {} : { revision: error.revision }),
+      });
+    }
+    return;
+  }
+
+  const skillLibraryReferencesMatch = url.pathname.match(
+    /^\/api\/skills\/library\/([^/]+)\/references$/
+  );
+  if (req.method === 'GET' && skillLibraryReferencesMatch) {
+    try {
+      const skillId = decodeURIComponent(skillLibraryReferencesMatch[1]);
+      const libraryRecord = state.skillRegistry.getLibraryRecord(skillId);
+      if (!libraryRecord) {
+        throw skillApiError(404, 'Library Skill was not found');
+      }
+      const report = state.skillRegistry.referenceReport({
+        artifactIds: libraryRecord.artifactIds,
+        references: collectSkillArtifactReferences(),
+      });
+      sendJson(res, 200, {
+        ...report,
+        libraryRecord,
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, {
+        error: error.message,
+        ...(error.revision == null ? {} : { revision: error.revision }),
+      });
+    }
+    return;
+  }
+
+  const skillLibraryLifecycleMatch = url.pathname.match(
+    /^\/api\/skills\/library\/([^/]+)\/(retire|restore)$/
+  );
+  if (req.method === 'POST' && skillLibraryLifecycleMatch) {
+    const body = await readBody(req);
+    try {
+      const skillId = decodeURIComponent(skillLibraryLifecycleMatch[1]);
+      const action = skillLibraryLifecycleMatch[2];
+      const result = action === 'retire'
+        ? await state.skillRegistry.retireSkill(skillId, {
+          expectedRevision: body.expectedRevision,
+        })
+        : await state.skillRegistry.restoreSkill(skillId, {
+          expectedRevision: body.expectedRevision,
+        });
+      const payload = {
+        skillId: result.libraryRecord.skillId,
+        state: action === 'retire' ? 'retired' : 'restored',
+        revision: result.revision,
+        idempotent: result.idempotent,
+        updatedAt: result.libraryRecord.updatedAt,
+      };
+      broadcastSkillsLibraryUpdated(payload);
+      recordSkillAudit(`skills.library.${action}`, payload, {
+        actor: 'relay-api',
+        subject: result.libraryRecord.skillId,
+      });
+      sendJson(res, 200, {
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, {
+        error: error.message,
+        ...(error.revision == null ? {} : { revision: error.revision }),
+      });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/artifacts/gc') {
+    const body = await readBody(req);
+    try {
+      if (body.artifactIds != null && !Array.isArray(body.artifactIds)) {
+        throw skillApiError(400, 'artifactIds must be an array');
+      }
+      const explicitArtifactIds = body.artifactIds != null;
+      const result = await state.skillRegistry.collectGarbage({
+        artifactIds: explicitArtifactIds ? body.artifactIds : undefined,
+        expectedRevision: body.expectedRevision,
+        referenceProvider: () => collectSkillArtifactReferences(),
+        requireAllUnreferenced: explicitArtifactIds,
+      });
+      const blocked = explicitArtifactIds && result.blockedArtifactIds.length > 0;
+      if (!blocked && (result.collectedArtifactIds.length || result.pendingArtifactIds.length)) {
+        broadcastSkillsLibraryUpdated({
+          state: 'garbage-collected',
+          revision: result.revision,
+          collectedArtifactIds: result.collectedArtifactIds,
+          pendingArtifactIds: result.pendingArtifactIds,
+          updatedAt: nowIso(),
+        });
+      }
+      recordSkillAudit('skills.artifacts.gc', {
+        requestedArtifactIds: explicitArtifactIds ? body.artifactIds : null,
+        blockedArtifactIds: result.blockedArtifactIds,
+        pendingArtifactIds: result.pendingArtifactIds,
+        collectedArtifactIds: result.collectedArtifactIds,
+        errors: result.errors,
+        revision: result.revision,
+      }, { actor: 'relay-api' });
+      sendJson(res, blocked ? 409 : 200, {
+        ok: !blocked && result.errors.length === 0,
+        ...result,
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, {
+        error: error.message,
+        ...(error.revision == null ? {} : { revision: error.revision }),
+      });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/skills/library') {
+    const registrySnapshot = skillRegistrySnapshot();
+    sendJson(res, 200, {
+      skills: combinedSkillLibrary(registrySnapshot),
+      artifacts: (registrySnapshot.artifacts || []).map(publicSkillArtifact),
+      catalog: mergeSkillLibraryWithCatalog(buildSkillCatalogFromSources()),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/library') {
+    const body = await readBody(req);
+    const incoming = Array.isArray(body.skills) ? body.skills : [body.skill || body];
+    const saved = [];
+    try {
+      for (const entry of incoming) {
+        saved.push(upsertSkillLibraryRecord(entry));
+      }
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return;
+    }
+    const catalog = mergeSkillLibraryWithCatalog(buildSkillCatalogFromSources());
+    sendJson(res, 200, {
+      ok: true,
+      saved,
+      skills: state.skillLibrary || [],
+      catalog,
+      dailySkillDigest: dailySkillDigest(catalog),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/actions') {
+    const body = await readBody(req);
+    const action = String(body.action || '').trim();
+    if (action !== 'install' && action !== 'uninstall') {
+      sendJson(res, 400, { error: 'action must be install or uninstall' });
+      return;
+    }
+    const hostIds = (Array.isArray(body.hostIds) ? body.hostIds : [])
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean);
+    const skillIds = (Array.isArray(body.skillIds) ? body.skillIds : [])
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean);
+    if (!hostIds.length || !skillIds.length) {
+      sendJson(res, 400, { error: 'hostIds and skillIds are required' });
+      return;
+    }
+    const phase3HostIds = hostIds.filter((hostId) => (
+      state.hosts.get(hostId)?.capabilities?.hostSkillDeploymentV1
+    ));
+    if (phase3HostIds.length) {
+      sendJson(res, 409, {
+        error: 'Legacy Skill actions are disabled for Phase 3 deployment Hosts; use Artifact deployments',
+        hostIds: phase3HostIds,
+      });
+      return;
+    }
+    const results = await runSkillsBatchAction(action, hostIds, skillIds);
+    sendJson(res, 200, {
+      ok: results.every((result) => result.ok),
+      action,
+      results,
+      ...(await buildSkillsManagerPayload()),
+    });
     return;
   }
 
@@ -9152,6 +14347,25 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (
+    req.method === 'GET'
+    && url.pathname.match(/^\/api\/sessions\/[^/]+\/(?:assistant-messages|assistant-projection)$/)
+  ) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = String(url.searchParams.get('hostId') || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const session = getSession(hostId, sessionId) || { sessionId };
+    const projection = assistantProjectionForIdentity(hostId, session, {
+      afterSeq: url.searchParams.get('afterSeq'),
+      limit: url.searchParams.get('limit'),
+    });
+    sendJson(res, 200, projection);
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/detail$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const hostId = url.searchParams.get('hostId');
@@ -9225,6 +14439,7 @@ async function handleRequest(req, res) {
       return;
     }
 
+    await persistSessionPresentation(hostId, session, { source: 'manual' });
     broadcastSessionEvent(hostId, sessionId, 'session.snapshot', session);
     sendJson(res, 200, { ok: true, session });
     return;
@@ -9333,6 +14548,15 @@ async function handleRequest(req, res) {
       return;
     }
 
+    if (!LOCAL_AGENT_START_ENABLED && action !== 'stop') {
+      sendJson(res, 403, {
+        ok: false,
+        status: 'local_agent_start_disabled',
+        message: 'This Relay instance is not allowed to start a local Agent.',
+      });
+      return;
+    }
+
     const result = action === 'stop'
       ? stopLocalAgent(hostId)
       : startLocalAgent({ hostId, label, restart: action === 'restart' });
@@ -9410,19 +14634,41 @@ async function handleRequest(req, res) {
       sendJson(res, 200, { ok: true, dismissed: true });
       return;
     }
+    const localAgentRegistration = reconcileRegisteredLocalAgent(
+      body.hostId,
+      body.label,
+      body.agentProcess
+    );
+    if (!localAgentRegistration.ok) {
+      sendJson(res, 409, {
+        error: localAgentRegistration.message,
+        code: localAgentRegistration.code,
+      });
+      return;
+    }
 
+    const existingHost = state.hosts.get(body.hostId);
     const host = {
       hostId: body.hostId,
       label: body.label || body.hostId,
       platform: body.platform || process.platform,
+      codexHome: body.codexHome || existingHost?.codexHome || '',
+      skillsRevision: body.skillsRevision || state.skillInventories.get(body.hostId)?.revision || existingHost?.skillsRevision || null,
       capabilities: body.capabilities || {},
-      registeredAt: state.hosts.get(body.hostId)?.registeredAt || nowIso(),
+      registeredAt: existingHost?.registeredAt || nowIso(),
       lastSeenAt: nowIso(),
     };
     state.hosts.set(body.hostId, host);
     attachMatchingConnectorsToHost(host);
-    state.commandQueues.set(body.hostId, pruneCommandQueue(state.commandQueues.get(body.hostId) || []));
-    sendJson(res, 200, { ok: true, host });
+    const registeredQueue = pruneCommandQueue(state.commandQueues.get(body.hostId) || []);
+    state.commandQueues.set(
+      body.hostId,
+      host.capabilities?.hostSkillDeploymentV1
+        ? purgeLegacySkillMutationCommands(registeredQueue)
+        : registeredQueue
+    );
+    reconcileSkillDeploymentsForHost(body.hostId, { includeRunning: true });
+    sendJson(res, 200, { ok: true, host, relayInstanceId: RELAY_INSTANCE_ID });
     return;
   }
 
@@ -9432,10 +14678,27 @@ async function handleRequest(req, res) {
       sendJson(res, 200, { ok: true, dismissed: true });
       return;
     }
+    if (body.hostId) {
+      const localAgentRegistration = reconcileRegisteredLocalAgent(
+        body.hostId,
+        body.label,
+        body.agentProcess
+      );
+      if (!localAgentRegistration.ok) {
+        sendJson(res, 409, {
+          error: localAgentRegistration.message,
+          code: localAgentRegistration.code,
+        });
+        return;
+      }
+    }
     const host = state.hosts.get(body.hostId);
+    const hostWasKnown = Boolean(host);
     if (host) {
       host.label = body.label || host.label || body.hostId;
       host.platform = body.platform || host.platform || 'unknown';
+      host.codexHome = body.codexHome || host.codexHome || '';
+      host.skillsRevision = body.skillsRevision || state.skillInventories.get(body.hostId)?.revision || host.skillsRevision || null;
       host.capabilities = body.capabilities || host.capabilities || {};
       host.lastSeenAt = nowIso();
       state.hosts.set(body.hostId, host);
@@ -9445,6 +14708,8 @@ async function handleRequest(req, res) {
         hostId: body.hostId,
         label: body.label || body.hostId,
         platform: body.platform || 'unknown',
+        codexHome: body.codexHome || '',
+        skillsRevision: body.skillsRevision || state.skillInventories.get(body.hostId)?.revision || null,
         capabilities: body.capabilities || {},
         registeredAt: nowIso(),
         lastSeenAt: nowIso(),
@@ -9452,21 +14717,38 @@ async function handleRequest(req, res) {
       state.hosts.set(body.hostId, nextHost);
       attachMatchingConnectorsToHost(nextHost);
     }
-    sendJson(res, 200, { ok: true });
+    if (body.hostId) {
+      reconcileSkillDeploymentsForHost(body.hostId, { includeRunning: !hostWasKnown });
+    }
+    sendJson(res, 200, { ok: true, relayInstanceId: RELAY_INSTANCE_ID });
     return;
   }
 
   if (req.method === 'GET' && url.pathname === '/api/agent/commands') {
     const hostId = url.searchParams.get('hostId');
-    const after = Number(url.searchParams.get('after') || '0');
     if (!hostId) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
+    const pollAuthorization = authorizeAgentCommandPoll(hostId, req);
+    if (!pollAuthorization.ok) {
+      sendJson(res, 409, {
+        error: pollAuthorization.message,
+        code: pollAuthorization.code,
+      });
+      return;
+    }
 
-    const ack = Number(url.searchParams.get('ack') || url.searchParams.get('lastProcessed') || '0');
+    const clientRelayInstanceId = String(url.searchParams.get('relayInstanceId') || '').trim();
+    const cursorBelongsToRelay = !clientRelayInstanceId || clientRelayInstanceId === RELAY_INSTANCE_ID;
+    const after = cursorBelongsToRelay ? Number(url.searchParams.get('after') || '0') : 0;
+    const ack = cursorBelongsToRelay
+      ? Number(url.searchParams.get('ack') || url.searchParams.get('lastProcessed') || '0')
+      : 0;
     const acked = ackCommands(hostId, ack);
-    sendJson(res, 200, { commands: getCommands(hostId, after), acked });
+    const commands = getCommands(hostId, after);
+    markDeliveredSkillDeploymentCommands(hostId, commands);
+    sendJson(res, 200, { commands, acked, relayInstanceId: RELAY_INSTANCE_ID });
     return;
   }
 
@@ -9482,89 +14764,46 @@ async function handleRequest(req, res) {
       sendJson(res, 409, { error: `host ${host.label || hostId} is offline` });
       return;
     }
+    try {
+      const plan = await planManagedLaunch(hostId, body);
+      const command = await enqueueManagedLaunch(plan, body);
+      sendJson(res, 200, {
+        ok: true,
+        sessionId: plan.targetSessionId,
+        bridgeSessionId: plan.targetSessionId,
+        runId: plan.runId,
+        nativeThreadId: plan.launchMode === 'resume' ? plan.nativeThreadId : null,
+        originSessionId: plan.originSessionId,
+        sourceSessionId: plan.sourceSessionId,
+        conversationKey: plan.conversationKey,
+        launchMode: plan.launchMode,
+        sessionBinding: publicBinding(plan.planned.run.apiBinding),
+        requestedSelection: plan.planned.run.requestedSelection,
+        command: publicQueuedCommand(command),
+      });
+    } catch (error) {
+      sendSessionContractError(res, error, 'queue-launch');
+    }
+    return;
+  }
 
-    const cwd = String(body.cwd || '').trim();
-    if (!cwd) {
-      sendJson(res, 400, { error: 'cwd is required' });
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/runtime-config$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = String(url.searchParams.get('hostId') || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
-
-    const originSessionId = body.originSessionId || null;
-    const sourceSessionId = body.sourceSessionId || originSessionId;
-    const launchMode = body.launchMode || (sourceSessionId ? 'resume' : 'fresh');
-    const sourceDetail = sourceSessionId
-      ? getSessionDetail(hostId, sourceSessionId, {
-        skipDiagnostics: true,
-        skipRemoteDetail: true,
-      })
-      : null;
-    const sourceSession = sourceDetail?.session || null;
-    const nativeThreadId = String(body.nativeThreadId || sourceSession?.nativeThreadId || sourceSession?.sessionId || '').trim() || null;
-    const sessionId = launchMode === 'resume' && sourceSessionId
-      ? sourceSessionId
-      : (body.sessionId || makeId());
-    const bridgeSessionId = sessionId;
-    const runId = body.runId || makeId();
-    const createdAt = nowIso();
-    const resolvedConversationKey = body.conversationKey || originSessionId || sessionId;
-    const resumeTranscript = sourceDetail ? buildResumeTranscript(sourceDetail.transcript) : [];
-
-    const apiConfig = normalizeApiConfig(body.apiConfig);
-    const apiProfile = summarizeApiConfig(apiConfig);
-
-    upsertSession(hostId, {
-      sessionId,
-      cwd,
-      title: body.label || cwd || sessionId,
-      source: 'managed',
-      state: 'starting',
-      live: false,
-      createdAt,
-      originSessionId,
-      sourceSessionId,
-      conversationKey: resolvedConversationKey,
-      launchMode,
-      bridgeSessionId,
-      runId,
-      nativeThreadId: nativeThreadId || sessionId,
-      messageCount: sourceDetail?.transcript?.length || 0,
-      apiProfile,
-    });
-
-    if (sourceDetail && Array.isArray(sourceDetail.transcript)) {
-      setSessionLog(hostId, sessionId, sourceDetail.transcript);
+    const runtimeConfig = sessionRuntimeConfig(hostId, sessionId);
+    if (!runtimeConfig) {
+      sendSessionContractError(res, new SessionContractError(
+        'session_history_unavailable',
+        'Saved Session history is unavailable.',
+        { statusCode: 404 }
+      ), 'load-runtime-config');
+      return;
     }
-
-    const command = enqueueCommand(hostId, {
-      type: 'session.start',
-      sessionId,
-      bridgeSessionId,
-      runId,
-      cwd,
-      label: body.label || cwd || sessionId,
-      command: body.command || null,
-      args: body.args || [],
-      createdAt,
-      originSessionId,
-      sourceSessionId,
-      conversationKey: resolvedConversationKey,
-      launchMode,
-      resumeTranscript,
-      nativeThreadId,
-      apiConfig,
-    });
-    sendJson(res, 200, {
-      ok: true,
-      sessionId,
-      bridgeSessionId,
-      runId,
-      nativeThreadId,
-      originSessionId,
-      sourceSessionId,
-      conversationKey: resolvedConversationKey,
-      launchMode,
-      command,
-    });
+    sendJson(res, 200, runtimeConfig);
     return;
   }
 
@@ -9575,45 +14814,193 @@ async function handleRequest(req, res) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
+    try {
+      const { record, run, runId, catalogRunId } = sessionCatalogRunRecord(hostId, sessionId);
+      if (!record || !run) {
+        throw new SessionContractError(
+          'session_history_unavailable',
+          'Saved Session runtime configuration is unavailable.',
+          { statusCode: 404 }
+        );
+      }
+      const binding = publicBinding(run.apiBinding);
+      if (!binding?.bindingFingerprint) {
+        throw new SessionContractError(
+          'session_api_binding_unavailable',
+          'The Session API binding cannot be resolved.',
+          { sessionBinding: binding, canRebind: true }
+        );
+      }
+      const session = getSession(hostId, sessionId);
+      const catalog = await state.modelCatalog.get({
+        hostId,
+        identity: { hostId, sessionId },
+        sessionId,
+        nativeThreadId: record.nativeThreadId || null,
+        bindingFingerprint: binding.bindingFingerprint,
+        runId: catalogRunId,
+        force: sessionAcceptsLiveControl(hostId, session),
+      });
+      sendJson(res, 200, {
+        hostId,
+        sessionId,
+        runId,
+        sessionBinding: binding,
+        ...publicModelCatalog(catalog),
+      });
+    } catch (error) {
+      sendSessionContractError(res, error, 'load-model-catalog');
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/models\/refresh$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = String(body.hostId || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    try {
+      const { record, run, runId, catalogRunId } = sessionCatalogRunRecord(hostId, sessionId);
+      if (!record || !run) {
+        throw new SessionContractError(
+          'session_history_unavailable',
+          'Saved Session runtime configuration is unavailable.',
+          { statusCode: 404 }
+        );
+      }
+      const sessionBinding = publicBinding(run.apiBinding);
+      const apiConfig = normalizeApiConfig(body.apiConfig);
+      const submittedBinding = makeSubmittedProfileBinding(apiConfig);
+      if (sessionBinding?.kind === 'profile' && !submittedBinding) {
+        throw new SessionContractError(
+          'session_api_binding_unavailable',
+          'The bound API profile is required to refresh provider models.',
+          { sessionBinding, canRebind: true }
+        );
+      }
+      if (submittedBinding && !bindingsEqual(sessionBinding, submittedBinding)) {
+        throw new SessionContractError(
+          'session_api_binding_mismatch',
+          'The submitted API profile does not match this Session.',
+          { sessionBinding, submittedBinding, canRebind: true }
+        );
+      }
+      const catalog = await state.modelCatalog.get({
+        hostId,
+        identity: { hostId, sessionId },
+        sessionId,
+        nativeThreadId: record.nativeThreadId || null,
+        bindingFingerprint: sessionBinding?.bindingFingerprint,
+        runId: catalogRunId,
+        apiConfig,
+        force: true,
+      });
+      sendJson(res, 200, {
+        hostId,
+        sessionId,
+        runId,
+        sessionBinding,
+        ...publicModelCatalog(catalog),
+      });
+    } catch (error) {
+      sendSessionContractError(res, error, 'refresh-model-catalog');
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/rebind$/)) {
+    const sourceSessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = String(body.hostId || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
     const hostError = getHostUnavailableError(hostId);
     if (hostError) {
       sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
-
-    const session = getSession(hostId, sessionId);
-    if (!session) {
-      sendJson(res, 404, { error: 'session not found' });
-      return;
-    }
-    if (!session.live) {
-      sendJson(res, 409, { error: 'session is not live' });
-      return;
-    }
-
-    const host = state.hosts.get(hostId);
-    if (!host?.capabilities?.modelList) {
-      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can list Codex models' });
-      return;
-    }
-
-    const requestId = makeId();
-    const pending = awaitModelListRequest(requestId);
-    enqueueCommand(hostId, {
-      type: 'session.model_list',
-      sessionId,
-      requestId,
-      includeHidden: url.searchParams.get('includeHidden') === 'true',
-      cursor: url.searchParams.get('cursor') || null,
-      limit: Number(url.searchParams.get('limit') || 80) || 80,
-    });
-
     try {
-      const payload = await pending;
-      sendJson(res, 200, payload);
+      const plan = await planManagedLaunch(hostId, body, {
+        sourceSessionId,
+        targetSessionId: sourceSessionId,
+        launchMode: 'resume',
+        explicitRebind: true,
+      });
+      const command = await enqueueManagedLaunch(plan, body);
+      sendJson(res, 200, {
+        ok: true,
+        sessionId: plan.targetSessionId,
+        bridgeSessionId: plan.targetSessionId,
+        runId: plan.runId,
+        nativeThreadId: plan.nativeThreadId,
+        originSessionId: plan.originSessionId,
+        sourceSessionId: plan.sourceSessionId,
+        conversationKey: plan.conversationKey,
+        launchMode: plan.launchMode,
+        sessionBinding: publicBinding(plan.planned.run.apiBinding),
+        requestedSelection: plan.planned.run.requestedSelection,
+        command: publicQueuedCommand(command),
+      });
     } catch (error) {
-      const statusCode = /not live|no live session/i.test(error.message || '') ? 409 : 504;
-      sendJson(res, statusCode, { error: error.message });
+      sendSessionContractError(res, error, 'rebind-session');
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/transcript-fallback$/)) {
+    const sourceSessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = String(body.hostId || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+    try {
+      const sourceDetail = getSessionDetail(hostId, sourceSessionId, {
+        skipDiagnostics: true,
+        skipRemoteDetail: true,
+      });
+      if (!sourceDetail?.session || !buildResumeTranscript(sourceDetail.transcript).length) {
+        throw new SessionContractError(
+          'session_history_unavailable',
+          'Transcript fallback requires non-empty saved history.',
+          { statusCode: 422 }
+        );
+      }
+      const plan = await planManagedLaunch(hostId, body, {
+        sourceSessionId,
+        targetSessionId: String(body.sessionId || makeId()),
+        launchMode: 'transcript_fallback',
+        requireExpectedRun: true,
+        expectSourceRun: true,
+      });
+      const command = await enqueueManagedLaunch(plan, body);
+      sendJson(res, 200, {
+        ok: true,
+        sessionId: plan.targetSessionId,
+        bridgeSessionId: plan.targetSessionId,
+        runId: plan.runId,
+        nativeThreadId: null,
+        originSessionId: plan.originSessionId,
+        sourceSessionId: plan.sourceSessionId,
+        conversationKey: plan.conversationKey,
+        launchMode: plan.launchMode,
+        sessionBinding: publicBinding(plan.planned.run.apiBinding),
+        requestedSelection: plan.planned.run.requestedSelection,
+        command: publicQueuedCommand(command),
+      });
+    } catch (error) {
+      sendSessionContractError(res, error, 'transcript-fallback');
     }
     return;
   }
@@ -9675,7 +15062,7 @@ async function handleRequest(req, res) {
       sendJson(res, 404, { error: 'session not found' });
       return;
     }
-    if (!session.live) {
+    if (!sessionAcceptsLiveControl(hostId, session)) {
       sendJson(res, 409, { error: 'session is not live' });
       return;
     }
@@ -9714,12 +15101,6 @@ async function handleRequest(req, res) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
-    const inputCacheKey = inputRequestCacheKey(hostId, sessionId, body.clientRequestId);
-    const cachedInput = getCachedInputRequest(inputCacheKey);
-    if (cachedInput) {
-      sendJson(res, 200, cachedInput);
-      return;
-    }
     const hostError = getHostUnavailableError(hostId);
     if (hostError) {
       sendJson(res, hostError.statusCode, { error: hostError.error });
@@ -9731,8 +15112,22 @@ async function handleRequest(req, res) {
       sendJson(res, 404, { error: 'session not found' });
       return;
     }
-    if (!session.live) {
+    if (!sessionAcceptsLiveControl(hostId, session)) {
       sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+
+    let liveRun;
+    try {
+      liveRun = validateLiveCommandBinding(session, body);
+    } catch (error) {
+      sendSessionContractError(res, error, 'validate-live-command');
+      return;
+    }
+    const inputCacheKey = inputRequestCacheKey(hostId, sessionId, body.clientRequestId, liveRun.runId);
+    const cachedInput = getCachedInputRequest(inputCacheKey);
+    if (cachedInput) {
+      sendJson(res, 200, cachedInput);
       return;
     }
 
@@ -9768,6 +15163,15 @@ async function handleRequest(req, res) {
       sendJson(res, 409, { error: 'this host agent needs to be restarted before it can use Codex turn controls' });
       return;
     }
+    try {
+      if (!liveRun.compatibilityRuntime) {
+        await validateLiveRequestedSelection(hostId, session.sessionId || sessionId, liveRun, body);
+        await recordLiveRequestedSelection(hostId, session.sessionId || sessionId, liveRun.runId, body);
+      }
+    } catch (error) {
+      sendSessionContractError(res, error, 'record-requested-selection');
+      return;
+    }
     const inlineImageFiles = cacheInlineImageInputFiles(hostId, sessionId, inputItems);
     const inlineTextFiles = cacheInlineTextFiles(hostId, sessionId, body.inlineFiles || body.inlineFileRefs || []);
     const transcriptFiles = normalizeFileTransferRefs([...uploadedFiles, ...inlineImageFiles, ...inlineTextFiles]);
@@ -9783,12 +15187,16 @@ async function handleRequest(req, res) {
       files: transcriptFiles,
       timestamp: nowIso(),
     });
-    const apiConfig = normalizeApiConfig(body.apiConfig);
-    const apiProfile = summarizeApiConfig(apiConfig);
     const next = upsertSession(hostId, {
       sessionId: effectiveSessionId,
       latestUserMessage: transcriptText,
-      apiProfile: apiProfile || session.apiProfile || null,
+      apiProfile: session.apiProfile || null,
+      apiBinding: liveRun.binding,
+      requestedSelection: {
+        model: String(body.model || '').trim() || null,
+        effort: String(body.effort || '').trim() || null,
+        source: 'user',
+      },
       codexOptions: {
         model: String(body.model || '').trim() || null,
         effort: String(body.effort || '').trim() || null,
@@ -9813,6 +15221,9 @@ async function handleRequest(req, res) {
       originSessionId: session.originSessionId || null,
       sourceSessionId: session.sourceSessionId || null,
       conversationKey: session.conversationKey || null,
+      runId: liveRun.runId,
+      apiBinding: liveRun.binding,
+      expectedBinding: liveRun.binding,
       text,
       inputItems,
       mode: String(body.mode || '').trim() || null,
@@ -9825,7 +15236,6 @@ async function handleRequest(req, res) {
       planFallback: String(body.planFallback || '').trim() || null,
       serviceTier: String(body.serviceTier || '').trim() || null,
       personality: String(body.personality || '').trim() || null,
-      apiConfig,
     });
     emitSessionRuntimePatch(hostId, effectiveSessionId, {
       phase: 'queued-turn',
@@ -9873,7 +15283,7 @@ async function handleRequest(req, res) {
       sendJson(res, 404, { error: 'session not found' });
       return;
     }
-    if (!session.live) {
+    if (!sessionAcceptsLiveControl(hostId, session)) {
       sendJson(res, 409, { error: 'session is not live' });
       return;
     }
@@ -9932,7 +15342,32 @@ async function handleRequest(req, res) {
         continue;
       }
 
-      const stop = beginSessionStop(session.hostId, session.sessionId);
+      let stopRequestId = null;
+      let stopRunId = session.runId || null;
+      const host = state.hosts.get(session.hostId);
+      if (host?.capabilities?.runApiBinding === true) {
+        stopRequestId = makeId();
+        try {
+          const prepared = await state.provenance.requestStopRun({
+            identity: { hostId: session.hostId, sessionId: session.sessionId },
+            runId: stopRunId,
+            stopRequestId,
+          });
+          stopRunId = prepared.runId;
+        } catch (error) {
+          results.push({
+            hostId: session.hostId,
+            sessionId: session.sessionId,
+            skipped: true,
+            error: error.message || 'Session Stop could not be prepared.',
+          });
+          continue;
+        }
+      }
+      const stop = beginSessionStop(session.hostId, session.sessionId, {
+        runId: stopRunId,
+        stopRequestId,
+      });
       results.push({
         hostId: session.hostId,
         sessionId: session.sessionId,
@@ -9967,7 +15402,36 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const stop = beginSessionStop(hostId, sessionId);
+    let expectedRunId = String(body.expectedRunId || '').trim() || null;
+    let stopRequestId = null;
+    const host = state.hosts.get(hostId);
+    if (host?.capabilities?.runApiBinding === true) {
+      stopRequestId = makeId();
+      try {
+        const prepared = await state.provenance.requestStopRun({
+          identity: { hostId, sessionId },
+          requireExpectedRun: true,
+          expectedRunId,
+          expectedBindingFingerprint: body.expectedBindingFingerprint,
+          expectedBindingProvided: Object.prototype.hasOwnProperty.call(
+            body,
+            'expectedBindingFingerprint'
+          ),
+          expectedRunStatus: body.expectedRunStatus,
+          expectedRunStatusProvided: Object.prototype.hasOwnProperty.call(body, 'expectedRunStatus'),
+          stopRequestId,
+        });
+        expectedRunId = prepared.runId;
+      } catch (error) {
+        sendSessionContractError(res, error, 'stop-session');
+        return;
+      }
+    }
+
+    const stop = beginSessionStop(hostId, sessionId, {
+      runId: expectedRunId,
+      stopRequestId,
+    });
     sendJson(res, 200, { ok: true, command: stop.command, commands: stop.commands });
     return;
   }
@@ -10050,25 +15514,32 @@ async function handleRequest(req, res) {
     }
 
     const session = getSession(hostId, sessionId);
-    const apiConfig = normalizeApiConfig(body.apiConfig);
-    const apiProfile = summarizeApiConfig(apiConfig);
-    if (session && apiProfile) {
-      const next = upsertSession(hostId, {
-        sessionId,
-        apiProfile,
-        lastUpdatedAt: nowIso(),
-      });
-      broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (!sessionAcceptsLiveControl(hostId, session)) {
+      sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+    let liveRun;
+    try {
+      liveRun = validateLiveCommandBinding(session, body);
+    } catch (error) {
+      sendSessionContractError(res, error, 'validate-live-command');
+      return;
     }
     const command = enqueueCommand(hostId, {
       type: 'session.compact',
-      sessionId,
+      sessionId: session.sessionId || sessionId,
       bridgeSessionId: session?.bridgeSessionId || null,
       nativeThreadId: session?.nativeThreadId || null,
       originSessionId: session?.originSessionId || null,
       sourceSessionId: session?.sourceSessionId || null,
       conversationKey: session?.conversationKey || null,
-      apiConfig,
+      runId: liveRun.runId,
+      apiBinding: liveRun.binding,
+      expectedBinding: liveRun.binding,
     });
     sendJson(res, 200, { ok: true, command });
     return;
@@ -10093,7 +15564,7 @@ async function handleRequest(req, res) {
       sendJson(res, 404, { error: 'session not found' });
       return;
     }
-    if (!session.live) {
+    if (!sessionAcceptsLiveControl(hostId, session)) {
       sendJson(res, 409, { error: 'session is not live' });
       return;
     }
@@ -10111,6 +15582,7 @@ async function handleRequest(req, res) {
       sessionId,
       requestId,
       action,
+      ...sessionIdentityPatch(hostId, sessionId),
       objective: Object.prototype.hasOwnProperty.call(body, 'objective') ? String(body.objective || '').trim() : undefined,
       status: Object.prototype.hasOwnProperty.call(body, 'status') ? String(body.status || '').trim() : undefined,
       tokenBudget: Number.isFinite(tokenBudget) && tokenBudget > 0 ? Math.floor(tokenBudget) : undefined,
@@ -10118,10 +15590,69 @@ async function handleRequest(req, res) {
 
     try {
       const payload = await pending;
+      if (action === 'clear' || payload.goal === null) {
+        clearGoalAutoApproveState(hostId, sessionId);
+      } else if (payload.goal) {
+        maybeClearGoalAutoApproveForRuntime(hostId, sessionId, {
+          ...(state.sessionRuntime.get(goalAutoApproveKey(hostId, sessionId)) || {}),
+          goal: payload.goal,
+        });
+      }
       sendJson(res, 200, { ok: true, goal: payload.goal || null, result: payload.result || null });
     } catch (error) {
       sendJson(res, /not live|no live session/i.test(error.message || '') ? 409 : 504, { error: error.message });
     }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/goal-auto-approve$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = String(url.searchParams.get('hostId') || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const stored = getGoalAutoApproveState(hostId, sessionId);
+    sendJson(res, 200, {
+      ok: true,
+      enabled: isGoalAutoApproveEnabled(hostId, sessionId),
+      state: stored ? { ...stored, enabled: isGoalAutoApproveEnabled(hostId, sessionId) } : null,
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/goal-auto-approve$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = body.hostId;
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+    const session = getSession(hostId, sessionId);
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    const runtime = state.sessionRuntime.get(goalAutoApproveKey(hostId, sessionId)) || {};
+    if (body.enabled !== false && !runtime.goal) {
+      sendJson(res, 409, { error: 'goal auto-approve requires an active goal' });
+      return;
+    }
+    const next = setGoalAutoApproveState(hostId, sessionId, {
+      enabled: body.enabled !== false,
+      requestId: body.requestId || null,
+    });
+    sendJson(res, 200, {
+      ok: true,
+      enabled: isGoalAutoApproveEnabled(hostId, sessionId),
+      state: next,
+    });
     return;
   }
 
@@ -10170,11 +15701,18 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const session = getSession(hostId, sessionId);
     const command = enqueueCommand(hostId, {
       type: 'session.request.respond',
       sessionId,
       requestId,
       response: body.response || null,
+      nativeThreadId: session?.nativeThreadId || null,
+      bridgeSessionId: session?.bridgeSessionId || null,
+      originSessionId: session?.originSessionId || null,
+      sourceSessionId: session?.sourceSessionId || null,
+      conversationKey: session?.conversationKey || null,
+      runId: session?.runId || null,
     });
     sendJson(res, 200, { ok: true, command });
     return;
@@ -10194,16 +15732,52 @@ async function handleRequest(req, res) {
       'Connection': 'keep-alive',
       'Access-Control-Allow-Origin': '*',
     });
-    res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, hostId, sessionId })}\n\n`);
-    addSessionSubscriber(hostId, sessionId, res, { optimize });
+    const identity = sessionIdentity(hostId, {
+      ...(getSession(hostId, sessionId) || {}),
+      sessionId,
+    });
+    const canonicalKey = resolveCanonicalConversationKey(hostId, identity);
+    const cursorHeader = Array.isArray(req.headers['last-event-id'])
+      ? req.headers['last-event-id'][0]
+      : req.headers['last-event-id'];
+    const cursor = String(
+      cursorHeader
+      || url.searchParams.get('lastEventId')
+      || url.searchParams.get('cursor')
+      || ''
+    ).trim();
+    const assistantAfter = url.searchParams.get('assistantAfter');
+    addSessionSubscriber(canonicalKey, res, {
+      optimize,
+      cursor,
+      makeReset: (currentCanonicalKey) => ({
+        session: sessionWithAssistantProjection(getSession(hostId, sessionId)),
+        assistantProjection: assistantProjectionForIdentity(hostId, identity, {
+          afterSeq: assistantAfter,
+          limit: 100,
+        }),
+        activities: state.activitySnapshots.snapshot(currentCanonicalKey),
+      }),
+    });
+    const stream = state.sessionEventStream.ensure(canonicalKey);
+    res.write(`event: ready\ndata: ${JSON.stringify({
+      ok: true,
+      hostId,
+      sessionId,
+      canonicalConversationKey: canonicalKey,
+      streamEpoch: state.sessionEventStream.epoch,
+      cursor: `${state.sessionEventStream.epoch}:${stream.counter}`,
+    })}\n\n`);
 
     const ping = setInterval(() => {
-      res.write(`event: ping\ndata: ${JSON.stringify({ time: nowIso() })}\n\n`);
+      if (!res.destroyed && !res.writableEnded) {
+        res.write(`event: ping\ndata: ${JSON.stringify({ time: nowIso() })}\n\n`);
+      }
     }, 20_000);
 
     req.on('close', () => {
       clearInterval(ping);
-      removeSessionSubscriber(hostId, sessionId, res);
+      removeSessionSubscriber(res);
     });
     return;
   }
@@ -10211,10 +15785,79 @@ async function handleRequest(req, res) {
   if (req.method === 'POST' && url.pathname === '/api/agent/events') {
     const body = await readBody(req);
     const events = Array.isArray(body.events) ? body.events : body.event ? [body.event] : [];
-    for (const event of events) {
-      applyAgentEvent(event);
+    const batchScope = validateAgentEventBatchScope(events);
+    if (!batchScope.ok) {
+      sendJson(res, 400, { error: batchScope.message, code: batchScope.code });
+      return;
     }
-    sendJson(res, 200, { ok: true, count: events.length });
+    const eventAuthorization = authorizeAgentEventBatch(batchScope.hostId, req);
+    if (!eventAuthorization.ok) {
+      sendJson(res, 409, {
+        error: eventAuthorization.message,
+        code: eventAuthorization.code,
+      });
+      return;
+    }
+    const batchKey = makeAgentEventBatchKey(body.batchId, events);
+    const batchDigest = batchKey ? makeAgentEventBatchDigest(events) : null;
+    const appliedBatch = batchKey ? state.appliedAgentEventBatches.get(batchKey) : null;
+    if (appliedBatch && appliedBatch.digest !== batchDigest) {
+      sendJson(res, 409, {
+        error: 'Agent event batch ID was reused with different events.',
+        code: 'agent_event_batch_id_conflict',
+      });
+      return;
+    }
+    if (appliedBatch) {
+      sendJson(res, 200, { ok: true, count: events.length, duplicate: true });
+      return;
+    }
+    const pendingBatch = batchKey ? state.pendingAgentEventBatches.get(batchKey) : null;
+    if (pendingBatch && pendingBatch.digest !== batchDigest) {
+      sendJson(res, 409, {
+        error: 'Agent event batch ID is already applying different events.',
+        code: 'agent_event_batch_id_conflict',
+      });
+      return;
+    }
+    let application = pendingBatch?.promise || null;
+    const duplicate = Boolean(pendingBatch);
+    if (!application) {
+      application = (async () => {
+        let appliedCount = 0;
+        try {
+          for (const event of events) {
+            await applyAgentEvent(event);
+            appliedCount += 1;
+          }
+        } catch (error) {
+          return { ok: false, error, appliedCount };
+        }
+        if (batchKey) rememberAppliedAgentEventBatch(batchKey, batchDigest);
+        return { ok: true, appliedCount };
+      })();
+      if (batchKey) {
+        state.pendingAgentEventBatches.set(batchKey, { digest: batchDigest, promise: application });
+      }
+    }
+    const outcome = await application;
+    if (
+      !duplicate
+      && batchKey
+      && state.pendingAgentEventBatches.get(batchKey)?.promise === application
+    ) {
+      state.pendingAgentEventBatches.delete(batchKey);
+    }
+    if (!outcome.ok) {
+      sendJson(res, 409, {
+        error: outcome.error?.message || 'Agent event batch application failed.',
+        code: 'agent_event_batch_apply_failed',
+        appliedCount: outcome.appliedCount,
+        failedEventIndex: outcome.appliedCount,
+      });
+      return;
+    }
+    sendJson(res, 200, { ok: true, count: events.length, duplicate });
     return;
   }
 
@@ -10231,7 +15874,237 @@ async function handleRequest(req, res) {
   sendJson(res, 404, { error: 'not found' });
 }
 
-function applyAgentEvent(event) {
+function makeAgentEventBatchKey(batchId, events) {
+  const normalizedBatchId = String(batchId || '').trim().slice(0, 512);
+  if (!normalizedBatchId || !Array.isArray(events) || !events.length) {
+    return null;
+  }
+  const hostScope = Array.from(new Set(events
+    .map((event) => String(event?.hostId || '').trim())
+    .filter(Boolean)))
+    .sort()
+    .join(',');
+  return `${hostScope}|${normalizedBatchId}`;
+}
+
+function makeAgentEventBatchDigest(events) {
+  return crypto.createHash('sha256').update(JSON.stringify(events)).digest('hex');
+}
+
+function rememberAppliedAgentEventBatch(batchKey, digest) {
+  state.appliedAgentEventBatches.set(batchKey, { digest, appliedAt: Date.now() });
+  while (state.appliedAgentEventBatches.size > AGENT_EVENT_BATCH_DEDUPE_LIMIT) {
+    state.appliedAgentEventBatches.delete(state.appliedAgentEventBatches.keys().next().value);
+  }
+}
+
+async function commitStartedSessionProvenance(event, currentSession = null) {
+  const bridgeSessionId = String(
+    event.bridgeSessionId
+    || currentSession?.bridgeSessionId
+    || currentSession?.sessionId
+    || event.sessionId
+    || ''
+  ).trim();
+  const nativeThreadId = String(event.nativeThreadId || event.sessionId || '').trim() || null;
+  const lookupSessionId = bridgeSessionId || nativeThreadId;
+  let record = state.provenance.getSessionRecord({ hostId: event.hostId, sessionId: lookupSessionId });
+  const host = state.hosts.get(event.hostId);
+  const compatibilityRunId = host?.capabilities?.runApiBinding === true
+    ? null
+    : currentSession?.runId;
+  let runId = String(event.runId || record?.activeRunId || compatibilityRunId || '').trim() || null;
+  let run = runId ? record?.runs?.[runId] || null : null;
+  const effectiveBinding = publicBinding(event.effectiveBinding);
+
+  if (
+    host?.capabilities?.runApiBinding !== true
+    && run?.apiBinding?.bindingFingerprint
+    && !effectiveBinding?.bindingFingerprint
+  ) {
+    throw new SessionContractError(
+      'session_api_binding_attestation_unsupported',
+      'This Host agent cannot attest the effective API binding for a newly started Session. Restart or upgrade the Host agent before launching it.',
+      { sessionBinding: publicBinding(run.apiBinding), canRebind: true }
+    );
+  }
+
+  if (!run && effectiveBinding?.bindingFingerprint) {
+    runId ||= makeId();
+    const planned = await state.provenance.planRun({
+      identity: { hostId: event.hostId, sessionId: bridgeSessionId || nativeThreadId },
+      conversationKey: event.conversationKey || bridgeSessionId || nativeThreadId,
+      runId,
+      launchMode: event.launchMode || 'fresh',
+      submittedBinding: effectiveBinding,
+      requestedSelection: event.effectiveSelection ? {
+        model: event.effectiveSelection.model || null,
+        effort: event.effectiveSelection.effort || null,
+        source: 'host-confirmed',
+      } : undefined,
+    });
+    record = planned.record;
+    run = planned.run;
+  }
+
+  if (host?.capabilities?.runApiBinding && !effectiveBinding?.bindingFingerprint) {
+    throw new SessionContractError(
+      'session_api_binding_unavailable',
+      'The Host did not confirm the effective API binding for this run.',
+      { sessionBinding: publicBinding(run?.apiBinding), canRebind: true }
+    );
+  }
+
+  if (!run) {
+    const merged = await state.provenance.mergeDiscovery({
+      hostId: event.hostId,
+      sessionId: bridgeSessionId || nativeThreadId,
+      bridgeSessionId: event.bridgeSessionId || null,
+      nativeThreadId,
+      conversationKey: event.conversationKey || bridgeSessionId || nativeThreadId,
+      originSessionId: event.originSessionId || null,
+      sourceSessionId: event.sourceSessionId || null,
+      source: 'managed',
+      title: event.title || currentSession?.title || nativeThreadId || bridgeSessionId,
+      cwd: event.cwd || currentSession?.cwd || null,
+      selection: event.effectiveSelection || null,
+    });
+    return {
+      record: merged.record,
+      runId: event.runId || currentSession?.runId || merged.record.latestSuccessfulRunId || null,
+      run: merged.record.runs?.[merged.record.latestSuccessfulRunId] || null,
+      compatibilityUnknownBinding: true,
+    };
+  }
+
+  if (host?.capabilities?.runApiBinding !== true && !run.apiBinding?.bindingFingerprint) {
+    return {
+      record,
+      runId,
+      run,
+      compatibilityUnknownBinding: true,
+    };
+  }
+
+  if (run.status === 'live' && record.activeRunId === runId) {
+    if (!bindingsEqual(run.apiBinding, effectiveBinding || run.apiBinding)) {
+      throw new SessionContractError(
+        'session_api_binding_mismatch',
+        'Host API attestation does not match the live run binding.',
+        {
+          sessionBinding: run.apiBinding,
+          submittedBinding: effectiveBinding,
+          canRebind: true,
+        }
+      );
+    }
+    return {
+      record,
+      runId,
+      run,
+      compatibilityUnknownBinding: false,
+    };
+  }
+
+  const confirmed = await state.provenance.confirmRun({
+    identity: {
+      hostId: event.hostId,
+      sessionId: bridgeSessionId || lookupSessionId,
+      bridgeSessionId: event.bridgeSessionId || bridgeSessionId || null,
+      nativeThreadId,
+      conversationKey: event.conversationKey || null,
+    },
+    runId,
+    bridgeSessionId: event.bridgeSessionId || bridgeSessionId || null,
+    nativeThreadId,
+    originSessionId: event.originSessionId || currentSession?.originSessionId || null,
+    sourceSessionId: event.sourceSessionId || currentSession?.sourceSessionId || null,
+    cwd: event.cwd || currentSession?.cwd || null,
+    title: event.title || currentSession?.title || '',
+    effectiveBinding: effectiveBinding || run.apiBinding,
+    effectiveSelection: event.effectiveSelection || {
+      model: event.model || null,
+      effort: event.effort || null,
+    },
+  });
+  return {
+    record: confirmed.record,
+    runId,
+    run: confirmed.record.runs?.[runId] || null,
+    compatibilityUnknownBinding: false,
+  };
+}
+
+function sessionCanTranscriptFallback(hostId, sessionId) {
+  const detail = getSessionDetail(hostId, sessionId, {
+    skipDiagnostics: true,
+    skipRemoteDetail: true,
+  });
+  return buildResumeTranscript(detail?.transcript || []).length > 0;
+}
+
+function sessionDiscoveryNeedsCommit(record, input = {}) {
+  if (!record) {
+    return true;
+  }
+  for (const field of ['bridgeSessionId', 'nativeThreadId', 'originSessionId', 'sourceSessionId']) {
+    if (input[field] && !record[field]) {
+      return true;
+    }
+  }
+  const sourceRank = { managed: 100, manual: 90, metadata: 70, imported: 50, rollout: 40, vscode: 30 };
+  const incomingRank = sourceRank[input.source] || 0;
+  const existingRank = sourceRank[record.source] || 0;
+  if (incomingRank > existingRank) {
+    return true;
+  }
+  if (incomingRank >= existingRank) {
+    if (input.conversationKey && input.conversationKey !== record.conversationKey) {
+      return true;
+    }
+    if (input.title && input.title !== record.title) {
+      return true;
+    }
+    if (input.cwd && input.cwd !== record.cwd) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function managedDiscoveryTargetsStaleRun(host, session, current, record) {
+  if (
+    !current
+    || current.source !== 'managed'
+    || (!current.live && current.state !== 'starting')
+  ) {
+    return false;
+  }
+  const discoveredRunId = String(session.runId || session.runtime?.runId || '').trim();
+  if (!discoveredRunId) {
+    // History rows carry assistant cursors but no run scope. They remain safe to merge
+    // while the separately emitted live runner row protects the current projection.
+    return false;
+  }
+  const activeRunId = String(record?.activeRunId || '').trim();
+  const activeRun = activeRunId ? record?.runs?.[activeRunId] || null : null;
+  const currentRunId = ['pending', 'live'].includes(activeRun?.status)
+    ? activeRunId
+    : String(current.runId || '').trim();
+  if (!currentRunId) {
+    return false;
+  }
+  if (discoveredRunId !== currentRunId) {
+    return true;
+  }
+  return Boolean(
+    host?.capabilities?.runApiBinding === true
+    && session.live
+    && (activeRunId !== discoveredRunId || activeRun?.status !== 'live')
+  );
+}
+
+async function applyAgentEvent(event) {
   if (!event || !event.type || !event.hostId) {
     return;
   }
@@ -10243,6 +16116,42 @@ function applyAgentEvent(event) {
   if (host) {
     host.lastSeenAt = nowIso();
     state.hosts.set(event.hostId, host);
+  }
+
+  if (event.type === 'host.skills.inventory') {
+    applyHostSkillInventoryEvent(event);
+    return;
+  }
+
+  if (event.type === 'host.skills.artifact.result') {
+    applyHostSkillArtifactResult(event);
+    return;
+  }
+
+  if (event.type === 'host.skills.deployment.result') {
+    applyHostSkillDeploymentResult(event);
+    return;
+  }
+
+  if (event.type === 'session.activity_snapshot') {
+    const activityIdentity = sessionIdentity(event.hostId, event);
+    const canonicalKey = resolveCanonicalConversationKey(event.hostId, activityIdentity);
+    const activityRevision = Number(event.activityRevision);
+    if (!canonicalKey || !Number.isSafeInteger(activityRevision) || activityRevision <= 0) {
+      return;
+    }
+    const accepted = state.activitySnapshots.accept(
+      state.sessionEventStream.epoch,
+      canonicalKey,
+      event
+    );
+    if (accepted) {
+      publishCanonicalSessionEvent(canonicalKey, 'session.activity', {
+        ...accepted,
+        streamEpoch: state.sessionEventStream.epoch,
+      });
+    }
+    return;
   }
 
   if (event.type === 'session.watch.updated') {
@@ -10265,12 +16174,32 @@ function applyAgentEvent(event) {
       state.hosts.set(event.hostId, host);
     }
     const sessions = Array.isArray(event.sessions) ? event.sessions : [];
+    const discoveryPublishesLive = (session, record = null) => {
+      if (!session?.live) {
+        return false;
+      }
+      if (host?.capabilities?.runApiBinding !== true) {
+        return true;
+      }
+      const durableRecord = record || state.provenance.getSessionRecord({
+        hostId: event.hostId,
+        sessionId: session.sessionId,
+      });
+      const runId = String(session.runId || session.runtime?.runId || '').trim();
+      const run = runId ? durableRecord?.runs?.[runId] || null : null;
+      return Boolean(
+        runId
+        && durableRecord?.activeRunId === runId
+        && run?.status === 'live'
+        && run.apiBinding?.bindingFingerprint
+      );
+    };
     const liveSessionIds = new Set();
     for (const discoveredSession of sessions) {
-      if (!discoveredSession?.live) {
+      if (!discoveryPublishesLive(discoveredSession)) {
         continue;
       }
-      for (const identity of sessionIdentityValues(discoveredSession)) {
+      for (const identity of sessionOwnershipIdentityValues(discoveredSession)) {
         liveSessionIds.add(identity);
       }
     }
@@ -10279,13 +16208,95 @@ function applyAgentEvent(event) {
         continue;
       }
       const existing = getSession(event.hostId, session.sessionId);
-      const isCurrentlyLive = sessionIdentityValues(session).some((identity) => liveSessionIds.has(identity));
-      const preserveManagedState = existing
-        && existing.source === 'managed'
-        && (existing.live || existing.state === 'starting')
+      const discoverySource = session.source === 'managed'
+        ? 'managed'
+        : session.source === 'vscode'
+          ? 'vscode'
+          : 'rollout';
+      const discoveryInput = {
+        hostId: event.hostId,
+        sessionId: session.sessionId,
+        bridgeSessionId: session.bridgeSessionId || existing?.bridgeSessionId || null,
+        nativeThreadId: session.nativeThreadId || existing?.nativeThreadId || session.sessionId,
+        conversationKey: session.conversationKey || existing?.conversationKey || session.sessionId,
+        originSessionId: session.originSessionId || existing?.originSessionId || null,
+        sourceSessionId: session.sourceSessionId || existing?.sourceSessionId || null,
+        source: discoverySource,
+        title: session.title || existing?.title || session.sessionId,
+        cwd: session.cwd || existing?.cwd || null,
+        createdAt: session.createdAt || existing?.createdAt || null,
+        apiProfile: session.apiProfile || existing?.apiProfile || null,
+        selection: session.codexOptions || existing?.codexOptions || null,
+        modelProviderHint: session.modelProvider || session.modelProviderHint || null,
+      };
+      const storedDiscovery = state.provenance.getSessionRecord({
+        hostId: event.hostId,
+        sessionId: session.sessionId,
+      });
+      const suppressStaleRunSideEffects = managedDiscoveryTargetsStaleRun(
+        host,
+        session,
+        existing,
+        storedDiscovery
+      );
+      const cursor = session.assistantCursor && typeof session.assistantCursor === 'object'
+        ? session.assistantCursor
+        : null;
+      let mergedDiscovery = { record: storedDiscovery };
+      let assignedAssistant = null;
+      if (!suppressStaleRunSideEffects) {
+        const priorCanonicalKeys = [...new Set([
+          session.sessionId,
+          session.bridgeSessionId,
+          session.nativeThreadId,
+        ].filter(Boolean).map((identityValue) => (
+          resolveCanonicalConversationKey(event.hostId, identityValue)
+        )))];
+        mergedDiscovery = sessionDiscoveryNeedsCommit(storedDiscovery, discoveryInput)
+          ? await state.provenance.mergeDiscovery(discoveryInput)
+          : { record: storedDiscovery };
+        const canonicalKey = mergedDiscovery.canonicalKey
+          || resolveCanonicalConversationKey(event.hostId, discoveryInput);
+        for (const priorCanonicalKey of priorCanonicalKeys) {
+          mergeCanonicalRealtimeKeys(priorCanonicalKey, canonicalKey);
+        }
+        assignedAssistant = cursor
+          ? await assignAssistantObservations(
+            event.hostId,
+            discoveryInput,
+            cursor.observations || [],
+            cursor
+          )
+          : null;
+        if (assignedAssistant?.changed) {
+          publishCanonicalSessionEvent(
+            assignedAssistant.canonicalKey,
+            'session.assistant_projection',
+            assignedAssistant.projection
+          );
+        }
+      }
+      const assistantProjectionIdentity = suppressStaleRunSideEffects
+        ? existing || { sessionId: session.sessionId }
+        : discoveryInput;
+      const assistantProjection = compactAssistantProjection(
+        assignedAssistant?.projection
+        || assistantProjectionForIdentity(event.hostId, assistantProjectionIdentity, {
+          afterSeq: Number.MAX_SAFE_INTEGER,
+          limit: 1,
+        })
+      );
+      const current = getSession(event.hostId, session.sessionId) || existing;
+      const publishDiscoveredLive = discoveryPublishesLive(session, mergedDiscovery.record);
+      const isCurrentlyLive = publishDiscoveredLive
+        && sessionOwnershipIdentityValues(session).some((identity) => liveSessionIds.has(identity));
+      const preserveManagedState = current
+        && current.source === 'managed'
+        && (current.live || current.state === 'starting')
         && (
           isCurrentlyLive
-          || (existing.state === 'starting' && sessionAgeMs(existing) < STALE_MANAGED_SESSION_GRACE_MS)
+          || !publishDiscoveredLive
+          || (current.state === 'starting' && sessionAgeMs(current) < STALE_MANAGED_SESSION_GRACE_MS)
         );
       const discoveredCreatedAt = session.createdAt || null;
       const discoveredConversationKey = session.conversationKey && session.conversationKey !== session.sessionId
@@ -10293,38 +16304,67 @@ function applyAgentEvent(event) {
         : '';
       const next = upsertSession(event.hostId, {
         sessionId: session.sessionId,
-        title: session.title || session.sessionId,
-        cwd: session.cwd || null,
-        source: preserveManagedState ? existing.source : (session.source || 'imported'),
-        state: preserveManagedState ? existing.state : (session.live ? 'running' : 'imported'),
-        live: preserveManagedState ? existing.live : Boolean(session.live),
-        createdAt: preserveManagedState ? existing.createdAt || discoveredCreatedAt : discoveredCreatedAt,
-        lastUpdatedAt: session.updatedAt || nowIso(),
-        messageCount: Math.max(Number(existing?.messageCount || 0), Number(session.messageCount || 0), Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0),
-        latestUserMessage: session.latestUserMessage || null,
-        latestAgentMessage: session.latestAgentMessage || null,
-        transcriptPreview: session.transcriptPreview || [],
-        rolloutPath: session.rolloutPath || existing?.rolloutPath || null,
-        originSessionId: session.originSessionId || existing?.originSessionId || null,
-        sourceSessionId: session.sourceSessionId || existing?.sourceSessionId || null,
-        conversationKey: discoveredConversationKey
-          || session.originSessionId
-          || existing?.conversationKey
-          || existing?.originSessionId
-          || existing?.sourceSessionId
-          || session.sessionId,
-        launchMode: session.launchMode || null,
-        runtime: preserveManagedState ? existing.runtime || null : session.runtime || existing?.runtime || null,
-        runId: session.runId || session.runtime?.runId || existing?.runId || null,
-        bridgeSessionId: session.bridgeSessionId || existing?.bridgeSessionId || null,
-        nativeThreadId: existing?.nativeThreadId || session.nativeThreadId || session.sessionId,
+        title: preserveManagedState
+          ? current.title || session.sessionId
+          : mergedDiscovery.record?.title || session.title || session.sessionId,
+        cwd: preserveManagedState ? current.cwd || null : mergedDiscovery.record?.cwd || session.cwd || null,
+        source: preserveManagedState ? current.source : (session.source || 'imported'),
+        state: preserveManagedState ? current.state : (publishDiscoveredLive ? 'running' : 'imported'),
+        live: preserveManagedState ? current.live : publishDiscoveredLive,
+        createdAt: preserveManagedState ? current.createdAt || discoveredCreatedAt : discoveredCreatedAt,
+        lastUpdatedAt: preserveManagedState ? current.lastUpdatedAt || nowIso() : session.updatedAt || nowIso(),
+        messageCount: Math.max(Number(current?.messageCount || 0), Number(session.messageCount || 0), Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0),
+        latestUserMessage: preserveManagedState
+          ? current.latestUserMessage || null
+          : session.latestUserMessage || current?.latestUserMessage || null,
+        latestAgentMessage: preserveManagedState
+          ? current.latestAgentMessage || null
+          : session.latestAgentMessage || current?.latestAgentMessage || null,
+        transcriptPreview: preserveManagedState
+          ? current.transcriptPreview || []
+          : Array.isArray(session.transcriptPreview) && session.transcriptPreview.length
+            ? session.transcriptPreview
+            : (current?.transcriptPreview || []),
+        assistantProjection,
+        rolloutPath: preserveManagedState
+          ? current.rolloutPath || null
+          : session.rolloutPath || current?.rolloutPath || null,
+        originSessionId: preserveManagedState
+          ? current.originSessionId || null
+          : session.originSessionId || current?.originSessionId || null,
+        sourceSessionId: preserveManagedState
+          ? current.sourceSessionId || null
+          : session.sourceSessionId || current?.sourceSessionId || null,
+        conversationKey: preserveManagedState
+          ? current.conversationKey || current.originSessionId || current.sourceSessionId || session.sessionId
+          : discoveredConversationKey
+            || session.originSessionId
+            || current?.conversationKey
+            || current?.originSessionId
+            || current?.sourceSessionId
+            || session.sessionId,
+        launchMode: preserveManagedState
+          ? current.launchMode || null
+          : session.launchMode || null,
+        runtime: preserveManagedState ? current.runtime || null : session.runtime || current?.runtime || null,
+        runId: preserveManagedState
+          ? current.runId || null
+          : session.runId || session.runtime?.runId || current?.runId || null,
+        bridgeSessionId: preserveManagedState
+          ? current.bridgeSessionId || null
+          : session.bridgeSessionId || current?.bridgeSessionId || null,
+        nativeThreadId: preserveManagedState
+          ? current.nativeThreadId || current.sessionId
+          : current?.nativeThreadId || session.nativeThreadId || session.sessionId,
       });
       if (!preserveManagedState && !next.live && Array.isArray(session.transcriptPreview)) {
         setSessionLog(event.hostId, next.sessionId, session.transcriptPreview, { merge: true });
       }
       broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
     }
-    closeManagedSessionsMissingFromDiscovery(event.hostId, liveSessionIds);
+    await closeManagedSessionsMissingFromDiscovery(event.hostId, liveSessionIds, {
+      discoveryId: event.discoveryId || null,
+    });
     return;
   }
 
@@ -10397,6 +16437,56 @@ function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'host.api_cataloged' && event.requestId) {
+    const pending = state.pendingApiCatalogRequests.get(event.requestId);
+    if (pending) {
+      pending.resolve({
+        hostId: event.hostId,
+        requestId: event.requestId,
+        bindingFingerprint: event.bindingFingerprint || null,
+        runId: event.runId || null,
+        result: event.result || null,
+        timestamp: event.timestamp || nowIso(),
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'host.binding_preflighted' && event.requestId) {
+    const pending = state.pendingBindingPreflightRequests.get(event.requestId);
+    if (pending) {
+      pending.resolve({
+        ok: event.ok === true,
+        code: event.code || null,
+        error: event.error || null,
+        binding: publicBinding(event.binding),
+        canRebind: Boolean(event.canRebind),
+        timestamp: event.timestamp || nowIso(),
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'host.skills.result' && event.requestId) {
+    const pending = state.pendingHostSkillRequests.get(event.requestId);
+    if (pending) {
+      if (event.error) {
+        pending.reject(new Error(event.error));
+      } else {
+        pending.resolve({
+          hostId: event.hostId,
+          requestId: event.requestId,
+          action: event.action || '',
+          ok: event.ok !== false,
+          skills: Array.isArray(event.skills) ? event.skills : [],
+          results: Array.isArray(event.results) ? event.results : [],
+          timestamp: event.timestamp || nowIso(),
+        });
+      }
+    }
+    return;
+  }
+
   if (event.type === 'session.detailed' && event.requestId) {
     const pending = state.pendingSessionDetailRequests.get(event.requestId);
     if (pending) {
@@ -10448,6 +16538,10 @@ function applyAgentEvent(event) {
         pending.resolve({
           models: Array.isArray(event.models) ? event.models : [],
           nextCursor: event.nextCursor || null,
+          complete: event.complete !== false,
+          truncated: event.truncated === true,
+          bindingFingerprint: event.bindingFingerprint || null,
+          runId: event.runId || null,
           hostId: event.hostId,
           sessionId: event.sessionId || null,
         });
@@ -10628,6 +16722,138 @@ function applyAgentEvent(event) {
   if (!sessionId) {
     return;
   }
+  const eventHost = state.hosts.get(event.hostId);
+  if (
+    eventHost?.capabilities?.runApiBinding === true
+    && RUN_ID_REQUIRED_SESSION_EVENT_TYPES.has(event.type)
+    && !String(event.runId || '').trim()
+  ) {
+    emitSessionDiagnostic(event.hostId, sessionId, {
+      severity: 'warning',
+      source: 'relay',
+      kind: 'lifecycle',
+      method: `${event.type}/missing-run-id`,
+      message: `Ignored ${event.type} from a binding-aware Host because runId was missing.`,
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'session.command_failed') {
+    const effectiveSessionId = resolveSessionId(event.hostId, sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    const currentSession = getSession(event.hostId, effectiveSessionId) || getSession(event.hostId, sessionId);
+    const code = String(event.code || 'session_command_failed').trim() || 'session_command_failed';
+    const message = String(event.error || event.message || 'Session command failed.');
+    if (event.operation === 'start' && event.runId) {
+      const failedRun = await failPlannedRun(
+        event.hostId,
+        currentSession?.bridgeSessionId || currentSession?.sessionId || sessionId,
+        event.runId,
+        { code, message }
+      );
+      const eventHost = state.hosts.get(event.hostId);
+      if (eventHost?.capabilities?.runApiBinding === true && failedRun?.transitioned !== true) {
+        return;
+      }
+      const failedSession = upsertSession(event.hostId, {
+        sessionId: currentSession?.sessionId || effectiveSessionId,
+        state: `failed:${code}`,
+        live: false,
+        runId: event.runId,
+        resumeError: {
+          code,
+          error: message,
+          stage: event.operation || 'start',
+          canRebind: Boolean(event.canRebind),
+          canTranscriptFallback: sessionCanTranscriptFallback(event.hostId, effectiveSessionId),
+        },
+        lastUpdatedAt: event.timestamp || nowIso(),
+      }, { preserveManagedLive: false });
+      broadcastSessionEvent(event.hostId, failedSession.sessionId, 'session.state_changed', failedSession);
+      broadcastSessionEvent(event.hostId, failedSession.sessionId, 'session.snapshot', failedSession);
+    }
+    emitSessionAlert(event.hostId, effectiveSessionId, {
+      severity: 'error',
+      source: 'runtime',
+      message,
+      timestamp: event.timestamp || nowIso(),
+    });
+    broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.command_failed', {
+      ...event,
+      code,
+      error: message,
+      timestamp: event.timestamp || nowIso(),
+    });
+    return;
+  }
+
+  if (event.type === 'session.selection_confirmed') {
+    const effectiveSessionId = resolveSessionId(event.hostId, sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    const currentSession = getSession(event.hostId, effectiveSessionId) || getSession(event.hostId, sessionId);
+    const liveRun = sessionRunRecord(event.hostId, currentSession?.sessionId || effectiveSessionId, { includePending: true });
+    if (!liveRun.run || !liveRun.runId) {
+      return;
+    }
+    const confirmedBinding = publicBinding(event.effectiveBinding);
+    if (confirmedBinding && !bindingsEqual(liveRun.run.apiBinding, confirmedBinding)) {
+      emitSessionAlert(event.hostId, effectiveSessionId, {
+        severity: 'error',
+        source: 'runtime',
+        message: 'Host selection confirmation used a different API binding than the live Session run.',
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
+    const confirmedRunId = event.runId || liveRun.runId;
+    let confirmed;
+    try {
+      confirmed = await state.provenance.confirmEffectiveSelection({
+        identity: {
+          hostId: event.hostId,
+          sessionId: currentSession?.bridgeSessionId || currentSession?.sessionId || effectiveSessionId,
+        },
+        runId: confirmedRunId,
+        selection: {
+          model: event.model || null,
+          effort: event.effort || null,
+        },
+      });
+    } catch (error) {
+      if (['session_run_not_found', 'session_run_state_conflict'].includes(error?.code)) {
+        return;
+      }
+      throw error;
+    }
+    if (eventTargetsPublishedParentRun(event, effectiveSessionId)) {
+      return;
+    }
+    if (getCurrentSessionRunId(event.hostId, effectiveSessionId) !== confirmedRunId) {
+      return;
+    }
+    const next = upsertSession(event.hostId, {
+      sessionId: currentSession?.sessionId || effectiveSessionId,
+      runId: confirmedRunId,
+      activeRunId: confirmedRunId,
+      apiBinding: publicBinding(liveRun.run.apiBinding),
+      effectiveSelection: confirmed.selection,
+      lastUpdatedAt: event.timestamp || nowIso(),
+    });
+    broadcastSessionEvent(event.hostId, next.sessionId, 'session.selection_confirmed', {
+      hostId: event.hostId,
+      sessionId: next.sessionId,
+      runId: confirmedRunId,
+      selection: confirmed.selection,
+      timestamp: event.timestamp || nowIso(),
+    });
+    broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
+    return;
+  }
 
   if (event.type === 'session.started') {
     const effectiveSessionId = event.sessionId || event.nativeThreadId || sessionId;
@@ -10638,8 +16864,24 @@ function applyAgentEvent(event) {
       ? (state.sessions.get(sessionKey(event.hostId, bridgeSessionId)) || getSession(event.hostId, bridgeSessionId))
       : null;
     const currentSession = getSession(event.hostId, effectiveSessionId);
-    const currentRunId = bridgeSession?.runId || currentSession?.runId || null;
+    const plannedSessionId = bridgeSession?.sessionId
+      || event.bridgeSessionId
+      || currentSession?.bridgeSessionId
+      || currentSession?.sessionId
+      || effectiveSessionId;
+    const startedRecord = state.provenance.getSessionRecord({
+      hostId: event.hostId,
+      sessionId: plannedSessionId,
+    });
+    const durableActiveRunId = String(startedRecord?.activeRunId || '').trim();
+    const durableActiveRun = durableActiveRunId
+      ? startedRecord?.runs?.[durableActiveRunId] || null
+      : null;
+    const currentRunId = ['pending', 'live'].includes(durableActiveRun?.status)
+      ? durableActiveRunId
+      : bridgeSession?.runId || currentSession?.runId || null;
     if (event.runId && currentRunId && event.runId !== currentRunId) {
+      const staleRun = startedRecord?.runs?.[event.runId] || null;
       emitSessionDiagnostic(event.hostId, effectiveSessionId, {
         severity: 'info',
         source: 'relay',
@@ -10649,16 +16891,121 @@ function applyAgentEvent(event) {
         data: {
           eventRunId: event.runId,
           currentRunId,
+          eventRunStatus: staleRun?.status || null,
         },
         timestamp: event.timestamp || nowIso(),
       });
+      if (
+        staleRun
+        && (
+          ['pending', 'failed'].includes(staleRun.status)
+          || startedRecord.activeRunId !== event.runId
+        )
+      ) {
+        enqueueCommand(event.hostId, {
+          type: 'session.stop',
+          sessionId: effectiveSessionId,
+          requestedSessionId: plannedSessionId,
+          bridgeSessionId: event.bridgeSessionId || plannedSessionId,
+          nativeThreadId: event.nativeThreadId || effectiveSessionId,
+          runId: event.runId,
+          suppressTerminalEvent: true,
+          reason: 'stale-session-started',
+        });
+      }
+      return;
+    }
+    const startedPresenceRunId = String(event.runId || currentRunId || '').trim();
+    if (
+      startedPresenceRunId
+      && durableActiveRunId === startedPresenceRunId
+      && ['pending', 'live'].includes(durableActiveRun?.status)
+    ) {
+      invalidateManagedDiscoveryMissingRun(
+        managedDiscoveryRunKey(event.hostId, plannedSessionId, startedPresenceRunId)
+      );
+    }
+    let confirmedProvenance;
+    try {
+      confirmedProvenance = await commitStartedSessionProvenance(
+        event,
+        bridgeSession || currentSession
+      );
+    } catch (error) {
+      const failureSessionId = bridgeSession?.sessionId || event.bridgeSessionId || effectiveSessionId;
+      const failedRun = await failPlannedRun(event.hostId, failureSessionId, event.runId || currentRunId, error);
+      const eventHost = state.hosts.get(event.hostId);
+      const wouldOverwriteLiveProjection = Boolean(bridgeSession?.live || currentSession?.live);
+      const rejectedRunId = event.runId || currentRunId || null;
+      const rejectedRecord = rejectedRunId ? state.provenance.getSessionRecord({
+        hostId: event.hostId,
+        sessionId: failureSessionId,
+      }) : null;
+      const rejectedRun = rejectedRunId ? rejectedRecord?.runs?.[rejectedRunId] || null : null;
+      if ((failedRun?.transitioned === true || rejectedRun?.status === 'failed') && rejectedRunId) {
+        enqueueCommand(event.hostId, {
+          type: 'session.stop',
+          sessionId: effectiveSessionId,
+          requestedSessionId: failureSessionId,
+          bridgeSessionId: event.bridgeSessionId || failureSessionId,
+          nativeThreadId: event.nativeThreadId || effectiveSessionId,
+          runId: rejectedRunId,
+          suppressTerminalEvent: true,
+          reason: 'start-confirmation-rejected',
+        });
+      }
+      if (
+        eventHost?.capabilities?.runApiBinding === true
+        && failedRun?.transitioned !== true
+        && (failedRun?.missing !== true || wouldOverwriteLiveProjection)
+      ) {
+        return;
+      }
+      const failed = upsertSession(event.hostId, {
+        sessionId: failureSessionId,
+        state: `failed:${error.code || 'session_spawn_failed'}`,
+        live: false,
+        runId: event.runId || currentRunId || null,
+        resumeError: {
+          code: error.code || 'session_spawn_failed',
+          error: error.message || 'Session start confirmation failed.',
+          stage: 'confirm-start',
+          canRebind: Boolean(error.canRebind),
+          canTranscriptFallback: sessionCanTranscriptFallback(event.hostId, failureSessionId),
+        },
+        lastUpdatedAt: event.timestamp || nowIso(),
+      }, { preserveManagedLive: false });
+      emitSessionAlert(event.hostId, failureSessionId, {
+        severity: 'error',
+        source: 'runtime',
+        message: error.message || 'Session start confirmation failed.',
+        timestamp: event.timestamp || nowIso(),
+      });
+      broadcastSessionEvent(event.hostId, failureSessionId, 'session.state_changed', failed);
+      broadcastSessionEvent(event.hostId, failureSessionId, 'session.snapshot', failed);
       return;
     }
     if (bridgeSessionId) {
       rememberSessionAlias(event.hostId, bridgeSessionId, effectiveSessionId);
     }
-    const runId = event.runId || bridgeSession?.runId || currentSession?.runId || null;
-    const apiProfile = bridgeSession?.apiProfile || currentSession?.apiProfile || null;
+    const runId = confirmedProvenance.runId || event.runId || bridgeSession?.runId || currentSession?.runId || null;
+    const confirmedRun = confirmedProvenance.run || confirmedProvenance.record?.runs?.[runId] || null;
+    if (
+      runId
+      && confirmedProvenance.record?.activeRunId === runId
+      && confirmedRun?.status === 'live'
+    ) {
+      invalidateManagedDiscoveryMissingRun(
+        managedDiscoveryRunKey(event.hostId, plannedSessionId, runId)
+      );
+    }
+    const confirmedBinding = publicBinding(confirmedRun?.apiBinding);
+    const apiProfile = confirmedBinding?.kind === 'profile' ? {
+      profileId: confirmedBinding.profileId || null,
+      label: confirmedBinding.label || confirmedBinding.provider || 'API profile',
+      provider: confirmedBinding.provider || null,
+      baseUrl: confirmedBinding.normalizedBaseUrl || null,
+    } : bridgeSession?.apiProfile || currentSession?.apiProfile || null;
     const inheritedOriginSessionId = event.originSessionId
       || bridgeSession?.originSessionId
       || currentSession?.originSessionId
@@ -10695,6 +17042,11 @@ function applyAgentEvent(event) {
         launchMode: event.launchMode || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
         apiProfile,
+        apiBinding: confirmedBinding,
+        activeRunId: confirmedProvenance.record?.activeRunId || runId,
+        latestSuccessfulRunId: confirmedProvenance.record?.latestSuccessfulRunId || runId,
+        requestedSelection: confirmedRun?.requestedSelection || null,
+        effectiveSelection: confirmedRun?.effectiveSelection || null,
       })
       : upsertSession(event.hostId, {
         sessionId: effectiveSessionId,
@@ -10714,6 +17066,11 @@ function applyAgentEvent(event) {
         bridgeSessionId: event.bridgeSessionId || null,
         nativeThreadId: event.nativeThreadId || effectiveSessionId,
         apiProfile,
+        apiBinding: confirmedBinding,
+        activeRunId: confirmedProvenance.record?.activeRunId || runId,
+        latestSuccessfulRunId: confirmedProvenance.record?.latestSuccessfulRunId || runId,
+        requestedSelection: confirmedRun?.requestedSelection || null,
+        effectiveSelection: confirmedRun?.effectiveSelection || null,
         lastUpdatedAt: nowIso(),
       });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.started', next);
@@ -10726,9 +17083,53 @@ function applyAgentEvent(event) {
     if (isStaleSessionRunEvent(event, effectiveSessionId)) {
       return;
     }
+    if (eventTargetsPublishedParentRun(event, effectiveSessionId)) {
+      if (event.stream === 'stderr') {
+        const alert = buildAlertFromOutput(event);
+        if (alert) {
+          emitSessionAlert(event.hostId, effectiveSessionId, alert);
+        }
+        return;
+      }
+      const outputChannel = getOutputChannel(event);
+      if (isInternalOutputEvent(event)) {
+        emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+          timestamp: event.timestamp || nowIso(),
+          severity: 'info',
+          source: event.source || 'codex',
+          kind: diagnosticKindForOutputChannel(outputChannel),
+          method: event.method || `session.output/${outputChannel || 'internal'}`,
+          message: event.chunk || '',
+          data: {
+            stream: event.stream || 'stdout',
+            text: event.chunk || '',
+            phase: event.phase || null,
+            channel: event.channel || null,
+          },
+        });
+        return;
+      }
+      if (classifyOutputSpeaker(event.chunk || '', event.stream || 'stdout') === 'agent') {
+        emitTranscriptEntry(event.hostId, effectiveSessionId, {
+          speaker: 'agent',
+          text: event.chunk || '',
+          stream: event.stream || 'stdout',
+          timestamp: event.timestamp || nowIso(),
+        });
+        broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.output', {
+          ...event,
+          sessionId: effectiveSessionId,
+          hostId: event.hostId,
+          timestamp: event.timestamp || nowIso(),
+        });
+      }
+      return;
+    }
+    const existingSession = getSession(event.hostId, effectiveSessionId);
+    const liveState = existingSession?.state === 'ending' ? 'ending' : 'running';
     const next = upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
-      state: 'running',
+      state: liveState,
       live: true,
       lastUpdatedAt: nowIso(),
     });
@@ -10766,7 +17167,7 @@ function applyAgentEvent(event) {
     if (speaker === 'agent') {
       const snapshot = upsertSession(event.hostId, {
         sessionId: effectiveSessionId,
-        state: 'running',
+        state: liveState,
         live: true,
         latestAgentMessage: event.chunk || null,
         lastUpdatedAt: nowIso(),
@@ -10796,7 +17197,7 @@ function applyAgentEvent(event) {
     if (isStaleSessionRunEvent(event, effectiveSessionId)) {
       return;
     }
-    const normalizedTranscript = normalizeStoredTranscriptEntry({
+    let normalizedTranscript = normalizeStoredTranscriptEntry({
       speaker: event.speaker || 'system',
       text: event.text || '',
       stream: event.stream || null,
@@ -10807,6 +17208,36 @@ function applyAgentEvent(event) {
       return;
     }
     const speaker = normalizedTranscript.speaker || 'system';
+    let assignedAssistant = null;
+    if (
+      (speaker === 'agent' || speaker === 'assistant')
+      && event.assistantObservation
+      && typeof event.assistantObservation === 'object'
+    ) {
+      assignedAssistant = await assignAssistantObservations(
+        event.hostId,
+        {
+          ...event,
+          sessionId: effectiveSessionId,
+        },
+        [event.assistantObservation]
+      );
+      const assignedEntry = assignedAssistant.entries[0];
+      if (!assignedEntry) {
+        throw new Error('Assistant transcript identity assignment did not produce a durable entry');
+      }
+      if (assignedAssistant.changed) {
+        publishCanonicalSessionEvent(
+          assignedAssistant.canonicalKey,
+          'session.assistant_projection',
+          assignedAssistant.projection
+        );
+      }
+      normalizedTranscript = normalizeStoredTranscriptEntry({
+        ...normalizedTranscript,
+        ...assignedEntry,
+      });
+    }
     if (consumePendingUserTranscriptEcho(event.hostId, effectiveSessionId, normalizedTranscript)) {
       return;
     }
@@ -10819,6 +17250,16 @@ function applyAgentEvent(event) {
       latestUserMessage: speaker === 'user' ? normalizedTranscript.text || null : existing?.latestUserMessage || null,
       latestAgentMessage: (speaker === 'agent' || speaker === 'assistant') ? normalizedTranscript.text || null : existing?.latestAgentMessage || null,
       nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
+      assistantProjection: compactAssistantProjection(
+        assignedAssistant?.projection
+        || assistantProjectionForIdentity(event.hostId, {
+          ...event,
+          sessionId: effectiveSessionId,
+        }, {
+          afterSeq: Number.MAX_SAFE_INTEGER,
+          limit: 1,
+        })
+      ),
       lastUpdatedAt: normalizedTranscript.timestamp || nowIso(),
     });
     emitTranscriptEntry(event.hostId, effectiveSessionId, normalizedTranscript);
@@ -10832,6 +17273,42 @@ function applyAgentEvent(event) {
     const existingRuntime = state.sessionRuntime.get(sessionKey(event.hostId, effectiveSessionId)) || null;
     const existingRunId = existingSession?.runId || existingRuntime?.runId || null;
     if (event.runId && existingRunId && event.runId !== existingRunId) {
+      const replacementRecord = state.provenance.getSessionRecord({
+        hostId: event.hostId,
+        sessionId: existingSession?.bridgeSessionId || existingSession?.sessionId || effectiveSessionId,
+      });
+      const replacementRun = replacementRecord?.activeRunId
+        ? replacementRecord.runs?.[replacementRecord.activeRunId] || null
+        : null;
+      const terminalNamedRun = replacementRecord?.runs?.[event.runId] || null;
+      if (
+        event.live === false
+        && terminalNamedRun?.status === 'live'
+        && (
+          replacementRecord.activeRunId === event.runId
+          || (
+            replacementRun?.status === 'pending'
+            && replacementRun.parentRunId === event.runId
+          )
+        )
+      ) {
+        await state.provenance.stopRun({
+          identity: {
+            hostId: event.hostId,
+            sessionId: existingSession?.bridgeSessionId || existingSession?.sessionId || effectiveSessionId,
+          },
+          runId: event.runId,
+        });
+        emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+          severity: 'info',
+          source: 'relay',
+          kind: 'lifecycle',
+          method: 'session.state_changed/replacement-parent-stopped',
+          message: `Recorded terminal state for parent run ${event.runId} without replacing pending run ${replacementRecord.activeRunId}.`,
+          timestamp: event.timestamp || nowIso(),
+        });
+        return;
+      }
       emitSessionDiagnostic(event.hostId, effectiveSessionId, {
         severity: 'info',
         source: 'relay',
@@ -10847,6 +17324,43 @@ function applyAgentEvent(event) {
         timestamp: event.timestamp || nowIso(),
       });
       return;
+    }
+    const terminalRunId = event.runId || existingRunId || null;
+    const terminalRecord = terminalRunId ? state.provenance.getSessionRecord({
+      hostId: event.hostId,
+      sessionId: existingSession?.bridgeSessionId || existingSession?.sessionId || effectiveSessionId,
+    }) : null;
+    const terminalRun = terminalRunId ? terminalRecord?.runs?.[terminalRunId] || null : null;
+    if (event.live === false && terminalRun?.status === 'failed') {
+      emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+        severity: 'info',
+        source: 'relay',
+        kind: 'lifecycle',
+        method: 'session.state_changed/ignored-failed-run-terminal',
+        message: `Ignored terminal state ${event.state || 'unknown'} after run ${terminalRunId} had already failed.`,
+        data: {
+          runId: terminalRunId,
+          failedCode: terminalRun.error?.code || null,
+          terminalState: event.state || null,
+        },
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
+    if (event.live === false && (event.runId || existingRunId)) {
+      try {
+        await state.provenance.stopRun({
+          identity: {
+            hostId: event.hostId,
+            sessionId: existingSession?.bridgeSessionId || existingSession?.sessionId || effectiveSessionId,
+          },
+          runId: event.runId || existingRunId,
+        });
+      } catch (error) {
+        if (error?.code !== 'session_run_not_found') {
+          throw error;
+        }
+      }
     }
     const wasEnding = existingSession?.state === 'ending' || existingRuntime?.phase === 'ending';
     const next = upsertSession(event.hostId, {
@@ -10905,6 +17419,9 @@ function applyAgentEvent(event) {
     if (isStaleSessionRunEvent(event, effectiveSessionId)) {
       return;
     }
+    if (eventTargetsPublishedParentRun(event, effectiveSessionId)) {
+      return;
+    }
     const existing = getSession(event.hostId, effectiveSessionId);
     upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
@@ -10920,6 +17437,7 @@ function applyAgentEvent(event) {
       ...(event.patch || {}),
       updatedAt: event.timestamp || nowIso(),
     });
+    maybeClearGoalAutoApproveForRuntime(event.hostId, effectiveSessionId, runtime);
     const phase = String(runtime?.phase || '').toLowerCase();
     const turnIsInactive = !runtime?.activeTurnId
       && !runtime?.busy
@@ -10999,7 +17517,7 @@ function applyAgentEvent(event) {
     if (isStaleSessionRunEvent(event, effectiveSessionId)) {
       return;
     }
-    emitSessionRequest(event.hostId, sessionId, {
+    const requestEntry = {
       requestId: event.requestId,
       createdAt: event.timestamp || nowIso(),
       updatedAt: event.timestamp || nowIso(),
@@ -11011,7 +17529,9 @@ function applyAgentEvent(event) {
       summary: event.summary || null,
       payload: event.payload || null,
       response: event.response || null,
-    });
+    };
+    emitSessionRequest(event.hostId, effectiveSessionId, requestEntry);
+    maybeAutoApproveSessionRequest(event.hostId, effectiveSessionId, requestEntry);
     return;
   }
 
@@ -11080,41 +17600,515 @@ function applyAgentEvent(event) {
   }
 }
 
+const activeRelayRequests = new Set();
 const server = http.createServer((req, res) => {
   req.on('error', (error) => {
     if (!isClientAbortError(error)) {
       console.error(error);
     }
   });
-  handleRequest(req, res).catch((error) => {
-    if (isClientAbortError(error) || req.destroyed || res.destroyed) {
-      return;
-    }
-    console.error(error);
-    if (!res.headersSent) {
-      sendJson(res, 500, { error: error.message || 'internal error' });
-      return;
-    }
-    res.destroy(error);
-  });
+  if (!relayReady) {
+    sendJson(res, 503, {
+      ok: false,
+      status: 'starting',
+      error: 'Relay startup is not complete.',
+    });
+    return;
+  }
+  const handling = handleRequest(req, res)
+    .catch((error) => {
+      if (isClientAbortError(error) || req.destroyed || res.destroyed) {
+        return;
+      }
+      console.error(error);
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: error.message || 'internal error' });
+        return;
+      }
+      res.destroy(error);
+    })
+    .finally(() => {
+      activeRelayRequests.delete(handling);
+    });
+  activeRelayRequests.add(handling);
 });
 
-server.listen(PORT, () => {
-  console.log(`relay listening on http://127.0.0.1:${PORT}`);
-  if (LOCAL_AGENT_WATCHDOG_ENABLED) {
-    console.log(`local agent watchdog enabled; startup grace ${Math.round(LOCAL_AGENT_STARTUP_GRACE_MS / 1000)}s, restart after ${Math.round(LOCAL_AGENT_OFFLINE_RESTART_MS / 1000)}s stale heartbeat`);
+function hydrateSessionMetadataCacheFromStore() {
+  const snapshot = state.sessionRecordStore?.readSnapshot();
+  if (!snapshot) {
+    return;
   }
-  if (RELAY_AUTH_TOKEN) {
-    console.log(`relay auth enabled; token file: ${RELAY_AUTH_TOKEN_PATH}`);
-    console.log(relayAuthAccount?.username
-      ? `relay web login enabled for user: ${relayAuthAccount.username}`
-      : `relay web login setup pending; account file: ${RELAY_AUTH_ACCOUNT_PATH}`);
-  } else {
-    console.warn('relay auth disabled by RELAY_AUTH_DISABLED');
+  const cache = new Map(state.sessionMetadata);
+  const canonicalSessions = new Map();
+  for (const [canonicalKey, record] of Object.entries(snapshot.records || {})) {
+    if (!record?.hostId || !record.title) {
+      continue;
+    }
+    const identities = getSessionTitleIdentities(null, record);
+    for (const identity of identities) {
+      cache.set(sessionMetadataKey(record.hostId, identity), {
+        hostId: record.hostId,
+        identity,
+        title: record.title,
+        cwd: record.cwd || '',
+        source: record.source || 'metadata',
+        updatedAt: record.updatedAt || nowIso(),
+      });
+    }
+    const sessionId = String(
+      record.nativeThreadId
+      || record.bridgeSessionId
+      || record.conversationKey
+      || canonicalKey.slice(`${record.hostId}::`.length)
+    ).trim();
+    if (!sessionId) {
+      continue;
+    }
+    canonicalSessions.set(canonicalKey, { hostId: record.hostId, sessionId });
+    const runId = record.activeRunId || record.latestSuccessfulRunId || null;
+    const run = runId ? record.runs?.[runId] || null : null;
+    const binding = publicBinding(run?.apiBinding);
+    const key = sessionKey(record.hostId, sessionId);
+    if (!state.sessions.has(key)) {
+      state.sessions.set(key, {
+        hostId: record.hostId,
+        sessionId,
+        title: record.title || sessionId,
+        cwd: record.cwd || null,
+        source: record.source || 'imported',
+        state: 'history-only',
+        live: false,
+        createdAt: run?.createdAt || record.updatedAt || null,
+        lastUpdatedAt: record.updatedAt || run?.endedAt || run?.createdAt || nowIso(),
+        originSessionId: record.originSessionId || null,
+        sourceSessionId: record.sourceSessionId || null,
+        conversationKey: record.conversationKey || sessionId,
+        bridgeSessionId: record.bridgeSessionId || null,
+        nativeThreadId: record.nativeThreadId || sessionId,
+        runId,
+        activeRunId: record.activeRunId || null,
+        latestSuccessfulRunId: record.latestSuccessfulRunId || null,
+        apiBinding: binding,
+        apiProfile: binding?.kind === 'profile' ? {
+          profileId: binding.profileId || null,
+          label: binding.label || binding.provider || 'API profile',
+          provider: binding.provider || null,
+          baseUrl: binding.normalizedBaseUrl || null,
+        } : null,
+        requestedSelection: run?.requestedSelection || null,
+        effectiveSelection: run?.effectiveSelection || null,
+        messageCount: 0,
+      });
+    }
   }
-});
-
-if (LOCAL_AGENT_WATCHDOG_ENABLED) {
-  const localAgentWatchdogTimer = setInterval(localAgentWatchdogTick, LOCAL_AGENT_WATCHDOG_INTERVAL_MS);
-  localAgentWatchdogTimer.unref?.();
+  for (const [aliasKey, canonicalKey] of Object.entries(snapshot.aliases || {})) {
+    const target = canonicalSessions.get(canonicalKey);
+    if (!target) {
+      continue;
+    }
+    const prefix = `${target.hostId}::`;
+    if (!aliasKey.startsWith(prefix)) {
+      continue;
+    }
+    const aliasSessionId = aliasKey.slice(prefix.length);
+    rememberSessionAlias(target.hostId, aliasSessionId, target.sessionId);
+    if (aliasSessionId !== target.sessionId) {
+      moveSessionArtifacts(target.hostId, aliasSessionId, target.sessionId);
+    }
+  }
+  for (const session of state.sessions.values()) {
+    const key = resolveSessionKey(session.hostId, session.sessionId);
+    session.messageCount = Math.max(
+      Number(session.messageCount || 0),
+      state.sessionLogs.get(key)?.length || 0
+    );
+  }
+  state.sessionMetadata = cache;
 }
+
+async function reconcilePendingSessionRunsAfterRestart() {
+  const snapshot = state.sessionRecordStore?.readSnapshot();
+  let reconciled = 0;
+  for (const [canonicalKey, record] of Object.entries(snapshot?.records || {})) {
+    const runId = record?.activeRunId || null;
+    const run = runId ? record.runs?.[runId] || null : null;
+    if (!run || run.status !== 'pending') {
+      continue;
+    }
+    const prefix = `${record.hostId}::`;
+    const sessionId = canonicalKey.startsWith(prefix)
+      ? canonicalKey.slice(prefix.length)
+      : record.bridgeSessionId || record.nativeThreadId;
+    await state.provenance.failRun({
+      identity: { hostId: record.hostId, sessionId },
+      runId,
+      code: 'session_relay_restarted',
+      message: 'Relay restarted before the Host confirmed this Session run.',
+    });
+    reconciled += 1;
+  }
+  if (reconciled > 0) {
+    console.warn(`[relay] reconciled ${reconciled} pending Session run(s) after restart`);
+  }
+}
+
+async function reconcileStopRequestsAfterRestart() {
+  const snapshot = state.sessionRecordStore?.readSnapshot();
+  let reconciled = 0;
+  for (const [canonicalKey, record] of Object.entries(snapshot?.records || {})) {
+    for (const [runId, run] of Object.entries(record?.runs || {})) {
+      if (!run?.stopRequestId) {
+        continue;
+      }
+      const prefix = `${record.hostId}::`;
+      const sessionId = canonicalKey.startsWith(prefix)
+        ? canonicalKey.slice(prefix.length)
+        : record.bridgeSessionId || record.nativeThreadId;
+      const result = await state.provenance.cancelStopRun({
+        identity: { hostId: record.hostId, sessionId },
+        runId,
+        stopRequestId: run.stopRequestId,
+      });
+      if (result.transitioned) {
+        reconciled += 1;
+      }
+    }
+  }
+  if (reconciled > 0) {
+    console.warn(`[relay] cleared ${reconciled} unconfirmed Session Stop request(s) after restart`);
+  }
+}
+
+function listenRelayServer() {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.removeListener('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.removeListener('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(PORT);
+  });
+}
+
+async function startRelay() {
+  relayStateLock = await acquireRelayStateLock(RELAY_STATE_ROOT);
+  try {
+    await listenRelayServer();
+    writeRelayOwnerMarker();
+    relayOwnerMarkerWritten = true;
+    RELAY_CONTROL_TOKEN = loadRelayControlToken();
+    RELAY_AUTH_TOKEN = loadRelayAuthToken();
+    relayAuthAccount = loadRelayAuthAccount();
+    loadPersistedRelayState();
+    state.sessionRecordStore = await SessionRecordStore.open({
+      rootDir: SESSION_RECORD_STORE_ROOT,
+      legacyMetadataPath: SESSION_METADATA_PATH,
+      now: nowIso,
+    });
+    state.provenance = new SessionProvenanceService({
+      store: state.sessionRecordStore,
+      now: nowIso,
+    });
+    await reconcileStopRequestsAfterRestart();
+    await reconcilePendingSessionRunsAfterRestart();
+    state.modelCatalog = new ModelCatalogService({
+      store: state.sessionRecordStore,
+      fetchLivePage: requestLiveModelPage,
+      fetchProviderPage: requestProviderModelPage,
+      now: nowIso,
+    });
+    state.skillAudit = new SkillAuditLog({
+      auditPath: SKILL_AUDIT_PATH,
+      now: nowIso,
+    });
+    state.skillAutomation = new SkillAutomationService({
+      tickIntervalMs: SKILL_AUTOMATION_TICK_MS,
+      loadSources: () => state.skillRegistry.snapshot({ includeManifest: false }).sources,
+      scheduleRefresh: (source) => queueRegistrySkillSourceRefresh(source.sourceId, {
+        automated: true,
+      }),
+      loadDesiredStates: () => state.skillDeployments.desiredStates(),
+      dispatchRollout: (request) => createSkillDeployment(request),
+      audit: (type, data, options) => recordSkillAudit(type, data, options),
+    });
+    hydrateSessionMetadataCacheFromStore();
+
+    if (LOCAL_AGENT_WATCHDOG_ENABLED) {
+      localAgentWatchdogTimer = setInterval(localAgentWatchdogTick, LOCAL_AGENT_WATCHDOG_INTERVAL_MS);
+      localAgentWatchdogTimer.unref?.();
+    }
+    relayReady = true;
+    state.skillAutomation.start();
+    if (sessionDiagnosticsNeedsNormalization) {
+      scheduleSessionDiagnosticsSave(0);
+    }
+    console.log(`relay listening on http://127.0.0.1:${PORT}`);
+    if (LOCAL_AGENT_WATCHDOG_ENABLED) {
+      console.log(`local agent watchdog enabled; startup grace ${Math.round(LOCAL_AGENT_STARTUP_GRACE_MS / 1000)}s, restart after ${Math.round(LOCAL_AGENT_OFFLINE_RESTART_MS / 1000)}s stale heartbeat`);
+    }
+    if (RELAY_AUTH_TOKEN) {
+      console.log(`relay auth enabled; token file: ${RELAY_AUTH_TOKEN_PATH}`);
+      console.log(relayAuthAccount?.username
+        ? `relay web login enabled for user: ${relayAuthAccount.username}`
+        : `relay web login setup pending; account file: ${RELAY_AUTH_ACCOUNT_PATH}`);
+    } else {
+      console.warn('relay auth disabled by RELAY_AUTH_DISABLED');
+    }
+  } catch (error) {
+    relayReady = false;
+    state.skillAutomation?.stop();
+    const cleanupErrors = [];
+    await closeRelayServer().catch((cleanupError) => cleanupErrors.push(cleanupError));
+    await state.sessionRecordStore?.close().catch((cleanupError) => cleanupErrors.push(cleanupError));
+    state.sessionRecordStore = null;
+    if (relayOwnerMarkerWritten) {
+      try {
+        await removeRelayOwnerMarker();
+        relayOwnerMarkerWritten = false;
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    const lock = relayStateLock;
+    if (lock) {
+      try {
+        await lock.release();
+        if (relayStateLock === lock) {
+          relayStateLock = null;
+        }
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (cleanupErrors.length) {
+      error.cleanupErrors = cleanupErrors.map((cleanupError) => cleanupError.message || String(cleanupError));
+    }
+    throw error;
+  }
+}
+
+async function forceTrackedLocalAgent(record) {
+  if (record.forceKillPromise) {
+    const error = await record.forceKillPromise;
+    if (error) throw error;
+    return true;
+  }
+  return forceKillLocalAgentRecord(record);
+}
+
+async function joinRelayShutdownAgents(context) {
+  let forceKillFailures = 0;
+  while (true) {
+    for (const record of state.localAgents.values()) {
+      trackLocalAgentForRelayShutdown(record, context.signal);
+    }
+    let survivors = Array.from(context.records).filter(localAgentProcessIsAlive);
+    while (survivors.length && Date.now() < context.deadline) {
+      await new Promise((resolve) => setTimeout(resolve, LOCAL_AGENT_EXIT_POLL_MS));
+      for (const record of state.localAgents.values()) {
+        trackLocalAgentForRelayShutdown(record, context.signal);
+      }
+      survivors = Array.from(context.records).filter(localAgentProcessIsAlive);
+    }
+    if (!survivors.length) {
+      return { ok: true, remainingAgentTrees: 0, forceKillFailures };
+    }
+
+    const forceKillResults = await Promise.allSettled(
+      survivors.map((record) => forceTrackedLocalAgent(record))
+    );
+    forceKillFailures += forceKillResults.filter((result) => result.status === 'rejected').length;
+    const remainingSurvivors = Array.from(context.records).filter(localAgentProcessIsAlive);
+    if (remainingSurvivors.length) {
+      return {
+        ok: false,
+        remainingAgentTrees: remainingSurvivors.length,
+        forceKillFailures,
+      };
+    }
+  }
+}
+
+function closeRelayServer() {
+  return new Promise((resolve, reject) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+    const forceCloseTimer = setTimeout(() => {
+      server.closeAllConnections?.();
+    }, 2000);
+    forceCloseTimer.unref?.();
+    server.close((error) => {
+      clearTimeout(forceCloseTimer);
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+    server.closeIdleConnections?.();
+  });
+}
+
+async function flushRelayPersistence() {
+  const errors = [];
+  if (sessionLogsSaveTimer) {
+    clearTimeout(sessionLogsSaveTimer);
+    sessionLogsSaveTimer = null;
+  }
+  try {
+    saveSessionLogs();
+  } catch (error) {
+    errors.push(error);
+  }
+
+  if (sessionDiagnosticsSaveTimer) {
+    clearTimeout(sessionDiagnosticsSaveTimer);
+    sessionDiagnosticsSaveTimer = null;
+  }
+  sessionDiagnosticsSavePending = true;
+  try {
+    do {
+      await flushSessionDiagnosticsSave();
+      if (sessionDiagnosticsSaveInFlight) {
+        await sessionDiagnosticsSaveInFlight;
+      }
+    } while (sessionDiagnosticsSavePending || sessionDiagnosticsSaveInFlight);
+    if (sessionDiagnosticsSaveError) {
+      throw sessionDiagnosticsSaveError;
+    }
+  } catch (error) {
+    errors.push(error);
+  }
+
+  try {
+    await state.sessionRecordStore?.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length) {
+    throw new AggregateError(errors, 'Relay persistence did not close cleanly.');
+  }
+}
+
+async function quiesceRelayBackgroundTasks() {
+  const automationTick = state.skillAutomation?.tickPromise;
+  if (automationTick) {
+    await automationTick;
+  }
+  while (relayBackgroundTasks.size) {
+    await Promise.allSettled(Array.from(relayBackgroundTasks));
+  }
+  await state.skillRegistry?.mutationTail;
+}
+
+async function shutdownRelay(signal = 'SIGTERM') {
+  if (relayShutdownPromise) return relayShutdownPromise;
+  relayShutdownPromise = Promise.resolve().then(async () => {
+    relayStopping = true;
+    state.skillAutomation?.stop();
+    for (const timer of stopFallbackTimers) {
+      clearTimeout(timer);
+    }
+    stopFallbackTimers.clear();
+    if (localAgentWatchdogTimer) {
+      clearInterval(localAgentWatchdogTimer);
+      localAgentWatchdogTimer = null;
+    }
+    relayShutdownContext = {
+      signal,
+      records: new Set(),
+      deadline: Date.now() + LOCAL_AGENT_SHUTDOWN_GRACE_MS + LOCAL_AGENT_FORCE_EXIT_WAIT_MS + 2000,
+    };
+    for (const record of state.localAgents.values()) {
+      trackLocalAgentForRelayShutdown(record, signal);
+    }
+
+    let joined = await joinRelayShutdownAgents(relayShutdownContext);
+    if (!joined.ok) {
+      console.error(
+        `[relay] ${signal} shutdown could not confirm ${joined.remainingAgentTrees} local Agent process tree(s) exited${joined.forceKillFailures ? `; ${joined.forceKillFailures} force-kill operation(s) failed` : ''}. Relay will remain alive for launcher/service fallback.`
+      );
+      process.exitCode = 1;
+      return {
+        ok: false,
+        signal,
+        remainingAgentTrees: joined.remainingAgentTrees,
+        forceKillFailures: joined.forceKillFailures,
+      };
+    }
+
+    relayReady = false;
+    await closeRelayServer();
+    await Promise.allSettled(Array.from(activeRelayRequests));
+    joined = await joinRelayShutdownAgents(relayShutdownContext);
+    if (!joined.ok) {
+      console.error(
+        `[relay] ${signal} shutdown could not confirm ${joined.remainingAgentTrees} late local Agent process tree(s) exited. Relay will remain alive for launcher/service fallback.`
+      );
+      process.exitCode = 1;
+      return {
+        ok: false,
+        signal,
+        remainingAgentTrees: joined.remainingAgentTrees,
+        forceKillFailures: joined.forceKillFailures,
+      };
+    }
+    await quiesceRelayBackgroundTasks();
+    try {
+      await flushRelayPersistence();
+    } catch (error) {
+      console.error(`[relay] ${signal} shutdown persistence failed: ${error.stack || error}`);
+      relayStateLock?.hold?.();
+      process.exitCode = 1;
+      return {
+        ok: false,
+        signal,
+        persistenceError: error.message || String(error),
+      };
+    }
+    await removeRelayOwnerMarker();
+    relayOwnerMarkerWritten = false;
+    const lock = relayStateLock;
+    await lock?.release();
+    if (relayStateLock === lock) {
+      relayStateLock = null;
+    }
+    process.exit(0);
+  }).catch((error) => {
+    console.error(`[relay] ${signal} shutdown failed: ${error.stack || error}`);
+    relayStateLock?.hold?.();
+    process.exitCode = 1;
+    return {
+      ok: false,
+      signal,
+      error: error.message || String(error),
+    };
+  });
+  return relayShutdownPromise;
+}
+
+process.once('SIGINT', () => {
+  void shutdownRelay('SIGINT');
+});
+process.once('SIGTERM', () => {
+  void shutdownRelay('SIGTERM');
+});
+if (truthyEnv(process.env.RELAY_TEST_CONTROL_ENABLED) && typeof process.on === 'function') {
+  process.on('message', (message) => {
+    if (message?.type === 'remote-codex:test:shutdown') {
+      void shutdownRelay('test-control');
+    }
+  });
+}
+
+startRelay().catch((error) => {
+  console.error(`[relay] startup failed: ${error.stack || error}`);
+  process.exitCode = 1;
+});

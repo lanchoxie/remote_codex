@@ -2,33 +2,78 @@
 
 ## Local workflow
 
-Install dependencies only if the project later gains any. The current prototype uses Node built-ins.
+Production verification and development must use separate checkouts (or Git
+worktrees). The relay reads mobile web assets from its checkout for every HTTP
+request, so a second port and a second state directory alone do not isolate a
+running production UI from source edits.
+
+Recommended topology:
+
+| Instance | Checkout | Port | Relay state | Agent |
+| --- | --- | ---: | --- | --- |
+| Production | stable, not edited while running | `8797` | production-only | real production Agent |
+| UI development | editable worktree | `8897` | `tmp/relay-8897` in the development worktree | disabled by default |
+| E2E development | editable worktree | `8897` | development-only | explicitly enabled with isolated Agent state |
+
+Create the development worktree from the stable checkout. Use command-scoped
+`safe.directory` when Windows reports a repository ownership mismatch; do not
+change the global Git configuration.
+
+```powershell
+git -c safe.directory=D:/project/remote_codex-prod worktree add D:\project\remote_codex-dev -b dev/local
+Set-Location D:\project\remote_codex-dev
+$env:REMOTE_CODEX_DEV_PORT = "8897"
+$env:REMOTE_CODEX_PRODUCTION_STATE_ROOT = "D:\project\remote_codex-prod\tmp"
+npm run dev
+```
+
+`npm run dev` refuses production port `8797`, creates a port-specific Relay
+state root, ignores inherited production paths and credentials, and starts no
+Agent by default. To exercise Agent flows, opt in explicitly:
+
+```powershell
+$env:REMOTE_CODEX_DEV_PORT = "8897"
+$env:REMOTE_CODEX_DEV_WITH_AGENT = "true"
+npm run dev
+```
+
+The development Agent uses its own `CODEX_HOME`, Remote Codex state, Host ID,
+owner marker, and Relay URL. Relay auth files, connectors, session data, skill
+state, SSH known-hosts data, logs, and browser auth cookies are also isolated by
+state root or port. Never override those development paths to point at the
+production state tree. Physical paths are checked after resolving Windows
+junctions and symbolic links, so aliases to the production tree are rejected.
+
+The Windows production launcher starts a real local Agent only on port `8797`.
+On any other port it clears inherited production auth, ignores generic
+production state variables, and disables Relay-managed Agent startup. Use
+`npm run dev` for development, including isolated Agent testing.
+
+Start production only from the stable checkout:
+
+```powershell
+.\start-windows.bat
+```
+
+For ordinary development and focused validation:
 
 ```bash
 npm run dev
 npm run test:managed
 ```
 
-Common direct commands:
-
-```bash
-PORT=8797 npm run relay
-RELAY_URL=http://127.0.0.1:8797 HOST_ID=local npm run agent
-```
-
-On Windows PowerShell:
-
-```powershell
-$env:PORT = "8797"
-npm run relay
-```
-
 ## Preview
 
-The current local preview convention is:
+The production preview convention is:
 
 ```text
 http://127.0.0.1:8797
+```
+
+The recommended development preview is:
+
+```text
+http://127.0.0.1:8897
 ```
 
 The relay serves both APIs and the static mobile web UI.
@@ -97,8 +142,8 @@ Supported actions:
 - `bootstrap`: starts the remote host agent through SSH when the connector can use non-interactive SSH.
 
 Saved connector passwords are kept out of connector profiles. They live in the
-ignored local file `tmp/connector-secrets.json` and are used only by connector
-actions on the relay machine.
+ignored `<RELAY_STATE_ROOT>/connector-secrets.json` file and are used only by
+connector actions on the relay machine.
 
 ## Event model
 

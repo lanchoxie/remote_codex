@@ -74,6 +74,21 @@ assert.strictEqual(
   'budgeted windows must keep the latest transcript entry'
 );
 
+const userExpandedWindow = sandbox.selectTranscriptRenderWindow(heavyEntries, 220, {
+  enforceBudget: true,
+  preserveRequestedLimit: true,
+});
+assert.strictEqual(
+  userExpandedWindow.renderedTranscript.length,
+  220,
+  'Load older should honor the user-expanded transcript window instead of applying the performance budget again'
+);
+assert.strictEqual(
+  userExpandedWindow.hiddenTranscriptCount,
+  0,
+  'Load older should reduce the hidden count when the requested window covers the conversation'
+);
+
 const lightEntries = Array.from({ length: 220 }, (_, index) => ({
   speaker: index % 2 ? 'agent' : 'user',
   timestamp: new Date(2026, 5, 1, 0, index).toISOString(),
@@ -93,8 +108,12 @@ assert(
 );
 assert(
   renderTranscriptSource.includes('buildThinkingEntriesForSession(session, {')
-    && renderTranscriptSource.includes('transcriptEntries: renderedTranscript'),
-  'renderTranscript should build thinking entries only for the rendered transcript window'
+    && renderTranscriptSource.includes('transcriptEntries: visibleTranscript'),
+  'thinking records should be paired from the full loaded transcript, not capped by the rendered DOM window'
+);
+assert(
+  renderTranscriptSource.includes('preserveRequestedLimit: explicitVisibleLimit > 0'),
+  'renderTranscript should disable the performance budget after the user clicks Load older'
 );
 
 const statusWindowSource = extractFunctionSource('renderStatusWindow');

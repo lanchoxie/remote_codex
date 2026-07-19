@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-store" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src http://127.0.0.1:*; script-src 'unsafe-inline'; style-src 'unsafe-inline'" />
+    <title>Restore Remote Codex Settings</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f7f8; color: #172126; font: 15px/1.5 system-ui, sans-serif; }
+      main { width: min(560px, calc(100% - 32px)); padding: 24px; border: 1px solid #cad2d6; background: #fff; border-radius: 8px; }
+      h1 { margin: 0 0 8px; font-size: 20px; letter-spacing: 0; }
+      p { margin: 0; color: #4c5a61; }
+      .error { color: #a12622; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Restoring local settings</h1>
+      <p id="status" role="status">Waiting for the one-time recovery service...</p>
+    </main>
+    <script>
+      (() => {
+        const UI_SETTINGS_KEY = 'mobile-codex-remote.ui-settings.v1';
+        const MANUAL_TITLES_KEY = 'mobile-codex-remote.manual-session-titles.v1';
+        const status = document.getElementById('status');
+        const params = new URLSearchParams(location.search);
+        const token = params.get('token') || '';
+        const port = Number(params.get('port') || '19230');
+        const recoveryBase = `http://127.0.0.1:${port}`;
+
+        function readJson(key, fallback) {
+          try {
+            return JSON.parse(window.localStorage.getItem(key) || '') || fallback;
+          } catch (_) {
+            return fallback;
+          }
+        }
+
+        function normalizeBaseUrl(value) {
+          return String(value || '').trim().replace(/\/+$/, '');
+        }
+
+        function logicalProfileKey(profile) {
+          const label = String(profile?.label || '')
+            .normalize('NFKC')
+            .toLocaleLowerCase('en-US')
+            .replace(/[\s_-]+/g, '');
+          return `${label}\n${normalizeBaseUrl(profile?.baseUrl)}`;
+        }
+
+        function mergeProfiles(existing, recovered) {
+          let profiles = Array.isArray(existing.apiProfiles) ? existing.apiProfiles.map((profile) => ({ ...profile })) : [];
+          if (
+            profiles.length === 1
+            && profiles[0].profileId === 'default'
+            && !profiles[0].apiKey
+            && !profiles[0].baseUrl
+          ) {
+            profiles = [];
+          }
+          const byId = new Map(profiles.map((profile) => [profile.profileId, profile]));
+          const byLogical = new Map(profiles.map((profile) => [logicalProfileKey(profile), profile]));
+          for (const candidate of recovered) {
+            const normalized = {
+              profileId: String(candidate.profileId || ''),
+              label: String(candidate.label || 'API Profile'),
+              provider: String(candidate.provider || 'OpenAI'),
+              baseUrl: normalizeBaseUrl(candidate.baseUrl),
+              apiKey: String(candidate.apiKey || ''),
+              rememberApiKey: true,
+            };
+            const current = byId.get(normalized.profileId) || byLogical.get(logicalProfileKey(normalized));
+            if (current) {
+              if (!current.apiKey) {
+                current.apiKey = normalized.apiKey;
+                current.rememberApiKey = true;
+              }
+              continue;
+            }
+            profiles.push(normalized);
+            byId.set(normalized.profileId, normalized);
+            byLogical.set(logicalProfileKey(normalized), normalized);
+          }
+          const ids = new Set(profiles.map((profile) => profile.profileId));
+          const fallbackId = recovered[0]?.profileId || profiles[0]?.profileId || 'default';
+          const hostApiProfiles = {};
+          for (const [hostId, profileId] of Object.entries(existing.hostApiProfiles || {})) {
+            if (ids.has(profileId)) {
+              hostApiProfiles[hostId] = profileId;
+            }
+          }
+          return {
+            locale: existing.locale === 'en' ? 'en' : 'zh-CN',
+            theme: existing.theme === 'dark-tech' ? 'dark-tech' : 'minimal-light',
+            optimizeSpeedMode: existing.optimizeSpeedMode !== false,
+            apiProfiles: profiles,
+            selectedApiProfileId: ids.has(existing.selectedApiProfileId) ? existing.selectedApiProfileId : fallbackId,
+            defaultApiProfileId: ids.has(existing.defaultApiProfileId) ? existing.defaultApiProfileId : fallbackId,
+            hostApiProfiles,
+          };
+        }
+
+        async function restore() {
+          if (!token || !Number.isInteger(port) || port < 1 || port > 65535) {
+            throw new Error('The recovery link is invalid.');
+          }
+          const response = await fetch(`${recoveryBase}/profiles?token=${encodeURIComponent(token)}`, {
+            cache: 'no-store',
+          });
+          if (!response.ok) {
+            throw new Error(`Recovery service returned HTTP ${response.status}.`);
+          }
+          const payload = await response.json();
+          const recoveredProfiles = Array.isArray(payload.apiProfiles) ? payload.apiProfiles : [];
+          const recoveredTitles = payload.manualSessionTitles && typeof payload.manualSessionTitles === 'object'
+            ? payload.manualSessionTitles
+            : {};
+          if (!recoveredProfiles.length) {
+            throw new Error('No API profiles were supplied by the recovery service.');
+          }
+
+          const settings = mergeProfiles(readJson(UI_SETTINGS_KEY, {}), recoveredProfiles);
+          const currentTitles = readJson(MANUAL_TITLES_KEY, {});
+          const titles = { ...recoveredTitles, ...currentTitles };
+          window.localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify(settings));
+          window.localStorage.setItem(MANUAL_TITLES_KEY, JSON.stringify(titles));
+
+          const verifiedSettings = readJson(UI_SETTINGS_KEY, {});
+          const verifiedTitles = readJson(MANUAL_TITLES_KEY, {});
+          const restoredProfiles = recoveredProfiles.filter((profile) => (
+            verifiedSettings.apiProfiles?.some((saved) => (
+              (saved.profileId === profile.profileId || logicalProfileKey(saved) === logicalProfileKey(profile))
+              && Boolean(saved.apiKey)
+            ))
+          ));
+          if (restoredProfiles.length !== recoveredProfiles.length) {
+            throw new Error('API profile verification failed after writing browser storage.');
+          }
+          const expectedTitleKeys = Object.keys(recoveredTitles);
+          if (expectedTitleKeys.some((key) => verifiedTitles[key] !== recoveredTitles[key])) {
+            throw new Error('Session title verification failed after writing browser storage.');
+          }
+
+          await fetch(`${recoveryBase}/ack?token=${encodeURIComponent(token)}`, {
+            method: 'POST',
+            cache: 'no-store',
+          });
+          status.textContent = `Restored ${restoredProfiles.length} API profiles and ${expectedTitleKeys.length} session title records. Reloading...`;
+          window.setTimeout(() => location.replace('/'), 1200);
+        }
+
+        async function restoreWithRetry() {
+          for (let attempt = 0; attempt < 43200; attempt += 1) {
+            try {
+              await restore();
+              return;
+            } catch (error) {
+              const message = error?.message || String(error);
+              if (/invalid|verification failed|No API profiles/i.test(message)) {
+                throw error;
+              }
+              status.textContent = `Waiting for the one-time recovery service... (${message})`;
+              await new Promise((resolve) => window.setTimeout(resolve, 2000));
+            }
+          }
+          throw new Error('The recovery service did not become available.');
+        }
+
+        restoreWithRetry().catch((error) => {
+          status.className = 'error';
+          status.textContent = error.message || String(error);
+        });
+      })();
+    </script>
+  </body>
+</html>

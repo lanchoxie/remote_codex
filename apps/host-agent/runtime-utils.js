@@ -53,7 +53,6 @@ function normalizeApiBaseUrl(value) {
   }
 
   parsed.hash = '';
-  parsed.search = '';
   parsed.pathname = parsed.pathname.replace(/\/+$/, '');
   return parsed.toString().replace(/\/+$/, '');
 }

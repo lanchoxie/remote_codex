@@ -41,8 +41,8 @@ assert(
   'host-agent must start heartbeats before initial discovery scans Codex history'
 );
 assert(
-  pollStartIndex < startupDiscoveryCallIndex,
-  'host-agent must start command polling before initial discovery scans Codex history'
+  pollStartIndex > startupDiscoveryCallIndex,
+  'host-agent must restore workspace roots before polling project deployment commands'
 );
 
 assert(
@@ -56,6 +56,18 @@ assert(
 assert(
   /RELAY_LOCAL_AGENT_STARTUP_GRACE_MS/.test(windowsStart),
   'Windows launcher should set a longer local-agent startup grace for cold Codex history scans'
+);
+assert(
+  /type:\s*'host\.shutdown'/.test(relay),
+  'Relay-managed local-agent Stop must request graceful Agent shutdown through the command channel'
+);
+assert(
+  /LOCAL_AGENT_SHUTDOWN_GRACE_MS/.test(relay) && /shutdownTimer/.test(relay),
+  'Relay-managed local-agent Stop must retain a bounded force-kill fallback'
+);
+assert(
+  /restartAfterStop/.test(relay),
+  'local-agent Restart must wait for graceful shutdown before spawning its replacement'
 );
 
 console.log('local-agent startup watchdog assertions passed');

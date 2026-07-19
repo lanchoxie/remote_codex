@@ -55,6 +55,56 @@ process controllable by itself. Stop, interrupt, prompt queueing, steering, and
 request responses still need a managed app-server session that the host-agent
 owns.
 
+## Canonical managed provenance
+
+Managed Session continuity is no longer inferred only from the current
+in-memory list or a rollout filename. Relay `SessionRecordStore` persists a
+canonical record with aliases for bridge Session ID, native thread ID,
+conversation key, origin ID, and source ID. Each run records immutable API
+binding identity plus requested/effective model selection.
+
+Rollout discovery remains weaker evidence. It may add native thread facts,
+title, cwd, transcript, and a model-provider hint, but it cannot overwrite a
+managed binding or lineage. A hash-like rollout provider hint cannot recover an
+API profile or secret. A legacy Session without verified binding evidence is
+marked unknown and requires explicit Rebind before managed resume.
+
+Resume uses the latest successful run, not the current browser Host default or
+a failed pending candidate. Fork inherits the source binding. Changing a
+Session provider or endpoint creates a new run through explicit Rebind. Native
+resume failure does not silently start a transcript replay; transcript fallback
+is a separately confirmed new native thread with preserved lineage.
+
+Lifecycle commands and confirmations are keyed by `runId`. The Host attests the
+secret-free effective binding in `session.started`; exact replay of the same
+start resends that confirmation rather than spawning a second process. A
+run-targeted command never falls through a reused Session alias to a newer
+runner. If confirmation fails or an obsolete start arrives late, the orphan is
+stopped with terminal-event suppression so it cannot close the current run.
+Stop, Rebind, and transcript fallback also compare the canonical run ID,
+status, and binding fingerprint observed by the caller inside the Store
+transaction. Stop intent, pending replacement, terminal delivery, restart
+recovery, and authoritative discovery therefore converge without allowing an
+older request or unscoped Host event to close a newer run.
+
+While Stop is pending, the durable intent blocks live controls even when late
+Host output or runtime events arrive. An unconfirmed Stop cancels that intent
+without overwriting a newer Host runtime projection. Replacement launches send
+a run-targeted Stop to the durable live parent before Start, including during
+the history-only projection window immediately after Relay restart.
+
+Pending launches do not take ownership of the source Session while catalog
+validation or Host startup is in flight. The old live run remains writable,
+and its runtime/model projection remains canonical until the new run is
+confirmed. Catalog responses and browser runtime-config responses carry run and
+binding ownership and are discarded when the selected Session has advanced.
+
+Each Relay deployment should normally use its own `RELAY_STATE_ROOT`, and
+non-primary ports require explicit isolation. Relay also acquires an OS-owned
+named IPC lock for the resolved state root before opening the Session Store.
+A concurrent owner fails startup with `relay_state_locked`; after that process
+exits or crashes, the OS releases ownership for a replacement Relay.
+
 ## Recommended host-agent responsibilities
 
 The host agent should provide four services.
