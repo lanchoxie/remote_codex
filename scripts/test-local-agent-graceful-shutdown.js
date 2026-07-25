@@ -26,6 +26,46 @@ assert(
     && /local_agent_ownership_(?:required|mismatch)/.test(AGENT_SOURCE),
   'a Relay-managed Agent must terminate itself when Relay ownership is revoked'
 );
+const ownershipRevocationShutdownSource = AGENT_SOURCE.slice(
+  AGENT_SOURCE.indexOf('function retryOwnershipRevokedShutdown'),
+  AGENT_SOURCE.indexOf('function handleShutdownSignal')
+);
+assert(
+  /ownershipRevocationShutdownPromise/.test(ownershipRevocationShutdownSource)
+    && /while \(true\)/.test(ownershipRevocationShutdownSource)
+    && /await shutdownHostAgent\('ownership-revoked'\)/.test(ownershipRevocationShutdownSource)
+    && /result\?\.timedOut/.test(ownershipRevocationShutdownSource)
+    && /await sleep\(OWNERSHIP_REVOKED_SHUTDOWN_RETRY_MS\)/.test(ownershipRevocationShutdownSource),
+  'ownership loss must share one shutdown attempt and retry incomplete shutdowns until the Agent exits'
+);
+assert(
+  (AGENT_SOURCE.match(/await shutdownForRelayOwnershipLoss\(error\)/g) || []).length >= 6,
+  'every dismissed or lease-revoked Agent loop must use the shared ownership-loss shutdown path'
+);
+assert(
+  /host_dismissed/.test(AGENT_SOURCE)
+    && /recoverAgentLeaseForRequest\(error, requestLeaseId\)/.test(
+      AGENT_SOURCE.slice(
+        AGENT_SOURCE.indexOf('async function heartbeatLoop'),
+        AGENT_SOURCE.indexOf('function sleep')
+      )
+    ),
+  'heartbeat must recover a rotated lease and terminate explicitly when a Host is dismissed'
+);
+assert(
+  /host_shutdown_incomplete/.test(AGENT_SOURCE)
+    && /retryCommand\s*=\s*true/.test(
+      AGENT_SOURCE.slice(
+        AGENT_SOURCE.indexOf("if (command.type === 'host.shutdown')"),
+        AGENT_SOURCE.indexOf("if (command.type === 'session.start')")
+      )
+    ),
+  'an incomplete host shutdown must remain retryable instead of acknowledging a dead Agent'
+);
+assert(
+  /stopLocalAgent\(hostId,\s*\{[\s\S]*host dismissed by operator/.test(RELAY_SOURCE),
+  'dismissing a live local Host must disable its watchdog and request local Agent shutdown'
+);
 assert(
   /async function failShutdownCancelledManagedSession/.test(AGENT_SOURCE)
     && /publishShutdownFailureOnce/.test(AGENT_SOURCE)
@@ -53,7 +93,7 @@ const pollLoopSource = AGENT_SOURCE.slice(
 assert(
   /acknowledgeCommandsBeforeShutdown/.test(pollLoopSource)
     && pollLoopSource.indexOf('acknowledgeCommandsBeforeShutdown')
-      < pollLoopSource.indexOf('processPolledCommand(command)'),
+      < pollLoopSource.indexOf('processPolledCommand(command'),
   'Agent must durably ack successful earlier commands before processing host.shutdown'
 );
 const finalAckSource = AGENT_SOURCE.slice(
@@ -70,8 +110,9 @@ const sessionStopSource = AGENT_SOURCE.slice(
   AGENT_SOURCE.indexOf('async function postCommandFailure')
 );
 assert(
-  /stopError\.retryCommand\s*=\s*true/.test(sessionStopSource),
-  'a failed runner stop must keep session.stop durable instead of advancing the command cursor'
+  /stopRunnerOnce\(runner/.test(sessionStopSource)
+    && /stopError\.retryCommand\s*=\s*true/.test(sessionStopSource),
+  'session.stop must share Host shutdown cleanup and stay durable when it fails'
 );
 const managedStartSource = AGENT_SOURCE.slice(
   AGENT_SOURCE.indexOf('async function startManagedSession'),
@@ -89,8 +130,33 @@ const eventPostSource = AGENT_SOURCE.slice(
   AGENT_SOURCE.indexOf('async function postEvent')
 );
 assert(
-  /headers:\s*managedAgentRequestHeaders\(\)/.test(eventPostSource),
+  /const headers = managedAgentRequestHeaders\(\)/.test(eventPostSource)
+    && /headers,/.test(eventPostSource),
   'Relay-managed Agents must attest ownership on every event batch request'
+);
+assert(
+  /batchId\s*=\s*String\(options\.batchId/.test(AGENT_SOURCE)
+    && /event:\$\{HOST_ID\}:\$\{makeId\(\)\}/.test(AGENT_SOURCE),
+  'Agent event retries must reuse a stable idempotency key for each POST call'
+);
+assert(
+  /sendSingle:\s*\(event\)\s*=>\s*postEvent\(event,\s*\{\s*\.\.\.options,\s*batchId:\s*''\s*\}\)/.test(AGENT_SOURCE),
+  'legacy batch fallback must allocate a distinct idempotency key per single event'
+);
+assert(
+  /expectedRelayInstanceId/.test(AGENT_SOURCE)
+    && /lastCommandId\s*=\s*0/.test(
+      AGENT_SOURCE.slice(
+        AGENT_SOURCE.indexOf('async function pollCommandsLoop'),
+        AGENT_SOURCE.indexOf('async function discoveryLoop')
+      )
+    ),
+  'command polling must stop processing a batch when the Relay epoch changes'
+);
+assert(
+  /partialAgentEventBatches/.test(RELAY_SOURCE)
+    && /rememberPartialAgentEventBatch/.test(RELAY_SOURCE),
+  'Relay event retries must resume a partially applied batch at the failed event'
 );
 
 function delay(ms) {
@@ -320,9 +386,10 @@ async function main() {
       }],
     });
     const retryableBatchId = `event-attestation-retry-${Date.now()}`;
+    const retryableDiscoveryEvent = discoveryEvent(HOST_ID, eventSessionId);
     const missingAttestationEvent = await requestJson(port, 'POST', '/api/agent/events', {
       batchId: retryableBatchId,
-      events: [discoveryEvent(HOST_ID, eventSessionId)],
+      events: [retryableDiscoveryEvent],
     });
     assert.strictEqual(missingAttestationEvent.statusCode, 409, JSON.stringify(missingAttestationEvent.body));
     assert.strictEqual(missingAttestationEvent.body?.code, 'local_agent_ownership_required');
@@ -332,7 +399,7 @@ async function main() {
       '/api/agent/events',
       {
         batchId: retryableBatchId,
-        events: [discoveryEvent(HOST_ID, eventSessionId)],
+        events: [retryableDiscoveryEvent],
       },
       ownershipHeaders(ownedMarker.marker, {
         'X-Remote-Codex-Agent-Token': 'wrong-event-token',
@@ -379,7 +446,7 @@ async function main() {
       '/api/agent/events',
       {
         batchId: retryableBatchId,
-        events: [discoveryEvent(HOST_ID, eventSessionId)],
+        events: [retryableDiscoveryEvent],
       },
       ownershipHeaders(ownedMarker.marker)
     );
@@ -391,7 +458,7 @@ async function main() {
       '/api/agent/events',
       {
         batchId: retryableBatchId,
-        events: [discoveryEvent(HOST_ID, eventSessionId)],
+        events: [retryableDiscoveryEvent],
       },
       ownershipHeaders(ownedMarker.marker)
     );
@@ -522,9 +589,25 @@ async function main() {
       const health = await requestJson(port, 'GET', '/health');
       return health.statusCode === 200 && health.body?.ok;
     });
+    const replacementHostsBeforeAgent = await requestJson(port, 'GET', '/api/hosts');
+    const replacementLastSeenBeforeAgent = (replacementHostsBeforeAgent.body?.hosts || [])
+      .find((host) => host.hostId === HOST_ID)?.lastSeenAt || null;
     await waitFor(async () => {
       const hosts = await requestJson(port, 'GET', '/api/hosts');
-      return (hosts.body?.hosts || []).some((host) => host.hostId === HOST_ID && host.lastSeenAt);
+      return (hosts.body?.hosts || []).some((host) => (
+        host.hostId === HOST_ID
+        && host.lastSeenAt
+        && host.lastSeenAt !== replacementLastSeenBeforeAgent
+      ));
+    }, 15000);
+    await waitFor(async () => {
+      const status = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/local-agent`, {
+        action: 'status',
+      });
+      return status.body?.localAgent?.status === 'running'
+        && Number(status.body?.localAgent?.pid) === recoveredPid
+        ? status
+        : null;
     }, 15000);
 
     const adopted = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/local-agent`, {
@@ -1262,7 +1345,9 @@ async function testForcedProcessTreeShutdown() {
 }
 
 const selectedScenario = String(process.argv[2] || '').trim();
-const testRun = selectedScenario === 'forced-tree'
+const testRun = selectedScenario === 'core'
+  ? Promise.resolve().then(main)
+  : selectedScenario === 'forced-tree'
   ? Promise.resolve().then(testForcedProcessTreeShutdown)
   : selectedScenario === 'late-shutdown'
     ? Promise.resolve().then(testRelayJoinsLateManagedAgent)

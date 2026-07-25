@@ -8,10 +8,6 @@ function assertIncludes(source, needle, message) {
   assert(source.includes(needle), `${message}\nExpected to find: ${needle}`);
 }
 
-function assertNotIncludes(source, needle, message) {
-  assert(!source.includes(needle), `${message}\nDid not expect to find: ${needle}`);
-}
-
 assertIncludes(
   agent,
   "process.platform !== 'win32'",
@@ -30,13 +26,29 @@ assertIncludes(
 
 assertIncludes(
   app,
-  'void watchSelectedSession(session);',
-  'Opening a history session should not wait for the watch request before loading full history.'
-);
-assertNotIncludes(
-  app,
   'await watchSelectedSession(session);',
-  'watchSelectedSession must remain fire-and-forget so Linux/HPC history detail is not blocked by watch setup.'
+  'Opening history should enqueue its watch before requesting the detail snapshot.'
+);
+const showSessionStart = app.indexOf('async function showSession(');
+const showSessionEnd = app.indexOf('\nfunction buildSessionExportUrl', showSessionStart);
+const showSessionSource = app.slice(showSessionStart, showSessionEnd);
+assert(
+  showSessionSource.indexOf('await watchSelectedSession(session);')
+    < showSessionSource.indexOf('/detail?${detailParams.toString()}'),
+  'watch registration must form a barrier before the full history snapshot to avoid an EOF handoff gap'
+);
+assertIncludes(
+  showSessionSource,
+  'state.fullTranscriptLoaded.delete(sessionKey)',
+  'reselecting history must invalidate its prior full snapshot before watch/detail handoff'
+);
+const refreshStart = app.indexOf('async function performRefresh(');
+const refreshEnd = app.indexOf('\nfunction addSessionIdentityValue', refreshStart);
+const refreshSource = app.slice(refreshStart, refreshEnd);
+assertIncludes(
+  refreshSource,
+  'state.shownSessionKey = null;',
+  'temporarily losing the selected session must invalidate the next same-key history snapshot'
 );
 assertIncludes(
   app,

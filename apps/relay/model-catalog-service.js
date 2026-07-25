@@ -1,3 +1,29 @@
+const { redactSecretText } = require('../../shared/secret-redaction');
+
+const CATALOG_ERROR_MAX_LENGTH = 400;
+const INVALID_HTML_CATALOG_ERROR = 'The API returned an HTML page instead of a recognizable model catalog. Check whether the Base URL needs /v1.';
+const EMPTY_CATALOG_ERROR = 'The model catalog request failed without a readable error.';
+
+function normalizeCatalogError(value) {
+  const raw = value instanceof Error ? value.message : value;
+  const text = redactSecretText(raw == null ? '' : String(raw))
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) {
+    return EMPTY_CATALOG_ERROR;
+  }
+  if (
+    /<!doctype\s+html\b/i.test(text)
+    || /<\/?[a-z][^>]*>/i.test(text)
+  ) {
+    return INVALID_HTML_CATALOG_ERROR;
+  }
+  if (text.length <= CATALOG_ERROR_MAX_LENGTH) {
+    return text;
+  }
+  return `${text.slice(0, CATALOG_ERROR_MAX_LENGTH - 3)}...`;
+}
+
 class ModelCatalogError extends Error {
   constructor(code, message, details = {}) {
     super(message);
@@ -8,34 +34,85 @@ class ModelCatalogError extends Error {
   }
 }
 
-function catalogKey({ hostId, bindingFingerprint, runId, nativeThreadId } = {}) {
+function providerKindForInput(input = {}) {
+  return String(input.providerKind || input.apiConfig?.providerKind || '').trim().toLowerCase() || 'unknown';
+}
+
+function providerModelsMayBypassLiveCatalog(input = {}) {
+  return input.allowProviderModelsWithoutLive === true || providerKindForInput(input) === 'custom';
+}
+
+function catalogKey(input = {}) {
+  const { hostId, bindingFingerprint, runId, nativeThreadId } = input;
   return [
     hostId,
     bindingFingerprint,
     runId || nativeThreadId || '-',
+    providerKindForInput(input),
   ].map((value) => encodeURIComponent(String(value || ''))).join('::');
 }
 
 function inFlightKey(input = {}) {
-  const providerCapability = input.apiConfig ? 'provider' : 'live-only';
-  return `${catalogKey(input)}::${providerCapability}`;
+  const providerCapability = input.apiConfig ? 'provider-enabled' : 'live-only';
+  const selectionPolicy = providerModelsMayBypassLiveCatalog(input)
+    ? 'provider-models-selectable'
+    : 'live-models-required';
+  return `${catalogKey(input)}::${providerCapability}::${selectionPolicy}`;
 }
 
 function uniqueStrings(values = []) {
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
 }
 
+const REASONING_EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
+function normalizeReasoningEffort(value, options = {}) {
+  const submitted = String(value || '').trim();
+  const effort = submitted.toLowerCase();
+  if (!effort) {
+    return null;
+  }
+  if (!REASONING_EFFORT_PATTERN.test(effort)) {
+    if (options.rejectInvalid === true) {
+      throw new ModelCatalogError(
+        'session_effort_invalid',
+        `Invalid reasoning effort "${submitted}".`,
+        {
+          statusCode: 422,
+          model: options.model || null,
+          effort: submitted,
+          expectedPattern: REASONING_EFFORT_PATTERN.source,
+        }
+      );
+    }
+    return null;
+  }
+  return effort;
+}
+
 function reasoningMetadata(raw = {}) {
-  const hasMetadata = Object.prototype.hasOwnProperty.call(raw, 'reasoningLevels')
-    || Object.prototype.hasOwnProperty.call(raw, 'supportedReasoningEfforts')
-    || Object.prototype.hasOwnProperty.call(raw, 'supported_reasoning_efforts');
+  const hasMetadata = typeof raw.reasoningDeclared === 'boolean'
+    ? raw.reasoningDeclared
+    : Object.prototype.hasOwnProperty.call(raw, 'reasoningLevels')
+      || Object.prototype.hasOwnProperty.call(raw, 'supportedReasoningEfforts')
+      || Object.prototype.hasOwnProperty.call(raw, 'supported_reasoning_efforts');
+  const hasDefault = typeof raw.defaultReasoningEffortDeclared === 'boolean'
+    ? raw.defaultReasoningEffortDeclared
+    : Object.prototype.hasOwnProperty.call(raw, 'defaultReasoningEffort')
+      || Object.prototype.hasOwnProperty.call(raw, 'default_reasoning_effort');
   const values = raw.reasoningLevels
     || raw.supportedReasoningEfforts
     || raw.supported_reasoning_efforts
     || [];
+  const defaultValue = raw.defaultReasoningEffort ?? raw.default_reasoning_effort;
   return {
     declared: hasMetadata,
-    levels: uniqueStrings(values.map((value) => value?.reasoningEffort || value?.reasoning_effort || value)),
+    levels: uniqueStrings(values
+      .map((value) => value?.reasoningEffort || value?.reasoning_effort || value)
+      .map((value) => normalizeReasoningEffort(value))
+      .filter(Boolean)),
+    defaultDeclared: hasDefault,
+    defaultReasoningEffort: normalizeReasoningEffort(defaultValue),
   };
 }
 
@@ -47,6 +124,8 @@ function normalizeModel(raw = {}) {
     displayName: String(raw.displayName || raw.display_name || raw.name || '').trim() || null,
     reasoningLevels: reasoning.levels,
     reasoningDeclared: reasoning.declared,
+    defaultReasoningEffort: reasoning.defaultReasoningEffort,
+    defaultReasoningEffortDeclared: reasoning.defaultDeclared,
     isDefault: Boolean(raw.isDefault || raw.is_default),
     visible: raw.visible !== false && raw.hidden !== true,
   };
@@ -64,13 +143,14 @@ function normalizeSource(raw = {}, fallbackSource = 'unknown') {
     truncated: raw.truncated === true,
     nextCursor: raw.nextCursor || raw.next_cursor || null,
     stale: raw.stale === true,
-    error: raw.error ? String(raw.error) : null,
+    error: raw.error == null ? null : normalizeCatalogError(raw.error),
     fetchedAt: raw.fetchedAt || raw.fetched_at || null,
     evidenceAuthority: raw.evidenceAuthority || null,
     evidenceComplete: raw.evidenceComplete === true,
     evidenceTruncated: raw.evidenceTruncated === true,
     evidenceNextCursor: raw.evidenceNextCursor || null,
     evidenceFetchedAt: raw.evidenceFetchedAt || null,
+    providerKind: String(raw.providerKind || raw.provider_kind || '').trim().toLowerCase() || null,
     models: (Array.isArray(raw.models) ? raw.models : []).map(normalizeModel).filter((model) => model.id),
   };
 }
@@ -143,6 +223,7 @@ function emptyModel(id) {
     availability: 'unknown',
     previouslyAdvertised: false,
     reasoningLevels: [],
+    defaultReasoningEffort: null,
     capabilityKnown: false,
     capabilitySource: null,
     isDefault: false,
@@ -152,10 +233,28 @@ function emptyModel(id) {
   };
 }
 
-function mergeCatalogSources(rawSources = []) {
+function mergeCatalogSources(rawSources = [], options = {}) {
   const sources = rawSources.map((source) => normalizeSource(source, source?.source));
   const liveProvesAbsence = sources.some((source) => sourceProvesAbsence(source, 'live'));
   const providerProvesAbsence = sources.some((source) => sourceProvesAbsence(source, 'provider'));
+  const providerModelsMayBypassLive = options.allowProviderModelsWithoutLive === true;
+  const providerEvidenceModelIds = new Set(sources
+    .filter((source) => (
+      !source.error
+      && (source.source === 'provider' || source.originSource === 'provider')
+    ))
+    .flatMap((source) => source.models.map((model) => model.id)));
+  const boundProviderEvidenceProvesAbsence = providerModelsMayBypassLive
+    && sources.some((source) => (
+      (source.source === 'last-known-good' || source.stale === true)
+      && source.originSource === 'provider'
+      && source.evidenceAuthority === 'authoritative'
+      && source.evidenceComplete === true
+      && source.evidenceTruncated !== true
+      && !source.evidenceNextCursor
+      && !source.error
+    ));
+  const providerSelectionProvesAbsence = providerProvesAbsence || boundProviderEvidenceProvesAbsence;
   const byId = new Map();
 
   const orderedSources = [...sources].sort((left, right) => {
@@ -176,16 +275,36 @@ function mergeCatalogSources(rawSources = []) {
         if (!current.reasoningLevels.length) {
           current.reasoningLevels = [...model.reasoningLevels];
         }
+        if (!current.defaultReasoningEffort && model.defaultReasoningEffort) {
+          current.defaultReasoningEffort = model.defaultReasoningEffort;
+        }
       } else if (source.source === 'override') {
         if (model.reasoningDeclared && current.capabilitySource !== 'live') {
           current.reasoningLevels = [...model.reasoningLevels];
+          current.defaultReasoningEffort = model.defaultReasoningEffort;
           current.capabilityKnown = true;
           current.capabilitySource = 'override';
+        } else if (
+          model.defaultReasoningEffortDeclared
+          && current.capabilitySource !== 'live'
+        ) {
+          current.defaultReasoningEffort = model.defaultReasoningEffort;
         }
       } else if (source.source === 'provider') {
         if (!source.error && !source.stale) {
           current.providerAdvertised = true;
           current.availability = 'available';
+          if (model.reasoningDeclared && current.capabilitySource !== 'live') {
+            current.reasoningLevels = [...model.reasoningLevels];
+            current.defaultReasoningEffort = model.defaultReasoningEffort;
+            current.capabilityKnown = true;
+            current.capabilitySource = 'provider';
+          } else if (
+            model.defaultReasoningEffortDeclared
+            && current.capabilitySource !== 'live'
+          ) {
+            current.defaultReasoningEffort = model.defaultReasoningEffort;
+          }
         }
       } else if (source.source === 'live') {
         if (!source.error && !source.stale) {
@@ -194,8 +313,11 @@ function mergeCatalogSources(rawSources = []) {
           current.isDefault = model.isDefault;
           if (model.reasoningDeclared) {
             current.reasoningLevels = [...model.reasoningLevels];
+            current.defaultReasoningEffort = model.defaultReasoningEffort;
             current.capabilityKnown = true;
             current.capabilitySource = 'live';
+          } else if (model.defaultReasoningEffortDeclared) {
+            current.defaultReasoningEffort = model.defaultReasoningEffort;
           }
         }
       }
@@ -204,10 +326,14 @@ function mergeCatalogSources(rawSources = []) {
   }
 
   for (const model of byId.values()) {
-    if (liveProvesAbsence && !model.sources.includes('live')) {
+    if (
+      liveProvesAbsence
+      && !model.sources.includes('live')
+      && !(providerModelsMayBypassLive && providerEvidenceModelIds.has(model.id))
+    ) {
       model.cliSupported = false;
     }
-    if (providerProvesAbsence && !model.sources.includes('provider')) {
+    if (providerSelectionProvesAbsence && !providerEvidenceModelIds.has(model.id)) {
       model.providerAdvertised = false;
       model.availability = 'unavailable';
     }
@@ -223,7 +349,7 @@ function mergeCatalogSources(rawSources = []) {
     if (liveProvesAbsence) {
       model.cliSupported = false;
     }
-    if (providerProvesAbsence) {
+    if (providerSelectionProvesAbsence) {
       model.providerAdvertised = false;
       model.availability = 'unavailable';
     }
@@ -231,40 +357,73 @@ function mergeCatalogSources(rawSources = []) {
     return model;
   }
 
-  function validate(selection = {}) {
-    const modelId = String(selection.model || '').trim();
-    const effort = String(selection.effort || '').trim();
-    if (!modelId) {
+  const defaultModel = [...byId.values()].find((model) => model.isDefault)?.id || null;
+
+  function validate(selection = {}, options = {}) {
+    const requestedModelId = String(selection.model || '').trim();
+    const modelId = requestedModelId || defaultModel || '';
+    const effort = normalizeReasoningEffort(selection.effort, {
+      rejectInvalid: true,
+      model: modelId || null,
+    });
+    if (!requestedModelId && !effort) {
       return null;
     }
-    const model = lookup(modelId);
-    if (model.availability === 'unavailable') {
+    const model = modelId ? lookup(modelId) : emptyModel('');
+    if (modelId && model.availability === 'unavailable') {
       throw new ModelCatalogError(
         'session_model_unavailable',
         `Model "${modelId}" is not advertised by the current API account.`,
         { model: modelId }
       );
     }
-    if (model.cliSupported === false) {
+    if (modelId && model.cliSupported === false) {
       throw new ModelCatalogError(
         'session_model_unsupported',
         `Model "${modelId}" is not supported by this Session app-server.`,
         { model: modelId }
       );
     }
-    if (effort && !model.capabilityKnown) {
-      throw new ModelCatalogError(
-        'session_effort_unsupported',
-        `Reasoning effort for "${modelId}" is unknown; use Auto.`,
-        { model: modelId, effort, capabilityUnknown: true }
-      );
-    }
-    if (effort && !model.reasoningLevels.includes(effort)) {
-      throw new ModelCatalogError(
-        'session_effort_unsupported',
-        `Reasoning effort "${effort}" is not supported by "${modelId}".`,
-        { model: modelId, effort, reasoningLevels: model.reasoningLevels }
-      );
+    if (effort) {
+      if (model.capabilityKnown) {
+        if (!model.reasoningLevels.includes(effort)) {
+          throw new ModelCatalogError(
+            'session_effort_unsupported',
+            `Reasoning effort "${effort}" is not supported by "${modelId}".`,
+            { model: modelId, effort, reasoningLevels: model.reasoningLevels }
+          );
+        }
+      } else {
+        const allowUnverifiedEffort = options.allowUnverifiedEffort === true
+          || selection.allowUnverifiedEffort === true;
+        if (allowUnverifiedEffort && options.allowManualEffortWhenUnknown === false) {
+          throw new ModelCatalogError(
+            'session_effort_unsupported',
+            'Manual effort values for unknown models are available only for Custom API providers.',
+            {
+              model: modelId || null,
+              effort,
+              capabilityUnknown: true,
+              providerKind: options.providerKind || 'unknown',
+            }
+          );
+        }
+        if (!allowUnverifiedEffort) {
+          throw new ModelCatalogError(
+            'session_effort_unverified',
+            modelId
+              ? `Reasoning effort "${effort}" cannot be verified for "${modelId}".`
+              : `Reasoning effort "${effort}" cannot be verified because the default model is unknown.`,
+            {
+              model: modelId || null,
+              effort,
+              capabilityUnknown: true,
+              allowUnverifiedEffort: false,
+              defaultModelUsed: !requestedModelId && Boolean(defaultModel),
+            }
+          );
+        }
+      }
     }
     return model;
   }
@@ -276,7 +435,7 @@ function mergeCatalogSources(rawSources = []) {
   return {
     models,
     sources: structuredClone(sources),
-    defaultModel: models.find((model) => model.isDefault)?.id || null,
+    defaultModel,
     lookup,
     validate,
     controlsFor(modelId) {
@@ -285,6 +444,7 @@ function mergeCatalogSources(rawSources = []) {
         allowAuto: true,
         capabilityKnown: model.capabilityKnown,
         reasoningLevels: model.capabilityKnown ? [...model.reasoningLevels] : [],
+        defaultReasoningEffort: model.defaultReasoningEffort,
       };
     },
   };
@@ -319,7 +479,7 @@ class ModelCatalogService {
     }
     const cached = this.readCache(input, key);
     if (!input.force && cached && this.cacheAge(cached) <= this.staleMs) {
-      const result = Promise.resolve(this.catalogFromCache(cached, 'fresh'));
+      const result = Promise.resolve(this.catalogFromCache(cached, 'fresh', input));
       return result;
     }
     const request = this.load(input, key, cached);
@@ -336,7 +496,12 @@ class ModelCatalogService {
       hostId: input.hostId,
       sessionId: input.sessionId || input.nativeThreadId,
     });
-    return record?.catalog?.[key] || null;
+    const cache = record?.catalog?.[key] || null;
+    const providerKind = providerKindForInput(input);
+    if (cache?.providerKind && String(cache.providerKind).toLowerCase() !== providerKind) {
+      return null;
+    }
+    return cache;
   }
 
   cacheAge(cache) {
@@ -348,10 +513,22 @@ class ModelCatalogService {
     return Math.max(0, nowMs - savedMs);
   }
 
-  catalogFromCache(cache, cacheState) {
-    const catalog = mergeCatalogSources(cache.sources || []);
+  catalogFromCache(cache, cacheState, input = {}) {
+    const providerKind = providerKindForInput(input);
+    const cachedSources = (cache.sources || []).filter((source) => (
+      source?.source !== 'override'
+      && (!source.providerKind || String(source.providerKind).toLowerCase() === providerKind)
+    ));
+    const catalog = mergeCatalogSources([
+      ...cachedSources,
+      ...this.overrideSources(input),
+    ], {
+      allowProviderModelsWithoutLive: providerModelsMayBypassLiveCatalog(input),
+    });
     catalog.cacheState = cacheState;
     catalog.savedAt = cache.savedAt || null;
+    catalog.providerKind = providerKind;
+    catalog.allowProviderModelsWithoutLive = providerModelsMayBypassLiveCatalog(input);
     return catalog;
   }
 
@@ -376,11 +553,15 @@ class ModelCatalogService {
   }
 
   overrideSources(input) {
+    const inputProviderKind = providerKindForInput(input);
     const matching = this.overrides.filter((entry) => {
       if (entry.bindingFingerprint && entry.bindingFingerprint !== input.bindingFingerprint) {
         return false;
       }
       if (entry.hostId && entry.hostId !== input.hostId) {
+        return false;
+      }
+      if (entry.providerKind && String(entry.providerKind).toLowerCase() !== inputProviderKind) {
         return false;
       }
       return true;
@@ -399,16 +580,21 @@ class ModelCatalogService {
       source: 'override',
       authority: 'capability-only',
       complete: false,
+      providerKind: inputProviderKind,
       models: matching,
     }, 'override')];
   }
 
-  staleSources(cache) {
+  staleSources(cache, input = {}) {
     if (!cache) {
       return [];
     }
+    const providerKind = providerKindForInput(input);
     const candidatesByOrigin = new Map();
     for (const rawSource of cache.sources || []) {
+      if (rawSource?.providerKind && String(rawSource.providerKind).toLowerCase() !== providerKind) {
+        continue;
+      }
       const fallback = lastKnownGoodSource(rawSource);
       if (!fallback) {
         continue;
@@ -422,7 +608,69 @@ class ModelCatalogService {
       .map((candidates) => [...candidates].sort(compareLastKnownGood)[0]);
   }
 
+  async persistCatalog(input = {}, catalog = null, operation = 'session.model_catalog.saved') {
+    const key = catalogKey(input);
+    if (!input.hostId || !input.bindingFingerprint || !catalog || typeof catalog !== 'object') {
+      throw new ModelCatalogError(
+        'session_api_binding_unavailable',
+        'A verified model catalog and binding are required before it can be saved.'
+      );
+    }
+    const providerKind = providerKindForInput(input);
+    const sources = (Array.isArray(catalog.sources) ? catalog.sources : [])
+      .filter((source) => source && !source.error)
+      .map((source) => structuredClone(source));
+    if (!sources.length) {
+      throw new ModelCatalogError(
+        'session_api_binding_unavailable',
+        'The verified model catalog has no reusable source evidence.'
+      );
+    }
+    const savedAt = catalog.savedAt || this.now();
+    await this.store.transact(operation, (tx) => {
+      const canonicalKey = tx.resolveCanonicalKey(input.identity || {
+        hostId: input.hostId,
+        sessionId: input.sessionId || input.nativeThreadId,
+      });
+      const record = tx.ensureRecord(canonicalKey, {
+        hostId: input.hostId,
+        conversationKey: input.sessionId || input.nativeThreadId,
+      });
+      record.catalog ||= {};
+      record.catalog[key] = {
+        savedAt,
+        providerKind,
+        sources,
+      };
+      record.updatedAt = this.now();
+      tx.markDirty(canonicalKey);
+    });
+  }
+
+  async inheritRunCatalog(input = {}, sourceRunId = null) {
+    const normalizedSourceRunId = String(sourceRunId || '').trim();
+    if (!normalizedSourceRunId || normalizedSourceRunId === String(input.runId || '').trim()) {
+      return null;
+    }
+    const sourceInput = {
+      ...input,
+      runId: normalizedSourceRunId,
+      force: false,
+    };
+    const cached = this.readCache(sourceInput, catalogKey(sourceInput));
+    if (!cached) {
+      return null;
+    }
+    const catalog = this.catalogFromCache(cached, 'inherited', input);
+    if (!catalog.sources.some((source) => source && !source.error)) {
+      return null;
+    }
+    await this.persistCatalog(input, catalog, 'session.model_catalog.inherited');
+    return catalog;
+  }
+
   async load(input, key, cache) {
+    const providerKind = providerKindForInput(input);
     const requests = [
       ['live', this.fetchLivePage],
       ['provider', this.fetchProviderPage],
@@ -433,14 +681,19 @@ class ModelCatalogService {
       }
       try {
         const result = await this.withTimeout(fetcher, input, sourceName);
-        return normalizeSource({ ...result, source: sourceName }, sourceName);
+        return normalizeSource({
+          ...result,
+          source: sourceName,
+          providerKind: result?.providerKind || providerKind,
+        }, sourceName);
       } catch (error) {
         return normalizeSource({
           source: sourceName,
           authority: 'advisory',
           complete: false,
-          error: error.message || String(error),
+          error: normalizeCatalogError(error),
           fetchedAt: this.now(),
+          providerKind,
           models: [],
         }, sourceName);
       }
@@ -450,7 +703,7 @@ class ModelCatalogService {
     const completeRefreshOrigins = new Set(successful
       .filter((source) => sourceProvesAbsence(source, source.source))
       .map((source) => source.source));
-    const fallbackSources = this.staleSources(cache)
+    const fallbackSources = this.staleSources(cache, input)
       .filter((source) => !completeRefreshOrigins.has(source.originSource));
     const overrides = this.overrideSources(input);
     const sources = [
@@ -458,39 +711,37 @@ class ModelCatalogService {
       ...overrides,
       ...freshSources,
     ];
-    const catalog = mergeCatalogSources(sources);
+    const catalog = mergeCatalogSources(sources, {
+      allowProviderModelsWithoutLive: providerModelsMayBypassLiveCatalog(input),
+    });
     catalog.cacheState = successful.length ? 'refreshed' : cache ? 'stale' : 'miss';
     catalog.savedAt = successful.length ? this.now() : cache?.savedAt || null;
+    catalog.providerKind = providerKind;
+    catalog.allowProviderModelsWithoutLive = providerModelsMayBypassLiveCatalog(input);
 
-    if (successful.length) {
-      const persistedSources = [
-        ...fallbackSources,
-        ...overrides,
-        ...successful,
-      ].map((source) => structuredClone(source));
-      await this.store.transact('session.model_catalog.saved', (tx) => {
-        const canonicalKey = tx.resolveCanonicalKey(input.identity || {
-          hostId: input.hostId,
-          sessionId: input.sessionId || input.nativeThreadId,
-        });
-        const record = tx.ensureRecord(canonicalKey, {
-          hostId: input.hostId,
-          conversationKey: input.sessionId || input.nativeThreadId,
-        });
-        record.catalog ||= {};
-        record.catalog[key] = {
-          savedAt: catalog.savedAt,
-          sources: persistedSources,
-        };
-        record.updatedAt = this.now();
-        tx.markDirty(canonicalKey);
-      });
+    if (successful.length && input.persist !== false) {
+      const persistedCatalog = {
+        ...catalog,
+        sources: [
+          ...fallbackSources,
+          ...overrides,
+          ...successful,
+        ],
+      };
+      await this.persistCatalog(input, persistedCatalog);
     }
     return catalog;
   }
 
-  validateSelection(catalog, selection) {
-    return catalog.validate(selection);
+  validateSelection(catalog, selection, options = {}) {
+    const providerKind = String(options.providerKind || catalog?.providerKind || '')
+      .trim()
+      .toLowerCase() || 'unknown';
+    return catalog.validate(selection, {
+      ...options,
+      providerKind,
+      allowManualEffortWhenUnknown: providerKind === 'custom',
+    });
   }
 }
 
@@ -499,5 +750,9 @@ module.exports = {
   ModelCatalogService,
   catalogKey,
   mergeCatalogSources,
+  normalizeCatalogError,
   normalizeModel,
+  normalizeReasoningEffort,
+  providerKindForInput,
+  providerModelsMayBypassLiveCatalog,
 };

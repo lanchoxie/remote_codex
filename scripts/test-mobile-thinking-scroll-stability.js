@@ -62,9 +62,100 @@ const thinkingPanel = sliceBetween(
   'renderThinkingPanel'
 );
 mustContain(
+  app,
+  'thinkingScrollMachines: new WeakMap()',
+  'thinking scroll machines should not strongly retain detached DOM by state key'
+);
+assert(
+  !app.includes('thinkingScrollVersions'),
+  'unused thinking scroll version state should not grow for every rendered card'
+);
+const thinkingScrollMachine = sliceBetween(
+  'function getThinkingScrollMachine(',
+  'function updateThinkingScrollState(',
+  'getThinkingScrollMachine'
+);
+mustContain(
+  thinkingScrollMachine,
+  'state.thinkingScrollMachines.get(scroller)',
+  'thinking scroll machines should be looked up by their DOM node'
+);
+mustContain(
+  thinkingScrollMachine,
+  'state.thinkingScrollMachines.set(scroller, machine)',
+  'thinking scroll machines should be weakly keyed by their DOM node'
+);
+assert(
+  !thinkingScrollMachine.includes('{ node: scroller, machine }'),
+  'thinking scroll state must not retain a DOM node as a strong Map value'
+);
+const thinkingUiPrune = sliceBetween(
+  'function pruneThinkingUiState(',
+  'function getThinkingScrollMachine(',
+  'pruneThinkingUiState'
+);
+for (const stateName of [
+  'state.thinkingPanels',
+  'state.thinkingScrollPositions',
+  'state.thinkingEntryCounts',
+  'state.thinkingEntryVersions',
+  'state.thinkingUnread',
+]) {
+  mustContain(
+    thinkingUiPrune,
+    stateName,
+    `${stateName} should be pruned when its thinking card leaves the rendered transcript`
+  );
+}
+mustContain(
+  thinkingUiPrune,
+  'keyedState.delete(stateKey)',
+  'keyed thinking maps should delete state that is no longer rendered'
+);
+const thinkingMessageBuilder = sliceBetween(
+  'function buildThinkingMessageElement(',
+  'function patchThinkingMessageElement(',
+  'buildThinkingMessageElement'
+);
+mustContain(
+  thinkingMessageBuilder,
+  'if (!details.isConnected)',
+  'detached thinking cards must not restore pruned panel state from queued toggle events'
+);
+mustContain(
+  thinkingMessageBuilder,
+  "wrapper.dataset.thinkingLive = 'placeholder'",
+  'transient live placeholders must be explicitly marked for terminal cleanup'
+);
+mustContain(
+  thinkingMessageBuilder,
+  'thinkingEntriesRenderVersion(entries)',
+  'same-row reasoning growth must participate in unread/version tracking'
+);
+mustContain(
+  thinkingMessageBuilder,
+  '&& savedScroll',
+  'new thinking content should mark unread without moving the internal reader'
+);
+mustContain(
   thinkingPanel,
   'patchThinkingMessageElement(',
   'live thinking updates should patch the existing message in place'
+);
+mustContain(
+  thinkingPanel,
+  '.message.thinking[data-thinking-live="placeholder"]',
+  'terminal runtime updates should target only stale live placeholders for removal'
+);
+mustContain(
+  thinkingPanel,
+  'for (const placeholder of stalePlaceholders) placeholder.remove()',
+  'a finished turn must remove its transient working placeholder'
+);
+mustContain(
+  thinkingPanel,
+  "userTimestamp: latestUserEntry?.timestamp || 'live'",
+  'the live placeholder lookup must use the same user timestamp identity as transcript rendering'
 );
 assert(
   !thinkingPanel.includes('existingMessage.replaceWith('),
@@ -85,6 +176,25 @@ mustContain(
   'LIVE_THINKING_ACTIVITY_ENTRY_LIMIT',
   'live thinking should use an explicit, high activity-entry limit'
 );
+const projectedThinkingPatch = sliceBetween(
+  'function patchProjectedThinkingActivity(',
+  'function applyActivityEvent(',
+  'patchProjectedThinkingActivity'
+);
+mustContain(
+  projectedThinkingPatch,
+  'queuedUiRenders.thinkingPanel = true',
+  'activity deltas should coalesce through the complete keyed Thinking patch'
+);
+assert(
+  !projectedThinkingPatch.includes("textNode.textContent = String(activity.text"),
+  'raw activity payloads must not overwrite an aggregated reasoning row directly'
+);
+mustContain(
+  projectedThinkingPatch,
+  "latestUserEntry?.timestamp || 'live'",
+  'activity patches should target the current user-turn Thinking card'
+);
 const formatThinkingValue = sliceBetween(
   'function formatThinkingValue(',
   'function normalizeThinkingMessage',
@@ -101,8 +211,18 @@ assert(
 );
 mustContain(
   formatThinkingValue,
-  "values.join(looksTokenized ? ' ' : '\\n')",
-  'frontend thinking arrays should join tokenized fragments with spaces while preserving real multiline blocks'
+  "rawValues.some((part) => /^\\s|\\s$/.test(part))",
+  'frontend thinking arrays should preserve exact delta boundaries when whitespace is present'
+);
+mustContain(
+  formatThinkingValue,
+  "return values.join(' ')",
+  'frontend thinking arrays should join even short English token arrays without hard line breaks'
+);
+mustContain(
+  formatThinkingValue,
+  "if (cjkOnly) return values.join('')",
+  'frontend thinking arrays should not insert artificial spaces between CJK fragments'
 );
 const extractStructuredText = sliceBetweenSource(
   discovery,
@@ -121,8 +241,18 @@ assert(
 );
 mustContain(
   extractStructuredText,
-  "values.join(looksTokenized ? ' ' : '\\n')",
-  'JSONL reasoning arrays should join tokenized fragments with spaces while preserving real multiline blocks'
+  "rawValues.some((part) => /^\\s|\\s$/.test(part))",
+  'JSONL reasoning arrays should preserve exact delta whitespace'
+);
+mustContain(
+  extractStructuredText,
+  "return values.join(' ')",
+  'JSONL reasoning arrays should join short English token arrays without hard line breaks'
+);
+mustContain(
+  extractStructuredText,
+  "if (cjkOnly) return values.join('')",
+  'JSONL reasoning arrays should join CJK fragments without artificial spaces'
 );
 
 mustContain(
@@ -293,6 +423,16 @@ const restoreThinkingScrollState = sliceBetween(
 );
 mustContain(
   restoreThinkingScrollState,
+  'if (!scroller.isConnected)',
+  'a detached thinking scroller must not restore stale state from a queued animation frame'
+);
+mustContain(
+  restoreThinkingScrollState,
+  'state.thinkingScrollPositions.get(stateKey) !== saved',
+  'a queued restore must not overwrite a newer thinking scroll snapshot'
+);
+mustContain(
+  restoreThinkingScrollState,
   'options.preserveDetached',
   'thinking scroll restore should distinguish live patches from explicit user-bottom actions'
 );
@@ -318,8 +458,32 @@ mustContain(
 );
 mustContain(
   app,
-  'item.dataset.thinkingViewportKey = thinkingEntryViewportKey(entry, index)',
+  'node.dataset.thinkingViewportKey = thinkingEntryViewportKey(entry, index)',
   'thinking history records should expose stable viewport keys'
+);
+mustContain(
+  app,
+  'node.dataset.thinkingEntryKey = entryKey',
+  'thinking history records should expose a stable key for narrow DOM patching'
+);
+const thinkingMessagePatch = sliceBetween(
+  'function patchThinkingMessageElement(',
+  'function renderFileCards(',
+  'patchThinkingMessageElement'
+);
+mustContain(
+  thinkingMessagePatch,
+  'patchThinkingHistoryList(existingHistory, nextHistory, patchedStateKey)',
+  'live Thinking refreshes should patch keyed rows instead of replacing the whole card'
+);
+assert(
+  !thinkingMessagePatch.includes('existingMessage.replaceChildren('),
+  'live Thinking refreshes must not replace the whole message and disturb the outer viewport'
+);
+mustContain(
+  thinkingMessagePatch,
+  'captureThinkingDisclosureStates(existingMessage, existingStateKey)',
+  'tool disclosure state should be captured before live row updates'
 );
 mustContain(
   app,
@@ -337,12 +501,13 @@ const thinkingMessageElement = sliceBetween(
 );
 mustContain(
   thinkingMessageElement,
-  'entries.length > previousEntryCount && savedScroll && details.open',
-  'new thinking activity should mark the card unread whenever the card was open before the live patch'
+  '(entries.length > previousEntryCount || contentChanged)',
+  'new rows and same-row content growth should both participate in unread tracking'
 );
-assert(
-  !thinkingMessageElement.includes('&& !savedScroll.atBottom && details.open'),
-  'new thinking activity should show Bottom even if the previous state was bottom-pinned'
+mustContain(
+  thinkingMessageElement,
+  '&& savedScroll',
+  'same-row growth should expose an unread marker without forcing an inner scroll'
 );
 mustContain(
   thinkingMessageElement,
@@ -427,6 +592,26 @@ assert(
   thinkingContentOpenBlocks.some((block) => /\boverflow\s*:\s*auto\b/.test(block)),
   'open thinking cards should keep their own internal scroll owner'
 );
+assert(
+  thinkingContentOpenBlocks.some((block) => /\bpadding-right\s*:\s*52px\b/.test(block)),
+  'narrow mobile Thinking cards should reserve one compact control rail instead of 86px'
+);
+const thinkingRailBlocks = cssBlocksFor('.thinking-scroll-actions.rail');
+assert(
+  thinkingRailBlocks.some((block) => (
+    /\bright\s*:\s*0\b/.test(block)
+    && /\bwidth\s*:\s*44px\b/.test(block)
+  )),
+  'the mobile Thinking scroll rail should use a single 44px touch column'
+);
+const thinkingCollapseBlocks = cssBlocksFor('.thinking-collapse-rail');
+assert(
+  thinkingCollapseBlocks.some((block) => (
+    /\bwidth\s*:\s*44px\b/.test(block)
+    && /\bheight\s*:\s*44px\b/.test(block)
+  )),
+  'the mobile Thinking collapse control should expose a 44px touch target'
+);
 
 const scheduleMathTypeset = sliceBetween(
   'function scheduleMathTypeset(container)',
@@ -470,6 +655,21 @@ const renderTranscript = sliceBetween(
   'function renderTranscript(',
   'function renderLocaleLabels()',
   'renderTranscript'
+);
+mustContain(
+  renderTranscript,
+  'const livePlaceholder = shouldShowLivePlaceholder && !segment && !liveSegment',
+  'the latest user turn should distinguish a transient placeholder from persisted activity'
+);
+mustContain(
+  renderTranscript,
+  "userTimestamp: latestUserEntry?.timestamp || 'live'",
+  'placeholder creation and live patch lookup must share a stable turn key'
+);
+assert.strictEqual(
+  (renderTranscript.match(/pruneThinkingUiState\(log\)/g) || []).length,
+  3,
+  'thinking state should be pruned in the no-session, empty-transcript, and normal render exits'
 );
 mustContain(
   renderTranscript,

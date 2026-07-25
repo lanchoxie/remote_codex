@@ -62,6 +62,8 @@ async function main() {
   assert.strictEqual(emitted[1].text, '  First word, then second.  Next');
   assert.strictEqual(emitted[1].final, true);
   assert.strictEqual(emitted[1].activityRevision, 2);
+  assert.strictEqual(aggregator.release(item), true);
+  assert.strictEqual(aggregator.has(item), false, 'delivered final records should be releasable');
 
   const replacement = { ...item, itemId: 'reasoning-2', summaryIndex: 1 };
   aggregator.replaceSnapshot(replacement, ' replacement\ntext ');
@@ -70,6 +72,52 @@ async function main() {
   assert.strictEqual(replacementSnapshot.text, ' replacement\ntext ');
   assert.strictEqual(replacementSnapshot.activityRevision, 1);
   assert.strictEqual(replacementSnapshot.final, true);
+
+  const metadataItem = {
+    ...item,
+    itemId: 'command-metadata',
+    kind: 'command',
+    itemType: 'commandExecution',
+    status: 'inProgress',
+    command: 'npm test',
+  };
+  aggregator.replaceSnapshot(metadataItem, 'same text');
+  await aggregator.flush(metadataItem);
+  aggregator.replaceSnapshot({ ...metadataItem, status: 'completed', exitCode: 0 }, 'same text');
+  await aggregator.flush({ ...metadataItem, status: 'completed', exitCode: 0 });
+  const metadataSnapshots = emitted.filter((snapshot) => snapshot.itemId === 'command-metadata');
+  assert.strictEqual(metadataSnapshots.length, 2, 'metadata-only changes should emit a new activity revision');
+  assert.strictEqual(metadataSnapshots[1].status, 'completed');
+  assert.strictEqual(metadataSnapshots[1].exitCode, 0);
+  assert.strictEqual(metadataSnapshots[1].activityRevision, 2);
+
+  const boundedEmitted = [];
+  const evicted = [];
+  const bounded = new ThinkingActivityAggregator({
+    canonicalConversationKey: 'host-b::conversation-b',
+    runId: 'run-bounded',
+    emitSnapshot: async (snapshot) => boundedEmitted.push(snapshot),
+    maxRecords: 2,
+    maxTextBytes: 1024,
+    maxTotalTextBytes: 2048,
+    setTimer: () => ({ bounded: true }),
+    clearTimer: () => {},
+    onEvict: (record) => evicted.push(record.activityKey),
+  });
+  const boundedItems = Array.from({ length: 3 }, (_, index) => ({
+    turnId: 'turn-bounded',
+    itemId: `item-${index}`,
+    summaryIndex: 0,
+  }));
+  for (const boundedItem of boundedItems) {
+    bounded.replaceSnapshot(boundedItem, '推理'.repeat(2000));
+  }
+  assert.strictEqual(bounded.debugStats().records, 2);
+  assert(bounded.debugStats().totalTextBytes <= 2048);
+  assert.strictEqual(evicted.length, 1, 'old activity records should be evicted at the hard limit');
+  await bounded.flush(boundedItems[2], { final: true });
+  assert.strictEqual(boundedEmitted[0].textTruncated, true);
+  assert(Buffer.byteLength(boundedEmitted[0].text, 'utf8') <= 1024);
 
   console.log('thinking activity aggregator assertions passed');
 }

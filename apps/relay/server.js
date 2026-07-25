@@ -5,20 +5,31 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const {
+  recoverMissingFileFromBackup,
+  replaceFileWithBackup,
+} = require('./atomic-file-replace');
+const {
   agentLogCommand,
   buildAgentLaunchCommand,
   buildDetachedBootstrapCommand,
   buildCodexBinResolutionCommand,
   buildRemoteStatusCommand,
   buildSshCommandParts,
+  connectorControlFileName,
+  connectorTmuxSessionName,
   connectorUsesGateway,
   decorateConnector,
   loadConnectors,
+  normalizeConnectorRemoteDirectory,
   normalizeConnectorInput,
   requiresInteractiveAuth,
   saveConnectors,
   shellQuote,
 } = require('../../shared/connectors');
+const {
+  linuxRuntimeNames,
+  normalizeLinuxArchitecture,
+} = require('../../shared/remote-runtime-platform');
 const {
   getConnectorSecretStatus,
   loadConnectorSecrets,
@@ -36,19 +47,29 @@ const { createSkillArtifactArchive } = require('../../shared/skill-artifact');
 const { normalizePortableSkillId } = require('../../shared/skill-id');
 const { parseSkillMarkdown } = require('../../shared/skill-inventory');
 const { redactSecretText, stripSecrets } = require('../../shared/secret-redaction');
-const { ActivitySnapshotStore } = require('../../shared/activity-snapshot-store');
+const {
+  ActivitySnapshotStore,
+  makeActivityRecoveryToken,
+} = require('../../shared/activity-snapshot-store');
 const {
   canonicalPhysicalPath,
   comparablePhysicalPath,
   physicalPathIsInside,
 } = require('../../shared/physical-path');
 const {
+  OFFICIAL_OPENAI_BASE_URL,
+  bindingFingerprint,
   bindingsEqual,
   makeProfileBinding,
   publicBinding,
 } = require('../../shared/api-binding');
 const { downloadGithubSkill, normalizeGithubSkillSource } = require('./github-skill-source');
+const { AgentEventLedger } = require('./agent-event-ledger');
+const { HostAgentLeaseRegistry } = require('./host-agent-lease');
 const { ModelCatalogError, ModelCatalogService } = require('./model-catalog-service');
+const { RebindCatalogReuseStore } = require('./rebind-catalog-reuse');
+const { normalizeApiConfig: normalizeRuntimeApiConfig } = require('../host-agent/runtime-utils');
+const providerCapabilities = require('../mobile-web/public/provider-capabilities');
 const {
   emptyNotificationState,
   ingestAssistantObservation,
@@ -56,6 +77,7 @@ const {
 } = require('./assistant-notification-ledger');
 const { acquireRelayStateLock } = require('./relay-state-lock');
 const { SessionEventStream } = require('./session-event-stream');
+const { writeSseEvent } = require('./sse-writer');
 const { SessionContractError, SessionProvenanceService } = require('./session-provenance-service');
 const { SessionRecordStore } = require('./session-record-store');
 const { SkillAuditLog } = require('./skill-audit-log');
@@ -69,6 +91,11 @@ const SESSION_EVENT_RING_SIZE = Math.max(
   1,
   Math.min(4096, Number(process.env.SESSION_EVENT_RING_SIZE || 512) || 512)
 );
+const SESSION_RESET_SSE_MAX_BYTES = Math.max(
+  2048,
+  Math.min(12 * 1024, Number(process.env.SESSION_RESET_SSE_MAX_BYTES || 8 * 1024) || 8 * 1024)
+);
+const SESSION_SSE_PAYLOAD_MAX_BYTES = Math.max(512, SESSION_RESET_SSE_MAX_BYTES - 512);
 const PRIMARY_RELAY_PORT = 8797;
 function enabledEnvironmentFlag(name, defaultValue) {
   const value = process.env[name];
@@ -117,6 +144,8 @@ if (comparablePhysicalPath(SESSION_RECORD_STORE_ROOT) === comparablePhysicalPath
 }
 const SESSION_LOGS_PATH = relayOwnedStatePath('SESSION_LOGS_PATH', process.env.SESSION_LOGS_PATH || path.join(RELAY_STATE_ROOT, 'session-logs.json'));
 const SESSION_DIAGNOSTICS_PATH = relayOwnedStatePath('SESSION_DIAGNOSTICS_PATH', process.env.SESSION_DIAGNOSTICS_PATH || path.join(RELAY_STATE_ROOT, 'session-diagnostics.json'));
+const DISMISSED_HOSTS_PATH = relayOwnedStatePath('DISMISSED_HOSTS_PATH', process.env.DISMISSED_HOSTS_PATH || path.join(RELAY_STATE_ROOT, 'dismissed-hosts.json'));
+const AGENT_EVENT_LEDGER_PATH = relayOwnedStatePath('AGENT_EVENT_LEDGER_PATH', process.env.AGENT_EVENT_LEDGER_PATH || path.join(RELAY_STATE_ROOT, 'agent-event-ledger.jsonl'));
 const CONNECTORS_PATH = relayOwnedStatePath('CONNECTORS_PATH', process.env.CONNECTORS_PATH || path.join(RELAY_STATE_ROOT, 'connectors.json'));
 const CONNECTOR_SECRETS_PATH = relayOwnedStatePath('CONNECTOR_SECRETS_PATH', process.env.CONNECTOR_SECRETS_PATH || path.join(RELAY_STATE_ROOT, 'connector-secrets.json'));
 const SKILL_FAVORITES_PATH = relayOwnedStatePath('SKILL_FAVORITES_PATH', process.env.SKILL_FAVORITES_PATH || path.join(RELAY_STATE_ROOT, 'skill-favorites.json'));
@@ -128,6 +157,7 @@ const SKILL_ARTIFACT_ROOT = relayOwnedStatePath('SKILL_ARTIFACT_ROOT', process.e
 const SKILL_DEPLOYMENTS_PATH = relayOwnedStatePath('SKILL_DEPLOYMENTS_PATH', process.env.SKILL_DEPLOYMENTS_PATH || path.join(RELAY_STATE_ROOT, 'skill-deployments.json'));
 const SKILL_AUDIT_PATH = relayOwnedStatePath('SKILL_AUDIT_PATH', process.env.SKILL_AUDIT_PATH || path.join(RELAY_STATE_ROOT, 'skill-audit.jsonl'));
 const SSH_KNOWN_HOSTS_PATH = relayOwnedStatePath('SSH_KNOWN_HOSTS_PATH', process.env.SSH_KNOWN_HOSTS_PATH || path.join(RELAY_STATE_ROOT, 'ssh', 'known_hosts'));
+const RUNTIME_STAGE_ROOT = path.join(RELAY_STATE_ROOT, 'runtime-stage');
 const SKILL_GITHUB_API_BASE_URL = process.env.SKILL_GITHUB_API_BASE_URL || 'https://api.github.com';
 const SKILL_GITHUB_TOKEN = process.env.REMOTE_CODEX_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '';
 const RECEIVED_FILES_ROOT = path.join(RELAY_STATE_ROOT, 'received-files');
@@ -145,6 +175,13 @@ const DEFAULT_COLLECTION_ID = 'default';
 const TRASH_COLLECTION_ID = 'trash';
 const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
 const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 192 * 1024 * 1024);
+const MAX_AGENT_EVENT_BODY_BYTES = Math.max(
+  1024 * 1024,
+  Math.min(
+    MAX_JSON_BODY_BYTES,
+    Number(process.env.RELAY_MAX_AGENT_EVENT_BODY_BYTES || 8 * 1024 * 1024) || 8 * 1024 * 1024
+  )
+);
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
 const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.RELAY_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
 const SKILL_ARTIFACT_MAX_UPLOAD_BYTES = Math.max(
@@ -176,8 +213,27 @@ const SKILL_AUTOMATION_TICK_MS = Math.max(
   1000,
   Number(process.env.SKILL_AUTOMATION_TICK_MS || 5 * 60 * 1000) || 5 * 60 * 1000
 );
-const FILE_TRANSFER_CHUNK_BYTES = Number(process.env.RELAY_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
-const CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES = Number(process.env.RELAY_CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES || 16 * 1024 * 1024);
+// Download payloads travel back inside JSON agent events and grow by roughly
+// 4/3 when base64-encoded. Keep both a single chunk and the non-chunked path
+// below the agent-event request limit with room for the event envelope.
+const AGENT_EVENT_BINARY_PAYLOAD_BYTES = Math.max(
+  256 * 1024,
+  Math.floor(Math.max(0, MAX_AGENT_EVENT_BODY_BYTES - 512 * 1024) * 3 / 4)
+);
+const FILE_TRANSFER_CHUNK_BYTES = Math.max(
+  64 * 1024,
+  Math.min(
+    Number(process.env.RELAY_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024) || 4 * 1024 * 1024,
+    AGENT_EVENT_BINARY_PAYLOAD_BYTES
+  )
+);
+const CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES = Math.max(
+  1,
+  Math.min(
+    Number(process.env.RELAY_CHUNKED_FILE_TRANSFER_THRESHOLD_BYTES || 16 * 1024 * 1024) || 16 * 1024 * 1024,
+    AGENT_EVENT_BINARY_PAYLOAD_BYTES
+  )
+);
 const CHUNKED_FILE_CACHE_MAX_BYTES = Number(process.env.RELAY_CHUNKED_FILE_CACHE_MAX_BYTES || MAX_FILE_TRANSFER_BYTES);
 const RECEIVED_FILE_TTL_MS = Number(process.env.RELAY_RECEIVED_FILE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const SESSION_LOG_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_LOG_ENTRY_LIMIT || 1000);
@@ -202,6 +258,26 @@ const SESSION_STOP_FALLBACK_MS = Number(process.env.RELAY_SESSION_STOP_FALLBACK_
 const INPUT_REQUEST_DEDUPE_TTL_MS = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_TTL_MS || 2 * 60 * 1000);
 const INPUT_REQUEST_DEDUPE_LIMIT = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_LIMIT || 500);
 const AGENT_EVENT_BATCH_DEDUPE_LIMIT = Math.max(1, Number(process.env.RELAY_AGENT_EVENT_BATCH_DEDUPE_LIMIT || 10000) || 10000);
+// A read-only Rebind preflight may prove the target provider catalog shortly
+// before the mutating Rebind request. Keep that proof in memory briefly so the
+// final request can re-check the Session expectation without fetching the same
+// provider catalog a second time.
+const REBIND_CATALOG_REUSE_TTL_MS = Math.max(
+  5_000,
+  Number(process.env.RELAY_REBIND_CATALOG_REUSE_TTL_MS || 2 * 60 * 1000) || 2 * 60 * 1000
+);
+const REBIND_CATALOG_REUSE_LIMIT = Math.max(
+  32,
+  Number(process.env.RELAY_REBIND_CATALOG_REUSE_LIMIT || 512) || 512
+);
+const HOST_OFFLINE_AFTER_MS = Math.max(
+  50,
+  Number(process.env.RELAY_HOST_OFFLINE_AFTER_MS || 30_000) || 30_000
+);
+const HOST_AGENT_LEASE_TTL_MS = Math.max(
+  HOST_OFFLINE_AFTER_MS,
+  Number(process.env.RELAY_HOST_AGENT_LEASE_TTL_MS || HOST_OFFLINE_AFTER_MS) || HOST_OFFLINE_AFTER_MS
+);
 const LOCAL_AGENT_WATCHDOG_ENABLED = enabledEnvironmentFlag(
   'RELAY_LOCAL_AGENT_WATCHDOG_ENABLED',
   PORT === PRIMARY_RELAY_PORT
@@ -293,23 +369,38 @@ function truthyEnv(value) {
 }
 
 function normalizeApiConfig(input = {}) {
-  if (!input || typeof input !== 'object') {
-    return null;
+  try {
+    return normalizeRuntimeApiConfig(input);
+  } catch (error) {
+    throw new SessionContractError(
+      error.code || 'session_api_binding_unavailable',
+      error.message || 'The submitted API profile is invalid.',
+      { statusCode: Number(error.statusCode || 422), canRebind: true }
+    );
   }
-  const provider = String(input.provider || '').trim().slice(0, 80);
-  const baseUrl = String(input.baseUrl || '').trim().slice(0, 500);
-  const apiKey = String(input.apiKey || '').trim();
-  const profileId = String(input.profileId || '').trim().slice(0, 120);
-  const label = String(input.label || '').trim().slice(0, 120);
-  if (!baseUrl && !apiKey) {
-    return null;
+}
+
+function modelCatalogProviderKind(apiConfig, binding) {
+  if (apiConfig) {
+    return providerCapabilities.inferProviderKind(apiConfig);
   }
+  if (binding?.providerKind) {
+    return providerCapabilities.inferProviderKind({ providerKind: binding.providerKind });
+  }
+  const providerHint = String(binding?.modelProviderHint || '').trim();
+  return providerCapabilities.inferProviderKind(providerHint || binding?.provider || '');
+}
+
+function modelCatalogInputPolicy(apiConfig, binding) {
+  const providerKind = modelCatalogProviderKind(apiConfig, binding);
+  const resolvedBinding = apiConfig ? makeProfileBinding(apiConfig) : publicBinding(binding);
+  const normalizedBaseUrl = String(resolvedBinding?.normalizedBaseUrl || '').trim();
+  const nonOfficialCompatibleEndpoint = resolvedBinding?.kind === 'profile'
+    && Boolean(normalizedBaseUrl)
+    && (providerKind !== 'openai' || normalizedBaseUrl !== OFFICIAL_OPENAI_BASE_URL);
   return {
-    provider: provider || 'OpenAI',
-    baseUrl,
-    apiKey,
-    profileId,
-    label,
+    providerKind,
+    allowProviderModelsWithoutLive: providerKind === 'custom' || nonOfficialCompatibleEndpoint,
   };
 }
 
@@ -325,6 +416,30 @@ function summarizeApiConfig(apiConfig) {
     provider: config.provider || null,
     baseUrl: binding.normalizedBaseUrl || null,
   };
+}
+
+function rebindCatalogApiConfigFingerprint(apiConfig) {
+  const config = normalizeApiConfig(apiConfig);
+  if (!config) {
+    return null;
+  }
+  // Do not expose or persist credentials. The digest still distinguishes a
+  // rotated API key, which must not reuse a catalog fetched with the old key.
+  return crypto.createHash('sha256').update(JSON.stringify({
+    provider: config.provider || null,
+    providerKind: config.providerKind || null,
+    profileId: config.profileId || null,
+    baseUrl: config.baseUrl || null,
+    apiKey: config.apiKey || null,
+  })).digest('hex');
+}
+
+function rebindCatalogSelectionFingerprint(selection = {}, allowUnverifiedEffort = false) {
+  return JSON.stringify({
+    model: String(selection?.model || '').trim() || null,
+    effort: String(selection?.effort || '').trim().toLowerCase() || null,
+    allowUnverifiedEffort: allowUnverifiedEffort === true,
+  });
 }
 
 function loadRelayAuthToken() {
@@ -1645,6 +1760,74 @@ function saveSessionLogs() {
   }, null, 2), 'utf8');
 }
 
+function loadDismissedHosts() {
+  try {
+    let raw;
+    try {
+      raw = fs.readFileSync(DISMISSED_HOSTS_PATH, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const recovered = recoverMissingFileFromBackup(DISMISSED_HOSTS_PATH);
+      if (!recovered.recovered) {
+        return new Set();
+      }
+      raw = fs.readFileSync(DISMISSED_HOSTS_PATH, 'utf8');
+    }
+    const parsed = JSON.parse(raw);
+    if (Number(parsed?.version) !== 1 || !Array.isArray(parsed.hosts)) {
+      throw new Error('invalid dismissed Host state schema');
+    }
+    const hosts = parsed.hosts.map((value) => String(value || '').trim());
+    if (hosts.some((hostId) => !hostId || hostId.length > 160)) {
+      throw new Error('invalid dismissed Host id');
+    }
+    return new Set(hosts);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return new Set();
+    }
+    throw new Error(`failed to load dismissed Host state: ${error.message || error}`);
+  }
+}
+
+function saveDismissedHosts() {
+  fs.mkdirSync(path.dirname(DISMISSED_HOSTS_PATH), { recursive: true });
+  const tempPath = `${DISMISSED_HOSTS_PATH}.${process.pid}.${makeId()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify({
+      version: 1,
+      savedAt: nowIso(),
+      hosts: Array.from(state.dismissedHosts).sort(),
+    }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    replaceFileWithBackup(tempPath, DISMISSED_HOSTS_PATH);
+  } finally {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+function restoreDismissedHost(hostId) {
+  const normalized = String(hostId || '').trim();
+  if (!normalized || !state.dismissedHosts.delete(normalized)) {
+    return false;
+  }
+  try {
+    saveDismissedHosts();
+  } catch (error) {
+    state.dismissedHosts.add(normalized);
+    throw error;
+  }
+  return true;
+}
+
+function boundedDiagnosticIdentity(value) {
+  const text = String(value == null ? '' : value).trim();
+  return text ? redactSecretText(text).slice(0, 512) : null;
+}
+
 function normalizeStoredSessionDiagnostic(entry) {
   if (!entry || typeof entry !== 'object') {
     return null;
@@ -1659,6 +1842,11 @@ function normalizeStoredSessionDiagnostic(entry) {
     : typeof entry.detail === 'string'
       ? redactSecretText(entry.detail)
       : stripSecrets(entry.detail);
+  const runId = boundedDiagnosticIdentity(entry.runId || data?.runId);
+  const turnId = boundedDiagnosticIdentity(entry.turnId || data?.turnId);
+  const itemId = boundedDiagnosticIdentity(entry.itemId || data?.itemId || data?.item_id);
+  const callId = boundedDiagnosticIdentity(entry.callId || data?.callId || data?.call_id);
+  const requestId = boundedDiagnosticIdentity(entry.requestId || data?.requestId || data?.request_id);
   return {
     timestamp: entry.timestamp || nowIso(),
     severity: entry.severity || 'info',
@@ -1668,7 +1856,13 @@ function normalizeStoredSessionDiagnostic(entry) {
     message,
     detail,
     data,
-    turnId: entry.turnId || data?.turnId || null,
+    runId,
+    turnId,
+    itemId,
+    callId,
+    requestId,
+    status: boundedDiagnosticIdentity(entry.status || data?.status),
+    final: entry.final === true,
   };
 }
 
@@ -1727,6 +1921,8 @@ async function saveSessionDiagnostics() {
 }
 
 let sessionLogsSaveTimer = null;
+let sessionLogsSavePending = false;
+let sessionLogsSaveError = null;
 let sessionDiagnosticsSaveTimer = null;
 let sessionDiagnosticsSaveInFlight = null;
 let sessionDiagnosticsSavePending = false;
@@ -1734,6 +1930,7 @@ let sessionDiagnosticsSaveError = null;
 let sessionDiagnosticsNeedsNormalization = false;
 
 function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
+  sessionLogsSavePending = true;
   if (sessionLogsSaveTimer) {
     return;
   }
@@ -1741,12 +1938,34 @@ function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
     sessionLogsSaveTimer = null;
     try {
       saveSessionLogs();
+      sessionLogsSavePending = false;
+      sessionLogsSaveError = null;
     } catch (error) {
+      sessionLogsSaveError = error;
       console.warn(`[relay] failed to save session logs: ${error.message}`);
     }
   }, Math.max(0, Number(delayMs) || 0));
   if (typeof sessionLogsSaveTimer.unref === 'function') {
     sessionLogsSaveTimer.unref();
+  }
+}
+
+function flushSessionLogsSave() {
+  if (!sessionLogsSavePending) {
+    return null;
+  }
+  if (sessionLogsSaveTimer) {
+    clearTimeout(sessionLogsSaveTimer);
+    sessionLogsSaveTimer = null;
+  }
+  try {
+    saveSessionLogs();
+    sessionLogsSavePending = false;
+    sessionLogsSaveError = null;
+    return null;
+  } catch (error) {
+    sessionLogsSaveError = error;
+    throw error;
   }
 }
 
@@ -1765,33 +1984,67 @@ function scheduleSessionDiagnosticsSave(delayMs = PERSIST_DEBOUNCE_MS) {
 }
 
 async function flushSessionDiagnosticsSave() {
-  if (sessionDiagnosticsSaveInFlight) {
-    return sessionDiagnosticsSaveInFlight;
-  }
-  if (!sessionDiagnosticsSavePending) {
-    return null;
-  }
-  sessionDiagnosticsSavePending = false;
-  sessionDiagnosticsSaveInFlight = saveSessionDiagnostics()
-    .then(() => {
-      sessionDiagnosticsSaveError = null;
-      sessionDiagnosticsNeedsNormalization = false;
-    })
-    .catch((error) => {
-      sessionDiagnosticsSaveError = error;
-      console.warn(`[relay] failed to save session diagnostics: ${error.message}`);
-    })
-    .finally(() => {
-      sessionDiagnosticsSaveInFlight = null;
-      if (sessionDiagnosticsSavePending) {
-        void flushSessionDiagnosticsSave();
+  // A save may already be writing an older snapshot while a new event marks
+  // the state dirty. Drain both the in-flight write and any pending follow-up
+  // before the caller records an event-batch checkpoint.
+  while (sessionDiagnosticsSaveInFlight || sessionDiagnosticsSavePending) {
+    if (sessionDiagnosticsSaveInFlight) {
+      const inFlight = sessionDiagnosticsSaveInFlight;
+      await inFlight;
+      continue;
+    }
+    if (sessionDiagnosticsSaveTimer) {
+      clearTimeout(sessionDiagnosticsSaveTimer);
+      sessionDiagnosticsSaveTimer = null;
+    }
+    sessionDiagnosticsSavePending = false;
+    let saveFailed = false;
+    const savePromise = Promise.resolve()
+      .then(() => saveSessionDiagnostics())
+      .then(() => {
+        sessionDiagnosticsSaveError = null;
+        sessionDiagnosticsNeedsNormalization = false;
+      })
+      .catch((error) => {
+        sessionDiagnosticsSaveError = error;
+        sessionDiagnosticsSavePending = true;
+        saveFailed = true;
+        console.warn(`[relay] failed to save session diagnostics: ${error.message}`);
+      });
+    sessionDiagnosticsSaveInFlight = savePromise;
+    try {
+      await savePromise;
+    } finally {
+      if (sessionDiagnosticsSaveInFlight === savePromise) {
+        sessionDiagnosticsSaveInFlight = null;
       }
-    });
-  return sessionDiagnosticsSaveInFlight;
+    }
+    if (saveFailed) {
+      // Preserve the dirty bit for the next explicit flush without spinning on
+      // a persistent filesystem failure in this call.
+      return null;
+    }
+  }
+  return null;
 }
+
+async function flushAgentEventBatchPersistence() {
+  flushSessionLogsSave();
+  await flushSessionDiagnosticsSave();
+  if (sessionDiagnosticsSaveError) {
+    throw sessionDiagnosticsSaveError;
+  }
+}
+
+const agentEventLedger = new AgentEventLedger({
+  filePath: AGENT_EVENT_LEDGER_PATH,
+  limit: AGENT_EVENT_BATCH_DEDUPE_LIMIT,
+  autoLoad: false,
+});
 
 const state = {
   hosts: new Map(),
+  hostAgentLeases: new HostAgentLeaseRegistry({ ttlMs: HOST_AGENT_LEASE_TTL_MS }),
   sessions: new Map(),
   sessionAliases: new Map(),
   commandQueues: new Map(),
@@ -1816,6 +2069,10 @@ const state = {
   pendingSkillRequests: new Map(),
   pendingHostSkillRequests: new Map(),
   pendingGoalRequests: new Map(),
+  rebindCatalogReuse: new RebindCatalogReuseStore({
+    ttlMs: REBIND_CATALOG_REUSE_TTL_MS,
+    maxEntries: REBIND_CATALOG_REUSE_LIMIT,
+  }),
   goalAutoApproveRequests: new Map(),
   pendingSessionDetailRequests: new Map(),
   pendingSessionSearchRequests: new Map(),
@@ -1824,11 +2081,14 @@ const state = {
   sessionDiscoveryRequests: new Map(),
   missingManagedDiscoveryRuns: new Map(),
   inputRequestCache: new Map(),
-  appliedAgentEventBatches: new Map(),
+  agentEventLedger,
+  appliedAgentEventBatches: agentEventLedger.applied,
+  partialAgentEventBatches: agentEventLedger.partial,
   pendingAgentEventBatches: new Map(),
   pendingUserTranscriptEchoes: new Map(),
   localAgents: new Map(),
   askpassActions: new Map(),
+  connectorActionsInFlight: new Map(),
   connectors: new Map(),
   connectorSecrets: new Map(),
   sessionCollections: new Map(),
@@ -1854,7 +2114,17 @@ const state = {
   nextCommandId: Date.now(),
 };
 
+function issueRebindCatalogReuseToken(input = {}) {
+  return state.rebindCatalogReuse.issue(input);
+}
+
+function consumeRebindCatalogReuseToken(tokenValue, input = {}) {
+  return state.rebindCatalogReuse.consume(tokenValue, input);
+}
+
 function loadPersistedRelayState() {
+  state.agentEventLedger.load();
+  state.dismissedHosts = loadDismissedHosts();
   state.sessionLogs = loadSessionLogs();
   state.sessionDiagnostics = loadSessionDiagnostics();
   state.connectorSecrets = loadConnectorSecrets(CONNECTOR_SECRETS_PATH);
@@ -1973,20 +2243,27 @@ function isClientAbortError(error) {
   );
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalBytes = 0;
     let rejected = false;
+    const declaredBytes = Number(req.headers?.['content-length'] || 0);
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+      rejected = true;
+      reject(new Error(`request body too large; limit is ${maxBytes} bytes`));
+      req.destroy();
+      return;
+    }
     req.on('data', (chunk) => {
       if (rejected) {
         return;
       }
       chunks.push(chunk);
       totalBytes += chunk.length;
-      if (totalBytes > MAX_JSON_BODY_BYTES) {
+      if (totalBytes > maxBytes) {
         rejected = true;
-        reject(new Error(`request body too large; limit is ${MAX_JSON_BODY_BYTES} bytes`));
+        reject(new Error(`request body too large; limit is ${maxBytes} bytes`));
         req.destroy();
       }
     });
@@ -2163,7 +2440,7 @@ function hostOnline(host) {
     return false;
   }
   const lastSeen = host.lastSeenAt ? Date.parse(host.lastSeenAt) : 0;
-  return Date.now() - lastSeen < 30_000;
+  return Date.now() - lastSeen < HOST_OFFLINE_AFTER_MS;
 }
 
 function hostHeartbeatAgeMs(host) {
@@ -2217,6 +2494,58 @@ function getHostUnavailableError(hostId) {
 function normalizeClientRequestId(value) {
   const text = String(value || '').trim().slice(0, 160);
   return /^[A-Za-z0-9._:-]+$/.test(text) ? text : '';
+}
+
+function deterministicLaunchUuid(hostId, clientRequestId, purpose) {
+  const digest = crypto.createHash('sha256')
+    .update(`remote-codex-launch\0${String(purpose || '')}\0${hostId}\0${clientRequestId}`)
+    .digest();
+  const bytes = Buffer.from(digest.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function normalizedLaunchCwd(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/$/, '');
+}
+
+function managedLaunchRequestFingerprint(input = {}) {
+  const body = input.body || {};
+  const requestedSelection = input.requestedSelection || {};
+  const apiConfig = input.apiConfig || null;
+  return crypto.createHash('sha256').update(JSON.stringify({
+    hostId: String(input.hostId || '').trim(),
+    targetSessionId: String(input.targetSessionId || '').trim(),
+    sourceSessionId: String(input.sourceSessionId || '').trim() || null,
+    launchMode: String(input.launchMode || '').trim(),
+    cwd: normalizedLaunchCwd(input.cwd),
+    conversationKey: String(input.conversationKey || '').trim(),
+    originSessionId: String(input.originSessionId || '').trim() || null,
+    nativeThreadId: String(input.nativeThreadId || '').trim() || null,
+    bindingFingerprint: String(input.bindingFingerprint || '').trim() || null,
+    apiConfigFingerprint: rebindCatalogApiConfigFingerprint(apiConfig),
+    apiProfile: apiConfig ? {
+      profileId: String(apiConfig.profileId || '').trim() || null,
+      providerKind: String(apiConfig.providerKind || '').trim().toLowerCase() || null,
+      provider: String(apiConfig.provider || '').trim().toLowerCase() || null,
+      baseUrl: String(apiConfig.baseUrl || '').trim().replace(/\/+$/, '') || null,
+    } : null,
+    model: String(requestedSelection.model || '').trim() || null,
+    effort: String(requestedSelection.effort || '').trim() || null,
+    selectionSource: String(requestedSelection.source || '').trim() || null,
+    allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+    refreshModels: body.refreshModels === true,
+    summary: String(body.summary || '').trim() || null,
+    label: String(body.label || '').trim(),
+    command: body.command == null ? null : body.command,
+    args: Array.isArray(body.args) ? body.args : [],
+  })).digest('hex');
 }
 
 function inputRequestCacheKey(hostId, sessionId, clientRequestId, runId = '') {
@@ -3280,7 +3609,7 @@ function queueSkillInventoryRefreshes(requestedHostIds) {
 }
 
 function writeSkillsEvent(res, eventName, payload) {
-  res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+  return writeSseEvent(res, eventName, payload);
 }
 
 function broadcastSkillsEvent(eventName, payload) {
@@ -3290,7 +3619,9 @@ function broadcastSkillsEvent(eventName, payload) {
       continue;
     }
     try {
-      writeSkillsEvent(res, eventName, payload);
+      if (!writeSkillsEvent(res, eventName, payload)) {
+        state.skillSubscribers.delete(res);
+      }
     } catch (_) {
       state.skillSubscribers.delete(res);
     }
@@ -4367,6 +4698,14 @@ function requestHostSessionDiscovery(hostId) {
   return true;
 }
 
+function normalizeSessionWatchRevision(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
 function enqueueSessionWatch(hostId, sessionId, body = {}) {
   const session = getSession(hostId, sessionId) || {};
   return enqueueCommand(hostId, {
@@ -4375,6 +4714,7 @@ function enqueueSessionWatch(hostId, sessionId, body = {}) {
     requestId: body.requestId || makeId(),
     clientId: body.clientId || null,
     viewId: body.viewId || null,
+    watchRevision: normalizeSessionWatchRevision(body.watchRevision),
     nativeThreadId: body.nativeThreadId || session.nativeThreadId || null,
     bridgeSessionId: body.bridgeSessionId || session.bridgeSessionId || null,
     originSessionId: body.originSessionId || session.originSessionId || null,
@@ -4391,6 +4731,7 @@ function enqueueSessionUnwatch(hostId, sessionId, body = {}) {
     requestId: body.requestId || makeId(),
     clientId: body.clientId || null,
     viewId: body.viewId || null,
+    watchRevision: normalizeSessionWatchRevision(body.watchRevision),
     nativeThreadId: body.nativeThreadId || session.nativeThreadId || null,
     bridgeSessionId: body.bridgeSessionId || session.bridgeSessionId || null,
     originSessionId: body.originSessionId || session.originSessionId || null,
@@ -4844,7 +5185,22 @@ function agentPollOwnershipAttestation(req) {
   };
 }
 
-function authorizeAgentCommandPoll(hostId, req) {
+function agentLeaseCredentials(req, body = null) {
+  return {
+    agentInstanceId: String(
+      body?.agentInstanceId
+      || req.headers['x-remote-codex-agent-instance']
+      || ''
+    ).trim(),
+    leaseId: String(
+      body?.agentLeaseId
+      || req.headers['x-remote-codex-agent-lease']
+      || ''
+    ).trim(),
+  };
+}
+
+function authorizeLocalAgentOwnership(hostId, req) {
   const existing = state.localAgents.get(hostId);
   const marker = inspectUnclaimedLocalAgentOwnershipMarker(hostId);
   const hasLiveRecord = localAgentProcessIsAlive(existing);
@@ -4857,7 +5213,7 @@ function authorizeAgentCommandPoll(hostId, req) {
         code: 'local_agent_ownership_mismatch',
         message: `Relay-managed Agent ownership is no longer active for ${hostId}.`,
       }
-      : { ok: true };
+      : { ok: true, managedAttestation: false };
   }
   if (!attestation) {
     return {
@@ -4877,12 +5233,35 @@ function authorizeAgentCommandPoll(hostId, req) {
     && String(expectedMarker.instanceId || '') === attestation.instanceId
     && constantTimeEqual(attestation.ownershipToken, expectedMarker.ownershipToken);
   return matches
-    ? { ok: true }
+    ? { ok: true, managedAttestation: true }
     : {
       ok: false,
       code: 'local_agent_ownership_mismatch',
       message: `Relay-managed Agent ownership attestation did not match ${hostId}.`,
     };
+}
+
+function authorizeAgentCommandPoll(hostId, req, options = {}) {
+  const localAuthorization = authorizeLocalAgentOwnership(hostId, req);
+  if (!localAuthorization.ok) {
+    return localAuthorization;
+  }
+  const credentials = agentLeaseCredentials(req);
+  const currentLease = state.hostAgentLeases.current(hostId);
+  if (
+    localAuthorization.managedAttestation
+    && !credentials.leaseId
+    && (!currentLease || currentLease.agentInstanceId === credentials.agentInstanceId)
+  ) {
+    // Compatibility for Relay-managed Agents from before host-wide leases.
+    return { ok: true, legacy: true, release: () => {} };
+  }
+  return state.hostAgentLeases.authorize(
+    hostId,
+    credentials.agentInstanceId,
+    credentials.leaseId,
+    options
+  );
 }
 
 function validateAgentEventBatchScope(events) {
@@ -4913,7 +5292,7 @@ function validateAgentEventBatchScope(events) {
 }
 
 function authorizeAgentEventBatch(hostId, req) {
-  return authorizeAgentCommandPoll(hostId, req);
+  return authorizeAgentCommandPoll(hostId, req, { hold: true });
 }
 
 function getLocalRelayUrl() {
@@ -5031,6 +5410,7 @@ function completeLocalAgentExit(record, code, signal) {
     const restartReason = record.restartReason || 'manual restart';
     const shouldRestart = shouldAutoRestartLocalAgent(record)
       && !['stopping', 'restarting'].includes(record.status);
+    state.hostAgentLeases.deleteIfOwned(record.hostId, record.instanceId);
     markLocalAgentExited(record.hostId, code, signal);
     if (forceKillError) {
       record.status = 'error';
@@ -5354,7 +5734,7 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
   };
   host.label = record.label || host.label;
   host.platform = host.platform || process.platform;
-  state.dismissedHosts.delete(normalizedHostId);
+  restoreDismissedHost(normalizedHostId);
   state.hosts.set(normalizedHostId, host);
 
   return {
@@ -5467,7 +5847,8 @@ function mergeCanonicalRealtimeKeys(loserKey, winnerKey) {
   state.activitySnapshots.mergeCanonicalKey(
     state.sessionEventStream.epoch,
     loserKey,
-    winnerKey
+    winnerKey,
+    { includeSnapshot: false }
   );
   state.sessionEventStream.mergeCanonicalKey(loserKey, winnerKey);
 }
@@ -5832,7 +6213,7 @@ function compactSessionDiagnostics(entries, options = {}) {
       continue;
     }
     const message = canonicalTranscriptText(entry.message);
-    const key = `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${message}|${entry.turnId || ''}`;
+    const key = `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${message}|${diagnosticIdentitySignature(entry)}`;
     if (seen.has(key)) {
       continue;
     }
@@ -5845,6 +6226,8 @@ function compactSessionDiagnostics(entries, options = {}) {
       previous
       && near
       && String(previous.kind || '') === String(entry.kind || '')
+      && String(previous.method || '') === String(entry.method || '')
+      && diagnosticIdentitySignature(previous) === diagnosticIdentitySignature(entry)
       && canonicalTranscriptText(previous.message) === message
     ) {
       continue;
@@ -5858,8 +6241,18 @@ function compactSessionDiagnostics(entries, options = {}) {
 
 const sessionDiagnosticKeyIndexes = new WeakMap();
 
+function diagnosticIdentitySignature(entry) {
+  return [
+    entry?.runId || entry?.data?.runId || '',
+    entry?.turnId || entry?.data?.turnId || '',
+    entry?.itemId || entry?.data?.itemId || entry?.data?.item_id || '',
+    entry?.callId || entry?.data?.callId || entry?.data?.call_id || '',
+    entry?.requestId || entry?.data?.requestId || entry?.data?.request_id || '',
+  ].join('|');
+}
+
 function sessionDiagnosticCompactionKey(entry) {
-  return `${entry?.timestamp || ''}|${entry?.kind || ''}|${entry?.method || ''}|${canonicalTranscriptText(entry?.message || '')}|${entry?.turnId || ''}`;
+  return `${entry?.timestamp || ''}|${entry?.kind || ''}|${entry?.method || ''}|${canonicalTranscriptText(entry?.message || '')}|${diagnosticIdentitySignature(entry)}`;
 }
 
 function getSessionDiagnosticKeyIndex(entries) {
@@ -5885,6 +6278,8 @@ function diagnosticsAreNearDuplicates(previous, entry) {
     && Number.isFinite(entryTime)
     && Math.abs(entryTime - previousTime) <= 2000
     && String(previous.kind || '') === String(entry.kind || '')
+    && String(previous.method || '') === String(entry.method || '')
+    && diagnosticIdentitySignature(previous) === diagnosticIdentitySignature(entry)
     && canonicalTranscriptText(previous.message) === canonicalTranscriptText(entry.message);
 }
 
@@ -7134,7 +7529,7 @@ function transcriptFingerprint(entry) {
 }
 
 function diagnosticFingerprint(entry) {
-  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.turnId || ''}`;
+  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${diagnosticIdentitySignature(entry)}`;
 }
 
 function setSessionLog(hostId, sessionId, entries, options = {}) {
@@ -7214,7 +7609,13 @@ function appendSessionDiagnostic(hostId, sessionId, entry) {
     message: entry.message || '',
     detail: entry.detail || null,
     data: entry.data || null,
+    runId: entry.runId || entry.data?.runId || null,
     turnId: entry.turnId || entry.data?.turnId || null,
+    itemId: entry.itemId || entry.data?.itemId || null,
+    callId: entry.callId || entry.data?.callId || null,
+    requestId: entry.requestId || entry.data?.requestId || null,
+    status: entry.status || entry.data?.status || null,
+    final: entry.final === true,
   });
   if (!nextEntry) {
     return null;
@@ -7466,6 +7867,8 @@ function appendSessionAlert(hostId, sessionId, entry) {
     severity: entry.severity || 'warning',
     source: entry.source || 'runtime',
     message: entry.message || '',
+    transient: entry.transient === true,
+    turnId: entry.turnId || null,
   };
   existing.push(nextEntry);
   state.sessionAlerts.set(
@@ -7806,7 +8209,8 @@ function migrateSessionIdentity(hostId, fromSessionId, toSessionId, patch = {}) 
     });
   }
 
-  const fromKey = sessionKey(hostId, fromSessionId);
+  const effectiveFromSessionId = resolveSessionId(hostId, fromSessionId);
+  const fromKey = resolveSessionKey(hostId, fromSessionId);
   const toKey = sessionKey(hostId, toSessionId);
   const fromSession = state.sessions.get(fromKey) || null;
   const toSession = state.sessions.get(toKey) || null;
@@ -7824,7 +8228,13 @@ function migrateSessionIdentity(hostId, fromSessionId, toSessionId, patch = {}) 
   state.sessions.set(toKey, next);
   state.sessions.delete(fromKey);
   rememberSessionAlias(hostId, fromSessionId, toSessionId);
-  moveSessionArtifacts(hostId, fromSessionId, toSessionId);
+  if (effectiveFromSessionId !== fromSessionId) {
+    rememberSessionAlias(hostId, effectiveFromSessionId, toSessionId);
+  }
+  moveSessionArtifacts(hostId, effectiveFromSessionId, toSessionId);
+  if (effectiveFromSessionId !== fromSessionId) {
+    moveSessionArtifacts(hostId, fromSessionId, toSessionId);
+  }
   const identities = getSessionTitleIdentities(fromSession || toSession, {
     ...patch,
     sessionId: toSessionId,
@@ -7844,7 +8254,10 @@ function migrateSessionIdentity(hostId, fromSessionId, toSessionId, patch = {}) 
     cwd: patch.cwd || fromSession?.cwd || toSession?.cwd || '',
     source: patch.source || fromSession?.source || toSession?.source || 'migration',
   });
-  migrateSessionCollectionItems(hostId, fromSessionId, toSessionId, patch);
+  migrateSessionCollectionItems(hostId, effectiveFromSessionId, toSessionId, patch);
+  if (effectiveFromSessionId !== fromSessionId) {
+    migrateSessionCollectionItems(hostId, fromSessionId, toSessionId, patch);
+  }
   return next;
 }
 
@@ -8876,7 +9289,6 @@ function ensureAskpassHelper() {
     '  }',
     '  exit 1',
     '}',
-    'Try-BrokerPrompt | Out-Null',
     '$index = 1',
     'if ($env:RC_ASKPASS_STATE_FILE -and (Test-Path -LiteralPath $env:RC_ASKPASS_STATE_FILE)) { try { $index = [int](Get-Content -LiteralPath $env:RC_ASKPASS_STATE_FILE -TotalCount 1) } catch { $index = 1 } }',
     'if ($index -lt 1) { $index = 1 }',
@@ -8891,8 +9303,9 @@ function ensureAskpassHelper() {
     '  $b64 = $env:RC_ASKPASS_PASSWORD_PROMPT_B64',
     '}',
     '$answer = Decode-B64 $b64',
-    'if ([string]::IsNullOrWhiteSpace($answer)) { exit 1 }',
-    '[Console]::Out.Write($answer)',
+    'if (-not [string]::IsNullOrWhiteSpace($answer)) { [Console]::Out.Write($answer); exit 0 }',
+    'Try-BrokerPrompt | Out-Null',
+    'exit 1',
   ].join('\r\n');
   const script = [
     '@echo off',
@@ -8976,9 +9389,16 @@ function remoteScpChildPath(base, child) {
 }
 
 function makeRemoteDeploymentDirectory(connector) {
-  const base = connector.bootstrap?.remoteDirectory || '~/mobile-codex-remote';
+  const base = normalizeConnectorRemoteDirectory(connector.bootstrap?.remoteDirectory);
   const id = `deploy-${Date.now()}-${makeId().slice(0, 8)}`.replace(/[^a-zA-Z0-9_.-]+/g, '-');
   return remoteScpChildPath(base, `.deployments/${id}`);
+}
+
+function connectorWithDeploymentBaseDirectory(connector) {
+  return withConnectorRemoteDirectory(
+    connector,
+    normalizeConnectorRemoteDirectory(connector.bootstrap?.remoteDirectory)
+  );
 }
 
 function withConnectorRemoteDirectory(connector, remoteDirectory) {
@@ -9246,10 +9666,15 @@ async function runSshTarExtract(connector, secret, localSources, remoteDirectory
   };
 }
 
-function getLocalNodeRuntimeArchive() {
-  const archiveName = 'node-v16.20.2-linux-x64.tar.xz';
+function getLocalNodeRuntimeArchive(architecture = 'x64') {
+  const runtime = linuxRuntimeNames(architecture);
+  if (!runtime) return null;
+  const archiveName = runtime.nodeArchiveName;
+  const override = runtime.architecture === 'arm64'
+    ? process.env.CODEX_NODE_ARM64_RUNTIME_ARCHIVE
+    : process.env.CODEX_NODE_RUNTIME_ARCHIVE;
   const candidates = [
-    process.env.CODEX_NODE_RUNTIME_ARCHIVE,
+    override,
     path.join(process.cwd(), 'runtimes', 'node', archiveName),
     path.join(RELAY_STATE_ROOT, archiveName),
     path.join(LEGACY_RUNTIME_CACHE_ROOT, archiveName),
@@ -9285,23 +9710,29 @@ function copyDirectoryRecursive(sourceDir, targetDir) {
   }
 }
 
-function getLocalCodexLinuxSourceDir() {
-  const override = String(process.env.CODEX_LINUX_RUNTIME_DIR || '').trim();
+function getLocalCodexLinuxSourceDir(architecture = 'x64') {
+  const runtime = linuxRuntimeNames(architecture);
+  if (!runtime) return null;
+  const override = String(
+    runtime.architecture === 'arm64'
+      ? process.env.CODEX_LINUX_ARM64_RUNTIME_DIR || ''
+      : process.env.CODEX_LINUX_RUNTIME_DIR || ''
+  ).trim();
   if (override && fs.existsSync(path.join(override, 'codex'))) {
     return path.resolve(override);
   }
 
-  const bundledRuntime = path.join(process.cwd(), 'runtimes', 'codex', 'linux-x86_64');
+  const bundledRuntime = path.join(process.cwd(), 'runtimes', 'codex', runtime.bundledCodexDirectory);
   if (fs.existsSync(path.join(bundledRuntime, 'codex'))) {
     return bundledRuntime;
   }
 
-  const legacyStagedRuntime = path.join(RELAY_STATE_ROOT, 'codex-linux-x86_64');
+  const legacyStagedRuntime = path.join(RELAY_STATE_ROOT, runtime.codexDirectoryName);
   if (fs.existsSync(path.join(legacyStagedRuntime, 'codex'))) {
     return legacyStagedRuntime;
   }
 
-  const legacyWorkspaceRuntime = path.join(LEGACY_RUNTIME_CACHE_ROOT, 'codex-linux-x86_64');
+  const legacyWorkspaceRuntime = path.join(LEGACY_RUNTIME_CACHE_ROOT, runtime.codexDirectoryName);
   if (fs.existsSync(path.join(legacyWorkspaceRuntime, 'codex'))) {
     return legacyWorkspaceRuntime;
   }
@@ -9318,7 +9749,7 @@ function getLocalCodexLinuxSourceDir() {
     .reverse();
 
   for (const entry of extensionDirs) {
-    const binDir = path.join(cursorExtensions, entry, 'bin', 'linux-x86_64');
+    const binDir = path.join(cursorExtensions, entry, 'bin', runtime.cursorPlatformDirectory);
     if (fs.existsSync(path.join(binDir, 'codex'))) {
       return binDir;
     }
@@ -9327,16 +9758,17 @@ function getLocalCodexLinuxSourceDir() {
   return null;
 }
 
-function stageLocalCodexLinuxRuntime() {
-  const sourceDir = getLocalCodexLinuxSourceDir();
+function stageLocalCodexLinuxRuntime(architecture = 'x64') {
+  const runtime = linuxRuntimeNames(architecture);
+  if (!runtime) return null;
+  const sourceDir = getLocalCodexLinuxSourceDir(runtime.architecture);
   if (!sourceDir) {
     return null;
   }
 
   const sourceCodex = path.join(sourceDir, 'codex');
   const codexStat = fs.statSync(sourceCodex);
-  const tmpRoot = RELAY_STATE_ROOT;
-  const stageDir = path.join(tmpRoot, 'codex-linux-x86_64');
+  const stageDir = path.join(RUNTIME_STAGE_ROOT, runtime.codexDirectoryName);
   const markerPath = path.join(stageDir, '.source.json');
   const marker = {
     sourceDir,
@@ -9383,6 +9815,7 @@ function stageLocalCodexLinuxRuntime() {
     sourceDir,
     stageDir,
     localSources,
+    remoteRelativeDir: localScpPath(path.relative(process.cwd(), stageDir)),
   };
 }
 
@@ -9408,6 +9841,53 @@ function buildSshActionOptions(connector, action, secret) {
 
 function authAwareTimeout(baseMs, secret) {
   return secret?.interactiveAskpass ? Math.max(baseMs, 180_000) : baseMs;
+}
+
+function buildRemoteBootstrapProbeCommand() {
+  return [
+    'remote_arch="$(uname -m 2>/dev/null || true)"',
+    'printf "CODEX_REMOTE_ARCH=%s\\n" "$remote_arch"',
+    'if command -v node >/dev/null 2>&1 || command -v nodejs >/dev/null 2>&1; then echo CODEX_REMOTE_NODE_PRESENT; else echo CODEX_REMOTE_NODE_MISSING; fi',
+  ].join('; ');
+}
+
+async function probeConnectorBootstrapRuntime(connector, secret) {
+  const commandParts = buildConnectorSshActionCommand(
+    connector,
+    buildRemoteBootstrapProbeCommand(),
+    secret,
+    'bootstrap'
+  );
+  if (!commandParts) {
+    return {
+      ok: false,
+      status: 'remote_probe_not_ready',
+      message: 'Connector does not have enough SSH information to probe the remote architecture.',
+      step: null,
+    };
+  }
+  const run = await runProcess(commandParts.command, commandParts.args, {
+    timeoutMs: authAwareTimeout(30_000, secret),
+    env: connectorUsesAskpass(connector, secret) ? buildAskpassEnv(connector, secret) : null,
+  });
+  const match = String(run.stdout || '').match(/CODEX_REMOTE_ARCH=([^\s]+)/);
+  const architecture = normalizeLinuxArchitecture(match?.[1]);
+  if (run.exitCode !== 0 || !architecture) {
+    return {
+      ok: false,
+      status: run.exitCode === 0 ? 'remote_architecture_unsupported' : 'remote_probe_failed',
+      message: run.exitCode === 0
+        ? `Unsupported remote Linux architecture: ${match?.[1] || 'unknown'}.`
+        : 'Unable to probe the remote Linux architecture before bootstrap.',
+      step: { name: 'remote_runtime_probe', ...run },
+    };
+  }
+  return {
+    ok: true,
+    architecture,
+    nodeAvailable: String(run.stdout || '').includes('CODEX_REMOTE_NODE_PRESENT'),
+    step: { name: 'remote_runtime_probe', ...run },
+  };
 }
 
 function buildRemotePrepareCommand(connector) {
@@ -9517,16 +9997,17 @@ function shellSingleQuote(value) {
   return `'${String(value || '').replace(/'/g, "'\\''")}'`;
 }
 
-function buildRemoteCodexResolutionScript(connector, codexRuntimeIncluded) {
+function buildRemoteCodexResolutionScript(connector, codexRuntimeIncluded, codexRuntimeRelativeDir = '') {
   const lines = [
     buildCodexBinResolutionCommand(connector),
   ];
 
-  if (codexRuntimeIncluded) {
+  const runtimeDir = String(codexRuntimeRelativeDir || '').replace(/[^A-Za-z0-9._/-]/g, '');
+  if (codexRuntimeIncluded && runtimeDir) {
     lines.push(
-      'if [ -z "$CODEX_BIN" ] && [ -f "tmp/codex-linux-x86_64/codex" ]; then',
+      `if [ -z "$CODEX_BIN" ] && [ -f "${runtimeDir}/codex" ]; then`,
       '  mkdir -p .runtime/codex',
-      '  cp -R "tmp/codex-linux-x86_64/." .runtime/codex/',
+      `  cp -R "${runtimeDir}/." .runtime/codex/`,
       '  chmod +x .runtime/codex/codex .runtime/codex/rg .runtime/codex/codex-resources/bwrap 2>/dev/null || true',
       '  if [ -x .runtime/codex/codex ]; then CODEX_BIN="$PWD/.runtime/codex/codex"; fi',
       'fi'
@@ -9553,14 +10034,27 @@ function buildRemoteCodexPreflightScript(connector) {
   ].join('\n');
 }
 
-function buildRemoteOneShotAgentLauncherScript(connector, restart) {
+function buildRemoteOneShotAgentLauncherScript(connector, restart, options = {}) {
   const mode = connector.bootstrap?.mode || 'manual_tmux';
   if (mode !== 'manual_tmux') {
     return buildDetachedBootstrapCommand(connector, { restart });
   }
 
-  const tmuxSession = connector.bootstrap?.tmuxSession || 'codex-remote';
-  const launchCommand = agentLogCommand(buildAgentLaunchCommand(connector));
+  const tmuxSession = connectorTmuxSessionName(connector);
+  const controlRemoteDirectory = normalizeConnectorRemoteDirectory(
+    options.controlRemoteDirectory || connector.bootstrap?.remoteDirectory
+  );
+  const controlLogFile = connectorControlFileName(connector, 'log');
+  const controlPidFile = connectorControlFileName(connector, 'pid');
+  const controlLogPath = remoteScpChildPath(controlRemoteDirectory, controlLogFile);
+  const controlPidPath = remoteScpChildPath(controlRemoteDirectory, controlPidFile);
+  const launchCommand = [
+    `echo "$$" > ${remoteShellPath(controlPidPath)}`,
+    agentLogCommand(
+      buildAgentLaunchCommand(connector, { execProcess: true }),
+      { logPath: controlLogPath }
+    ),
+  ].join('\n');
   const launchScriptPath = '.remote-codex-agent-launch.sh';
   const launchScriptCommand = 'sh .remote-codex-agent-launch.sh';
   const refreshExistingAgent = true;
@@ -9573,10 +10067,91 @@ function buildRemoteOneShotAgentLauncherScript(connector, restart) {
     launchCommand,
     'REMOTE_CODEX_AGENT_LAUNCH',
     'chmod +x ' + launchScriptPath,
+    `control_dir=${remoteShellPath(controlRemoteDirectory)}`,
+    'mkdir -p "$control_dir"',
+    'control_dir="$(cd "$control_dir" 2>/dev/null && pwd -P)"',
+    'test -n "$control_dir" || { echo CODEX_REMOTE_AGENT_CONTROL_DIR_FAILED; exit 74; }',
+    `expected_connector_id=${shellQuote(connector.connectorId || '')}`,
+    `expected_host_id=${shellQuote(connector.hostId || '')}`,
+    `pid_file="$control_dir/${controlPidFile}"`,
+    'if [ ! -f "$pid_file" ] && [ -d "$control_dir/.deployments" ]; then',
+    '  legacy_pid_file="$control_dir/codex-remote.agent.pid"',
+    '  if [ ! -f "$legacy_pid_file" ]; then',
+    "    legacy_pid_file=\"$(find \"$control_dir/.deployments\" -maxdepth 8 -type f -name codex-remote.agent.pid -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)\"",
+    '  fi',
+    '  if [ -n "$legacy_pid_file" ]; then cp "$legacy_pid_file" "$pid_file" 2>/dev/null || true; fi',
+    'fi',
+    'tracked_agent_tree() {',
+    '  tree="$1"',
+    '  frontier="$1"',
+    '  while [ -n "$frontier" ]; do',
+    '    next_frontier=""',
+    '    for parent_pid in $frontier; do',
+    `      for child_pid in $(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$parent_pid" '$2 == parent { print $1 }'); do`,
+    '        case " $tree " in *" $child_pid "*) ;; *) tree="$tree $child_pid"; next_frontier="$next_frontier $child_pid" ;; esac',
+    '      done',
+    '    done',
+    '    frontier="$next_frontier"',
+    '  done',
+    '  echo "$tree"',
+    '}',
+    'is_control_agent_pid() {',
+    '  candidate_pid="$1"',
+    '  case "$candidate_pid" in ""|*[!0-9]*) return 1 ;; esac',
+    '  kill -0 "$candidate_pid" 2>/dev/null || return 1',
+    '  candidate_exe="$(readlink -f "/proc/$candidate_pid/exe" 2>/dev/null || true)"',
+    '  case "${candidate_exe##*/}" in node|nodejs) ;; *) return 1 ;; esac',
+    '  candidate_command="$(tr \'\\000\' \' \' < "/proc/$candidate_pid/cmdline" 2>/dev/null || true)"',
+    '  case "$candidate_command" in *apps/host-agent/agent.js*) ;; *) return 1 ;; esac',
+    '  candidate_environment="$(tr \'\\000\' \'\\n\' < "/proc/$candidate_pid/environ" 2>/dev/null || true)"',
+    '  candidate_connector_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^REMOTE_CODEX_CONNECTOR_ID=//p" | head -n 1)"',
+    '  candidate_host_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^HOST_ID=//p" | head -n 1)"',
+    '  if [ -n "$expected_connector_id" ] && [ -n "$candidate_connector_id" ]; then',
+    '    [ "$candidate_connector_id" = "$expected_connector_id" ] || return 1',
+    '  elif [ -n "$expected_host_id" ] && [ -n "$candidate_host_id" ]; then',
+    '    [ "$candidate_host_id" = "$expected_host_id" ] || return 1',
+    '  else',
+    '    return 1',
+    '  fi',
+    '  candidate_cwd="$(readlink -f "/proc/$candidate_pid/cwd" 2>/dev/null || true)"',
+    '  case "$candidate_cwd" in "$control_dir"|"$control_dir"/*) return 0 ;; *) return 1 ;; esac',
+    '}',
+    'stop_agent_tree() {',
+    '  root_pid="$1"',
+    '  agent_pids="$(tracked_agent_tree "$root_pid")"',
+    '  for agent_pid in $agent_pids; do kill -TERM "$agent_pid" 2>/dev/null || true; done',
+    '  remaining=12',
+    '  while [ "$remaining" -gt 0 ]; do',
+    '    agent_alive=0',
+    '    for agent_pid in $agent_pids; do if kill -0 "$agent_pid" 2>/dev/null; then agent_alive=1; fi; done',
+    '    [ "$agent_alive" = "0" ] && break',
+    '    sleep 1',
+    '    remaining=$((remaining - 1))',
+    '  done',
+    '  for agent_pid in $agent_pids; do if kill -0 "$agent_pid" 2>/dev/null; then kill -KILL "$agent_pid" 2>/dev/null || true; fi; done',
+    '}',
+    'stop_tracked_agent() {',
+    '  [ -f "$pid_file" ] || return 0',
+    '  old_pid="$(cat "$pid_file" 2>/dev/null || true)"',
+    '  case "$old_pid" in ""|*[!0-9]*) rm -f "$pid_file"; return 0 ;; esac',
+    '  if ! kill -0 "$old_pid" 2>/dev/null; then rm -f "$pid_file"; return 0; fi',
+    '  if ! is_control_agent_pid "$old_pid"; then echo CODEX_REMOTE_AGENT_STALE_PID_IGNORED; rm -f "$pid_file"; return 0; fi',
+    '  stop_agent_tree "$old_pid"',
+    '  rm -f "$pid_file"',
+    '}',
+    'stop_untracked_control_agents() {',
+    '  ps -eo pid=,comm=,args= 2>/dev/null | while read -r candidate_pid candidate_comm candidate_args; do',
+    '    case "$candidate_comm" in node|nodejs) ;; *) continue ;; esac',
+    '    case "$candidate_args" in *apps/host-agent/agent.js*) ;; *) continue ;; esac',
+    '    if is_control_agent_pid "$candidate_pid"; then',
+    '      echo "CODEX_REMOTE_AGENT_UNTRACKED_STOPPED=$candidate_pid"',
+    '      stop_agent_tree "$candidate_pid"',
+    '    fi',
+    '  done',
+    '}',
+    'stop_tracked_agent',
+    'stop_untracked_control_agents',
     'if command -v tmux >/dev/null 2>&1; then',
-    refreshExistingAgent
-      ? `  tmux kill-session -t ${shellQuote(tmuxSession)} 2>/dev/null || true`
-      : '  true',
     `  if ${tmuxEnsureCommand}; then`,
     '    echo CODEX_REMOTE_AGENT_TMUX_BOOTSTRAPPED',
     '  else',
@@ -9584,8 +10159,6 @@ function buildRemoteOneShotAgentLauncherScript(connector, restart) {
     '    exit 74',
     '  fi',
     'else',
-    '  pid_file=codex-remote.agent.pid',
-    `  if [ "${restartFlag}" = "1" ] && [ -f "$pid_file" ]; then kill "$(cat "$pid_file")" 2>/dev/null || true; fi`,
     `  if [ "${restartFlag}" = "1" ] || ! { [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; }; then`,
     `    nohup ${launchScriptCommand} >/dev/null 2>&1 < /dev/null &`,
     '    agent_pid=$!',
@@ -9602,7 +10175,11 @@ function buildRemoteOneShotAgentLauncherScript(connector, restart) {
 
 function buildRemoteOneShotBootstrapCommand(connector, action, payload = {}) {
   const nodeArchive = String(payload.nodeArchiveName || '').replace(/'/g, '');
-  const bootstrapCommand = buildRemoteOneShotAgentLauncherScript(connector, action === 'restart');
+  const bootstrapCommand = buildRemoteOneShotAgentLauncherScript(
+    connector,
+    action === 'restart',
+    { controlRemoteDirectory: payload.controlRemoteDirectory }
+  );
   const script = [
     'echo CODEX_REMOTE_AGENT_DIR_READY',
     'test -f apps/host-agent/agent.js && echo CODEX_REMOTE_CHECK_AGENT=ok || { echo CODEX_REMOTE_CHECK_AGENT=missing; exit 70; }',
@@ -9622,7 +10199,11 @@ function buildRemoteOneShotBootstrapCommand(connector, action, payload = {}) {
       : 'true',
     'test -n "$NODE_BIN" && echo "CODEX_REMOTE_CHECK_NODE=$NODE_BIN" || { echo CODEX_REMOTE_CHECK_NODE=missing; exit 72; }',
     '"$NODE_BIN" -v 2>/dev/null || true',
-    buildRemoteCodexResolutionScript(connector, Boolean(payload.codexRuntimeIncluded)),
+    buildRemoteCodexResolutionScript(
+      connector,
+      Boolean(payload.codexRuntimeIncluded),
+      payload.codexRuntimeRelativeDir
+    ),
     'test -n "$CODEX_BIN" && echo "CODEX_REMOTE_CHECK_CODEX=$CODEX_BIN" || { echo CODEX_REMOTE_CHECK_CODEX=missing; exit 73; }',
     '"$CODEX_BIN" --help >/dev/null 2>&1 && echo CODEX_REMOTE_CODEX_HELP_OK || echo CODEX_REMOTE_CODEX_HELP_WARNING',
     buildRemoteCodexPreflightScript(connector),
@@ -9634,22 +10215,30 @@ function buildRemoteOneShotBootstrapCommand(connector, action, payload = {}) {
   return `sh -lc ${shellSingleQuote(script)}`;
 }
 
-function collectOneShotBootstrapSources() {
+function collectOneShotBootstrapSources(options = {}) {
+  const architecture = normalizeLinuxArchitecture(options.architecture || 'x64');
+  if (!architecture) {
+    throw new Error(`Unsupported remote Linux architecture: ${options.architecture || 'unknown'}.`);
+  }
   const sources = ['apps', 'shared', 'package.json'];
-  const nodeRuntime = getLocalNodeRuntimeArchive();
+  const nodeRuntime = options.nodeAvailable === true
+    ? null
+    : getLocalNodeRuntimeArchive(architecture);
   if (nodeRuntime) {
     sources.push(nodeRuntime.localPath);
   }
 
-  const codexRuntime = stageLocalCodexLinuxRuntime();
+  const codexRuntime = stageLocalCodexLinuxRuntime(architecture);
   if (codexRuntime?.localSources?.length) {
     sources.push(...codexRuntime.localSources);
   }
 
   return {
     sources,
+    architecture,
     nodeArchiveName: nodeRuntime?.archiveName || '',
     codexRuntimeIncluded: Boolean(codexRuntime?.localSources?.length),
+    codexRuntimeRelativeDir: codexRuntime?.remoteRelativeDir || '',
   };
 }
 
@@ -9694,19 +10283,36 @@ function classifyOneShotBootstrapFailure(action, step) {
 }
 
 async function runConnectorBootstrapOneShot(connector, action, secret) {
-  const remoteDirectory = makeRemoteDeploymentDirectory(connector);
-  const deploymentConnector = withConnectorRemoteDirectory(connector, remoteDirectory);
+  const baseConnector = connectorWithDeploymentBaseDirectory(connector);
+  const probe = await probeConnectorBootstrapRuntime(baseConnector, secret);
+  if (!probe.ok) {
+    return {
+      ok: false,
+      status: probe.status,
+      message: probe.message,
+      remoteDirectory: baseConnector.bootstrap?.remoteDirectory || '',
+      connector: baseConnector,
+      step: probe.step || null,
+      steps: probe.step ? [probe.step] : [],
+    };
+  }
+  const remoteDirectory = makeRemoteDeploymentDirectory(baseConnector);
+  const deploymentConnector = withConnectorRemoteDirectory(baseConnector, remoteDirectory);
   let payload;
   try {
-    payload = collectOneShotBootstrapSources();
+    payload = collectOneShotBootstrapSources({
+      architecture: probe.architecture,
+      nodeAvailable: probe.nodeAvailable,
+    });
+    payload.controlRemoteDirectory = baseConnector.bootstrap?.remoteDirectory || '~/mobile-codex-remote';
   } catch (error) {
     return {
       ok: false,
       status: 'local_runtime_stage_failed',
       message: `Unable to prepare the local one-shot bootstrap payload: ${error.message}`,
       remoteDirectory,
-      connector: deploymentConnector,
-      steps: [],
+      connector: baseConnector,
+      steps: probe.step ? [probe.step] : [],
     };
   }
 
@@ -9729,15 +10335,16 @@ async function runConnectorBootstrapOneShot(connector, action, secret) {
       status: 'local_archive_failed',
       message: `Unable to build the local one-shot bootstrap archive: ${error.message}`,
       remoteDirectory,
-      connector: deploymentConnector,
-      steps: [],
+      connector: baseConnector,
+      steps: probe.step ? [probe.step] : [],
       payload: {
+        architecture: payload.architecture,
         nodeRuntimeIncluded: Boolean(payload.nodeArchiveName),
         codexRuntimeIncluded: payload.codexRuntimeIncluded,
       },
     };
   }
-  const steps = upload.step ? [upload.step] : [];
+  const steps = [probe.step, upload.step].filter(Boolean);
   const combinedText = sshRunText(upload.step || upload);
   const ok = upload.ok
     && upload.step?.stdout?.includes('CODEX_REMOTE_AGENT_BOOTSTRAPPED')
@@ -9756,11 +10363,12 @@ async function runConnectorBootstrapOneShot(connector, action, secret) {
     ok,
     ...classification,
     remoteDirectory,
-    connector: deploymentConnector,
+    connector: baseConnector,
     command: decorateSingleConnector(deploymentConnector).plan.sshBootstrapCommand,
     step: upload.step || null,
     steps,
     payload: {
+      architecture: payload.architecture,
       nodeRuntimeIncluded: Boolean(payload.nodeArchiveName),
       codexRuntimeIncluded: payload.codexRuntimeIncluded,
     },
@@ -9796,7 +10404,8 @@ function buildRemoteDiagnosticCommand(connector = null) {
 
 function buildRemoteAgentLogCommand(connector) {
   const remoteDir = remoteShellPath(connector.bootstrap?.remoteDirectory);
-  return `cd ${remoteDir} && tail -n 160 codex-remote.agent.log 2>/dev/null || true`;
+  const logFile = connectorControlFileName(connector, 'log');
+  return `cd ${remoteDir} && tail -n 160 ${shellQuote(logFile)} 2>/dev/null || true`;
 }
 
 function buildConnectorSshActionCommand(connector, remoteCommand, secret, action = 'bootstrap', sshOptions = {}) {
@@ -10147,8 +10756,8 @@ function classifyConnectorAction(action, run) {
     if (stdout.includes('CODEX_REMOTE_AGENT_PROCESS_RUNNING')) {
       return { ok: true, status: 'remote_agent_running', message: 'Remote host-agent process is running without tmux.' };
     }
-    if (stdout.includes('CODEX_REMOTE_AGENT_TMUX_MISSING')) {
-      return { ok: true, status: 'remote_agent_missing', message: 'Remote tmux agent session is not running yet.' };
+    if (stdout.includes('CODEX_REMOTE_AGENT_MISSING') || stdout.includes('CODEX_REMOTE_AGENT_TMUX_MISSING')) {
+      return { ok: true, status: 'remote_agent_missing', message: 'Remote host-agent process is not running yet.' };
     }
     return { ok: true, status: 'remote_status_unknown', message: 'Remote status command completed, but no known status marker was returned.' };
   }
@@ -10543,7 +11152,7 @@ async function requestLiveModelPage(input = {}) {
       cursor,
       limit: 200,
       bindingFingerprint: input.bindingFingerprint || null,
-      runId: input.runId || null,
+      runId: input.liveRunId || input.runId || null,
     });
     const page = await pending;
     if (
@@ -10688,10 +11297,31 @@ function publicModelCatalog(catalog) {
   return {
     models: Array.isArray(catalog?.models) ? catalog.models : [],
     sources: Array.isArray(catalog?.sources) ? catalog.sources : [],
+    providerKind: catalog?.providerKind || null,
     defaultModel: catalog?.defaultModel || null,
     cacheState: catalog?.cacheState || 'miss',
     savedAt: catalog?.savedAt || null,
+    allowProviderModelsWithoutLive: catalog?.allowProviderModelsWithoutLive === true,
   };
+}
+
+function assertFreshProviderCatalog(catalog, submittedBinding) {
+  const providerSource = (Array.isArray(catalog?.sources) ? catalog.sources : [])
+    .find((source) => source?.source === 'provider' && source.stale !== true);
+  if (providerSource && !providerSource.error) {
+    return;
+  }
+  const detail = String(providerSource?.error || '').trim();
+  throw new SessionContractError(
+    'session_api_binding_unavailable',
+    detail
+      ? `The selected API profile could not list models: ${detail}`
+      : 'The selected API profile did not return a current provider model catalog.',
+    {
+      submittedBinding: publicBinding(submittedBinding),
+      canRebind: true,
+    }
+  );
 }
 
 function awaitSkillListRequest(requestId, timeoutMs = 35000) {
@@ -11591,6 +12221,7 @@ function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
     connection: 'closed',
     busy: false,
     activeTurnId: null,
+    currentTurnStatus: 'closed',
     waitingOnApproval: false,
     waitingOnUserInput: false,
     runId: existing?.runId || null,
@@ -11629,6 +12260,37 @@ function isStaleSessionRunEvent(event, effectiveSessionId) {
   }
   const currentRunId = getCurrentSessionRunId(event.hostId, effectiveSessionId);
   return Boolean(currentRunId && currentRunId !== event.runId);
+}
+
+function isDuplicateManagedStartFailureError(event, effectiveSessionId, message) {
+  const runId = String(event?.runId || '').trim();
+  const session = getSession(event?.hostId, effectiveSessionId);
+  const resumeError = session?.resumeError;
+  if (
+    !runId
+    || String(session?.runId || '').trim() !== runId
+    || resumeError?.stage !== 'start'
+  ) {
+    return false;
+  }
+  const record = state.provenance?.getSessionRecord({
+    hostId: event.hostId,
+    sessionId: effectiveSessionId,
+  });
+  if (record?.runs?.[runId]?.status !== 'failed') {
+    return false;
+  }
+  const structuredMessage = String(resumeError.error || '').trim();
+  const runtimeMessage = String(message || '').trim();
+  return Boolean(
+    structuredMessage
+    && runtimeMessage
+    && (
+      runtimeMessage === structuredMessage
+      || runtimeMessage.endsWith(structuredMessage)
+      || structuredMessage.endsWith(runtimeMessage)
+    )
+  );
 }
 
 function eventTargetsPublishedParentRun(event, effectiveSessionId) {
@@ -11688,7 +12350,7 @@ async function stopSessionRunDurably(hostId, sessionId, runId = null, options = 
 }
 
 async function closeMissingDiscoveredRun(hostId, sessionId, runId, run, closeToken) {
-  const expectedBindingFingerprint = run?.apiBinding?.bindingFingerprint || null;
+  const expectedBindingFingerprint = bindingFingerprint(run?.apiBinding);
   try {
     const stopped = await state.provenance.stopRun({
       identity: { hostId, sessionId },
@@ -11735,6 +12397,36 @@ async function closeMissingDiscoveredRun(hostId, sessionId, runId, run, closeTok
 
 function managedDiscoveryRunKey(hostId, sessionId, runId) {
   return `${hostId}\0${runId || `session:${sessionId}`}`;
+}
+
+const RUNLESS_MANAGED_DISCOVERY_PRESENCE = Symbol('runless-managed-discovery-presence');
+
+function noteManagedDiscoveryRunPresence(presence, session, options = {}) {
+  if (!session?.live || session.source !== 'managed') {
+    return;
+  }
+  const runId = String(session.runId || session.runtime?.runId || '').trim();
+  if (!runId && options.allowRunlessWildcard !== true) {
+    return;
+  }
+  const runToken = runId || RUNLESS_MANAGED_DISCOVERY_PRESENCE;
+  for (const identity of sessionOwnershipIdentityValues(session)) {
+    const runIds = presence.get(identity) || new Set();
+    runIds.add(runToken);
+    presence.set(identity, runIds);
+  }
+}
+
+function managedDiscoveryReportsRun(presence, identities, runId) {
+  const normalizedRunId = String(runId || '').trim();
+  return identities.some((identity) => {
+    const runIds = presence.get(String(identity || '').trim());
+    if (!runIds) {
+      return false;
+    }
+    return runIds.has(normalizedRunId)
+      || runIds.has(RUNLESS_MANAGED_DISCOVERY_PRESENCE);
+  });
 }
 
 function managedDiscoveryCloseTokenIsCurrent(token) {
@@ -11839,7 +12531,7 @@ function pruneManagedDiscoveryMissingRuns(hostId, seen) {
   }
 }
 
-async function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds, options = {}) {
+async function closeManagedSessionsMissingFromDiscovery(hostId, managedRunPresence, options = {}) {
   let closedCount = 0;
   const evaluation = { decisions: new Map(), seen: new Set() };
   const discoveryId = String(options.discoveryId || '').trim();
@@ -11851,7 +12543,11 @@ async function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds, 
     const runId = String(session.runId || record?.activeRunId || '').trim();
     const run = runId ? record?.runs?.[runId] || null : null;
     const missingKey = managedDiscoveryRunKey(hostId, session.sessionId, runId);
-    if (sessionOwnershipIdentityValues(session).some((identity) => liveSessionIds.has(identity))) {
+    if (managedDiscoveryReportsRun(
+      managedRunPresence,
+      sessionOwnershipIdentityValues(session),
+      runId
+    )) {
       noteManagedRunPresent(evaluation, missingKey);
       continue;
     }
@@ -11924,7 +12620,7 @@ async function closeManagedSessionsMissingFromDiscovery(hostId, liveSessionIds, 
       record.conversationKey,
       canonicalSessionId,
     ].map((value) => String(value || '').trim()).filter(Boolean);
-    if (identities.some((identity) => liveSessionIds.has(identity))) {
+    if (managedDiscoveryReportsRun(managedRunPresence, identities, runId)) {
       noteManagedRunPresent(evaluation, managedDiscoveryRunKey(hostId, canonicalSessionId, runId));
       continue;
     }
@@ -11999,15 +12695,30 @@ function scheduleStopFallback(hostId, sessionId, options = {}) {
         lastUpdatedAt: nowIso(),
       }, { preserveManagedLive: false });
       const runtimeBase = runtime || options.previousRuntime || {};
+      const previousRuntime = options.previousRuntime || {};
+      const stopStateProjected = runtimeBase.phase === 'ending'
+        || runtimeBase.connection === 'closing'
+        || runtimeBase.currentTurnStatus === 'stopping';
+      const hasPreviousRuntime = Boolean(options.previousRuntime && typeof options.previousRuntime === 'object');
+      const restoredRuntimeBase = stopStateProjected && hasPreviousRuntime
+        ? { ...runtimeBase, ...previousRuntime }
+        : {
+          ...runtimeBase,
+          ...(stopStateProjected ? {
+            phase: 'idle',
+            connection: 'ready',
+            busy: false,
+            activeTurnId: null,
+            currentTurnStatus: 'idle',
+            waitingOnApproval: false,
+            waitingOnUserInput: false,
+          } : {}),
+        };
       const restoredRuntime = setSessionRuntime(hostId, restored.sessionId, {
-        ...runtimeBase,
-        phase: runtimeBase.phase === 'ending'
-          ? options.previousRuntime?.phase || 'idle'
-          : runtimeBase.phase || options.previousRuntime?.phase || 'idle',
-        connection: runtimeBase.connection === 'closing'
-          ? options.previousRuntime?.connection || 'ready'
-          : runtimeBase.connection || options.previousRuntime?.connection || 'ready',
-        runId: expectedRunId,
+        ...restoredRuntimeBase,
+        phase: restoredRuntimeBase.phase || 'idle',
+        connection: restoredRuntimeBase.connection || 'ready',
+        runId: expectedRunId || restoredRuntimeBase.runId || null,
         updatedAt: nowIso(),
       });
       broadcastSessionEvent(hostId, restored.sessionId, 'session.runtime_updated', {
@@ -12034,6 +12745,51 @@ function scheduleStopFallback(hostId, sessionId, options = {}) {
   return timer;
 }
 
+function runtimePatchWithPendingStopPriority(hostId, sessionId, eventRunId, patch = {}) {
+  const record = state.provenance?.getSessionRecord({ hostId, sessionId });
+  const activeRunId = String(record?.activeRunId || '').trim();
+  const activeRun = activeRunId ? record?.runs?.[activeRunId] || null : null;
+  const session = getSession(hostId, sessionId);
+  const runtime = state.sessionRuntime.get(resolveSessionKey(hostId, sessionId))
+    || state.sessionRuntime.get(sessionKey(hostId, sessionId))
+    || null;
+  const hostUsesDurableRunBinding = state.hosts.get(hostId)?.capabilities?.runApiBinding === true;
+  const legacyStopProjection = !hostUsesDurableRunBinding && (
+    String(session?.state || '').toLowerCase() === 'ending'
+    || String(runtime?.phase || '').toLowerCase() === 'ending'
+    || String(runtime?.connection || '').toLowerCase() === 'closing'
+    || String(runtime?.currentTurnStatus || '').toLowerCase() === 'stopping'
+  );
+  const pendingStop = Boolean(
+    activeRun?.stopRequestId
+    || legacyStopProjection
+  );
+  if (!pendingStop) {
+    return patch;
+  }
+  const pendingStopRunId = String(
+    activeRun?.stopRequestId
+      ? activeRunId
+      : session?.runId || runtime?.runId || activeRunId || ''
+  ).trim();
+  const normalizedEventRunId = String(eventRunId || patch.runId || '').trim();
+  if (normalizedEventRunId && pendingStopRunId && normalizedEventRunId !== pendingStopRunId) {
+    return patch;
+  }
+  return {
+    ...patch,
+    phase: 'ending',
+    connection: 'closing',
+    busy: false,
+    activeTurnId: null,
+    currentTurnStatus: 'stopping',
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+    pendingInputSummary: null,
+    queuedCommandId: null,
+  };
+}
+
 function beginSessionStop(hostId, sessionId, options = {}) {
   const session = getSession(hostId, sessionId);
   const effectiveSessionId = session?.sessionId || sessionId;
@@ -12053,6 +12809,11 @@ function beginSessionStop(hostId, sessionId, options = {}) {
       connection: 'closing',
       busy: false,
       activeTurnId: null,
+      currentTurnStatus: 'stopping',
+      waitingOnApproval: false,
+      waitingOnUserInput: false,
+      pendingInputSummary: null,
+      queuedCommandId: null,
       runId: targetRunId,
       updatedAt: nowIso(),
     });
@@ -12065,6 +12826,11 @@ function beginSessionStop(hostId, sessionId, options = {}) {
         connection: 'closing',
         busy: false,
         activeTurnId: null,
+        currentTurnStatus: 'stopping',
+        waitingOnApproval: false,
+        waitingOnUserInput: false,
+        pendingInputSummary: null,
+        queuedCommandId: null,
       },
       timestamp: nowIso(),
     });
@@ -12182,10 +12948,7 @@ function sendSessionSse(res, event) {
     const eventPayload = publicSessionEventPayload(event.eventName, event.payload, {
       optimize: res.sessionPayloadOptimize !== false,
     });
-    res.write(`id: ${event.id}\n`);
-    res.write(`event: ${event.eventName}\n`);
-    res.write(`data: ${JSON.stringify(eventPayload)}\n\n`);
-    return true;
+    return writeSseEvent(res, event.eventName, eventPayload, { id: event.id });
   } catch (error) {
     if (!isClientAbortError(error)) {
       console.error(error);
@@ -12194,7 +12957,178 @@ function sendSessionSse(res, event) {
   }
 }
 
+function boundedSessionResetText(value, max) {
+  return boundedSessionSseText(value, max);
+}
+
+function boundedSessionSseText(value, maxBytes) {
+  const text = String(value || '');
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(text.slice(0, middle), 'utf8') <= maxBytes) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  let bounded = text.slice(0, low);
+  if (bounded && /[\uD800-\uDBFF]/.test(bounded.at(-1))) {
+    bounded = bounded.slice(0, -1);
+  }
+  return bounded;
+}
+
+function boundedSessionResetAssistantProjection(projection) {
+  const compact = compactAssistantProjection(projection);
+  if (!compact) return null;
+  return {
+    ...compact,
+    canonicalConversationKey: boundedSessionResetText(compact.canonicalConversationKey, 512),
+    latestAssistantId: boundedSessionResetText(compact.latestAssistantId, 256) || null,
+    latestAssistantAt: boundedSessionResetText(compact.latestAssistantAt, 128) || null,
+    aliases: (Array.isArray(compact.aliases) ? compact.aliases : [])
+      .slice(0, 4)
+      .map((alias) => boundedSessionResetText(alias, 128))
+      .filter(Boolean),
+  };
+}
+
+function boundedSessionResetRecord(session) {
+  if (!session || typeof session !== 'object') return null;
+  return {
+    hostId: boundedSessionResetText(session.hostId, 128),
+    sessionId: boundedSessionResetText(session.sessionId, 256),
+    title: boundedSessionResetText(session.title, 256),
+    cwd: boundedSessionResetText(session.cwd, 512) || null,
+    cwdLabel: boundedSessionResetText(session.cwdLabel, 256) || null,
+    source: boundedSessionResetText(session.source, 64),
+    state: boundedSessionResetText(session.state, 128),
+    live: session.live === true,
+    createdAt: boundedSessionResetText(session.createdAt, 128) || null,
+    lastUpdatedAt: boundedSessionResetText(session.lastUpdatedAt, 128) || null,
+    messageCount: Math.max(0, Number(session.messageCount || 0)),
+    latestUserMessage: boundedSessionResetText(session.latestUserMessage, 256) || null,
+    latestAgentMessage: boundedSessionResetText(session.latestAgentMessage, 256) || null,
+    rolloutPath: boundedSessionResetText(session.rolloutPath, 512) || null,
+    originSessionId: boundedSessionResetText(session.originSessionId, 256) || null,
+    sourceSessionId: boundedSessionResetText(session.sourceSessionId, 256) || null,
+    conversationKey: boundedSessionResetText(session.conversationKey, 256) || null,
+    launchMode: boundedSessionResetText(session.launchMode, 64) || null,
+    runId: boundedSessionResetText(session.runId, 256) || null,
+    bridgeSessionId: boundedSessionResetText(session.bridgeSessionId, 256) || null,
+    nativeThreadId: boundedSessionResetText(session.nativeThreadId, 256) || null,
+  };
+}
+
+function boundedSessionResetPayload(payload = {}) {
+  const assistantProjection = boundedSessionResetAssistantProjection(
+    payload.assistantProjection || payload.assistant
+  );
+  const base = {
+    streamEpoch: boundedSessionResetText(payload.streamEpoch, 128),
+    streamCounter: Math.max(0, Number(payload.streamCounter || 0)),
+    canonicalConversationKey: boundedSessionResetText(payload.canonicalConversationKey, 512),
+    assistantProjection,
+    assistant: assistantProjection,
+    session: boundedSessionResetRecord(payload.session),
+    reason: boundedSessionResetText(payload.reason, 128),
+    activityCount: Math.max(0, Number(payload.activityCount || 0)),
+  };
+  const activities = Array.isArray(payload.activities) ? payload.activities : [];
+  const complete = {
+    ...base,
+    activities,
+    activitiesTruncated: payload.activitiesTruncated === true,
+    detailRecoveryRequired: payload.detailRecoveryRequired === true,
+  };
+  if (Buffer.byteLength(JSON.stringify(complete), 'utf8') <= SESSION_SSE_PAYLOAD_MAX_BYTES) {
+    return complete;
+  }
+  const truncated = {
+    ...base,
+    activities: [],
+    activitiesTruncated: payload.activitiesTruncated === true || activities.length > 0,
+    detailRecoveryRequired: true,
+  };
+  if (Buffer.byteLength(JSON.stringify(truncated), 'utf8') <= SESSION_SSE_PAYLOAD_MAX_BYTES) {
+    return truncated;
+  }
+  const minimalAssistant = assistantProjection ? {
+    canonicalConversationKey: boundedSessionResetText(
+      assistantProjection.canonicalConversationKey,
+      128
+    ),
+    latestAssistantSeq: assistantProjection.latestAssistantSeq,
+    projectionRevision: assistantProjection.projectionRevision,
+    cursorUnknown: assistantProjection.cursorUnknown,
+  } : null;
+  const minimal = {
+    streamEpoch: boundedSessionResetText(payload.streamEpoch, 64),
+    streamCounter: Math.max(0, Number(payload.streamCounter || 0)),
+    canonicalConversationKey: boundedSessionResetText(payload.canonicalConversationKey, 128),
+    assistantProjection: minimalAssistant,
+    assistant: minimalAssistant,
+    session: payload.session ? {
+      hostId: boundedSessionResetText(payload.session.hostId, 64),
+      sessionId: boundedSessionResetText(payload.session.sessionId, 128),
+      state: boundedSessionResetText(payload.session.state, 32),
+      live: payload.session.live === true,
+    } : null,
+    reason: boundedSessionResetText(payload.reason, 32),
+    activityCount: Math.max(0, Number(payload.activityCount || 0)),
+    activities: [],
+    activitiesTruncated: payload.activitiesTruncated === true || activities.length > 0,
+    detailRecoveryRequired: true,
+  };
+  if (Buffer.byteLength(JSON.stringify(minimal), 'utf8') <= SESSION_SSE_PAYLOAD_MAX_BYTES) {
+    return minimal;
+  }
+  return {
+    streamEpoch: boundedSessionResetText(payload.streamEpoch, 32),
+    streamCounter: Math.max(0, Number(payload.streamCounter || 0)),
+    canonicalConversationKey: boundedSessionResetText(payload.canonicalConversationKey, 64),
+    reason: boundedSessionResetText(payload.reason, 24),
+    activityCount: Math.max(0, Number(payload.activityCount || 0)),
+    activities: [],
+    activitiesTruncated: payload.activitiesTruncated === true || activities.length > 0,
+    detailRecoveryRequired: true,
+  };
+}
+
+function boundedSessionActivityPayload(payload = {}) {
+  if (
+    Buffer.byteLength(JSON.stringify(payload), 'utf8')
+    <= SESSION_SSE_PAYLOAD_MAX_BYTES
+  ) {
+    return payload;
+  }
+  const targetBytes = SESSION_SSE_PAYLOAD_MAX_BYTES;
+  const canonicalConversationKey = String(payload.canonicalConversationKey || '');
+  const compact = {
+    canonicalConversationKey: Buffer.byteLength(canonicalConversationKey, 'utf8') <= 512
+      ? canonicalConversationKey
+      : '',
+    activityRecoveryToken: makeActivityRecoveryToken(payload.activityKey),
+    activityRevision: Number(payload.activityRevision || 0),
+    streamEpoch: boundedSessionSseText(payload.streamEpoch, 128),
+    text: '',
+    activityTruncated: true,
+    activityByteLength: Buffer.byteLength(String(payload.text || ''), 'utf8'),
+  };
+  if (Buffer.byteLength(JSON.stringify(compact), 'utf8') <= targetBytes) {
+    return compact;
+  }
+  compact.canonicalConversationKey = '';
+  return compact;
+}
+
 function publicSessionEventPayload(eventName, payload, options = {}) {
+  if (eventName === 'stream.reset') {
+    return boundedSessionResetPayload(payload);
+  }
   if (
     options.optimize !== false
     && (eventName === 'session.snapshot' || eventName === 'session.started' || eventName === 'session.state_changed')
@@ -12205,11 +13139,17 @@ function publicSessionEventPayload(eventName, payload, options = {}) {
 }
 
 function publishCanonicalSessionEvent(canonicalKey, eventName, payload) {
-  const projectedPayload = (
-    eventName === 'session.snapshot'
-    || eventName === 'session.started'
-    || eventName === 'session.state_changed'
-  ) ? sessionWithAssistantProjection(payload) : payload;
+  if (!state.sessionEventStream.has(canonicalKey)) {
+    state.sessionEventStream.markTombstoneDirty(canonicalKey);
+    return null;
+  }
+  const projectedPayload = eventName === 'session.activity'
+    ? boundedSessionActivityPayload(payload)
+    : (
+      eventName === 'session.snapshot'
+      || eventName === 'session.started'
+      || eventName === 'session.state_changed'
+    ) ? sessionWithAssistantProjection(payload) : payload;
   return state.sessionEventStream.publish(canonicalKey, eventName, projectedPayload);
 }
 
@@ -12231,6 +13171,9 @@ function addSessionSubscriber(canonicalKey, res, options = {}) {
     makeReset: (currentCanonicalKey) => options.makeReset?.(currentCanonicalKey) || {},
   });
   res.sessionStreamUnsubscribe = unsubscribe;
+  if (res.destroyed || res.writableEnded) {
+    removeSessionSubscriber(res);
+  }
   res.once('error', () => {
     removeSessionSubscriber(res);
   });
@@ -12362,13 +13305,83 @@ function sessionCatalogRunRecord(hostId, sessionId) {
       record,
       run: pendingRun,
       runId: pendingRunId,
-      catalogRunId: pendingRun.parentRunId || pendingRunId,
+      catalogRunId: pendingRunId,
+      liveRunId: pendingRun.parentRunId || null,
     };
   }
   return {
     ...resolved,
     catalogRunId: resolved.runId,
+    liveRunId: resolved.runId,
   };
+}
+
+function assertRebindRunExpectation(record, body = {}) {
+  const expectedRunId = String(body.expectedRunId || '').trim();
+  const expectedBindingProvided = Object.prototype.hasOwnProperty.call(
+    body,
+    'expectedBindingFingerprint'
+  );
+  const expectedRunStatus = String(body.expectedRunStatus || '').trim() || null;
+  const expectedRunStatusProvided = Object.prototype.hasOwnProperty.call(body, 'expectedRunStatus');
+  if (!expectedRunId || !expectedBindingProvided || !expectedRunStatusProvided) {
+    throw new SessionContractError(
+      'session_run_precondition_required',
+      'This Session operation requires the observed run identity and API binding.',
+      { statusCode: 428 }
+    );
+  }
+
+  const activeRunId = String(record?.activeRunId || '').trim() || null;
+  const activeRun = activeRunId ? record?.runs?.[activeRunId] || null : null;
+  if (activeRun?.status === 'pending') {
+    throw new SessionContractError(
+      'session_run_pending',
+      `Run ${activeRunId} is still pending for this Session.`,
+      { statusCode: 409, currentRunId: activeRunId }
+    );
+  }
+  if (activeRun?.stopRequestId) {
+    throw new SessionContractError(
+      'session_run_stopping',
+      `Run ${activeRunId} already has a pending Stop request.`,
+      {
+        statusCode: 409,
+        currentRunId: activeRunId,
+        currentRunStatus: 'stopping',
+        currentBindingFingerprint: bindingFingerprint(activeRun.apiBinding),
+      }
+    );
+  }
+
+  const currentRunId = activeRun?.status === 'live'
+    ? activeRunId
+    : String(record?.latestSuccessfulRunId || activeRunId || '').trim() || null;
+  const currentRun = currentRunId ? record?.runs?.[currentRunId] || null : null;
+  const currentBindingFingerprint = bindingFingerprint(currentRun?.apiBinding);
+  const currentRunStatus = String(currentRun?.status || '').trim() || null;
+  const expectedBindingFingerprint = String(body.expectedBindingFingerprint || '').trim() || null;
+  if (
+    !currentRunId
+    || currentRunId !== expectedRunId
+    || currentBindingFingerprint !== expectedBindingFingerprint
+    || currentRunStatus !== expectedRunStatus
+  ) {
+    throw new SessionContractError(
+      'session_run_changed',
+      'The Session run changed after it was loaded. Reload it before retrying this operation.',
+      {
+        statusCode: 409,
+        currentRunId,
+        currentRunStatus,
+        currentBindingFingerprint,
+        expectedRunId,
+        expectedRunStatus,
+        expectedBindingFingerprint,
+      }
+    );
+  }
+  return { record, run: currentRun, runId: currentRunId, runStatus: currentRunStatus };
 }
 
 function sessionAcceptsLiveControl(hostId, session) {
@@ -12424,6 +13437,8 @@ function sessionRuntimeConfig(hostId, sessionId) {
     activeRunId: record.activeRunId || null,
     latestSuccessfulRunId: record.latestSuccessfulRunId || null,
     runStatus: run?.stopRequestId ? 'stopping' : run?.status || null,
+    nativeResumeReady: run ? run.nativeResumeReady !== false : false,
+    nativeResumeReadyKnown: typeof run?.nativeResumeReady === 'boolean',
     apiBinding: publicBinding(run?.apiBinding) || null,
     sessionBinding: publicBinding(run?.apiBinding) || null,
     requestedSelection: run?.requestedSelection || null,
@@ -12432,6 +13447,8 @@ function sessionRuntimeConfig(hostId, sessionId) {
       runId: record.activeRunId,
       status: pendingRun.status || null,
       launchMode: pendingRun.launchMode || null,
+      nativeResumeReady: pendingRun.nativeResumeReady !== false,
+      nativeResumeReadyKnown: typeof pendingRun.nativeResumeReady === 'boolean',
       sessionBinding: publicBinding(pendingRun.apiBinding),
       requestedSelection: pendingRun.requestedSelection || null,
     } : null,
@@ -12502,15 +13519,23 @@ function validateLiveCommandBinding(session, body = {}) {
       { sessionBinding, submittedBinding, canRebind: true }
     );
   }
+  if (
+    submittedBinding?.providerKind
+    && sessionBinding?.providerKind
+    && submittedBinding.providerKind !== sessionBinding.providerKind
+  ) {
+    throw new SessionContractError(
+      'session_api_binding_mismatch',
+      'Command provider policy differs from the live Session run.',
+      { sessionBinding, submittedBinding, canRebind: true }
+    );
+  }
   return { record, run, runId, binding: sessionBinding };
 }
 
 async function recordLiveRequestedSelection(hostId, sessionId, runId, body = {}) {
   const model = String(body.model || '').trim() || null;
   const effort = String(body.effort || '').trim() || null;
-  if (!model && !effort) {
-    return null;
-  }
   if (!runId) {
     throw new SessionContractError(
       'session_run_not_found',
@@ -12540,8 +13565,11 @@ async function validateLiveRequestedSelection(hostId, sessionId, liveRun, body =
     nativeThreadId: liveRun.record?.nativeThreadId || null,
     bindingFingerprint: liveRun.binding.bindingFingerprint,
     runId: liveRun.runId,
+    ...modelCatalogInputPolicy(null, liveRun.binding),
   });
-  return state.modelCatalog.validateSelection(catalog, selection);
+  return state.modelCatalog.validateSelection(catalog, selection, {
+    allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+  });
 }
 
 async function resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind) {
@@ -12588,6 +13616,20 @@ async function failPlannedRun(hostId, sessionId, runId, error) {
   }
 }
 
+function assertIdleBatchRebind(hostId, sourceSessionId, targetSessionId, sourceSession) {
+  const preferredSessionId = sourceSession?.sessionId || sourceSessionId || targetSessionId;
+  const runtime = state.sessionRuntime.get(resolveSessionKey(hostId, preferredSessionId))
+    || state.sessionRuntime.get(sessionKey(hostId, sourceSessionId || targetSessionId))
+    || {};
+  if (runtime.busy === true || runtime.waitingOnApproval === true || runtime.waitingOnUserInput === true) {
+    throw new SessionContractError(
+      'session_run_busy',
+      'The Session became active after preflight; batch Rebind will not interrupt it.',
+      { statusCode: 409 }
+    );
+  }
+}
+
 async function planManagedLaunch(hostId, body = {}, options = {}) {
   const sourceSessionId = String(
     options.sourceSessionId
@@ -12600,6 +13642,17 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     || body.launchMode
     || (sourceSessionId ? 'resume' : 'fresh')
   ).trim() || 'fresh';
+  const rawClientRequestId = options.acceptClientRequestId === true
+    ? String(body.clientRequestId || '').trim()
+    : '';
+  const clientRequestId = normalizeClientRequestId(rawClientRequestId);
+  if (rawClientRequestId && clientRequestId !== rawClientRequestId) {
+    throw stageSessionError(new SessionContractError(
+      'session_request_invalid',
+      'clientRequestId must be at most 160 letters, numbers, dots, colons, underscores, or hyphens.',
+      { statusCode: 400 }
+    ), 'validate-request');
+  }
   const sourceDetail = sourceSessionId
     ? getSessionDetail(hostId, sourceSessionId, {
       skipDiagnostics: true,
@@ -12624,15 +13677,32 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
   }
 
   const targetSessionId = String(options.targetSessionId || body.sessionId || (
-    launchMode === 'resume' ? sourceSessionId : makeId()
+    ['resume', 'fresh_rebind'].includes(launchMode)
+      ? sourceSessionId
+      : clientRequestId
+        ? deterministicLaunchUuid(hostId, clientRequestId, 'session')
+        : makeId()
   )).trim();
-  const runId = String(body.runId || makeId()).trim();
+  const runId = String(
+    body.runId
+    || (clientRequestId ? deterministicLaunchUuid(hostId, clientRequestId, 'run') : makeId())
+  ).trim();
   const sourceSession = sourceDetail?.session || null;
   const sourceRecord = sourceSessionId
     ? state.provenance.getSessionRecord({ hostId, sessionId: sourceSessionId })
     : null;
+  const sourceRunId = sourceRecord?.latestSuccessfulRunId || sourceRecord?.activeRunId || null;
+  const sourceRun = sourceRunId ? sourceRecord?.runs?.[sourceRunId] || null : null;
+  if (['resume', 'fork'].includes(launchMode) && sourceRun?.nativeResumeReady === false) {
+    const operation = launchMode === 'fork' ? 'forked' : 'resumed';
+    throw stageSessionError(new SessionContractError(
+      launchMode === 'fork' ? 'session_native_fork_unavailable' : 'session_native_resume_unavailable',
+      `This Session has not started its first native turn and cannot be ${operation}. Start a fresh Session instead.`,
+      { statusCode: 409 }
+    ), 'resolve-history');
+  }
   const apiConfig = normalizeApiConfig(body.apiConfig);
-  const explicitRebind = options.explicitRebind === true || body.explicitRebind === true;
+  const explicitRebind = options.explicitRebind === true;
   const requireExpectedRun = explicitRebind || options.requireExpectedRun === true;
 
   let submittedBinding;
@@ -12666,12 +13736,38 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     sessionId: targetSessionId,
   };
   const hasSubmittedSelection = Object.prototype.hasOwnProperty.call(body, 'model')
-    || Object.prototype.hasOwnProperty.call(body, 'effort');
+    || Object.prototype.hasOwnProperty.call(body, 'effort')
+    || Object.prototype.hasOwnProperty.call(body, 'summary');
+  const submittedEffort = String(body.effort || '').trim() || null;
   const requestedSelection = hasSubmittedSelection ? {
     model: String(body.model || '').trim() || null,
-    effort: String(body.effort || '').trim() || null,
+    effort: submittedEffort,
+    summary: String(body.summary || '').trim() || null,
+    ...(submittedEffort && body.allowUnverifiedEffort === true ? { allowUnverifiedEffort: true } : {}),
     source: String(body.selectionSource || 'user').trim() || 'user',
   } : undefined;
+  const requestFingerprint = clientRequestId ? managedLaunchRequestFingerprint({
+    hostId,
+    targetSessionId,
+    sourceSessionId,
+    launchMode,
+    cwd,
+    conversationKey,
+    originSessionId,
+    nativeThreadId,
+    bindingFingerprint: submittedBinding?.bindingFingerprint,
+    apiConfig,
+    requestedSelection,
+    body,
+  }) : '';
+
+  if (explicitRebind && body.requireIdle === true) {
+    try {
+      assertIdleBatchRebind(hostId, sourceSessionId, targetSessionId, sourceSession);
+    } catch (error) {
+      throw stageSessionError(error, 'plan-run');
+    }
+  }
 
   let planned;
   try {
@@ -12681,6 +13777,8 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
       conversationKey,
       runId,
       launchMode,
+      clientRequestId,
+      requestFingerprint,
       submittedBinding,
       explicitRebind,
       requireExpectedRun,
@@ -12699,32 +13797,14 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     throw stageSessionError(error, 'plan-run');
   }
 
-  let catalog;
-  try {
-    catalog = await state.modelCatalog.get({
-      hostId,
-      identity,
-      sessionId: targetSessionId,
-      nativeThreadId,
-      bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
-      runId: planned.run.parentRunId || runId,
-      apiConfig,
-      force: body.refreshModels === true,
-    });
-    state.modelCatalog.validateSelection(catalog, planned.run.requestedSelection);
-  } catch (error) {
-    await failPlannedRun(hostId, targetSessionId, runId, error);
-    throw stageSessionError(error, 'load-model-catalog');
-  }
-
-  return {
+  const planResult = {
     hostId,
     targetSessionId,
     sourceSessionId,
     sourceDetail,
     sourceSession,
     cwd,
-    launchMode,
+    launchMode: planned.run.launchMode || launchMode,
     runId,
     conversationKey,
     originSessionId,
@@ -12732,14 +13812,325 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     apiConfig,
     apiProfile: summarizeApiConfig(apiConfig),
     planned,
-    catalog,
     explicitRebind,
+    clientRequestId: clientRequestId || null,
+    idempotentReplay: planned.idempotentReplay === true,
+  };
+  if (planResult.idempotentReplay) {
+    return { ...planResult, catalog: null };
+  }
+
+  const requestedModel = String(planned.run.requestedSelection?.model || '').trim();
+  const requestedEffort = String(planned.run.requestedSelection?.effort || '').trim();
+  if (
+    !explicitRebind
+    && planResult.launchMode === 'resume'
+    && !requestedModel
+    && !requestedEffort
+  ) {
+    try {
+      const catalog = await state.modelCatalog.inheritRunCatalog({
+        hostId,
+        identity,
+        sessionId: targetSessionId,
+        nativeThreadId,
+        bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
+        runId,
+        liveRunId: planned.run.parentRunId || null,
+        ...modelCatalogInputPolicy(apiConfig, planned.run.apiBinding),
+        apiConfig,
+      }, planned.run.parentRunId);
+      return { ...planResult, catalog };
+    } catch (error) {
+      await failPlannedRun(hostId, targetSessionId, runId, error);
+      throw stageSessionError(error, 'load-model-catalog');
+    }
+  }
+
+  let catalog;
+  try {
+    const catalogPolicy = modelCatalogInputPolicy(apiConfig, planned.run.apiBinding);
+    const providerKind = catalogPolicy.providerKind;
+    const reuseInput = {
+      hostId,
+      sourceSessionId,
+      targetSessionId,
+      currentRunId: body.expectedRunId,
+      currentRunStatus: body.expectedRunStatus,
+      currentBindingFingerprint: body.expectedBindingFingerprint,
+      targetBindingFingerprint: planned.run.apiBinding.bindingFingerprint,
+      targetProfileId: planned.run.apiBinding.profileId,
+      targetProviderKind: providerKind,
+      targetApiConfigFingerprint: rebindCatalogApiConfigFingerprint(apiConfig),
+      selectionFingerprint: rebindCatalogSelectionFingerprint(
+        planned.run.requestedSelection,
+        body.allowUnverifiedEffort === true
+      ),
+    };
+    catalog = explicitRebind
+      ? consumeRebindCatalogReuseToken(body.modelCatalogReuseToken, reuseInput)
+      : null;
+    const reusedCatalog = Boolean(catalog);
+    if (!catalog) {
+      catalog = await state.modelCatalog.get({
+        hostId,
+        identity,
+        sessionId: targetSessionId,
+        nativeThreadId,
+        bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
+        runId,
+        liveRunId: planned.run.parentRunId || null,
+        ...catalogPolicy,
+        apiConfig,
+        force: (explicitRebind && Boolean(apiConfig)) || body.refreshModels === true,
+      });
+    }
+    if (explicitRebind && apiConfig) {
+      assertFreshProviderCatalog(catalog, planned.run.apiBinding);
+    }
+    state.modelCatalog.validateSelection(catalog, planned.run.requestedSelection, {
+      allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+    });
+    if (reusedCatalog) {
+      await state.modelCatalog.persistCatalog({
+        hostId,
+        identity,
+        sessionId: targetSessionId,
+        nativeThreadId,
+        bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
+        runId,
+        liveRunId: planned.run.parentRunId || null,
+        providerKind,
+      }, catalog, 'session.model_catalog.reused');
+    }
+  } catch (error) {
+    await failPlannedRun(hostId, targetSessionId, runId, error);
+    throw stageSessionError(error, 'load-model-catalog');
+  }
+
+  return { ...planResult, catalog };
+}
+
+async function validateManagedRebind(hostId, sourceSessionId, body = {}) {
+  const sourceSession = getSession(hostId, sourceSessionId);
+  if (!sourceSession) {
+    throw stageSessionError(new SessionContractError(
+      'session_history_unavailable',
+      'Saved Session history is unavailable.',
+      { statusCode: 404 }
+    ), 'resolve-history');
+  }
+
+  const cwd = String(body.cwd || sourceSession.cwd || '').trim();
+  if (!cwd) {
+    throw stageSessionError(new SessionContractError(
+      'session_cwd_unavailable',
+      'The Session working directory is unavailable.',
+      { statusCode: 422 }
+    ), 'resolve-cwd');
+  }
+
+  let observed;
+  try {
+    observed = assertRebindRunExpectation(
+      state.provenance.getSessionRecord({ hostId, sessionId: sourceSessionId }),
+      body
+    );
+  } catch (error) {
+    throw stageSessionError(error, 'plan-run');
+  }
+
+  const apiConfig = normalizeApiConfig(body.apiConfig);
+  let submittedBinding;
+  try {
+    submittedBinding = await resolveLaunchBinding(hostId, apiConfig, observed.record, true);
+    if (!submittedBinding || submittedBinding.kind === 'unknown' || !submittedBinding.bindingFingerprint) {
+      throw new SessionContractError(
+        'session_api_binding_unavailable',
+        'The Session API binding cannot be resolved.',
+        {
+          sessionBinding: publicBinding(observed.run?.apiBinding),
+          submittedBinding: publicBinding(submittedBinding),
+          canRebind: true,
+        }
+      );
+    }
+  } catch (error) {
+    throw stageSessionError(error, 'resolve-binding');
+  }
+
+  const proposedRunId = String(body.runId || '').trim() || null;
+  if (proposedRunId && observed.record?.runs?.[proposedRunId]) {
+    throw stageSessionError(new SessionContractError(
+      'session_run_conflict',
+      `Run ${proposedRunId} already exists.`
+    ), 'plan-run');
+  }
+
+  const inheritedRunId = observed.record?.latestSuccessfulRunId
+    || observed.record?.activeRunId
+    || observed.runId;
+  const inheritedRun = inheritedRunId ? observed.record?.runs?.[inheritedRunId] || observed.run : observed.run;
+  const hasSubmittedSelection = Object.prototype.hasOwnProperty.call(body, 'model')
+    || Object.prototype.hasOwnProperty.call(body, 'effort')
+    || Object.prototype.hasOwnProperty.call(body, 'summary');
+  const inheritedSelection = inheritedRun?.effectiveSelection || inheritedRun?.requestedSelection || {};
+  const selectedEffort = String(
+    hasSubmittedSelection ? body.effort || '' : inheritedSelection.effort || ''
+  ).trim() || null;
+  const requestedSelection = {
+    model: String(hasSubmittedSelection ? body.model || '' : inheritedSelection.model || '').trim() || null,
+    effort: selectedEffort,
+    summary: String(hasSubmittedSelection ? body.summary || '' : inheritedSelection.summary || '').trim() || null,
+    ...(selectedEffort && (hasSubmittedSelection
+      ? body.allowUnverifiedEffort === true
+      : inheritedSelection.allowUnverifiedEffort === true) ? { allowUnverifiedEffort: true } : {}),
+    source: String(
+      hasSubmittedSelection
+        ? body.selectionSource || 'user'
+        : inheritedSelection.source || 'inherit'
+    ).trim() || 'inherit',
+  };
+
+  const validationCatalogRunId = `rebind-validation:${makeId()}`;
+  let catalog;
+  try {
+    catalog = await state.modelCatalog.get({
+      hostId,
+      identity: { hostId, sessionId: sourceSessionId },
+      sessionId: sourceSession.sessionId || sourceSessionId,
+      nativeThreadId: String(body.nativeThreadId || sourceSession.nativeThreadId || '').trim() || null,
+      bindingFingerprint: submittedBinding.bindingFingerprint,
+      runId: validationCatalogRunId,
+      liveRunId: inheritedRunId || null,
+      ...modelCatalogInputPolicy(apiConfig, submittedBinding),
+      apiConfig,
+      force: Boolean(apiConfig) || body.refreshModels === true,
+      persist: false,
+    });
+    if (apiConfig) {
+      assertFreshProviderCatalog(catalog, submittedBinding);
+    }
+    state.modelCatalog.validateSelection(catalog, requestedSelection, {
+      allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+    });
+  } catch (error) {
+    throw stageSessionError(error, 'load-model-catalog');
+  }
+
+  try {
+    observed = assertRebindRunExpectation(
+      state.provenance.getSessionRecord({ hostId, sessionId: sourceSessionId }),
+      body
+    );
+    if (proposedRunId && observed.record?.runs?.[proposedRunId]) {
+      throw new SessionContractError(
+        'session_run_conflict',
+        `Run ${proposedRunId} already exists.`
+      );
+    }
+  } catch (error) {
+    throw stageSessionError(error, 'plan-run');
+  }
+
+  const runtime = state.sessionRuntime.get(resolveSessionKey(hostId, sourceSession.sessionId || sourceSessionId))
+    || state.sessionRuntime.get(sessionKey(hostId, sourceSessionId))
+    || {};
+  const busy = runtime.busy === true;
+  const waitingOnApproval = runtime.waitingOnApproval === true;
+  const waitingOnUserInput = runtime.waitingOnUserInput === true;
+  const requiresInterrupt = busy || waitingOnApproval || waitingOnUserInput;
+  const modelCatalogReuseToken = issueRebindCatalogReuseToken({
+    hostId,
+    sourceSessionId,
+    targetSessionId: sourceSession.sessionId || sourceSessionId,
+    currentRunId: observed.runId,
+    currentRunStatus: observed.runStatus,
+    currentBindingFingerprint: bindingFingerprint(observed.run?.apiBinding),
+    targetBindingFingerprint: submittedBinding.bindingFingerprint,
+    targetProfileId: submittedBinding.profileId,
+    targetProviderKind: modelCatalogProviderKind(apiConfig, submittedBinding),
+    targetApiConfigFingerprint: rebindCatalogApiConfigFingerprint(apiConfig),
+    selectionFingerprint: rebindCatalogSelectionFingerprint(
+      requestedSelection,
+      body.allowUnverifiedEffort === true
+    ),
+    catalog,
+  });
+  return {
+    ok: true,
+    valid: true,
+    canExecute: true,
+    canExecuteWithoutInterrupt: !requiresInterrupt,
+    requiresInterrupt,
+    busy,
+    waitingOnApproval,
+    waitingOnUserInput,
+    hostId,
+    sessionId: sourceSession.sessionId || sourceSessionId,
+    canonicalSessionId: observed.record?.nativeThreadId
+      || observed.record?.bridgeSessionId
+      || observed.record?.conversationKey
+      || sourceSession.sessionId
+      || sourceSessionId,
+    currentRunId: observed.runId,
+    currentRunStatus: observed.runStatus,
+    nativeResumeReady: observed.run?.nativeResumeReady !== false,
+    nativeResumeReadyKnown: typeof observed.run?.nativeResumeReady === 'boolean',
+    launchMode: observed.run?.nativeResumeReady === false ? 'fresh_rebind' : 'resume',
+    sessionBinding: publicBinding(observed.run?.apiBinding),
+    submittedBinding: publicBinding(submittedBinding),
+    requestedSelection,
+    codexOptions: {
+      model: requestedSelection.model || null,
+      effort: requestedSelection.effort || null,
+      summary: String(body.summary || '').trim() || null,
+      allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+    },
+    runtime: {
+      phase: runtime.phase || null,
+      connection: runtime.connection || null,
+      activeTurnId: runtime.activeTurnId || null,
+      busy,
+      waitingOnApproval,
+      waitingOnUserInput,
+    },
+    modelCatalog: publicModelCatalog(catalog),
+    modelCatalogReuseToken,
   };
 }
 
 async function enqueueManagedLaunch(plan, body = {}) {
+  if (plan.explicitRebind) {
+    const latestRecord = state.provenance.getSessionRecord({
+      hostId: plan.hostId,
+      sessionId: plan.targetSessionId,
+    });
+    const latestRun = latestRecord?.runs?.[plan.runId] || null;
+    if (latestRun?.status === 'pending') {
+      plan.launchMode = latestRun.launchMode || plan.launchMode;
+      plan.planned = {
+        ...plan.planned,
+        run: latestRun,
+        record: latestRecord,
+      };
+    }
+  }
+  if (plan.explicitRebind && body.requireIdle === true) {
+    try {
+      assertIdleBatchRebind(
+        plan.hostId,
+        plan.sourceSessionId,
+        plan.targetSessionId,
+        plan.sourceSession
+      );
+    } catch (error) {
+      await failPlannedRun(plan.hostId, plan.targetSessionId, plan.runId, error);
+      throw stageSessionError(error, 'plan-run');
+    }
+  }
   const createdAt = nowIso();
-  const resumeTranscript = plan.sourceDetail
+  const resumeTranscript = plan.launchMode === 'transcript_fallback' && plan.sourceDetail
     ? buildResumeTranscript(plan.sourceDetail.transcript)
     : [];
   const requestedSelection = plan.planned.run.requestedSelection || {};
@@ -12766,13 +14157,21 @@ async function enqueueManagedLaunch(plan, body = {}) {
     launchMode: plan.launchMode,
     bridgeSessionId: plan.targetSessionId,
     runId: plan.runId,
-    nativeThreadId: plan.launchMode === 'resume'
-      ? plan.nativeThreadId || plan.targetSessionId
-      : plan.targetSessionId,
+    nativeThreadId: plan.launchMode === 'fresh_rebind'
+      ? null
+      : plan.launchMode === 'resume'
+        ? plan.nativeThreadId || plan.targetSessionId
+        : plan.targetSessionId,
     messageCount: plan.sourceDetail?.transcript?.length || 0,
     apiProfile: plan.apiProfile,
     apiBinding: publicBinding(plan.planned.run.apiBinding),
     requestedSelection,
+    codexOptions: {
+      model: requestedSelection.model || null,
+      effort: requestedSelection.effort || null,
+      summary: String(body.summary || '').trim() || null,
+      allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+    },
   });
 
   if (plan.sourceDetail && Array.isArray(plan.sourceDetail.transcript)) {
@@ -12794,7 +14193,9 @@ async function enqueueManagedLaunch(plan, body = {}) {
     conversationKey: plan.conversationKey,
     launchMode: plan.launchMode,
     resumeTranscript,
-    nativeThreadId: plan.nativeThreadId,
+    nativeThreadId: plan.launchMode === 'fresh_rebind' ? null : plan.nativeThreadId,
+    rebindNativeThreadId: plan.explicitRebind ? plan.nativeThreadId : null,
+    explicitRebind: plan.explicitRebind === true,
     apiConfig: plan.apiConfig,
     apiBinding: plan.planned.run.apiBinding?.kind === 'profile'
       ? publicBinding(plan.planned.run.apiBinding)
@@ -12802,9 +14203,17 @@ async function enqueueManagedLaunch(plan, body = {}) {
     expectedBinding: publicBinding(plan.planned.run.apiBinding),
     model: requestedSelection.model || null,
     effort: requestedSelection.effort || null,
+    summary: String(body.summary || '').trim() || null,
     requestedSelection,
   });
   return command;
+}
+
+function queuedManagedLaunchCommand(hostId, runId) {
+  return (state.commandQueues.get(hostId) || []).find((command) => (
+    command?.type === 'session.start'
+    && String(command.runId || '') === String(runId || '')
+  )) || null;
 }
 
 async function handleRequest(req, res) {
@@ -12814,7 +14223,7 @@ async function handleRequest(req, res) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Relay-Auth-Token, X-Remote-Codex-Upload-Token, X-Remote-Codex-Host-Id, X-Remote-Codex-Instance-Digest',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Relay-Auth-Token, X-Remote-Codex-Agent-Instance, X-Remote-Codex-Agent-Lease, X-Remote-Codex-Upload-Token, X-Remote-Codex-Host-Id, X-Remote-Codex-Instance-Digest',
     });
     res.end();
     return;
@@ -12964,11 +14373,21 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    sendJson(res, 200, {
-      ok: true,
+    const persistence = state.sessionRecordStore?.readHealth?.() || {
+      status: 'starting',
+      writable: false,
+      revision: 0,
+      snapshotError: null,
+      error: null,
+    };
+    const ok = relayReady && persistence.status !== 'failed';
+    sendJson(res, ok ? 200 : 503, {
+      ok,
+      ready: relayReady,
       time: nowIso(),
       authRequired: Boolean(RELAY_AUTH_TOKEN),
       instanceId: RELAY_INSTANCE_ID,
+      persistence,
     });
     return;
   }
@@ -12978,7 +14397,7 @@ async function handleRequest(req, res) {
       sendJson(res, 200, {
         ok: true,
         update: getLocalUpdateStatus({ rootDir: process.cwd(), fetch: url.searchParams.get('fetch') !== '0' }),
-      });
+      }, { 'Cache-Control': 'no-store' });
     } catch (error) {
       sendJson(res, 500, {
         ok: false,
@@ -13371,22 +14790,42 @@ async function handleRequest(req, res) {
     }
 
     const body = await readBody(req);
-    upsertConnectorSecretsFromBody(connector.connectorId, body);
     const action = String(body.action || '').trim();
-    const requestOrigin = body.clientOrigin || (req.headers.host ? `http://${req.headers.host}` : '');
-    const actionConnector = (action === 'bootstrap' || action === 'restart')
-      ? connectorWithActionRelayOrigin(connector, requestOrigin)
-      : connector;
-    if ((action === 'bootstrap' || action === 'restart') && actionConnector.hostId) {
-      state.dismissedHosts.delete(actionConnector.hostId);
+    const activeAction = state.connectorActionsInFlight.get(connector.connectorId) || null;
+    if (activeAction) {
+      sendJson(res, 409, {
+        ok: false,
+        action,
+        status: 'connector_action_in_progress',
+        error: `Connector action ${activeAction.action || 'unknown'} is already running.`,
+        activeAction,
+      });
+      return;
     }
-    const actionSecret = buildConnectorActionSecret(connector.connectorId, body);
-    const askpassRecord = registerAskpassAction(connector.connectorId, action, actionSecret);
+    const actionLease = {
+      action,
+      startedAt: nowIso(),
+    };
+    state.connectorActionsInFlight.set(connector.connectorId, actionLease);
+    let askpassRecord = null;
     try {
+      upsertConnectorSecretsFromBody(connector.connectorId, body);
+      const requestOrigin = body.clientOrigin || (req.headers.host ? `http://${req.headers.host}` : '');
+      const actionConnector = (action === 'bootstrap' || action === 'restart')
+        ? connectorWithActionRelayOrigin(connector, requestOrigin)
+        : connector;
+      if ((action === 'bootstrap' || action === 'restart') && actionConnector.hostId) {
+        restoreDismissedHost(actionConnector.hostId);
+      }
+      const actionSecret = buildConnectorActionSecret(connector.connectorId, body);
+      askpassRecord = registerAskpassAction(connector.connectorId, action, actionSecret);
       const result = await runConnectorAction(actionConnector, action, actionSecret);
       sendJson(res, result.httpStatus, result.payload);
     } finally {
       closeAskpassAction(askpassRecord);
+      if (state.connectorActionsInFlight.get(connector.connectorId) === actionLease) {
+        state.connectorActionsInFlight.delete(connector.connectorId);
+      }
     }
     return;
   }
@@ -13399,7 +14838,9 @@ async function handleRequest(req, res) {
       'Access-Control-Allow-Origin': '*',
       'X-Accel-Buffering': 'no',
     });
-    writeSkillsEvent(res, 'ready', { ok: true, time: nowIso() });
+    if (!writeSkillsEvent(res, 'ready', { ok: true, time: nowIso() })) {
+      return;
+    }
     state.skillSubscribers.add(res);
     const ping = setInterval(() => {
       if (res.destroyed || res.writableEnded) {
@@ -13408,7 +14849,10 @@ async function handleRequest(req, res) {
         return;
       }
       try {
-        writeSkillsEvent(res, 'ping', { time: nowIso() });
+        if (!writeSkillsEvent(res, 'ping', { time: nowIso() })) {
+          state.skillSubscribers.delete(res);
+          clearInterval(ping);
+        }
       } catch (_) {
         state.skillSubscribers.delete(res);
         clearInterval(ping);
@@ -14366,6 +15810,51 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/activities$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const hostId = String(url.searchParams.get('hostId') || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const session = getSession(hostId, sessionId) || { sessionId };
+    const canonicalConversationKey = resolveCanonicalConversationKey(hostId, session);
+    const activityRecoveryToken = String(url.searchParams.get('activityToken') || '').trim();
+    if (activityRecoveryToken) {
+      if (activityRecoveryToken.length > 128) {
+        sendJson(res, 400, { error: 'activityToken is invalid' });
+        return;
+      }
+      const activity = state.activitySnapshots.activityByRecoveryToken(
+        canonicalConversationKey,
+        activityRecoveryToken
+      );
+      const summary = state.activitySnapshots.summary(canonicalConversationKey);
+      sendJson(res, 200, {
+        canonicalConversationKey,
+        streamEpoch: state.sessionEventStream.epoch,
+        activities: activity ? [activity] : [],
+        targeted: true,
+        revision: summary.revision,
+        totalCount: summary.count,
+        totalBytes: summary.totalBytes,
+      });
+      return;
+    }
+    const page = state.activitySnapshots.snapshotPage(canonicalConversationKey, {
+      cursor: url.searchParams.get('cursor'),
+      limit: url.searchParams.get('limit'),
+      maxBytes: url.searchParams.get('maxBytes'),
+      expectedRevision: url.searchParams.get('revision'),
+    });
+    sendJson(res, 200, {
+      canonicalConversationKey,
+      streamEpoch: state.sessionEventStream.epoch,
+      ...page,
+    }, { 'Cache-Control': 'no-store' });
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/detail$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
     const hostId = url.searchParams.get('hostId');
@@ -14412,6 +15901,7 @@ async function handleRequest(req, res) {
       : enqueueSessionUnwatch(hostId, sessionId, {
         clientId: url.searchParams.get('clientId') || '',
         viewId: url.searchParams.get('viewId') || '',
+        watchRevision: url.searchParams.get('watchRevision'),
       });
     sendJson(res, 200, { ok: true, command });
     return;
@@ -14572,7 +16062,7 @@ async function handleRequest(req, res) {
       return;
     }
 
-    state.dismissedHosts.delete(hostId);
+    restoreDismissedHost(hostId);
     const host = state.hosts.get(hostId) || {
       hostId,
       label: body.label || hostId,
@@ -14589,7 +16079,7 @@ async function handleRequest(req, res) {
 
   if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/import$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
-    state.dismissedHosts.delete(hostId);
+    restoreDismissedHost(hostId);
     const host = state.hosts.get(hostId) || {
       hostId,
       label: hostId,
@@ -14606,10 +16096,30 @@ async function handleRequest(req, res) {
 
   if (req.method === 'DELETE' && url.pathname.match(/^\/api\/hosts\/[^/]+$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    const localAgent = state.localAgents.get(hostId);
+    if (localAgent) {
+      stopLocalAgent(hostId, {
+        disableAutoRestart: true,
+        reason: 'host dismissed by operator',
+      });
+    }
     state.dismissedHosts.add(hostId);
+    saveDismissedHosts();
     state.hosts.delete(hostId);
+    // Keep a live Relay-managed Agent lease until its shutdown handshake exits.
+    // Its next heartbeat/register receives the dismissal signal and the Agent
+    // then exits; completeLocalAgentExit removes the lease. Remote hosts have
+    // no local process to wait for, so their lease can be discarded now.
+    if (!localAgent || !localAgentProcessIsAlive(localAgent)) {
+      state.hostAgentLeases.delete(hostId);
+    }
+    state.commandQueues.delete(hostId);
+    const removedCanonicalKeys = new Set();
     for (const key of Array.from(state.sessions.keys())) {
       if (key.startsWith(`${hostId}::`)) {
+        const session = state.sessions.get(key);
+        const canonicalKey = resolveCanonicalConversationKey(hostId, session || key.slice(hostId.length + 2));
+        if (canonicalKey) removedCanonicalKeys.add(canonicalKey);
         state.sessions.delete(key);
         state.sessionLogs.delete(key);
         state.sessionAlerts.delete(key);
@@ -14617,6 +16127,14 @@ async function handleRequest(req, res) {
         state.sessionDiagnostics.delete(key);
         state.sessionRequests.delete(key);
       }
+    }
+    for (const key of Array.from(state.sessionAliases.keys())) {
+      if (key.startsWith(`${hostId}::`)) {
+        state.sessionAliases.delete(key);
+      }
+    }
+    for (const canonicalKey of removedCanonicalKeys) {
+      state.activitySnapshots.deleteConversation(canonicalKey);
     }
     saveSessionLogs();
     scheduleSessionDiagnosticsSave(0);
@@ -14631,7 +16149,12 @@ async function handleRequest(req, res) {
       return;
     }
     if (state.dismissedHosts.has(body.hostId)) {
-      sendJson(res, 200, { ok: true, dismissed: true });
+      sendJson(res, 200, {
+        ok: true,
+        dismissed: true,
+        shutdown: true,
+        relayInstanceId: RELAY_INSTANCE_ID,
+      });
       return;
     }
     const localAgentRegistration = reconcileRegisteredLocalAgent(
@@ -14643,6 +16166,19 @@ async function handleRequest(req, res) {
       sendJson(res, 409, {
         error: localAgentRegistration.message,
         code: localAgentRegistration.code,
+      });
+      return;
+    }
+    const leaseRegistration = state.hostAgentLeases.register(
+      body.hostId,
+      body.agentInstanceId
+    );
+    if (!leaseRegistration.ok) {
+      sendJson(res, 409, {
+        error: leaseRegistration.message,
+        code: leaseRegistration.code,
+        retryAfterMs: leaseRegistration.retryAfterMs || null,
+        relayInstanceId: RELAY_INSTANCE_ID,
       });
       return;
     }
@@ -14668,14 +16204,27 @@ async function handleRequest(req, res) {
         : registeredQueue
     );
     reconcileSkillDeploymentsForHost(body.hostId, { includeRunning: true });
-    sendJson(res, 200, { ok: true, host, relayInstanceId: RELAY_INSTANCE_ID });
+    const publicLease = state.hostAgentLeases.publicLease(leaseRegistration.lease);
+    sendJson(res, 200, {
+      ok: true,
+      host,
+      relayInstanceId: RELAY_INSTANCE_ID,
+      agentLeaseId: publicLease?.leaseId || null,
+      agentLeaseExpiresAt: publicLease?.expiresAt || null,
+      agentLeaseTtlMs: publicLease?.ttlMs || null,
+    });
     return;
   }
 
   if (req.method === 'POST' && url.pathname === '/api/agent/heartbeat') {
     const body = await readBody(req);
     if (state.dismissedHosts.has(body.hostId)) {
-      sendJson(res, 200, { ok: true, dismissed: true });
+      sendJson(res, 200, {
+        ok: true,
+        dismissed: true,
+        shutdown: true,
+        relayInstanceId: RELAY_INSTANCE_ID,
+      });
       return;
     }
     if (body.hostId) {
@@ -14691,6 +16240,24 @@ async function handleRequest(req, res) {
         });
         return;
       }
+    }
+    const leaseCredentials = agentLeaseCredentials(req, {
+      agentInstanceId: body.agentInstanceId,
+      agentLeaseId: body.agentLeaseId,
+    });
+    const leaseHeartbeat = state.hostAgentLeases.heartbeat(
+      body.hostId,
+      body.agentInstanceId,
+      leaseCredentials.leaseId
+    );
+    if (!leaseHeartbeat.ok) {
+      sendJson(res, 409, {
+        error: leaseHeartbeat.message,
+        code: leaseHeartbeat.code,
+        retryAfterMs: leaseHeartbeat.retryAfterMs || null,
+        relayInstanceId: RELAY_INSTANCE_ID,
+      });
+      return;
     }
     const host = state.hosts.get(body.hostId);
     const hostWasKnown = Boolean(host);
@@ -14720,7 +16287,52 @@ async function handleRequest(req, res) {
     if (body.hostId) {
       reconcileSkillDeploymentsForHost(body.hostId, { includeRunning: !hostWasKnown });
     }
-    sendJson(res, 200, { ok: true, relayInstanceId: RELAY_INSTANCE_ID });
+    const publicLease = state.hostAgentLeases.publicLease(leaseHeartbeat.lease);
+    sendJson(res, 200, {
+      ok: true,
+      relayInstanceId: RELAY_INSTANCE_ID,
+      agentLeaseId: publicLease?.leaseId || null,
+      agentLeaseExpiresAt: publicLease?.expiresAt || null,
+      agentLeaseTtlMs: publicLease?.ttlMs || null,
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/agent/release') {
+    const body = await readBody(req);
+    const hostId = String(body.hostId || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const releaseAuthorization = authorizeAgentCommandPoll(hostId, req);
+    if (!releaseAuthorization.ok) {
+      sendJson(res, 409, {
+        error: releaseAuthorization.message,
+        code: releaseAuthorization.code,
+        relayInstanceId: RELAY_INSTANCE_ID,
+      });
+      return;
+    }
+    const credentials = agentLeaseCredentials(req, body);
+    const released = state.hostAgentLeases.release(
+      hostId,
+      credentials.agentInstanceId,
+      credentials.leaseId
+    );
+    if (!released.ok) {
+      sendJson(res, 409, {
+        error: released.message,
+        code: released.code,
+        relayInstanceId: RELAY_INSTANCE_ID,
+      });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      released: released.released,
+      relayInstanceId: RELAY_INSTANCE_ID,
+    });
     return;
   }
 
@@ -14735,6 +16347,7 @@ async function handleRequest(req, res) {
       sendJson(res, 409, {
         error: pollAuthorization.message,
         code: pollAuthorization.code,
+        relayInstanceId: RELAY_INSTANCE_ID,
       });
       return;
     }
@@ -14765,10 +16378,13 @@ async function handleRequest(req, res) {
       return;
     }
     try {
-      const plan = await planManagedLaunch(hostId, body);
-      const command = await enqueueManagedLaunch(plan, body);
+      const plan = await planManagedLaunch(hostId, body, { acceptClientRequestId: true });
+      const command = plan.idempotentReplay
+        ? queuedManagedLaunchCommand(hostId, plan.runId)
+        : await enqueueManagedLaunch(plan, body);
       sendJson(res, 200, {
         ok: true,
+        idempotentReplay: plan.idempotentReplay === true,
         sessionId: plan.targetSessionId,
         bridgeSessionId: plan.targetSessionId,
         runId: plan.runId,
@@ -14815,7 +16431,7 @@ async function handleRequest(req, res) {
       return;
     }
     try {
-      const { record, run, runId, catalogRunId } = sessionCatalogRunRecord(hostId, sessionId);
+      const { record, run, runId, catalogRunId, liveRunId } = sessionCatalogRunRecord(hostId, sessionId);
       if (!record || !run) {
         throw new SessionContractError(
           'session_history_unavailable',
@@ -14839,7 +16455,9 @@ async function handleRequest(req, res) {
         nativeThreadId: record.nativeThreadId || null,
         bindingFingerprint: binding.bindingFingerprint,
         runId: catalogRunId,
-        force: sessionAcceptsLiveControl(hostId, session),
+        liveRunId,
+        ...modelCatalogInputPolicy(null, binding),
+        force: run.status === 'live' && sessionAcceptsLiveControl(hostId, session),
       });
       sendJson(res, 200, {
         hostId,
@@ -14863,7 +16481,7 @@ async function handleRequest(req, res) {
       return;
     }
     try {
-      const { record, run, runId, catalogRunId } = sessionCatalogRunRecord(hostId, sessionId);
+      const { record, run, runId, catalogRunId, liveRunId } = sessionCatalogRunRecord(hostId, sessionId);
       if (!record || !run) {
         throw new SessionContractError(
           'session_history_unavailable',
@@ -14874,13 +16492,6 @@ async function handleRequest(req, res) {
       const sessionBinding = publicBinding(run.apiBinding);
       const apiConfig = normalizeApiConfig(body.apiConfig);
       const submittedBinding = makeSubmittedProfileBinding(apiConfig);
-      if (sessionBinding?.kind === 'profile' && !submittedBinding) {
-        throw new SessionContractError(
-          'session_api_binding_unavailable',
-          'The bound API profile is required to refresh provider models.',
-          { sessionBinding, canRebind: true }
-        );
-      }
       if (submittedBinding && !bindingsEqual(sessionBinding, submittedBinding)) {
         throw new SessionContractError(
           'session_api_binding_mismatch',
@@ -14888,6 +16499,19 @@ async function handleRequest(req, res) {
           { sessionBinding, submittedBinding, canRebind: true }
         );
       }
+      if (
+        submittedBinding?.providerKind
+        && sessionBinding?.providerKind
+        && submittedBinding.providerKind !== sessionBinding.providerKind
+      ) {
+        throw new SessionContractError(
+          'session_api_binding_mismatch',
+          'Submitted provider policy differs from the live Session run.',
+          { sessionBinding, submittedBinding, canRebind: true }
+        );
+      }
+      // Browser credentials may have rotated; a live refresh can only trust the
+      // model metadata reported by the already-running app-server.
       const catalog = await state.modelCatalog.get({
         hostId,
         identity: { hostId, sessionId },
@@ -14895,7 +16519,8 @@ async function handleRequest(req, res) {
         nativeThreadId: record.nativeThreadId || null,
         bindingFingerprint: sessionBinding?.bindingFingerprint,
         runId: catalogRunId,
-        apiConfig,
+        liveRunId,
+        ...modelCatalogInputPolicy(null, sessionBinding),
         force: true,
       });
       sendJson(res, 200, {
@@ -14907,6 +16532,27 @@ async function handleRequest(req, res) {
       });
     } catch (error) {
       sendSessionContractError(res, error, 'refresh-model-catalog');
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/rebind\/validate$/)) {
+    const sourceSessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const body = await readBody(req);
+    const hostId = String(body.hostId || '').trim();
+    if (!hostId) {
+      sendJson(res, 400, { error: 'hostId is required' });
+      return;
+    }
+    const hostError = getHostUnavailableError(hostId);
+    if (hostError) {
+      sendJson(res, hostError.statusCode, { error: hostError.error });
+      return;
+    }
+    try {
+      sendJson(res, 200, await validateManagedRebind(hostId, sourceSessionId, body));
+    } catch (error) {
+      sendSessionContractError(res, error, 'validate-rebind');
     }
     return;
   }
@@ -14925,10 +16571,12 @@ async function handleRequest(req, res) {
       return;
     }
     try {
+      const currentRun = sessionRunRecord(hostId, sourceSessionId).run;
+      const launchMode = currentRun?.nativeResumeReady === false ? 'fresh_rebind' : 'resume';
       const plan = await planManagedLaunch(hostId, body, {
         sourceSessionId,
         targetSessionId: sourceSessionId,
-        launchMode: 'resume',
+        launchMode,
         explicitRebind: true,
       });
       const command = await enqueueManagedLaunch(plan, body);
@@ -14937,13 +16585,20 @@ async function handleRequest(req, res) {
         sessionId: plan.targetSessionId,
         bridgeSessionId: plan.targetSessionId,
         runId: plan.runId,
-        nativeThreadId: plan.nativeThreadId,
+        nativeThreadId: plan.launchMode === 'resume' ? plan.nativeThreadId : null,
         originSessionId: plan.originSessionId,
         sourceSessionId: plan.sourceSessionId,
         conversationKey: plan.conversationKey,
         launchMode: plan.launchMode,
         sessionBinding: publicBinding(plan.planned.run.apiBinding),
         requestedSelection: plan.planned.run.requestedSelection,
+        modelCatalog: plan.catalog ? {
+          hostId,
+          sessionId: plan.targetSessionId,
+          runId: plan.runId,
+          sessionBinding: publicBinding(plan.planned.run.apiBinding),
+          ...publicModelCatalog(plan.catalog),
+        } : null,
         command: publicQueuedCommand(command),
       });
     } catch (error) {
@@ -15020,8 +16675,14 @@ async function handleRequest(req, res) {
     }
 
     const body = await readBody(req);
-    const apiConfig = normalizeApiConfig(body.apiConfig);
-    if (!apiConfig || (!apiConfig.baseUrl && !apiConfig.apiKey)) {
+    let apiConfig;
+    try {
+      apiConfig = normalizeApiConfig(body.apiConfig);
+    } catch (error) {
+      sendSessionContractError(res, error, 'validate-api-profile');
+      return;
+    }
+    if (!apiConfig) {
       sendJson(res, 400, { error: 'API Base URL or API Key is required before testing this host' });
       return;
     }
@@ -15033,6 +16694,9 @@ async function handleRequest(req, res) {
       requestId,
       apiConfig,
       timeoutMs: Number(body.timeoutMs || 15000) || 15000,
+      cursor: String(body.cursor || '').trim() || null,
+      limit: Math.max(1, Math.min(500, Number(body.limit || 200) || 200)),
+      includeLimit: body.includeLimit === true,
     });
 
     try {
@@ -15200,6 +16864,7 @@ async function handleRequest(req, res) {
       codexOptions: {
         model: String(body.model || '').trim() || null,
         effort: String(body.effort || '').trim() || null,
+        allowUnverifiedEffort: body.allowUnverifiedEffort === true,
         summary: String(body.summary || '').trim() || null,
         mode: String(body.mode || '').trim() || null,
         approvalPolicy: typeof body.approvalPolicy === 'object' ? body.approvalPolicy : String(body.approvalPolicy || '').trim() || null,
@@ -15746,34 +17411,56 @@ async function handleRequest(req, res) {
       || url.searchParams.get('cursor')
       || ''
     ).trim();
-    const assistantAfter = url.searchParams.get('assistantAfter');
     addSessionSubscriber(canonicalKey, res, {
       optimize,
       cursor,
-      makeReset: (currentCanonicalKey) => ({
-        session: sessionWithAssistantProjection(getSession(hostId, sessionId)),
-        assistantProjection: assistantProjectionForIdentity(hostId, identity, {
-          afterSeq: assistantAfter,
-          limit: 100,
-        }),
-        activities: state.activitySnapshots.snapshot(currentCanonicalKey),
-      }),
+      makeReset: (currentCanonicalKey) => {
+        const currentSession = getSession(hostId, sessionId);
+        const activitySummary = state.activitySnapshots.summary(currentCanonicalKey);
+        return {
+          session: boundedSessionResetRecord(currentSession),
+          assistantProjection: boundedSessionResetAssistantProjection(
+            currentSession?.assistantProjection
+          ),
+          activities: [],
+          activitiesTruncated: activitySummary.count > 0,
+          activityCount: activitySummary.count,
+        };
+      },
     });
+    if (
+      res.destroyed
+      || res.writableEnded
+      || !state.sessionEventStream.has(canonicalKey)
+    ) {
+      removeSessionSubscriber(res);
+      return;
+    }
     const stream = state.sessionEventStream.ensure(canonicalKey);
-    res.write(`event: ready\ndata: ${JSON.stringify({
+    if (!writeSseEvent(res, 'ready', {
       ok: true,
       hostId,
       sessionId,
       canonicalConversationKey: canonicalKey,
       streamEpoch: state.sessionEventStream.epoch,
-      cursor: `${state.sessionEventStream.epoch}:${stream.counter}`,
-    })}\n\n`);
+      cursor: `${stream.cursorEpoch}:${stream.counter}`,
+    })) {
+      removeSessionSubscriber(res);
+      return;
+    }
 
     const ping = setInterval(() => {
-      if (!res.destroyed && !res.writableEnded) {
-        res.write(`event: ping\ndata: ${JSON.stringify({ time: nowIso() })}\n\n`);
+      if (res.destroyed || res.writableEnded) {
+        clearInterval(ping);
+        removeSessionSubscriber(res);
+        return;
+      }
+      if (!writeSseEvent(res, 'ping', { time: nowIso() })) {
+        clearInterval(ping);
+        removeSessionSubscriber(res);
       }
     }, 20_000);
+    ping.unref?.();
 
     req.on('close', () => {
       clearInterval(ping);
@@ -15783,7 +17470,7 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/agent/events') {
-    const body = await readBody(req);
+    const body = await readBody(req, MAX_AGENT_EVENT_BODY_BYTES);
     const events = Array.isArray(body.events) ? body.events : body.event ? [body.event] : [];
     const batchScope = validateAgentEventBatchScope(events);
     if (!batchScope.ok) {
@@ -15795,70 +17482,121 @@ async function handleRequest(req, res) {
       sendJson(res, 409, {
         error: eventAuthorization.message,
         code: eventAuthorization.code,
+        relayInstanceId: RELAY_INSTANCE_ID,
       });
       return;
     }
-    const batchKey = makeAgentEventBatchKey(body.batchId, events);
-    const batchDigest = batchKey ? makeAgentEventBatchDigest(events) : null;
-    const appliedBatch = batchKey ? state.appliedAgentEventBatches.get(batchKey) : null;
-    if (appliedBatch && appliedBatch.digest !== batchDigest) {
-      sendJson(res, 409, {
-        error: 'Agent event batch ID was reused with different events.',
-        code: 'agent_event_batch_id_conflict',
-      });
-      return;
-    }
-    if (appliedBatch) {
-      sendJson(res, 200, { ok: true, count: events.length, duplicate: true });
-      return;
-    }
-    const pendingBatch = batchKey ? state.pendingAgentEventBatches.get(batchKey) : null;
-    if (pendingBatch && pendingBatch.digest !== batchDigest) {
-      sendJson(res, 409, {
-        error: 'Agent event batch ID is already applying different events.',
-        code: 'agent_event_batch_id_conflict',
-      });
-      return;
-    }
-    let application = pendingBatch?.promise || null;
-    const duplicate = Boolean(pendingBatch);
-    if (!application) {
-      application = (async () => {
-        let appliedCount = 0;
-        try {
-          for (const event of events) {
-            await applyAgentEvent(event);
-            appliedCount += 1;
-          }
-        } catch (error) {
-          return { ok: false, error, appliedCount };
-        }
-        if (batchKey) rememberAppliedAgentEventBatch(batchKey, batchDigest);
-        return { ok: true, appliedCount };
-      })();
-      if (batchKey) {
-        state.pendingAgentEventBatches.set(batchKey, { digest: batchDigest, promise: application });
+    try {
+      const batchKey = makeAgentEventBatchKey(body.batchId, events);
+      const batchDigest = batchKey ? makeAgentEventBatchDigest(events) : null;
+      const appliedBatch = batchKey ? state.appliedAgentEventBatches.get(batchKey) : null;
+      if (appliedBatch && appliedBatch.digest !== batchDigest) {
+        sendJson(res, 409, {
+          error: 'Agent event batch ID was reused with different events.',
+          code: 'agent_event_batch_id_conflict',
+          relayInstanceId: RELAY_INSTANCE_ID,
+        });
+        return;
       }
-    }
-    const outcome = await application;
-    if (
-      !duplicate
-      && batchKey
-      && state.pendingAgentEventBatches.get(batchKey)?.promise === application
-    ) {
-      state.pendingAgentEventBatches.delete(batchKey);
-    }
-    if (!outcome.ok) {
-      sendJson(res, 409, {
-        error: outcome.error?.message || 'Agent event batch application failed.',
-        code: 'agent_event_batch_apply_failed',
-        appliedCount: outcome.appliedCount,
-        failedEventIndex: outcome.appliedCount,
+      if (appliedBatch) {
+        sendJson(res, 200, {
+          ok: true,
+          count: events.length,
+          duplicate: true,
+          relayInstanceId: RELAY_INSTANCE_ID,
+        });
+        return;
+      }
+      const partialBatch = batchKey ? state.partialAgentEventBatches.get(batchKey) : null;
+      if (partialBatch && partialBatch.digest !== batchDigest) {
+        sendJson(res, 409, {
+          error: 'Agent event batch ID was reused with different events.',
+          code: 'agent_event_batch_id_conflict',
+          relayInstanceId: RELAY_INSTANCE_ID,
+        });
+        return;
+      }
+      const pendingBatch = batchKey ? state.pendingAgentEventBatches.get(batchKey) : null;
+      if (pendingBatch && pendingBatch.digest !== batchDigest) {
+        sendJson(res, 409, {
+          error: 'Agent event batch ID is already applying different events.',
+          code: 'agent_event_batch_id_conflict',
+          relayInstanceId: RELAY_INSTANCE_ID,
+        });
+        return;
+      }
+      let application = pendingBatch?.promise || null;
+      const duplicate = Boolean(pendingBatch);
+      if (!application) {
+        application = (async () => {
+          let appliedCount = Math.max(
+            0,
+            Math.min(events.length, Number(partialBatch?.appliedCount || 0))
+          );
+          try {
+            for (let index = appliedCount; index < events.length; index += 1) {
+              const event = events[index];
+              await applyAgentEvent(event);
+              appliedCount = index + 1;
+            }
+            if (batchKey) {
+              // The dedupe checkpoint must never outrun transcript/diagnostic
+              // persistence. Otherwise a restart could discard an accepted
+              // event whose response was lost before its deferred save ran.
+              await flushAgentEventBatchPersistence();
+              rememberAppliedAgentEventBatch(batchKey, batchDigest);
+            }
+          } catch (error) {
+            if (batchKey && appliedCount > 0) {
+              try {
+                // Keep the in-flight batch registered until this durable
+                // checkpoint attempt settles. Concurrent retries must join the
+                // same Promise instead of reapplying the accepted prefix.
+                await flushAgentEventBatchPersistence();
+                rememberPartialAgentEventBatch(batchKey, batchDigest, appliedCount);
+              } catch (checkpointError) {
+                if (checkpointError !== error && !checkpointError.cause) {
+                  checkpointError.cause = error;
+                }
+                return { ok: false, error: checkpointError, appliedCount };
+              }
+            }
+            return { ok: false, error, appliedCount };
+          }
+          return { ok: true, appliedCount };
+        })();
+        if (batchKey) {
+          state.pendingAgentEventBatches.set(batchKey, { digest: batchDigest, promise: application });
+        }
+      }
+      const outcome = await application;
+      if (
+        !duplicate
+        && batchKey
+        && state.pendingAgentEventBatches.get(batchKey)?.promise === application
+      ) {
+        state.pendingAgentEventBatches.delete(batchKey);
+      }
+      if (!outcome.ok) {
+        sendJson(res, 409, {
+          error: outcome.error?.message || 'Agent event batch application failed.',
+          code: 'agent_event_batch_apply_failed',
+          appliedCount: outcome.appliedCount,
+          failedEventIndex: outcome.appliedCount,
+          relayInstanceId: RELAY_INSTANCE_ID,
+        });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        count: events.length,
+        duplicate,
+        relayInstanceId: RELAY_INSTANCE_ID,
       });
       return;
+    } finally {
+      eventAuthorization.release?.();
     }
-    sendJson(res, 200, { ok: true, count: events.length, duplicate });
-    return;
   }
 
   if (req.method === 'GET' && serveStatic(req, res, url.pathname)) {
@@ -15892,10 +17630,14 @@ function makeAgentEventBatchDigest(events) {
 }
 
 function rememberAppliedAgentEventBatch(batchKey, digest) {
-  state.appliedAgentEventBatches.set(batchKey, { digest, appliedAt: Date.now() });
-  while (state.appliedAgentEventBatches.size > AGENT_EVENT_BATCH_DEDUPE_LIMIT) {
-    state.appliedAgentEventBatches.delete(state.appliedAgentEventBatches.keys().next().value);
+  state.agentEventLedger.recordApplied(batchKey, digest);
+}
+
+function rememberPartialAgentEventBatch(batchKey, digest, appliedCount) {
+  if (!batchKey || !digest || !Number.isSafeInteger(appliedCount) || appliedCount <= 0) {
+    return;
   }
+  state.agentEventLedger.recordPartial(batchKey, digest, appliedCount);
 }
 
 async function commitStartedSessionProvenance(event, currentSession = null) {
@@ -15998,6 +17740,18 @@ async function commitStartedSessionProvenance(event, currentSession = null) {
         }
       );
     }
+    if (
+      host?.capabilities?.nativeResumeReadiness === true
+      && event.runtime?.nativeResumeReady === true
+      && run.nativeResumeReady !== true
+    ) {
+      const readiness = await state.provenance.confirmNativeResumeReady({
+        identity: { hostId: event.hostId, sessionId: bridgeSessionId || lookupSessionId },
+        runId,
+      });
+      record = readiness.record;
+      run = record.runs?.[runId] || run;
+    }
     return {
       record,
       runId,
@@ -16022,6 +17776,10 @@ async function commitStartedSessionProvenance(event, currentSession = null) {
     cwd: event.cwd || currentSession?.cwd || null,
     title: event.title || currentSession?.title || '',
     effectiveBinding: effectiveBinding || run.apiBinding,
+    launchMode: event.launchMode || null,
+    nativeResumeReady: host?.capabilities?.nativeResumeReadiness === true
+      ? event.runtime?.nativeResumeReady === true
+      : true,
     effectiveSelection: event.effectiveSelection || {
       model: event.model || null,
       effort: event.effort || null,
@@ -16143,7 +17901,7 @@ async function applyAgentEvent(event) {
     const accepted = state.activitySnapshots.accept(
       state.sessionEventStream.epoch,
       canonicalKey,
-      event
+      stripSecrets(event)
     );
     if (accepted) {
       publishCanonicalSessionEvent(canonicalKey, 'session.activity', {
@@ -16194,13 +17952,17 @@ async function applyAgentEvent(event) {
         && run.apiBinding?.bindingFingerprint
       );
     };
-    const liveSessionIds = new Set();
+    const publishedLiveSessionIds = new Set();
+    const managedRunPresence = new Map();
     for (const discoveredSession of sessions) {
+      noteManagedDiscoveryRunPresence(managedRunPresence, discoveredSession, {
+        allowRunlessWildcard: host?.capabilities?.runApiBinding !== true,
+      });
       if (!discoveryPublishesLive(discoveredSession)) {
         continue;
       }
       for (const identity of sessionOwnershipIdentityValues(discoveredSession)) {
-        liveSessionIds.add(identity);
+        publishedLiveSessionIds.add(identity);
       }
     }
     for (const session of sessions) {
@@ -16289,7 +18051,7 @@ async function applyAgentEvent(event) {
       const current = getSession(event.hostId, session.sessionId) || existing;
       const publishDiscoveredLive = discoveryPublishesLive(session, mergedDiscovery.record);
       const isCurrentlyLive = publishDiscoveredLive
-        && sessionOwnershipIdentityValues(session).some((identity) => liveSessionIds.has(identity));
+        && sessionOwnershipIdentityValues(session).some((identity) => publishedLiveSessionIds.has(identity));
       const preserveManagedState = current
         && current.source === 'managed'
         && (current.live || current.state === 'starting')
@@ -16362,7 +18124,7 @@ async function applyAgentEvent(event) {
       }
       broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
     }
-    await closeManagedSessionsMissingFromDiscovery(event.hostId, liveSessionIds, {
+    await closeManagedSessionsMissingFromDiscovery(event.hostId, managedRunPresence, {
       discoveryId: event.discoveryId || null,
     });
     return;
@@ -16877,6 +18639,33 @@ async function applyAgentEvent(event) {
     const durableActiveRun = durableActiveRunId
       ? startedRecord?.runs?.[durableActiveRunId] || null
       : null;
+    const announcedRunId = String(event.runId || '').trim();
+    const boundNativeThreadId = String(startedRecord?.nativeThreadId || '').trim();
+    const announcedNativeThreadId = String(event.nativeThreadId || effectiveSessionId || '').trim();
+    if (
+      announcedRunId
+      && durableActiveRunId === announcedRunId
+      && durableActiveRun?.status === 'live'
+      && boundNativeThreadId
+      && announcedNativeThreadId
+      && boundNativeThreadId !== announcedNativeThreadId
+    ) {
+      appendSessionDiagnostic(event.hostId, boundNativeThreadId, {
+        severity: 'info',
+        source: 'relay',
+        kind: 'lifecycle',
+        method: 'session.started/ignored-duplicate-native',
+        message: `Ignored duplicate start for run ${announcedRunId} from native thread ${announcedNativeThreadId}; the run is already bound to ${boundNativeThreadId}.`,
+        data: {
+          runId: announcedRunId,
+          acceptedNativeThreadId: boundNativeThreadId,
+          ignoredNativeThreadId: announcedNativeThreadId,
+          bridgeSessionId: event.bridgeSessionId || startedRecord?.bridgeSessionId || null,
+        },
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
     const currentRunId = ['pending', 'live'].includes(durableActiveRun?.status)
       ? durableActiveRunId
       : bridgeSession?.runId || currentSession?.runId || null;
@@ -16984,9 +18773,6 @@ async function applyAgentEvent(event) {
       broadcastSessionEvent(event.hostId, failureSessionId, 'session.state_changed', failed);
       broadcastSessionEvent(event.hostId, failureSessionId, 'session.snapshot', failed);
       return;
-    }
-    if (bridgeSessionId) {
-      rememberSessionAlias(event.hostId, bridgeSessionId, effectiveSessionId);
     }
     const runId = confirmedProvenance.runId || event.runId || bridgeSession?.runId || currentSession?.runId || null;
     const confirmedRun = confirmedProvenance.run || confirmedProvenance.record?.runs?.[runId] || null;
@@ -17377,6 +19163,7 @@ async function applyAgentEvent(event) {
         connection: 'closed',
         busy: false,
         activeTurnId: null,
+        currentTurnStatus: 'closed',
         waitingOnApproval: false,
         waitingOnUserInput: false,
         runId: event.runId || existingRunId || null,
@@ -17419,6 +19206,16 @@ async function applyAgentEvent(event) {
     if (isStaleSessionRunEvent(event, effectiveSessionId)) {
       return;
     }
+    if (
+      event.patch?.nativeResumeReady === true
+      && event.runId
+      && state.hosts.get(event.hostId)?.capabilities?.nativeResumeReadiness === true
+    ) {
+      await state.provenance.confirmNativeResumeReady({
+        identity: { hostId: event.hostId, sessionId: effectiveSessionId },
+        runId: event.runId,
+      });
+    }
     if (eventTargetsPublishedParentRun(event, effectiveSessionId)) {
       return;
     }
@@ -17433,8 +19230,14 @@ async function applyAgentEvent(event) {
       lastUpdatedAt: event.timestamp || nowIso(),
       nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
     });
+    const runtimePatch = runtimePatchWithPendingStopPriority(
+      event.hostId,
+      effectiveSessionId,
+      event.runId,
+      event.patch || {}
+    );
     const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
-      ...(event.patch || {}),
+      ...runtimePatch,
       updatedAt: event.timestamp || nowIso(),
     });
     maybeClearGoalAutoApproveForRuntime(event.hostId, effectiveSessionId, runtime);
@@ -17506,7 +19309,13 @@ async function applyAgentEvent(event) {
       message: event.message || '',
       detail: event.detail || null,
       data: event.data || null,
+      runId: event.runId || event.data?.runId || null,
       turnId: event.turnId || event.data?.turnId || null,
+      itemId: event.itemId || event.data?.itemId || null,
+      callId: event.callId || event.data?.callId || null,
+      requestId: event.requestId || event.data?.requestId || null,
+      status: event.status || event.data?.status || null,
+      final: event.final === true,
       timestamp: event.timestamp || nowIso(),
     });
     return;
@@ -17529,6 +19338,10 @@ async function applyAgentEvent(event) {
       summary: event.summary || null,
       payload: event.payload || null,
       response: event.response || null,
+      runId: event.runId || event.payload?.runId || null,
+      turnId: event.turnId || event.payload?.turnId || null,
+      itemId: event.itemId || event.payload?.itemId || null,
+      callId: event.callId || event.payload?.callId || null,
     };
     emitSessionRequest(event.hostId, effectiveSessionId, requestEntry);
     maybeAutoApproveSessionRequest(event.hostId, effectiveSessionId, requestEntry);
@@ -17571,6 +19384,27 @@ async function applyAgentEvent(event) {
       markSessionClosed(event.hostId, effectiveSessionId);
       return;
     }
+    if (isDuplicateManagedStartFailureError(event, effectiveSessionId, message)) {
+      emitSessionDiagnostic(event.hostId, effectiveSessionId, {
+        severity: 'info',
+        source: 'relay',
+        kind: 'lifecycle',
+        method: 'session.error/suppressed-duplicate-start-failure',
+        message: `Suppressed duplicate runtime error after the structured start failure for run ${event.runId}.`,
+        detail: message,
+        data: {
+          runId: event.runId,
+          duplicateOf: 'session.command_failed',
+        },
+        timestamp: event.timestamp || nowIso(),
+      });
+      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.error', {
+        ...event,
+        duplicateAlertSuppressed: true,
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
 
     emitSessionAlert(event.hostId, effectiveSessionId, {
       severity: 'error',
@@ -17594,6 +19428,8 @@ async function applyAgentEvent(event) {
       severity: event.severity || 'warning',
       source: event.source || 'runtime',
       message: event.message || '',
+      transient: event.transient === true,
+      turnId: event.turnId || null,
       timestamp: event.timestamp || nowIso(),
     });
     return;
@@ -17641,7 +19477,7 @@ function hydrateSessionMetadataCacheFromStore() {
   const cache = new Map(state.sessionMetadata);
   const canonicalSessions = new Map();
   for (const [canonicalKey, record] of Object.entries(snapshot.records || {})) {
-    if (!record?.hostId || !record.title) {
+    if (!record?.hostId || !record.title || state.dismissedHosts.has(record.hostId)) {
       continue;
     }
     const identities = getSessionTitleIdentities(null, record);
@@ -17820,6 +19656,10 @@ async function startRelay() {
       store: state.sessionRecordStore,
       fetchLivePage: requestLiveModelPage,
       fetchProviderPage: requestProviderModelPage,
+      overrides: [{
+        ...providerCapabilities.createAdvisoryOverrideSource('openai'),
+        providerKind: 'openai',
+      }],
       now: nowIso,
     });
     state.skillAudit = new SkillAuditLog({
@@ -17974,12 +19814,7 @@ async function flushRelayPersistence() {
   }
   sessionDiagnosticsSavePending = true;
   try {
-    do {
-      await flushSessionDiagnosticsSave();
-      if (sessionDiagnosticsSaveInFlight) {
-        await sessionDiagnosticsSaveInFlight;
-      }
-    } while (sessionDiagnosticsSavePending || sessionDiagnosticsSaveInFlight);
+    await flushSessionDiagnosticsSave();
     if (sessionDiagnosticsSaveError) {
       throw sessionDiagnosticsSaveError;
     }

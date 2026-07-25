@@ -469,6 +469,37 @@ assert.strictEqual(retryStore.flush(), true, 'a failed receipt save must remain 
 assert.strictEqual(successfulFailureEvents, 1);
 assert.strictEqual(new ReceiptStore({ load: () => failingStorage, now }).has('retry::one'), true);
 
+let quotaReceiptSaves = 0;
+let quotaReceiptPersistErrors = 0;
+let quotaReceiptDisabled = 0;
+const quotaReceiptStore = new ReceiptStore({
+  load: () => '',
+  save: () => {
+    quotaReceiptSaves += 1;
+    throw Object.assign(
+      new Error("Failed to execute 'setItem' on 'Storage': exceeded the quota."),
+      { name: 'QuotaExceededError' }
+    );
+  },
+  onPersistError: () => { quotaReceiptPersistErrors += 1; },
+  onPersistenceDisabled: () => { quotaReceiptDisabled += 1; },
+  now,
+});
+assert.doesNotThrow(() => quotaReceiptStore.set({
+  ...emptyReceipt('quota-receipt::one', now),
+  notifiedThroughAssistantSeq: 1,
+}));
+assert.strictEqual(quotaReceiptSaves, 1, 'receipt quota must make one storage attempt');
+assert.strictEqual(quotaReceiptPersistErrors, 0, 'receipt quota must not enter the ordinary retry path');
+assert.strictEqual(quotaReceiptDisabled, 1, 'receipt quota must switch to in-memory tracking');
+assert.strictEqual(quotaReceiptStore.isPersistenceDisabled(), true);
+quotaReceiptStore.set({
+  ...quotaReceiptStore.get('quota-receipt::one'),
+  notifiedThroughAssistantSeq: 2,
+});
+assert.strictEqual(quotaReceiptSaves, 1, 'in-memory receipt tracking must not retry localStorage writes');
+assert.strictEqual(quotaReceiptStore.get('quota-receipt::one').notifiedThroughAssistantSeq, 2);
+
 let readFailureStorage = JSON.stringify({
   version: 3,
   receipts: {

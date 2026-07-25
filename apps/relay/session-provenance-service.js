@@ -1,4 +1,5 @@
 const {
+  bindingFingerprint,
   bindingsEqual,
   makeHostEnvironmentBinding,
   makeProfileBinding,
@@ -58,9 +59,12 @@ function identityValues(input = {}, options = {}) {
 }
 
 function cloneSelection(selection, fallbackSource = 'inherit') {
+  const effort = String(selection?.effort || '').trim() || null;
   return {
     model: String(selection?.model || '').trim() || null,
-    effort: String(selection?.effort || '').trim() || null,
+    effort,
+    summary: String(selection?.summary || '').trim() || null,
+    ...(effort && selection?.allowUnverifiedEffort === true ? { allowUnverifiedEffort: true } : {}),
     source: String(selection?.source || fallbackSource).trim() || fallbackSource,
   };
 }
@@ -114,7 +118,7 @@ function assertRunMutationExpectation(record, input = {}) {
         statusCode: 409,
         currentRunId: activeRunId,
         currentRunStatus: 'stopping',
-        currentBindingFingerprint: activeRun.apiBinding?.bindingFingerprint || null,
+        currentBindingFingerprint: bindingFingerprint(activeRun.apiBinding),
       }
     );
   }
@@ -122,7 +126,7 @@ function assertRunMutationExpectation(record, input = {}) {
     ? activeRunId
     : String(record?.latestSuccessfulRunId || activeRunId || '').trim() || null;
   const currentRun = currentRunId ? record?.runs?.[currentRunId] || null : null;
-  const currentBindingFingerprint = currentRun?.apiBinding?.bindingFingerprint || null;
+  const currentBindingFingerprint = bindingFingerprint(currentRun?.apiBinding);
   const currentRunStatus = String(currentRun?.status || '').trim() || null;
   const expectedBindingFingerprint = String(input.expectedBindingFingerprint || '').trim() || null;
   if (
@@ -159,8 +163,8 @@ function mergeRuns(strongerRuns = {}, weakerRuns = {}) {
     if (!strongerRun || !weakerRun) {
       continue;
     }
-    const strongerFingerprint = strongerRun.apiBinding?.bindingFingerprint || null;
-    const weakerFingerprint = weakerRun.apiBinding?.bindingFingerprint || null;
+    const strongerFingerprint = bindingFingerprint(strongerRun.apiBinding);
+    const weakerFingerprint = bindingFingerprint(weakerRun.apiBinding);
     if (strongerFingerprint && weakerFingerprint && strongerFingerprint !== weakerFingerprint) {
       throw new SessionContractError(
         'session_run_conflict',
@@ -173,6 +177,22 @@ function mergeRuns(strongerRuns = {}, weakerRuns = {}) {
         ...weakerRun,
         ...strongerRun,
         apiBinding: weakerRun.apiBinding,
+      };
+    }
+    if (
+      typeof strongerRun.nativeResumeReady === 'boolean'
+      || typeof weakerRun.nativeResumeReady === 'boolean'
+    ) {
+      merged[runId] = {
+        ...merged[runId],
+        nativeResumeReady: strongerRun.nativeResumeReady === true
+          || weakerRun.nativeResumeReady === true,
+      };
+    }
+    if (strongerRun.rebindFallbackAllowed === true || weakerRun.rebindFallbackAllowed === true) {
+      merged[runId] = {
+        ...merged[runId],
+        rebindFallbackAllowed: true,
       };
     }
   }
@@ -251,16 +271,52 @@ class SessionProvenanceService {
   planRun(input = {}) {
     const runId = String(input.runId || '').trim();
     const launchMode = String(input.launchMode || 'fresh').trim();
+    const clientRequestId = String(input.clientRequestId || '').trim();
+    const requestFingerprint = String(input.requestFingerprint || '').trim();
     if (!runId) {
       throw new TypeError('planRun requires runId');
     }
+    if (clientRequestId && !requestFingerprint) {
+      throw new TypeError('planRun requires requestFingerprint with clientRequestId');
+    }
     return this.store.transact('session.run.planned', (tx) => {
+      if (launchMode === 'fresh_rebind' && input.explicitRebind !== true) {
+        throw new SessionContractError(
+          'session_run_state_conflict',
+          'fresh_rebind is reserved for an explicit Rebind of the same Session.',
+          { statusCode: 409 }
+        );
+      }
       const targetKey = tx.resolveCanonicalKey(input.identity);
       const sourceKey = input.sourceIdentity
         ? tx.resolveCanonicalKey(input.sourceIdentity)
         : targetKey;
       const targetRecord = tx.getRecord(targetKey);
       const sourceRecord = tx.getRecord(sourceKey);
+      const acceptedRequestEntry = clientRequestId
+        ? Object.entries(targetRecord?.runs || {}).find(([, run]) => run?.clientRequestId === clientRequestId)
+        : null;
+      if (acceptedRequestEntry) {
+        const [acceptedRunId, acceptedRun] = acceptedRequestEntry;
+        const replaysAcceptedRequest = acceptedRunId === runId
+          && acceptedRun.requestFingerprint === requestFingerprint;
+        if (replaysAcceptedRequest) {
+          return {
+            canonicalKey: targetKey,
+            run: structuredClone(acceptedRun),
+            record: structuredClone(targetRecord),
+            idempotentReplay: true,
+          };
+        }
+        throw new SessionContractError(
+          'session_request_conflict',
+          'This Session creation request ID was already used with different launch settings.',
+          { statusCode: 409, currentRunId: acceptedRunId, currentRunStatus: acceptedRun.status || null }
+        );
+      }
+      if (targetRecord?.runs?.[runId]) {
+        throw new SessionContractError('session_run_conflict', `Run ${runId} already exists.`);
+      }
       const pendingRunId = String(targetRecord?.activeRunId || '').trim();
       const pendingRun = pendingRunId ? targetRecord?.runs?.[pendingRunId] : null;
       if (pendingRun?.status === 'pending') {
@@ -277,10 +333,11 @@ class SessionProvenanceService {
           { statusCode: 409, currentRunId: pendingRunId, currentRunStatus: 'stopping' }
         );
       }
-      if (
-        pendingRun?.status === 'live'
-        && !(launchMode === 'resume' && targetKey === sourceKey)
-      ) {
+      const replacesSameSession = targetKey === sourceKey && (
+        launchMode === 'resume'
+        || (launchMode === 'fresh_rebind' && input.explicitRebind === true)
+      );
+      if (pendingRun?.status === 'live' && !replacesSameSession) {
         throw new SessionContractError(
           'session_run_state_conflict',
           `Run ${pendingRunId} is already live for the target Session.`,
@@ -288,7 +345,7 @@ class SessionProvenanceService {
             statusCode: 409,
             currentRunId: pendingRunId,
             currentRunStatus: 'live',
-            currentBindingFingerprint: pendingRun.apiBinding?.bindingFingerprint || null,
+            currentBindingFingerprint: bindingFingerprint(pendingRun.apiBinding),
           }
         );
       }
@@ -306,6 +363,11 @@ class SessionProvenanceService {
         ? null
         : sourceRecord?.latestSuccessfulRunId || sourceRecord?.activeRunId || null;
       const inheritedRun = inheritedRunId ? sourceRecord?.runs?.[inheritedRunId] : null;
+      const effectiveLaunchMode = (
+        launchMode === 'fresh_rebind'
+        && input.explicitRebind === true
+        && inheritedRun?.nativeResumeReady === true
+      ) ? 'resume' : launchMode;
       const submittedBinding = publicBinding(input.submittedBinding);
 
       if (
@@ -344,14 +406,17 @@ class SessionProvenanceService {
         conversationKey: input.identity.conversationKey || input.identity.sessionId,
         source: 'managed',
       });
-      if (record.runs[runId]) {
-        throw new SessionContractError('session_run_conflict', `Run ${runId} already exists.`);
-      }
       const inheritedSelection = inheritedRun?.effectiveSelection || inheritedRun?.requestedSelection;
       record.runs[runId] = {
         status: 'pending',
-        launchMode,
+        launchMode: effectiveLaunchMode,
+        clientRequestId: clientRequestId || null,
+        requestFingerprint: requestFingerprint || null,
         parentRunId: inheritedRunId,
+        nativeResumeReady: effectiveLaunchMode === 'resume'
+          ? inheritedRun?.nativeResumeReady !== false
+          : false,
+        rebindFallbackAllowed: input.explicitRebind === true,
         apiBinding: binding,
         requestedSelection: cloneSelection(input.requestedSelection || inheritedSelection),
         effectiveSelection: null,
@@ -387,7 +452,7 @@ class SessionProvenanceService {
         type: 'session.run.planned',
         canonicalKey: targetKey,
         runId,
-        launchMode,
+        launchMode: effectiveLaunchMode,
         bindingFingerprint: binding.bindingFingerprint,
       });
       tx.markDirty(targetKey);
@@ -429,12 +494,32 @@ class SessionProvenanceService {
           }
         );
       }
+      const confirmedLaunchMode = String(input.launchMode || '').trim();
+      if (confirmedLaunchMode && confirmedLaunchMode !== run.launchMode) {
+        const isAdaptiveRebind = run.rebindFallbackAllowed === true && (
+          (run.launchMode === 'fresh_rebind' && confirmedLaunchMode === 'resume')
+          || (run.launchMode === 'resume' && confirmedLaunchMode === 'fresh_rebind')
+        );
+        if (!isAdaptiveRebind) {
+          throw new SessionContractError(
+            'session_run_state_conflict',
+            `Run ${input.runId} started with unexpected launch mode ${confirmedLaunchMode}.`,
+            { statusCode: 409 }
+          );
+        }
+        run.launchMode = confirmedLaunchMode;
+      }
       const parentRun = run.parentRunId ? record.runs?.[run.parentRunId] : null;
       if (parentRun?.status === 'live') {
         parentRun.status = 'stopped';
         parentRun.endedAt = this.now();
       }
       run.status = 'live';
+      if (run.launchMode === 'resume' || run.launchMode === 'fork') {
+        run.nativeResumeReady = true;
+      } else if (typeof input.nativeResumeReady === 'boolean') {
+        run.nativeResumeReady = input.nativeResumeReady;
+      }
       run.effectiveSelection = {
         model: String(input.effectiveSelection?.model || '').trim() || null,
         effort: String(input.effectiveSelection?.effort || '').trim() || null,
@@ -453,9 +538,58 @@ class SessionProvenanceService {
       record.updatedAt = this.now();
       clearTranscriptFallbackLock(tx, run, input.runId, record.updatedAt);
       this.setAliases(tx, canonicalKey, { ...input.identity, ...record });
-      tx.appendDomainEvent({ type: 'session.run.confirmed', canonicalKey, runId: input.runId });
+      tx.appendDomainEvent({
+        type: 'session.run.confirmed',
+        canonicalKey,
+        runId: input.runId,
+        launchMode: run.launchMode,
+      });
       tx.markDirty(canonicalKey);
       return { canonicalKey, record: structuredClone(record), transitioned: true };
+    });
+  }
+
+  confirmNativeResumeReady(input = {}) {
+    return this.store.transact('session.native_resume_ready', (tx) => {
+      const canonicalKey = tx.resolveCanonicalKey(input.identity);
+      const record = tx.getRecord(canonicalKey);
+      const runId = String(input.runId || record?.activeRunId || '').trim();
+      const run = record?.runs?.[runId];
+      if (!run) {
+        throw new SessionContractError(
+          'session_run_not_found',
+          `Run ${runId || ''} was not found.`,
+          { statusCode: 404 }
+        );
+      }
+      if (run.status !== 'live') {
+        throw new SessionContractError(
+          'session_run_state_conflict',
+          `Run ${runId} cannot become natively resumable from state ${run.status || 'unknown'}.`,
+          { statusCode: 409 }
+        );
+      }
+      let transitioned = false;
+      if (run.nativeResumeReady !== true) {
+        run.nativeResumeReady = true;
+        transitioned = true;
+      }
+      if (!transitioned) {
+        return { canonicalKey, runId, record: structuredClone(record), transitioned: false };
+      }
+      record.updatedAt = this.now();
+      tx.appendDomainEvent({
+        type: 'session.native_resume_ready',
+        canonicalKey,
+        runId,
+      });
+      tx.markDirty(canonicalKey);
+      return {
+        canonicalKey,
+        runId,
+        record: structuredClone(record),
+        transitioned: true,
+      };
     });
   }
 
@@ -771,6 +905,7 @@ class SessionProvenanceService {
         status: 'stopped',
         launchMode: 'resume',
         parentRunId: null,
+        nativeResumeReady: true,
         apiBinding: binding,
         requestedSelection: cloneSelection({ ...input.selection, source: evidenceSource }, evidenceSource),
         effectiveSelection: {
@@ -862,6 +997,7 @@ class SessionProvenanceService {
           status: 'stopped',
           launchMode: 'resume',
           parentRunId: null,
+          nativeResumeReady: true,
           apiBinding: binding,
           requestedSelection: cloneSelection(input.selection, 'discovery'),
           effectiveSelection: {

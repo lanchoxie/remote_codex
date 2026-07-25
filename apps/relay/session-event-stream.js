@@ -17,45 +17,205 @@ class SessionEventStream {
   constructor(options = {}) {
     this.epoch = String(options.epoch || crypto.randomUUID());
     this.ringSize = Math.max(1, Math.min(4096, Number(options.ringSize || 256) || 256));
+    this.tombstoneLimit = Math.max(1, Math.min(4096, Number(options.tombstoneLimit || 256) || 256));
+    this.tombstoneTtlMs = Math.max(1000, Number(options.tombstoneTtlMs || 60_000) || 60_000);
+    this.maxStreamBytes = Math.max(
+      256,
+      Math.min(64 * 1024 * 1024, Number(options.maxStreamBytes || 2 * 1024 * 1024) || 2 * 1024 * 1024)
+    );
+    this.maxTotalBytes = Math.max(
+      this.maxStreamBytes,
+      Math.min(256 * 1024 * 1024, Number(options.maxTotalBytes || 16 * 1024 * 1024) || 16 * 1024 * 1024)
+    );
+    this.streamGeneration = 0;
+    this.eventOrder = 0;
+    this.totalRingBytes = 0;
     this.streams = new Map();
+    this.tombstones = new Map();
+  }
+
+  pruneTombstones(now = Date.now()) {
+    for (const [key, tombstone] of this.tombstones) {
+      if (tombstone.expiresAt <= now) this.tombstones.delete(key);
+    }
+    while (this.tombstones.size > this.tombstoneLimit) {
+      this.tombstones.delete(this.tombstones.keys().next().value);
+    }
+  }
+
+  saveTombstone(canonicalKey, stream, dirty = false) {
+    const key = String(canonicalKey || '');
+    if (!key || !stream?.cursorEpoch) return;
+    this.tombstones.delete(key);
+    this.tombstones.set(key, {
+      cursorEpoch: stream.cursorEpoch,
+      counter: stream.counter,
+      dirty: Boolean(dirty),
+      expiresAt: Date.now() + this.tombstoneTtlMs,
+    });
+    this.pruneTombstones();
+  }
+
+  markTombstoneDirty(canonicalKey) {
+    const key = String(canonicalKey || '');
+    const tombstone = this.tombstones.get(key);
+    if (!tombstone) return false;
+    tombstone.dirty = true;
+    tombstone.expiresAt = Date.now() + this.tombstoneTtlMs;
+    this.tombstones.delete(key);
+    this.tombstones.set(key, tombstone);
+    this.pruneTombstones();
+    return true;
+  }
+
+  rotateCursor(stream) {
+    this.clearRing(stream);
+    this.streamGeneration += 1;
+    stream.cursorEpoch = `${this.epoch}.${this.streamGeneration}`;
+    stream.counter = 0;
+  }
+
+  removeRingHead(stream, count = 1) {
+    const removeCount = Math.max(0, Math.min(stream?.ring?.length || 0, Number(count) || 0));
+    if (!removeCount) return 0;
+    const removedBytes = stream.ringEntryBytes
+      .splice(0, removeCount)
+      .reduce((sum, bytes) => sum + bytes, 0);
+    stream.ring.splice(0, removeCount);
+    stream.ringOrders.splice(0, removeCount);
+    stream.ringBytes = Math.max(0, stream.ringBytes - removedBytes);
+    this.totalRingBytes = Math.max(0, this.totalRingBytes - removedBytes);
+    return removedBytes;
+  }
+
+  clearRing(stream) {
+    if (!stream) return;
+    this.totalRingBytes = Math.max(0, this.totalRingBytes - (stream.ringBytes || 0));
+    stream.ring = [];
+    stream.ringEntryBytes = [];
+    stream.ringOrders = [];
+    stream.ringBytes = 0;
+  }
+
+  trimRingBudgets(stream) {
+    while (
+      stream.ring.length
+      && (stream.ring.length > this.ringSize || stream.ringBytes > this.maxStreamBytes)
+    ) {
+      this.removeRingHead(stream);
+    }
+    while (this.totalRingBytes > this.maxTotalBytes) {
+      let oldestStream = null;
+      let oldestOrder = Infinity;
+      for (const candidate of this.streams.values()) {
+        const order = candidate.ringOrders[0];
+        if (Number.isFinite(order) && order < oldestOrder) {
+          oldestOrder = order;
+          oldestStream = candidate;
+        }
+      }
+      if (!oldestStream) break;
+      this.removeRingHead(oldestStream);
+    }
   }
 
   ensure(canonicalKey) {
     const key = String(canonicalKey || '');
     if (!key) throw new TypeError('canonical conversation key is required');
     if (!this.streams.has(key)) {
-      this.streams.set(key, { counter: 0, ring: [], subscribers: new Set() });
+      this.pruneTombstones();
+      const tombstone = this.tombstones.get(key) || null;
+      this.tombstones.delete(key);
+      if (!tombstone || tombstone.dirty) this.streamGeneration += 1;
+      this.streams.set(key, {
+        cursorEpoch: tombstone && !tombstone.dirty
+          ? tombstone.cursorEpoch
+          : `${this.epoch}.${this.streamGeneration}`,
+        counter: tombstone && !tombstone.dirty ? tombstone.counter : 0,
+        ring: [],
+        ringEntryBytes: [],
+        ringOrders: [],
+        ringBytes: 0,
+        subscribers: new Set(),
+      });
     }
     return this.streams.get(key);
   }
 
+  has(canonicalKey) {
+    const stream = this.streams.get(String(canonicalKey || ''));
+    return Boolean(stream && stream.subscribers.size > 0);
+  }
+
+  deleteIfEmpty(canonicalKey, stream) {
+    const key = String(canonicalKey || '');
+    if (
+      stream
+      && stream.subscribers.size === 0
+      && this.streams.get(key) === stream
+    ) {
+      this.streams.delete(key);
+      this.clearRing(stream);
+      this.saveTombstone(key, stream);
+      return true;
+    }
+    return false;
+  }
+
+  deliver(subscriber, event) {
+    let accepted = false;
+    try {
+      accepted = subscriber.send(event) !== false;
+    } catch (_) {
+      accepted = false;
+    }
+    if (!accepted) {
+      subscriber.remove();
+    }
+    return accepted;
+  }
+
   publish(canonicalKey, eventName, payload) {
     const key = String(canonicalKey || '');
-    const stream = this.ensure(key);
+    if (!key) throw new TypeError('canonical conversation key is required');
+    const stream = this.streams.get(key);
+    if (!stream) {
+      this.markTombstoneDirty(key);
+      return null;
+    }
+    if (stream.subscribers.size === 0) {
+      this.streams.delete(key);
+      this.clearRing(stream);
+      this.saveTombstone(key, stream, true);
+      return null;
+    }
     stream.counter += 1;
     const entry = {
-      id: `${this.epoch}:${stream.counter}`,
+      id: `${stream.cursorEpoch}:${stream.counter}`,
       streamEpoch: this.epoch,
       streamCounter: stream.counter,
       canonicalConversationKey: key,
       eventName: String(eventName || 'message'),
       payload: clone(payload),
     };
+    const retainedBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');
     stream.ring.push(entry);
-    if (stream.ring.length > this.ringSize) {
-      stream.ring.splice(0, stream.ring.length - this.ringSize);
-    }
+    stream.ringEntryBytes.push(retainedBytes);
+    stream.ringOrders.push(++this.eventOrder);
+    stream.ringBytes += retainedBytes;
+    this.totalRingBytes += retainedBytes;
+    this.trimRingBudgets(stream);
     for (const subscriber of [...stream.subscribers]) {
-      if (subscriber.send(clone(entry)) === false) {
-        stream.subscribers.delete(subscriber);
-      }
+      this.deliver(subscriber, clone(entry));
     }
+    this.deleteIfEmpty(key, stream);
     return clone(entry);
   }
 
   replay(canonicalKey, rawCursor) {
     const key = String(canonicalKey || '');
-    const stream = this.ensure(key);
+    if (!key) throw new TypeError('canonical conversation key is required');
+    const stream = this.streams.get(key) || { cursorEpoch: null, counter: 0, ring: [] };
     const cursor = parseCursor(rawCursor);
     if (!rawCursor) {
       return {
@@ -75,7 +235,7 @@ class SessionEventStream {
         streamCounter: stream.counter,
       };
     }
-    if (cursor.epoch !== this.epoch) {
+    if (!stream.cursorEpoch || cursor.epoch !== stream.cursorEpoch) {
       return {
         reset: true,
         reason: 'epoch_mismatch',
@@ -116,7 +276,8 @@ class SessionEventStream {
 
   resetEnvelope(canonicalKey, projection = {}) {
     const key = String(canonicalKey || '');
-    const stream = this.ensure(key);
+    if (!key) throw new TypeError('canonical conversation key is required');
+    const stream = this.streams.get(key) || { counter: 0 };
     const assistantProjection = projection.assistantProjection || projection.assistant || null;
     return clone({
       streamEpoch: this.epoch,
@@ -125,15 +286,19 @@ class SessionEventStream {
       assistantProjection,
       assistant: assistantProjection,
       activities: Array.isArray(projection.activities) ? projection.activities : [],
+      activitiesTruncated: projection.activitiesTruncated === true,
+      activityCount: Math.max(0, Number(projection.activityCount || 0)),
+      detailRecoveryRequired: projection.detailRecoveryRequired === true,
       session: projection.session || null,
     });
   }
 
   resetEvent(canonicalKey, reason, projection = {}) {
     const key = String(canonicalKey || '');
-    const stream = this.ensure(key);
+    if (!key) throw new TypeError('canonical conversation key is required');
+    const stream = this.streams.get(key) || { counter: 0 };
     return {
-      id: `${this.epoch}:${stream.counter}`,
+      id: `${stream.cursorEpoch || this.epoch}:${stream.counter}`,
       streamEpoch: this.epoch,
       streamCounter: stream.counter,
       canonicalConversationKey: key,
@@ -151,32 +316,43 @@ class SessionEventStream {
       throw new TypeError('canonicalKey and send are required');
     }
     const stream = this.ensure(canonicalKey);
+    let active = true;
     const subscriber = {
       send: options.send,
       makeReset: typeof options.makeReset === 'function' ? options.makeReset : () => ({}),
       stream,
+      canonicalKey,
+      remove: () => {
+        if (!active) return false;
+        active = false;
+        const currentStream = subscriber.stream;
+        const currentKey = subscriber.canonicalKey;
+        const removed = currentStream.subscribers.delete(subscriber);
+        this.deleteIfEmpty(currentKey, currentStream);
+        return removed;
+      },
     };
     stream.subscribers.add(subscriber);
 
-    const replay = this.replay(canonicalKey, options.cursor);
-    if (replay.reset) {
-      subscriber.send(this.resetEvent(
-        canonicalKey,
-        replay.reason,
-        subscriber.makeReset(canonicalKey)
-      ));
-    } else {
-      for (const event of replay.events) {
-        subscriber.send(event);
+    try {
+      const replay = this.replay(canonicalKey, options.cursor);
+      if (replay.reset) {
+        this.deliver(subscriber, this.resetEvent(
+          canonicalKey,
+          replay.reason,
+          subscriber.makeReset(canonicalKey)
+        ));
+      } else {
+        for (const event of replay.events) {
+          if (!this.deliver(subscriber, event)) break;
+        }
       }
+    } catch (error) {
+      subscriber.remove();
+      throw error;
     }
 
-    let active = true;
-    return () => {
-      if (!active) return false;
-      active = false;
-      return subscriber.stream.subscribers.delete(subscriber);
-    };
+    return subscriber.remove;
   }
 
   mergeCanonicalKey(loserKeyValue, winnerKeyValue) {
@@ -186,31 +362,56 @@ class SessionEventStream {
       return { merged: false, canonicalConversationKey: winnerKey || loserKey };
     }
     const loser = this.streams.get(loserKey);
-    if (!loser) {
+    const existingWinner = this.streams.get(winnerKey);
+    if (!loser && !existingWinner) {
+      this.tombstones.delete(loserKey);
+      this.markTombstoneDirty(winnerKey);
       return { merged: false, canonicalConversationKey: winnerKey };
     }
-    const winner = this.ensure(winnerKey);
-    const moved = [...loser.subscribers];
+    const winner = existingWinner || this.ensure(winnerKey);
+    const moved = loser ? [...loser.subscribers] : [];
+    const resetSubscribers = new Set(winner.subscribers);
     for (const subscriber of moved) {
+      loser.subscribers.delete(subscriber);
       winner.subscribers.add(subscriber);
+      resetSubscribers.add(subscriber);
       subscriber.stream = winner;
-      subscriber.send(this.resetEvent(
-        winnerKey,
-        'canonical_key_changed',
-        subscriber.makeReset(winnerKey)
-      ));
+      subscriber.canonicalKey = winnerKey;
     }
-    loser.subscribers.clear();
-    this.streams.delete(loserKey);
+    if (loser) {
+      this.streams.delete(loserKey);
+      this.clearRing(loser);
+    }
+    this.tombstones.delete(loserKey);
+    this.rotateCursor(winner);
+    let resetError = null;
+    for (const subscriber of resetSubscribers) {
+      try {
+        this.deliver(subscriber, this.resetEvent(
+          winnerKey,
+          'canonical_key_changed',
+          subscriber.makeReset(winnerKey)
+        ));
+      } catch (error) {
+        subscriber.remove();
+        resetError ||= error;
+      }
+    }
+    this.deleteIfEmpty(winnerKey, winner);
+    if (resetError) throw resetError;
     return {
-      merged: true,
+      merged: Boolean(loser),
       canonicalConversationKey: winnerKey,
       movedSubscribers: moved.length,
+      resetSubscribers: resetSubscribers.size,
     };
   }
 
   clear(canonicalKey) {
-    this.streams.delete(String(canonicalKey || ''));
+    const key = String(canonicalKey || '');
+    this.clearRing(this.streams.get(key));
+    this.streams.delete(key);
+    this.tombstones.delete(key);
   }
 }
 

@@ -84,7 +84,7 @@ function openSse(port, requestPath) {
         const separator = buffer.match(/\r?\n\r?\n/);
         const raw = buffer.slice(0, separator.index);
         buffer = buffer.slice(separator.index + separator[0].length);
-        const frame = { id: '', event: 'message', data: null };
+        const frame = { id: '', event: 'message', data: null, raw };
         const data = [];
         for (const line of raw.split(/\r?\n/)) {
           if (line.startsWith('id:')) frame.id = line.slice(3).trim();
@@ -153,6 +153,7 @@ async function main() {
       RELAY_STATE_ROOT: tempRoot,
       RELAY_AUTH_DISABLED: 'true',
       RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
+      SESSION_RESET_SSE_MAX_BYTES: '2048',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -160,6 +161,7 @@ async function main() {
   relay.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')));
   let stream = null;
   let resetStream = null;
+  let largeResetStream = null;
 
   try {
     await waitForRelay(port, relay);
@@ -182,7 +184,22 @@ async function main() {
     assert.deepStrictEqual(initialReset.data.activities, []);
 
     const firstText = 'First line\n\n  preserved indent  ';
-    await postEvents(port, [activity(BRIDGE_ID, 1, firstText)]);
+    await postEvents(port, [{
+      ...activity(BRIDGE_ID, 1, firstText),
+      callId: 'call-thinking',
+      requestId: 'request-thinking',
+      itemType: 'commandExecution',
+      status: 'running',
+      command: 'node <literal>.js',
+      cwd: 'D:/workspace',
+      output: '<literal output>',
+      durationMs: 12,
+      processId: 'process-thinking',
+      arguments: { target: '<literal>' },
+      result: { ok: true },
+      commandActions: [{ type: 'read', path: 'package.json' }],
+      fileChanges: [{ path: 'src/app.js', status: 'modified', diff: '-old\n+new' }],
+    }]);
     const first = await waitForFrame(
       stream,
       (frame) => frame.event === 'session.activity' && frame.data.activityRevision === 1,
@@ -195,6 +212,35 @@ async function main() {
       JSON.stringify([`${HOST_ID}::${BRIDGE_ID}`, 'run-thinking', 'turn-thinking', 'item-thinking', 0])
     );
     assert.strictEqual(first.data.streamEpoch, initialReset.data.streamEpoch);
+    assert.deepStrictEqual({
+      callId: first.data.callId,
+      requestId: first.data.requestId,
+      itemType: first.data.itemType,
+      status: first.data.status,
+      command: first.data.command,
+      cwd: first.data.cwd,
+      output: first.data.output,
+      durationMs: first.data.durationMs,
+      processId: first.data.processId,
+      arguments: first.data.arguments,
+      result: first.data.result,
+      commandActions: first.data.commandActions,
+      fileChanges: first.data.fileChanges,
+    }, {
+      callId: 'call-thinking',
+      requestId: 'request-thinking',
+      itemType: 'commandExecution',
+      status: 'running',
+      command: 'node <literal>.js',
+      cwd: 'D:/workspace',
+      output: '<literal output>',
+      durationMs: 12,
+      processId: 'process-thinking',
+      arguments: { target: '<literal>' },
+      result: { ok: true },
+      commandActions: [{ type: 'read', path: 'package.json' }],
+      fileChanges: [{ path: 'src/app.js', status: 'modified', diff: '-old\n+new' }],
+    }, 'Relay SSE should preserve bounded structured activity fields');
 
     await postEvents(port, [{
       type: 'session.discovery',
@@ -212,10 +258,18 @@ async function main() {
       'alias merge did not reset the active subscriber'
     );
     assert.strictEqual(mergeReset.data.canonicalConversationKey, `${HOST_ID}::${NATIVE_ID}`);
-    assert.strictEqual(mergeReset.data.activities.length, 1);
-    assert.strictEqual(mergeReset.data.activities[0].text, firstText);
+    assert.deepStrictEqual(mergeReset.data.activities, []);
+    assert.strictEqual(mergeReset.data.activitiesTruncated, true);
+    assert.strictEqual(mergeReset.data.activityCount, 1);
+    const mergedActivityPage = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${BRIDGE_ID}/activities?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(mergedActivityPage.statusCode, 200);
+    assert.strictEqual(mergedActivityPage.body.activities[0].text, firstText);
     assert.strictEqual(
-      mergeReset.data.activities[0].activityKey,
+      mergedActivityPage.body.activities[0].activityKey,
       JSON.stringify([`${HOST_ID}::${NATIVE_ID}`, 'run-thinking', 'turn-thinking', 'item-thinking', 0])
     );
 
@@ -264,9 +318,160 @@ async function main() {
     );
     assert.strictEqual(epochReset.data.reason, 'epoch_mismatch');
     assert.strictEqual(epochReset.data.canonicalConversationKey, `${HOST_ID}::${NATIVE_ID}`);
-    assert.strictEqual(epochReset.data.activities.length, 1);
-    assert.strictEqual(epochReset.data.activities[0].activityRevision, 2);
-    assert.strictEqual(epochReset.data.activities[0].text, secondText);
+    assert.deepStrictEqual(epochReset.data.activities, []);
+    assert.strictEqual(epochReset.data.activitiesTruncated, true);
+    assert.strictEqual(epochReset.data.activityCount, 1);
+
+    stream.close();
+    stream = null;
+    resetStream.close();
+    resetStream = null;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const largeText = 'large activity '.repeat(2000);
+    await postEvents(port, [{
+      ...activity(BRIDGE_ID, 3, largeText),
+      conversationKey: NATIVE_ID,
+      bridgeSessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+    }]);
+    largeResetStream = openSse(
+      port,
+      `/api/sessions/${BRIDGE_ID}/events?hostId=${HOST_ID}&lastEventId=old-epoch:9`
+    );
+    const largeReset = await waitForFrame(
+      largeResetStream,
+      (frame) => frame.event === 'stream.reset',
+      'large activity reset was not delivered'
+    );
+    assert.strictEqual(largeReset.data.activitiesTruncated, true);
+    assert.deepStrictEqual(largeReset.data.activities, []);
+    assert(
+      Buffer.byteLength(`${largeReset.raw}\n\n`, 'utf8') <= 2048,
+      'stream.reset frame must remain below the configured SSE byte budget'
+    );
+
+    const liveLargeText = '持续推理内容'.repeat(4000);
+    await postEvents(port, [{
+      ...activity(BRIDGE_ID, 4, liveLargeText),
+      conversationKey: NATIVE_ID,
+      bridgeSessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+    }]);
+    const compactActivity = await waitForFrame(
+      largeResetStream,
+      (frame) => frame.event === 'session.activity' && frame.data.activityRevision === 4,
+      'large live activity invalidation was not delivered'
+    );
+    assert.strictEqual(compactActivity.data.activityTruncated, true);
+    assert.strictEqual(compactActivity.data.text, '');
+    assert.match(compactActivity.data.activityRecoveryToken, /^[A-Za-z0-9_-]{43}$/);
+    assert.strictEqual(compactActivity.data.activityByteLength, Buffer.byteLength(liveLargeText, 'utf8'));
+    assert(
+      Buffer.byteLength(`${compactActivity.raw}\n\n`, 'utf8') <= 2048,
+      'large live activity frame must remain below the configured SSE byte budget'
+    );
+
+    const targetedActivitySnapshot = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${BRIDGE_ID}/activities?hostId=${HOST_ID}&activityToken=${encodeURIComponent(compactActivity.data.activityRecoveryToken)}`
+    );
+    assert.strictEqual(targetedActivitySnapshot.statusCode, 200);
+    assert.strictEqual(targetedActivitySnapshot.body.targeted, true);
+    assert.strictEqual(targetedActivitySnapshot.body.activities.length, 1);
+    assert.strictEqual(targetedActivitySnapshot.body.activities[0].activityRevision, 4);
+    assert.strictEqual(targetedActivitySnapshot.body.activities[0].text, liveLargeText);
+
+    const nearBudgetText = 'm'.repeat(1400);
+    await postEvents(port, [{
+      ...activity(BRIDGE_ID, 5, nearBudgetText),
+      conversationKey: NATIVE_ID,
+      bridgeSessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+    }]);
+    const nearBudgetActivity = await waitForFrame(
+      largeResetStream,
+      (frame) => frame.event === 'session.activity' && frame.data.activityRevision === 5,
+      'near-budget live activity was not delivered'
+    );
+    assert.strictEqual(
+      nearBudgetActivity.data.activityTruncated,
+      true,
+      'payloads that leave no room for SSE framing should use compact recovery'
+    );
+    assert(Buffer.byteLength(`${nearBudgetActivity.raw}\n\n`, 'utf8') <= 2048);
+
+    const diagnosticMessage = 'stream remains connected after compact activity';
+    await postEvents(port, [{
+      type: 'session.diagnostic',
+      hostId: HOST_ID,
+      sessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+      severity: 'info',
+      source: 'thinking-activity-test',
+      kind: 'continuity',
+      message: diagnosticMessage,
+      timestamp: '2099-03-01T00:00:05.000Z',
+    }]);
+    await waitForFrame(
+      largeResetStream,
+      (frame) => frame.event === 'session.diagnostic' && frame.data.message === diagnosticMessage,
+      'SSE stream disconnected after the compact live activity'
+    );
+
+    const duplicateDiagnosticMessage = 'same text from distinct tools';
+    await postEvents(port, [{
+      type: 'session.diagnostic',
+      hostId: HOST_ID,
+      sessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+      runId: 'run-thinking',
+      turnId: 'turn-thinking',
+      itemId: 'tool-a',
+      severity: 'info',
+      source: 'thinking-activity-test',
+      kind: 'tool-call',
+      method: 'item/completed',
+      message: duplicateDiagnosticMessage,
+      timestamp: '2099-03-01T00:00:06.000Z',
+    }, {
+      type: 'session.diagnostic',
+      hostId: HOST_ID,
+      sessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+      runId: 'run-thinking',
+      turnId: 'turn-thinking',
+      itemId: 'tool-b',
+      severity: 'info',
+      source: 'thinking-activity-test',
+      kind: 'tool-call',
+      method: 'item/completed',
+      message: duplicateDiagnosticMessage,
+      timestamp: '2099-03-01T00:00:06.000Z',
+    }]);
+    await waitForFrame(
+      largeResetStream,
+      (frame) => frame.event === 'session.diagnostic' && frame.data.itemId === 'tool-b',
+      'distinct diagnostic identity was incorrectly compacted'
+    );
+    assert.strictEqual(
+      largeResetStream.frames.filter((frame) => (
+        frame.event === 'session.diagnostic'
+        && frame.data.message === duplicateDiagnosticMessage
+      )).length,
+      2,
+      'same-message tool diagnostics with different item IDs must both be delivered'
+    );
+
+    const activitySnapshot = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${BRIDGE_ID}/activities?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(activitySnapshot.statusCode, 200);
+    assert.strictEqual(activitySnapshot.body.activities.length, 1);
+    assert.strictEqual(activitySnapshot.body.activities[0].activityRevision, 5);
+    assert.strictEqual(activitySnapshot.body.activities[0].text, nearBudgetText);
 
     console.log('Relay thinking activity assertions passed');
   } catch (error) {
@@ -275,6 +480,7 @@ async function main() {
   } finally {
     stream?.close();
     resetStream?.close();
+    largeResetStream?.close();
     await stopChild(relay);
   }
 }

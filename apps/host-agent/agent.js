@@ -32,17 +32,23 @@ const {
   retainRunnerForStartRetry,
   replayManagedSessionStart,
   shouldPublishMissingRunnerStop,
+  stopRunnerOnce,
 } = require('./managed-session-lifecycle');
 const { cleanupStaleApiProfileCodexHomes } = require('./codex-app-server-runner');
 const { normalizeApiConfig } = require('./runtime-utils');
 const {
   attestHostEnvironmentBinding,
   deriveRunBinding,
-  normalizeProviderModelPage,
+  testApiProfile,
 } = require('./session-api-runtime');
 const { HostSkillArtifactService } = require('./skill-artifact-service');
 const { HostSkillDeploymentService } = require('./skill-deployment-service');
 const { HostSkillInventoryService } = require('./skill-inventory-service');
+const {
+  pruneExpiredSessionWatches,
+  removeSessionWatch,
+  upsertSessionWatch,
+} = require('./session-watch-registry');
 
 const RELAY_URL = process.env.RELAY_URL || 'http://127.0.0.1:8787';
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
@@ -96,6 +102,10 @@ const AGENT_SHUTDOWN_GRACE_MS = Math.max(
   1000,
   Number(process.env.AGENT_SHUTDOWN_GRACE_MS || 10000) || 10000
 );
+const OWNERSHIP_REVOKED_SHUTDOWN_RETRY_MS = Math.max(
+  250,
+  Number(process.env.AGENT_OWNERSHIP_REVOKED_SHUTDOWN_RETRY_MS || 1000) || 1000
+);
 const AGENT_PROCESS_STARTED_AT = nowIso();
 const RELAY_MANAGED_LOCAL_AGENT = /^(1|true|yes|on)$/i.test(
   String(process.env.RELAY_MANAGED_LOCAL_AGENT || '').trim()
@@ -103,6 +113,7 @@ const RELAY_MANAGED_LOCAL_AGENT = /^(1|true|yes|on)$/i.test(
 const RELAY_MANAGED_AGENT_INSTANCE_ID = String(
   process.env.RELAY_MANAGED_AGENT_INSTANCE_ID || ''
 ).trim();
+const AGENT_INSTANCE_ID = RELAY_MANAGED_AGENT_INSTANCE_ID || makeId();
 const RELAY_MANAGED_AGENT_TOKEN = String(process.env.RELAY_MANAGED_AGENT_TOKEN || '').trim();
 const RELAY_MANAGED_MARKER_PATH = String(process.env.RELAY_MANAGED_MARKER_PATH || '').trim();
 const RELAY_MANAGED_OWNER_PID = Math.trunc(Number(process.env.RELAY_MANAGED_OWNER_PID || 0));
@@ -114,6 +125,7 @@ const liveSessions = new Map();
 const managedSessionStartGate = createManagedSessionStartGate();
 const activeFileUploads = new Map();
 const watchedHistorySessions = new Map();
+const watchedSessionRevisions = new Map();
 let lastWatchPerformanceReportAt = 0;
 let hostSkillInventory = null;
 let hostSkillDeployment = null;
@@ -134,6 +146,8 @@ const codexTailer = CODEX_TAIL_ENABLED
   : null;
 let lastCommandId = 0;
 let relayInstanceId = null;
+let agentLeaseId = null;
+let agentRegistrationPromise = null;
 
 function observeRelayInstance(body) {
   const nextRelayInstanceId = String(body?.relayInstanceId || '').trim();
@@ -143,6 +157,14 @@ function observeRelayInstance(body) {
     lastCommandId = 0;
   }
   relayInstanceId = nextRelayInstanceId;
+  return changed;
+}
+
+function observeAgentLease(body) {
+  const nextLeaseId = String(body?.agentLeaseId || '').trim();
+  if (!nextLeaseId) return false;
+  const changed = Boolean(agentLeaseId && agentLeaseId !== nextLeaseId);
+  agentLeaseId = nextLeaseId;
   return changed;
 }
 
@@ -167,12 +189,14 @@ function managedAgentProcessMetadata() {
 
 function managedAgentRequestHeaders() {
   const metadata = managedAgentProcessMetadata();
-  if (!metadata) return {};
   return {
-    'X-Remote-Codex-Agent-Managed': '1',
-    'X-Remote-Codex-Agent-Pid': String(metadata.pid),
-    'X-Remote-Codex-Agent-Instance': metadata.instanceId,
-    'X-Remote-Codex-Agent-Token': metadata.ownershipToken,
+    'X-Remote-Codex-Agent-Instance': AGENT_INSTANCE_ID,
+    ...(agentLeaseId ? { 'X-Remote-Codex-Agent-Lease': agentLeaseId } : {}),
+    ...(metadata ? {
+      'X-Remote-Codex-Agent-Managed': '1',
+      'X-Remote-Codex-Agent-Pid': String(metadata.pid),
+      'X-Remote-Codex-Agent-Token': metadata.ownershipToken,
+    } : {}),
   };
 }
 
@@ -256,6 +280,7 @@ function loadRelayAuthToken() {
 function getCapabilities() {
   return {
     discovery: true,
+    hostAgentLeaseV1: true,
     managedSessions: true,
     directoryBrowse: true,
     hostSkills: true,
@@ -277,6 +302,7 @@ function getCapabilities() {
     apiCatalog: true,
     bindingPreflight: true,
     runApiBinding: MANAGED_RUNTIME !== 'demo' && MANAGED_COMMAND !== 'demo',
+    nativeResumeReadiness: MANAGED_RUNTIME !== 'demo' && MANAGED_COMMAND !== 'demo',
     review: true,
     imageInput: true,
     fileTransfer: true,
@@ -284,6 +310,7 @@ function getCapabilities() {
     agentRuntimes: true,
     realtimeSessionSync: CODEX_TAIL_ENABLED,
     codexJsonlTail: CODEX_TAIL_ENABLED,
+    sessionWatchV2: true,
     demoMode: MANAGED_RUNTIME === 'demo' || MANAGED_COMMAND === 'demo',
   };
 }
@@ -547,12 +574,33 @@ function isTransientFetchError(error) {
 }
 
 function isRelayOwnershipRevokedError(error) {
-  if (!RELAY_MANAGED_LOCAL_AGENT || Number(error?.statusCode || 0) !== 409) return false;
+  if (Number(error?.statusCode || 0) !== 409) return false;
+  const code = String(error?.body?.code || '').trim();
+  if (code === 'host_agent_instance_conflict') {
+    return Boolean(agentLeaseId);
+  }
   return new Set([
     'local_agent_ownership_required',
     'local_agent_ownership_mismatch',
     'local_agent_instance_conflict',
-  ]).has(String(error?.body?.code || '').trim());
+    'host_agent_lease_revoked',
+  ]).has(code);
+}
+
+function isRelayHostDismissedError(error) {
+  return String(error?.code || error?.body?.code || '').trim() === 'host_dismissed';
+}
+
+function makeRelayHostDismissedError() {
+  const error = new Error(`Host ${HOST_ID} was dismissed by the Relay.`);
+  error.code = 'host_dismissed';
+  return error;
+}
+
+function isPreLeaseAgentInstanceConflict(error) {
+  return !agentLeaseId
+    && Number(error?.statusCode || 0) === 409
+    && String(error?.body?.code || '').trim() === 'host_agent_instance_conflict';
 }
 
 function logAgentTransient(prefix, error) {
@@ -641,8 +689,9 @@ function fetchJsonOnce(targetUrl, options = {}) {
     );
 
     req.on('error', (error) => settle(reject, error));
-    if (FETCH_REQUEST_TIMEOUT_MS > 0) {
-      req.setTimeout(FETCH_REQUEST_TIMEOUT_MS, () => {
+    const requestTimeoutMs = Number(options.timeoutMs ?? FETCH_REQUEST_TIMEOUT_MS);
+    if (requestTimeoutMs > 0) {
+      req.setTimeout(requestTimeoutMs, () => {
         const error = new Error('relay request timed out');
         error.code = 'ETIMEDOUT';
         req.destroy(error);
@@ -655,154 +704,66 @@ function fetchJsonOnce(targetUrl, options = {}) {
   });
 }
 
-function buildApiTestUrl(baseUrl, options = {}) {
-  const raw = String(baseUrl || '').trim() || 'https://api.openai.com/v1';
-  const url = new URL(`${raw.replace(/\/+$/, '')}/models`);
-  const cursor = String(options.cursor || '').trim();
-  const limit = Math.max(1, Math.min(500, Number(options.limit || 200) || 200));
-  if (cursor) {
-    url.searchParams.set('after', cursor);
-  }
-  if (options.includeLimit === true) {
-    url.searchParams.set('limit', String(limit));
-  }
-  return url.toString();
-}
-
-function summarizeApiTestBody(raw) {
-  const text = String(raw || '').trim();
-  if (!text) {
-    return '';
-  }
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed?.error?.message) {
-      return String(parsed.error.message).slice(0, 500);
-    }
-    if (parsed?.message) {
-      return String(parsed.message).slice(0, 500);
-    }
-    if (Array.isArray(parsed?.data)) {
-      return `${parsed.data.length} model${parsed.data.length === 1 ? '' : 's'} returned`;
-    }
-    return JSON.stringify(parsed).slice(0, 500);
-  } catch (_) {
-    return text.slice(0, 500);
-  }
-}
-
-function testApiProfile(apiConfig, options = {}) {
-  const config = normalizeApiConfig(apiConfig) || {};
-  const targetUrl = buildApiTestUrl(config.baseUrl, options);
-  const parsed = new URL(targetUrl);
-  const client = parsed.protocol === 'https:' ? https : http;
-  const timeoutMs = Number(options.timeoutMs || 15000) || 15000;
-  const startedAt = Date.now();
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (payload) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve({
-        ok: Boolean(payload.ok),
-        statusCode: payload.statusCode || 0,
-        latencyMs: Date.now() - startedAt,
-        url: targetUrl,
-        provider: config.provider || null,
-        profileId: config.profileId || null,
-        label: config.label || null,
-        message: payload.message || '',
-        error: payload.error || null,
-        modelPage: payload.modelPage || null,
-        testedAt: nowIso(),
-      });
-    };
-
-    const req = client.request(
-      {
-        method: 'GET',
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-        path: `${parsed.pathname}${parsed.search}`,
-        headers: {
-          Accept: 'application/json',
-          ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
-        },
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const raw = Buffer.concat(chunks).toString('utf8');
-          const statusCode = res.statusCode || 0;
-          const message = summarizeApiTestBody(raw);
-          let modelPage = null;
-          if (statusCode >= 200 && statusCode < 300) {
-            try {
-              modelPage = normalizeProviderModelPage(JSON.parse(raw || '{}'), {
-                limit: options.limit,
-              });
-            } catch (_) {
-              modelPage = null;
-            }
-          }
-          finish({
-            ok: statusCode >= 200 && statusCode < 300,
-            statusCode,
-            message: message || `${statusCode} ${res.statusMessage || ''}`.trim(),
-            error: statusCode >= 400 ? (message || `${statusCode} ${res.statusMessage || 'HTTP error'}`.trim()) : null,
-            modelPage,
-          });
-        });
-        res.on('error', (error) => finish({ error: error.message }));
-        res.on('aborted', () => finish({ error: 'response aborted' }));
-      }
-    );
-    req.on('error', (error) => finish({ error: error.message }));
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`API test timed out after ${timeoutMs}ms`));
-    });
-    req.end();
-  });
-}
-
 async function postAgentEventPayload(body, label, options = {}) {
-  try {
-    return await fetchJson(`${RELAY_URL}/api/agent/events`, {
-      method: 'POST',
-      body,
-      retryOnTransient: options.retryOnTransient !== false,
-      headers: managedAgentRequestHeaders(),
-    });
-  } catch (error) {
-    if (options.bestEffort) {
-      logAgentTransient(`[agent] failed to post ${label}:`, error);
-      return null;
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const headers = managedAgentRequestHeaders();
+    const requestLeaseId = String(headers['X-Remote-Codex-Agent-Lease'] || '').trim();
+    try {
+      const result = await fetchJson(`${RELAY_URL}/api/agent/events`, {
+        method: 'POST',
+        body,
+        retryOnTransient: options.retryOnTransient !== false,
+        headers,
+      });
+      if (result.body?.dismissed) {
+        throw makeRelayHostDismissedError();
+      }
+      observeRelayInstance(result.body);
+      observeAgentLease(result.body);
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        try {
+          if (await recoverAgentLeaseForRequest(error, requestLeaseId)) {
+            continue;
+          }
+        } catch (recoveryError) {
+          lastError = recoveryError;
+        }
+      }
+      break;
     }
-    if (isTransientFetchError(error)) {
-      logAgentTransient(`[agent] failed to post ${label}:`, error);
-    }
-    throw error;
   }
+  if (options.bestEffort) {
+    logAgentTransient(`[agent] failed to post ${label}:`, lastError);
+    return null;
+  }
+  if (isTransientFetchError(lastError)) {
+    logAgentTransient(`[agent] failed to post ${label}:`, lastError);
+  }
+  throw lastError;
 }
 
 async function postEvent(event, options = {}) {
-  await postAgentEventPayload({ event }, event?.type || 'event', options);
+  const batchId = String(options.batchId || '').trim() || `event:${HOST_ID}:${makeId()}`;
+  await postAgentEventPayload({ event, batchId }, event?.type || 'event', options);
 }
 
 async function postEvents(events, options = {}) {
   const batch = (Array.isArray(events) ? events : []).filter(Boolean);
+  const batchId = String(options.batchId || '').trim() || `events:${HOST_ID}:${makeId()}`;
   return deliverAgentEventBatch(batch, {
-    batchId: options.batchId || null,
+    batchId,
     bestEffort: Boolean(options.bestEffort),
     sendBatch: (eventBatch, batchId) => postAgentEventPayload({
       events: eventBatch,
       ...(batchId ? { batchId } : {}),
     }, `${eventBatch.length} event(s)`, options),
-    sendSingle: (event) => postEvent(event, options),
+    // A legacy Relay receives separate POSTs. Each event needs its own key;
+    // reusing the original batch id would conflict after the first payload.
+    sendSingle: (event) => postEvent(event, { ...options, batchId: '' }),
   });
 }
 
@@ -853,8 +814,10 @@ async function registerHost() {
   const result = await fetchJson(`${RELAY_URL}/api/agent/register`, {
     method: 'POST',
     retryOnTransient: true,
+    headers: managedAgentRequestHeaders(),
     body: {
       hostId: HOST_ID,
+      agentInstanceId: AGENT_INSTANCE_ID,
       label: HOST_LABEL,
       platform: process.platform,
       codexHome: CODEX_HOME,
@@ -863,15 +826,51 @@ async function registerHost() {
       agentProcess: managedAgentProcessMetadata(),
     },
   });
+  if (result.body?.dismissed) {
+    throw makeRelayHostDismissedError();
+  }
   observeRelayInstance(result.body);
+  observeAgentLease(result.body);
+}
+
+function ensureHostRegistration() {
+  if (!agentRegistrationPromise) {
+    agentRegistrationPromise = registerHost().finally(() => {
+      agentRegistrationPromise = null;
+    });
+  }
+  return agentRegistrationPromise;
+}
+
+async function recoverAgentLeaseForRequest(error, requestLeaseId = '') {
+  const code = String(error?.body?.code || '').trim();
+  const relayChanged = observeRelayInstance(error?.body);
+  const leaseRotated = Boolean(
+    requestLeaseId
+    && agentLeaseId
+    && requestLeaseId !== agentLeaseId
+  );
+  if (code === 'host_agent_registration_required') {
+    await ensureHostRegistration();
+    return true;
+  }
+  if (code === 'host_agent_lease_revoked' && (relayChanged || leaseRotated)) {
+    if (!leaseRotated) {
+      await ensureHostRegistration();
+    }
+    return true;
+  }
+  return false;
 }
 
 async function heartbeat() {
   const result = await fetchJson(`${RELAY_URL}/api/agent/heartbeat`, {
     method: 'POST',
     retryOnTransient: true,
+    headers: managedAgentRequestHeaders(),
     body: {
       hostId: HOST_ID,
+      agentInstanceId: AGENT_INSTANCE_ID,
       label: HOST_LABEL,
       platform: process.platform,
       codexHome: CODEX_HOME,
@@ -881,7 +880,35 @@ async function heartbeat() {
       time: nowIso(),
     },
   });
+  if (result.body?.dismissed) {
+    throw makeRelayHostDismissedError();
+  }
   observeRelayInstance(result.body);
+  observeAgentLease(result.body);
+}
+
+async function releaseAgentLease() {
+  const releasingLeaseId = String(agentLeaseId || '').trim();
+  if (!releasingLeaseId) return false;
+  try {
+    await fetchJson(`${RELAY_URL}/api/agent/release`, {
+      method: 'POST',
+      body: {
+        hostId: HOST_ID,
+        agentInstanceId: AGENT_INSTANCE_ID,
+        agentLeaseId: releasingLeaseId,
+      },
+      headers: managedAgentRequestHeaders(),
+      timeoutMs: 1500,
+    });
+    if (agentLeaseId === releasingLeaseId) {
+      agentLeaseId = null;
+    }
+    return true;
+  } catch (error) {
+    logAgentTransient('[agent] lease release failed:', error);
+    return false;
+  }
 }
 
 async function performDiscovery() {
@@ -1066,44 +1093,46 @@ function resolveDiscoveredSession(command = {}) {
   return null;
 }
 
-function watchKey(command = {}) {
-  return [
-    command.clientId,
-    command.viewId,
-    command.sessionId,
-    command.nativeThreadId,
-    command.conversationKey,
-  ].map((value) => String(value || '').trim()).filter(Boolean).join('::');
-}
-
 async function handleSessionWatch(command = {}) {
   const requestId = command.requestId || makeId();
   const requestedSessionId = String(command.sessionId || command.nativeThreadId || '').trim();
   const found = resolveSessionFileFromCandidates(command);
+  const watchOptions = {
+    ownerRevisions: watchedSessionRevisions,
+    ttlMs: SESSION_WATCH_TTL_MS,
+  };
   if (!found?.rolloutPath) {
+    const watchResult = upsertSessionWatch(watchedHistorySessions, command, {
+      sessionId: requestedSessionId,
+      nativeThreadId: command.nativeThreadId || requestedSessionId,
+      conversationKey: command.conversationKey || null,
+      rolloutPath: null,
+    }, watchOptions);
+    refreshTailerWatchedSessions();
     await postEvent({
       type: 'session.watch.updated',
       hostId: HOST_ID,
       requestId,
       sessionId: requestedSessionId,
       watched: false,
+      stale: watchResult.stale,
+      replaced: watchResult.replaced,
+      watchRevision: command.watchRevision ?? null,
+      leaseMs: SESSION_WATCH_TTL_MS,
+      expiresAt: watchResult.entry?.expiresAt || null,
+      watchedSessionCount: watchedHistorySessions.size,
       error: `history session ${requestedSessionId || '(unknown)'} was not found under CODEX_HOME`,
       timestamp: nowIso(),
     }, { bestEffort: true });
     return;
   }
 
-  const key = watchKey(command) || found.sessionId;
-  watchedHistorySessions.set(key, {
+  const watchResult = upsertSessionWatch(watchedHistorySessions, command, {
     ...found,
     sessionId: found.sessionId,
     nativeThreadId: found.nativeThreadId || found.sessionId,
-    clientId: command.clientId || null,
-    viewId: command.viewId || null,
-    requestedSessionId: requestedSessionId || null,
-    conversationKey: command.conversationKey || null,
-    expiresAt: Date.now() + SESSION_WATCH_TTL_MS,
-  });
+    conversationKey: command.conversationKey || found.conversationKey || null,
+  }, watchOptions);
   refreshTailerWatchedSessions();
   await postEvent({
     type: 'session.watch.updated',
@@ -1112,33 +1141,23 @@ async function handleSessionWatch(command = {}) {
     sessionId: found.sessionId,
     requestedSessionId: requestedSessionId || null,
     nativeThreadId: found.nativeThreadId || found.sessionId,
-    watched: true,
+    watched: watchResult.accepted,
+    activeSessionId: watchResult.entry?.sessionId || null,
+    stale: watchResult.stale,
+    replaced: watchResult.replaced,
+    watchRevision: command.watchRevision ?? null,
+    leaseMs: SESSION_WATCH_TTL_MS,
+    expiresAt: watchResult.entry?.expiresAt || null,
     watchedSessionCount: watchedHistorySessions.size,
     timestamp: nowIso(),
   }, { bestEffort: true });
 }
 
 async function handleSessionUnwatch(command = {}) {
-  const key = watchKey(command);
-  let removed = 0;
-  if (key && watchedHistorySessions.delete(key)) {
-    removed += 1;
-  }
-
-  const identities = new Set(collectSessionIdentityCandidates(command));
-  if (identities.size) {
-    for (const [entryKey, entry] of Array.from(watchedHistorySessions.entries())) {
-      if (
-        identities.has(String(entry.sessionId || ''))
-        || identities.has(String(entry.nativeThreadId || ''))
-        || identities.has(String(entry.requestedSessionId || ''))
-        || identities.has(String(entry.conversationKey || ''))
-      ) {
-        watchedHistorySessions.delete(entryKey);
-        removed += 1;
-      }
-    }
-  }
+  const result = removeSessionWatch(watchedHistorySessions, command, {
+    ownerRevisions: watchedSessionRevisions,
+    ttlMs: SESSION_WATCH_TTL_MS,
+  });
 
   refreshTailerWatchedSessions();
   await postEvent({
@@ -1147,19 +1166,18 @@ async function handleSessionUnwatch(command = {}) {
     requestId: command.requestId || makeId(),
     sessionId: command.sessionId || command.nativeThreadId || null,
     watched: false,
-    removed,
+    removed: result.removed,
+    stale: result.stale,
+    watchRevision: command.watchRevision ?? null,
     watchedSessionCount: watchedHistorySessions.size,
     timestamp: nowIso(),
   }, { bestEffort: true });
 }
 
 function pruneExpiredWatchedSessions() {
-  const now = Date.now();
-  for (const [key, entry] of Array.from(watchedHistorySessions.entries())) {
-    if (Number(entry.expiresAt || 0) <= now) {
-      watchedHistorySessions.delete(key);
-    }
-  }
+  return pruneExpiredSessionWatches(watchedHistorySessions, {
+    ownerRevisions: watchedSessionRevisions,
+  });
 }
 
 function uniqueLiveRunners() {
@@ -1190,10 +1208,10 @@ function resolveLiveTailSessions() {
 }
 
 function refreshTailerWatchedSessions() {
+  pruneExpiredWatchedSessions();
   if (!codexTailer) {
     return { activeSessionCount: 0, watchedSessionCount: 0, liveSessionCount: 0 };
   }
-  pruneExpiredWatchedSessions();
   const liveTailSessions = resolveLiveTailSessions();
   const active = new Map();
   for (const session of watchedHistorySessions.values()) {
@@ -2359,6 +2377,8 @@ async function startManagedSession(command) {
       cwd,
       launchMode: command.launchMode || null,
       nativeThreadId: command.nativeThreadId || null,
+      rebindNativeThreadId: command.rebindNativeThreadId || null,
+      explicitRebind: command.explicitRebind === true,
       codexHome: CODEX_HOME,
       apiConfig,
       apiBinding,
@@ -2450,7 +2470,19 @@ async function handleCommand(command) {
   }
 
   if (command.type === 'host.shutdown') {
-    await shutdownHostAgent('relay-command');
+    hostAgentShutdownRetryPending = true;
+    const result = await shutdownHostAgent('relay-command');
+    if (result?.timedOut || result?.errors?.length) {
+      const error = new Error(
+        result.timedOut
+          ? 'Host Agent shutdown timed out; command remains retryable.'
+          : `Host Agent shutdown failed with ${result.errors.length} runner stop error(s).`
+      );
+      error.code = 'host_shutdown_incomplete';
+      error.retryCommand = true;
+      throw error;
+    }
+    hostAgentShutdownRetryPending = false;
     return;
   }
 
@@ -2482,6 +2514,9 @@ async function handleCommand(command) {
   if (command.type === 'host.api_test') {
     const result = await testApiProfile(command.apiConfig, {
       timeoutMs: command.timeoutMs,
+      cursor: command.cursor,
+      limit: command.limit,
+      includeLimit: command.includeLimit === true,
     });
     await postEvent({
       type: 'host.api_tested',
@@ -2753,6 +2788,8 @@ async function handleCommand(command) {
           currentTurnStatus: 'submitting',
           queuedCommandId: command.id || null,
           pendingInputSummary: String(command.text || '').slice(0, 240),
+          lastError: null,
+          lastCodexError: null,
           runId: runner.runId || command.runId || null,
         },
         timestamp: nowIso(),
@@ -3092,7 +3129,9 @@ async function handleCommand(command) {
 
   if (command.type === 'session.stop') {
     try {
-      await runner.stop({ suppressTerminalEvent: command.suppressTerminalEvent === true });
+      await stopRunnerOnce(runner, {
+        suppressTerminalEvent: command.suppressTerminalEvent === true,
+      });
     } catch (cause) {
       const stopError = cause instanceof Error
         ? cause
@@ -3144,7 +3183,7 @@ async function postCommandFailure(command, error) {
   }
 }
 
-async function processPolledCommand(command) {
+async function processPolledCommand(command, expectedRelayInstanceId = '') {
   const commandId = Number(command?.id || 0);
   try {
     await handleCommand(command);
@@ -3155,6 +3194,17 @@ async function processPolledCommand(command) {
       return false;
     }
     await postCommandFailure(command, error);
+  }
+  if (
+    expectedRelayInstanceId
+    && relayInstanceId
+    && relayInstanceId !== expectedRelayInstanceId
+  ) {
+    // A response from the previous Relay epoch may contain commands that have
+    // already been acknowledged or replaced. Do not advance the new cursor
+    // with an old command id.
+    lastCommandId = 0;
+    return false;
   }
   lastCommandId = Math.max(lastCommandId, commandId);
   return true;
@@ -3171,7 +3221,7 @@ async function acknowledgeCommandsBeforeShutdown() {
     }
   );
   if (observeRelayInstance(result.body)) {
-    await registerHost();
+    await ensureHostRegistration();
     return false;
   }
   return true;
@@ -3179,14 +3229,23 @@ async function acknowledgeCommandsBeforeShutdown() {
 
 async function pollCommandsLoop() {
   while (true) {
+    if (managedSessionStartGate.isShuttingDown() && !hostAgentShutdownRetryPending) {
+      return;
+    }
+    let requestLeaseId = '';
     try {
+      const headers = managedAgentRequestHeaders();
+      requestLeaseId = String(headers['X-Remote-Codex-Agent-Lease'] || '').trim();
       const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}&ack=${lastCommandId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}`, {
         retryOnTransient: true,
-        headers: managedAgentRequestHeaders(),
+        headers,
       });
       if (observeRelayInstance(result.body)) {
-        await registerHost();
+        await ensureHostRegistration();
       }
+      const batchRelayInstanceId = String(
+        result.body?.relayInstanceId || relayInstanceId || ''
+      ).trim();
       const commands = (Array.isArray(result.body && result.body.commands)
         ? result.body.commands
         : [])
@@ -3194,12 +3253,21 @@ async function pollCommandsLoop() {
         .sort((left, right) => Number(left?.id || 0) - Number(right?.id || 0));
       for (const command of commands) {
         if (
+          batchRelayInstanceId
+          && relayInstanceId
+          && relayInstanceId !== batchRelayInstanceId
+        ) {
+          lastCommandId = 0;
+          await ensureHostRegistration();
+          break;
+        }
+        if (
           command?.type === 'host.shutdown'
           && !(await acknowledgeCommandsBeforeShutdown())
         ) {
           break;
         }
-        const processed = await processPolledCommand(command);
+        const processed = await processPolledCommand(command, batchRelayInstanceId);
         if (!processed) {
           break;
         }
@@ -3209,9 +3277,19 @@ async function pollCommandsLoop() {
       }
       await sleep(POLL_INTERVAL_MS);
     } catch (error) {
+      try {
+        if (await recoverAgentLeaseForRequest(error, requestLeaseId)) {
+          continue;
+        }
+      } catch (recoveryError) {
+        error = recoveryError;
+      }
+      if (isRelayHostDismissedError(error)) {
+        await shutdownForRelayOwnershipLoss(error);
+        return;
+      }
       if (isRelayOwnershipRevokedError(error)) {
-        logAgentError('[agent] Relay ownership was revoked; stopping this Agent instance');
-        await shutdownHostAgent('ownership-revoked');
+        await shutdownForRelayOwnershipLoss(error);
         return;
       }
       logAgentTransient('[agent] command poll failed:', error);
@@ -3222,10 +3300,21 @@ async function pollCommandsLoop() {
 
 async function discoveryLoop() {
   while (true) {
+    if (managedSessionStartGate.isShuttingDown()) {
+      return;
+    }
     try {
       await sendDiscovery();
       await sleep(DISCOVERY_INTERVAL_MS);
     } catch (error) {
+      if (isRelayHostDismissedError(error)) {
+        await shutdownForRelayOwnershipLoss(error);
+        return;
+      }
+      if (isRelayOwnershipRevokedError(error)) {
+        await shutdownForRelayOwnershipLoss(error);
+        return;
+      }
       logAgentTransient('[agent] discovery failed:', error);
       await sleep(Math.max(DISCOVERY_INTERVAL_MS, 3000));
     }
@@ -3238,6 +3327,9 @@ async function codexTailLoop() {
   }
 
   while (true) {
+    if (managedSessionStartGate.isShuttingDown()) {
+      return;
+    }
     try {
       const scope = refreshTailerWatchedSessions();
       const startedAt = Date.now();
@@ -3249,6 +3341,14 @@ async function codexTailLoop() {
       }
       await sleep(CODEX_TAIL_INTERVAL_MS);
     } catch (error) {
+      if (isRelayHostDismissedError(error)) {
+        await shutdownForRelayOwnershipLoss(error);
+        return;
+      }
+      if (isRelayOwnershipRevokedError(error)) {
+        await shutdownForRelayOwnershipLoss(error);
+        return;
+      }
       logAgentTransient('[agent] codex tail failed:', error);
       await sleep(Math.max(CODEX_TAIL_INTERVAL_MS, 3000));
     }
@@ -3257,13 +3357,28 @@ async function codexTailLoop() {
 
 async function heartbeatLoop() {
   while (true) {
+    if (managedSessionStartGate.isShuttingDown() && !hostAgentShutdownRetryPending) {
+      return;
+    }
+    const requestLeaseId = String(agentLeaseId || '').trim();
     try {
+      pruneExpiredWatchedSessions();
       await heartbeat();
       await sleep(5000);
     } catch (error) {
+      try {
+        if (await recoverAgentLeaseForRequest(error, requestLeaseId)) {
+          continue;
+        }
+      } catch (recoveryError) {
+        error = recoveryError;
+      }
+      if (isRelayHostDismissedError(error)) {
+        await shutdownForRelayOwnershipLoss(error);
+        return;
+      }
       if (isRelayOwnershipRevokedError(error)) {
-        logAgentError('[agent] Relay ownership was revoked; stopping this Agent instance');
-        await shutdownHostAgent('ownership-revoked');
+        await shutdownForRelayOwnershipLoss(error);
         return;
       }
       logAgentTransient('[agent] heartbeat failed:', error);
@@ -3330,7 +3445,7 @@ async function main() {
     logAgentError('[agent] managed Codex overlay janitor:', error);
   }
 
-  await retryStartupStep('register host', registerHost);
+  await retryStartupStep('register host', ensureHostRegistration, 12);
   const heartbeatTask = heartbeatLoop();
   hostSkillInventory.start();
   await runStartupDiscovery();
@@ -3350,6 +3465,8 @@ function stopHostSkillInventory() {
 
 const managedSessionShutdownStopOptions = {};
 let hostAgentShutdownReason = null;
+let hostAgentShutdownRetryPending = false;
+let ownershipRevocationShutdownPromise = null;
 const shutdownManagedSessions = createManagedSessionShutdown({
   liveSessions,
   startGate: managedSessionStartGate,
@@ -3357,6 +3474,13 @@ const shutdownManagedSessions = createManagedSessionShutdown({
   graceTimeoutMs: AGENT_SHUTDOWN_GRACE_MS,
   stopOptions: managedSessionShutdownStopOptions,
   log: (message) => logAgentError('[agent] shutdown:', message),
+  exit: (code) => {
+    if (hostAgentShutdownSuppressesTerminalEvents() || !agentLeaseId) {
+      process.exit(code);
+      return;
+    }
+    void releaseAgentLease().finally(() => process.exit(code));
+  },
 });
 
 function hostAgentShutdownSuppressesTerminalEvents() {
@@ -3389,6 +3513,62 @@ function shutdownHostAgent(reason = 'SIGTERM') {
   return shutdownManagedSessions(hostAgentShutdownReason);
 }
 
+function isCompletedHostAgentShutdown(result) {
+  return Boolean(
+    result
+    && result.timedOut !== true
+    && (!Array.isArray(result.errors) || result.errors.length === 0)
+  );
+}
+
+function retryOwnershipRevokedShutdown() {
+  if (ownershipRevocationShutdownPromise) {
+    return ownershipRevocationShutdownPromise;
+  }
+
+  // A Relay-command shutdown keeps polling alive so that command can be
+  // retried. Ownership loss is terminal for this instance, so it supersedes
+  // that retry mode and lets the other Agent loops wind down.
+  hostAgentShutdownRetryPending = false;
+  const retry = async () => {
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      try {
+        const result = await shutdownHostAgent('ownership-revoked');
+        if (isCompletedHostAgentShutdown(result)) {
+          return result;
+        }
+        const problem = result?.timedOut
+          ? 'timed out'
+          : `${Array.isArray(result?.errors) ? result.errors.length : 'unknown'} runner stop error(s)`;
+        logAgentError(
+          `[agent] ownership-revoked shutdown ${problem}; retrying in ${OWNERSHIP_REVOKED_SHUTDOWN_RETRY_MS}ms (attempt ${attempt})`
+        );
+      } catch (error) {
+        logAgentError(
+          `[agent] ownership-revoked shutdown failed: ${error?.message || error}; retrying in ${OWNERSHIP_REVOKED_SHUTDOWN_RETRY_MS}ms (attempt ${attempt})`
+        );
+      }
+      await sleep(OWNERSHIP_REVOKED_SHUTDOWN_RETRY_MS);
+    }
+  };
+
+  ownershipRevocationShutdownPromise = retry().finally(() => {
+    ownershipRevocationShutdownPromise = null;
+  });
+  return ownershipRevocationShutdownPromise;
+}
+
+function shutdownForRelayOwnershipLoss(error) {
+  if (isRelayHostDismissedError(error)) {
+    logAgentNotice(`[agent] Host ${HOST_ID} was dismissed by the Relay; stopping this Agent instance`);
+  } else {
+    logAgentError(`[agent] Relay ownership was revoked (${error?.body?.code || 'unknown'}); stopping this Agent instance`);
+  }
+  return retryOwnershipRevokedShutdown();
+}
+
 function handleShutdownSignal(signal) {
   logAgentNotice(`[agent] received ${signal}; stopping`);
   return shutdownHostAgent(signal);
@@ -3409,10 +3589,15 @@ async function retryStartupStep(label, task, attempts = 8) {
       return;
     } catch (error) {
       lastError = error;
-      if (isRelayOwnershipRevokedError(error)) {
+      if (isRelayHostDismissedError(error) || isRelayOwnershipRevokedError(error)) {
         throw error;
       }
-      const delay = Math.min(5000, 300 * attempt * attempt);
+      if (attempt >= attempts) {
+        break;
+      }
+      const delay = isPreLeaseAgentInstanceConflict(error)
+        ? Math.min(5000, Math.max(500, Number(error?.body?.retryAfterMs || 0) || 500))
+        : Math.min(5000, 300 * attempt * attempt);
       logAgentError(`[agent] ${label} failed (${attempt}/${attempts}): ${error.message}`);
       await sleep(delay);
     }
@@ -3420,7 +3605,15 @@ async function retryStartupStep(label, task, attempts = 8) {
   throw lastError;
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
+  if (isRelayHostDismissedError(error)) {
+    await shutdownForRelayOwnershipLoss(error);
+    return;
+  }
+  if (isRelayOwnershipRevokedError(error)) {
+    await shutdownForRelayOwnershipLoss(error);
+    return;
+  }
   console.error('[agent] fatal:', error);
   process.exit(1);
 });

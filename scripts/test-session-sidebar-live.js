@@ -205,6 +205,73 @@ assert.deepStrictEqual(
   'live conversations should be grouped before non-live conversations, then keep the selected sort order'
 );
 
+api.state.sessions = [
+  {
+    hostId: 'win',
+    sessionId: 'replacement-live',
+    conversationKey: 'shared-conversation',
+    source: 'managed',
+    state: 'running',
+    live: true,
+    messageCount: 0,
+  },
+  {
+    hostId: 'win',
+    sessionId: 'stale-starting-shell',
+    conversationKey: 'shared-conversation',
+    source: 'managed',
+    state: 'starting',
+    live: false,
+    messageCount: 0,
+    transcriptPreview: [],
+  },
+  {
+    hostId: 'win',
+    sessionId: 'empty-history',
+    conversationKey: 'shared-conversation',
+    source: 'managed',
+    state: 'history-only',
+    live: false,
+    messageCount: 0,
+  },
+  {
+    hostId: 'win',
+    sessionId: 'starting-with-message',
+    conversationKey: 'shared-conversation',
+    source: 'managed',
+    state: 'starting',
+    live: false,
+    messageCount: 1,
+  },
+  {
+    hostId: 'win',
+    sessionId: 'starting-without-live-peer',
+    conversationKey: 'standalone-starting',
+    source: 'managed',
+    state: 'starting',
+    live: false,
+    messageCount: 0,
+  },
+];
+
+const variantGroups = api.getConversationGroups('win');
+const sharedGroup = variantGroups.find((group) => group.conversationKey === 'shared-conversation');
+assert(sharedGroup, 'shared managed conversation should remain visible');
+assert.deepStrictEqual(
+  Array.from(sharedGroup.sessions.map((session) => session.sessionId).sort()),
+  ['empty-history', 'replacement-live', 'starting-with-message'],
+  'a live managed replacement should hide only its empty non-live starting shell'
+);
+assert.strictEqual(sharedGroup.totalCount, 3, 'hidden starting shells must not inflate the visible variant count');
+assert.strictEqual(sharedGroup.messageCount, 1, 'visible variant messages should still contribute to the group count');
+
+const standaloneStarting = variantGroups.find((group) => group.conversationKey === 'standalone-starting');
+assert.strictEqual(
+  standaloneStarting?.sessions?.[0]?.sessionId,
+  'starting-without-live-peer',
+  'an empty starting Session without a live managed peer must stay visible'
+);
+
 assert.ok(
   source.includes("group.liveCount > 0 ? 'live' : 'history'"),
   'conversation card class should distinguish live and history groups'

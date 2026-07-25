@@ -854,17 +854,26 @@ function extractStructuredText(value) {
 }
 
 function joinStructuredTextParts(parts) {
-  const values = (Array.isArray(parts) ? parts : [])
-    .map((part) => String(part || '').trim())
-    .filter(Boolean);
-  if (!values.length) {
+  const rawValues = (Array.isArray(parts) ? parts : [])
+    .map((part) => String(part || ''))
+    .filter((part) => part.trim());
+  if (!rawValues.length) {
     return '';
   }
-  if (values.some((part) => /\r?\n/.test(part))) {
-    return values.join('\n').trim();
+  if (rawValues.some((part) => /\r?\n/.test(part))) {
+    return rawValues.map((part) => part.trim()).join('\n').trim();
   }
-  const looksTokenized = values.length >= 4 && values.every((part) => part.length <= 32 && !/[.!?。！？:：;；]$/.test(part));
-  return values.join(looksTokenized ? ' ' : '\n').replace(/[ \t]+\n/g, '\n').trim();
+  if (rawValues.some((part) => /^\s|\s$/.test(part))) {
+    return rawValues.join('').trim();
+  }
+  const values = rawValues.map((part) => part.trim());
+  const cjkOnly = values.every((part) => !/[A-Za-z0-9]/.test(part))
+    && values.some((part) => /[\u3400-\u9fff\uf900-\ufaff]/.test(part));
+  if (cjkOnly) return values.join('');
+  return values.join(' ')
+    .replace(/\s+([,.!?;:，。！？；：])/g, '$1')
+    .replace(/([([{])\s+/g, '$1')
+    .trim();
 }
 
 function parseJsonObject(value) {

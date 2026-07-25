@@ -5,9 +5,33 @@ const {
   redactSecretText,
   stripSecrets,
 } = require('../../shared/secret-redaction');
+const {
+  recoverMissingFileFromBackupAsync,
+  replaceFileWithBackupAsync,
+} = require('./atomic-file-replace');
 
 const SCHEMA_VERSION = 1;
 const SENTINEL_SCHEMA_VERSION = 1;
+const SNAPSHOT_INVARIANT_ERROR_CODES = new Set([
+  'session_store_high_water_rollback',
+  'session_store_identity_conflict',
+  'session_store_snapshot_fork',
+  'session_store_snapshot_invalid',
+]);
+
+function snapshotFailureRequiresReadOnly(error) {
+  const code = String(error?.code || '');
+  return Boolean(
+    error?.recoveryPath
+    || error?.restoreError
+    || SNAPSHOT_INVARIANT_ERROR_CODES.has(code)
+    || code.startsWith('session_store_snapshot_')
+    || code.startsWith('session_store_sentinel_')
+    || code.startsWith('session_store_wal_')
+    || code === 'session_store_checksum_gap'
+    || code === 'session_store_revision_gap'
+  );
+}
 
 class StoreRecoveryError extends Error {
   constructor(code, message, details = null) {
@@ -404,10 +428,12 @@ class SessionRecordStore {
     this.lastSnapshotError = null;
     this.sentinelEstablished = false;
     this.needsSecretRewrite = false;
+    this.fileReplaceOptions = options.fileReplaceOptions || {};
   }
 
   async openStore() {
     await fs.promises.mkdir(this.rootDir, { recursive: true });
+    await this.recoverInterruptedReplacements();
     const sentinel = await this.readSentinelEnvelope();
     const current = await this.readSnapshotEnvelope(this.currentSnapshotPath);
     const previous = await this.readSnapshotEnvelope(this.previousSnapshotPath);
@@ -688,6 +714,7 @@ class SessionRecordStore {
             status: 'stopped',
             launchMode: 'resume',
             parentRunId: null,
+            nativeResumeReady: true,
             apiBinding: { kind: 'unknown', modelProviderHint: null },
             requestedSelection: { model: null, effort: null, source: 'legacy_metadata' },
             effectiveSelection: { model: null, effort: null, confirmedAt: null },
@@ -767,8 +794,11 @@ class SessionRecordStore {
           `Unable to persist Session store snapshot: ${redactSecretText(error.message || String(error))}`
         );
         this.lastSnapshotError = wrapped;
-        this.mutationsClosed = wrapped.message;
-        throw wrapped;
+        if (snapshotFailureRequiresReadOnly(error)) {
+          // The WAL and sentinel already committed this revision. Do not report
+          // it as rejected, but stop the next mutation on a broken invariant.
+          this.mutationsClosed = wrapped.message;
+        }
       }
     }
     return result;
@@ -786,6 +816,28 @@ class SessionRecordStore {
 
   readSnapshot() {
     return clone(this.projection);
+  }
+
+  readHealth() {
+    const snapshotError = this.lastSnapshotError?.message
+      ? redactSecretText(this.lastSnapshotError.message)
+      : null;
+    if (this.mutationsClosed) {
+      return {
+        status: 'failed',
+        writable: false,
+        revision: Number(this.projection.storeRevision || 0),
+        snapshotError,
+        error: redactSecretText(this.mutationsClosed),
+      };
+    }
+    return {
+      status: snapshotError ? 'degraded' : 'ok',
+      writable: true,
+      revision: Number(this.projection.storeRevision || 0),
+      snapshotError,
+      error: null,
+    };
   }
 
   resolveCanonicalKey(identity) {
@@ -835,9 +887,11 @@ class SessionRecordStore {
           : new StoreRecoveryError(
             'session_store_snapshot_failed',
             `Unable to persist Session store snapshot: ${redactSecretText(error.message || String(error))}`
-          );
+        );
         this.lastSnapshotError = wrapped;
-        this.mutationsClosed = wrapped.message;
+        if (snapshotFailureRequiresReadOnly(error)) {
+          this.mutationsClosed = wrapped.message;
+        }
         throw wrapped;
       }
     };
@@ -1017,18 +1071,17 @@ class SessionRecordStore {
   }
 
   async replaceFile(sourcePath, destinationPath) {
-    try {
-      await fs.promises.rename(sourcePath, destinationPath);
-    } catch (error) {
-      if (!['EEXIST', 'EPERM', 'ENOTEMPTY'].includes(error.code)) {
-        throw error;
-      }
-      await fs.promises.unlink(destinationPath).catch((unlinkError) => {
-        if (unlinkError.code !== 'ENOENT') {
-          throw unlinkError;
-        }
-      });
-      await fs.promises.rename(sourcePath, destinationPath);
+    await replaceFileWithBackupAsync(sourcePath, destinationPath, this.fileReplaceOptions);
+  }
+
+  async recoverInterruptedReplacements() {
+    for (const targetPath of [
+      this.currentSnapshotPath,
+      this.previousSnapshotPath,
+      this.walPath,
+      this.sentinelPath,
+    ]) {
+      await recoverMissingFileFromBackupAsync(targetPath, this.fileReplaceOptions);
     }
   }
 

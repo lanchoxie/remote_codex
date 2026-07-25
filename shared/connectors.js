@@ -87,6 +87,33 @@ function normalizeStringList(value) {
     .filter(Boolean);
 }
 
+function normalizeConnectorRemoteDirectory(value) {
+  const fallback = '~/mobile-codex-remote';
+  const text = cleanString(value) || fallback;
+  const normalized = text.replace(/\\/g, '/').replace(/\/+$/, '') || fallback;
+  const generatedDeployment = normalized.match(/^(.*?)\/\.deployments\/deploy-[^/]+(?:\/.*)?$/i);
+  return cleanString(generatedDeployment?.[1]) || normalized;
+}
+
+function connectorControlKey(connector = {}) {
+  const identity = cleanString(connector.connectorId || connector.hostId || 'default');
+  return identity.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96) || 'default';
+}
+
+function connectorControlFileName(connector, kind) {
+  const suffix = kind === 'log' ? 'log' : 'pid';
+  return `codex-remote.${connectorControlKey(connector)}.agent.${suffix}`;
+}
+
+function connectorTmuxSessionName(connector = {}) {
+  const configured = cleanString(connector.bootstrap?.tmuxSession) || 'codex-remote';
+  const suffix = connectorControlKey(connector).slice(0, 12);
+  if (configured.endsWith(`-${suffix}`)) {
+    return configured;
+  }
+  return `${configured.slice(0, Math.max(1, 120 - suffix.length))}-${suffix}`;
+}
+
 function shellQuote(value) {
   const text = cleanString(value);
   if (!text) {
@@ -282,7 +309,9 @@ function normalizeConnectorInput(input = {}, existing = null) {
     },
     bootstrap: {
       mode: BOOTSTRAP_MODES.has(bootstrapMode) ? bootstrapMode : 'manual_tmux',
-      remoteDirectory: cleanString(nextBootstrap.remoteDirectory || input.bootstrapRemoteDirectory || previousBootstrap.remoteDirectory) || '~/mobile-codex-remote',
+      remoteDirectory: normalizeConnectorRemoteDirectory(
+        nextBootstrap.remoteDirectory || input.bootstrapRemoteDirectory || previousBootstrap.remoteDirectory
+      ),
       tmuxSession: cleanString(nextBootstrap.tmuxSession || input.bootstrapTmuxSession || previousBootstrap.tmuxSession) || 'codex-remote',
       serviceName: cleanString(nextBootstrap.serviceName || input.bootstrapServiceName || previousBootstrap.serviceName) || 'codex-remote',
       launchCommand: cleanText(nextBootstrap.launchCommand || input.bootstrapLaunchCommand || previousBootstrap.launchCommand),
@@ -292,7 +321,7 @@ function normalizeConnectorInput(input = {}, existing = null) {
   };
 }
 
-function buildAgentLaunchCommand(connector) {
+function buildAgentLaunchCommand(connector, options = {}) {
   const exports = [];
   if (connector.relayUrl) {
     exports.push(`RELAY_URL=${shellEnvValue(connector.relayUrl)}`);
@@ -302,6 +331,9 @@ function buildAgentLaunchCommand(connector) {
   }
   if (connector.hostId) {
     exports.push(`HOST_ID=${shellEnvValue(connector.hostId)}`);
+  }
+  if (connector.connectorId) {
+    exports.push(`REMOTE_CODEX_CONNECTOR_ID=${shellEnvValue(connector.connectorId)}`);
   }
   if (connector.label) {
     exports.push(`HOST_LABEL=${shellEnvValue(connector.label)}`);
@@ -315,11 +347,15 @@ function buildAgentLaunchCommand(connector) {
   exports.push('AUTO_START_SESSION=false');
 
   const envBlock = exports.length ? `${exports.join(' ')} ` : '';
+  const nodeLaunch = `${envBlock}PATH="$PATH" CODEX_BIN="$CODEX_BIN" "$NODE_BIN" apps/host-agent/agent.js`;
+  const managedNodeLaunch = options.execProcess === true
+    ? `exec env ${nodeLaunch}`
+    : nodeLaunch;
   return connector.bootstrap.launchCommand
     || [
       buildNodeBinResolutionCommand(),
       buildCodexBinResolutionCommand(connector),
-      `test -n "$NODE_BIN" && ${envBlock}PATH="$PATH" CODEX_BIN="$CODEX_BIN" "$NODE_BIN" apps/host-agent/agent.js`,
+      `test -n "$NODE_BIN" && ${managedNodeLaunch}`,
     ].join('\n');
 }
 
@@ -327,8 +363,9 @@ function tmuxShellCommand(command) {
   return shellQuote(`sh -lc ${shellQuote(command)}`);
 }
 
-function agentLogCommand(command) {
-  return `echo "[remote-codex] start $(date -Is 2>/dev/null || date)" >> codex-remote.agent.log; { ${command}; } >> codex-remote.agent.log 2>&1`;
+function agentLogCommand(command, options = {}) {
+  const logPath = shellPathArg(options.logPath || 'codex-remote.agent.log');
+  return `echo "[remote-codex] start $(date -Is 2>/dev/null || date)" >> ${logPath}; { ${command}; } >> ${logPath} 2>&1`;
 }
 
 function buildBootstrapCommand(connector) {
@@ -336,7 +373,7 @@ function buildBootstrapCommand(connector) {
   const launchCommand = buildAgentLaunchCommand(connector);
 
   if (connector.bootstrap.mode === 'manual_tmux') {
-    return `cd ${shellPathArg(remoteDir)} && tmux new -As ${shellQuote(connector.bootstrap.tmuxSession)} ${tmuxShellCommand(agentLogCommand(launchCommand))}`;
+    return `cd ${shellPathArg(remoteDir)} && tmux new -As ${shellQuote(connectorTmuxSessionName(connector))} ${tmuxShellCommand(agentLogCommand(launchCommand, { logPath: connectorControlFileName(connector, 'log') }))}`;
   }
 
   if (connector.bootstrap.mode === 'manual_systemd') {
@@ -359,14 +396,15 @@ function buildDetachedBootstrapCommand(connector, options = {}) {
   const launchCommand = buildAgentLaunchCommand(connector);
 
   if (connector.bootstrap.mode === 'manual_tmux') {
-    const tmuxSession = connector.bootstrap.tmuxSession || 'codex-remote';
-    const startCommand = `tmux new-session -d -s ${shellQuote(tmuxSession)} ${tmuxShellCommand(agentLogCommand(launchCommand))}`;
+    const tmuxSession = connectorTmuxSessionName(connector);
+    const logFile = connectorControlFileName(connector, 'log');
+    const startCommand = `tmux new-session -d -s ${shellQuote(tmuxSession)} ${tmuxShellCommand(agentLogCommand(launchCommand, { logPath: logFile }))}`;
     const tmuxCommand = options.restart
       ? `(tmux kill-session -t ${shellQuote(tmuxSession)} 2>/dev/null || true) && ${startCommand}`
       : `(tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null || ${startCommand})`;
-    const pidFile = 'codex-remote.agent.pid';
+    const pidFile = connectorControlFileName(connector, 'pid');
     const pidCheck = `test -f ${pidFile} && kill -0 "$(cat ${pidFile})" 2>/dev/null`;
-    const nohupStart = `nohup sh -lc ${shellQuote(agentLogCommand(launchCommand))} >/dev/null 2>&1 < /dev/null & echo $! > ${pidFile}`;
+    const nohupStart = `nohup sh -lc ${shellQuote(agentLogCommand(launchCommand, { logPath: logFile }))} >/dev/null 2>&1 < /dev/null & echo $! > ${pidFile}`;
     const nohupCommand = options.restart
       ? `(${pidCheck} && kill "$(cat ${pidFile})" 2>/dev/null || true); ${nohupStart}`
       : `(${pidCheck} || ${nohupStart})`;
@@ -378,9 +416,10 @@ function buildDetachedBootstrapCommand(connector, options = {}) {
   }
 
   if (connector.bootstrap.mode === 'ssh_exec' || connector.bootstrap.mode === 'gateway_launcher') {
+    const logFile = connectorControlFileName(connector, 'log');
     return [
       `cd ${shellPathArg(remoteDir)}`,
-      `nohup sh -lc ${shellQuote(launchCommand)} > codex-remote.agent.log 2>&1 < /dev/null &`,
+      `nohup sh -lc ${shellQuote(launchCommand)} > ${shellPathArg(logFile)} 2>&1 < /dev/null &`,
       'echo CODEX_REMOTE_AGENT_BOOTSTRAPPED',
     ].join(' && ');
   }
@@ -395,12 +434,16 @@ function buildDetachedBootstrapCommand(connector, options = {}) {
 function buildRemoteStatusCommand(connector) {
   if (connector.bootstrap?.mode === 'manual_tmux') {
     const remoteDir = connector.bootstrap.remoteDirectory || '~/mobile-codex-remote';
-    const tmuxSession = connector.bootstrap.tmuxSession || 'codex-remote';
+    const expectedConnectorId = cleanString(connector.connectorId);
+    const expectedHostId = cleanString(connector.hostId);
     return [
-      `cd ${shellPathArg(remoteDir)} 2>/dev/null || true;`,
-      `if command -v tmux >/dev/null 2>&1 && tmux has-session -t ${shellQuote(tmuxSession)} 2>/dev/null; then echo CODEX_REMOTE_AGENT_TMUX_RUNNING; exit 0; fi;`,
-      'if test -f codex-remote.agent.pid && kill -0 "$(cat codex-remote.agent.pid)" 2>/dev/null; then echo CODEX_REMOTE_AGENT_PROCESS_RUNNING; exit 0; fi;',
-      'echo CODEX_REMOTE_AGENT_TMUX_MISSING',
+      `control_dir=${shellPathArg(remoteDir)};`,
+      `expected_connector_id=${shellEnvValue(expectedConnectorId)};`,
+      `expected_host_id=${shellEnvValue(expectedHostId)};`,
+      'if cd "$control_dir" 2>/dev/null; then control_dir="$(pwd -P)"; else echo CODEX_REMOTE_AGENT_MISSING; exit 0; fi;',
+      'agent_pid="$(ps -eo pid=,comm=,args= 2>/dev/null | while read -r candidate_pid candidate_comm candidate_args; do case "$candidate_comm" in node|nodejs) ;; *) continue ;; esac; case "$candidate_args" in *apps/host-agent/agent.js*) ;; *) continue ;; esac; candidate_environment="$(tr \'\\000\' \'\\n\' < "/proc/$candidate_pid/environ" 2>/dev/null || true)"; candidate_connector_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^REMOTE_CODEX_CONNECTOR_ID=//p" | head -n 1)"; candidate_host_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^HOST_ID=//p" | head -n 1)"; identity_match=0; if test -n "$expected_connector_id" && test -n "$candidate_connector_id"; then test "$candidate_connector_id" = "$expected_connector_id" && identity_match=1; elif test -n "$expected_host_id" && test -n "$candidate_host_id"; then test "$candidate_host_id" = "$expected_host_id" && identity_match=1; fi; test "$identity_match" = 1 || continue; candidate_cwd="$(readlink -f "/proc/$candidate_pid/cwd" 2>/dev/null || true)"; case "$candidate_cwd" in "$control_dir"|"$control_dir"/*) echo "$candidate_pid"; break ;; esac; done)";',
+      'if test -n "$agent_pid" && kill -0 "$agent_pid" 2>/dev/null; then echo CODEX_REMOTE_AGENT_PROCESS_RUNNING; exit 0; fi;',
+      'echo CODEX_REMOTE_AGENT_MISSING',
     ].join(' ');
   }
 
@@ -613,7 +656,7 @@ function buildConnectorPlan(connector) {
   }
 
   if (connector.bootstrap.mode === 'manual_tmux') {
-    steps.push(`Keep the agent inside tmux session "${connector.bootstrap.tmuxSession}" so Codex survives SSH disconnects.`);
+    steps.push(`Keep the agent inside tmux session "${connectorTmuxSessionName(connector)}" so Codex survives SSH disconnects.`);
   } else if (connector.bootstrap.mode === 'manual_systemd') {
     steps.push(`Prefer a user-level systemd unit such as "${connector.bootstrap.serviceName}" if the cluster allows long-lived user services.`);
   } else if (connector.bootstrap.mode === 'ssh_exec') {
@@ -716,7 +759,7 @@ function serializeConnector(connector) {
     },
     bootstrap: {
       mode: connector.bootstrap?.mode || 'manual_tmux',
-      remoteDirectory: connector.bootstrap?.remoteDirectory || '~/mobile-codex-remote',
+      remoteDirectory: normalizeConnectorRemoteDirectory(connector.bootstrap?.remoteDirectory),
       tmuxSession: connector.bootstrap?.tmuxSession || 'codex-remote',
       serviceName: connector.bootstrap?.serviceName || 'codex-remote',
       launchCommand: connector.bootstrap?.launchCommand || '',
@@ -762,9 +805,13 @@ module.exports = {
   buildNodeBinResolutionCommand,
   buildRemoteStatusCommand,
   buildSshCommandParts,
+  connectorControlFileName,
+  connectorControlKey,
+  connectorTmuxSessionName,
   decorateConnector,
   connectorUsesGateway,
   loadConnectors,
+  normalizeConnectorRemoteDirectory,
   normalizeConnectorInput,
   requiresInteractiveAuth,
   saveConnectors,

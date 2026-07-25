@@ -14,6 +14,8 @@
   const MAX_FILE_BYTES = 1024 * 1024;
   const MAX_PROFILES = 256;
   const MAX_HOST_MAPPINGS = 2048;
+  const PROVIDER_KINDS = new Set(['openai', 'anthropic', 'gemini', 'custom']);
+  const REASONING_EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 
   class BackupError extends Error {
     constructor(code, message) {
@@ -47,16 +49,64 @@
     return parsed.toString();
   }
 
+  function inferProviderKind(provider) {
+    const normalized = String(provider == null ? '' : provider)
+      .trim()
+      .toLowerCase()
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ');
+    if (['openai', 'open ai', 'openai api', 'official openai'].includes(normalized)) return 'openai';
+    if (['anthropic', 'claude', 'anthropic claude', 'anthropic api', 'anthropic/claude'].includes(normalized)) return 'anthropic';
+    if (['gemini', 'google gemini', 'gemini api', 'google ai', 'google/gemini'].includes(normalized)) return 'gemini';
+    return 'custom';
+  }
+
+  function normalizeProviderKind(value, provider) {
+    const providerKind = String(value == null ? '' : value).trim().toLowerCase();
+    if (!providerKind) return inferProviderKind(provider);
+    if (!PROVIDER_KINDS.has(providerKind)) {
+      throw new BackupError('api_profile_backup_invalid', `Unsupported API provider kind: ${providerKind}`);
+    }
+    return providerKind;
+  }
+
+  function normalizeSessionDefaults(value) {
+    if (value != null && (!value || typeof value !== 'object' || Array.isArray(value))) {
+      throw new BackupError('api_profile_backup_invalid', 'API profile session defaults must be an object');
+    }
+    const input = value || {};
+    const model = string(input.model, 512, 'default model');
+    const effort = string(input.effort, 32, 'default reasoning effort');
+    if (effort && !REASONING_EFFORT_PATTERN.test(effort)) {
+      throw new BackupError('api_profile_backup_invalid', 'Default reasoning effort has an invalid format');
+    }
+    const rawEffortMode = string(input.effortMode, 16, 'default reasoning effort mode').toLowerCase();
+    if (rawEffortMode && rawEffortMode !== 'auto' && rawEffortMode !== 'manual') {
+      throw new BackupError('api_profile_backup_invalid', 'Default reasoning effort mode must be auto or manual');
+    }
+    const effortMode = rawEffortMode || (effort ? 'manual' : 'auto');
+    return {
+      model,
+      effortMode,
+      effort: effortMode === 'manual' ? effort : '',
+      allowUnverifiedEffort: effortMode === 'manual' && Boolean(effort) && input.allowUnverifiedEffort === true,
+      summary: string(input.summary, 64, 'default reasoning summary'),
+    };
+  }
+
   function normalizeProfile(value, index) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new BackupError('api_profile_backup_invalid', `API profile ${index + 1} must be an object`);
     }
+    const provider = string(value.provider, 128, 'API provider', { required: true });
     return {
       profileId: string(value.profileId, 128, 'API profile ID', { required: true }),
       label: string(value.label, 256, 'API profile label', { required: true }),
-      provider: string(value.provider, 128, 'API provider', { required: true }),
+      provider,
+      providerKind: normalizeProviderKind(value.providerKind, provider),
       baseUrl: normalizeBaseUrl(value.baseUrl),
       apiKey: string(value.apiKey, 16384, 'API key', { trim: false }),
+      sessionDefaults: normalizeSessionDefaults(value.sessionDefaults),
     };
   }
 
@@ -308,11 +358,13 @@
       }
       if (identity(current) === identity(backup)) {
         idMap[backup.profileId] = current.profileId;
-        if (!current.apiKey && backup.apiKey) current.apiKey = backup.apiKey;
+        let apiKey = current.apiKey;
+        if (!apiKey && backup.apiKey) apiKey = backup.apiKey;
         else if (current.apiKey && backup.apiKey && current.apiKey !== backup.apiKey) {
           conflicts.push({ type: 'credential', profileId: backup.profileId });
-          if (options.keyConflicts?.[backup.profileId] === 'backup') current.apiKey = backup.apiKey;
+          if (options.keyConflicts?.[backup.profileId] === 'backup') apiKey = backup.apiKey;
         }
+        Object.assign(current, backup, { apiKey });
         continue;
       }
       conflicts.push({ type: 'identity', profileId: backup.profileId });
@@ -358,6 +410,7 @@
     encryptBackup,
     planSafeMerge,
     previewPayload,
+    normalizeSessionDefaults,
     validatePayload,
   };
 }));

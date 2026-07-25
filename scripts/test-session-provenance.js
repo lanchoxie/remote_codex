@@ -14,6 +14,7 @@ const {
   makeProfileBinding,
   makeUnknownBinding,
   normalizeBaseUrl,
+  publicBinding,
 } = require('../shared/api-binding');
 
 async function main() {
@@ -43,6 +44,27 @@ async function main() {
     provider: 'OpenAI',
     baseUrl: 'https://other.example/v1',
   });
+  const legacyOpenAiKeyOnlyBinding = {
+    kind: 'profile',
+    profileId: 'legacy-openai-key-only',
+    label: 'Legacy OpenAI key-only',
+    provider: 'OpenAI',
+    providerKind: null,
+    normalizedBaseUrl: null,
+    bindingFingerprint: 'persisted-pre-canonicalization-fingerprint',
+  };
+  const canonicalOpenAiKeyOnlyBinding = makeProfileBinding({
+    profileId: 'legacy-openai-key-only',
+    label: 'Legacy OpenAI key-only',
+    provider: 'OpenAI',
+    providerKind: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+  });
+  assert.strictEqual(
+    publicBinding(legacyOpenAiKeyOnlyBinding).bindingFingerprint,
+    canonicalOpenAiKeyOnlyBinding.bindingFingerprint,
+    'publicBinding must recalculate legacy OpenAI null-base identity with the official endpoint'
+  );
   assert.strictEqual(bindingsEqual(asxs, renamedAsxs), true, 'label/key rotation must not change API identity');
   assert.strictEqual(JSON.stringify(asxs).includes('secret-one'), false);
   assert.strictEqual(
@@ -78,6 +100,95 @@ async function main() {
     () => normalizeBaseUrl('https://api.example.invalid/v1?X-Amz-Signature=opaque-value'),
     /must not contain credentials/,
     'provider-prefixed signature query parameters must never become persisted binding identity'
+  );
+
+  await store.transact('test.seed.legacy-openai-key-only', (tx) => {
+    const key = tx.resolveCanonicalKey({ hostId: 'host-legacy-openai', sessionId: 'legacy-openai-session' });
+    const record = tx.ensureRecord(key, {
+      hostId: 'host-legacy-openai',
+      conversationKey: 'legacy-openai-session',
+      source: 'managed',
+    });
+    record.runs['legacy-openai-run'] = {
+      status: 'stopped',
+      launchMode: 'fresh',
+      parentRunId: null,
+      nativeResumeReady: true,
+      apiBinding: structuredClone(legacyOpenAiKeyOnlyBinding),
+      requestedSelection: null,
+      effectiveSelection: null,
+      createdAt: now(),
+      endedAt: now(),
+    };
+    record.latestSuccessfulRunId = 'legacy-openai-run';
+    record.activeRunId = null;
+    record.updatedAt = now();
+    tx.markDirty(key);
+  });
+  const legacyOpenAiResume = await service.planRun({
+    identity: { hostId: 'host-legacy-openai', sessionId: 'legacy-openai-session' },
+    runId: 'legacy-openai-resume',
+    launchMode: 'resume',
+    submittedBinding: canonicalOpenAiKeyOnlyBinding,
+    requireExpectedRun: true,
+    expectedRunId: 'legacy-openai-run',
+    expectedRunStatus: 'stopped',
+    expectedRunStatusProvided: true,
+    expectedBindingFingerprint: canonicalOpenAiKeyOnlyBinding.bindingFingerprint,
+    expectedBindingProvided: true,
+  });
+  assert.strictEqual(
+    legacyOpenAiResume.run.apiBinding.bindingFingerprint,
+    canonicalOpenAiKeyOnlyBinding.bindingFingerprint,
+    'a normal Resume must accept the canonicalized legacy OpenAI key-only binding'
+  );
+
+  const legacyCustomNullBaseBinding = {
+    kind: 'profile',
+    profileId: 'legacy-custom-null-base',
+    provider: 'OpenAI',
+    providerKind: 'custom',
+    normalizedBaseUrl: null,
+    bindingFingerprint: 'legacy-custom-null-base-fingerprint',
+  };
+  assert.strictEqual(publicBinding(legacyCustomNullBaseBinding).normalizedBaseUrl, null);
+  await store.transact('test.seed.legacy-custom-null-base', (tx) => {
+    const key = tx.resolveCanonicalKey({ hostId: 'host-legacy-custom', sessionId: 'legacy-custom-session' });
+    const record = tx.ensureRecord(key, {
+      hostId: 'host-legacy-custom',
+      conversationKey: 'legacy-custom-session',
+      source: 'managed',
+    });
+    record.runs['legacy-custom-run'] = {
+      status: 'stopped',
+      launchMode: 'fresh',
+      parentRunId: null,
+      nativeResumeReady: true,
+      apiBinding: structuredClone(legacyCustomNullBaseBinding),
+      requestedSelection: null,
+      effectiveSelection: null,
+      createdAt: now(),
+      endedAt: now(),
+    };
+    record.latestSuccessfulRunId = 'legacy-custom-run';
+    record.activeRunId = null;
+    record.updatedAt = now();
+    tx.markDirty(key);
+  });
+  await assert.rejects(
+    service.planRun({
+      identity: { hostId: 'host-legacy-custom', sessionId: 'legacy-custom-session' },
+      runId: 'legacy-custom-resume',
+      launchMode: 'resume',
+      submittedBinding: makeProfileBinding({
+        profileId: 'legacy-custom-null-base',
+        provider: 'OpenAI',
+        providerKind: 'custom',
+        baseUrl: 'https://custom.example/v1',
+      }),
+    }),
+    (error) => error instanceof SessionContractError && error.code === 'session_api_binding_mismatch',
+    'a Custom null-base legacy run must still require an explicit Rebind'
   );
 
   const first = await service.planRun({
@@ -458,6 +569,45 @@ async function main() {
     'a duplicate failure must preserve the first terminal failure'
   );
 
+  const readinessMergeHost = 'host-native-readiness-merge';
+  for (const sessionId of ['readiness-strong', 'readiness-weak']) {
+    await service.planRun({
+      identity: { hostId: readinessMergeHost, sessionId },
+      runId: 'shared-readiness-run',
+      launchMode: 'fresh',
+      submittedBinding: asxs,
+    });
+    await service.confirmRun({
+      identity: { hostId: readinessMergeHost, sessionId },
+      runId: 'shared-readiness-run',
+      nativeThreadId: `${sessionId}-native`,
+      effectiveBinding: asxs,
+    });
+  }
+  await service.confirmNativeResumeReady({
+    identity: { hostId: readinessMergeHost, sessionId: 'readiness-strong' },
+    runId: 'shared-readiness-run',
+  });
+  for (const sessionId of ['readiness-strong', 'readiness-weak']) {
+    await service.stopRun({
+      identity: { hostId: readinessMergeHost, sessionId },
+      runId: 'shared-readiness-run',
+    });
+  }
+  await service.mergeDiscovery({
+    hostId: readinessMergeHost,
+    sessionId: 'readiness-weak',
+    bridgeSessionId: 'readiness-strong',
+    nativeThreadId: 'readiness-weak-native',
+    source: 'managed',
+  });
+  assert.strictEqual(
+    service.getSessionRecord({ hostId: readinessMergeHost, sessionId: 'readiness-weak' })
+      .runs['shared-readiness-run'].nativeResumeReady,
+    true,
+    'canonical record merging must never regress native readiness from true to false'
+  );
+
   const activeLive = await service.planRun({
     identity: { hostId: 'host-live-race', sessionId: 'live-race' },
     runId: 'run-live-race',
@@ -470,6 +620,146 @@ async function main() {
     nativeThreadId: 'live-race',
     effectiveBinding: asxs,
   });
+  let liveRaceRecord = service.getSessionRecord({ hostId: 'host-live-race', sessionId: 'live-race' });
+  assert.strictEqual(
+    liveRaceRecord.runs['run-live-race'].nativeResumeReady,
+    false,
+    'a fresh run must remain explicitly non-resumable until its first native turn starts'
+  );
+  await assert.rejects(
+    service.planRun({
+      identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+      runId: 'run-implicit-fresh-rebind',
+      launchMode: 'fresh_rebind',
+      submittedBinding: other,
+    }),
+    (error) => error instanceof SessionContractError && error.code === 'session_run_state_conflict',
+    'fresh_rebind must not be available outside an explicit same-Session Rebind'
+  );
+  const freshRebind = await service.planRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    sourceIdentity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-explicit-fresh-rebind',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+  });
+  assert.strictEqual(freshRebind.canonicalKey, activeLive.canonicalKey);
+  assert.strictEqual(freshRebind.run.parentRunId, 'run-live-race');
+  assert.strictEqual(freshRebind.run.nativeResumeReady, false);
+  assert.strictEqual(freshRebind.run.apiBinding.bindingFingerprint, other.bindingFingerprint);
+  const readiness = await service.confirmNativeResumeReady({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-live-race',
+  });
+  assert.strictEqual(readiness.transitioned, true);
+  assert.strictEqual(readiness.promotedRunId, undefined);
+  liveRaceRecord = service.getSessionRecord({ hostId: 'host-live-race', sessionId: 'live-race' });
+  assert.strictEqual(liveRaceRecord.runs['run-explicit-fresh-rebind'].launchMode, 'fresh_rebind');
+  assert.strictEqual(liveRaceRecord.runs['run-explicit-fresh-rebind'].nativeResumeReady, false);
+  await service.failRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-explicit-fresh-rebind',
+    code: 'simulated_fresh_rebind_failure',
+  });
+  const duplicateReadiness = await service.confirmNativeResumeReady({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-live-race',
+  });
+  assert.strictEqual(duplicateReadiness.transitioned, false, 'native readiness confirmation must be idempotent');
+  liveRaceRecord = service.getSessionRecord({ hostId: 'host-live-race', sessionId: 'live-race' });
+  assert.strictEqual(liveRaceRecord.runs['run-live-race'].nativeResumeReady, true);
+  const materializedResume = await service.planRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    sourceIdentity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-materialized-resume',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+  });
+  assert.strictEqual(materializedResume.run.parentRunId, 'run-live-race');
+  assert.strictEqual(
+    materializedResume.run.launchMode,
+    'resume',
+    'planRun must atomically upgrade fresh_rebind when the inherited parent is already ready'
+  );
+  assert.strictEqual(materializedResume.run.nativeResumeReady, true);
+  await service.failRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-materialized-resume',
+    code: 'simulated_resume_failure',
+  });
+
+  const adaptiveHostId = 'host-adaptive-rebind-confirm';
+  await service.planRun({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    runId: 'adaptive-parent',
+    launchMode: 'fresh',
+    submittedBinding: asxs,
+  });
+  await service.confirmRun({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    runId: 'adaptive-parent',
+    nativeThreadId: 'adaptive-native',
+    effectiveBinding: asxs,
+  });
+  const adaptiveFresh = await service.planRun({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    sourceIdentity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    runId: 'adaptive-child',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+  });
+  assert.strictEqual(adaptiveFresh.run.launchMode, 'fresh_rebind');
+  const adaptiveResumed = await service.confirmRun({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    runId: 'adaptive-child',
+    nativeThreadId: 'adaptive-native',
+    effectiveBinding: other,
+    launchMode: 'resume',
+    nativeResumeReady: true,
+  });
+  assert.strictEqual(adaptiveResumed.record.runs['adaptive-child'].launchMode, 'resume');
+  assert.strictEqual(adaptiveResumed.record.runs['adaptive-child'].nativeResumeReady, true);
+
+  const legacyHostId = 'host-legacy-adaptive-rebind';
+  await service.planRun({
+    identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    runId: 'legacy-parent',
+    launchMode: 'fresh',
+    submittedBinding: asxs,
+  });
+  await service.confirmRun({
+    identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    runId: 'legacy-parent',
+    nativeThreadId: 'legacy-native',
+    effectiveBinding: asxs,
+  });
+  await service.confirmNativeResumeReady({
+    identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    runId: 'legacy-parent',
+  });
+  const legacyPlannedResume = await service.planRun({
+    identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    sourceIdentity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    runId: 'legacy-child',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+  });
+  assert.strictEqual(legacyPlannedResume.run.launchMode, 'resume');
+  const legacyFresh = await service.confirmRun({
+    identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    runId: 'legacy-child',
+    nativeThreadId: 'legacy-new-native',
+    effectiveBinding: other,
+    launchMode: 'fresh_rebind',
+    nativeResumeReady: false,
+  });
+  assert.strictEqual(legacyFresh.record.runs['legacy-child'].launchMode, 'fresh_rebind');
+  assert.strictEqual(legacyFresh.record.runs['legacy-child'].nativeResumeReady, false);
+
   await assert.rejects(
     service.planRun({
       identity: { hostId: 'host-live-race', sessionId: 'live-race' },
@@ -566,6 +856,86 @@ async function main() {
   assert.strictEqual(stillPending.activeRunId, firstPending.record.activeRunId);
   assert.strictEqual(stillPending.runs['run-old-pending'].status, 'pending');
   assert.strictEqual(stillPending.runs['run-current-pending'], undefined, 'a rejected launch must not overwrite the active run');
+
+  const idempotentFirst = await service.planRun({
+    identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+    runId: 'stable-run',
+    launchMode: 'fresh',
+    clientRequestId: 'create-intent-1',
+    requestFingerprint: 'same-payload-fingerprint',
+    submittedBinding: asxs,
+  });
+  const idempotentReplay = await service.planRun({
+    identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+    runId: 'stable-run',
+    launchMode: 'fresh',
+    clientRequestId: 'create-intent-1',
+    requestFingerprint: 'same-payload-fingerprint',
+    submittedBinding: asxs,
+  });
+  assert.strictEqual(idempotentReplay.idempotentReplay, true, 'an accepted client creation intent must be replayable');
+  assert.deepStrictEqual(idempotentReplay.run, idempotentFirst.run, 'an idempotent replay must return the accepted run');
+  assert.strictEqual(
+    Object.keys(idempotentReplay.record.runs).length,
+    1,
+    'an idempotent replay must not create another pending run'
+  );
+  await assert.rejects(
+    service.planRun({
+      identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+      runId: 'different-run-under-same-intent',
+      launchMode: 'fresh',
+      clientRequestId: 'create-intent-1',
+      requestFingerprint: 'same-payload-fingerprint',
+      submittedBinding: asxs,
+    }),
+    (error) => error instanceof SessionContractError && error.code === 'session_request_conflict',
+    'a client creation intent must remain bound to its first accepted run ID'
+  );
+  await assert.rejects(
+    service.planRun({
+      identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+      runId: 'stable-run',
+      launchMode: 'fresh',
+      clientRequestId: 'create-intent-1',
+      requestFingerprint: 'changed-payload-fingerprint',
+      submittedBinding: asxs,
+    }),
+    (error) => error instanceof SessionContractError
+      && error.code === 'session_request_conflict'
+      && error.statusCode === 409,
+    'reusing a creation intent with different settings must fail closed'
+  );
+  await service.confirmRun({
+    identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+    runId: 'stable-run',
+    nativeThreadId: 'stable-target',
+    effectiveBinding: asxs,
+  });
+  const liveReplay = await service.planRun({
+    identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+    runId: 'stable-run',
+    launchMode: 'fresh',
+    clientRequestId: 'create-intent-1',
+    requestFingerprint: 'same-payload-fingerprint',
+    submittedBinding: asxs,
+  });
+  assert.strictEqual(liveReplay.idempotentReplay, true);
+  assert.strictEqual(liveReplay.run.status, 'live', 'a lost response retry must recover an already-live run');
+  await service.stopRun({
+    identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+    runId: 'stable-run',
+  });
+  const stoppedReplay = await service.planRun({
+    identity: { hostId: 'host-idempotent', sessionId: 'stable-target' },
+    runId: 'stable-run',
+    launchMode: 'fresh',
+    clientRequestId: 'create-intent-1',
+    requestFingerprint: 'same-payload-fingerprint',
+    submittedBinding: asxs,
+  });
+  assert.strictEqual(stoppedReplay.idempotentReplay, true);
+  assert.strictEqual(stoppedReplay.run.status, 'stopped', 'a retry must not recreate an accepted stopped run');
 
   await service.failRun({
     identity: { hostId: 'host-superseded', sessionId: 'superseded' },

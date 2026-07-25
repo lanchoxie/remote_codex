@@ -84,7 +84,6 @@ class CodexSessionTailer {
 
   async poll() {
     const sessions = this.getActiveTailSessions();
-    const seenPaths = new Set();
     let newSessionCount = 0;
     let emittedEvents = 0;
     let postedBatchCount = 0;
@@ -93,10 +92,9 @@ class CodexSessionTailer {
     postedBatchCount += await this.flushPendingEvents({ flushPartial: true });
 
     for (const session of sessions) {
-      if (!session.rolloutPath) {
+      if (!session.rolloutPath || !this.watchedSessions.has(session.rolloutPath)) {
         continue;
       }
-      seenPaths.add(session.rolloutPath);
       let state = this.files.get(session.rolloutPath);
       if (!state) {
         const stats = safeStat(session.rolloutPath);
@@ -200,8 +198,9 @@ class CodexSessionTailer {
 
     postedBatchCount += await this.flushPendingEvents({ flushPartial: true });
 
+    const currentlyWatchedPaths = new Set(this.watchedSessions.keys());
     for (const filePath of Array.from(this.files.keys())) {
-      if (!seenPaths.has(filePath)) {
+      if (!currentlyWatchedPaths.has(filePath)) {
         this.files.delete(filePath);
       }
     }

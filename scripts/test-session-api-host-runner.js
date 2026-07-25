@@ -9,6 +9,8 @@ const { PassThrough } = require('stream');
 const {
   assertRunBinding,
   attestHostEnvironmentBinding,
+  buildProviderModelsUrl,
+  classifyProviderModelResponse,
   classifyNativeThreadError,
   deriveRunBinding,
   modelCapabilitiesFromList,
@@ -18,16 +20,23 @@ const {
   validateModelSelection,
 } = require('../apps/host-agent/session-api-runtime');
 const {
+  buildCodexStateDatabaseDiagnostic,
   CodexAppServerRunner,
+  classifyCodexStateDatabaseStderr,
   cleanupApiProfileCodexHome,
   cleanupStaleApiProfileCodexHomes,
+  isMissingNativeRolloutError,
   normalizeTurnStartParams,
   prepareApiProfileCodexHome,
+  resolveDefaultCodexBin,
   startCodexAppServerSession,
   updateApiProfileCodexHomeOwnership,
 } = require('../apps/host-agent/codex-app-server-runner');
 const { startManagedRuntimeSession } = require('../apps/host-agent/runtime-adapters');
-const { normalizeApiConfig } = require('../apps/host-agent/runtime-utils');
+const {
+  buildApiProcessEnvironment,
+  normalizeApiConfig,
+} = require('../apps/host-agent/runtime-utils');
 let managedLifecycle = {};
 try {
   managedLifecycle = require('../apps/host-agent/managed-session-lifecycle');
@@ -35,9 +44,64 @@ try {
   managedLifecycle = {};
 }
 const {
+  bindingsEqual,
   makeHostEnvironmentBinding,
   makeProfileBinding,
+  publicBinding,
 } = require('../shared/api-binding');
+
+const sqliteOpenFailureText = 'ERROR codex_app_server: failed to initialize SQLite state runtime: database error: (code: 14) unable to open database file';
+const sqliteOpenFailure = buildCodexStateDatabaseDiagnostic(
+  sqliteOpenFailureText,
+  'C:\\Users\\acceptance\\.codex\\.remote-codex-managed\\rc-owner\\.codex'
+);
+assert.strictEqual(sqliteOpenFailure.classification, 'open-create');
+assert.strictEqual(sqliteOpenFailure.quarantine, false);
+assert.match(sqliteOpenFailure.message, /open or create SQLite state/);
+assert.match(sqliteOpenFailure.detail, /not evidence that the database is corrupted/);
+assert.match(sqliteOpenFailure.detail, /existing SQLite files were left untouched/);
+assert.strictEqual(sqliteOpenFailure.data.rawStderr, sqliteOpenFailureText);
+for (const unavailableText of [
+  'failed to create SQLite state database: Access is denied',
+  'SQLite state initialization failed: permission denied',
+  'SQLITE_CANTOPEN while opening state_5.sqlite',
+]) {
+  const diagnostic = buildCodexStateDatabaseDiagnostic(unavailableText, 'C:\\Users\\acceptance\\.codex');
+  assert.strictEqual(diagnostic.classification, 'open-create');
+  assert.strictEqual(diagnostic.quarantine, false);
+  assert.strictEqual(diagnostic.data.rawStderr, unavailableText);
+}
+
+const sqlitePathFailureText = 'failed to initialize sqlite state db: ENAMETOOLONG: filename or extension is too long';
+const sqlitePathFailure = buildCodexStateDatabaseDiagnostic(sqlitePathFailureText, 'C:\\very-long\\.codex');
+assert.strictEqual(sqlitePathFailure.classification, 'path-too-long');
+assert.strictEqual(sqlitePathFailure.quarantine, false);
+assert.match(sqlitePathFailure.detail, /filesystem path is too long/);
+assert.match(sqlitePathFailure.detail, new RegExp(sqlitePathFailureText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+const sqliteGenericFailure = buildCodexStateDatabaseDiagnostic(
+  'codex_app_server: failed to initialize sqlite state db',
+  'C:\\Users\\acceptance\\.codex'
+);
+assert.strictEqual(sqliteGenericFailure.classification, 'initialization');
+assert.strictEqual(sqliteGenericFailure.quarantine, false);
+assert.match(sqliteGenericFailure.detail, /did not establish database corruption/);
+
+for (const corruptionText of [
+  'database error: (code: 26) file is not a database',
+  'SQLite failure: database disk image is malformed',
+  'SQLITE_CORRUPT while reading state_5.sqlite',
+]) {
+  const diagnostic = buildCodexStateDatabaseDiagnostic(corruptionText, 'C:\\Users\\acceptance\\.codex');
+  assert.strictEqual(diagnostic.classification, 'corruption');
+  assert.strictEqual(diagnostic.quarantine, true);
+  assert.match(diagnostic.detail, /affected state_\*\.sqlite files may be moved aside/);
+}
+assert.strictEqual(
+  classifyCodexStateDatabaseStderr('failed to create unrelated output file'),
+  null,
+  'non-SQLite stderr must not be classified as a state database failure'
+);
 
 const completePage = normalizeProviderModelPage({
   data: [{ id: 'model-a' }, { id: 'model-b' }],
@@ -51,6 +115,39 @@ assert.deepStrictEqual(completePage, {
   truncated: false,
 });
 
+assert.throws(
+  () => normalizeProviderModelPage({ message: 'welcome' }),
+  (error) => error?.code === 'provider_model_catalog_invalid' && /Base URL needs \/v1/.test(error.message),
+  'HTTP JSON that is not a model list must not be accepted as an empty catalog'
+);
+
+assert.deepStrictEqual(
+  classifyProviderModelResponse(200, '<html>provider console</html>'),
+  {
+    ok: false,
+    reachable: true,
+    catalogValid: false,
+    modelPage: null,
+    error: 'The API returned HTTP success but not a recognizable model catalog. Check whether the Base URL needs /v1.',
+  }
+);
+assert.strictEqual(classifyProviderModelResponse(200, '{"message":"welcome"}').ok, false);
+assert.strictEqual(classifyProviderModelResponse(200, '{"data":[{"name":"missing-id"}]}').ok, false);
+const emptyCatalogResponse = classifyProviderModelResponse(200, '{"data":[]}');
+assert.strictEqual(emptyCatalogResponse.ok, true);
+assert.strictEqual(emptyCatalogResponse.catalogValid, true);
+assert.deepStrictEqual(emptyCatalogResponse.modelPage.models, []);
+assert.deepStrictEqual(
+  classifyProviderModelResponse(401, '{"error":{"message":"bad key"}}'),
+  {
+    ok: false,
+    reachable: false,
+    catalogValid: false,
+    modelPage: null,
+    error: null,
+  }
+);
+
 const truncatedPage = normalizeProviderModelPage({
   data: [{ id: 'model-a' }, { id: 'model-b' }, { id: 'model-c' }],
 }, { limit: 2 });
@@ -58,6 +155,33 @@ assert.strictEqual(truncatedPage.complete, false);
 assert.strictEqual(truncatedPage.truncated, true);
 assert.strictEqual(truncatedPage.nextCursor, 'model-b');
 assert.deepStrictEqual(truncatedPage.models, [{ id: 'model-a' }, { id: 'model-b' }]);
+
+const pagedResponse = normalizeProviderModelPage({
+  data: [{
+    id: 'model-reasoning',
+    supported_reasoning_efforts: ['low', 'ultra'],
+    default_reasoning_effort: 'low',
+  }],
+  has_more: true,
+  last_id: 'model-reasoning',
+});
+assert.strictEqual(pagedResponse.complete, false);
+assert.strictEqual(pagedResponse.nextCursor, 'model-reasoning');
+assert.deepStrictEqual(pagedResponse.models, [{
+  id: 'model-reasoning',
+  reasoningLevels: ['low', 'ultra'],
+  defaultReasoningEffort: 'low',
+}]);
+
+const queryModelsUrl = new URL(buildProviderModelsUrl(
+  'https://azure.example/openai?api-version=2025-04-01&deployment=primary',
+  { cursor: 'model-a', limit: 37, includeLimit: true }
+));
+assert.strictEqual(queryModelsUrl.pathname, '/openai/models');
+assert.strictEqual(queryModelsUrl.searchParams.get('api-version'), '2025-04-01');
+assert.strictEqual(queryModelsUrl.searchParams.get('deployment'), 'primary');
+assert.strictEqual(queryModelsUrl.searchParams.get('after'), 'model-a');
+assert.strictEqual(queryModelsUrl.searchParams.get('limit'), '37');
 
 const expectedHostBinding = makeHostEnvironmentBinding({
   provider: 'OpenAI',
@@ -69,6 +193,122 @@ const profile = makeProfileBinding({
   provider: 'OpenAI',
   baseUrl: 'https://profile.example/v1',
 });
+const legacyOpenAiKeyOnlyBinding = {
+  kind: 'profile',
+  profileId: 'legacy-openai-key-only',
+  label: 'Legacy OpenAI key-only',
+  provider: 'OpenAI',
+  providerKind: null,
+  normalizedBaseUrl: null,
+  bindingFingerprint: 'legacy-fingerprint-with-null-base',
+};
+const normalizedOpenAiKeyOnlyConfig = normalizeApiConfig({
+  profileId: 'legacy-openai-key-only',
+  label: 'Legacy OpenAI key-only',
+  provider: 'OpenAI',
+  apiKey: 'legacy-key',
+});
+assert.throws(
+  () => normalizeApiConfig({
+    profileId: 'missing-key',
+    provider: 'OpenAI',
+  }),
+  (error) => error?.code === 'api_key_required' && error?.statusCode === 422,
+  'an explicit API profile must fail closed when its key is missing'
+);
+const inheritedApiEnvironment = {
+  PATH: 'test-path',
+  OPENAI_API_KEY: 'host-key-must-not-leak',
+  OpenAi_Base_Url: 'https://host-case-variant.example/v1',
+  OPENAI_ORGANIZATION: 'host-org-must-not-leak',
+  KEEP_ME: 'preserved',
+};
+assert.deepStrictEqual(
+  buildApiProcessEnvironment(inheritedApiEnvironment, {
+    profileId: 'isolated-profile',
+    provider: 'OpenAI',
+    baseUrl: 'https://isolated.example/v1',
+    apiKey: 'isolated-key',
+  }),
+  {
+    PATH: 'test-path',
+    KEEP_ME: 'preserved',
+    OPENAI_API_KEY: 'isolated-key',
+    OPENAI_BASE_URL: 'https://isolated.example/v1',
+    OPENAI_API_BASE: 'https://isolated.example/v1',
+  },
+  'an explicit profile child must scrub inherited OPENAI_* values before injecting its own credentials'
+);
+assert.deepStrictEqual(
+  buildApiProcessEnvironment(inheritedApiEnvironment, null),
+  inheritedApiEnvironment,
+  'a host-environment child must preserve the inherited environment'
+);
+const canonicalOpenAiKeyOnlyBinding = makeProfileBinding(normalizedOpenAiKeyOnlyConfig);
+assert.strictEqual(
+  publicBinding(legacyOpenAiKeyOnlyBinding).normalizedBaseUrl,
+  'https://api.openai.com/v1'
+);
+assert.strictEqual(bindingsEqual(legacyOpenAiKeyOnlyBinding, canonicalOpenAiKeyOnlyBinding), true);
+assert.strictEqual(
+  deriveRunBinding({
+    apiBinding: legacyOpenAiKeyOnlyBinding,
+    apiConfig: normalizedOpenAiKeyOnlyConfig,
+  }).bindingFingerprint,
+  canonicalOpenAiKeyOnlyBinding.bindingFingerprint,
+  'Host binding verification must canonicalize a legacy OpenAI key-only run before comparison'
+);
+const legacyCustomNullBaseBinding = {
+  kind: 'profile',
+  profileId: 'legacy-custom-null-base',
+  provider: 'OpenAI',
+  providerKind: 'custom',
+  normalizedBaseUrl: null,
+  bindingFingerprint: 'legacy-custom-null-base-fingerprint',
+};
+assert.strictEqual(publicBinding(legacyCustomNullBaseBinding).normalizedBaseUrl, null);
+for (const providerKind of ['custom', 'anthropic', 'gemini']) {
+  assert.strictEqual(
+    makeProfileBinding({
+      profileId: `non-official-${providerKind}`,
+      provider: 'OpenAI',
+      providerKind,
+    }).normalizedBaseUrl,
+    null,
+    `${providerKind} must not acquire the official OpenAI endpoint from its display label`
+  );
+}
+assert.strictEqual(
+  makeProfileBinding({
+    profileId: 'explicit-official-kind',
+    provider: 'Renamed official provider',
+    providerKind: 'openai',
+  }).normalizedBaseUrl,
+  'https://api.openai.com/v1',
+  'the explicit OpenAI provider kind must canonicalize an omitted Base URL'
+);
+assert.strictEqual(
+  makeProfileBinding({
+    profileId: 'compatible-label',
+    provider: 'OpenAI-compatible',
+  }).normalizedBaseUrl,
+  null,
+  'an OpenAI-compatible label must not acquire the official OpenAI endpoint'
+);
+assert.throws(
+  () => deriveRunBinding({
+    apiBinding: legacyCustomNullBaseBinding,
+    apiConfig: {
+      profileId: 'legacy-custom-null-base',
+      provider: 'OpenAI',
+      providerKind: 'custom',
+      baseUrl: 'https://custom.example/v1',
+      apiKey: 'custom-key',
+    },
+  }),
+  (error) => error?.code === 'session_api_binding_mismatch',
+  'a Custom null-base legacy binding must not be treated as official OpenAI'
+);
 const attested = attestHostEnvironmentBinding({
   env: {
     OPENAI_API_KEY: 'must-not-leak',
@@ -91,23 +331,39 @@ assert.throws(
 assert.throws(
   () => deriveRunBinding({
     apiBinding: profile,
-    apiConfig: { profileId: 'other', provider: 'OpenAI', baseUrl: 'https://other.example/v1' },
+    apiConfig: {
+      profileId: 'other',
+      provider: 'OpenAI',
+      baseUrl: 'https://other.example/v1',
+      apiKey: 'other-key',
+    },
     allowUnavailable: true,
   }),
   (error) => error.code === 'session_api_binding_mismatch',
   'allowUnavailable must not hide an explicit binding/config mismatch'
 );
 assert.strictEqual(
-  deriveRunBinding({ apiBinding: profile, apiConfig: { profileId: 'profile-a', provider: 'openai', baseUrl: 'https://PROFILE.example/v1/' } }).bindingFingerprint,
+  deriveRunBinding({
+    apiBinding: profile,
+    apiConfig: {
+      profileId: 'profile-a',
+      provider: 'openai',
+      baseUrl: 'https://PROFILE.example/v1/',
+      apiKey: 'profile-key',
+    },
+  }).bindingFingerprint,
   profile.bindingFingerprint,
   'matching explicit binding and API config should derive one verified identity'
 );
 const queryProfileConfig = {
   profileId: 'azure-profile',
   provider: 'Azure OpenAI',
+  providerKind: 'custom',
   baseUrl: 'https://azure.example/openai/?api-version=2025-04-01&deployment=primary#ignored',
+  apiKey: 'azure-key',
 };
 const normalizedQueryProfileConfig = normalizeApiConfig(queryProfileConfig);
+assert.strictEqual(normalizedQueryProfileConfig.providerKind, 'custom');
 assert.strictEqual(
   normalizedQueryProfileConfig.baseUrl,
   'https://azure.example/openai?api-version=2025-04-01&deployment=primary',
@@ -150,6 +406,51 @@ assert.strictEqual(fileAttested.binding.modelProviderHint, 'acme');
 assert.strictEqual(fileAttested.binding.normalizedBaseUrl, 'https://codex-home.example/v1');
 assert.strictEqual(JSON.stringify(fileAttested).includes('must-not-leak-from-file'), false);
 fs.rmSync(attestationHome, { recursive: true, force: true });
+
+const credentialIsolationHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-credential-isolation-'));
+const hostAuth = {
+  OPENAI_API_KEY: 'host-auth-key-must-not-leak',
+  tokens: { access_token: 'host-access-token-must-not-leak' },
+  account_id: 'host-account-must-not-leak',
+};
+fs.writeFileSync(
+  path.join(credentialIsolationHome, 'auth.json'),
+  `${JSON.stringify(hostAuth)}\n`,
+  'utf8'
+);
+let explicitCredentialOverlay = null;
+let hostEnvironmentOverlay = null;
+try {
+  explicitCredentialOverlay = prepareApiProfileCodexHome(credentialIsolationHome, {
+    profileId: 'credential-isolation',
+    provider: 'OpenAI',
+    apiKey: 'explicit-profile-key',
+  });
+  assert.deepStrictEqual(
+    JSON.parse(fs.readFileSync(path.join(explicitCredentialOverlay.codexHome, 'auth.json'), 'utf8')),
+    { OPENAI_API_KEY: 'explicit-profile-key' },
+    'an explicit profile overlay must not copy Host auth tokens or account metadata'
+  );
+  assert.strictEqual(cleanupApiProfileCodexHome(explicitCredentialOverlay.cleanupOwner), true);
+  explicitCredentialOverlay = null;
+
+  hostEnvironmentOverlay = prepareApiProfileCodexHome(credentialIsolationHome, null);
+  assert.deepStrictEqual(
+    JSON.parse(fs.readFileSync(path.join(hostEnvironmentOverlay.codexHome, 'auth.json'), 'utf8')),
+    hostAuth,
+    'a host-environment overlay must preserve Host auth.json'
+  );
+  assert.strictEqual(cleanupApiProfileCodexHome(hostEnvironmentOverlay.cleanupOwner), true);
+  hostEnvironmentOverlay = null;
+} finally {
+  if (explicitCredentialOverlay && fs.existsSync(explicitCredentialOverlay.profileHomeDir)) {
+    cleanupApiProfileCodexHome(explicitCredentialOverlay.cleanupOwner);
+  }
+  if (hostEnvironmentOverlay && fs.existsSync(hostEnvironmentOverlay.profileHomeDir)) {
+    cleanupApiProfileCodexHome(hostEnvironmentOverlay.cleanupOwner);
+  }
+  fs.rmSync(credentialIsolationHome, { recursive: true, force: true });
+}
 
 const rotated = makeProfileBinding({
   profileId: 'profile-a',
@@ -201,16 +502,62 @@ assert.strictEqual(runner.validateModelSelection('gpt-5.6-sol', 'max').effort, '
 
 assert.strictEqual(classifyNativeThreadError('resume', new Error('not found')).code, 'session_native_resume_failed');
 assert.strictEqual(classifyNativeThreadError('fork', new Error('not found')).code, 'session_native_fork_failed');
+assert.strictEqual(isMissingNativeRolloutError(new Error('no rollout found for thread id thread-a')), true);
+assert.strictEqual(isMissingNativeRolloutError(new Error('provider authentication failed')), false);
+assert.strictEqual(isMissingNativeRolloutError(new Error('unknown thread id thread-a')), false);
+assert.strictEqual(isMissingNativeRolloutError(new Error('thread thread-a not found')), false);
+assert.strictEqual(isMissingNativeRolloutError(new Error('rollout thread-a not found')), false);
 assert.strictEqual(resumeStrategyForLaunchMode('transcript_fallback'), 'transcript_fallback');
 assert.strictEqual(resumeStrategyForLaunchMode('fresh'), 'fresh');
+assert.strictEqual(resumeStrategyForLaunchMode('fresh_rebind'), 'fresh');
+
+if (process.platform === 'win32') {
+  const resolverHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-codex-bin-resolver-'));
+  const markdownDecoy = path.join(resolverHome, 'codex-network.md');
+  const commandShim = path.join(resolverHome, 'codex.cmd');
+  try {
+    fs.writeFileSync(markdownDecoy, '# This is documentation, not an executable.\n', 'utf8');
+    assert.notStrictEqual(
+      resolveDefaultCodexBin(resolverHome),
+      markdownDecoy,
+      'Windows Codex discovery must not treat a codex-named Markdown file as executable'
+    );
+    fs.writeFileSync(commandShim, '@echo off\r\n', 'utf8');
+    assert.strictEqual(
+      resolveDefaultCodexBin(resolverHome),
+      commandShim,
+      'Windows Codex discovery must accept an actual command shim from the requested home'
+    );
+  } finally {
+    fs.rmSync(resolverHome, { recursive: true, force: true });
+  }
+}
 
 const agentSource = fs.readFileSync('apps/host-agent/agent.js', 'utf8');
 assert(agentSource.includes("command.type === 'host.api_catalog'"));
 assert(agentSource.includes("command.type === 'host.binding_preflight'"));
 assert(agentSource.includes("type: 'session.command_failed'"));
+const missingRunnerStart = agentSource.indexOf('if (!runner) {');
+const missingRunnerInputStart = agentSource.indexOf("if (command.type === 'session.input') {", missingRunnerStart);
+const liveInputStart = agentSource.indexOf("if (command.type === 'session.input') {", missingRunnerInputStart + 1);
+const liveInputEnd = agentSource.indexOf("if (command.type === 'session.model_list')", liveInputStart);
+assert(liveInputStart >= 0 && liveInputEnd > liveInputStart, 'Host agent must have a live session.input handler');
+const liveInputBlock = agentSource.slice(liveInputStart, liveInputEnd);
+assert(
+  liveInputBlock.includes('lastError: null') && liveInputBlock.includes('lastCodexError: null'),
+  'accepting session.input must clear stale runtime errors before submitting the new turn'
+);
+assert(
+  agentSource.includes('nativeResumeReadiness:'),
+  'new Host agents must negotiate native readiness before Relay trusts an unmaterialized state'
+);
 const runnerSource = fs.readFileSync('apps/host-agent/codex-app-server-runner.js', 'utf8');
 assert(!runnerSource.includes("const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])"));
 assert(!/catch \(error\) \{\s*thread = await startTranscriptFallbackThread\(error\);\s*\}/.test(runnerSource));
+assert(
+  runnerSource.includes('resolveLocalCodexBin({ pathEnv: process.env.PATH })'),
+  'Codex runner fallback must resolve a concrete Windows command shim instead of spawning a bare extensionless codex command'
+);
 assert(
   /updateApiProfileCodexHomeOwnership\(this\.apiProfileCleanupOwner,[\s\S]*childState:\s*'spawning'/.test(runnerSource)
     && /childPid:\s*this\.child\.pid/.test(runnerSource),
@@ -348,7 +695,7 @@ assert(
   'shutdown terminal delivery failure must reach the start gate owner completion'
 );
 const polledCommandSource = agentSource.slice(
-  agentSource.indexOf('async function processPolledCommand(command)'),
+  agentSource.indexOf('async function processPolledCommand(command'),
   agentSource.indexOf('async function pollCommandsLoop()')
 );
 assert(
@@ -467,9 +814,17 @@ async function verifyCodexStopSuppressionUpgradesMonotonically() {
   child.once('exit', (code, signal) => runner.handleExit(code, signal).catch(() => {}));
   const keepAlive = setInterval(() => {}, 1000);
   try {
+    runner.appendThinkingDelta({
+      turnId: 'turn-stop-suppression-upgrade',
+      itemId: 'reasoning-stop-suppression-upgrade',
+    }, 'must not reach a revoked Relay');
     const ordinaryStop = runner.stop();
-    await new Promise((resolve) => setImmediate(resolve));
     const ownershipRevokedStop = runner.stop({ suppressTerminalEvent: true });
+    assert.strictEqual(
+      ownershipRevokedStop,
+      ordinaryStop,
+      'concurrent Codex stop callers must share one child termination operation'
+    );
     child.signalCode = 'SIGTERM';
     child.emit('exit', null, 'SIGTERM');
     await Promise.all([ordinaryStop, ownershipRevokedStop]);
@@ -479,6 +834,12 @@ async function verifyCodexStopSuppressionUpgradesMonotonically() {
       [],
       'ownership-revoked suppression must monotonically upgrade an ordinary stop in flight'
     );
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === 'session.activity_snapshot'),
+      [],
+      'ownership-revoked suppression must discard queued activity instead of posting through a revoked lease'
+    );
+    assert.strictEqual(runner.thinkingActivities.size, 0);
   } finally {
     clearInterval(keepAlive);
     if (!runner.overlayCleaned) runner.cleanupManagedOverlay();
@@ -668,6 +1029,9 @@ async function verifyCodexTerminalDeliveryFailureRequestsCommandRetry() {
     codexHome: baseHome,
     apiConfig: { profileId: 'codex-terminal-retry', provider: 'OpenAI', apiKey: 'secret' },
     postEvent: async (event) => {
+      if (event.type === 'session.activity_snapshot') {
+        throw new Error('simulated activity snapshot delivery failure');
+      }
       if (event.type === 'session.state_changed') {
         throw new Error('simulated terminal state delivery failure');
       }
@@ -690,11 +1054,21 @@ async function verifyCodexTerminalDeliveryFailureRequestsCommandRetry() {
   runner.startCompleted = true;
   child.once('exit', (code, signal) => runner.handleExit(code, signal).catch(() => {}));
   try {
+    runner.appendThinkingDelta({
+      turnId: 'turn-codex-terminal-retry',
+      itemId: 'reasoning-codex-terminal-retry',
+    }, 'cached delivery failure');
     await assert.rejects(
       runner.stop(),
-      (error) => error?.retryCommand === true && /terminal state delivery failure/.test(error.message),
-      'Codex stop must retry the command when its authoritative terminal event is not delivered'
+      (error) => error?.retryCommand === true,
+      'Codex stop must retry the command when final activity or terminal state delivery fails'
     );
+    await assert.doesNotReject(
+      () => runner.stop({ suppressTerminalEvent: true }),
+      'ownership loss must ignore cached Agent-event delivery failures after child exit'
+    );
+    assert.strictEqual(runner.thinkingActivities.size, 0);
+    assert.strictEqual(runner.activitySnapshotDeliveryErrors.size, 0);
     assert.strictEqual(runner.overlayCleaned, true);
   } finally {
     if (!runner.overlayCleaned) runner.cleanupManagedOverlay();
@@ -823,6 +1197,53 @@ async function verifyPostOverlayConstructorFailureRemovesCredentials() {
   }
 }
 
+async function verifySqliteOpenFailurePreservesFilesAndRawStartupError() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-sqlite-open-failure-'));
+  const rawStderr = 'codex_app_server: failed to initialize SQLite state runtime: database error: (code: 14) unable to open database file';
+  const originalError = new Error('codex app-server exited early: 1 / null');
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-sqlite-open-failure',
+    sessionId: 'session-sqlite-open-failure',
+    runId: 'run-sqlite-open-failure',
+    title: 'SQLite open failure',
+    cwd: process.cwd(),
+    codexHome: baseHome,
+    apiConfig: { profileId: 'sqlite-open-failure', provider: 'OpenAI', apiKey: 'secret' },
+    postEvent: async () => {},
+  });
+  const statePath = path.join(runner.codexHome, 'state_5.sqlite');
+  fs.writeFileSync(statePath, 'valid state placeholder that must not be quarantined', 'utf8');
+  let attempts = 0;
+  runner.startOnce = async function simulateSqliteOpenFailure() {
+    attempts += 1;
+    this.startupStateDbDiagnostic = buildCodexStateDatabaseDiagnostic(rawStderr, this.codexHome);
+    throw originalError;
+  };
+  try {
+    await assert.rejects(
+      runner.start(),
+      (error) => (
+        error?.code === 'session_sqlite_open_failed'
+        && error?.cause === originalError
+        && error?.rawStderr === rawStderr
+        && error?.sqliteFailureKind === 'open-create'
+        && /existing SQLite files were left untouched/.test(error?.message || '')
+      ),
+      'open/create failures must retain raw stderr and the original startup failure without claiming corruption'
+    );
+    assert.strictEqual(attempts, 1, 'a non-corruption SQLite failure must not trigger the quarantine retry');
+    assert.strictEqual(fs.existsSync(statePath), true, 'a non-corruption SQLite failure must not move state files');
+    assert.deepStrictEqual(
+      fs.readdirSync(runner.codexHome).filter((entry) => entry.startsWith('broken-sqlite-backup-')),
+      [],
+      'a non-corruption SQLite failure must not create a quarantine directory'
+    );
+  } finally {
+    if (!runner.overlayCleaned) runner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
 async function verifySqliteStartupRetryStopsFirstChildBeforeReuse() {
   const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-sqlite-retry-child-'));
   const runner = new CodexAppServerRunner({
@@ -864,7 +1285,7 @@ async function verifySqliteStartupRetryStopsFirstChildBeforeReuse() {
     if (attempts === 1) {
       this.child = firstChild;
       this.rpc = { attempt: 1 };
-      this.startupStateDbError = true;
+      this.startupStateDbCorruption = true;
       throw new Error('simulated Codex SQLite startup failure');
     }
     assert.strictEqual(firstChildExited, true, 'SQLite retry must confirm the first child exit');
@@ -927,7 +1348,7 @@ async function verifySqliteRetryTimeoutRequiresTrackedCommandRetry() {
           attempts += 1;
           this.child = child;
           this.rpc = { attempt: attempts };
-          this.startupStateDbError = true;
+          this.startupStateDbCorruption = true;
           throw new Error('simulated Codex SQLite startup failure with live child');
         };
       },
@@ -1036,7 +1457,7 @@ async function verifySqliteRetryExitWaiterSurvivesConcurrentShutdown() {
     return true;
   };
   runner.child = child;
-  runner.startupStateDbError = true;
+  runner.startupStateDbCorruption = true;
   const keepAlive = setInterval(() => {}, 1000);
   try {
     const retryStop = runner.stopChildForStartupRetry();
@@ -1084,6 +1505,11 @@ async function verifyPreSpawnCodexCancellationPublishesTerminalFailure() {
         },
       }),
       (error) => error?.code === 'host_agent_shutting_down'
+    );
+    assert.strictEqual(
+      createdRunner.stopPromise,
+      firstStop,
+      'startup rejection cleanup must join the shutdown stop already in flight'
     );
     await firstStop;
     assert.deepStrictEqual(
@@ -1155,6 +1581,11 @@ async function verifyProcessStopSuppressionUpgradesMonotonically() {
     const ordinaryStop = runner.stop();
     await new Promise((resolve) => setImmediate(resolve));
     const ownershipRevokedStop = runner.stop({ suppressTerminalEvent: true });
+    assert.strictEqual(
+      ownershipRevokedStop,
+      ordinaryStop,
+      'concurrent process stop callers must share one child termination operation'
+    );
     child.signalCode = 'SIGTERM';
     child.emit('exit', null, 'SIGTERM');
     await Promise.all([ordinaryStop, ownershipRevokedStop]);
@@ -1247,6 +1678,87 @@ function makeFakeManagedChild(pid) {
   return child;
 }
 
+async function verifyManagedProcessSpawnCredentialIsolation() {
+  const inheritedValues = {
+    OPENAI_API_KEY: 'inherited-key-must-not-leak',
+    OPENAI_BASE_URL: 'https://inherited.example/v1',
+    OPENAI_ORGANIZATION: 'inherited-org-must-not-leak',
+    REMOTE_CODEX_ENV_SENTINEL: 'preserved',
+  };
+  const previousValues = new Map(Object.keys(inheritedValues).map((name) => [
+    name,
+    {
+      present: Object.prototype.hasOwnProperty.call(process.env, name),
+      value: process.env[name],
+    },
+  ]));
+  Object.assign(process.env, inheritedValues);
+
+  const captureSpawnEnvironment = async (apiConfig, pid) => {
+    const child = makeFakeManagedChild(pid);
+    let capturedEnvironment = null;
+    child.kill = (signal = 'SIGTERM') => {
+      child.killed = true;
+      queueMicrotask(() => {
+        child.signalCode = signal;
+        child.emit('exit', null, signal);
+      });
+      return true;
+    };
+    const runner = await startManagedRuntimeSession({
+      runtime: {
+        kind: 'process',
+        runtimeId: `process:credential-isolation-${pid}`,
+        label: 'Credential isolation test',
+        command: 'unused-test-command',
+        args: [],
+      },
+      hostId: 'host-credential-isolation',
+      sessionId: `session-credential-isolation-${pid}`,
+      runId: `run-credential-isolation-${pid}`,
+      cwd: process.cwd(),
+      title: 'Credential isolation test',
+      apiConfig,
+      spawnProcess: (_command, _args, options) => {
+        capturedEnvironment = options.env;
+        queueMicrotask(() => child.emit('spawn'));
+        return child;
+      },
+      postEvent: async () => {},
+    });
+    await runner.stop();
+    return capturedEnvironment;
+  };
+
+  try {
+    const explicitEnvironment = await captureSpawnEnvironment({
+      profileId: 'spawn-isolated-profile',
+      provider: 'OpenAI',
+      baseUrl: 'https://explicit.example/v1',
+      apiKey: 'explicit-key',
+    }, 850101);
+    assert.strictEqual(explicitEnvironment.OPENAI_API_KEY, 'explicit-key');
+    assert.strictEqual(explicitEnvironment.OPENAI_BASE_URL, 'https://explicit.example/v1');
+    assert.strictEqual(explicitEnvironment.OPENAI_API_BASE, 'https://explicit.example/v1');
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(explicitEnvironment, 'OPENAI_ORGANIZATION'), false);
+    assert.strictEqual(explicitEnvironment.REMOTE_CODEX_ENV_SENTINEL, 'preserved');
+
+    const hostEnvironment = await captureSpawnEnvironment(null, 850102);
+    assert.strictEqual(hostEnvironment.OPENAI_API_KEY, inheritedValues.OPENAI_API_KEY);
+    assert.strictEqual(hostEnvironment.OPENAI_BASE_URL, inheritedValues.OPENAI_BASE_URL);
+    assert.strictEqual(hostEnvironment.OPENAI_ORGANIZATION, inheritedValues.OPENAI_ORGANIZATION);
+    assert.strictEqual(hostEnvironment.REMOTE_CODEX_ENV_SENTINEL, 'preserved');
+  } finally {
+    for (const [name, previous] of previousValues) {
+      if (previous.present) {
+        process.env[name] = previous.value;
+      } else {
+        delete process.env[name];
+      }
+    }
+  }
+}
+
 async function verifyRuntimeErrorDeliveryFailureDoesNotBlockTerminalState() {
   const child = makeFakeManagedChild(850001);
   const stateEvents = [];
@@ -1334,6 +1846,10 @@ async function verifyProcessTerminalDeliveryFailureRequestsCommandRetry() {
       runner.stop(),
       (error) => error?.retryCommand === true && /process terminal delivery failure/.test(error.message),
       'process stop must reject with retryCommand when its terminal state is not delivered'
+    );
+    await assert.doesNotReject(
+      () => runner.stop({ suppressTerminalEvent: true }),
+      'ownership loss must recover a childless process runner from stale terminal delivery failure'
     );
     await new Promise((resolve) => setImmediate(resolve));
     assert.strictEqual(
@@ -1479,8 +1995,16 @@ async function verifyManagedSessionShutdownWaitsBeforeExit() {
   assert.deepStrictEqual(exits, [0]);
 
   const timeoutExits = [];
+  let releaseTimedStop;
+  let timedStopCalls = 0;
+  const timedRunner = {
+    async stop() {
+      timedStopCalls += 1;
+      await new Promise((resolve) => { releaseTimedStop = resolve; });
+    },
+  };
   const timedShutdown = managedLifecycle.createManagedSessionShutdown({
-    liveSessions: new Map([['stuck', { stop: async () => new Promise(() => {}) }]]),
+    liveSessions: new Map([['stuck', timedRunner]]),
     exit: (code) => timeoutExits.push(code),
     graceTimeoutMs: 10,
   });
@@ -1491,6 +2015,18 @@ async function verifyManagedSessionShutdownWaitsBeforeExit() {
     [],
     'a timed-out shutdown must keep the Agent root alive for process-tree fallback'
   );
+  assert.strictEqual(timedStopCalls, 1);
+  const retryAfterTimeout = timedShutdown('SIGTERM');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(
+    timedStopCalls,
+    1,
+    'a retry after the grace timeout must wait for the original runner.stop instead of overlapping it'
+  );
+  releaseTimedStop();
+  const retryAfterTimeoutResult = await retryAfterTimeout;
+  assert.strictEqual(retryAfterTimeoutResult.timedOut, false);
+  assert.deepStrictEqual(timeoutExits, [0]);
 
   const failedExits = [];
   const failedShutdown = managedLifecycle.createManagedSessionShutdown({
@@ -1512,6 +2048,28 @@ async function verifyManagedSessionShutdownWaitsBeforeExit() {
     [],
     'runner stop errors must keep the Agent root alive for Relay/launcher tree fallback'
   );
+
+  let retryStopAttempts = 0;
+  const retryExits = [];
+  const retryShutdown = managedLifecycle.createManagedSessionShutdown({
+    liveSessions: new Map([['retry-stop', {
+      async stop() {
+        retryStopAttempts += 1;
+        if (retryStopAttempts === 1) {
+          throw new Error('first runner stop attempt failed');
+        }
+      },
+    }]]),
+    exit: (code) => retryExits.push(code),
+    graceTimeoutMs: 1000,
+  });
+  const firstRetryResult = await retryShutdown('relay-command');
+  assert.strictEqual(firstRetryResult.errors.length, 1);
+  assert.deepStrictEqual(retryExits, []);
+  const secondRetryResult = await retryShutdown('relay-command');
+  assert.deepStrictEqual(secondRetryResult.errors, []);
+  assert.strictEqual(retryStopAttempts, 2, 'a failed Host shutdown command must retry runner cleanup');
+  assert.deepStrictEqual(retryExits, [0]);
 }
 
 async function verifyShutdownSuppressionUpgradeRestopsTrackedRunner() {
@@ -1519,6 +2077,14 @@ async function verifyShutdownSuppressionUpgradeRestopsTrackedRunner() {
   let releaseFirstStop;
   const firstStopBlocked = new Promise((resolve) => { releaseFirstStop = resolve; });
   const runner = {
+    suppressTerminalEvent: false,
+    agentEventsSuppressed: false,
+    applyStopOptions(options = {}) {
+      if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
+        this.suppressTerminalEvent = true;
+        this.agentEventsSuppressed = true;
+      }
+    },
     async stop(options) {
       calls.push({ ...options });
       if (calls.length === 1) await firstStopBlocked;
@@ -1538,8 +2104,18 @@ async function verifyShutdownSuppressionUpgradeRestopsTrackedRunner() {
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepStrictEqual(
     calls,
-    [{}, { suppressTerminalEvent: true }],
-    'suppression upgrade must re-invoke the idempotent runner stop while the first shutdown is pending'
+    [{}],
+    'suppression upgrade must not overlap the runner stop already in flight'
+  );
+  assert.strictEqual(
+    runner.suppressTerminalEvent,
+    true,
+    'suppression upgrade must still update the runner while its stop is pending'
+  );
+  assert.strictEqual(
+    runner.agentEventsSuppressed,
+    true,
+    'suppression upgrade must invoke the runner-level no-more-events mode'
   );
   releaseFirstStop();
   await upgraded;
@@ -1691,6 +2267,15 @@ async function verifyShutdownObservesPendingStartTerminalFailure() {
     [],
     'shutdown terminal delivery failure must keep the Host Agent alive for command retry'
   );
+  const upgraded = await shutdown.upgradeStopOptions({ suppressTerminalEvent: true });
+  assert.deepStrictEqual(
+    upgraded.errors,
+    [],
+    'ownership loss must ignore the cached command-owner delivery error'
+  );
+  const ownershipResult = await shutdown('ownership-revoked');
+  assert.deepStrictEqual(ownershipResult.errors, []);
+  assert.deepStrictEqual(exits, [0]);
 }
 
 async function verifyShutdownIgnoresUnrelatedStartRetryFailure() {
@@ -1883,6 +2468,51 @@ async function verifyManagedOverlayCreationAllowsLinkedBaseHome() {
   }
 }
 
+async function verifyFirstManagedOverlayPersistsRolloutsForResume() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-first-rollout-'));
+  let overlay = null;
+  try {
+    assert.strictEqual(
+      fs.existsSync(path.join(baseHome, 'sessions')),
+      false,
+      'fixture must model a brand-new CODEX_HOME'
+    );
+    overlay = prepareApiProfileCodexHome(baseHome, {
+      profileId: 'first-rollout',
+      provider: 'OpenAI',
+      apiKey: 'first-rollout-secret',
+    }, { sessionId: 'first-rollout', runId: 'run-first-rollout' });
+
+    const overlaySessions = path.join(overlay.codexHome, 'sessions');
+    const relativeRolloutPath = path.join(
+      '2026',
+      '07',
+      '21',
+      'rollout-2026-07-21T13-22-24-native-thread.jsonl'
+    );
+    const overlayRolloutPath = path.join(overlaySessions, relativeRolloutPath);
+    fs.mkdirSync(path.dirname(overlayRolloutPath), { recursive: true });
+    fs.writeFileSync(overlayRolloutPath, '{"type":"session_meta"}\n', 'utf8');
+
+    const durableRolloutPath = path.join(baseHome, 'sessions', relativeRolloutPath);
+    assert.strictEqual(
+      fs.existsSync(durableRolloutPath),
+      true,
+      'the first managed runner must write rollouts into the durable base home'
+    );
+    assert.strictEqual(cleanupApiProfileCodexHome(overlay.cleanupOwner), true);
+    overlay = null;
+    assert.strictEqual(
+      fs.existsSync(durableRolloutPath),
+      true,
+      'overlay cleanup must not delete the rollout required by native Resume'
+    );
+  } finally {
+    if (overlay && fs.existsSync(overlay.profileHomeDir)) cleanupApiProfileCodexHome(overlay.cleanupOwner);
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
 async function verifyOwnedOverlayCleanupRejectsLinkedMarker() {
   const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-overlay-linked-marker-'));
   const overlay = prepareApiProfileCodexHome(baseHome, {
@@ -1913,6 +2543,107 @@ async function verifyOwnedOverlayCleanupRejectsLinkedMarker() {
     fs.lstatSync = originalLstatSync;
     cleanupApiProfileCodexHome(overlay.cleanupOwner);
     fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyManagedOverlayShortPathBudgetAndMetadata() {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-path-budget-'));
+  const targetBaseLength = 154;
+  const fillerLength = Math.max(8, targetBaseLength - parent.length - 1);
+  const baseHome = path.join(parent, 'b'.repeat(fillerLength));
+  fs.mkdirSync(baseHome, { recursive: true });
+  const apiConfig = {
+    profileId: 'minemine-profile-with-a-production-length-identifier',
+    label: 'MineMine acceptance profile',
+    provider: 'MineMine OpenAI compatible API',
+    providerKind: 'custom',
+    baseUrl: 'https://hpc.example.invalid/v1',
+    apiKey: 'path-budget-secret-must-not-appear-in-owner-marker',
+  };
+  const metadata = {
+    hostId: 'windows-acceptance-host',
+    sessionId: '019f7617-85ff-7eb2-85bd-7575191e4f46-session-metadata-suffix',
+    bridgeSessionId: 'bridge-session-019f7617-85ff-7eb2-85bd-7575191e4f46',
+    nativeThreadId: '019f7617-85ff-7eb2-85bd-7575191e4f46',
+    sourceSessionId: 'source-session-019f7617-85ff-7eb2-85bd-7575191e4f46',
+    originSessionId: 'origin-session-019f7617-85ff-7eb2-85bd-7575191e4f46',
+    conversationKey: 'conversation-019f7617-85ff-7eb2-85bd-7575191e4f46',
+    runId: 'run-019f7617-85ff-7eb2-85bd-7575191e4f46-production-suffix',
+    launchMode: 'fresh_rebind',
+  };
+  let first = null;
+  let second = null;
+  try {
+    first = prepareApiProfileCodexHome(baseHome, apiConfig, metadata);
+    second = prepareApiProfileCodexHome(baseHome, {
+      ...apiConfig,
+      apiKey: 'rotated-path-budget-secret',
+    }, metadata);
+    const firstName = path.basename(first.profileHomeDir);
+    const secondName = path.basename(second.profileHomeDir);
+    assert.match(firstName, /^rc-[a-f0-9]{32}$/);
+    assert.match(secondName, /^rc-[a-f0-9]{32}$/);
+    assert.strictEqual(firstName.length, 35, 'managed overlay directory names must have fixed short length');
+    assert.notStrictEqual(firstName, secondName, 'identical session metadata must still receive collision-free overlays');
+
+    const statePath = path.join(first.codexHome, 'state_5.sqlite');
+    assert(
+      statePath.length <= 240,
+      `production-like Windows SQLite path must stay within the 240-character budget (got ${statePath.length})`
+    );
+    assert(
+      statePath.length - path.resolve(baseHome).length <= 80,
+      'session/profile/run metadata must not increase the managed SQLite path length'
+    );
+
+    const markerText = fs.readFileSync(first.cleanupOwner.ownerMarkerPath, 'utf8');
+    const marker = JSON.parse(markerText);
+    const secondMarkerText = fs.readFileSync(second.cleanupOwner.ownerMarkerPath, 'utf8');
+    const secondMarker = JSON.parse(secondMarkerText);
+    assert.deepStrictEqual(marker.metadata.host, { hostId: metadata.hostId });
+    assert.deepStrictEqual(marker.metadata.session, {
+      sessionId: metadata.sessionId,
+      bridgeSessionId: metadata.bridgeSessionId,
+      nativeThreadId: metadata.nativeThreadId,
+      sourceSessionId: metadata.sourceSessionId,
+      originSessionId: metadata.originSessionId,
+      conversationKey: metadata.conversationKey,
+    });
+    assert.deepStrictEqual(marker.metadata.run, {
+      runId: metadata.runId,
+      launchMode: metadata.launchMode,
+    });
+    assert.deepStrictEqual(marker.metadata.profile, {
+      profileId: apiConfig.profileId,
+      label: apiConfig.label,
+      provider: apiConfig.provider,
+      providerKind: apiConfig.providerKind,
+      configHash: marker.metadata.profile.configHash,
+      configuredBaseUrl: true,
+      configuredApiKey: true,
+    });
+    assert.match(marker.metadata.profile.configHash, /^[a-f0-9]{16}$/);
+    assert.strictEqual(markerText.includes(apiConfig.apiKey), false, 'owner metadata must never persist API keys');
+    assert.strictEqual(
+      secondMarker.metadata.profile.configHash,
+      marker.metadata.profile.configHash,
+      'overlay configHash must not be derived from the API key'
+    );
+    assert.strictEqual(
+      second.providerKey,
+      first.providerKey,
+      'rotating a credential must not change the non-secret provider configuration identity'
+    );
+    assert.strictEqual(secondMarkerText.includes('rotated-path-budget-secret'), false);
+
+    assert.strictEqual(cleanupApiProfileCodexHome(first.cleanupOwner), true);
+    first = null;
+    assert.strictEqual(cleanupApiProfileCodexHome(second.cleanupOwner), true);
+    second = null;
+  } finally {
+    if (first && fs.existsSync(first.profileHomeDir)) cleanupApiProfileCodexHome(first.cleanupOwner);
+    if (second && fs.existsSync(second.profileHomeDir)) cleanupApiProfileCodexHome(second.cleanupOwner);
+    fs.rmSync(parent, { recursive: true, force: true });
   }
 }
 
@@ -2111,6 +2842,359 @@ async function verifyStartReplayResendsAttestedConfirmation() {
   assert.strictEqual(replayEvents[0].runId, 'run-current');
   assert.strictEqual(replayEvents[0].effectiveBinding.bindingFingerprint, profile.bindingFingerprint);
   assert.strictEqual(replayEvents[0].bridgeSessionId, 'bridge-reused');
+}
+
+async function verifyNativeResumeReadyAfterFirstTurnStart() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-native-resume-ready-'));
+  fs.writeFileSync(path.join(baseHome, 'auth.json'), '{}\n', 'utf8');
+  fs.writeFileSync(path.join(baseHome, 'config.toml'), '', 'utf8');
+  const events = [];
+  let turnStartSucceeded = false;
+  let failFirstTurnStart = true;
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-native-resume-ready',
+    sessionId: 'bridge-native-resume-ready',
+    bridgeSessionId: 'bridge-native-resume-ready',
+    runId: 'run-native-resume-ready',
+    title: 'Native resume readiness',
+    cwd: process.cwd(),
+    launchMode: 'fresh_rebind',
+    codexHome: baseHome,
+    postEvent: async (event) => {
+      if (event.type === 'session.runtime_updated' && event.patch?.nativeResumeReady === true) {
+        assert.strictEqual(
+          turnStartSucceeded,
+          true,
+          'native readiness must not be reported before turn/start RPC succeeds'
+        );
+      }
+      events.push(event);
+    },
+  });
+  runner.threadId = 'native-resume-ready-thread';
+  runner.sessionId = runner.threadId;
+  runner.nativeThreadId = runner.threadId;
+  runner.runtime.nativeThreadId = runner.threadId;
+  runner.rpc = {
+    request: async (method) => {
+      assert.strictEqual(method, 'turn/start');
+      if (failFirstTurnStart) {
+        failFirstTurnStart = false;
+        throw new Error('simulated turn/start failure before rollout creation');
+      }
+      turnStartSucceeded = true;
+      return { turn: { id: 'turn-native-resume-ready' } };
+    },
+  };
+  try {
+    assert.strictEqual(runner.runtime.nativeResumeReady, false);
+    await assert.rejects(
+      runner.sendInput('first attempt fails'),
+      /simulated turn\/start failure/
+    );
+    assert.strictEqual(runner.runtime.nativeResumeReady, false);
+    assert.strictEqual(
+      events.some((event) => event.patch?.nativeResumeReady === true),
+      false,
+      'a rejected turn/start must leave the native thread explicitly non-resumable'
+    );
+
+    const turnId = await runner.sendInput('second attempt succeeds');
+    assert.strictEqual(turnId, 'turn-native-resume-ready');
+    assert.strictEqual(runner.runtime.nativeResumeReady, true);
+    assert.strictEqual(
+      events.filter((event) => event.type === 'session.runtime_updated' && event.patch?.nativeResumeReady === true).length,
+      1,
+      'the first successful native turn must publish readiness exactly once'
+    );
+  } finally {
+    runner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyRuntimeErrorsClearAfterTurnRecovery() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-runtime-error-recovery-'));
+  fs.writeFileSync(path.join(baseHome, 'auth.json'), '{}\n', 'utf8');
+  fs.writeFileSync(path.join(baseHome, 'config.toml'), '', 'utf8');
+  const events = [];
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-runtime-error-recovery',
+    sessionId: 'bridge-runtime-error-recovery',
+    bridgeSessionId: 'bridge-runtime-error-recovery',
+    runId: 'run-runtime-error-recovery',
+    title: 'Runtime error recovery',
+    cwd: process.cwd(),
+    launchMode: 'fresh',
+    codexHome: baseHome,
+    postEvent: async (event) => events.push(event),
+  });
+  runner.threadId = 'thread-runtime-error-recovery';
+  runner.sessionId = runner.threadId;
+  runner.nativeThreadId = runner.threadId;
+  runner.rpc = {
+    request: async (method) => {
+      assert.strictEqual(method, 'turn/start');
+      return { turn: { id: 'turn-runtime-error-recovery' } };
+    },
+  };
+
+  try {
+    runner.runtime.lastError = 'stale input error';
+    runner.runtime.lastCodexError = 'staleInputError';
+    await runner.sendInput('retry after the session becomes live');
+    assert.strictEqual(runner.runtime.lastError, null, 'successful turn submission must clear lastError');
+    assert.strictEqual(runner.runtime.lastCodexError, null, 'successful turn submission must clear lastCodexError');
+
+    runner.runtime.lastError = 'stale notification error';
+    runner.runtime.lastCodexError = 'staleNotificationError';
+    await runner.handleNotification({
+      method: 'turn/started',
+      params: {
+        threadId: runner.threadId,
+        turn: { id: 'turn-runtime-error-recovery', status: { type: 'inProgress' } },
+      },
+    });
+    assert.strictEqual(runner.runtime.lastError, null, 'turn/started must clear lastError');
+    assert.strictEqual(runner.runtime.lastCodexError, null, 'turn/started must clear lastCodexError');
+
+    runner.runtime.lastError = 'stale retry warning';
+    runner.runtime.lastCodexError = 'responseStreamDisconnected';
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: runner.threadId,
+        turn: { id: 'turn-runtime-error-recovery', status: { type: 'completed' } },
+      },
+    });
+    assert.strictEqual(runner.runtime.lastError, null, 'successful turn completion must clear lastError');
+    assert.strictEqual(runner.runtime.lastCodexError, null, 'successful turn completion must clear lastCodexError');
+
+    runner.runtime.lastError = 'current terminal failure';
+    runner.runtime.lastCodexError = 'usageLimitExceeded';
+    runner.activeTurnId = 'turn-runtime-error-failed';
+    runner.turnBuffers.set(runner.activeTurnId, '');
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: runner.threadId,
+        turn: { id: runner.activeTurnId, status: { type: 'failed' } },
+      },
+    });
+    assert.strictEqual(runner.runtime.lastError, 'current terminal failure', 'failed completion must preserve lastError');
+    assert.strictEqual(runner.runtime.lastCodexError, 'usageLimitExceeded', 'failed completion must preserve lastCodexError');
+    assert(
+      events.some((event) => (
+        event.type === 'session.runtime_updated'
+        && event.patch?.lastError === null
+        && event.patch?.lastCodexError === null
+      )),
+      'runtime recovery must publish explicit nulls so Relay can clear its merged projection'
+    );
+  } finally {
+    runner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyAdaptiveFreshRebindThreadOpen() {
+  const createRunner = (baseHome, postEvent = async () => {}) => new CodexAppServerRunner({
+    hostId: 'host-adaptive-rebind',
+    sessionId: 'bridge-adaptive-rebind',
+    bridgeSessionId: 'bridge-adaptive-rebind',
+    runId: 'run-adaptive-rebind',
+    title: 'Adaptive Rebind',
+    cwd: process.cwd(),
+    launchMode: 'fresh_rebind',
+    rebindNativeThreadId: 'native-rebind-source',
+    explicitRebind: true,
+    codexHome: baseHome,
+    postEvent,
+  });
+
+  const missingHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-rebind-missing-rollout-'));
+  const missingCalls = [];
+  const missingEvents = [];
+  const missingRunner = createRunner(missingHome, async (event) => missingEvents.push(event));
+  missingRunner.rpc = {
+    request: async (method, params) => {
+      missingCalls.push({ method, params });
+      if (method === 'thread/resume') {
+        throw new Error('no rollout found for thread id native-rebind-source');
+      }
+      assert.strictEqual(method, 'thread/start');
+      return { thread: { id: 'native-rebind-fresh' } };
+    },
+  };
+  try {
+    const opened = await missingRunner.openThread();
+    assert.strictEqual(opened.thread.id, 'native-rebind-fresh');
+    assert.deepStrictEqual(missingCalls.map((entry) => entry.method), ['thread/resume', 'thread/start']);
+    assert.strictEqual(missingRunner.launchMode, 'fresh_rebind');
+    assert.strictEqual(missingRunner.runtime.launchMode, 'fresh_rebind');
+    assert.strictEqual(missingRunner.runtime.nativeResumeReady, false);
+    assert.strictEqual(missingRunner.runtime.resumeStrategy, 'fresh');
+    assert.strictEqual(
+      JSON.stringify(missingEvents).includes('from transcript context'),
+      false,
+      'an empty Rebind fallback must not claim that transcript context was injected'
+    );
+  } finally {
+    missingRunner.cleanupManagedOverlay();
+    fs.rmSync(missingHome, { recursive: true, force: true });
+  }
+
+  const readyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-rebind-ready-rollout-'));
+  const readyCalls = [];
+  const readyRunner = createRunner(readyHome);
+  readyRunner.rpc = {
+    request: async (method, params) => {
+      readyCalls.push({ method, params });
+      assert.strictEqual(method, 'thread/resume');
+      assert.strictEqual(params.threadId, 'native-rebind-source');
+      return { thread: { id: 'native-rebind-source' } };
+    },
+  };
+  try {
+    const opened = await readyRunner.openThread();
+    assert.strictEqual(opened.thread.id, 'native-rebind-source');
+    assert.deepStrictEqual(readyCalls.map((entry) => entry.method), ['thread/resume']);
+    assert.strictEqual(readyRunner.launchMode, 'resume');
+    assert.strictEqual(readyRunner.nativeThreadId, 'native-rebind-source');
+    assert.strictEqual(readyRunner.runtime.launchMode, 'resume');
+    assert.strictEqual(readyRunner.runtime.nativeResumeReady, true);
+    assert.strictEqual(readyRunner.runtime.resumeStrategy, 'native_resume');
+  } finally {
+    readyRunner.cleanupManagedOverlay();
+    fs.rmSync(readyHome, { recursive: true, force: true });
+  }
+
+  for (const [label, message] of [
+    ['unknown-thread', 'unknown thread id native-rebind-source'],
+    ['thread-not-found', 'thread native-rebind-source not found'],
+    ['database-error', 'thread database could not be opened'],
+  ]) {
+    const failureHome = fs.mkdtempSync(path.join(os.tmpdir(), `session-api-rebind-${label}-`));
+    const failureCalls = [];
+    const failureRunner = createRunner(failureHome);
+    failureRunner.rpc = {
+      request: async (method) => {
+        failureCalls.push(method);
+        throw new Error(message);
+      },
+    };
+    try {
+      await assert.rejects(
+        failureRunner.openThread(),
+        (error) => error?.code === 'session_native_resume_failed'
+      );
+      assert.deepStrictEqual(
+        failureCalls,
+        ['thread/resume'],
+        `${label} must not downgrade an explicit Rebind to thread/start`
+      );
+    } finally {
+      failureRunner.cleanupManagedOverlay();
+      fs.rmSync(failureHome, { recursive: true, force: true });
+    }
+  }
+
+  const legacyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-legacy-rebind-'));
+  const legacyRunner = new CodexAppServerRunner({
+    hostId: 'host-legacy-rebind',
+    sessionId: 'bridge-legacy-rebind',
+    runId: 'run-legacy-rebind',
+    title: 'Legacy Rebind',
+    cwd: process.cwd(),
+    launchMode: 'resume',
+    nativeThreadId: 'native-legacy-rebind',
+    explicitRebind: true,
+    codexHome: legacyHome,
+    postEvent: async () => {},
+  });
+  const legacyCalls = [];
+  legacyRunner.rpc = {
+    request: async (method) => {
+      legacyCalls.push(method);
+      if (method === 'thread/resume') {
+        throw new Error('no rollout found for thread id native-legacy-rebind');
+      }
+      return { thread: { id: 'native-legacy-fresh' } };
+    },
+  };
+  try {
+    const opened = await legacyRunner.openThread();
+    assert.strictEqual(opened.thread.id, 'native-legacy-fresh');
+    assert.deepStrictEqual(legacyCalls, ['thread/resume', 'thread/start']);
+    assert.strictEqual(legacyRunner.launchMode, 'fresh_rebind');
+    assert.strictEqual(legacyRunner.runtime.launchMode, 'fresh_rebind');
+    assert.strictEqual(legacyRunner.runtime.nativeResumeReady, false);
+  } finally {
+    legacyRunner.cleanupManagedOverlay();
+    fs.rmSync(legacyHome, { recursive: true, force: true });
+  }
+
+  const strictHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-strict-resume-'));
+  const strictRunner = new CodexAppServerRunner({
+    hostId: 'host-strict-resume',
+    sessionId: 'bridge-strict-resume',
+    runId: 'run-strict-resume',
+    title: 'Strict Resume',
+    cwd: process.cwd(),
+    launchMode: 'resume',
+    nativeThreadId: 'native-strict-resume',
+    explicitRebind: false,
+    codexHome: strictHome,
+    postEvent: async () => {},
+  });
+  const strictCalls = [];
+  strictRunner.rpc = {
+    request: async (method) => {
+      strictCalls.push(method);
+      throw new Error('no rollout found for thread id native-strict-resume');
+    },
+  };
+  try {
+    await assert.rejects(
+      strictRunner.openThread(),
+      (error) => error?.code === 'session_native_resume_failed'
+    );
+    assert.deepStrictEqual(strictCalls, ['thread/resume'], 'ordinary Resume must never downgrade to thread/start');
+  } finally {
+    strictRunner.cleanupManagedOverlay();
+    fs.rmSync(strictHome, { recursive: true, force: true });
+  }
+
+  const strictForkHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-strict-fork-'));
+  const strictForkRunner = new CodexAppServerRunner({
+    hostId: 'host-strict-fork',
+    sessionId: 'bridge-strict-fork',
+    runId: 'run-strict-fork',
+    title: 'Strict Fork',
+    cwd: process.cwd(),
+    launchMode: 'fork',
+    nativeThreadId: 'native-strict-fork',
+    explicitRebind: false,
+    codexHome: strictForkHome,
+    postEvent: async () => {},
+  });
+  const strictForkCalls = [];
+  strictForkRunner.rpc = {
+    request: async (method) => {
+      strictForkCalls.push(method);
+      throw new Error('no rollout found for thread id native-strict-fork');
+    },
+  };
+  try {
+    await assert.rejects(
+      strictForkRunner.openThread(),
+      (error) => error?.code === 'session_native_fork_failed'
+    );
+    assert.deepStrictEqual(strictForkCalls, ['thread/fork'], 'ordinary Fork must never downgrade to thread/start');
+  } finally {
+    strictForkRunner.cleanupManagedOverlay();
+    fs.rmSync(strictForkHome, { recursive: true, force: true });
+  }
 }
 
 async function verifyRejectedRunnerStartupKillsSpawnedChild() {
@@ -2339,11 +3423,13 @@ verifyPagedRunnerCapabilities()
   .then(verifyCodexStopTimeoutPreservesLiveChildOverlay)
   .then(verifyConstructorFailureRemovesOwnedOverlay)
   .then(verifyPostOverlayConstructorFailureRemovesCredentials)
+  .then(verifySqliteOpenFailurePreservesFilesAndRawStartupError)
   .then(verifySqliteStartupRetryStopsFirstChildBeforeReuse)
   .then(verifySqliteRetryTimeoutRequiresTrackedCommandRetry)
   .then(verifySqliteRetryExitWaiterSurvivesConcurrentShutdown)
   .then(verifyPreSpawnCodexCancellationPublishesTerminalFailure)
   .then(verifyIntentionalProcessStopIsSingleTerminalOutcome)
+  .then(verifyManagedProcessSpawnCredentialIsolation)
   .then(verifyProcessStopSuppressionUpgradesMonotonically)
   .then(verifyProcessSpawnHandshakeRejectsMissingExecutable)
   .then(verifySynchronousProcessSpawnFailureDefersTerminalToCommandOwner)
@@ -2363,9 +3449,14 @@ verifyPagedRunnerCapabilities()
   .then(verifyManagedOverlayJanitorRejectsLinkedRoot)
   .then(verifyManagedOverlayCreationRejectsLinkedRoot)
   .then(verifyManagedOverlayCreationAllowsLinkedBaseHome)
+  .then(verifyFirstManagedOverlayPersistsRolloutsForResume)
   .then(verifyOwnedOverlayCleanupRejectsLinkedMarker)
+  .then(verifyManagedOverlayShortPathBudgetAndMetadata)
   .then(verifyManagedOverlayJanitorRequiresDeadOwnerAndChild)
   .then(verifyManagedOverlayJanitorRequiresAttestationForLegacyMarkers)
+  .then(verifyNativeResumeReadyAfterFirstTurnStart)
+  .then(verifyRuntimeErrorsClearAfterTurnRecovery)
+  .then(verifyAdaptiveFreshRebindThreadOpen)
   .then(verifyStartReplayResendsAttestedConfirmation)
   .then(verifyRejectedRunnerStartupKillsSpawnedChild)
   .then(verifySpawnMarkerFailureIsControlled)

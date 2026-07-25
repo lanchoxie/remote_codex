@@ -4,13 +4,15 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
+const { resolveLocalCodexBin } = require('../../shared/codex-preflight');
 const { nowIso } = require('../../shared/protocol');
 const {
   ThinkingActivityAggregator,
   makeActivityKey,
+  truncateActivityText,
 } = require('../../shared/thinking-activity');
 const {
-  buildApiEnvironment,
+  buildApiProcessEnvironment,
   describeApiConfig,
   normalizeApiConfig,
 } = require('./runtime-utils');
@@ -32,13 +34,303 @@ const TURN_START_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_TURN_START_TI
 const MANAGED_OVERLAY_MARKER_KIND = 'remote-codex-managed-overlay';
 const MANAGED_OVERLAY_MARKER_VERSION = 1;
 const MANAGED_OVERLAY_MARKER_NAME = '.remote-codex-owner';
+const NOTIFICATION_QUEUE_MAX_ITEMS = 256;
+const NOTIFICATION_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
+const NOTIFICATION_QUEUE_MAX_ITEM_BYTES = 64 * 1024;
+const NOTIFICATION_QUEUE_TERMINAL_RESERVED_ITEMS = 16;
+const NOTIFICATION_QUEUE_TERMINAL_RESERVED_BYTES = 256 * 1024;
+const TURN_BUFFER_MAX_BYTES = 512 * 1024;
+const NOTIFICATION_TRUNCATION_SUFFIX = '\n...[notification truncated]';
+const TURN_BUFFER_TRUNCATION_SUFFIX = '\n...[assistant output truncated]';
+const ACTIVITY_COMMAND_MAX_BYTES = 16 * 1024;
+const ACTIVITY_OUTPUT_MAX_BYTES = 128 * 1024;
+const ACTIVITY_PROGRESS_MAX_BYTES = 64 * 1024;
+const ACTIVITY_DIFF_MAX_BYTES = 32 * 1024;
+const ACTIVITY_FILE_CHANGES_MAX_BYTES = 128 * 1024;
+const ACTIVITY_STRUCTURED_VALUE_MAX_BYTES = 64 * 1024;
+const ACTIVITY_STRUCTURED_STRING_MAX_BYTES = 8 * 1024;
+const ACTIVITY_MAX_FILE_CHANGES = 128;
+
+function truncateUtf8(value, maxBytes, suffix = '') {
+  const text = String(value ?? '');
+  const byteLimit = Math.max(0, Number(maxBytes) || 0);
+  if (Buffer.byteLength(text, 'utf8') <= byteLimit) return text;
+  const suffixText = String(suffix || '');
+  const suffixBytes = Math.min(Buffer.byteLength(suffixText, 'utf8'), byteLimit);
+  const budget = Math.max(0, byteLimit - suffixBytes);
+  const encoded = Buffer.from(text, 'utf8');
+  let end = Math.min(encoded.length, budget);
+  while (end > 0 && (encoded[end] & 0b11000000) === 0b10000000) end -= 1;
+  return `${encoded.subarray(0, end).toString('utf8')}${truncateUtf8Suffix(suffixText, suffixBytes)}`;
+}
+
+function truncateUtf8Suffix(value, maxBytes) {
+  const encoded = Buffer.from(String(value || ''), 'utf8');
+  if (encoded.length <= maxBytes) return encoded.toString('utf8');
+  let end = Math.min(encoded.length, Math.max(0, maxBytes));
+  while (end > 0 && (encoded[end] & 0b11000000) === 0b10000000) end -= 1;
+  return encoded.subarray(0, end).toString('utf8');
+}
+
+function notificationSerializedBytes(message) {
+  try {
+    return Buffer.byteLength(JSON.stringify(message), 'utf8');
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function compactCodexErrorControl(errorInfo) {
+  if (!errorInfo) return null;
+  if (typeof errorInfo === 'string') return truncateUtf8(errorInfo, 256, NOTIFICATION_TRUNCATION_SUFFIX);
+  if (typeof errorInfo !== 'object') return truncateUtf8(String(errorInfo), 128);
+  const knownKeys = [
+    'httpConnectionFailed',
+    'responseStreamConnectionFailed',
+    'responseStreamDisconnected',
+    'responseTooManyFailedAttempts',
+    'activeTurnNotSteerable',
+  ];
+  for (const key of knownKeys) {
+    if (!errorInfo[key]) continue;
+    const detail = errorInfo[key];
+    if (!detail || typeof detail !== 'object') return { [key]: true };
+    return {
+      [key]: {
+        ...(detail.httpStatusCode != null
+          ? {
+            httpStatusCode: typeof detail.httpStatusCode === 'number'
+              ? detail.httpStatusCode
+              : truncateUtf8(detail.httpStatusCode, 32),
+          }
+          : {}),
+        ...(detail.turnKind != null ? { turnKind: truncateUtf8(detail.turnKind, 128) } : {}),
+      },
+    };
+  }
+  return truncateUtf8(summarizeValue(errorInfo), 256, NOTIFICATION_TRUNCATION_SUFFIX);
+}
+
+function compactErrorNotification(params, identity, maxBytes) {
+  const originalMessage = String(params.error?.message || 'codex error');
+  const compact = {
+    method: 'error',
+    params: {
+      threadId: truncateUtf8(identity.threadId || '', 256),
+      turnId: truncateUtf8(identity.turnId || '', 256),
+      willRetry: params.willRetry === true,
+      error: {
+        message: '',
+        codexErrorInfo: compactCodexErrorControl(params.error?.codexErrorInfo || params.error?.codexError),
+        ...(params.error?.codexError != null
+          ? { codexError: truncateUtf8(summarizeValue(params.error.codexError), 128) }
+          : {}),
+        truncated: true,
+      },
+    },
+  };
+  const emptyBytes = notificationSerializedBytes(compact);
+  let messageBudget = Math.max(64, maxBytes - emptyBytes - 16);
+  compact.params.error.message = truncateUtf8(
+    originalMessage,
+    messageBudget,
+    NOTIFICATION_TRUNCATION_SUFFIX
+  );
+  while (notificationSerializedBytes(compact) > maxBytes && messageBudget > 64) {
+    messageBudget = Math.max(64, Math.floor(messageBudget / 2));
+    compact.params.error.message = truncateUtf8(
+      originalMessage,
+      messageBudget,
+      NOTIFICATION_TRUNCATION_SUFFIX
+    );
+  }
+  if (notificationSerializedBytes(compact) > maxBytes) {
+    compact.params.error.message = truncateUtf8(originalMessage, 64);
+  }
+  return compact;
+}
+
+function compactOversizedNotification(message, maxBytes) {
+  const method = String(message?.method || 'notification');
+  const params = message?.params && typeof message.params === 'object' ? message.params : {};
+  const identity = {
+    threadId: params.threadId || params.thread?.id || null,
+    turnId: params.turnId || params.turn?.id || null,
+    itemId: params.itemId || params.item?.id || null,
+    summaryIndex: params.summaryIndex ?? null,
+    processId: params.processId || null,
+    processHandle: params.processHandle || null,
+  };
+  const textBudget = Math.max(1024, maxBytes - 4096);
+  let compactParams;
+
+  if (method === 'thread/started') {
+    compactParams = { thread: { id: identity.threadId } };
+  } else if (method === 'thread/status/changed') {
+    compactParams = {
+      threadId: identity.threadId,
+      status: {
+        type: params.status?.type || null,
+        activeFlags: Array.isArray(params.status?.activeFlags)
+          ? params.status.activeFlags.slice(0, 32).map((value) => truncateUtf8(value, 256))
+          : [],
+        truncated: true,
+      },
+    };
+  } else if (method === 'thread/goal/updated' || method === 'thread/goal/cleared') {
+    compactParams = {
+      threadId: identity.threadId,
+      goal: method.endsWith('/cleared') ? null : {
+        status: params.goal?.status || null,
+        objective: truncateUtf8(params.goal?.objective || '', textBudget, NOTIFICATION_TRUNCATION_SUFFIX),
+        truncated: true,
+      },
+    };
+  } else if (method === 'turn/started' || method === 'turn/completed') {
+    compactParams = {
+      threadId: identity.threadId,
+      turnId: identity.turnId,
+      turn: {
+        id: identity.turnId,
+        status: params.turn?.status || null,
+        truncated: true,
+      },
+    };
+  } else if (method === 'item/started' || method === 'item/completed') {
+    compactParams = {
+      threadId: identity.threadId,
+      turnId: identity.turnId,
+      itemId: identity.itemId,
+      startedAtMs: params.startedAtMs ?? null,
+      completedAtMs: params.completedAtMs ?? null,
+      item: compactAppServerThreadItem(params.item, textBudget),
+    };
+  } else if (method === 'item/agentMessage/delta') {
+    compactParams = {
+      ...identity,
+      phase: params.phase || params.item?.phase || null,
+      delta: truncateUtf8(params.delta || '', textBudget, NOTIFICATION_TRUNCATION_SUFFIX),
+    };
+  } else if (method === 'item/reasoning/summaryTextDelta') {
+    compactParams = {
+      ...identity,
+      delta: truncateUtf8(params.delta || '', textBudget, NOTIFICATION_TRUNCATION_SUFFIX),
+    };
+  } else if (method === 'item/plan/delta' || method === 'turn/plan/updated') {
+    compactParams = {
+      ...identity,
+      delta: truncateUtf8(params.delta || '', Math.floor(textBudget / 2), NOTIFICATION_TRUNCATION_SUFFIX),
+      plan: truncateUtf8(params.plan || '', Math.floor(textBudget / 2), NOTIFICATION_TRUNCATION_SUFFIX),
+    };
+  } else if (
+    method === 'item/commandExecution/outputDelta'
+    || method === 'process/outputDelta'
+    || method === 'command/exec/outputDelta'
+  ) {
+    compactParams = {
+      ...identity,
+      stream: params.stream || null,
+      capReached: typeof params.capReached === 'boolean' ? params.capReached : null,
+      delta: truncateUtf8(params.delta || '', Math.floor(textBudget / 2), NOTIFICATION_TRUNCATION_SUFFIX),
+      deltaBase64: truncateUtf8(params.deltaBase64 || '', Math.floor(textBudget / 2), NOTIFICATION_TRUNCATION_SUFFIX),
+    };
+  } else if (method === 'item/fileChange/patchUpdated') {
+    compactParams = {
+      ...identity,
+      changes: normalizeAppServerFileChanges(
+        params.changes || params.fileChanges || params.file_changes,
+        textBudget
+      ),
+    };
+  } else if (method === 'item/mcpToolCall/progress') {
+    compactParams = {
+      ...identity,
+      callId: params.callId || null,
+      requestId: params.requestId || null,
+      message: truncateUtf8(params.message || '', textBudget, NOTIFICATION_TRUNCATION_SUFFIX),
+    };
+  } else if (method === 'warning') {
+    compactParams = {
+      message: truncateUtf8(params.message || '', textBudget, NOTIFICATION_TRUNCATION_SUFFIX),
+      truncated: true,
+    };
+  } else if (method === 'error') {
+    compactParams = {
+      threadId: identity.threadId,
+      turnId: identity.turnId,
+      willRetry: Boolean(params.willRetry),
+      error: {
+        message: truncateUtf8(params.error?.message || '', Math.floor(textBudget / 2), NOTIFICATION_TRUNCATION_SUFFIX),
+        additionalDetails: truncateUtf8(
+          params.error?.additionalDetails || '',
+          Math.floor(textBudget / 2),
+          NOTIFICATION_TRUNCATION_SUFFIX
+        ),
+        codexErrorInfo: compactCodexErrorControl(params.error?.codexErrorInfo || params.error?.codexError),
+        truncated: true,
+      },
+    };
+  } else if (method === 'thread/tokenUsage/updated') {
+    compactParams = {
+      threadId: identity.threadId,
+      tokenUsage: { total: params.tokenUsage?.total || null, truncated: true },
+    };
+  } else if (method === 'account/rateLimits/updated') {
+    compactParams = {
+      accountId: params.accountId || null,
+      rateLimits: {
+        rateLimitReachedType: params.rateLimits?.rateLimitReachedType || null,
+        truncated: true,
+      },
+    };
+  } else {
+    compactParams = {
+      ...identity,
+      truncated: true,
+      summary: truncateUtf8(summarizeValue(params), textBudget, NOTIFICATION_TRUNCATION_SUFFIX),
+    };
+  }
+
+  let compact = { method, params: compactParams };
+  if (notificationSerializedBytes(compact) > maxBytes) {
+    compact = method === 'error'
+      ? compactErrorNotification(params, identity, maxBytes)
+      : {
+        method,
+        params: {
+          ...identity,
+          truncated: true,
+          summary: truncateUtf8(summarizeValue(compactParams), Math.max(0, maxBytes - 2048)),
+        },
+      };
+  }
+  return compact;
+}
 
 function retryableTerminalDeliveryError(error) {
   const result = error instanceof Error
     ? error
     : new Error(String(error || 'Session terminal state delivery failed.'));
   result.retryCommand = true;
+  result.terminalDeliveryFailure = true;
   return result;
+}
+
+function errorWithoutSuppressedTerminalDelivery(error, suppressDelivery) {
+  if (!error || !suppressDelivery) return error;
+  if (error.terminalDeliveryFailure === true) return null;
+  if (!(error instanceof AggregateError) || !Array.isArray(error.errors)) return error;
+  const remaining = error.errors
+    .map((nested) => errorWithoutSuppressedTerminalDelivery(nested, true))
+    .filter(Boolean);
+  if (!remaining.length) return null;
+  if (remaining.length === 1) return remaining[0];
+  const aggregate = new AggregateError(remaining, error.message);
+  if (remaining.some((nested) => nested?.retryCommand === true)) aggregate.retryCommand = true;
+  if (remaining.some((nested) => nested?.processTreeFallbackRequired === true)) {
+    aggregate.processTreeFallbackRequired = true;
+  }
+  return aggregate;
 }
 
 function throwTerminalErrors(errors, message) {
@@ -95,28 +387,307 @@ function normalizeAppServerFileChangeStatus(value) {
   return text || 'modified';
 }
 
-function normalizeAppServerFileChanges(fileChanges) {
+function normalizeAppServerFileChanges(fileChanges, maxBytes = ACTIVITY_FILE_CHANGES_MAX_BYTES) {
   if (!fileChanges || typeof fileChanges !== 'object') {
     return [];
   }
-  return Object.entries(fileChanges)
+  const entries = Array.isArray(fileChanges)
+    ? fileChanges.map((change, index) => [change?.path || change?.file || String(index), change])
+    : Object.entries(fileChanges);
+  const normalized = entries
+    .slice(0, ACTIVITY_MAX_FILE_CHANGES)
     .map(([pathValue, change]) => {
       if (!change || typeof change !== 'object') {
         return null;
       }
-      const status = normalizeAppServerFileChangeStatus(change.type || change.status);
-      const diff = String(change.unified_diff || change.unifiedDiff || change.diff || change.patch || '').trim();
+      const status = normalizeAppServerFileChangeStatus(change.kind || change.type || change.status);
+      const diff = truncateUtf8(
+        String(change.unified_diff || change.unifiedDiff || change.diff || change.patch || '').trim(),
+        ACTIVITY_DIFF_MAX_BYTES,
+        NOTIFICATION_TRUNCATION_SUFFIX
+      );
       const diffCounts = countDiffLines(diff);
       const contentLines = countTextLines(change.content || '');
       return {
-        path: String(pathValue || change.path || change.file || change.file_path || 'workspace change'),
+        path: truncateUtf8(
+          String(change.path || change.file || change.file_path || pathValue || 'workspace change'),
+          4096,
+          NOTIFICATION_TRUNCATION_SUFFIX
+        ),
         status,
+        kind: truncateUtf8(String(change.kind || change.type || change.status || status), 64),
         additions: status === 'added' && !diff ? contentLines : diff ? diffCounts.additions : null,
         deletions: status === 'deleted' && !diff ? contentLines : diff ? diffCounts.deletions : null,
         diff,
+        movePath: change.movePath || change.move_path
+          ? truncateUtf8(change.movePath || change.move_path, 4096, NOTIFICATION_TRUNCATION_SUFFIX)
+          : null,
       };
     })
     .filter(Boolean);
+  const result = [];
+  let bytes = 2;
+  for (const change of normalized) {
+    const changeBytes = notificationSerializedBytes(change) + (result.length ? 1 : 0);
+    if (bytes + changeBytes > Math.max(1024, Number(maxBytes) || ACTIVITY_FILE_CHANGES_MAX_BYTES)) break;
+    result.push(change);
+    bytes += changeBytes;
+  }
+  return result;
+}
+
+function sanitizeActivityValue(value, depth = 0) {
+  if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    return truncateUtf8(value, ACTIVITY_STRUCTURED_STRING_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX);
+  }
+  if (depth >= 6) {
+    return truncateUtf8(summarizeValue(value), 1024, NOTIFICATION_TRUNCATION_SUFFIX);
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 64).map((entry) => sanitizeActivityValue(entry, depth + 1));
+  }
+  if (typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value)
+      .slice(0, 64)
+      .map(([key, entry]) => [
+        truncateUtf8(key, 256, NOTIFICATION_TRUNCATION_SUFFIX),
+        sanitizeActivityValue(entry, depth + 1),
+      ]));
+  }
+  return truncateUtf8(String(value), 1024, NOTIFICATION_TRUNCATION_SUFFIX);
+}
+
+function boundedActivityValue(value, maxBytes = ACTIVITY_STRUCTURED_VALUE_MAX_BYTES) {
+  if (value == null) return null;
+  const sanitized = sanitizeActivityValue(value);
+  if (notificationSerializedBytes(sanitized) <= maxBytes) return sanitized;
+  return {
+    truncated: true,
+    summary: truncateUtf8(
+      summarizeValue(value),
+      Math.max(256, maxBytes - 128),
+      NOTIFICATION_TRUNCATION_SUFFIX
+    ),
+  };
+}
+
+function boundedActivityNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function activityKindForItemType(itemType) {
+  return ({
+    commandExecution: 'command',
+    fileChange: 'file-change',
+    mcpToolCall: 'mcp-tool',
+    dynamicToolCall: 'tool-call',
+    collabAgentToolCall: 'collaboration',
+    webSearch: 'web-search',
+    imageView: 'image',
+    imageGeneration: 'image-generation',
+    plan: 'plan',
+    contextCompaction: 'context',
+    enteredReviewMode: 'review',
+    exitedReviewMode: 'review',
+  })[itemType] || null;
+}
+
+function normalizeAppServerActivityItem(item, params = {}, lifecycle = 'progress') {
+  if (!item || typeof item !== 'object') return null;
+  const itemType = String(item.type || '').trim();
+  const kind = activityKindForItemType(itemType);
+  if (!kind) return null;
+  const itemId = String(item.id || params.itemId || '').trim();
+  const turnId = String(params.turnId || '').trim();
+  if (!itemId || !turnId) return null;
+  const toolLike = ['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'webSearch']
+    .includes(itemType);
+  const status = String(item.status || (lifecycle === 'completed' ? 'completed' : 'inProgress'));
+  const identity = {
+    turnId,
+    itemId,
+    summaryIndex: 0,
+    kind,
+    itemType,
+    method: lifecycle === 'completed' ? 'item/completed' : 'item/started',
+    callId: String(item.callId || item.call_id || params.callId || (toolLike ? itemId : '')).trim() || null,
+    status,
+  };
+  const requestId = String(item.requestId || item.request_id || params.requestId || '').trim();
+  if (requestId) identity.requestId = requestId;
+  if (params.startedAtMs != null) identity.startedAtMs = boundedActivityNumber(params.startedAtMs);
+  if (params.completedAtMs != null) identity.completedAtMs = boundedActivityNumber(params.completedAtMs);
+  if (item.durationMs != null || item.duration_ms != null) {
+    identity.durationMs = boundedActivityNumber(item.durationMs ?? item.duration_ms);
+  }
+  let text = '';
+
+  if (itemType === 'commandExecution') {
+    const command = truncateUtf8(item.command || '', ACTIVITY_COMMAND_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX);
+    const output = truncateUtf8(item.aggregatedOutput || item.output || '', ACTIVITY_OUTPUT_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX);
+    Object.assign(identity, {
+      command,
+      cwd: truncateUtf8(item.cwd || '', 4096, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      source: String(item.source || '').trim() || null,
+      ...(lifecycle === 'completed' ? { stream: null } : {}),
+      commandActions: boundedActivityValue(item.commandActions || item.command_actions || []),
+    });
+    const processId = String(item.processId || item.process_id || '').trim();
+    if (processId) identity.processId = processId;
+    if (item.aggregatedOutput != null || item.output != null) {
+      identity.output = output;
+      identity.outputTruncated = Buffer.byteLength(String(item.aggregatedOutput || item.output || ''), 'utf8') > ACTIVITY_OUTPUT_MAX_BYTES;
+    }
+    if (item.exitCode != null || item.exit_code != null) {
+      identity.exitCode = boundedActivityNumber(item.exitCode ?? item.exit_code);
+    }
+    text = command || 'Command execution';
+  } else if (itemType === 'fileChange') {
+    const fileChanges = normalizeAppServerFileChanges(item.changes || item.fileChanges || item.file_changes);
+    if (item.changes != null || item.fileChanges != null || item.file_changes != null) {
+      Object.assign(identity, { fileChanges, changes: fileChanges });
+    }
+    text = fileChanges.length
+      ? `${status === 'inProgress' ? 'Updating' : 'Updated'} ${fileChanges.length} file(s)`
+      : 'File change';
+  } else if (itemType === 'mcpToolCall') {
+    Object.assign(identity, {
+      server: truncateUtf8(item.server || '', 512, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      tool: truncateUtf8(item.tool || '', 512, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      arguments: boundedActivityValue(item.arguments),
+      resourceUri: truncateUtf8(item.mcpAppResourceUri || '', 4096, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+    });
+    if (item.result != null) identity.result = boundedActivityValue(item.result);
+    if (item.error != null) identity.error = boundedActivityValue(item.error, 16 * 1024);
+    text = identity.error?.message || `${identity.server || 'MCP'} / ${identity.tool || 'tool'}`;
+  } else if (itemType === 'dynamicToolCall') {
+    Object.assign(identity, {
+      namespace: truncateUtf8(item.namespace || '', 512, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      tool: truncateUtf8(item.tool || '', 512, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      arguments: boundedActivityValue(item.arguments),
+      result: boundedActivityValue(item.contentItems || item.content_items),
+      success: typeof item.success === 'boolean' ? item.success : null,
+    });
+    text = `${identity.namespace ? `${identity.namespace} / ` : ''}${identity.tool || 'Dynamic tool'}`;
+  } else if (itemType === 'collabAgentToolCall') {
+    Object.assign(identity, {
+      tool: boundedActivityValue(item.tool, 8 * 1024),
+      senderThreadId: String(item.senderThreadId || '').trim() || null,
+      receiverThreadIds: boundedActivityValue(item.receiverThreadIds || []),
+      prompt: truncateUtf8(item.prompt || '', ACTIVITY_PROGRESS_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      agentsStates: boundedActivityValue(item.agentsStates || {}),
+      model: truncateUtf8(item.model || '', 512, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      reasoningEffort: truncateUtf8(item.reasoningEffort || item.reasoning_effort || '', 128, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+    });
+    text = typeof item.tool === 'string' ? item.tool : summarizeValue(item.tool || 'Collaboration');
+  } else if (itemType === 'webSearch') {
+    Object.assign(identity, {
+      query: truncateUtf8(item.query || '', ACTIVITY_PROGRESS_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX),
+      action: truncateUtf8(
+        typeof item.action === 'string' ? item.action : item.action?.type || '',
+        4096,
+        NOTIFICATION_TRUNCATION_SUFFIX
+      ) || null,
+      actionData: boundedActivityValue(item.action, 16 * 1024),
+    });
+    text = identity.query || 'Web search';
+  } else if (itemType === 'plan') {
+    text = truncateUtf8(item.text || '', ACTIVITY_PROGRESS_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX) || 'Plan';
+  } else {
+    Object.assign(identity, {
+      path: truncateUtf8(item.path || item.savedPath || '', 4096, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+      result: boundedActivityValue(item.result),
+      review: truncateUtf8(item.review || '', ACTIVITY_PROGRESS_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX) || null,
+    });
+    text = identity.path || identity.review || itemType;
+  }
+
+  return { identity, text };
+}
+
+function compactAppServerThreadItem(item, maxBytes) {
+  if (!item || typeof item !== 'object') return null;
+  const itemType = String(item.type || '').trim();
+  const fieldBudget = Math.max(256, Math.floor(Math.max(1024, maxBytes) / 4));
+  const compact = {
+    id: truncateUtf8(item.id || '', 512, NOTIFICATION_TRUNCATION_SUFFIX),
+    type: itemType || null,
+    status: item.status || null,
+    durationMs: boundedActivityNumber(item.durationMs ?? item.duration_ms),
+    truncated: true,
+  };
+  if (itemType === 'reasoning') {
+    const summaries = Array.isArray(item.summary) ? item.summary : [];
+    const perSummaryBudget = Math.max(256, Math.floor(maxBytes / Math.max(1, Math.min(16, summaries.length))));
+    return {
+      ...compact,
+      summary: summaries.slice(0, 16).map((value) => truncateUtf8(
+        persistedReasoningSummaryText(value),
+        perSummaryBudget,
+        NOTIFICATION_TRUNCATION_SUFFIX
+      )),
+      content: [],
+    };
+  }
+  if (itemType === 'commandExecution') {
+    return {
+      ...compact,
+      command: truncateUtf8(item.command || '', Math.min(fieldBudget, ACTIVITY_COMMAND_MAX_BYTES), NOTIFICATION_TRUNCATION_SUFFIX),
+      cwd: truncateUtf8(item.cwd || '', 4096, NOTIFICATION_TRUNCATION_SUFFIX),
+      processId: item.processId || item.process_id || null,
+      source: item.source || null,
+      commandActions: boundedActivityValue(item.commandActions || item.command_actions || [], fieldBudget),
+      aggregatedOutput: truncateUtf8(
+        item.aggregatedOutput || item.output || '',
+        Math.min(fieldBudget, ACTIVITY_OUTPUT_MAX_BYTES),
+        NOTIFICATION_TRUNCATION_SUFFIX
+      ),
+      exitCode: boundedActivityNumber(item.exitCode ?? item.exit_code),
+    };
+  }
+  if (itemType === 'fileChange') {
+    return {
+      ...compact,
+      changes: normalizeAppServerFileChanges(
+        item.changes || item.fileChanges || item.file_changes,
+        fieldBudget
+      ),
+    };
+  }
+  if (itemType === 'mcpToolCall') {
+    return {
+      ...compact,
+      server: truncateUtf8(item.server || '', 512, NOTIFICATION_TRUNCATION_SUFFIX),
+      tool: truncateUtf8(item.tool || '', 512, NOTIFICATION_TRUNCATION_SUFFIX),
+      arguments: boundedActivityValue(item.arguments, fieldBudget),
+      result: boundedActivityValue(item.result, fieldBudget),
+      error: boundedActivityValue(item.error, Math.min(fieldBudget, 16 * 1024)),
+      mcpAppResourceUri: truncateUtf8(item.mcpAppResourceUri || '', 4096, NOTIFICATION_TRUNCATION_SUFFIX),
+    };
+  }
+  if (itemType === 'dynamicToolCall') {
+    return {
+      ...compact,
+      namespace: truncateUtf8(item.namespace || '', 512, NOTIFICATION_TRUNCATION_SUFFIX),
+      tool: truncateUtf8(item.tool || '', 512, NOTIFICATION_TRUNCATION_SUFFIX),
+      arguments: boundedActivityValue(item.arguments, fieldBudget),
+      contentItems: boundedActivityValue(item.contentItems || item.content_items, fieldBudget),
+      success: typeof item.success === 'boolean' ? item.success : null,
+    };
+  }
+  if (itemType === 'webSearch') {
+    return {
+      ...compact,
+      query: truncateUtf8(item.query || '', Math.min(fieldBudget, ACTIVITY_PROGRESS_MAX_BYTES), NOTIFICATION_TRUNCATION_SUFFIX),
+      action: boundedActivityValue(item.action, fieldBudget),
+    };
+  }
+  return {
+    ...compact,
+    summary: truncateUtf8(summarizeValue(item), Math.max(256, maxBytes - 1024), NOTIFICATION_TRUNCATION_SUFFIX),
+  };
 }
 
 function shouldSurfaceStderrLine(text) {
@@ -173,27 +744,147 @@ function shouldSurfaceStderrLine(text) {
 }
 
 function isRuntimeDiagnosticStderrLine(text) {
-  return /codex_app_server: failed to initialize sqlite state db/i.test(text)
-    || /failed to initialize sqlite state runtime/i.test(text)
-    || /file is not a database/i.test(text)
-    || /Codex could not find bubblewrap on PATH/i.test(text)
+  return /Codex could not find bubblewrap on PATH/i.test(text)
     || /sandbox prerequisites/i.test(text)
     || /concepts\/sandboxing#prerequisites/i.test(text);
 }
 
-function isCodexStateDatabaseError(text) {
-  return /codex_app_server: failed to initialize sqlite state db/i.test(text)
+function classifyCodexStateDatabaseStderr(value) {
+  const text = stripAnsi(value).trim();
+  if (!text) return null;
+
+  const corruption = /\bSQLITE_(?:CORRUPT|NOTADB)\b/i.test(text)
+    || /file is not a database/i.test(text)
+    || /database disk image is malformed/i.test(text)
+    || /malformed database schema/i.test(text)
+    || /database (?:is |appears )?(?:corrupt|corrupted|malformed)/i.test(text)
+    || /(?:corrupt|corrupted|malformed) (?:sqlite )?database/i.test(text);
+  if (corruption) {
+    return { kind: 'corruption', quarantine: true };
+  }
+
+  const hasDatabaseContext = /sqlite|database(?: file)?|state_\d+\.sqlite/i.test(text);
+  if (!hasDatabaseContext) return null;
+
+  const pathTooLong = /ENAMETOOLONG|path too long|filename or extension is too long/i.test(text);
+  if (pathTooLong) {
+    return { kind: 'path-too-long', quarantine: false };
+  }
+
+  const unavailable = /\bSQLITE_CANTOPEN\b/i.test(text)
+    || /\(code:\s*14\)/i.test(text)
+    || /unable to open database file/i.test(text)
+    || /(?:failed|unable|cannot|can't) to (?:open|create).*(?:sqlite|database)/i.test(text)
+    || /(?:sqlite|database).*(?:failed|unable|cannot|can't) to (?:open|create)/i.test(text)
+    || /permission denied|access (?:is )?denied|read-only database|readonly database/i.test(text);
+  if (unavailable) {
+    return { kind: 'open-create', quarantine: false };
+  }
+
+  if (
+    /codex_app_server: failed to initialize sqlite state db/i.test(text)
     || /failed to initialize sqlite state runtime/i.test(text)
-    || /file is not a database/i.test(text);
+    || /failed to initialize.*sqlite/i.test(text)
+  ) {
+    return { kind: 'initialization', quarantine: false };
+  }
+  return null;
 }
 
-function codexStateDatabaseHint(text) {
+function codexStateDatabaseHint(classification, text, codexHome = null) {
+  const location = codexHome
+    ? ` CODEX_HOME: ${limitText(codexHome, 360)}.`
+    : '';
+  const raw = ` Raw stderr: ${limitText(text, 1200)}`;
+  if (classification?.kind === 'corruption') {
+    return [
+      'Codex reported that its SQLite state is corrupted or is not a database.',
+      'Only the affected state_*.sqlite files may be moved aside automatically; the whole CODEX_HOME is not removed.',
+      location,
+      raw,
+    ].join(' ').replace(/\s+/g, ' ').trim();
+  }
+  if (classification?.kind === 'path-too-long') {
+    return [
+      'Codex could not create or open its SQLite state because the filesystem path is too long.',
+      'Shorten CODEX_HOME or the managed overlay path; existing SQLite files were left untouched.',
+      location,
+      raw,
+    ].join(' ').replace(/\s+/g, ' ').trim();
+  }
+  if (classification?.kind === 'open-create') {
+    return [
+      'Codex could not create or open its SQLite state. This is not evidence that the database is corrupted.',
+      'Check the CODEX_HOME path length, directory existence, write permissions, and file locks; existing SQLite files were left untouched.',
+      location,
+      raw,
+    ].join(' ').replace(/\s+/g, ' ').trim();
+  }
   return [
-    'Codex could not start because the SQLite state under CODEX_HOME is not a valid database.',
-    'Do not delete the whole ~/.codex directory.',
-    'Inspect and move only the broken sqlite state file, then restart this host-agent.',
-    `Raw stderr: ${limitText(text, 420)}`,
-  ].join(' ');
+    'Codex reported a SQLite initialization failure, but stderr did not establish database corruption.',
+    'Existing SQLite files were left untouched; inspect the raw error before retrying.',
+    location,
+    raw,
+  ].join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function buildCodexStateDatabaseDiagnostic(value, codexHome = null) {
+  const text = stripAnsi(value).trim();
+  const classification = classifyCodexStateDatabaseStderr(text);
+  if (!classification) return null;
+  const messages = {
+    corruption: 'Codex reported corrupted SQLite state.',
+    'path-too-long': 'Codex SQLite state path is too long.',
+    'open-create': 'Codex could not open or create SQLite state.',
+    initialization: 'Codex could not initialize SQLite state.',
+  };
+  return {
+    classification: classification.kind,
+    quarantine: classification.quarantine,
+    message: messages[classification.kind] || 'Codex SQLite state initialization failed.',
+    detail: codexStateDatabaseHint(classification, text, codexHome),
+    data: {
+      classification: classification.kind,
+      quarantine: classification.quarantine,
+      codexHome,
+      rawStderr: limitText(text, 1200),
+    },
+  };
+}
+
+function preferCodexStateDatabaseDiagnostic(current, candidate) {
+  if (!candidate) return current || null;
+  if (!current) return candidate;
+  const priorities = {
+    initialization: 1,
+    'open-create': 2,
+    'path-too-long': 3,
+    corruption: 4,
+  };
+  return (priorities[candidate.classification] || 0) >= (priorities[current.classification] || 0)
+    ? candidate
+    : current;
+}
+
+function codexStateDatabaseStartupError(error, diagnostic) {
+  if (!diagnostic) return error;
+  const codes = {
+    corruption: 'session_sqlite_corrupt',
+    'path-too-long': 'session_sqlite_path_too_long',
+    'open-create': 'session_sqlite_open_failed',
+    initialization: 'session_sqlite_initialization_failed',
+  };
+  const failure = new Error(`${diagnostic.message} ${diagnostic.detail}`);
+  failure.code = codes[diagnostic.classification] || 'session_sqlite_initialization_failed';
+  failure.cause = error;
+  failure.sqliteFailureKind = diagnostic.classification;
+  failure.rawStderr = diagnostic.data?.rawStderr || null;
+  for (const property of ['failureState', 'retryCommand', 'processTreeFallbackRequired']) {
+    if (Object.prototype.hasOwnProperty.call(error || {}, property)) {
+      failure[property] = error[property];
+    }
+  }
+  return failure;
 }
 
 const CODEX_SCAN_SKIP_DIRS = new Set([
@@ -218,7 +909,7 @@ function isExecutableFile(filePath) {
       return false;
     }
     if (process.platform === 'win32') {
-      return true;
+      return ['.exe', '.cmd', '.bat', '.com'].includes(path.extname(filePath).toLowerCase());
     }
     return Boolean(stats.mode & 0o111);
   } catch {
@@ -367,6 +1058,10 @@ function resolveDefaultCodexBin(codexHomeOverride = null) {
   }
 
   const cursorExtensions = path.join(home, '.cursor', 'extensions');
+  pushUnique(candidates, seen, resolveLocalCodexBin({
+    pathEnv: process.env.PATH,
+    cursorExtensionsDir: path.join(agentRoot, '.missing-cursor-extensions'),
+  }));
   if (fs.existsSync(cursorExtensions)) {
     const extensionDirs = fs.readdirSync(cursorExtensions, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && entry.name.startsWith('openai.chatgpt-'))
@@ -382,7 +1077,12 @@ function resolveDefaultCodexBin(codexHomeOverride = null) {
     }
   }
 
-  return candidates.find((candidate) => isExecutableFile(candidate)) || 'codex';
+  const bundledOrExtensionBin = candidates.find((candidate) => isExecutableFile(candidate));
+  if (bundledOrExtensionBin) {
+    return bundledOrExtensionBin;
+  }
+  const pathBin = resolveLocalCodexBin({ pathEnv: process.env.PATH });
+  return isExecutableFile(pathBin) ? pathBin : 'codex';
 }
 
 function buildCodexProcessPath(codexBin) {
@@ -434,6 +1134,17 @@ function buildResumePrelude(bootstrap) {
   ].join('\n');
 }
 
+function isMissingNativeRolloutError(error) {
+  const messages = [];
+  let current = error;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    messages.push(String(current?.message || current));
+    current = current?.cause;
+  }
+  const text = messages.join('\n');
+  return /\bno rollout found for thread id\b/i.test(text);
+}
+
 function limitText(value, max = 240) {
   const text = String(value || '');
   if (text.length <= max) {
@@ -474,8 +1185,8 @@ function hashApiConfig(config) {
     .createHash('sha256')
     .update(JSON.stringify({
       provider: config.provider || '',
+      providerKind: config.providerKind || '',
       baseUrl: config.baseUrl || '',
-      apiKey: config.apiKey || '',
       profileId: config.profileId || '',
     }))
     .digest('hex')
@@ -765,25 +1476,74 @@ function rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) {
   return `${next.trim()}\n${profileBlock}`;
 }
 
+function managedOverlayMarkerMetadata(config, configHash, options = {}) {
+  const textOrNull = (value) => {
+    if (value == null) return null;
+    const text = String(value).trim();
+    return text || null;
+  };
+  return {
+    host: {
+      hostId: textOrNull(options.hostId),
+    },
+    session: {
+      sessionId: textOrNull(options.sessionId),
+      bridgeSessionId: textOrNull(options.bridgeSessionId),
+      nativeThreadId: textOrNull(options.nativeThreadId),
+      sourceSessionId: textOrNull(options.sourceSessionId),
+      originSessionId: textOrNull(options.originSessionId),
+      conversationKey: textOrNull(options.conversationKey),
+    },
+    profile: {
+      profileId: textOrNull(config?.profileId),
+      label: textOrNull(config?.label),
+      provider: textOrNull(config?.provider),
+      providerKind: textOrNull(config?.providerKind),
+      configHash,
+      configuredBaseUrl: Boolean(config?.baseUrl),
+      configuredApiKey: Boolean(config?.apiKey),
+    },
+    run: {
+      runId: textOrNull(options.runId),
+      launchMode: textOrNull(options.launchMode),
+    },
+  };
+}
+
 function prepareApiProfileCodexHome(baseHome, apiConfig, options = {}) {
   const config = normalizeApiConfig(apiConfig);
   const hash = config ? hashApiConfig(config) : 'host-env';
-  const segment = safeProfileSegment(config?.profileId || config?.label || config?.provider || 'host-env');
-  const sessionSegment = safeProfileSegment(options.sessionId || options.bridgeSessionId || 'session');
-  const ownerToken = crypto.randomBytes(16).toString('hex');
-  const runSegment = safeProfileSegment(options.runId || ownerToken.slice(0, 12));
   const managedRoot = path.join(baseHome, '.remote-codex-managed');
-  const profileHomeDir = path.join(managedRoot, `${sessionSegment}-${segment}-${hash}-${runSegment}-${ownerToken.slice(0, 12)}`);
   // Keep every managed session in its own HOME. This prevents our app-server
   // from sharing Codex SQLite state with an interactive Codex running on HPC.
-  const overlayHome = path.join(profileHomeDir, '.codex');
-  const ownerMarkerPath = path.join(profileHomeDir, MANAGED_OVERLAY_MARKER_NAME);
+  // Human-readable session/profile/run metadata belongs in the owner marker,
+  // not in this path: long Windows paths can prevent SQLite from creating state.
+  let ownerToken = null;
+  let profileHomeDir = null;
+  let overlayHome = null;
+  let ownerMarkerPath = null;
   let profileHomeCreated = false;
   let managedRootReal = null;
   try {
     managedRootReal = ensureManagedOverlayRoot(baseHome, managedRoot);
-    fs.mkdirSync(profileHomeDir, { recursive: false, mode: 0o700 });
-    profileHomeCreated = true;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      ownerToken = crypto.randomBytes(16).toString('hex');
+      profileHomeDir = path.join(managedRoot, `rc-${ownerToken}`);
+      try {
+        fs.mkdirSync(profileHomeDir, { recursive: false, mode: 0o700 });
+        profileHomeCreated = true;
+        break;
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+      }
+    }
+    if (!profileHomeCreated) {
+      const error = new Error('Could not allocate a unique managed Codex overlay directory.');
+      error.code = 'session_overlay_name_collision';
+      throw error;
+    }
+    overlayHome = path.join(profileHomeDir, '.codex');
+    ownerMarkerPath = path.join(profileHomeDir, MANAGED_OVERLAY_MARKER_NAME);
     inspectManagedOverlayDirectory(managedRootReal, profileHomeDir);
     ensurePrivateDirectory(overlayHome);
     writeManagedOverlayOwnerMarker(ownerMarkerPath, `${JSON.stringify({
@@ -795,18 +1555,19 @@ function prepareApiProfileCodexHome(baseHome, apiConfig, options = {}) {
       childState: 'not-started',
       createdAt: nowIso(),
       updatedAt: nowIso(),
+      metadata: managedOverlayMarkerMetadata(config, hash, options),
     }, null, 2)}\n`);
 
-    const baseAuthPath = path.join(baseHome, 'auth.json');
     const overlayAuthPath = path.join(overlayHome, 'auth.json');
     let auth = {};
-    try {
-      auth = JSON.parse(fs.readFileSync(baseAuthPath, 'utf8'));
-    } catch {
-      auth = {};
-    }
-    if (config?.apiKey) {
-      auth.OPENAI_API_KEY = config.apiKey;
+    if (config) {
+      auth = { OPENAI_API_KEY: config.apiKey };
+    } else {
+      try {
+        auth = JSON.parse(fs.readFileSync(path.join(baseHome, 'auth.json'), 'utf8'));
+      } catch {
+        auth = {};
+      }
     }
     writePrivateFile(overlayAuthPath, `${JSON.stringify(auth, null, 2)}\n`);
 
@@ -824,6 +1585,11 @@ function prepareApiProfileCodexHome(baseHome, apiConfig, options = {}) {
       config ? rewriteConfigTomlForApiProfile(baseConfig, config, providerKey) : baseConfig
     );
 
+    // Rollouts must outlive this per-run credential overlay so a stopped
+    // managed Session can be resumed by the next runner. A brand-new
+    // CODEX_HOME has no sessions directory yet, which previously caused the
+    // first runner to create it inside the disposable overlay.
+    ensurePrivateDirectory(path.join(baseHome, 'sessions'));
     for (const name of ['installation_id', 'cap_sid', 'session_index.jsonl', '.personality_migration']) {
       copyFileIfExists(path.join(baseHome, name), path.join(overlayHome, name));
     }
@@ -1671,6 +2437,8 @@ class CodexAppServerRunner {
     this.sourceSessionId = options.sourceSessionId || null;
     this.conversationKey = options.conversationKey || this.originSessionId || this.bridgeSessionId;
     this.bootstrap = options.bootstrap || null;
+    this.rebindNativeThreadId = options.rebindNativeThreadId || null;
+    this.explicitRebind = options.explicitRebind === true;
     this.postEvent = options.postEvent;
     this.onTerminated = options.onTerminated || null;
     this.apiConfig = normalizeApiConfig(options.apiConfig);
@@ -1683,6 +2451,7 @@ class CodexAppServerRunner {
     });
     this.baseCodexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     const preparedCodexHome = prepareApiProfileCodexHome(this.baseCodexHome, this.apiConfig, {
+      hostId: this.hostId,
       sessionId: this.sessionId,
       bridgeSessionId: this.bridgeSessionId,
       nativeThreadId: options.nativeThreadId || null,
@@ -1690,6 +2459,7 @@ class CodexAppServerRunner {
       originSessionId: this.originSessionId,
       conversationKey: this.conversationKey,
       runId: this.runId,
+      launchMode: this.launchMode,
     });
     try {
       this.codexHome = preparedCodexHome.codexHome;
@@ -1706,11 +2476,15 @@ class CodexAppServerRunner {
       this.child = null;
       this.rpc = null;
       this.stopRequested = false;
+      this.stopPromise = null;
       this.stopGraceTimeoutMs = Math.max(1, Number(options.stopGraceTimeoutMs || 5000) || 5000);
       this.stopKillTimeoutMs = Math.max(1, Number(options.stopKillTimeoutMs || 1000) || 1000);
       this.suppressTerminalEvent = false;
+      this.agentEventsSuppressed = false;
       this.terminationPromise = null;
       this.startCompleted = false;
+      this.startupStateDbCorruption = false;
+      this.startupStateDbDiagnostic = null;
       this.childExitConfirmed = false;
       this.startupRetryExit = null;
       this.startupRetryExitResolver = null;
@@ -1720,16 +2494,21 @@ class CodexAppServerRunner {
       this.overlayCleaned = false;
       this.threadId = null;
       this.nativeThreadId = options.nativeThreadId || null;
+      this.nativeResumeReady = ['resume', 'fork'].includes(this.launchMode);
       this.activeTurnId = null;
       this.turnBuffers = new Map();
+      this.turnBufferTruncated = new Set();
+      this.maxTurnBufferBytes = TURN_BUFFER_MAX_BYTES;
       this.turnModes = new Map();
       this.planBuffers = new Map();
       this.reasoningBuffers = new Map();
-      this.notificationHandlers = new Set();
+      this.initializeNotificationQueue();
       this.initializeThinkingActivity();
       this.pendingRequests = new Map();
       this.modelCapabilities = new Map();
-      this.resumePrelude = buildResumePrelude(this.bootstrap);
+      this.resumePrelude = this.launchMode === 'transcript_fallback'
+        ? buildResumePrelude(this.bootstrap)
+        : null;
       this.resumePreludeUsed = !this.resumePrelude;
       this.runtime = {
         kind: 'codex_app_server',
@@ -1742,6 +2521,7 @@ class CodexAppServerRunner {
         cwd: this.cwd,
         codexHome: this.codexHome,
         nativeThreadId: this.nativeThreadId || null,
+        nativeResumeReady: this.nativeResumeReady,
         launchMode: this.launchMode,
         codexHomeProfile: this.apiProfileHome ? 'api-profile-isolated' : 'managed-isolated',
         apiProfileId: this.apiConfig?.profileId || null,
@@ -1780,21 +2560,402 @@ class CodexAppServerRunner {
     return validateRuntimeModelSelection(this.modelCapabilities, model, effort);
   }
 
+  initializeNotificationQueue(options = {}) {
+    this.notificationQueue = [];
+    this.notificationQueueBytes = 0;
+    this.notificationQueueWorker = null;
+    this.notificationInFlight = null;
+    this.notificationCoalescedEntries = new Map();
+    this.notificationCoalescingEpoch = 0;
+    this.notificationOverflow = null;
+    this.notificationDroppedCount = 0;
+    this.notificationCoalescedCount = 0;
+    this.notificationLastError = null;
+    this.maxNotificationQueueItems = Math.max(
+      8,
+      Number(options.maxItems || NOTIFICATION_QUEUE_MAX_ITEMS) || NOTIFICATION_QUEUE_MAX_ITEMS
+    );
+    this.maxNotificationQueueBytes = Math.max(
+      16 * 1024,
+      Number(options.maxBytes || NOTIFICATION_QUEUE_MAX_BYTES) || NOTIFICATION_QUEUE_MAX_BYTES
+    );
+    this.maxNotificationItemBytes = Math.max(
+      1024,
+      Math.min(
+        Number(options.maxItemBytes || NOTIFICATION_QUEUE_MAX_ITEM_BYTES) || NOTIFICATION_QUEUE_MAX_ITEM_BYTES,
+        this.maxNotificationQueueBytes
+      )
+    );
+    this.notificationTerminalReservedItems = Math.max(
+      1,
+      Math.min(
+        Number(options.terminalReservedItems || NOTIFICATION_QUEUE_TERMINAL_RESERVED_ITEMS)
+          || NOTIFICATION_QUEUE_TERMINAL_RESERVED_ITEMS,
+        this.maxNotificationQueueItems - 1
+      )
+    );
+    this.notificationTerminalReservedBytes = Math.max(
+      this.maxNotificationItemBytes,
+      Math.min(
+        Number(options.terminalReservedBytes || NOTIFICATION_QUEUE_TERMINAL_RESERVED_BYTES)
+          || NOTIFICATION_QUEUE_TERMINAL_RESERVED_BYTES,
+        this.maxNotificationQueueBytes - 1024
+      )
+    );
+  }
+
+  ensureNotificationQueue() {
+    if (!Array.isArray(this.notificationQueue)) this.initializeNotificationQueue();
+  }
+
+  notificationPriority(message) {
+    const method = String(message?.method || '');
+    if (
+      method === 'turn/completed'
+      || (method === 'error' && message?.params?.willRetry !== true)
+    ) {
+      return 'critical-terminal';
+    }
+    if (method === 'item/completed') {
+      return 'item-terminal';
+    }
+    if (method === 'thread/started' || method === 'turn/started') return 'barrier';
+    if (method === 'item/agentMessage/delta' && notificationPhase(message?.params) !== 'commentary') {
+      return 'ordered';
+    }
+    return 'best-effort';
+  }
+
+  notificationCoalesceKey(message, priority) {
+    if (priority === 'critical-terminal' || priority === 'item-terminal' || priority === 'barrier') {
+      return null;
+    }
+    const method = String(message?.method || '');
+    const params = message?.params || {};
+    const threadId = truncateUtf8(
+      params.threadId || params.thread?.id || this.threadId || this.currentSessionId() || 'thread',
+      256
+    );
+    const turnId = truncateUtf8(params.turnId || params.turn?.id || this.activeTurnId || 'turn', 256);
+    const itemId = truncateUtf8(params.itemId || params.item?.id || 'item', 256);
+    const epoch = this.notificationCoalescingEpoch;
+    if (method === 'thread/status/changed') return `${epoch}:thread-status:${threadId}`;
+    if (method === 'thread/goal/updated' || method === 'thread/goal/cleared') {
+      return `${epoch}:goal:${threadId}`;
+    }
+    if (method === 'thread/tokenUsage/updated') return `${epoch}:tokens:${threadId}`;
+    if (method === 'account/rateLimits/updated') {
+      return `${epoch}:rate-limits:${truncateUtf8(params.accountId || 'account', 256)}`;
+    }
+    if (method === 'item/agentMessage/delta') {
+      return `${epoch}:agent:${turnId}:${itemId}:${notificationPhase(params) || 'final'}`;
+    }
+    if (method === 'item/reasoning/summaryTextDelta') {
+      return `${epoch}:reasoning:${turnId}:${itemId}:${Number(params.summaryIndex ?? 0)}`;
+    }
+    if (method === 'item/plan/delta' || method === 'turn/plan/updated') {
+      return `${epoch}:plan:${method}:${turnId}:${itemId}`;
+    }
+    if (method === 'item/fileChange/patchUpdated') {
+      return `${epoch}:file-change:${turnId}:${itemId}`;
+    }
+    if (method === 'item/mcpToolCall/progress') {
+      return `${epoch}:mcp-progress:${turnId}:${itemId}`;
+    }
+    if (
+      method === 'item/commandExecution/outputDelta'
+      || method === 'process/outputDelta'
+      || method === 'command/exec/outputDelta'
+    ) {
+      return `${epoch}:command:${method}:${turnId}:${truncateUtf8(
+        params.processId || params.processHandle || itemId,
+        256
+      )}:${truncateUtf8(params.stream || '', 32)}`;
+    }
+    return null;
+  }
+
+  mergeNotificationMessages(previous, incoming) {
+    const method = String(incoming?.method || '');
+    if (method !== previous?.method) return incoming;
+    if (
+      method === 'thread/status/changed'
+      || method === 'thread/tokenUsage/updated'
+      || method === 'account/rateLimits/updated'
+      || method === 'turn/plan/updated'
+      || method === 'item/fileChange/patchUpdated'
+    ) {
+      return incoming;
+    }
+    if (method === 'thread/goal/updated' || method === 'thread/goal/cleared') return incoming;
+
+    const previousParams = previous?.params || {};
+    const incomingParams = incoming?.params || {};
+    const mergedParams = { ...previousParams, ...incomingParams };
+    if (method === 'item/agentMessage/delta' || method === 'item/reasoning/summaryTextDelta') {
+      mergedParams.delta = `${previousParams.delta || ''}${incomingParams.delta || ''}`;
+      if (previousParams.text || incomingParams.text) {
+        mergedParams.text = `${previousParams.text || ''}${incomingParams.text || ''}`;
+      }
+    } else if (method === 'item/plan/delta') {
+      mergedParams.delta = `${previousParams.delta || ''}${incomingParams.delta || ''}`;
+      if (previousParams.plan || incomingParams.plan) {
+        mergedParams.plan = `${previousParams.plan || ''}${incomingParams.plan || ''}`;
+      }
+    } else if (
+      method === 'item/commandExecution/outputDelta'
+      || method === 'process/outputDelta'
+      || method === 'command/exec/outputDelta'
+    ) {
+      mergedParams.delta = `${previousParams.delta || ''}${incomingParams.delta || ''}`;
+      mergedParams.deltaBase64 = `${previousParams.deltaBase64 || ''}${incomingParams.deltaBase64 || ''}`;
+    } else if (method === 'item/mcpToolCall/progress') {
+      mergedParams.message = [previousParams.message, incomingParams.message]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+        .join('\n');
+    } else {
+      return incoming;
+    }
+    return { ...incoming, params: mergedParams };
+  }
+
+  removeNotificationQueueEntry(entry, options = {}) {
+    const index = this.notificationQueue.indexOf(entry);
+    if (index < 0) return false;
+    this.notificationQueue.splice(index, 1);
+    this.notificationQueueBytes = Math.max(0, this.notificationQueueBytes - entry.bytes);
+    if (
+      entry.coalesceKey
+      && this.notificationCoalescedEntries.get(entry.coalesceKey) === entry
+    ) {
+      this.notificationCoalescedEntries.delete(entry.coalesceKey);
+    }
+    if (options.dropped) this.recordNotificationDrop(entry.message, entry.bytes);
+    return true;
+  }
+
+  recordNotificationDrop(message, bytes = 0) {
+    this.notificationDroppedCount += 1;
+    if (!this.notificationOverflow) {
+      this.notificationOverflow = {
+        count: 0,
+        bytes: 0,
+        methods: new Set(),
+      };
+    }
+    this.notificationOverflow.count += 1;
+    this.notificationOverflow.bytes += Math.max(0, Number(bytes) || 0);
+    if (this.notificationOverflow.methods.size < 8) {
+      this.notificationOverflow.methods.add(truncateUtf8(message?.method || 'notification', 128));
+    }
+  }
+
+  ensureNotificationQueueRoom(extraItems, extraBytes, priority, protectedEntry = null) {
+    const isCriticalTerminal = priority === 'critical-terminal';
+    const usesTerminalCapacity = isCriticalTerminal || priority === 'item-terminal';
+    const itemLimit = usesTerminalCapacity
+      ? this.maxNotificationQueueItems
+      : this.maxNotificationQueueItems - this.notificationTerminalReservedItems;
+    const byteLimit = usesTerminalCapacity
+      ? this.maxNotificationQueueBytes
+      : this.maxNotificationQueueBytes - this.notificationTerminalReservedBytes;
+    const inFlightItems = this.notificationInFlight ? 1 : 0;
+    const inFlightBytes = this.notificationInFlight?.bytes || 0;
+    const fits = () => (
+      this.notificationQueue.length + inFlightItems + extraItems <= itemLimit
+      && this.notificationQueueBytes + inFlightBytes + extraBytes <= byteLimit
+    );
+    while (!fits()) {
+      let evicted = this.notificationQueue.find(
+        (entry) => entry !== protectedEntry && entry.priority === 'best-effort'
+      );
+      if (!evicted && isCriticalTerminal) {
+        evicted = this.notificationQueue.find(
+          (entry) => entry !== protectedEntry && entry.priority === 'item-terminal'
+        );
+      }
+      if (!evicted && isCriticalTerminal) {
+        evicted = this.notificationQueue.find(
+          (entry) => entry !== protectedEntry && entry.priority !== 'critical-terminal'
+        );
+      }
+      if (!evicted) return false;
+      this.removeNotificationQueueEntry(evicted, { dropped: true });
+    }
+    return true;
+  }
+
   enqueueNotification(message) {
-    if (!this.notificationHandlers) this.notificationHandlers = new Set();
-    const handling = this.handleNotification(message)
-      .catch((error) => {
-        console.error(`[codex-runner] notification failed: ${error.message || error}`);
-      });
-    this.notificationHandlers.add(handling);
-    handling.finally(() => this.notificationHandlers.delete(handling));
-    return handling;
+    this.ensureNotificationQueue();
+    let queuedMessage = message;
+    let bytes = notificationSerializedBytes(queuedMessage);
+    if (bytes > this.maxNotificationItemBytes) {
+      queuedMessage = compactOversizedNotification(queuedMessage, this.maxNotificationItemBytes);
+      bytes = notificationSerializedBytes(queuedMessage);
+    }
+    if (!Number.isFinite(bytes) || bytes > this.maxNotificationItemBytes) {
+      this.recordNotificationDrop(message, Number.isFinite(bytes) ? bytes : 0);
+      return this.ensureNotificationQueueWorker();
+    }
+
+    const priority = this.notificationPriority(queuedMessage);
+    const coalesceKey = this.notificationCoalesceKey(queuedMessage, priority);
+    const previousEntry = coalesceKey ? this.notificationCoalescedEntries.get(coalesceKey) : null;
+    if (previousEntry) {
+      const mergedMessage = this.mergeNotificationMessages(previousEntry.message, queuedMessage);
+      const mergedBytes = notificationSerializedBytes(mergedMessage);
+      if (mergedBytes <= this.maxNotificationItemBytes) {
+        const byteDelta = mergedBytes - previousEntry.bytes;
+        if (byteDelta <= 0 || this.ensureNotificationQueueRoom(0, byteDelta, priority, previousEntry)) {
+          this.notificationQueueBytes += byteDelta;
+          previousEntry.message = mergedMessage;
+          previousEntry.bytes = mergedBytes;
+          this.notificationCoalescedCount += 1;
+          return this.ensureNotificationQueueWorker();
+        }
+      }
+      previousEntry.coalesceKey = null;
+      this.notificationCoalescedEntries.delete(coalesceKey);
+    }
+
+    if (!this.ensureNotificationQueueRoom(1, bytes, priority)) {
+      this.recordNotificationDrop(queuedMessage, bytes);
+      return this.ensureNotificationQueueWorker();
+    }
+    const entry = { message: queuedMessage, bytes, priority, coalesceKey };
+    this.notificationQueue.push(entry);
+    this.notificationQueueBytes += bytes;
+    if (coalesceKey) this.notificationCoalescedEntries.set(coalesceKey, entry);
+    if (priority === 'critical-terminal' || priority === 'item-terminal' || priority === 'barrier') {
+      this.notificationCoalescingEpoch += 1;
+    }
+    return this.ensureNotificationQueueWorker();
+  }
+
+  ensureNotificationQueueWorker() {
+    this.ensureNotificationQueue();
+    if (this.notificationQueueWorker || (!this.notificationQueue.length && !this.notificationOverflow)) {
+      return this.notificationQueueWorker || Promise.resolve();
+    }
+    const worker = (async () => {
+      for (;;) {
+        while (this.notificationQueue.length) {
+          const entry = this.notificationQueue.shift();
+          this.notificationQueueBytes = Math.max(0, this.notificationQueueBytes - entry.bytes);
+          if (
+            entry.coalesceKey
+            && this.notificationCoalescedEntries.get(entry.coalesceKey) === entry
+          ) {
+            this.notificationCoalescedEntries.delete(entry.coalesceKey);
+          }
+          this.notificationInFlight = {
+            method: String(entry.message?.method || 'notification'),
+            bytes: entry.bytes,
+            priority: entry.priority,
+          };
+          try {
+            await this.handleNotification(entry.message);
+          } catch (error) {
+            this.notificationLastError = error;
+            console.error(`[codex-runner] notification failed: ${error.message || error}`);
+          } finally {
+            this.notificationInFlight = null;
+          }
+        }
+        if (!this.notificationOverflow) break;
+        const overflow = this.notificationOverflow;
+        this.notificationOverflow = null;
+        try {
+          await this.emitDiagnostic({
+            severity: 'warning',
+            source: 'runtime',
+            kind: 'notification-overflow',
+            message: `Dropped ${overflow.count} queued Codex notifications to stay within memory limits.`,
+            data: {
+              droppedCount: overflow.count,
+              droppedBytes: overflow.bytes,
+              methods: Array.from(overflow.methods),
+            },
+          });
+        } catch (error) {
+          this.notificationLastError = error;
+          console.error(`[codex-runner] notification overflow diagnostic failed: ${error.message || error}`);
+        }
+      }
+    })();
+    const delivery = worker.finally(() => {
+      if (this.notificationQueueWorker === delivery) this.notificationQueueWorker = null;
+      if (this.notificationQueue.length || this.notificationOverflow) {
+        this.ensureNotificationQueueWorker();
+      }
+    });
+    this.notificationQueueWorker = delivery;
+    return delivery;
+  }
+
+  notificationQueueStats() {
+    this.ensureNotificationQueue();
+    const inFlightItems = this.notificationInFlight ? 1 : 0;
+    const inFlightBytes = this.notificationInFlight?.bytes || 0;
+    return {
+      pendingItems: this.notificationQueue.length,
+      pendingBytes: this.notificationQueueBytes,
+      inFlightItems,
+      inFlightBytes,
+      totalItems: this.notificationQueue.length + inFlightItems,
+      totalBytes: this.notificationQueueBytes + inFlightBytes,
+      maxItems: this.maxNotificationQueueItems,
+      maxBytes: this.maxNotificationQueueBytes,
+      maxItemBytes: this.maxNotificationItemBytes,
+      dropped: this.notificationDroppedCount,
+      coalesced: this.notificationCoalescedCount,
+    };
   }
 
   async drainNotifications() {
-    while (this.notificationHandlers?.size) {
-      await Promise.all(Array.from(this.notificationHandlers));
+    this.ensureNotificationQueue();
+    while (this.notificationQueueWorker || this.notificationQueue.length || this.notificationOverflow) {
+      await this.ensureNotificationQueueWorker();
     }
+  }
+
+  resetTurnBuffer(turnId) {
+    const key = String(turnId || '');
+    if (!key) return;
+    if (!this.turnBufferTruncated) this.turnBufferTruncated = new Set();
+    this.turnBuffers.set(key, '');
+    this.turnBufferTruncated.delete(key);
+  }
+
+  appendTurnBuffer(turnId, delta) {
+    const key = String(turnId || '');
+    if (!key) return '';
+    if (!this.turnBufferTruncated) this.turnBufferTruncated = new Set();
+    const previous = this.turnBuffers.get(key) || '';
+    if (this.turnBufferTruncated.has(key)) return previous;
+    const maxBytes = Math.max(1024, Number(this.maxTurnBufferBytes || TURN_BUFFER_MAX_BYTES));
+    const next = `${previous}${String(delta ?? '')}`;
+    if (Buffer.byteLength(next, 'utf8') <= maxBytes) {
+      this.turnBuffers.set(key, next);
+      return next;
+    }
+    const bounded = truncateUtf8(next, maxBytes, TURN_BUFFER_TRUNCATION_SUFFIX);
+    this.turnBuffers.set(key, bounded);
+    this.turnBufferTruncated.add(key);
+    return bounded;
+  }
+
+  releaseTurnBuffer(turnId) {
+    const key = String(turnId || '');
+    if (!key) return;
+    this.turnBuffers.delete(key);
+    this.turnBufferTruncated?.delete(key);
+  }
+
+  clearTurnBuffers() {
+    this.turnBuffers.clear();
+    this.turnBufferTruncated?.clear();
   }
 
   activityCanonicalConversationKey() {
@@ -1816,6 +2977,9 @@ class CodexAppServerRunner {
   initializeThinkingActivity(options = {}) {
     this.thinkingActivities = new Map();
     this.activitySnapshotDelivery = Promise.resolve();
+    this.activitySnapshotDeliveryInFlight = null;
+    this.pendingActivitySnapshots = new Map();
+    this.maxPendingActivitySnapshots = 64;
     this.activitySnapshotDeliveryErrors = new Map();
     this.thinkingActivityAggregator = new ThinkingActivityAggregator({
       canonicalConversationKey: this.activityCanonicalConversationKey(),
@@ -1825,6 +2989,14 @@ class CodexAppServerRunner {
       setTimer: options.setTimer,
       clearTimer: options.clearTimer,
       now: options.now,
+      maxRecords: 64,
+      maxTextBytes: 256 * 1024,
+      maxTotalTextBytes: 8 * 1024 * 1024,
+      onEvict: (record) => {
+        this.thinkingActivities.delete(record.activityKey);
+        this.pendingActivitySnapshots.delete(record.activityKey);
+        this.activitySnapshotDeliveryErrors.delete(record.activityKey);
+      },
     });
   }
 
@@ -1835,21 +3007,56 @@ class CodexAppServerRunner {
     return this.thinkingActivityAggregator;
   }
 
-  normalizeThinkingIdentity(identity = {}) {
-    const turnId = String(identity.turnId || '').trim();
-    const itemId = String(identity.itemId || '').trim();
+  normalizeActivityIdentity(identity = {}) {
+    const turnId = truncateUtf8(String(identity.turnId || '').trim(), 512);
+    const itemId = truncateUtf8(String(
+      identity.itemId || identity.callId || identity.requestId || identity.processId || ''
+    ).trim(), 512);
     if (!turnId || !itemId) return null;
     const summaryIndex = Number(identity.summaryIndex ?? 0);
-    return {
+    const normalized = {
       turnId,
       itemId,
       summaryIndex: Number.isFinite(summaryIndex) ? summaryIndex : 0,
-      kind: 'reasoning',
+      kind: truncateUtf8(identity.kind || 'activity', 64),
+      itemType: truncateUtf8(identity.itemType || identity.kind || 'activity', 64),
     };
+    for (const field of [
+      'method', 'callId', 'requestId', 'status', 'startedAtMs', 'completedAtMs', 'durationMs',
+      'command', 'cwd', 'processId', 'source', 'stream', 'commandActions', 'output', 'outputTruncated',
+      'exitCode', 'fileChanges', 'changes', 'server', 'tool', 'arguments', 'result', 'error',
+      'progress', 'progressTruncated', 'resourceUri', 'namespace', 'success', 'senderThreadId',
+      'receiverThreadIds', 'prompt', 'agentsStates', 'query', 'action', 'actionData', 'path', 'review',
+      'model', 'reasoningEffort',
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(identity, field)) normalized[field] = identity[field];
+    }
+    for (const [field, maxBytes] of Object.entries({
+      method: 256,
+      callId: 512,
+      requestId: 512,
+      status: 64,
+      cwd: 4096,
+      processId: 512,
+      source: 128,
+      stream: 64,
+      server: 512,
+      namespace: 512,
+      senderThreadId: 512,
+      path: 4096,
+      resourceUri: 4096,
+      model: 512,
+      reasoningEffort: 128,
+    })) {
+      if (normalized[field] != null) {
+        normalized[field] = truncateUtf8(normalized[field], maxBytes, NOTIFICATION_TRUNCATION_SUFFIX);
+      }
+    }
+    return normalized;
   }
 
-  trackThinkingActivity(identity) {
-    const normalized = this.normalizeThinkingIdentity(identity);
+  trackActivity(identity) {
+    const normalized = this.normalizeActivityIdentity(identity);
     if (!normalized) return null;
     const activityKey = makeActivityKey({
       canonicalConversationKey: this.activityCanonicalConversationKey(),
@@ -1860,24 +3067,76 @@ class CodexAppServerRunner {
     if (!tracked) {
       tracked = { activityKey, identity: normalized, finalized: false };
       this.thinkingActivities.set(activityKey, tracked);
+    } else {
+      tracked.identity = { ...tracked.identity, ...normalized };
     }
     return tracked;
   }
 
-  appendThinkingDelta(identity, delta) {
-    const tracked = this.trackThinkingActivity(identity);
+  trackThinkingActivity(identity) {
+    return this.trackActivity({ ...identity, kind: 'reasoning', itemType: 'reasoning' });
+  }
+
+  appendActivityDelta(identity, delta, options = {}) {
+    const tracked = this.trackActivity(identity);
     if (!tracked) return null;
     tracked.finalized = false;
-    this.ensureThinkingActivityAggregator().appendDelta(tracked.identity, String(delta ?? ''));
+    this.ensureThinkingActivityAggregator().appendDelta(
+      tracked.identity,
+      String(delta ?? ''),
+      options
+    );
     return tracked;
   }
 
-  replaceThinkingSnapshot(identity, text) {
-    const tracked = this.trackThinkingActivity(identity);
+  replaceActivitySnapshot(identity, text, options = {}) {
+    const tracked = this.trackActivity(identity);
     if (!tracked) return null;
     tracked.finalized = false;
-    this.ensureThinkingActivityAggregator().replaceSnapshot(tracked.identity, String(text ?? ''));
+    this.ensureThinkingActivityAggregator().replaceSnapshot(
+      tracked.identity,
+      String(text ?? ''),
+      options
+    );
     return tracked;
+  }
+
+  appendActivityFieldDelta(identity, field, delta, options = {}) {
+    const tracked = this.trackActivity(identity);
+    if (!tracked) return null;
+    const aggregator = this.ensureThinkingActivityAggregator();
+    const current = aggregator.record(tracked.identity);
+    const previous = String(current?.[field] || '');
+    const separator = previous && options.separator ? String(options.separator) : '';
+    const bounded = truncateActivityText(
+      `${previous}${separator}${String(delta ?? '')}`,
+      options.maxTextBytes || ACTIVITY_PROGRESS_MAX_BYTES
+    );
+    tracked.identity = {
+      ...tracked.identity,
+      [field]: bounded.text,
+      [`${field}Truncated`]: bounded.truncated,
+    };
+    tracked.finalized = false;
+    aggregator.replaceSnapshot(tracked.identity, current?.text || '', {
+      force: true,
+      maxTextBytes: options.maxTextBytes,
+    });
+    return tracked;
+  }
+
+  appendThinkingDelta(identity, delta) {
+    return this.appendActivityDelta(
+      { ...identity, kind: 'reasoning', itemType: 'reasoning' },
+      delta
+    );
+  }
+
+  replaceThinkingSnapshot(identity, text) {
+    return this.replaceActivitySnapshot(
+      { ...identity, kind: 'reasoning', itemType: 'reasoning' },
+      text
+    );
   }
 
   emitActivitySnapshot(snapshot) {
@@ -1893,16 +3152,61 @@ class CodexAppServerRunner {
       ...snapshot,
     };
     const activityKey = String(snapshot.activityKey || '');
-    const delivery = this.activitySnapshotDelivery.then(async () => {
-      try {
-        await this.postEvent(event);
-        this.activitySnapshotDeliveryErrors.delete(activityKey);
-      } catch (error) {
-        this.activitySnapshotDeliveryErrors.set(activityKey, error);
+    if (this.pendingActivitySnapshots.has(activityKey)) {
+      this.pendingActivitySnapshots.delete(activityKey);
+    } else if (this.pendingActivitySnapshots.size >= this.maxPendingActivitySnapshots) {
+      const pendingEntries = [...this.pendingActivitySnapshots.entries()];
+      const evicted = pendingEntries.find(([, pending]) => pending.final !== true)
+        || pendingEntries[0];
+      if (evicted) this.pendingActivitySnapshots.delete(evicted[0]);
+    }
+    this.pendingActivitySnapshots.set(activityKey, event);
+    return this.ensureActivitySnapshotDelivery();
+  }
+
+  ensureActivitySnapshotDelivery() {
+    if (this.activitySnapshotDeliveryInFlight) {
+      return this.activitySnapshotDeliveryInFlight;
+    }
+    const worker = (async () => {
+      while (this.pendingActivitySnapshots.size) {
+        const [activityKey, event] = this.pendingActivitySnapshots.entries().next().value;
+        this.pendingActivitySnapshots.delete(activityKey);
+        try {
+          await this.postEvent(event);
+          this.activitySnapshotDeliveryErrors.delete(activityKey);
+        } catch (error) {
+          const deliveryError = retryableTerminalDeliveryError(error);
+          if (
+            !this.activitySnapshotDeliveryErrors.has(activityKey)
+            && this.activitySnapshotDeliveryErrors.size >= this.maxPendingActivitySnapshots
+          ) {
+            this.activitySnapshotDeliveryErrors.delete(
+              this.activitySnapshotDeliveryErrors.keys().next().value
+            );
+          }
+          this.activitySnapshotDeliveryErrors.set(activityKey, deliveryError);
+        }
       }
+    })();
+    const delivery = worker.finally(() => {
+      if (this.activitySnapshotDeliveryInFlight === delivery) {
+        this.activitySnapshotDeliveryInFlight = null;
+      }
+      if (this.pendingActivitySnapshots.size) {
+        return this.ensureActivitySnapshotDelivery();
+      }
+      return null;
     });
+    this.activitySnapshotDeliveryInFlight = delivery;
     this.activitySnapshotDelivery = delivery;
     return delivery;
+  }
+
+  async waitForActivitySnapshotDelivery() {
+    while (this.pendingActivitySnapshots.size || this.activitySnapshotDeliveryInFlight) {
+      await this.ensureActivitySnapshotDelivery();
+    }
   }
 
   async finalizeThinkingActivities(filter = {}) {
@@ -1919,7 +3223,7 @@ class CodexAppServerRunner {
     for (const tracked of selected) {
       snapshots.push(await this.thinkingActivityAggregator.flush(tracked.identity, { final: true }));
     }
-    await this.activitySnapshotDelivery;
+    await this.waitForActivitySnapshotDelivery();
 
     const failures = selected
       .map((tracked) => this.activitySnapshotDeliveryErrors.get(tracked.activityKey))
@@ -1929,7 +3233,27 @@ class CodexAppServerRunner {
       if (failures.length === 1) throw failures[0];
       throw new AggregateError(failures, 'Thinking activity snapshot delivery failed.');
     }
+    for (const tracked of selected) {
+      this.thinkingActivityAggregator.release(tracked.identity);
+      this.thinkingActivities.delete(tracked.activityKey);
+      this.activitySnapshotDeliveryErrors.delete(tracked.activityKey);
+    }
     return snapshots;
+  }
+
+  async discardThinkingActivities() {
+    if (!this.thinkingActivityAggregator) return;
+    this.pendingActivitySnapshots.clear();
+    const inFlight = this.activitySnapshotDeliveryInFlight;
+    if (inFlight) {
+      await inFlight.catch(() => {});
+    }
+    this.pendingActivitySnapshots.clear();
+    for (const tracked of this.thinkingActivities.values()) {
+      this.thinkingActivityAggregator.release(tracked.identity);
+    }
+    this.thinkingActivities.clear();
+    this.activitySnapshotDeliveryErrors.clear();
   }
 
   async start() {
@@ -1940,7 +3264,8 @@ class CodexAppServerRunner {
       throw error;
     }
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      this.startupStateDbError = false;
+      this.startupStateDbCorruption = false;
+      this.startupStateDbDiagnostic = null;
       try {
         await this.startOnce();
         if (this.stopRequested) {
@@ -1952,12 +3277,13 @@ class CodexAppServerRunner {
         this.startCompleted = true;
         return;
       } catch (error) {
-        if (attempt === 0 && this.startupStateDbError) {
+        const startupError = codexStateDatabaseStartupError(error, this.startupStateDbDiagnostic);
+        if (attempt === 0 && this.startupStateDbCorruption) {
           try {
             await this.stopChildForStartupRetry();
           } catch (stopError) {
-            this.startupStateDbError = false;
-            stopError.cause = stopError.cause || error;
+            this.startupStateDbCorruption = false;
+            stopError.cause = stopError.cause || startupError;
             throw stopError;
           }
           const repair = quarantineCodexStateDatabases(this.codexHome, 'startup');
@@ -1974,8 +3300,8 @@ class CodexAppServerRunner {
             continue;
           }
         }
-        this.startupStateDbError = false;
-        throw error;
+        this.startupStateDbCorruption = false;
+        throw startupError;
       }
     }
   }
@@ -2076,6 +3402,179 @@ class CodexAppServerRunner {
     this.startupRetryExit = null;
   }
 
+  async openThread(threadApiParams = {}) {
+    const startFreshThread = async (reason = null) => {
+      const usesTranscript = this.launchMode === 'transcript_fallback';
+      if (reason) {
+        await this.emitDiagnostic({
+          severity: 'warning',
+          source: 'codex',
+          kind: 'native-thread-fallback',
+          message: usesTranscript
+            ? 'Native Codex thread was not available; started a live session from transcript context instead.'
+            : 'The previous Codex thread has no resumable rollout; starting a new thread for Rebind.',
+          detail: String(reason.message || reason).slice(0, 500),
+        }).catch(() => {});
+      }
+      await this.emitRuntime({
+        connection: 'ready',
+        phase: 'starting-thread',
+        startupStep: reason ? 'thread-start-fallback' : 'thread-start',
+        busy: true,
+      });
+      await this.emitDiagnostic({
+        severity: reason ? 'warning' : 'info',
+        source: 'codex',
+        kind: 'lifecycle',
+        method: 'thread/start',
+        message: reason
+          ? usesTranscript
+            ? 'Starting a fallback Codex thread from transcript context.'
+            : 'Starting a new Codex thread because the Rebind source has no rollout.'
+          : 'Starting a new Codex thread.',
+        detail: reason ? String(reason.message || reason).slice(0, 500) : undefined,
+        data: {
+          launchMode: this.launchMode,
+          nativeThreadId: this.nativeThreadId || null,
+        },
+      }).catch(() => {});
+      const thread = await this.rpc.request('thread/start', {
+        cwd: this.cwd,
+        approvalPolicy: 'on-request',
+        sandbox: 'workspace-write',
+        personality: 'friendly',
+        ...threadApiParams,
+      }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
+      this.runtime.resumeStrategy = resumeStrategyForLaunchMode(this.launchMode);
+      return thread;
+    };
+
+    const resumeNativeThread = async (nativeThreadId) => {
+      await this.emitRuntime({
+        connection: 'ready',
+        phase: 'resuming-thread',
+        startupStep: 'thread-resume',
+        busy: true,
+      });
+      await this.emitDiagnostic({
+        severity: 'info',
+        source: 'codex',
+        kind: 'lifecycle',
+        method: 'thread/resume',
+        message: `Resuming Codex thread ${limitText(nativeThreadId, 64)}.`,
+        data: {
+          launchMode: this.launchMode,
+          nativeThreadId,
+        },
+      }).catch(() => {});
+      const thread = await this.rpc.request('thread/resume', {
+        threadId: nativeThreadId,
+        cwd: this.cwd,
+        approvalPolicy: 'on-request',
+        sandbox: 'workspace-write',
+        personality: 'friendly',
+        ...threadApiParams,
+      }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
+      this.runtime.resumeStrategy = 'native_resume';
+      return thread;
+    };
+
+    if (this.launchMode === 'resume') {
+      if (!this.nativeThreadId) {
+        throw classifyNativeThreadError('resume', new Error('native thread id is missing'));
+      }
+      try {
+        return await resumeNativeThread(this.nativeThreadId);
+      } catch (error) {
+        if (this.explicitRebind && isMissingNativeRolloutError(error)) {
+          this.launchMode = 'fresh_rebind';
+          this.nativeThreadId = null;
+          this.nativeResumeReady = false;
+          this.runtime.launchMode = 'fresh_rebind';
+          this.runtime.nativeThreadId = null;
+          this.runtime.nativeResumeReady = false;
+          return startFreshThread(error);
+        }
+        throw classifyNativeThreadError('resume', error);
+      }
+    }
+
+    if (this.launchMode === 'fork') {
+      if (!this.nativeThreadId) {
+        throw classifyNativeThreadError('fork', new Error('native thread id is missing'));
+      }
+      try {
+        await this.emitRuntime({
+          connection: 'ready',
+          phase: 'forking-thread',
+          startupStep: 'thread-fork',
+          busy: true,
+        });
+        await this.emitDiagnostic({
+          severity: 'info',
+          source: 'codex',
+          kind: 'lifecycle',
+          method: 'thread/fork',
+          message: `Forking Codex thread ${limitText(this.nativeThreadId, 64)}.`,
+          data: {
+            launchMode: this.launchMode,
+            nativeThreadId: this.nativeThreadId,
+          },
+        }).catch(() => {});
+        const thread = await this.rpc.request('thread/fork', {
+          threadId: this.nativeThreadId,
+          cwd: this.cwd,
+          approvalPolicy: 'on-request',
+          sandbox: 'workspace-write',
+          ephemeral: false,
+          threadSource: 'user',
+          ...threadApiParams,
+        }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
+        this.runtime.resumeStrategy = 'native_fork';
+        return thread;
+      } catch (error) {
+        throw classifyNativeThreadError('fork', error);
+      }
+    }
+
+    if (this.launchMode === 'transcript_fallback') {
+      if (!this.resumePrelude) {
+        const error = new Error('Transcript fallback requires non-empty bounded history.');
+        error.code = 'session_history_unavailable';
+        throw error;
+      }
+      return startFreshThread(new Error('Explicit transcript fallback requested.'));
+    }
+
+    if (
+      this.launchMode === 'fresh_rebind'
+      && this.explicitRebind
+      && this.rebindNativeThreadId
+    ) {
+      try {
+        const thread = await resumeNativeThread(this.rebindNativeThreadId);
+        this.launchMode = 'resume';
+        this.nativeThreadId = this.rebindNativeThreadId;
+        this.nativeResumeReady = true;
+        this.runtime.launchMode = 'resume';
+        this.runtime.nativeResumeReady = true;
+        return thread;
+      } catch (error) {
+        if (!isMissingNativeRolloutError(error)) {
+          throw classifyNativeThreadError('resume', error);
+        }
+        this.nativeThreadId = null;
+        this.nativeResumeReady = false;
+        this.runtime.launchMode = 'fresh_rebind';
+        this.runtime.nativeThreadId = null;
+        this.runtime.nativeResumeReady = false;
+        return startFreshThread(error);
+      }
+    }
+
+    return startFreshThread();
+  }
+
   async startOnce() {
     const processHome = this.profileHomeDir || path.dirname(this.baseCodexHome);
     const threadApiParams = this.apiProviderKey ? { modelProvider: this.apiProviderKey } : {};
@@ -2094,8 +3593,7 @@ class CodexAppServerRunner {
         shell: shouldSpawnCodexThroughShell(this.codexBin),
         windowsHide: true,
         env: {
-          ...process.env,
-          ...buildApiEnvironment(this.apiConfig),
+          ...buildApiProcessEnvironment(process.env, this.apiConfig),
           CODEX_HOME: this.codexHome,
           PATH: buildCodexProcessPath(this.codexBin),
           HOME: processHome,
@@ -2187,20 +3685,27 @@ class CodexAppServerRunner {
     stderr.on('line', async (line) => {
       const text = stripAnsi(line);
       const summary = text.length > 420 ? `${text.slice(0, 417)}...` : text;
-      if (isCodexStateDatabaseError(text)) {
-        this.startupStateDbError = true;
-        const hint = codexStateDatabaseHint(text);
+      const stateDbDiagnostic = buildCodexStateDatabaseDiagnostic(text, this.codexHome);
+      if (stateDbDiagnostic) {
+        this.startupStateDbDiagnostic = preferCodexStateDatabaseDiagnostic(
+          this.startupStateDbDiagnostic,
+          stateDbDiagnostic
+        );
+        if (stateDbDiagnostic.quarantine) {
+          this.startupStateDbCorruption = true;
+        }
         await this.emitDiagnostic({
           severity: 'error',
           source: 'stderr',
           kind: 'runtime-startup',
-          message: 'Codex state database is not readable.',
-          detail: hint,
+          message: stateDbDiagnostic.message,
+          detail: stateDbDiagnostic.detail,
+          data: stateDbDiagnostic.data,
         }).catch(() => {});
         await this.emitAlert({
           severity: 'error',
           source: 'runtime',
-          message: hint,
+          message: stateDbDiagnostic.detail,
         }).catch(() => {});
         return;
       }
@@ -2300,127 +3805,7 @@ class CodexAppServerRunner {
       },
     });
 
-    const startTranscriptFallbackThread = async (reason = null) => {
-      if (reason) {
-        await this.emitDiagnostic({
-          severity: 'warning',
-          source: 'codex',
-          kind: 'native-thread-fallback',
-          message: 'Native Codex thread was not available; started a live session from transcript context instead.',
-          detail: String(reason.message || reason).slice(0, 500),
-        }).catch(() => {});
-      }
-      await this.emitRuntime({
-        connection: 'ready',
-        phase: 'starting-thread',
-        startupStep: reason ? 'thread-start-fallback' : 'thread-start',
-        busy: true,
-      });
-      await this.emitDiagnostic({
-        severity: reason ? 'warning' : 'info',
-        source: 'codex',
-        kind: 'lifecycle',
-        method: 'thread/start',
-        message: reason
-          ? 'Starting a fallback Codex thread from transcript context.'
-          : 'Starting a new Codex thread.',
-        detail: reason ? String(reason.message || reason).slice(0, 500) : undefined,
-        data: {
-          launchMode: this.launchMode,
-          nativeThreadId: this.nativeThreadId || null,
-        },
-      }).catch(() => {});
-      const fallbackThread = await this.rpc.request('thread/start', {
-        cwd: this.cwd,
-        approvalPolicy: 'on-request',
-        sandbox: 'workspace-write',
-        personality: 'friendly',
-        ...threadApiParams,
-      }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
-      this.runtime.resumeStrategy = resumeStrategyForLaunchMode(this.launchMode);
-      return fallbackThread;
-    };
-
-    let thread = null;
-    if (this.launchMode === 'resume') {
-      if (!this.nativeThreadId) {
-        throw classifyNativeThreadError('resume', new Error('native thread id is missing'));
-      }
-      try {
-        await this.emitRuntime({
-          connection: 'ready',
-          phase: 'resuming-thread',
-          startupStep: 'thread-resume',
-          busy: true,
-        });
-        await this.emitDiagnostic({
-          severity: 'info',
-          source: 'codex',
-          kind: 'lifecycle',
-          method: 'thread/resume',
-          message: `Resuming Codex thread ${limitText(this.nativeThreadId, 64)}.`,
-          data: {
-            launchMode: this.launchMode,
-            nativeThreadId: this.nativeThreadId,
-          },
-        }).catch(() => {});
-        thread = await this.rpc.request('thread/resume', {
-          threadId: this.nativeThreadId,
-          cwd: this.cwd,
-          approvalPolicy: 'on-request',
-          sandbox: 'workspace-write',
-          personality: 'friendly',
-          ...threadApiParams,
-        }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
-        this.runtime.resumeStrategy = 'native_resume';
-      } catch (error) {
-        throw classifyNativeThreadError('resume', error);
-      }
-    } else if (this.launchMode === 'fork') {
-      if (!this.nativeThreadId) {
-        throw classifyNativeThreadError('fork', new Error('native thread id is missing'));
-      }
-      try {
-        await this.emitRuntime({
-          connection: 'ready',
-          phase: 'forking-thread',
-          startupStep: 'thread-fork',
-          busy: true,
-        });
-        await this.emitDiagnostic({
-          severity: 'info',
-          source: 'codex',
-          kind: 'lifecycle',
-          method: 'thread/fork',
-          message: `Forking Codex thread ${limitText(this.nativeThreadId, 64)}.`,
-          data: {
-            launchMode: this.launchMode,
-            nativeThreadId: this.nativeThreadId,
-          },
-        }).catch(() => {});
-        thread = await this.rpc.request('thread/fork', {
-          threadId: this.nativeThreadId,
-          cwd: this.cwd,
-          approvalPolicy: 'on-request',
-          sandbox: 'workspace-write',
-          ephemeral: false,
-          threadSource: 'user',
-          ...threadApiParams,
-        }, THREAD_OPEN_REQUEST_TIMEOUT_MS);
-        this.runtime.resumeStrategy = 'native_fork';
-      } catch (error) {
-        throw classifyNativeThreadError('fork', error);
-      }
-    } else if (this.launchMode === 'transcript_fallback') {
-      if (!this.resumePrelude) {
-        const error = new Error('Transcript fallback requires non-empty bounded history.');
-        error.code = 'session_history_unavailable';
-        throw error;
-      }
-      thread = await startTranscriptFallbackThread(new Error('Explicit transcript fallback requested.'));
-    } else {
-      thread = await startTranscriptFallbackThread();
-    }
+    const thread = await this.openThread(threadApiParams);
 
     this.threadId = thread?.thread?.id || null;
     if (!this.threadId) {
@@ -2507,6 +3892,8 @@ class CodexAppServerRunner {
       phase: 'submitting-turn',
       currentTurnStatus: 'submitting',
       pendingInputSummary: limitText(effectivePrompt, 240),
+      lastError: null,
+      lastCodexError: null,
       model: params.model || null,
       effort: params.effort || null,
       summary: params.summary || null,
@@ -2575,6 +3962,8 @@ class CodexAppServerRunner {
           phase: 'submitting-turn',
           currentTurnStatus: 'submitting',
           pendingInputSummary: limitText(prompt, 240),
+          lastError: null,
+          lastCodexError: null,
           model: fallbackParams.model || null,
           effort: fallbackParams.effort || null,
           summary: fallbackParams.summary || null,
@@ -2601,15 +3990,19 @@ class CodexAppServerRunner {
     }
 
     const turnId = turn?.turn?.id || null;
+    const becameNativeResumeReady = this.runtime.nativeResumeReady !== true;
     if (turnId) {
       this.activeTurnId = turnId;
-      this.turnBuffers.set(turnId, '');
+      this.resetTurnBuffer(turnId);
       this.turnModes.set(turnId, collaborationMode?.mode || mode || 'default');
       await this.emitRuntime({
+        ...(becameNativeResumeReady ? { nativeResumeReady: true } : {}),
         activeTurnId: turnId,
         busy: true,
         phase: (collaborationMode?.mode === 'plan' || mode === 'plan') ? 'planning' : 'thinking',
         currentTurnStatus: 'inProgress',
+        lastError: null,
+        lastCodexError: null,
         model: params.model || null,
         effort: params.effort || null,
         summary: params.summary || null,
@@ -2620,6 +4013,8 @@ class CodexAppServerRunner {
         reasoningSummary: null,
         planSummary: null,
       });
+    } else if (becameNativeResumeReady) {
+      await this.emitRuntime({ nativeResumeReady: true });
     }
     await this.postEvent({
       type: 'session.selection_confirmed',
@@ -2742,7 +4137,7 @@ class CodexAppServerRunner {
     const turnId = response?.turn?.id || null;
     if (turnId) {
       this.activeTurnId = turnId;
-      this.turnBuffers.set(turnId, '');
+      this.resetTurnBuffer(turnId);
       await this.emitRuntime({
         activeTurnId: turnId,
         busy: true,
@@ -2770,26 +4165,70 @@ class CodexAppServerRunner {
     return cleaned;
   }
 
-  async stop(options = {}) {
+  applyStopOptions(options = {}) {
     if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
       this.suppressTerminalEvent = true;
+      if (!this.agentEventsSuppressed) {
+        this.agentEventsSuppressed = true;
+        // Ownership loss is terminal for this Agent instance. Prevent queued
+        // notifications, activity snapshots, and exit cleanup from posting any
+        // more events through a revoked lease.
+        this.postEvent = async () => null;
+      }
     }
+  }
+
+  stop(options = {}) {
+    this.applyStopOptions(options);
     this.stopRequested = true;
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+    let attemptPromise = null;
+    attemptPromise = this.performStop().catch((error) => {
+      if (this.stopPromise === attemptPromise) {
+        this.stopPromise = null;
+      }
+      throw error;
+    });
+    this.stopPromise = attemptPromise;
+    return attemptPromise;
+  }
+
+  async performStop() {
     const terminalErrors = [];
+    const captureTerminalError = (error) => {
+      const remaining = errorWithoutSuppressedTerminalDelivery(
+        error,
+        this.agentEventsSuppressed
+      );
+      if (remaining) terminalErrors.push(remaining);
+    };
     let activityFlushError = null;
     try {
       await this.drainNotifications();
-      await this.finalizeThinkingActivities();
+      if (this.agentEventsSuppressed) {
+        await this.discardThinkingActivities();
+      } else {
+        await this.finalizeThinkingActivities();
+      }
     } catch (error) {
       activityFlushError = error;
     }
+    if (this.agentEventsSuppressed && this.thinkingActivities.size) {
+      await this.discardThinkingActivities();
+    }
     const finishStop = () => {
+      const remainingActivityError = errorWithoutSuppressedTerminalDelivery(
+        activityFlushError,
+        this.agentEventsSuppressed
+      );
       if (
-        activityFlushError
+        remainingActivityError
         && this.activitySnapshotDeliveryErrors?.size
-        && !terminalErrors.includes(activityFlushError)
+        && !terminalErrors.includes(remainingActivityError)
       ) {
-        terminalErrors.push(activityFlushError);
+        terminalErrors.push(remainingActivityError);
       }
       throwTerminalErrors(terminalErrors, 'Codex runner stop did not complete cleanly.');
     };
@@ -2801,7 +4240,7 @@ class CodexAppServerRunner {
       try {
         await this.terminationPromise;
       } catch (error) {
-        terminalErrors.push(error);
+        captureTerminalError(error);
       }
       finishStop();
       return;
@@ -2814,7 +4253,7 @@ class CodexAppServerRunner {
           await this.handleExit(child.exitCode, child.signalCode);
         }
       } catch (error) {
-        terminalErrors.push(error);
+        captureTerminalError(error);
       }
       finishStop();
       return;
@@ -2867,13 +4306,13 @@ class CodexAppServerRunner {
       try {
         await this.terminationPromise;
       } catch (error) {
-        terminalErrors.push(error);
+        captureTerminalError(error);
       }
     } else if (child.exitCode !== null || child.signalCode !== null) {
       try {
         await this.handleExit(child.exitCode, child.signalCode);
       } catch (error) {
-        terminalErrors.push(error);
+        captureTerminalError(error);
       }
     } else {
       const error = new Error(
@@ -2910,7 +4349,7 @@ class CodexAppServerRunner {
     }
     if (this.activeTurnId === interruptedTurnId) {
       this.activeTurnId = null;
-      this.turnBuffers.delete(interruptedTurnId);
+      this.releaseTurnBuffer(interruptedTurnId);
       this.turnModes.delete(interruptedTurnId);
       this.planBuffers.delete(interruptedTurnId);
       this.reasoningBuffers.delete(interruptedTurnId);
@@ -3190,6 +4629,33 @@ class CodexAppServerRunner {
     }
   }
 
+  activeTurnRecoveryPatch(turnId, patch = {}) {
+    const normalizedTurnId = String(turnId || '').trim();
+    if (!normalizedTurnId || normalizedTurnId !== String(this.activeTurnId || '').trim()) {
+      return null;
+    }
+    return {
+      activeTurnId: normalizedTurnId,
+      busy: true,
+      currentTurnStatus: 'inProgress',
+      lastError: null,
+      lastCodexError: null,
+      ...patch,
+    };
+  }
+
+  async emitActiveTurnRecoveryIfNeeded(turnId, patch = {}) {
+    if (!this.runtime.lastError && !this.runtime.lastCodexError) {
+      return false;
+    }
+    const recoveryPatch = this.activeTurnRecoveryPatch(turnId, patch);
+    if (!recoveryPatch) {
+      return false;
+    }
+    await this.emitRuntime(recoveryPatch);
+    return true;
+  }
+
   async handleNotification(message) {
     const method = message.method;
     const params = message.params || {};
@@ -3219,9 +4685,70 @@ class CodexAppServerRunner {
     if (method === 'thread/status/changed') {
       const status = params.status || null;
       const type = status?.type || 'unknown';
+      if (type === 'systemError') {
+        const turnId = params.turnId || this.activeTurnId;
+        const errorText = String(
+          params.error?.message
+          || status?.message
+          || 'Codex thread entered a system error state.'
+        );
+        const codexError = describeCodexError(
+          params.error?.codexErrorInfo || status?.codexErrorInfo || null
+        ) || 'systemError';
+        let activityFlushError = null;
+        try {
+          await this.finalizeThinkingActivities({ turnId });
+        } catch (error) {
+          activityFlushError = error;
+        }
+        this.activeTurnId = null;
+        await this.resolvePendingRequestsForClosedTurn(
+          'failed',
+          'Request closed because the Codex thread entered a system error state.'
+        );
+        await this.emitRuntime({
+          threadStatus: status,
+          phase: 'error',
+          activeTurnId: null,
+          busy: false,
+          waitingOnApproval: false,
+          waitingOnUserInput: false,
+          currentTurnStatus: 'failed',
+          pendingInputSummary: null,
+          queuedCommandId: null,
+          lastError: errorText,
+          lastCodexError: codexError,
+        });
+        await this.postEvent({
+          type: 'session.error',
+          hostId: this.hostId,
+          sessionId: this.currentSessionId(),
+          message: errorText,
+          timestamp: nowIso(),
+        });
+        await this.emitDiagnostic({
+          severity: 'error',
+          source: 'codex',
+          kind: 'thread-status',
+          method,
+          message: errorText,
+          detail: codexError,
+          data: status,
+          turnId,
+        });
+        if (turnId) {
+          this.releaseTurnBuffer(turnId);
+          this.turnModes.delete(turnId);
+          this.planBuffers.delete(turnId);
+          this.reasoningBuffers.delete(turnId);
+        }
+        if (activityFlushError) throw activityFlushError;
+        return;
+      }
       const waitingOnApproval = Array.isArray(status?.activeFlags) && status.activeFlags.includes('waitingOnApproval');
       const waitingOnUserInput = Array.isArray(status?.activeFlags) && status.activeFlags.includes('waitingOnUserInput');
       await this.emitRuntime({
+        ...(type === 'active' ? this.activeTurnRecoveryPatch(this.activeTurnId) || {} : {}),
         threadStatus: status || null,
         phase: waitingOnApproval
           ? 'waiting-approval'
@@ -3282,7 +4809,7 @@ class CodexAppServerRunner {
     if (method === 'turn/started') {
       this.activeTurnId = params.turn?.id || params.turnId || this.activeTurnId;
       if (this.activeTurnId && !this.turnBuffers.has(this.activeTurnId)) {
-        this.turnBuffers.set(this.activeTurnId, '');
+        this.resetTurnBuffer(this.activeTurnId);
       }
       const turnMode = this.activeTurnId ? this.turnModes.get(this.activeTurnId) : '';
       await this.emitRuntime({
@@ -3290,6 +4817,8 @@ class CodexAppServerRunner {
         busy: true,
         phase: turnMode === 'plan' ? 'planning' : 'thinking',
         currentTurnStatus: params.turn?.status?.type || 'inProgress',
+        lastError: null,
+        lastCodexError: null,
         reasoningSummary: null,
         planSummary: null,
       });
@@ -3304,12 +4833,38 @@ class CodexAppServerRunner {
       return;
     }
 
+    if (method === 'item/started') {
+      const activity = normalizeAppServerActivityItem(params.item, params, 'started');
+      if (activity) {
+        await this.emitActiveTurnRecoveryIfNeeded(activity.identity.turnId);
+        this.replaceActivitySnapshot(activity.identity, activity.text, {
+          force: true,
+          maxTextBytes: activity.identity.kind === 'command'
+            ? ACTIVITY_OUTPUT_MAX_BYTES
+            : ACTIVITY_PROGRESS_MAX_BYTES,
+        });
+        await this.emitDiagnostic({
+          severity: 'info',
+          source: 'codex',
+          kind: activity.identity.kind,
+          method,
+          message: limitText(activity.text, 300),
+          turnId: activity.identity.turnId,
+          data: activity.identity,
+        });
+        return;
+      }
+    }
+
     if (method === 'item/agentMessage/delta') {
       const turnId = params.turnId || this.activeTurnId;
       if (!turnId) {
         return;
       }
       const text = notificationDeltaText(params);
+      if (text) {
+        await this.emitActiveTurnRecoveryIfNeeded(turnId, { phase: 'thinking' });
+      }
       if (notificationPhase(params) === 'commentary') {
         if (text) {
           await this.emitDiagnostic({
@@ -3329,24 +4884,144 @@ class CodexAppServerRunner {
         }
         return;
       }
-      const previous = this.turnBuffers.get(turnId) || '';
-      this.turnBuffers.set(turnId, `${previous}${params.delta || ''}`);
+      this.appendTurnBuffer(turnId, params.delta || '');
       return;
     }
 
     if (method === 'item/commandExecution/outputDelta' || method === 'process/outputDelta' || method === 'command/exec/outputDelta') {
+      const turnId = params.turnId || this.activeTurnId;
+      const outputDelta = String(params.delta || params.deltaBase64 || '');
+      if (outputDelta) {
+        await this.emitActiveTurnRecoveryIfNeeded(turnId);
+        const commandActivityIdentity = {
+          turnId,
+          itemId: params.itemId || params.processId || params.processHandle,
+          callId: params.callId || params.itemId || null,
+          ...(params.requestId ? { requestId: params.requestId } : {}),
+          kind: 'command',
+          itemType: 'commandExecution',
+          method,
+          status: 'inProgress',
+          ...(params.processId || params.processHandle
+            ? { processId: params.processId || params.processHandle }
+            : {}),
+          ...(params.source ? { source: params.source } : {}),
+        };
+        this.appendActivityFieldDelta(
+          commandActivityIdentity,
+          'output',
+          outputDelta,
+          { maxTextBytes: ACTIVITY_OUTPUT_MAX_BYTES }
+        );
+        const outputStream = String(params.stream || '').toLowerCase();
+        if (outputStream === 'stdout' || outputStream === 'stderr') {
+          this.appendActivityFieldDelta(
+            commandActivityIdentity,
+            outputStream,
+            outputDelta,
+            { maxTextBytes: ACTIVITY_OUTPUT_MAX_BYTES }
+          );
+        }
+      }
       await this.emitDiagnostic({
         severity: 'info',
         source: 'codex',
         kind: 'command-output',
         method,
-        message: limitText(params.delta || params.deltaBase64 || '', 220),
+        message: limitText(outputDelta, 220),
+        turnId,
         data: {
           itemId: params.itemId || null,
+          callId: params.callId || params.itemId || null,
+          requestId: params.requestId || null,
+          turnId: turnId || null,
           processId: params.processId || null,
           processHandle: params.processHandle || null,
           stream: params.stream || null,
           capReached: typeof params.capReached === 'boolean' ? params.capReached : null,
+        },
+      });
+      return;
+    }
+
+    if (method === 'item/fileChange/patchUpdated') {
+      const turnId = params.turnId || this.activeTurnId;
+      const itemId = params.itemId || params.callId || params.requestId;
+      const fileChanges = normalizeAppServerFileChanges(
+        params.changes || params.fileChanges || params.file_changes
+      );
+      const message = fileChanges.length
+        ? `Updated patch for ${fileChanges.length} file(s)`
+        : 'File patch updated';
+      await this.emitActiveTurnRecoveryIfNeeded(turnId);
+      this.replaceActivitySnapshot({
+        turnId,
+        itemId,
+        callId: params.callId || itemId || null,
+        ...(params.requestId ? { requestId: params.requestId } : {}),
+        kind: 'file-change',
+        itemType: 'fileChange',
+        method,
+        status: 'inProgress',
+        fileChanges,
+        changes: fileChanges,
+      }, message, { force: true, maxTextBytes: ACTIVITY_PROGRESS_MAX_BYTES });
+      await this.emitDiagnostic({
+        severity: 'info',
+        source: 'codex',
+        kind: 'file-change',
+        method,
+        message,
+        turnId,
+        data: {
+          turnId: turnId || null,
+          itemId: itemId || null,
+          callId: params.callId || itemId || null,
+          requestId: params.requestId || null,
+          fileChanges,
+          changes: fileChanges,
+        },
+      });
+      return;
+    }
+
+    if (method === 'item/mcpToolCall/progress') {
+      const turnId = params.turnId || this.activeTurnId;
+      const itemId = params.itemId || params.callId || params.requestId;
+      const progress = truncateUtf8(
+        params.message || params.progress || '',
+        ACTIVITY_PROGRESS_MAX_BYTES,
+        NOTIFICATION_TRUNCATION_SUFFIX
+      );
+      if (progress) {
+        await this.emitActiveTurnRecoveryIfNeeded(turnId);
+        this.appendActivityFieldDelta({
+          turnId,
+          itemId,
+          callId: params.callId || itemId || null,
+          ...(params.requestId ? { requestId: params.requestId } : {}),
+          kind: 'mcp-tool',
+          itemType: 'mcpToolCall',
+          method,
+          status: 'inProgress',
+        }, 'progress', progress, {
+          maxTextBytes: ACTIVITY_PROGRESS_MAX_BYTES,
+          separator: '\n',
+        });
+      }
+      await this.emitDiagnostic({
+        severity: 'info',
+        source: 'codex',
+        kind: 'mcp-tool',
+        method,
+        message: limitText(progress || 'MCP tool progress', 300),
+        turnId,
+        data: {
+          turnId: turnId || null,
+          itemId: itemId || null,
+          callId: params.callId || itemId || null,
+          requestId: params.requestId || null,
+          progress,
         },
       });
       return;
@@ -3363,15 +5038,16 @@ class CodexAppServerRunner {
       }, reasoningChunk);
       if (turnId) {
         const previous = this.reasoningBuffers.get(turnId) || '';
-        this.reasoningBuffers.set(turnId, `${previous}${reasoningChunk}`);
+        this.reasoningBuffers.set(
+          turnId,
+          truncateActivityText(`${previous}${reasoningChunk}`, 256 * 1024).text
+        );
       }
       if (isActiveTurn) {
-        await this.emitRuntime({
-          activeTurnId: turnId,
-          busy: true,
+        await this.emitRuntime(this.activeTurnRecoveryPatch(turnId, {
           phase: 'thinking',
           reasoningSummary: limitText(this.reasoningBuffers.get(turnId), 1200),
-        });
+        }));
       }
       await this.emitDiagnostic({
         severity: 'info',
@@ -3395,16 +5071,17 @@ class CodexAppServerRunner {
       const isActiveTurn = turnId && turnId === this.activeTurnId;
       if (turnId) {
         const previous = this.planBuffers.get(turnId) || '';
-        const next = mergeThinkingBuffer(previous, planChunk);
+        const next = truncateActivityText(
+          mergeThinkingBuffer(previous, planChunk),
+          256 * 1024
+        ).text;
         this.planBuffers.set(turnId, next);
       }
       if (isActiveTurn) {
-        await this.emitRuntime({
-          activeTurnId: turnId,
-          busy: true,
+        await this.emitRuntime(this.activeTurnRecoveryPatch(turnId, {
           phase: 'planning',
           planSummary: limitText(this.planBuffers.get(turnId), 1200),
-        });
+        }));
       }
       await this.emitDiagnostic({
         severity: 'info',
@@ -3453,6 +5130,7 @@ class CodexAppServerRunner {
     }
 
     if (method === 'item/commandExecution/terminalInteraction') {
+      await this.emitActiveTurnRecoveryIfNeeded(params.turnId || this.activeTurnId);
       await this.emitDiagnostic({
         severity: 'info',
         source: 'codex',
@@ -3468,14 +5146,48 @@ class CodexAppServerRunner {
       return;
     }
 
-    if (method === 'item/completed' && params.item?.type === 'reasoning') {
+    if (method === 'item/completed') {
       const turnId = params.turnId || this.activeTurnId;
-      const itemId = params.item.id || params.itemId;
-      const summaries = Array.isArray(params.item.summary) ? params.item.summary : [];
-      summaries.forEach((summary, summaryIndex) => {
-        this.replaceThinkingSnapshot({ turnId, itemId, summaryIndex }, persistedReasoningSummaryText(summary));
-      });
-      await this.finalizeThinkingActivities({ turnId, itemId });
+      const itemId = params.item?.id || params.itemId;
+      if (params.item?.type === 'reasoning') {
+        await this.emitActiveTurnRecoveryIfNeeded(turnId);
+        const summaries = Array.isArray(params.item.summary) ? params.item.summary : [];
+        summaries.forEach((summary, summaryIndex) => {
+          this.replaceThinkingSnapshot({
+            turnId,
+            itemId,
+            summaryIndex,
+            method,
+            status: 'completed',
+            completedAtMs: boundedActivityNumber(params.completedAtMs),
+          }, persistedReasoningSummaryText(summary));
+        });
+        await this.finalizeThinkingActivities({ turnId, itemId });
+        return;
+      }
+      const activity = normalizeAppServerActivityItem(params.item, { ...params, turnId }, 'completed');
+      if (activity) {
+        await this.emitActiveTurnRecoveryIfNeeded(turnId);
+        this.replaceActivitySnapshot(activity.identity, activity.text, {
+          force: true,
+          maxTextBytes: activity.identity.kind === 'command'
+            ? ACTIVITY_OUTPUT_MAX_BYTES
+            : ACTIVITY_PROGRESS_MAX_BYTES,
+        });
+        await this.finalizeThinkingActivities({ turnId, itemId });
+        await this.emitDiagnostic({
+          severity: ['failed', 'declined'].includes(String(activity.identity.status || '').toLowerCase())
+            ? 'error'
+            : 'info',
+          source: 'codex',
+          kind: activity.identity.kind,
+          method,
+          message: limitText(activity.text, 300),
+          turnId,
+          data: activity.identity,
+        });
+        return;
+      }
     }
 
     if (method === 'turn/completed') {
@@ -3491,7 +5203,7 @@ class CodexAppServerRunner {
         await this.emitOutput(text, 'stdout');
       }
       if (turnId) {
-        this.turnBuffers.delete(turnId);
+        this.releaseTurnBuffer(turnId);
         this.turnModes.delete(turnId);
         this.planBuffers.delete(turnId);
         this.reasoningBuffers.delete(turnId);
@@ -3514,6 +5226,9 @@ class CodexAppServerRunner {
             ? 'error'
             : 'idle',
         currentTurnStatus: params.turn?.status?.type || 'completed',
+        ...(params.turn?.status?.type === 'failed'
+          ? {}
+          : { lastError: null, lastCodexError: null }),
       });
       await this.emitDiagnostic({
         severity: params.turn?.status?.type === 'failed' ? 'error' : 'info',
@@ -3563,6 +5278,8 @@ class CodexAppServerRunner {
           severity: 'warning',
           source: 'codex',
           message: text,
+          transient: true,
+          turnId: turnId || null,
         });
       } else {
         try {
@@ -3570,13 +5287,20 @@ class CodexAppServerRunner {
         } catch (error) {
           activityFlushError = error;
         }
+        this.activeTurnId = null;
         await this.resolvePendingRequestsForClosedTurn(
           'failed',
           'Request closed because the Codex turn failed.'
         );
         await this.emitRuntime({
           phase: codexError === 'usageLimitExceeded' || codexError === 'contextWindowExceeded' ? 'quota-exhausted' : 'error',
+          activeTurnId: null,
           busy: false,
+          waitingOnApproval: false,
+          waitingOnUserInput: false,
+          currentTurnStatus: 'failed',
+          pendingInputSummary: null,
+          queuedCommandId: null,
           lastError: text,
           lastCodexError: codexError,
         });
@@ -3587,7 +5311,6 @@ class CodexAppServerRunner {
           message: text,
           timestamp: nowIso(),
         });
-        this.activeTurnId = null;
       }
       await this.emitDiagnostic({
         severity: params.willRetry ? 'warning' : 'error',
@@ -3599,7 +5322,10 @@ class CodexAppServerRunner {
         data: params.error || null,
       });
       if (turnId && !params.willRetry) {
-        this.turnBuffers.delete(turnId);
+        this.releaseTurnBuffer(turnId);
+        this.turnModes.delete(turnId);
+        this.planBuffers.delete(turnId);
+        this.reasoningBuffers.delete(turnId);
       }
       if (activityFlushError) throw activityFlushError;
       return;
@@ -3765,7 +5491,7 @@ class CodexAppServerRunner {
   async handleExit(code, signal) {
     this.childExitConfirmed = true;
     if (
-      this.startupStateDbError
+      this.startupStateDbCorruption
       && !this.startCompleted
       && !this.stopRequested
       && !this.terminationPromise
@@ -3786,9 +5512,20 @@ class CodexAppServerRunner {
     const terminalErrors = [];
     try {
       await this.drainNotifications();
-      await this.finalizeThinkingActivities();
+      if (this.agentEventsSuppressed) {
+        await this.discardThinkingActivities();
+      } else {
+        await this.finalizeThinkingActivities();
+      }
     } catch (error) {
-      terminalErrors.push(error);
+      const remaining = errorWithoutSuppressedTerminalDelivery(
+        error,
+        this.agentEventsSuppressed
+      );
+      if (remaining) terminalErrors.push(remaining);
+    }
+    if (this.agentEventsSuppressed && this.thinkingActivities.size) {
+      await this.discardThinkingActivities();
     }
     let overlayCleanupError = null;
     try {
@@ -3809,7 +5546,7 @@ class CodexAppServerRunner {
       overlayCleanupError = error;
     }
     this.activeTurnId = null;
-    this.turnBuffers.clear();
+    this.clearTurnBuffers();
     this.turnModes.clear();
     this.planBuffers.clear();
     this.reasoningBuffers.clear();
@@ -3819,7 +5556,7 @@ class CodexAppServerRunner {
         'Request closed because the Codex app-server exited.'
       );
     } catch (error) {
-      terminalErrors.push(error);
+      terminalErrors.push(retryableTerminalDeliveryError(error));
     }
     try {
       await this.emitRuntime({
@@ -3829,6 +5566,8 @@ class CodexAppServerRunner {
         waitingOnUserInput: false,
         activeTurnId: null,
         phase: 'closed',
+        currentTurnStatus: 'closed',
+        pendingInputSummary: null,
       }).catch(() => {});
       if (typeof this.onTerminated === 'function') {
         try {
@@ -3928,6 +5667,12 @@ class CodexAppServerRunner {
       severity: entry.severity || 'warning',
       source: entry.source || 'runtime',
       message: entry.message || '',
+      ...(Object.prototype.hasOwnProperty.call(entry, 'transient')
+        ? { transient: entry.transient }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(entry, 'turnId')
+        ? { turnId: entry.turnId }
+        : {}),
       timestamp: nowIso(),
     });
   }
@@ -4044,9 +5789,12 @@ async function startCodexAppServerSession(options) {
 }
 
 module.exports = {
+  buildCodexStateDatabaseDiagnostic,
   CodexAppServerRunner,
+  classifyCodexStateDatabaseStderr,
   cleanupApiProfileCodexHome,
   cleanupStaleApiProfileCodexHomes,
+  isMissingNativeRolloutError,
   normalizeAppServerFileChanges,
   normalizeTurnStartParams,
   prepareApiProfileCodexHome,

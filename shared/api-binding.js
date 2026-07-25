@@ -1,8 +1,15 @@
 const crypto = require('crypto');
 const { isSecretQueryKey } = require('./secret-redaction');
 
+const OFFICIAL_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+
 function normalizedText(value) {
   return String(value || '').trim() || null;
+}
+
+function normalizedProviderKind(value) {
+  const kind = String(value || '').trim().toLowerCase();
+  return ['openai', 'anthropic', 'gemini', 'custom'].includes(kind) ? kind : null;
 }
 
 function normalizeBaseUrl(value) {
@@ -32,6 +39,18 @@ function bindingDigest(identity) {
   return crypto.createHash('sha256').update(JSON.stringify(identity)).digest('hex');
 }
 
+function profileBaseUrl(value = {}) {
+  const configured = normalizedText(value.normalizedBaseUrl || value.baseUrl);
+  if (configured) {
+    return configured;
+  }
+  const rawProviderKind = normalizedText(value.providerKind);
+  const officialByKind = normalizedProviderKind(rawProviderKind) === 'openai';
+  const officialLegacyLabel = !rawProviderKind
+    && String(normalizedText(value.provider) || '').toLowerCase() === 'openai';
+  return officialByKind || officialLegacyLabel ? OFFICIAL_OPENAI_BASE_URL : null;
+}
+
 function finishBinding(value = {}) {
   const kind = ['profile', 'host_environment', 'unknown'].includes(value.kind)
     ? value.kind
@@ -41,7 +60,10 @@ function finishBinding(value = {}) {
     profileId: kind === 'profile' ? normalizedText(value.profileId) : null,
     label: normalizedText(value.label),
     provider: normalizedText(value.provider),
-    normalizedBaseUrl: normalizeBaseUrl(value.normalizedBaseUrl || value.baseUrl),
+    providerKind: normalizedProviderKind(value.providerKind),
+    normalizedBaseUrl: normalizeBaseUrl(
+      kind === 'profile' ? profileBaseUrl(value) : value.normalizedBaseUrl || value.baseUrl
+    ),
     modelProviderHint: normalizedText(value.modelProviderHint),
   };
   if (kind === 'unknown') {
@@ -69,6 +91,7 @@ function makeProfileBinding(apiConfig = {}) {
     profileId: apiConfig.profileId,
     label: apiConfig.label,
     provider: apiConfig.provider,
+    providerKind: apiConfig.providerKind,
     normalizedBaseUrl: apiConfig.normalizedBaseUrl || apiConfig.baseUrl,
     modelProviderHint: apiConfig.modelProviderHint,
   });
@@ -79,6 +102,7 @@ function makeHostEnvironmentBinding(attestation = {}) {
     kind: 'host_environment',
     label: attestation.label,
     provider: attestation.provider,
+    providerKind: attestation.providerKind,
     normalizedBaseUrl: attestation.normalizedBaseUrl || attestation.baseUrl,
     modelProviderHint: attestation.modelProviderHint,
   });
@@ -111,6 +135,7 @@ function bindingsEqual(left, right) {
 }
 
 module.exports = {
+  OFFICIAL_OPENAI_BASE_URL,
   bindingFingerprint,
   bindingsEqual,
   makeHostEnvironmentBinding,

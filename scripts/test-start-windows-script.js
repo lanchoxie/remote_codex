@@ -253,6 +253,12 @@ assert(
   'Windows restart must request authenticated Relay shutdown and wait for verified exit'
 );
 assert(
+  /\[int\]\$RelayShutdownTimeoutSeconds\s*=\s*120/.test(script)
+    && (script.match(/-TimeoutSeconds \$RelayShutdownTimeoutSeconds/g) || []).length >= 2
+    && /still closing persistence after \$RelayShutdownTimeoutSeconds seconds/.test(script),
+  'Windows restart must allow large Relay snapshots to close without weakening the no-force persistence guard'
+);
+assert(
   /Current Relay rejected its control token; refusing force restart/.test(script)
     && /Verified sibling Relay rejected its control token; refusing force takeover/.test(script),
   'a present but rejected control token must be a hard failure, never a force-kill fallback'

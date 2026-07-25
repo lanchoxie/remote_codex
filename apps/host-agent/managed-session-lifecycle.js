@@ -103,16 +103,76 @@ function retainRunnerForStartRetry(liveSessions, runner, command = {}, error = n
   return retained;
 }
 
+// A stop timeout only bounds the caller's wait. The runner's own stop operation
+// can still be waiting for its child to exit. Keep one operation per runner so
+// a retry or a terminal-event suppression upgrade cannot issue a second kill or
+// attach a second exit waiter while the first operation is still in flight.
+const runnerStopStates = new WeakMap();
+
+function mergeRunnerStopOptions(target, patch = {}) {
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value === undefined) continue;
+    if (key === 'suppressTerminalEvent' || key === 'deferStartupTerminalEvent') {
+      target[key] = target[key] === true || value === true;
+      continue;
+    }
+    target[key] = value;
+  }
+  return target;
+}
+
+function applyRunnerStopOptions(runner, options = {}) {
+  if (typeof runner?.applyStopOptions === 'function') {
+    runner.applyStopOptions(options);
+    return;
+  }
+  if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
+    runner.suppressTerminalEvent = true;
+  }
+}
+
+function stopRunnerOnce(runner, options = {}) {
+  if (!runner || typeof runner.stop !== 'function') {
+    return Promise.resolve(false);
+  }
+
+  const existing = runnerStopStates.get(runner);
+  if (existing) {
+    mergeRunnerStopOptions(existing.options, options);
+    applyRunnerStopOptions(runner, existing.options);
+    return existing.promise;
+  }
+
+  const state = {
+    options: mergeRunnerStopOptions({}, options),
+    promise: null,
+  };
+  applyRunnerStopOptions(runner, state.options);
+  state.promise = Promise.resolve()
+    .then(() => runner.stop(state.options))
+    .then(() => true)
+    .catch((error) => {
+      // A failed stop is retryable. Remove only after the operation has
+      // settled, so callers that arrive while it is still rejecting share it.
+      if (runnerStopStates.get(runner) === state) {
+        runnerStopStates.delete(runner);
+      }
+      throw error;
+    });
+  runnerStopStates.set(runner, state);
+  return state.promise;
+}
+
 async function abortUnconfirmedRunner(runner) {
   if (!runner || typeof runner.stop !== 'function') return false;
-  await runner.stop({ suppressTerminalEvent: true });
+  await stopRunnerOnce(runner, { suppressTerminalEvent: true });
   return true;
 }
 
 async function stopUniqueLiveRunners(liveSessions, options = {}) {
   const runners = Array.from(new Set(liveSessions?.values?.() || []))
     .filter((runner) => runner && typeof runner.stop === 'function');
-  const settled = await Promise.allSettled(runners.map((runner) => runner.stop(options)));
+  const settled = await Promise.allSettled(runners.map((runner) => stopRunnerOnce(runner, options)));
   const errors = settled
     .filter((result) => result.status === 'rejected')
     .map((result) => String(result.reason?.message || result.reason || 'managed runner stop failed'));
@@ -186,14 +246,16 @@ function createManagedSessionStartGate() {
           seenRunners.add(runner);
           stopped = true;
           try {
-            await runner.stop(options);
+            await stopRunnerOnce(runner, options);
           } catch (error) {
             stopError = error;
           }
         }
         const ownerCompletionError = await record?.finishedPromise;
         if (stopError) throw stopError;
-        if (ownerCompletionError) throw ownerCompletionError;
+        if (ownerCompletionError && options.suppressTerminalEvent !== true) {
+          throw ownerCompletionError;
+        }
         return stopped;
       }));
       const errors = settled
@@ -222,17 +284,26 @@ function createManagedSessionShutdown(options = {}) {
     : {};
   let shutdownPromise = null;
   let inFlightStarts = [];
+  let shutdownStarted = false;
+  let inventoryStopped = false;
 
   const shutdownManagedSessions = function shutdownManagedSessions(signal = 'SIGTERM') {
     if (shutdownPromise) return shutdownPromise;
-    inFlightStarts = typeof startGate?.beginShutdown === 'function'
-      ? startGate.beginShutdown()
-      : [];
-    shutdownPromise = Promise.resolve().then(async () => {
-      try {
-        stopInventory();
-      } catch (error) {
-        log(`failed to stop Host inventory watcher: ${error?.message || error}`);
+    if (!shutdownStarted) {
+      shutdownStarted = true;
+      inFlightStarts = typeof startGate?.beginShutdown === 'function'
+        ? startGate.beginShutdown()
+        : [];
+    }
+    let attemptPromise = null;
+    attemptPromise = Promise.resolve().then(async () => {
+      if (!inventoryStopped) {
+        inventoryStopped = true;
+        try {
+          stopInventory();
+        } catch (error) {
+          log(`failed to stop Host inventory watcher: ${error?.message || error}`);
+        }
       }
       const pendingRunners = new Set(
         inFlightStarts.map((record) => record?.runner).filter(Boolean)
@@ -280,8 +351,22 @@ function createManagedSessionShutdown(options = {}) {
         exit(0);
       }
       return { signal, ...result };
+    }).then((result) => {
+      if (
+        shutdownPromise === attemptPromise
+        && (result.timedOut || result.errors.length > 0)
+      ) {
+        shutdownPromise = null;
+      }
+      return result;
+    }, (error) => {
+      if (shutdownPromise === attemptPromise) {
+        shutdownPromise = null;
+      }
+      throw error;
     });
-    return shutdownPromise;
+    shutdownPromise = attemptPromise;
+    return attemptPromise;
   };
 
   shutdownManagedSessions.upgradeStopOptions = async (patch = {}) => {
@@ -368,5 +453,6 @@ module.exports = {
   replayManagedSessionStart,
   runnerMatchesCommandRun,
   shouldPublishMissingRunnerStop,
+  stopRunnerOnce,
   stopUniqueLiveRunners,
 };

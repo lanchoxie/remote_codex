@@ -5,6 +5,8 @@ const os = require('os');
 const path = require('path');
 
 const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
+const PROVIDER_KINDS = new Set(['openai', 'anthropic', 'gemini', 'custom']);
+const REASONING_EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 
 function normalizeBaseUrl(value) {
   const raw = String(value || '').trim();
@@ -20,6 +22,40 @@ function normalizeBaseUrl(value) {
   } catch {
     return raw.replace(/\/+$/, '');
   }
+}
+
+function inferProviderKind(provider) {
+  const normalized = String(provider || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ');
+  if (['openai', 'open ai', 'openai api', 'official openai'].includes(normalized)) return 'openai';
+  if (['anthropic', 'claude', 'anthropic claude', 'anthropic api', 'anthropic/claude'].includes(normalized)) return 'anthropic';
+  if (['gemini', 'google gemini', 'gemini api', 'google ai', 'google/gemini'].includes(normalized)) return 'gemini';
+  return 'custom';
+}
+
+function normalizeProviderKind(value, provider) {
+  const providerKind = String(value || '').trim().toLowerCase();
+  return PROVIDER_KINDS.has(providerKind) ? providerKind : inferProviderKind(provider);
+}
+
+function normalizeSessionDefaults(value) {
+  const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const effortCandidate = String(input.effort || '').trim();
+  const effort = REASONING_EFFORT_PATTERN.test(effortCandidate) ? effortCandidate : '';
+  const requestedMode = String(input.effortMode || '').trim().toLowerCase();
+  const effortMode = requestedMode === 'manual' || requestedMode === 'auto'
+    ? requestedMode
+    : effort ? 'manual' : 'auto';
+  return {
+    model: String(input.model || '').trim().slice(0, 512),
+    effortMode,
+    effort: effortMode === 'manual' ? effort : '',
+    allowUnverifiedEffort: effortMode === 'manual' && Boolean(effort) && input.allowUnverifiedEffort === true,
+    summary: String(input.summary || '').trim().slice(0, 64),
+  };
 }
 
 function parseTomlString(block, key) {
@@ -65,8 +101,10 @@ function parseManagedOverlay(input = {}) {
     profileId: pathMatch[1],
     label,
     provider: 'OpenAI',
+    providerKind: 'openai',
     baseUrl,
     apiKey,
+    sessionDefaults: normalizeSessionDefaults(),
     modifiedAtMs: Number(input.modifiedAtMs) || 0,
   };
 }
@@ -141,13 +179,16 @@ function discoverRecoverableProfiles(managedRoot) {
 }
 
 function normalizeStoredProfile(profile = {}) {
+  const provider = String(profile.provider || 'OpenAI').trim() || 'OpenAI';
   return {
     profileId: String(profile.profileId || profile.id || '').trim(),
-    label: String(profile.label || profile.name || profile.provider || 'API Profile').trim(),
-    provider: String(profile.provider || 'OpenAI').trim() || 'OpenAI',
+    label: String(profile.label || profile.name || provider || 'API Profile').trim(),
+    provider,
+    providerKind: normalizeProviderKind(profile.providerKind, provider),
     baseUrl: normalizeBaseUrl(profile.baseUrl),
     apiKey: String(profile.apiKey || ''),
     rememberApiKey: profile.rememberApiKey !== false || Boolean(profile.apiKey),
+    sessionDefaults: normalizeSessionDefaults(profile.sessionDefaults),
   };
 }
 
@@ -202,7 +243,9 @@ function summarizeProfiles(profiles = []) {
     profileId: profile.profileId,
     label: profile.label,
     provider: profile.provider,
+    providerKind: normalizeProviderKind(profile.providerKind, profile.provider),
     baseUrl: profile.baseUrl,
+    sessionDefaults: normalizeSessionDefaults(profile.sessionDefaults),
     hasKey: Boolean(profile.apiKey),
     keyLength: String(profile.apiKey || '').length,
   }));
@@ -503,6 +546,8 @@ module.exports = {
   ensurePageOrigin,
   logicalProfileKey,
   mergeRecoveredProfiles,
+  normalizeSessionDefaults,
+  normalizeStoredProfile,
   parseManagedOverlay,
   readRecoverableTitles,
   selectRecoverableTitles,

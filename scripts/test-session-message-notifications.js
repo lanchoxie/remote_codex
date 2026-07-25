@@ -113,6 +113,8 @@ async function main() {
   let outboxStorageWrites = 0;
   let receiptStorageReads = 0;
   let outboxStorageReads = 0;
+  let receiptQuotaFailuresRemaining = 0;
+  let outboxQuotaFailuresRemaining = 0;
   let messageChannelListener = null;
   const notificationBroadcasts = [];
   const immediate = (fn) => { fn(); return 0; };
@@ -176,9 +178,23 @@ async function main() {
       setItem: (key, value) => {
         if (key === 'mobile-codex-remote.message-read-receipts.v2') {
           receiptStorageWrites += 1;
+          if (receiptQuotaFailuresRemaining > 0) {
+            receiptQuotaFailuresRemaining -= 1;
+            throw Object.assign(
+              new Error("Failed to execute 'setItem' on 'Storage': exceeded the quota."),
+              { name: 'QuotaExceededError' }
+            );
+          }
         }
         if (key === 'mobile-codex-remote.message-notification-outbox.v1') {
           outboxStorageWrites += 1;
+          if (outboxQuotaFailuresRemaining > 0) {
+            outboxQuotaFailuresRemaining -= 1;
+            throw Object.assign(
+              new Error("Failed to execute 'setItem' on 'Storage': exceeded the quota."),
+              { name: 'QuotaExceededError' }
+            );
+          }
         }
         storage.set(key, value);
       },
@@ -219,6 +235,8 @@ window.__messageNotificationTest = {
   markSessionMessagesRead,
   refreshMessageUnreadState,
   notificationOutboxPresenters,
+  dedupeAlerts,
+  getAlertsForSession,
   catchUpAssistantProjection,
   drainMessageNotificationOutbox,
   scheduleMessageNotificationBroadcastFlush,
@@ -463,6 +481,157 @@ window.__messageNotificationTest = {
   assert(storage.has('mobile-codex-remote.message-read-receipts.v2'));
   assert(storage.has('mobile-codex-remote.message-notification-outbox.v1'));
 
+  const sessionAKey = api.makeSessionKey(sessionA.hostId, sessionA.sessionId);
+  await api.notificationOutboxPresenters().presentInApp({
+    hostId: sessionA.hostId,
+    sessionId: sessionA.sessionId,
+    alertId: 'assistant-alert:test',
+    previewText: 'ordinary assistant reply',
+  });
+  assert.deepStrictEqual(
+    api.state.alerts.get(sessionAKey) || [],
+    [],
+    'ordinary assistant replies must use unread-message UI instead of Session Alerts'
+  );
+  assert.strictEqual(
+    api.hasUnreadMessagesForSession(sessionA),
+    true,
+    'in-app notification presentation must preserve the unread-message signal'
+  );
+
+  api.state.alerts.set(sessionAKey, [{
+    severity: 'info',
+    source: 'assistant-message',
+    message: 'historical assistant reply',
+  }, {
+    severity: 'info',
+    source: 'runtime',
+    message: 'Session stopped successfully.',
+  }, {
+    severity: 'warning',
+    source: 'runtime',
+    message: 'Session needs attention.',
+  }, {
+    severity: 'error',
+    source: 'runtime',
+    message: 'Session failed.',
+  }, {
+    severity: 'debug',
+    source: 'runtime',
+    message: 'Debug details must stay out of Alerts.',
+  }]);
+  assert.deepStrictEqual(
+    Array.from(api.getAlertsForSession(sessionA), (alert) => alert.message),
+    ['Session needs attention.', 'Session failed.'],
+    'Alerts must hide historical assistant/info entries while preserving warnings and errors'
+  );
+
+  const normalizedRetryAlert = api.dedupeAlerts([{
+    severity: 'warning',
+    source: 'codex',
+    message: 'Retry metadata survives browser dedupe.',
+    transient: true,
+    turnId: 'turn-retry',
+  }])[0];
+  assert.strictEqual(normalizedRetryAlert.transient, true, 'alert dedupe must preserve transient metadata');
+  assert.strictEqual(normalizedRetryAlert.turnId, 'turn-retry', 'alert dedupe must preserve turn identity');
+
+  const transientInputCommand = 'no live session for command session.input';
+  const sameTurnRetry = 'Response stream disconnected; retrying the same turn.';
+  const previousTurnRetry = 'Provider temporarily unavailable; retrying an earlier turn.';
+  const uncorrelatedRetry = 'Transient retry without a turn identity.';
+  const terminalTransient = 'Provider exhausted all retry attempts.';
+  const realRuntimeError = 'Provider rejected the request permanently.';
+  api.state.alerts.set(sessionAKey, [{
+    severity: 'error',
+    source: 'runtime',
+    message: transientInputCommand,
+    timestamp: '2026-07-16T10:02:00.000Z',
+    transient: true,
+    turnId: 'turn-before-retry',
+  }, {
+    severity: 'warning',
+    source: 'codex',
+    message: sameTurnRetry,
+    timestamp: '2026-07-16T10:02:01.000Z',
+    transient: true,
+    turnId: 'turn-retry',
+  }, {
+    severity: 'warning',
+    source: 'codex',
+    message: previousTurnRetry,
+    timestamp: '2026-07-16T10:02:02.000Z',
+    transient: true,
+    turnId: 'turn-before-retry',
+  }, {
+    severity: 'warning',
+    source: 'codex',
+    message: uncorrelatedRetry,
+    timestamp: '2026-07-16T10:02:03.000Z',
+    transient: true,
+    turnId: null,
+  }, {
+    severity: 'error',
+    source: 'codex',
+    message: terminalTransient,
+    timestamp: '2026-07-16T10:02:04.000Z',
+    transient: true,
+    turnId: 'turn-retry',
+  }, {
+    severity: 'error',
+    source: 'runtime',
+    message: realRuntimeError,
+    timestamp: '2026-07-16T10:02:00.000Z',
+  }]);
+  api.state.runtime.set(sessionAKey, {
+    phase: 'retrying',
+    connection: 'ready',
+    activeTurnId: 'turn-retry',
+    busy: true,
+    lastError: sameTurnRetry,
+    lastCodexError: 'responseStreamDisconnected',
+    updatedAt: '2026-07-16T10:03:00.000Z',
+  });
+  assert.deepStrictEqual(
+    Array.from(api.getAlertsForSession(sessionA), (alert) => alert.message),
+    [transientInputCommand, sameTurnRetry, previousTurnRetry, uncorrelatedRetry, terminalTransient, realRuntimeError],
+    'transient retry warnings must remain visible while runtime still carries an error'
+  );
+
+  api.state.runtime.set(sessionAKey, {
+    phase: 'error',
+    connection: 'ready',
+    activeTurnId: null,
+    busy: false,
+    currentTurnStatus: 'failed',
+    lastError: null,
+    lastCodexError: null,
+    updatedAt: '2026-07-16T10:04:00.000Z',
+  });
+  assert.deepStrictEqual(
+    Array.from(api.getAlertsForSession(sessionA), (alert) => alert.message),
+    [transientInputCommand, sameTurnRetry, previousTurnRetry, uncorrelatedRetry, terminalTransient, realRuntimeError],
+    'a newer terminal runtime is not proof that a retry warning recovered'
+  );
+
+  api.state.runtime.set(sessionAKey, {
+    phase: 'thinking',
+    connection: 'ready',
+    activeTurnId: 'turn-retry',
+    busy: true,
+    currentTurnStatus: 'inProgress',
+    lastError: null,
+    lastCodexError: null,
+    updatedAt: '2026-07-16T10:05:00.000Z',
+  });
+  assert.deepStrictEqual(
+    Array.from(api.getAlertsForSession(sessionA), (alert) => alert.message),
+    [transientInputCommand, uncorrelatedRetry, terminalTransient, realRuntimeError],
+    'recovered same-turn and departed-turn retry warnings should hide without hiding terminal errors'
+  );
+  api.state.alerts.delete(sessionAKey);
+  api.state.runtime.delete(sessionAKey);
+
   api.markSessionMessagesRead(sessionA, null, { clearAllUnread: true });
   api.refreshMessageUnreadState();
   assert.strictEqual(api.hasUnreadMessagesForSession(sessionA), false);
@@ -624,6 +793,74 @@ window.__messageNotificationTest = {
     'outbox-only broadcasts must not parse or recompute receipts'
   );
   sandbox.window.setTimeout = immediate;
+
+  const alertsBeforeQuota = Array.from(api.state.alerts.values())
+    .reduce((total, alerts) => total + alerts.length, 0);
+  const writesBeforeQuota = outboxStorageWrites;
+  outboxQuotaFailuresRemaining = 3;
+  api.state.messageNotificationOutbox.enqueue({
+    canonicalConversationKey: 'quota::conversation',
+    assistantMessageId: 'quota-assistant-1',
+    assistantSeq: 1,
+    previewText: 'quota fallback',
+    hostId: 'quota-host',
+    sessionId: 'quota-session',
+  });
+  await api.state.messageNotificationOutbox.whenIdle();
+  assert.strictEqual(
+    api.state.messageNotificationOutbox.isPersistenceDisabled(),
+    true,
+    'two quota failures must downgrade the outbox to memory storage'
+  );
+  assert.strictEqual(
+    outboxStorageWrites - writesBeforeQuota,
+    3,
+    'the UI outbox must stop after a compacted retry and one post-clear write'
+  );
+  assert.strictEqual(
+    api.state.messageOutboxPersistRetryTimer,
+    null,
+    'quota fallback must not schedule an outbox persistence retry loop'
+  );
+  assert.strictEqual(
+    Array.from(api.state.alerts.values()).reduce((total, alerts) => total + alerts.length, 0),
+    alertsBeforeQuota,
+    'localStorage quota maintenance must not create a visible Session alert'
+  );
+  const writesAfterFallback = outboxStorageWrites;
+  api.state.messageNotificationOutbox.enqueue({
+    canonicalConversationKey: 'quota::conversation',
+    assistantMessageId: 'quota-assistant-2',
+    assistantSeq: 2,
+    previewText: 'memory only',
+    hostId: 'quota-host',
+    sessionId: 'quota-session',
+  });
+  await api.state.messageNotificationOutbox.whenIdle();
+  assert.strictEqual(
+    outboxStorageWrites,
+    writesAfterFallback,
+    'memory fallback must not keep retrying localStorage writes'
+  );
+
+  const alertsBeforeReceiptQuota = Array.from(api.state.alerts.values())
+    .reduce((total, alerts) => total + alerts.length, 0);
+  const receiptWritesBeforeQuota = receiptStorageWrites;
+  receiptQuotaFailuresRemaining = 1;
+  api.state.messageReceiptStore.set({
+    ...api.state.messageReceiptStore.get('quota::receipt'),
+    canonicalConversationKey: 'quota::receipt',
+    notifiedThroughAssistantSeq: 1,
+  });
+  await api.state.messageReceiptStore.whenIdle();
+  assert.strictEqual(api.state.messageReceiptStore.isPersistenceDisabled(), true);
+  assert.strictEqual(receiptStorageWrites - receiptWritesBeforeQuota, 1);
+  assert.strictEqual(api.state.messageReceiptPersistRetryTimer, null);
+  assert.strictEqual(
+    Array.from(api.state.alerts.values()).reduce((total, alerts) => total + alerts.length, 0),
+    alertsBeforeReceiptQuota,
+    'receipt quota fallback must not create a visible Session alert'
+  );
 
   await Promise.resolve();
   console.log('session message notification assertions passed');

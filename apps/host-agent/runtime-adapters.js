@@ -3,7 +3,7 @@ const path = require('path');
 const readline = require('readline');
 const { normalizeArgs, nowIso } = require('../../shared/protocol');
 const { startCodexAppServerSession } = require('./codex-app-server-runner');
-const { buildApiEnvironment } = require('./runtime-utils');
+const { buildApiProcessEnvironment } = require('./runtime-utils');
 
 const CODEX_RUNTIME_ALIASES = new Set([
   'codex',
@@ -101,6 +101,7 @@ async function startProcessManagedRuntimeSession({
   let spawned = false;
   let spawnFailed = false;
   let runtimeError = null;
+  let agentEventsSuppressed = false;
   let resolveTerminalCompletion;
   const terminalCompletion = new Promise((resolve) => {
     resolveTerminalCompletion = resolve;
@@ -131,8 +132,10 @@ async function startProcessManagedRuntimeSession({
     conversationKey: conversationKey || originSessionId || sessionId,
     launchMode: launchMode || null,
     stopRequested: false,
+    stopPromise: null,
     startCompleted: false,
     suppressTerminalEvent: false,
+    agentEventsSuppressed: false,
     runtime: {
       kind: 'child_process',
       adapterId: runtime.kind || 'process',
@@ -147,57 +150,93 @@ async function startProcessManagedRuntimeSession({
       if (!child?.stdin) throw new Error('Managed process is not running.');
       child.stdin.write(`${String(text || '')}\n`);
     },
-    async stop(options = {}) {
+    applyStopOptions(options = {}) {
       if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
         runner.suppressTerminalEvent = true;
+        runner.agentEventsSuppressed = true;
+        agentEventsSuppressed = true;
       }
+    },
+    stop(options = {}) {
+      runner.applyStopOptions(options);
       runner.stopRequested = true;
-      if (!child) {
-        await finalizeTerminal(null, null, {
-          terminalState: 'failed:start-cancelled',
-        });
-        return;
+      if (runner.stopPromise) {
+        return runner.stopPromise;
       }
-      if (spawnFailed && terminalPromise) {
-        await terminalPromise;
-        return;
-      }
-      if (child.exitCode !== null || child.signalCode !== null) {
-        if (!terminalPromise) finalizeTerminal(child.exitCode, child.signalCode);
-        await terminalPromise;
-        return;
-      }
-      try {
-        child.kill();
-      } catch (error) {
-        runtimeError = runtimeError || error;
-        forwardRuntimeError(error);
-      }
-      if (!(await waitForTerminal(Math.max(1, Number(stopGraceTimeoutMs) || 5000)))) {
-        try {
-          child.kill('SIGKILL');
-        } catch (error) {
-          runtimeError = runtimeError || error;
-          forwardRuntimeError(error);
+      let attemptPromise = null;
+      attemptPromise = performRunnerStop().catch((error) => {
+        if (runner.stopPromise === attemptPromise) {
+          runner.stopPromise = null;
         }
-        await waitForTerminal(Math.max(1, Number(stopKillTimeoutMs) || 1000));
-      }
-      if (!terminalPromise) {
-        const error = new Error(
-          `Managed process did not confirm exit after ${Math.max(1, Number(stopGraceTimeoutMs) || 5000) + Math.max(1, Number(stopKillTimeoutMs) || 1000)}ms.`
-        );
-        error.code = 'session_stop_timeout';
-        error.processTreeFallbackRequired = true;
         throw error;
-      }
-      await terminalPromise;
+      });
+      runner.stopPromise = attemptPromise;
+      return attemptPromise;
     },
   };
 
   let terminalPromise = null;
+
+  function deliverEvent(event) {
+    return agentEventsSuppressed ? Promise.resolve(null) : postEvent(event);
+  }
+
+  async function awaitTerminalCleanup() {
+    try {
+      await terminalPromise;
+    } catch (error) {
+      if (agentEventsSuppressed && error?.terminalDeliveryFailure === true) {
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async function performRunnerStop() {
+    if (!child) {
+      await finalizeTerminal(null, null, {
+        terminalState: 'failed:start-cancelled',
+      });
+      return;
+    }
+    if (spawnFailed && terminalPromise) {
+      await awaitTerminalCleanup();
+      return;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      if (!terminalPromise) finalizeTerminal(child.exitCode, child.signalCode);
+      await awaitTerminalCleanup();
+      return;
+    }
+    try {
+      child.kill();
+    } catch (error) {
+      runtimeError = runtimeError || error;
+      forwardRuntimeError(error);
+    }
+    if (!(await waitForTerminal(Math.max(1, Number(stopGraceTimeoutMs) || 5000)))) {
+      try {
+        child.kill('SIGKILL');
+      } catch (error) {
+        runtimeError = runtimeError || error;
+        forwardRuntimeError(error);
+      }
+      await waitForTerminal(Math.max(1, Number(stopKillTimeoutMs) || 1000));
+    }
+    if (!terminalPromise) {
+      const error = new Error(
+        `Managed process did not confirm exit after ${Math.max(1, Number(stopGraceTimeoutMs) || 5000) + Math.max(1, Number(stopKillTimeoutMs) || 1000)}ms.`
+      );
+      error.code = 'session_stop_timeout';
+      error.processTreeFallbackRequired = true;
+      throw error;
+    }
+    await awaitTerminalCleanup();
+  }
+
   async function forwardRuntimeError(error) {
     try {
-      await postEvent({
+      await deliverEvent({
         type: 'session.error',
         hostId,
         sessionId,
@@ -223,7 +262,7 @@ async function startProcessManagedRuntimeSession({
       if (options.error) await forwardRuntimeError(options.error);
       if (!runner.suppressTerminalEvent) {
         try {
-          await postEvent({
+          await deliverEvent({
             type: 'session.state_changed',
             hostId,
             sessionId,
@@ -242,6 +281,7 @@ async function startProcessManagedRuntimeSession({
             ? postError
             : new Error(String(postError || 'Session terminal state delivery failed.'));
           retryError.retryCommand = true;
+          retryError.terminalDeliveryFailure = true;
           throw retryError;
         }
       }
@@ -272,8 +312,7 @@ async function startProcessManagedRuntimeSession({
       shell: false,
       windowsHide: true,
       env: {
-        ...process.env,
-        ...buildApiEnvironment(apiConfig),
+        ...buildApiProcessEnvironment(process.env, apiConfig),
         DEMO_BOOTSTRAP_JSON: JSON.stringify(bootstrap || null),
         DEMO_SESSION_LABEL: String(title || cwd || sessionId),
       },
@@ -289,7 +328,7 @@ async function startProcessManagedRuntimeSession({
   const stderr = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
 
   stdout.on('line', (line) => {
-    postEvent({
+    deliverEvent({
       type: 'session.output',
       hostId,
       sessionId,
@@ -303,7 +342,7 @@ async function startProcessManagedRuntimeSession({
   });
 
   stderr.on('line', (line) => {
-    postEvent({
+    deliverEvent({
       type: 'session.output',
       hostId,
       sessionId,
@@ -365,6 +404,8 @@ async function startManagedRuntimeSession(options) {
       cwd: options.cwd,
       launchMode: options.launchMode || null,
       nativeThreadId: options.nativeThreadId || null,
+      rebindNativeThreadId: options.rebindNativeThreadId || null,
+      explicitRebind: options.explicitRebind === true,
       codexHome: options.codexHome,
       apiConfig: options.apiConfig,
       apiBinding: options.apiBinding,

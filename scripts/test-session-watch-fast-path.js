@@ -28,6 +28,14 @@ function row(type, message, timestamp) {
   };
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-watch-fast-path-'));
   const codexHome = path.join(root, '.codex');
@@ -78,6 +86,66 @@ async function main() {
   assert.strictEqual(secondWatchResult.activeSessionCount, 1, 'switching watch targets should keep tail scope narrow');
   assert.strictEqual(secondWatchResult.emittedEvents, 1, 'only the currently watched rollout should emit new events');
   assert.deepStrictEqual(events.map((event) => event.sessionId), [sessionA, sessionB]);
+
+  tailer.setWatchedSessions([
+    { sessionId: sessionA, nativeThreadId: sessionA, rolloutPath: fileA, live: true },
+    { sessionId: sessionB, nativeThreadId: sessionB, rolloutPath: fileB, selected: true },
+  ]);
+  await tailer.poll();
+  appendJsonl(fileA, row('agent_message', 'live A must continue while B is selected', '2026-06-27T00:00:05.000Z'));
+  appendJsonl(fileB, row('agent_message', 'selected history B must update', '2026-06-27T00:00:06.000Z'));
+  const unionResult = await tailer.poll();
+  assert.strictEqual(unionResult.activeSessionCount, 2, 'the active scope should contain live plus selected history');
+  assert.deepStrictEqual(events.slice(-2).map((event) => event.sessionId), [sessionA, sessionB]);
+
+  tailer.setWatchedSessions([
+    { sessionId: sessionA, nativeThreadId: sessionA, rolloutPath: fileA, live: true },
+  ]);
+  appendJsonl(fileA, row('agent_message', 'live A remains after switching away', '2026-06-27T00:00:07.000Z'));
+  appendJsonl(fileB, row('agent_message', 'unselected history B must stop', '2026-06-27T00:00:08.000Z'));
+  const liveOnlyResult = await tailer.poll();
+  assert.strictEqual(liveOnlyResult.activeSessionCount, 1);
+  assert.strictEqual(events.at(-1).sessionId, sessionA, 'switching away must retain live A but drop history B');
+
+  tailer.setWatchedSessions([
+    { sessionId: sessionA, nativeThreadId: sessionA, rolloutPath: fileA, live: true },
+    { sessionId: sessionA, nativeThreadId: sessionA, rolloutPath: fileA, selected: true },
+  ]);
+  const dedupedResult = await tailer.poll();
+  assert.strictEqual(dedupedResult.activeSessionCount, 1, 'selected=live must deduplicate by rollout path');
+
+  const raceHome = path.join(root, '.codex-race');
+  const raceFileA = path.join(raceHome, 'sessions', '2026', '06', '27', `rollout-a-${sessionA}.jsonl`);
+  const raceFileB = path.join(raceHome, 'sessions', '2026', '06', '27', `rollout-b-${sessionB}.jsonl`);
+  writeJsonl(raceFileA, []);
+  writeJsonl(raceFileB, []);
+  const transportStarted = deferred();
+  const releaseTransport = deferred();
+  const raceEvents = [];
+  let shouldBlock = true;
+  const raceTailer = new CodexSessionTailer({
+    codexHome: raceHome,
+    hostId: 'race-host',
+    postEvents: async (batch) => {
+      raceEvents.push(...batch);
+      if (shouldBlock) {
+        shouldBlock = false;
+        transportStarted.resolve();
+        await releaseTransport.promise;
+      }
+    },
+  });
+  raceTailer.setWatchedSessions([{ sessionId: sessionA, nativeThreadId: sessionA, rolloutPath: raceFileA }]);
+  appendJsonl(raceFileA, row('agent_message', 'block old poll', '2026-06-27T00:01:00.000Z'));
+  const blockedPoll = raceTailer.poll();
+  await transportStarted.promise;
+  raceTailer.setWatchedSessions([{ sessionId: sessionB, nativeThreadId: sessionB, rolloutPath: raceFileB }]);
+  appendJsonl(raceFileB, row('agent_message', 'must survive old poll cleanup', '2026-06-27T00:01:01.000Z'));
+  releaseTransport.resolve();
+  await blockedPoll;
+  const raceResult = await raceTailer.poll();
+  assert.strictEqual(raceResult.emittedEvents, 1, 'a watch added during an older poll must not be re-primed at EOF');
+  assert.strictEqual(raceEvents.at(-1).sessionId, sessionB);
 
   fs.rmSync(root, { recursive: true, force: true });
   console.log('session watch fast-path assertions passed');

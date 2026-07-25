@@ -144,8 +144,40 @@ async function testEqualRevisionSnapshotForkFailsClosed() {
   await generationOnlyStore.close();
 }
 
+async function testInterruptedReplacementRecovery() {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-interrupted-replace-'));
+  const sentinelPath = path.join(rootDir, 'store-sentinel.json');
+  const store = await SessionRecordStore.open({
+    rootDir,
+    sentinelPath,
+    snapshotEvery: 1,
+  });
+  await store.transact('test.interrupted.replace.first', () => null);
+  await store.transact('test.interrupted.replace.second', () => null);
+  await store.close();
+
+  const canonicalPaths = [
+    path.join(rootDir, 'snapshot-current.json'),
+    path.join(rootDir, 'snapshot-previous.json'),
+    path.join(rootDir, 'wal-current.jsonl'),
+    sentinelPath,
+  ];
+  for (const canonicalPath of canonicalPaths) {
+    assert(fs.existsSync(canonicalPath), `fixture canonical file must exist: ${canonicalPath}`);
+    fs.renameSync(canonicalPath, `${canonicalPath}.interrupted.next.bak`);
+  }
+
+  const recovered = await SessionRecordStore.open({ rootDir, sentinelPath });
+  assert.strictEqual(recovered.readSnapshot().storeRevision, 2);
+  for (const canonicalPath of canonicalPaths) {
+    assert(fs.existsSync(canonicalPath), `startup must restore interrupted replacement: ${canonicalPath}`);
+  }
+  await recovered.close();
+}
+
 async function main() {
   await testEqualRevisionSnapshotForkFailsClosed();
+  await testInterruptedReplacementRecovery();
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-record-store-'));
   const legacyMetadataPath = path.join(rootDir, 'legacy-session-metadata.json');
   fs.writeFileSync(legacyMetadataPath, JSON.stringify({
@@ -348,29 +380,67 @@ async function main() {
     rootDir: snapshotFailureRoot,
     snapshotEvery: 1,
   });
+  const writeSnapshotAfterFailure = snapshotFailureStore.writeSnapshot.bind(snapshotFailureStore);
+  let snapshotAttempts = 0;
   snapshotFailureStore.writeSnapshot = async () => {
-    throw new Error('simulated snapshot failure with Bearer snapshot-secret-must-not-leak');
+    snapshotAttempts += 1;
+    if (snapshotAttempts === 1) {
+      throw new Error('simulated snapshot failure with Bearer snapshot-secret-must-not-leak');
+    }
+    return writeSnapshotAfterFailure();
   };
-  await assert.rejects(
-    snapshotFailureStore.transact('test.snapshot.failure', (tx) => {
-      const key = tx.resolveCanonicalKey({ hostId: 'host-failure', sessionId: 'session-failure' });
-      tx.ensureRecord(key, { hostId: 'host-failure', conversationKey: 'session-failure' });
-      tx.markDirty(key);
-    }),
-    (error) => error instanceof StoreRecoveryError
-      && error.code === 'session_store_snapshot_failed'
-      && !error.message.includes('snapshot-secret-must-not-leak'),
-    'automatic snapshot failure must be reported without leaking provider secrets'
+  await snapshotFailureStore.transact('test.snapshot.failure', (tx) => {
+    const key = tx.resolveCanonicalKey({ hostId: 'host-failure', sessionId: 'session-failure' });
+    tx.ensureRecord(key, { hostId: 'host-failure', conversationKey: 'session-failure' });
+    tx.markDirty(key);
+  });
+  assert.strictEqual(snapshotFailureStore.readSnapshot().storeRevision, 1);
+  assert.strictEqual(snapshotFailureStore.mutationsClosed, null);
+  assert.strictEqual(snapshotFailureStore.readHealth().status, 'degraded');
+  assert.strictEqual(snapshotFailureStore.readHealth().writable, true);
+  assert(
+    snapshotFailureStore.lastSnapshotError instanceof StoreRecoveryError
+      && snapshotFailureStore.lastSnapshotError.code === 'session_store_snapshot_failed'
+      && !snapshotFailureStore.lastSnapshotError.message.includes('snapshot-secret-must-not-leak'),
+    'a failed automatic checkpoint must be observable without leaking secrets or rejecting a durable commit'
   );
-  await assert.rejects(
-    snapshotFailureStore.transact('test.after.snapshot.failure', () => null),
-    (error) => error instanceof StoreRecoveryError && error.code === 'session_store_mutation_closed',
-    'automatic snapshot failure must fail later metadata mutations closed'
-  );
+  await snapshotFailureStore.transact('test.after.snapshot.failure', () => null);
+  assert.strictEqual(snapshotFailureStore.readSnapshot().storeRevision, 2);
+  assert.strictEqual(snapshotFailureStore.lastSnapshotError, null, 'a later checkpoint must clear degraded state');
+  assert.strictEqual(snapshotFailureStore.readHealth().status, 'ok');
   await snapshotFailureStore.close();
   const snapshotFailureRecovered = await SessionRecordStore.open({ rootDir: snapshotFailureRoot });
-  assert.strictEqual(snapshotFailureRecovered.readSnapshot().storeRevision, 1);
+  assert.strictEqual(snapshotFailureRecovered.readSnapshot().storeRevision, 2);
   await snapshotFailureRecovered.close();
+
+  const snapshotRestoreFailureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-snapshot-restore-failure-'));
+  const snapshotRestoreFailureStore = await SessionRecordStore.open({
+    rootDir: snapshotRestoreFailureRoot,
+    snapshotEvery: 1,
+  });
+  snapshotRestoreFailureStore.writeSnapshot = async () => {
+    const error = new Error('simulated replacement and restoration failure');
+    error.code = 'EBUSY';
+    error.recoveryPath = path.join(snapshotRestoreFailureRoot, 'snapshot-current.json.test.bak');
+    error.restoreError = new Error('simulated restoration failure');
+    throw error;
+  };
+  await snapshotRestoreFailureStore.transact('test.snapshot.restore.failure', () => null);
+  assert.strictEqual(
+    snapshotRestoreFailureStore.readSnapshot().storeRevision,
+    1,
+    'the revision is already committed before checkpoint restoration fails'
+  );
+  assert.strictEqual(snapshotRestoreFailureStore.readHealth().status, 'failed');
+  await assert.rejects(
+    snapshotRestoreFailureStore.transact('test.after.snapshot.restore.failure', () => null),
+    (error) => error instanceof StoreRecoveryError && error.code === 'session_store_mutation_closed',
+    'an unrestored canonical persistence file must stop the next mutation'
+  );
+  await snapshotRestoreFailureStore.close();
+  const snapshotRestoreFailureRecovered = await SessionRecordStore.open({ rootDir: snapshotRestoreFailureRoot });
+  assert.strictEqual(snapshotRestoreFailureRecovered.readSnapshot().storeRevision, 1);
+  await snapshotRestoreFailureRecovered.close();
 
   const walFailureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-wal-failure-'));
   const walFailureStore = await SessionRecordStore.open({
@@ -398,6 +468,8 @@ async function main() {
     'a WAL append failure must fail every later metadata mutation closed'
   );
   assert.strictEqual(walFailureStore.readSnapshot().storeRevision, 0);
+  assert.strictEqual(walFailureStore.readHealth().status, 'failed');
+  assert.strictEqual(walFailureStore.readHealth().writable, false);
   await walFailureStore.close();
 
   const sentinelRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-sentinel-'));
@@ -701,7 +773,7 @@ async function main() {
     'received-files',
     'local-agents',
     'remote-codex-askpass.cmd',
-    'codex-linux-x86_64',
+    'runtime-stage',
   ]) {
     assert(
       relaySource.includes(`path.join(RELAY_STATE_ROOT, '${relativePath}')`),

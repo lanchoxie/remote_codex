@@ -7,7 +7,9 @@ param(
   [switch]$DryRun,
   [switch]$Restart,
   [switch]$NoRestart,
-  [switch]$SkipPreflight
+  [switch]$SkipPreflight,
+  [ValidateRange(30, 600)]
+  [int]$RelayShutdownTimeoutSeconds = 120
 )
 
 $ErrorActionPreference = "Stop"
@@ -863,7 +865,10 @@ function Stop-VerifiedSiblingRelay {
     throw "Verified sibling Relay rejected its control token; refusing force takeover."
   }
   if ($gracefulRelayStop) {
-    Wait-ProcessExit -ProcessId ([int]$Candidate.RelayProcess.ProcessId) -TimeoutSeconds 30 | Out-Null
+    Write-Host "Waiting up to $RelayShutdownTimeoutSeconds seconds for sibling Relay persistence to close..."
+    Wait-ProcessExit `
+      -ProcessId ([int]$Candidate.RelayProcess.ProcessId) `
+      -TimeoutSeconds $RelayShutdownTimeoutSeconds | Out-Null
   } elseif (-not $DryRun) {
     Start-Sleep -Seconds 1
   }
@@ -871,7 +876,7 @@ function Stop-VerifiedSiblingRelay {
   if (-not $DryRun -and (Get-Process -Id ([int]$Candidate.RelayProcess.ProcessId) -ErrorAction SilentlyContinue)) {
     $currentListeners = @(Get-PortListenerProcessIds -LocalPort $LocalPort)
     if ($currentListeners.Count -eq 0) {
-      throw "Sibling Relay stopped listening but did not exit cleanly; refusing force takeover while persistence may still be closing."
+      throw "Sibling Relay stopped listening but is still closing persistence after $RelayShutdownTimeoutSeconds seconds. Refusing force takeover; wait for PID $($Candidate.RelayProcess.ProcessId) to exit, then retry."
     }
     $verifiedRelay = Assert-SiblingRelayCandidateUnchanged -Candidate $Candidate -LocalPort $LocalPort
     Stop-RepoProcesses -Name "relay" -Processes @($verifiedRelay)
@@ -1083,12 +1088,15 @@ if ($restartRequested) {
       throw "Current Relay rejected its control token; refusing force restart."
     }
     if ($gracefulRelayStop) {
-      Wait-ProcessExit -ProcessId ([int]$relayProcesses[0].ProcessId) -TimeoutSeconds 30 | Out-Null
+      Write-Host "Waiting up to $RelayShutdownTimeoutSeconds seconds for Relay persistence to close..."
+      Wait-ProcessExit `
+        -ProcessId ([int]$relayProcesses[0].ProcessId) `
+        -TimeoutSeconds $RelayShutdownTimeoutSeconds | Out-Null
     }
     if (-not $DryRun -and (Get-Process -Id ([int]$relayProcesses[0].ProcessId) -ErrorAction SilentlyContinue)) {
       $currentListeners = @(Get-PortListenerProcessIds -LocalPort $Port)
       if ($currentListeners.Count -eq 0) {
-        throw "Relay stopped listening but did not exit cleanly; refusing force restart while persistence may still be closing."
+        throw "Relay stopped listening but is still closing persistence after $RelayShutdownTimeoutSeconds seconds. Refusing force restart; wait for PID $($relayProcesses[0].ProcessId) to exit, then retry."
       }
       $currentRelay = Get-ProcessById -ProcessId ([int]$relayProcesses[0].ProcessId)
       if (

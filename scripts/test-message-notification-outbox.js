@@ -444,6 +444,194 @@ async function main() {
     'presented outbox retention must survive reopening'
   );
 
+  const oversizedId = alertIdFor('sanitized', 'oversized');
+  let sanitizedStorage = {};
+  const sanitized = new NotificationOutbox({
+    load: () => ({
+      version: 1,
+      items: {
+        [oversizedId]: {
+          canonicalConversationKey: 'sanitized',
+          assistantMessageId: 'oversized',
+          assistantSeq: 9,
+          previewText: 'x'.repeat(4000),
+          content: 'must not be persisted'.repeat(1000),
+          arbitraryProjectionPayload: { large: 'y'.repeat(4000) },
+          status: 'pending',
+          revision: 2,
+          updatedAt: '2026-07-16T09:00:00.000Z',
+        },
+      },
+    }),
+    save: (value) => { sanitizedStorage = JSON.parse(JSON.stringify(value)); },
+    now: () => '2026-07-16T10:00:00.000Z',
+  });
+  const sanitizedItem = sanitized.get(oversizedId);
+  assert.strictEqual(sanitizedItem.previewText.length, 280, 'notification previews must be bounded');
+  assert.strictEqual('content' in sanitizedItem, false, 'full message content must not enter the outbox');
+  assert.strictEqual(
+    'arbitraryProjectionPayload' in sanitizedItem,
+    false,
+    'projection-only fields must not enter the outbox'
+  );
+  assert.deepStrictEqual(
+    Object.keys(sanitizedStorage.items[oversizedId]).sort(),
+    [
+      'alertId',
+      'assistantAt',
+      'assistantMessageId',
+      'assistantSeq',
+      'canonicalConversationKey',
+      'hostId',
+      'previewText',
+      'revision',
+      'sessionId',
+      'status',
+      'updatedAt',
+    ],
+    'durable outbox items must contain only notification fields'
+  );
+  sanitizedStorage.items[oversizedId].lateLegacyPayload = 'q'.repeat(4000);
+  sanitized.reload();
+  assert.strictEqual(
+    'lateLegacyPayload' in sanitizedStorage.items[oversizedId],
+    false,
+    'reload must compact oversized data written by an older browser tab'
+  );
+
+  let byteBoundedStorage = {};
+  const byteBounded = new NotificationOutbox({
+    load: () => ({}),
+    save: (value) => { byteBoundedStorage = JSON.parse(JSON.stringify(value)); },
+    now: () => '2026-07-16T10:00:00.000Z',
+    byteLimit: 4096,
+  });
+  byteBounded.batch((target) => {
+    for (let index = 0; index < 50; index += 1) {
+      target.enqueue({
+        canonicalConversationKey: 'byte-budget',
+        assistantMessageId: `byte-${index}`,
+        assistantSeq: index + 1,
+        previewText: 'z'.repeat(280),
+      });
+    }
+  });
+  assert(
+    Buffer.byteLength(JSON.stringify(byteBoundedStorage), 'utf8') <= 4096,
+    'serialized outbox state must stay inside its byte budget'
+  );
+  assert(
+    Object.keys(byteBoundedStorage.items).length > 0
+      && Object.keys(byteBoundedStorage.items).length < 50,
+    'byte pruning must retain the newest notifications that fit'
+  );
+  assert(
+    byteBounded.get(alertIdFor('byte-budget', 'byte-49')),
+    'byte pruning must prefer the newest pending notification'
+  );
+
+  const quotaError = () => Object.assign(
+    new Error("Failed to execute 'setItem' on 'Storage': exceeded the quota."),
+    { name: 'QuotaExceededError' }
+  );
+  let quotaRetryStorage = {};
+  let quotaRetrySaves = 0;
+  let quotaRetryClears = 0;
+  let quotaRecoveries = 0;
+  const quotaRetry = new NotificationOutbox({
+    load: () => quotaRetryStorage,
+    save: (value) => {
+      quotaRetrySaves += 1;
+      if (quotaRetrySaves === 1) throw quotaError();
+      quotaRetryStorage = JSON.parse(JSON.stringify(value));
+    },
+    clear: () => {
+      quotaRetryClears += 1;
+      quotaRetryStorage = {};
+    },
+    onQuotaRecovered: () => { quotaRecoveries += 1; },
+  });
+  quotaRetry.enqueue({ ...message, assistantMessageId: 'quota-retry' });
+  assert.strictEqual(quotaRetrySaves, 2, 'quota recovery must retry one compacted write');
+  assert.strictEqual(quotaRetryClears, 0, 'a successful compacted retry must preserve durable storage continuity');
+  assert.strictEqual(quotaRecoveries, 1, 'a recovered quota write must request a local drain follow-up');
+  assert.strictEqual(quotaRetry.isPersistenceDisabled(), false, 'a successful compacted retry stays durable');
+
+  let reclaimedQuotaStorage = {};
+  let reclaimedQuotaSaves = 0;
+  let reclaimedQuotaClears = 0;
+  let reclaimedQuotaRecoveries = 0;
+  const reclaimedQuota = new NotificationOutbox({
+    load: () => reclaimedQuotaStorage,
+    save: (value) => {
+      reclaimedQuotaSaves += 1;
+      if (reclaimedQuotaSaves < 3) throw quotaError();
+      reclaimedQuotaStorage = JSON.parse(JSON.stringify(value));
+    },
+    clear: () => {
+      reclaimedQuotaClears += 1;
+      reclaimedQuotaStorage = {};
+    },
+    onQuotaRecovered: () => { reclaimedQuotaRecoveries += 1; },
+  });
+  reclaimedQuota.enqueue({ ...message, assistantMessageId: 'quota-after-clear' });
+  assert.strictEqual(reclaimedQuotaSaves, 3);
+  assert.strictEqual(reclaimedQuotaClears, 1);
+  assert.strictEqual(reclaimedQuotaRecoveries, 1);
+  assert.strictEqual(reclaimedQuota.isPersistenceDisabled(), false);
+  assert.strictEqual(Object.keys(reclaimedQuotaStorage.items).length, 1);
+
+  let persistentQuotaSaves = 0;
+  let persistentQuotaErrors = 0;
+  let persistentQuotaClears = 0;
+  let persistenceDisabledCalls = 0;
+  const persistentQuota = new NotificationOutbox({
+    load: () => ({}),
+    save: () => {
+      persistentQuotaSaves += 1;
+      throw quotaError();
+    },
+    clear: () => { persistentQuotaClears += 1; },
+    onPersistError: () => { persistentQuotaErrors += 1; },
+    onPersistenceDisabled: () => { persistenceDisabledCalls += 1; },
+  });
+  persistentQuota.enqueue({ ...message, assistantMessageId: 'persistent-quota-1' });
+  assert.strictEqual(
+    persistentQuotaSaves,
+    3,
+    'persistent quota errors must stop after one compacted retry and one post-clear write'
+  );
+  assert.strictEqual(persistentQuotaClears, 1, 'persistent quota must remove its oversized durable snapshot');
+  assert.strictEqual(persistentQuotaErrors, 0, 'quota exhaustion must not enter the ordinary error retry path');
+  assert.strictEqual(persistenceDisabledCalls, 1, 'persistent quota must switch the page to memory storage once');
+  assert.strictEqual(persistentQuota.isPersistenceDisabled(), true);
+  persistentQuota.enqueue({ ...message, assistantMessageId: 'persistent-quota-2' });
+  assert.strictEqual(
+    persistentQuotaSaves,
+    3,
+    'the in-memory fallback must not create a repeated localStorage write storm'
+  );
+  let unelectedPresentations = 0;
+  await assert.rejects(drainOutboxWithElection({
+    navigator: {},
+    storage: {
+      getItem: () => null,
+      setItem: () => { throw quotaError(); },
+    },
+    ownerId: 'quota-tab',
+    outbox: persistentQuota,
+    presenters: {
+      presentInApp: async () => { unelectedPresentations += 1; },
+      presentSystem: async () => ({ explicitlyUnavailable: true }),
+      advanceNotified: async () => {},
+    },
+  }), /quota/i);
+  assert.strictEqual(
+    unelectedPresentations,
+    0,
+    'a storage-full tab must not bypass cross-tab election and present duplicate notifications'
+  );
+
   const sharedValues = new Map();
   const sharedOptions = {
     load: () => JSON.parse(sharedValues.get('outbox') || '{}'),

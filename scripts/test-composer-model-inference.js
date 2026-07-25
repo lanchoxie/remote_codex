@@ -27,8 +27,8 @@ assert(
 );
 
 assert(
-  inferSession.includes("model: runtime.model || latestTurnControl?.data?.model || session.codexOptions?.model || ''"),
-  'Codex model inference should only use structured runtime, turn/start, or session codexOptions'
+  inferSession.includes("model: runtime.model || latestTurnControl?.data?.model || session.codexOptions?.model || session.requestedSelection?.model || ''"),
+  'Codex model inference should only use structured runtime, turn/start, session options, or requested selection'
 );
 
 assert(

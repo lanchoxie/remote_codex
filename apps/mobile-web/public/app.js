@@ -28,6 +28,14 @@ const state = {
   eventSourceKey: null,
   eventCursorByCanonical: new Map(),
   streamRecoveryInFlight: false,
+  streamDetailRecoveryInFlight: false,
+  streamDetailRecoveryPendingKey: null,
+  streamActivityRecoveryPendingKeys: new Set(),
+  streamDetailRecoveryRetryTimer: null,
+  streamDetailRecoveryRetryKey: null,
+  streamDetailRecoveryRetryAttempt: 0,
+  streamDetailRecoveryCanonicalKeys: new Map(),
+  activitySnapshotRecoveryTasks: new Map(),
   transcripts: new Map(),
   alerts: new Map(),
   dismissedAlerts: new Map(),
@@ -37,14 +45,17 @@ const state = {
   receivedFiles: new Map(),
   receivedFilesLoadingKeys: new Set(),
   streamStatus: new Map(),
-  activityProjection: window.RemoteCodexTranscriptState?.createTranscriptActivityProjection?.() || null,
+  activityProjection: window.RemoteCodexTranscriptState?.createTranscriptActivityProjection?.({
+    onConversationRemoved: (canonicalKey) => forgetActivityCanonicalConversation(canonicalKey),
+  }) || null,
   activityCanonicalKeysBySession: new Map(),
   thinkingPanels: new Map(),
   thinkingScrollPositions: new Map(),
-  thinkingScrollVersions: new Map(),
-  thinkingScrollMachines: new Map(),
+  thinkingScrollMachines: new WeakMap(),
   thinkingEntryCounts: new Map(),
+  thinkingEntryVersions: new Map(),
   thinkingUnread: new Set(),
+  thinkingDisclosures: new Map(),
   messageReceiptStore: null,
   legacyMessageReadReceipts: {},
   assistantProjections: new Map(),
@@ -79,7 +90,10 @@ const state = {
   transcriptVisibleLimits: new Map(),
   fullTranscriptLoaded: new Set(),
   historyLoading: new Set(),
-  watchedSessionKey: null,
+  shownSessionKey: null,
+  sessionWatchController: null,
+  sessionWatchCatchUpRequired: false,
+  sessionWatchHiddenAt: 0,
   watchClientId: null,
   manualSessionTitles: new Map(),
   alertWindowOpen: false,
@@ -179,6 +193,10 @@ const state = {
   },
   apiPingResults: new Map(),
   apiPingBusyHosts: new Set(),
+  apiProfileModelCatalogs: new Map(),
+  apiProfileModelCatalogHostId: '',
+  apiProfileModelCatalogRequests: new Map(),
+  apiProfileModelCatalogPersistenceError: '',
   apiProfileBackup: {
     open: false,
     mode: 'export',
@@ -192,8 +210,9 @@ const state = {
   },
   localAgentActionBusyId: null,
   hostRestartBusyId: null,
-  sessionLaunchBusy: null,
+  sessionLaunchBusy: new Map(),
   sessionApiRebindBusyKeys: new Set(),
+  sessionRebindFailures: new Map(),
   sessionTranscriptFallbackBusyKeys: new Set(),
   imagePreview: {
     open: false,
@@ -211,6 +230,11 @@ const state = {
     sessions: [],
     selectedKeys: new Set(),
     busy: false,
+    profileId: '',
+    phase: 'select',
+    resultsByKey: new Map(),
+    operationId: 0,
+    selection: null,
   },
   exportDialog: {
     open: false,
@@ -253,9 +277,8 @@ const state = {
   codexControls: {
     modelCatalogByKey: new Map(),
     modelOptionsLoadingKeys: new Set(),
+    modelOptionsErrorsByKey: new Map(),
     modelOptionsRetryAfterBySession: new Map(),
-    rebindTargetProfileBySession: new Map(),
-    rebindTargetIdentityBySession: new Map(),
     skillOptionsBySession: new Map(),
     skillOptionsLoadingKeys: new Set(),
     skillOptionsRetryAfterBySession: new Map(),
@@ -266,12 +289,17 @@ const state = {
     modelsLoading: false,
     steerQueue: [],
     queueAutoSendScheduled: false,
+    composerDraftsBySession: new Map(),
+    composerSessionKeyAliases: new Map(),
+    mountedComposerSessionKey: '',
+    mountingComposerDraft: false,
     activeDraftsBySession: new Map(),
     pendingComposerDraftsBySession: new Map(),
     composerSubmissionsBySession: new Map(),
     inputAnswersByRequest: new Map(),
     recentSubmissions: new Map(),
     steerNotice: null,
+    apiSwitchNoticesBySession: new Map(),
   },
   slashMenu: {
     open: false,
@@ -293,6 +321,13 @@ const state = {
 
 const STREAM_HEALTH_CHECK_MS = 15_000;
 const STREAM_STALE_RECONNECT_MS = 65_000;
+const SESSION_WATCH_RENEW_MS = 10_000;
+const ACTIVITY_SNAPSHOT_RECOVERY_DEBOUNCE_MS = 250;
+const ACTIVITY_SNAPSHOT_RECOVERY_MAX_WAIT_MS = 2_000;
+const ACTIVITY_SNAPSHOT_RECOVERY_MAX_TARGETS = 8;
+const ACTIVITY_SNAPSHOT_RECOVERY_RETRY_MAX_MS = 30_000;
+const STREAM_RECOVERY_FETCH_TIMEOUT_MS = 30_000;
+const ACTIVITY_CANONICAL_ALIAS_LIMIT = 512;
 
 const DEFAULT_COLLECTION_ID = 'default';
 const TRASH_COLLECTION_ID = 'trash';
@@ -305,6 +340,7 @@ const MAX_COMPOSER_UPLOAD_FILES = 8;
 const MAX_COMPOSER_UPLOAD_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const COMPOSER_DRAFT_SESSION_LIMIT = 32;
 const TRANSCRIPT_RENDER_WINDOW = 160;
 const TRANSCRIPT_RENDER_INCREMENT = 160;
 const TRANSCRIPT_RENDER_MIN_WINDOW = 32;
@@ -320,7 +356,9 @@ const UI_EVENT_RENDER_DEBOUNCE_MS = 80;
 const TRANSCRIPT_EVENT_RENDER_DEBOUNCE_MS = 160;
 const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
 const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
+const API_PROFILE_MODEL_CATALOGS_STORAGE_KEY = 'mobile-codex-remote.api-profile-model-catalogs.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
+const SESSION_REBIND_FAILURES_STORAGE_KEY = 'mobile-codex-remote.session-rebind-failures.v1';
 const DISMISSED_ALERTS_STORAGE_KEY = 'mobile-codex-remote.dismissed-alerts.v1';
 const MANUAL_SESSION_TITLES_STORAGE_KEY = 'mobile-codex-remote.manual-session-titles.v1';
 const LEGACY_MESSAGE_READ_RECEIPTS_STORAGE_KEY = 'mobile-codex-remote.message-read-receipts.v1';
@@ -333,11 +371,14 @@ const MESSAGE_NOTIFICATION_LOCK_DB_NAME = 'mobile-codex-remote.notification-lock
 const MESSAGE_NOTIFICATION_LOCK_STORE_NAME = 'locks';
 const MESSAGE_NOTIFICATION_CHANNEL_NAME = 'mobile-codex-remote.message-notifications.v1';
 const MESSAGE_NOTIFICATION_BROADCAST_DEBOUNCE_MS = 80;
+const OPENAI_OFFICIAL_BASE_URL = 'https://api.openai.com/v1';
 const ASSISTANT_PROJECTION_PAGE_LIMIT = 100;
 const ASSISTANT_PROJECTION_MAX_RESTARTS = 3;
 const DEFAULT_COMPOSER_OPTIONS = {
   model: '',
   effort: '',
+  effortMode: 'auto',
+  allowUnverifiedEffort: false,
   summary: '',
   mode: 'default',
   approvalPolicy: 'on-request',
@@ -356,9 +397,17 @@ const DEFAULT_UI_SETTINGS = {
     profileId: 'default',
     label: 'OpenAI',
     provider: 'OpenAI',
+    providerKind: 'openai',
     baseUrl: '',
     apiKey: '',
     rememberApiKey: true,
+    sessionDefaults: {
+      model: '',
+      effortMode: 'auto',
+      effort: '',
+      allowUnverifiedEffort: false,
+      summary: '',
+    },
   }],
 };
 const UI_TEXT = {
@@ -381,14 +430,14 @@ const UI_TEXT = {
     'settings.hostsTitle': 'Hosts and connectors',
     'settings.hostsCopy': 'Manage connected hosts, import a host id, or open HPC connector profiles.',
     'settings.sessionDefaultsTitle': 'Selected Session',
-    'settings.sessionDefaultsCopy': 'Model and runtime controls target the selected Session. The browser default below is used only for new Sessions.',
+    'settings.sessionDefaultsCopy': 'Review the selected Session binding and configure advanced run settings.',
     'settings.apiTitle': 'API profiles',
     'settings.apiCopy': 'Create API profiles and choose the browser default for each Host\'s new Sessions.',
     'settings.profileSelect': 'Editing profile',
     'settings.addProfile': 'New profile',
     'settings.deleteProfile': 'Delete profile',
     'settings.profileName': 'Profile name',
-    'settings.apiProvider': 'Provider label',
+    'settings.apiProvider': 'Provider',
     'settings.api-base-url': 'Base URL',
     'settings.api-key': 'API key',
     'settings.defaultProfile': 'New Session default API profile',
@@ -396,6 +445,17 @@ const UI_TEXT = {
     'settings.hostMappingCopy': 'Each Host can use the browser default profile or a dedicated profile for new Sessions.',
     'settings.rememberKey': 'Remember API key in this browser',
     'settings.apiRestartTip': 'Host mappings are defaults for new Sessions only. Existing Sessions keep their run binding; use Session Rebind to change provider or Base URL.',
+    'settings.useDetectedV1': 'Use detected /v1',
+    'settings.detectedV1Status': 'The Host validated {baseUrl}. Apply the detected /v1 before requesting models again.',
+    'settings.autoModel': 'Auto model',
+    'settings.autoThinking': 'Auto thinking',
+    'settings.defaultSummary': 'Default summary',
+    'models.refreshCurrent': 'Refresh current models',
+    'models.loadingCurrent': 'Loading...',
+    'models.currentLabel': 'Current Session models',
+    'models.sessionLabel': 'Session models',
+    'models.autoRuntimeAvailable': 'Auto / runtime default ({count} available)',
+    'settings.applyCurrentSessionToLive': 'Apply current Session settings to other live Sessions',
     'settings.apiWarning': 'Do not use this on an untrusted relay or shared browser. The key is sent through your relay when starting a session.',
     'settings.clearKey': 'Clear API key',
     'settings.clearKeyConfirm': 'Clear the API key for "{profile}"? This removes it from this browser only. Already running sessions keep their current environment.',
@@ -410,6 +470,27 @@ const UI_TEXT = {
     'top.alerts': 'Alerts',
     'session.endConfirm': 'End this live Codex session? The history stays available and can be resumed later.',
     'session.endAlreadyClosed': 'This conversation is already history only.',
+    'session.rebindConfirmTitle': 'Rebind this Session?',
+    'session.rebindConfirmFrom': 'From: {binding}',
+    'session.rebindConfirmTo': 'To: {binding}',
+    'session.rebindConfirmEndpoint': 'Final /responses endpoint: {endpoint}',
+    'session.rebindRestartWarning': 'This stops and restarts the Session. It will proceed only while the current turn is idle.',
+    'session.apiSwitchCanceled': 'API switch canceled. The current API was kept.',
+    'session.apiSwitchSuccess': 'API switched to {target}; the Session restarted successfully.',
+    'session.apiSwitchSuccessSelection': 'API switched to {target}; next model is {model} and thinking is Auto.',
+    'session.apiSwitchWaitIdle': 'Finish or stop the current turn before switching API.',
+    'session.apiSwitchBusy': 'Checking the API and restarting this Session...',
+    'session.turnControlsUnsupported': 'This runtime does not support per-turn model or thinking controls.',
+    'session.nextTurnSelection': 'Next turn: {model} | thinking {effort}',
+    'session.runningSelection': 'Running: {model} | thinking {effort}. Changes below apply to a later turn.',
+    'session.rebindFailed': 'The previous Rebind to {target} failed.',
+    'session.rebindResumePrevious': 'Resume will use the last successful binding: {binding}.',
+    'session.rebindContinue': 'Continue?',
+    'session.hostEnvironment': 'Host environment',
+    'session.unknownApiBinding': 'Unknown API binding',
+    'session.endpointUnavailable': 'Unavailable',
+    'session.batchApplySuccess': 'Applied the current Session settings and restarted {count} live Session(s) successfully.',
+    'session.batchApplyPartial': 'Batch apply finished: {success} succeeded; {failed} need attention.',
   },
   'zh-CN': {
     'common.close': '关闭',
@@ -430,10 +511,10 @@ const UI_TEXT = {
     'settings.hostsTitle': 'Host 与连接器',
     'settings.hostsCopy': '管理已连接的 host、导入 host id，或打开 HPC 连接器配置。',
     'settings.sessionDefaultsTitle': '当前 Session',
-    'settings.sessionDefaultsCopy': '模型与运行设置仅作用于当前选中的 Session；下方浏览器默认 API 只用于新 Session。',
+    'settings.sessionDefaultsCopy': '查看当前 Session 的实际 API 绑定，并配置高级运行参数。',
     'settings.apiTitle': 'API 配置',
     'settings.apiCopy': '创建 API 配置，并为每个 Host 的新 Session 选择当前浏览器默认值。',
-    'settings.apiProvider': '提供方标签',
+    'settings.apiProvider': '提供方',
     'settings.api-base-url': 'Base URL',
     'settings.api-key': 'API Key',
     'settings.profileSelect': '正在编辑',
@@ -445,6 +526,17 @@ const UI_TEXT = {
     'settings.hostMappingCopy': '每个 Host 可为新 Session 使用浏览器默认配置或指定专用配置。',
     'settings.rememberKey': '在当前浏览器记住 API Key',
     'settings.apiRestartTip': 'Host 映射只用于新 Session；现有 Session 保留原 run binding。更换提供方或 Base URL 请使用 Session Rebind。',
+    'settings.useDetectedV1': '使用检测到的 /v1',
+    'settings.detectedV1Status': 'Host 已验证 {baseUrl}。请先应用检测到的 /v1，再重新请求模型。',
+    'settings.autoModel': '自动模型',
+    'settings.autoThinking': '自动推理强度',
+    'settings.defaultSummary': '默认摘要',
+    'models.refreshCurrent': '刷新当前模型',
+    'models.loadingCurrent': '正在加载...',
+    'models.currentLabel': '当前 Session 模型',
+    'models.sessionLabel': 'Session 模型',
+    'models.autoRuntimeAvailable': '自动 / 运行时默认（{count} 个可用）',
+    'settings.applyCurrentSessionToLive': '将当前 Session 设置应用到其他 live Session',
     'settings.apiWarning': '不要在不可信 relay 或共享浏览器上使用。启动会话时，这个 key 会经过你的 relay 发送到对应 host。',
     'settings.clearKey': '清除 API Key',
     'settings.clearKeyConfirm': '确定清除“{profile}”的 API Key 吗？这只会从当前浏览器移除。已经运行中的 session 会继续使用当前环境。',
@@ -459,9 +551,44 @@ const UI_TEXT = {
     'top.alerts': '提醒',
     'session.endConfirm': '结束当前 live Codex 会话？历史仍然保留，之后可以继续 Resume。',
     'session.endAlreadyClosed': '这个对话已经是历史状态。',
+    'session.rebindConfirmTitle': '重新绑定这个 Session？',
+    'session.rebindConfirmFrom': '当前：{binding}',
+    'session.rebindConfirmTo': '目标：{binding}',
+    'session.rebindConfirmEndpoint': '最终 /responses 地址：{endpoint}',
+    'session.rebindRestartWarning': '这会停止并重启当前 Session；只有当前轮次空闲时才会继续。',
+    'session.apiSwitchCanceled': '已取消切换 API，当前 API 保持不变。',
+    'session.apiSwitchSuccess': '已切换到 {target}，Session 重启成功。',
+    'session.apiSwitchSuccessSelection': '已切换到 {target}；下一轮模型为 {model}，推理强度为 Auto。',
+    'session.apiSwitchWaitIdle': '请先等待当前轮次完成或停止当前轮次，再切换 API。',
+    'session.apiSwitchBusy': '正在检查 API 并重启当前 Session...',
+    'session.turnControlsUnsupported': '当前运行器不支持逐轮模型或推理强度设置。',
+    'session.nextTurnSelection': '下一轮：{model} | 推理 {effort}',
+    'session.runningSelection': '当前运行：{model} | 推理 {effort}。下方修改将用于之后的轮次。',
+    'session.rebindFailed': '上次重新绑定到 {target} 失败。',
+    'session.rebindResumePrevious': '继续会使用最近一次成功的绑定：{binding}。',
+    'session.rebindContinue': '是否继续？',
+    'session.hostEnvironment': 'Host 环境',
+    'session.unknownApiBinding': '未知 API 绑定',
+    'session.endpointUnavailable': '不可用',
+    'session.batchApplySuccess': '已成功将当前 Session 设置应用到 {count} 个 live Session 并完成重启。',
+    'session.batchApplyPartial': '批量应用完成：成功 {success} 个，另有 {failed} 个需要处理。',
   },
 };
 const ZH_STATIC_TEXT = {
+  'API': 'API',
+  'Next model': '下一轮模型',
+  'Next thinking': '下一轮推理强度',
+  'Restart Session with the current API profile': '使用当前 API 配置重启 Session',
+  'Refresh current Session models': '刷新当前 Session 模型',
+  'Select a Session to configure its runtime.': '选择 Session 后配置运行参数。',
+  'Target API': '目标 API',
+  'Run settings': '运行设置',
+  'Current Session settings': '当前 Session 设置',
+  'Current Session model': '当前 Session 模型',
+  'Model': '模型',
+  'Thinking': '推理强度',
+  'Custom model ID': '自定义模型 ID',
+  'Custom model ID...': '自定义模型 ID...',
   'Relay Locked': 'Relay 已锁定',
   'Sign in': '登录',
   'This protects your Codex hosts when the relay is reachable from a phone, Tailscale, or another network.': '当 relay 可以从手机、Tailscale 或其他网络访问时，这会保护你的 Codex hosts。',
@@ -501,6 +628,8 @@ const ZH_STATIC_TEXT = {
   'Browse': '浏览',
   'Optional conversation title': '可选对话标题',
   'New In Directory': '在目录中新建',
+  'Creating Session...': '正在创建会话...',
+  'A Session is already being created for this Host and path. Please wait.': '正在为这个 Host 和路径创建会话，请勿重复点击。',
   'Use Selected Path': '使用所选路径',
   'New collection name': '新收藏夹名称',
   'Add': '添加',
@@ -928,9 +1057,14 @@ function readLocalStorageJson(key, fallback) {
 
 function writeLocalStorageJson(key, value) {
   try {
-    window.localStorage?.setItem(key, JSON.stringify(value));
+    if (!window.localStorage) {
+      return false;
+    }
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
   } catch (_) {
     // Local storage may be unavailable in private or restricted browsers.
+    return false;
   }
 }
 
@@ -938,17 +1072,85 @@ function makeApiProfileId() {
   return `api-${makeClientId()}`;
 }
 
+const REASONING_EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
+function providerCapabilitiesRegistry() {
+  return window.RemoteCodexProviderCapabilities || null;
+}
+
+function inferApiProviderKind(input = {}) {
+  const registry = providerCapabilitiesRegistry();
+  if (registry?.inferProviderKind) {
+    return registry.inferProviderKind(input);
+  }
+  const explicit = String(input?.providerKind || '').trim().toLowerCase();
+  if (['openai', 'anthropic', 'gemini', 'custom'].includes(explicit)) {
+    return explicit;
+  }
+  const label = String(input?.provider || input || '').trim().toLowerCase();
+  if (label === 'openai') return 'openai';
+  if (label === 'anthropic' || label === 'claude') return 'anthropic';
+  if (label === 'gemini' || label === 'google gemini') return 'gemini';
+  return 'custom';
+}
+
+function canonicalProviderLabel(providerKind, customLabel = '') {
+  const registry = providerCapabilitiesRegistry();
+  const option = registry?.getProviderOption?.(providerKind);
+  if (providerKind === 'custom') {
+    return String(customLabel || option?.canonicalProvider || 'Custom').trim() || 'Custom';
+  }
+  return option?.canonicalProvider
+    || ({ openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini' }[providerKind])
+    || 'Custom';
+}
+
+function normalizeSessionDefaults(input = {}) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const effort = String(source.effort || '').trim().toLowerCase();
+  const validEffort = REASONING_EFFORT_PATTERN.test(effort) ? effort : '';
+  const requestedMode = String(source.effortMode || '').trim().toLowerCase();
+  const effortMode = ['auto', 'manual'].includes(requestedMode)
+    ? requestedMode
+    : validEffort ? 'manual' : 'auto';
+  return {
+    model: String(source.model || '').trim(),
+    effortMode,
+    effort: effortMode === 'manual' ? validEffort : '',
+    allowUnverifiedEffort: effortMode === 'manual' && Boolean(validEffort) && source.allowUnverifiedEffort === true,
+    summary: ['auto', 'concise', 'detailed', 'none'].includes(String(source.summary || '').trim())
+      ? String(source.summary || '').trim()
+      : '',
+  };
+}
+
+function formatSessionDefaultsSummary(input = {}) {
+  const defaults = normalizeSessionDefaults(input);
+  return [
+    defaults.model || t('settings.autoModel'),
+    defaults.effort ? reasoningEffortLabel(defaults.effort) : t('settings.autoThinking'),
+    defaults.summary || t('settings.defaultSummary'),
+  ].join(' | ');
+}
+
 function normalizeApiProfile(input = {}, index = 0) {
   const fallback = DEFAULT_UI_SETTINGS.apiProfiles[0];
   const profileId = String(input.profileId || input.id || (index === 0 ? fallback.profileId : makeApiProfileId())).trim() || makeApiProfileId();
   const label = String(input.label || input.name || input.provider || (index === 0 ? fallback.label : `API Profile ${index + 1}`)).trim();
+  const hasProviderIdentity = Boolean(String(input.providerKind || input.provider || '').trim());
+  const providerKind = inferApiProviderKind(hasProviderIdentity ? input : fallback);
+  const provider = String(input.provider || '').trim();
   return {
     profileId,
     label: label || `API Profile ${index + 1}`,
-    provider: String(input.provider || fallback.provider).trim() || fallback.provider,
+    providerKind,
+    // provider participates in the API binding fingerprint. Preserve legacy
+    // labels during migration; providerKind is capability metadata only.
+    provider: provider || canonicalProviderLabel(providerKind),
     baseUrl: String(input.baseUrl || '').trim(),
     apiKey: String(input.apiKey || ''),
     rememberApiKey: input.rememberApiKey !== false || Boolean(input.apiKey),
+    sessionDefaults: normalizeSessionDefaults(input.sessionDefaults),
   };
 }
 
@@ -1075,6 +1277,139 @@ function persistManualSessionTitles() {
   writeLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, serializeManualSessionTitles());
 }
 
+function normalizedBrowserSecretKey(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function isBrowserSecretQueryKey(value) {
+  const key = normalizedBrowserSecretKey(value);
+  if (!key || key === 'tokenbudget') {
+    return false;
+  }
+  return key === 'auth'
+    || key === 'password'
+    || key === 'passwd'
+    || key === 'secret'
+    || key === 'authorization'
+    || key === 'proxyauthorization'
+    || key === 'cookie'
+    || key === 'setcookie'
+    || key === 'accesskey'
+    || key === 'secretkey'
+    || key === 'accountkey'
+    || key === 'storagekey'
+    || key === 'encryptionkey'
+    || key === 'connectionstring'
+    || /^(?:aws)?(?:accesskeyid|secretaccesskey)$/.test(key)
+    || /(?:apikey|token|password|passwd|secret|credential|credentials|authorization|privatekey|signingkey|cookie)$/.test(key)
+    || key === 'key'
+    || key === 'sig'
+    || key === 'signature'
+    || key === 'code'
+    || /key$/.test(key)
+    || /signature$/.test(key);
+}
+
+function browserSafeUrl(value, maxLength = 600) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    const url = new URL(raw);
+    if (url.username || url.password) {
+      return null;
+    }
+    for (const key of [...url.searchParams.keys()]) {
+      if (isBrowserSecretQueryKey(key)) {
+        url.searchParams.delete(key);
+      }
+    }
+    url.hash = '';
+    return url.toString().slice(0, maxLength) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserSafeApiBinding(value) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const kind = ['profile', 'host_environment', 'unknown'].includes(String(value.kind || ''))
+    ? String(value.kind)
+    : 'unknown';
+  return {
+    kind,
+    profileId: kind === 'profile' ? String(value.profileId || '').trim().slice(0, 120) || null : null,
+    label: String(value.label || '').trim().slice(0, 120) || null,
+    provider: String(value.provider || '').trim().slice(0, 80) || null,
+    providerKind: String(value.providerKind || '').trim().toLowerCase().slice(0, 32) || null,
+    normalizedBaseUrl: browserSafeUrl(value.normalizedBaseUrl || value.baseUrl, 500),
+    modelProviderHint: kind === 'host_environment'
+      ? String(value.modelProviderHint || '').trim().slice(0, 120) || null
+      : null,
+    bindingFingerprint: String(value.bindingFingerprint || '').trim().slice(0, 128) || null,
+  };
+}
+
+function browserSafeRebindTarget(value) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  return {
+    kind: value.kind === 'host_environment' ? 'host_environment' : 'profile',
+    profileId: String(value.profileId || '').trim().slice(0, 120) || null,
+    label: String(value.label || '').trim().slice(0, 120) || null,
+    provider: String(value.provider || '').trim().slice(0, 80) || null,
+    providerKind: String(value.providerKind || '').trim().toLowerCase().slice(0, 32) || null,
+    baseUrl: browserSafeUrl(value.baseUrl, 500),
+    responsesEndpoint: browserSafeUrl(value.responsesEndpoint, 600)
+      || (value.kind === 'host_environment' ? 'Host-resolved /responses endpoint' : null),
+  };
+}
+
+function normalizeSessionRebindFailures(input = {}) {
+  const result = new Map();
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return result;
+  }
+  for (const [rawKey, rawValue] of Object.entries(input)) {
+    const key = String(rawKey || '').trim();
+    const hostId = String(rawValue?.hostId || '').trim().slice(0, 180);
+    const sessionId = String(rawValue?.sessionId || '').trim().slice(0, 180);
+    const previousBinding = browserSafeApiBinding(rawValue?.previousBinding);
+    const target = browserSafeRebindTarget(rawValue?.target);
+    if (!key || !hostId || !sessionId || !previousBinding || !target) {
+      continue;
+    }
+    result.set(key, {
+      hostId,
+      sessionId,
+      failedAt: String(rawValue?.failedAt || '').trim().slice(0, 40) || null,
+      previousBinding,
+      target,
+      errorCode: String(rawValue?.errorCode || '').trim().slice(0, 120) || null,
+    });
+  }
+  return result;
+}
+
+function persistSessionRebindFailures() {
+  const serialized = {};
+  for (const [key, value] of state.sessionRebindFailures.entries()) {
+    serialized[key] = {
+      hostId: value.hostId,
+      sessionId: value.sessionId,
+      failedAt: value.failedAt || null,
+      previousBinding: browserSafeApiBinding(value.previousBinding),
+      target: browserSafeRebindTarget(value.target),
+      errorCode: value.errorCode || null,
+    };
+  }
+  writeLocalStorageJson(SESSION_REBIND_FAILURES_STORAGE_KEY, serialized);
+}
+
 function initializeMessageNotificationState() {
   const client = window.MessageNotificationClient;
   if (!client?.ReceiptStore || !client?.NotificationOutbox) {
@@ -1094,9 +1429,14 @@ function initializeMessageNotificationState() {
     ),
     onLockUnavailable: () => scheduleMessageNotificationStoreRetry('receipt'),
     onPersistError: (error) => {
+      if (isMessageNotificationQuotaError(error)) {
+        resetMessageNotificationStoreRetry('receipt');
+        return;
+      }
       reportError(error);
       scheduleMessageNotificationStoreRetry('receipt');
     },
+    onPersistenceDisabled: () => resetMessageNotificationStoreRetry('receipt'),
   });
   state.legacyMessageReadReceipts = readLocalStorageJson(
     LEGACY_MESSAGE_READ_RECEIPTS_STORAGE_KEY,
@@ -1108,6 +1448,7 @@ function initializeMessageNotificationState() {
       MESSAGE_NOTIFICATION_OUTBOX_STORAGE_KEY,
       JSON.stringify(value)
     ),
+    clear: () => window.localStorage?.removeItem(MESSAGE_NOTIFICATION_OUTBOX_STORAGE_KEY),
     onPersist: () => {
       resetMessageNotificationStoreRetry('outbox');
       broadcastMessageNotificationState('outbox-changed');
@@ -1118,8 +1459,19 @@ function initializeMessageNotificationState() {
     ),
     onLockUnavailable: () => scheduleMessageNotificationStoreRetry('outbox'),
     onPersistError: (error) => {
+      if (isMessageNotificationQuotaError(error)) {
+        resetMessageNotificationStoreRetry('outbox');
+        return;
+      }
       reportError(error);
       scheduleMessageNotificationStoreRetry('outbox');
+    },
+    onPersistenceDisabled: () => {
+      resetMessageNotificationStoreRetry('outbox');
+      window.setTimeout(() => void requestMessageNotificationOutboxDrain(), 0);
+    },
+    onQuotaRecovered: () => {
+      window.setTimeout(() => void requestMessageNotificationOutboxDrain(), 0);
     },
   });
   if (typeof window.BroadcastChannel === 'function') {
@@ -1149,10 +1501,135 @@ function applyManualSessionTitle(session) {
   return title ? { ...session, title, manualTitle: true } : session;
 }
 
+function apiProfileModelForStorage(model) {
+  const id = String(model?.id || model?.model || '').trim().slice(0, 256);
+  if (!id) {
+    return null;
+  }
+  return {
+    id,
+    displayName: String(model?.displayName || id).trim().slice(0, 256),
+    description: String(model?.description || '').trim().slice(0, 240),
+    inputModalities: Array.isArray(model?.inputModalities)
+      ? model.inputModalities.map((value) => String(value || '').slice(0, 64)).slice(0, 12)
+      : [],
+    reasoningLevels: Array.isArray(model?.reasoningLevels)
+      ? model.reasoningLevels.map((value) => String(value || '').trim().slice(0, 32)).filter(Boolean).slice(0, 24)
+      : [],
+    capabilityKnown: model?.capabilityKnown === true,
+    defaultReasoningEffort: String(model?.defaultReasoningEffort || '').trim().slice(0, 32),
+    allowManualEffort: model?.allowManualEffort === true,
+    capabilitySource: String(model?.capabilitySource || '').trim().slice(0, 64),
+    selectable: model?.selectable !== false,
+    availability: String(model?.availability || 'available').trim().slice(0, 32),
+    cliSupported: typeof model?.cliSupported === 'boolean' ? model.cliSupported : 'unknown',
+    providerAdvertised: typeof model?.providerAdvertised === 'boolean' ? model.providerAdvertised : true,
+    visible: model?.visible !== false,
+    isDefault: model?.isDefault === true,
+    supportsPersonality: model?.supportsPersonality === true,
+  };
+}
+
+function apiProfileModelCatalogStorageKey(catalogKey) {
+  return `stored::${localConfigRevision(String(catalogKey || ''))}`;
+}
+
+function apiProfileModelCatalogStorageKeyFromRevision(identityRevision) {
+  return `stored::${String(identityRevision || '').trim()}`;
+}
+
+function normalizeStoredApiProfileModelCatalogs(input) {
+  const catalogs = new Map();
+  const entries = Array.isArray(input) ? input : [];
+  for (const candidate of entries.slice(-40)) {
+    const legacyKey = String(candidate?.key || '').trim();
+    const identityRevision = String(
+      candidate?.identityRevision || (legacyKey ? localConfigRevision(legacyKey) : '')
+    ).trim().slice(0, 128);
+    const key = apiProfileModelCatalogStorageKeyFromRevision(identityRevision);
+    const profileId = String(candidate?.profileId || '').trim();
+    const hostId = String(candidate?.hostId || '').trim();
+    if (!/^\d+-[a-f0-9]{32}$/i.test(identityRevision) || !profileId || !hostId || !Array.isArray(candidate?.models)) {
+      continue;
+    }
+    const persistenceTruncated = candidate.persistenceTruncated === true || candidate.models.length > 300;
+    const models = candidate.models
+      .slice(0, 300)
+      .map(apiProfileModelForStorage)
+      .filter(Boolean);
+    catalogs.set(key, {
+      key,
+      identityRevision,
+      profileId,
+      hostId,
+      models,
+      complete: candidate.complete === true && !persistenceTruncated,
+      truncated: candidate.truncated === true || persistenceTruncated,
+      persistenceTruncated,
+      nextCursor: String(candidate.nextCursor || '').trim() || null,
+      fetchedAt: String(candidate.fetchedAt || '').trim() || null,
+      restored: true,
+    });
+  }
+  return catalogs;
+}
+
+function apiProfileModelCatalogForStorage(catalog) {
+  const models = catalog?.models || [];
+  const persistenceTruncated = catalog?.persistenceTruncated === true || models.length > 300;
+  return {
+    identityRevision: catalog?.identityRevision
+      || localConfigRevision(String(catalog?.key || '')),
+    profileId: catalog?.profileId,
+    hostId: catalog?.hostId,
+    models: models.slice(0, 300).map(apiProfileModelForStorage).filter(Boolean),
+    complete: catalog?.complete === true && !persistenceTruncated,
+    truncated: catalog?.truncated === true || persistenceTruncated,
+    persistenceTruncated,
+    nextCursor: catalog?.nextCursor || null,
+    fetchedAt: catalog?.fetchedAt || null,
+  };
+}
+
+function persistApiProfileModelCatalogs() {
+  const profileIds = new Set((state.ui.apiProfiles || []).map((profile) => profile.profileId));
+  const latestByScope = new Map();
+  for (const catalog of state.apiProfileModelCatalogs.values()) {
+    if (profileIds.has(catalog?.profileId) && catalog?.hostId) {
+      const scope = `${catalog.profileId}::${catalog.hostId}`;
+      latestByScope.delete(scope);
+      latestByScope.set(scope, catalog);
+    }
+  }
+  const candidates = [...latestByScope.values()].slice(-12).reverse();
+  const entries = [];
+  let estimatedBytes = 2;
+  let droppedForBudget = false;
+  for (const catalog of candidates) {
+    const entry = apiProfileModelCatalogForStorage(catalog);
+    const entryBytes = JSON.stringify(entry).length * 2 + 2;
+    if (estimatedBytes + entryBytes > 1_500_000) {
+      droppedForBudget = true;
+      continue;
+    }
+    entries.push(entry);
+    estimatedBytes += entryBytes;
+  }
+  entries.reverse();
+  const saved = writeLocalStorageJson(API_PROFILE_MODEL_CATALOGS_STORAGE_KEY, entries);
+  state.apiProfileModelCatalogPersistenceError = saved && !droppedForBudget
+    ? ''
+    : 'The verified catalog is available for this page, but browser storage could not retain every model list.';
+  return saved && !droppedForBudget;
+}
+
 function initializePersistentUiState() {
   state.navigatorCollapsed = readLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, true) !== false;
   state.dismissedAlerts = normalizeDismissedAlerts(readLocalStorageJson(DISMISSED_ALERTS_STORAGE_KEY, {}));
   state.manualSessionTitles = normalizeManualSessionTitles(readLocalStorageJson(MANUAL_SESSION_TITLES_STORAGE_KEY, {}));
+  state.sessionRebindFailures = normalizeSessionRebindFailures(
+    readLocalStorageJson(SESSION_REBIND_FAILURES_STORAGE_KEY, {})
+  );
   initializeMessageNotificationState();
   const storedUi = normalizeUiSettings(readLocalStorageJson(UI_SETTINGS_STORAGE_KEY, DEFAULT_UI_SETTINGS));
   state.ui.locale = storedUi.locale;
@@ -1162,6 +1639,10 @@ function initializePersistentUiState() {
   state.ui.selectedApiProfileId = storedUi.selectedApiProfileId;
   state.ui.defaultApiProfileId = storedUi.defaultApiProfileId;
   state.ui.hostApiProfiles = storedUi.hostApiProfiles;
+  state.apiProfileModelCatalogs = normalizeStoredApiProfileModelCatalogs(
+    readLocalStorageJson(API_PROFILE_MODEL_CATALOGS_STORAGE_KEY, [])
+  );
+  persistApiProfileModelCatalogs();
   const storedOptions = readLocalStorageJson(COMPOSER_SESSION_OPTIONS_STORAGE_KEY, {});
   if (storedOptions && typeof storedOptions === 'object') {
     for (const [key, value] of Object.entries(storedOptions)) {
@@ -1263,7 +1744,10 @@ function applyStaticLocalization(root = document.body) {
     textNodes.push(walker.currentNode);
   }
   for (const node of textNodes) {
-    node.nodeValue = translateStaticText(node.nodeValue);
+    const translated = translateStaticText(node.nodeValue);
+    if (node.nodeValue !== translated) {
+      node.nodeValue = translated;
+    }
   }
 
   for (const element of root.querySelectorAll('[placeholder], [aria-label], [title]')) {
@@ -1272,10 +1756,64 @@ function applyStaticLocalization(root = document.body) {
     }
     for (const attribute of ['placeholder', 'aria-label', 'title']) {
       if (element.hasAttribute(attribute)) {
-        element.setAttribute(attribute, translateStaticText(element.getAttribute(attribute)));
+        const current = element.getAttribute(attribute);
+        const translated = translateStaticText(current);
+        if (current !== translated) {
+          element.setAttribute(attribute, translated);
+        }
       }
     }
   }
+}
+
+function optionTreeSignature(specs = []) {
+  return JSON.stringify(specs);
+}
+
+function createOptionTreeNode(spec = {}) {
+  if (Array.isArray(spec.options)) {
+    const group = document.createElement('optgroup');
+    group.label = String(spec.label || '');
+    for (const child of spec.options) {
+      group.appendChild(createOptionTreeNode(child));
+    }
+    return group;
+  }
+  const option = document.createElement('option');
+  option.value = String(spec.value || '');
+  option.textContent = String(spec.text || '');
+  if (spec.label != null) {
+    option.label = String(spec.label);
+  }
+  option.disabled = spec.disabled === true;
+  return option;
+}
+
+function syncOptionTree(container, specs = []) {
+  if (!container) {
+    return false;
+  }
+  const signature = optionTreeSignature(specs);
+  if (container.dataset.optionTreeSignature === signature) {
+    return false;
+  }
+  container.replaceChildren(...specs.map(createOptionTreeNode));
+  container.dataset.optionTreeSignature = signature;
+  return true;
+}
+
+function syncSelectOptions(select, specs = [], selectedValue = select?.value || '') {
+  if (!select) {
+    return false;
+  }
+  const changed = syncOptionTree(select, specs);
+  const requested = String(selectedValue || '');
+  const available = Array.from(select.options || []).some((option) => option.value === requested);
+  const nextValue = available ? requested : '';
+  if (select.value !== nextValue) {
+    select.value = nextValue;
+  }
+  return changed;
 }
 
 function getApiProfiles() {
@@ -1307,6 +1845,7 @@ function getApiRequestConfig(hostId = state.selectedHostId) {
   }
   const config = {
     provider: api.provider,
+    providerKind: api.providerKind,
     baseUrl: api.baseUrl,
     apiKey: api.apiKey,
     profileId: api.profileId,
@@ -1321,11 +1860,362 @@ function apiProfileRequestConfig(profile) {
   }
   return {
     provider: profile.provider || '',
+    providerKind: profile.providerKind || '',
     baseUrl: profile.baseUrl || '',
     apiKey: profile.apiKey || '',
     profileId: profile.profileId || '',
     label: profile.label || profile.provider || profile.profileId || '',
   };
+}
+
+function apiProfileModelHosts() {
+  return state.hosts.filter((host) => host.online && host.capabilities?.apiTest);
+}
+
+function selectedApiProfileModelHostId(profile = getSelectedApiProfile()) {
+  const hosts = apiProfileModelHosts();
+  const availableIds = new Set(hosts.map((host) => host.hostId));
+  const requested = String(el('settings-api-model-host')?.value || state.apiProfileModelCatalogHostId || '');
+  if (availableIds.has(requested)) {
+    return requested;
+  }
+  const mapped = hosts.find((host) => state.ui.hostApiProfiles?.[host.hostId] === profile?.profileId);
+  if (mapped) {
+    return mapped.hostId;
+  }
+  if (availableIds.has(state.selectedHostId)) {
+    return state.selectedHostId;
+  }
+  return hosts[0]?.hostId || '';
+}
+
+function apiProfileEditorDraft(profile) {
+  const selected = getSelectedApiProfile();
+  if (!profile || selected?.profileId !== profile.profileId || !el('settings-api-provider-kind')) {
+    return profile;
+  }
+  const providerKind = el('settings-api-provider-kind')?.value
+    || profile.providerKind
+    || inferApiProviderKind(profile);
+  const providerInput = String(el('settings-api-provider')?.value || '').trim();
+  return {
+    ...profile,
+    providerKind,
+    provider: providerKind !== 'custom' && providerKind === profile.providerKind && providerInput
+      ? providerInput
+      : canonicalProviderLabel(providerKind, providerInput),
+    baseUrl: String(el('settings-api-base-url')?.value || '').trim(),
+    apiKey: String(el('settings-api-key')?.value || ''),
+  };
+}
+
+function apiProfileModelCatalogKey(profile, hostId = selectedApiProfileModelHostId(profile)) {
+  if (!profile || !hostId) {
+    return '';
+  }
+  return apiProfileModelCatalogKeyForConfig(apiProfileEditorDraft(profile), hostId);
+}
+
+function apiProfileModelCatalogKeyForConfig(apiConfig, hostId) {
+  if (!apiConfig || !hostId) {
+    return '';
+  }
+  return `${encodeURIComponent(hostId)}::${rebindProfilePreviewIdentity(apiConfig)}`;
+}
+
+function getApiProfileModelCatalog(profile = getSelectedApiProfile(), hostId = '') {
+  const resolvedHostId = hostId || selectedApiProfileModelHostId(profile);
+  const key = apiProfileModelCatalogKey(profile, resolvedHostId);
+  const catalog = key
+    ? state.apiProfileModelCatalogs.get(key)
+      || state.apiProfileModelCatalogs.get(apiProfileModelCatalogStorageKey(key))
+      || null
+    : null;
+  return catalog
+    && catalog.profileId === profile?.profileId
+    && catalog.hostId === resolvedHostId
+    ? catalog
+    : null;
+}
+
+function validatedApiBaseUrlSuggestion(result, currentBaseUrl = '') {
+  if (
+    !result
+    || result.suggestionReason !== 'validated_v1_models'
+    || !result.suggestedBaseUrl
+  ) {
+    return '';
+  }
+  try {
+    const current = new URL(String(currentBaseUrl || '').trim());
+    const suggested = new URL(String(result.suggestedBaseUrl || '').trim());
+    if (
+      !['http:', 'https:'].includes(suggested.protocol)
+      || suggested.username
+      || suggested.password
+      || current.origin !== suggested.origin
+    ) {
+      return '';
+    }
+    current.hash = '';
+    suggested.hash = '';
+    current.searchParams.sort();
+    suggested.searchParams.sort();
+    const currentPath = current.pathname.replace(/\/+$/, '');
+    const suggestedPath = suggested.pathname.replace(/\/+$/, '');
+    if (suggestedPath !== `${currentPath}/v1` || current.search !== suggested.search) {
+      return '';
+    }
+    return suggested.toString().replace(/\/+$/, '');
+  } catch (_) {
+    return '';
+  }
+}
+
+function clearApiProfileModelState(profileId) {
+  const id = String(profileId || '').trim();
+  if (!id) {
+    return;
+  }
+  for (const [key, catalog] of state.apiProfileModelCatalogs.entries()) {
+    if (String(catalog?.profileId || '') === id) {
+      state.apiProfileModelCatalogs.delete(key);
+    }
+  }
+  for (const [key, request] of state.apiProfileModelCatalogRequests.entries()) {
+    if (String(request?.profileId || '') === id) {
+      state.apiProfileModelCatalogRequests.delete(key);
+    }
+  }
+  for (const [key, catalog] of state.codexControls.modelCatalogByKey.entries()) {
+    if (String(catalog?.previewProfileId || '') === id) {
+      state.codexControls.modelCatalogByKey.delete(key);
+      state.codexControls.modelOptionsErrorsByKey.delete(key);
+      state.codexControls.modelOptionsRetryAfterBySession.delete(key);
+    }
+  }
+  persistApiProfileModelCatalogs();
+}
+
+function renderApiProfileModelCatalogControls(profile = getSelectedApiProfile()) {
+  const select = el('settings-api-model-host');
+  const button = el('settings-api-fetch-models-button');
+  const suggestionButton = el('settings-api-apply-suggested-base-url-button');
+  const status = el('settings-api-model-catalog-status');
+  if (!suggestionButton || !status) {
+    return;
+  }
+
+  const hostId = selectedApiProfileModelHostId(profile);
+  const hosts = apiProfileModelHosts();
+  const hostOptions = hosts.length
+    ? hosts.map((host) => ({
+      value: host.hostId,
+      text: `${host.label || host.hostId} (${host.hostId})`,
+    }))
+    : [{ value: '', text: 'No online Host supports API model requests' }];
+  if (select) {
+    syncSelectOptions(select, hostOptions, hostId);
+  }
+  state.apiProfileModelCatalogHostId = hostId;
+
+  const key = apiProfileModelCatalogKey(profile, hostId);
+  const request = state.apiProfileModelCatalogRequests.get(key) || {};
+  const busy = request.busy === true;
+  const suggestedBaseUrl = validatedApiBaseUrlSuggestion(request, apiProfileEditorDraft(profile)?.baseUrl);
+  const catalog = getApiProfileModelCatalog(profile, hostId);
+  if (button) {
+    button.disabled = !hostId || busy;
+    button.textContent = busy ? 'Fetching...' : catalog ? 'Refresh models' : 'Fetch models';
+  }
+  suggestionButton.classList.toggle('hidden', !suggestedBaseUrl);
+  suggestionButton.disabled = busy || !suggestedBaseUrl;
+  suggestionButton.textContent = t('settings.useDetectedV1');
+  status.classList.toggle('hidden', !suggestedBaseUrl);
+  if (suggestedBaseUrl) {
+    status.textContent = formatUiText('settings.detectedV1Status', { baseUrl: suggestedBaseUrl });
+  } else {
+    status.textContent = '';
+  }
+}
+
+async function fetchApiProfileModelPages(hostId, apiConfig, options = {}) {
+  const limit = Math.max(1, Math.min(500, Number(options.limit || 200) || 200));
+  const maxPages = Math.max(1, Math.min(25, Number(options.maxPages || 10) || 10));
+  const modelsById = new Map();
+  const seenCursors = new Set();
+  let cursor = '';
+  let complete = false;
+  let nextCursor = null;
+  let fetchedAt = null;
+
+  for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+    const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/api-test`, {
+      method: 'POST',
+      body: JSON.stringify({
+        apiConfig,
+        cursor: cursor || undefined,
+        limit,
+        includeLimit: true,
+      }),
+    });
+    const result = response?.result || null;
+    const page = result?.modelPage;
+    if (!result?.ok || !page || !Array.isArray(page.models)) {
+      const error = new Error(normalizeModelCatalogError(result?.error || result?.message));
+      const suggestedBaseUrl = validatedApiBaseUrlSuggestion(result, apiConfig?.baseUrl);
+      if (suggestedBaseUrl) {
+        error.suggestedBaseUrl = suggestedBaseUrl;
+        error.suggestionReason = result.suggestionReason;
+      }
+      throw error;
+    }
+    for (const model of page.models) {
+      const id = String(model?.id || model?.model || '').trim();
+      if (id && !modelsById.has(id)) {
+        modelsById.set(id, model);
+      }
+    }
+    fetchedAt = response.timestamp || result.testedAt || fetchedAt || new Date().toISOString();
+    nextCursor = String(page.nextCursor || '').trim() || null;
+    complete = page.complete === true;
+    if (complete || !nextCursor || seenCursors.has(nextCursor)) {
+      break;
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+
+  return {
+    models: [...modelsById.values()],
+    complete,
+    truncated: !complete,
+    nextCursor: complete ? null : nextCursor,
+    fetchedAt,
+  };
+}
+
+function apiProfileModelRequestIsCurrent(key, hostId) {
+  const current = getSelectedApiProfile();
+  return Boolean(
+    current
+    && selectedApiProfileModelHostId(current) === hostId
+    && apiProfileModelCatalogKey(current, hostId) === key
+  );
+}
+
+async function fetchApiProfileModels() {
+  const profile = saveActiveApiProfileFromSettingsForm();
+  const hostId = selectedApiProfileModelHostId(profile);
+  if (!profile) {
+    throw new Error('Choose an API profile first.');
+  }
+  if (!hostId) {
+    throw new Error('No online Host can request models for this API profile.');
+  }
+  const apiConfig = apiProfileRequestConfig(profile);
+  if (!apiConfig || (!apiConfig.baseUrl && !apiConfig.apiKey)) {
+    throw new Error('Enter a Base URL or API Key before requesting models.');
+  }
+  validateApiConfigForRequest(apiConfig, hostId);
+  const key = apiProfileModelCatalogKeyForConfig(apiConfig, hostId);
+  const operationId = makeClientId();
+  state.apiProfileModelCatalogRequests.set(key, {
+    operationId,
+    profileId: profile.profileId,
+    hostId,
+    busy: true,
+    error: '',
+  });
+  renderApiProviderEditorState(profile);
+  try {
+    await verifyHostAvailable(hostId);
+    const page = await fetchApiProfileModelPages(hostId, apiConfig);
+    const registry = providerCapabilitiesRegistry();
+    const providerKind = apiConfig.providerKind || inferApiProviderKind(apiConfig);
+    const models = registry?.decorateModels?.(providerKind, page.models)
+      || page.models.map((model) => ({ ...model, id: String(model?.id || model?.model || '').trim() })).filter((model) => model.id);
+    const catalog = {
+      key,
+      profileId: profile.profileId,
+      hostId,
+      models,
+      complete: page.complete === true,
+      truncated: page.truncated === true,
+      nextCursor: page.nextCursor || null,
+      fetchedAt: page.fetchedAt || new Date().toISOString(),
+    };
+    const isLatest = state.apiProfileModelCatalogRequests.get(key)?.operationId === operationId;
+    if (isLatest) {
+      state.apiProfileModelCatalogs.delete(key);
+      state.apiProfileModelCatalogs.delete(apiProfileModelCatalogStorageKey(key));
+      state.apiProfileModelCatalogs.set(key, catalog);
+      persistApiProfileModelCatalogs();
+      state.apiProfileModelCatalogRequests.set(key, {
+        operationId,
+        profileId: profile.profileId,
+        hostId,
+        busy: false,
+        error: '',
+      });
+    }
+    if (isLatest && apiProfileModelRequestIsCurrent(key, hostId)) {
+      renderApiProviderEditorState(getSelectedApiProfile());
+    }
+    return catalog;
+  } catch (error) {
+    const normalizedError = error instanceof Error ? error : new Error(String(error || ''));
+    normalizedError.message = normalizeModelCatalogError(normalizedError.message);
+    const isLatest = state.apiProfileModelCatalogRequests.get(key)?.operationId === operationId;
+    if (isLatest) {
+      state.apiProfileModelCatalogRequests.set(key, {
+        operationId,
+        profileId: profile.profileId,
+        hostId,
+        busy: false,
+        error: normalizedError.message,
+        suggestedBaseUrl: normalizedError.suggestedBaseUrl || '',
+        suggestionReason: normalizedError.suggestionReason || '',
+      });
+    }
+    if (isLatest && apiProfileModelRequestIsCurrent(key, hostId)) {
+      renderApiProviderEditorState(getSelectedApiProfile());
+    }
+    throw normalizedError;
+  }
+}
+
+async function applySuggestedApiProfileBaseUrl() {
+  const profile = getSelectedApiProfile();
+  const hostId = selectedApiProfileModelHostId(profile);
+  const key = apiProfileModelCatalogKey(profile, hostId);
+  const request = key ? state.apiProfileModelCatalogRequests.get(key) || null : null;
+  const suggestedBaseUrl = validatedApiBaseUrlSuggestion(
+    request,
+    apiProfileEditorDraft(profile)?.baseUrl
+  );
+  if (!profile || !hostId || !suggestedBaseUrl) {
+    throw new Error('The detected /v1 suggestion is no longer valid. Request models again.');
+  }
+
+  el('settings-api-base-url').value = suggestedBaseUrl;
+  profile.baseUrl = suggestedBaseUrl;
+  clearApiProfileModelState(profile.profileId);
+  persistUiSettings();
+  renderApiProviderEditorState(profile);
+  return fetchApiProfileModels();
+}
+
+function normalizeModelCatalogError(value) {
+  const fallback = 'The API returned HTTP success but not a recognizable model catalog. Check whether the Base URL needs /v1.';
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  if (!text) {
+    return fallback;
+  }
+  if (/<!doctype\s+html\b/i.test(text) || /<\/?[a-z][^>]*>/i.test(text)) {
+    return fallback;
+  }
+  return text.length <= 400 ? text : `${text.slice(0, 397)}...`;
 }
 
 function normalizeApiIdentityBaseUrl(value) {
@@ -1344,6 +2234,14 @@ function normalizeApiIdentityBaseUrl(value) {
   }
 }
 
+function effectiveApiBaseUrl(value = {}) {
+  const configured = normalizeApiIdentityBaseUrl(value.baseUrl || value.normalizedBaseUrl);
+  if (configured) {
+    return configured;
+  }
+  return inferApiProviderKind(value) === 'openai' ? OPENAI_OFFICIAL_BASE_URL : '';
+}
+
 function apiBindingMatchesProfileIdentity(binding, profile) {
   if (binding?.kind !== 'profile' || !profile) {
     return false;
@@ -1358,8 +2256,13 @@ function apiBindingMatchesProfileIdentity(binding, profile) {
   if (bindingProvider !== profileProvider) {
     return false;
   }
-  return normalizeApiIdentityBaseUrl(binding.normalizedBaseUrl || binding.baseUrl)
-    === normalizeApiIdentityBaseUrl(profile.baseUrl);
+  if (
+    binding.providerKind
+    && inferApiProviderKind(profile) !== String(binding.providerKind).trim().toLowerCase()
+  ) {
+    return false;
+  }
+  return effectiveApiBaseUrl(binding) === effectiveApiBaseUrl(profile);
 }
 
 function sessionApiBinding(session) {
@@ -1373,6 +2276,53 @@ function sessionApiBinding(session) {
     return session.apiBinding ?? null;
   }
   return session?.sessionRecord?.apiBinding || null;
+}
+
+function getBoundApiProfileForSession(session) {
+  const binding = sessionApiBinding(session);
+  if (binding?.kind !== 'profile') {
+    return null;
+  }
+  return (state.ui.apiProfiles || []).find((profile) => (
+    profile.profileId === binding.profileId
+    && apiBindingMatchesProfileIdentity(binding, profile)
+  )) || null;
+}
+
+function sessionApiControlValue(session) {
+  const binding = sessionApiBinding(session);
+  if (binding?.kind === 'host_environment') {
+    return '__host_environment__';
+  }
+  if (binding?.kind === 'profile' && binding.profileId) {
+    return String(binding.profileId);
+  }
+  return '__unknown_binding__';
+}
+
+function sessionSupportsTurnSelectionControls(session) {
+  if (!session) {
+    return false;
+  }
+  const host = getHost(session.hostId);
+  if (host?.capabilities?.turnControls === false) {
+    return false;
+  }
+  if (!session.live) {
+    return host?.capabilities?.turnControls !== false;
+  }
+  const runtime = session.runtime || getRuntimeForSession(session) || {};
+  const adapter = String(runtime.adapterId || runtime.runtimeId || runtime.kind || '')
+    .trim()
+    .toLowerCase()
+    .replaceAll('_', '-');
+  if (adapter) {
+    return adapter === 'codex-app-server';
+  }
+  return Boolean(
+    host?.capabilities?.turnControls === true
+    || sessionApiBinding(session)?.bindingFingerprint
+  );
 }
 
 function sessionContractError(code, message, details = {}) {
@@ -1445,7 +2395,7 @@ function resolveLaunchApiConfig({ hostId, sourceSession = null, explicitProfileI
           profileId: profile.profileId || null,
           label: profile.label || null,
           provider: profile.provider || 'OpenAI',
-          normalizedBaseUrl: normalizeApiIdentityBaseUrl(profile.baseUrl) || null,
+          normalizedBaseUrl: effectiveApiBaseUrl(profile) || null,
         },
         canRebind: true,
       }
@@ -1457,6 +2407,10 @@ function resolveLaunchApiConfig({ hostId, sourceSession = null, explicitProfileI
 function validateApiConfigForRequest(apiConfig, hostId = state.selectedHostId) {
   if (!apiConfig) {
     return;
+  }
+  if (!apiConfig.baseUrl && inferApiProviderKind(apiConfig) !== 'openai') {
+    const profileLabel = apiConfig.label || apiConfig.provider || apiConfig.profileId || 'selected API profile';
+    throw new Error(`${profileLabel} requires an explicit Base URL. Only OpenAI profiles can use the official default endpoint.`);
   }
   if (apiConfig.baseUrl && !apiConfig.apiKey) {
     const host = getHost(hostId);
@@ -1684,6 +2638,7 @@ function requireRelayLogin(message = '') {
   state.auth.authenticated = false;
   state.auth.error = message || 'Relay login is required.';
   closeStream();
+  void releaseSelectedSessionWatchNow();
   closeSkillsInventoryEvents();
   renderAuthGate();
 }
@@ -1750,6 +2705,7 @@ async function changeRelayPassword(payload) {
 }
 
 async function logoutRelay() {
+  await unwatchSelectedSession({ silent: true }).catch(() => null);
   await fetchJson('/api/auth/logout', {
     method: 'POST',
     body: JSON.stringify({}),
@@ -1772,6 +2728,34 @@ function getSessionKey(session) {
   return session ? makeSessionKey(session.hostId, session.sessionId) : null;
 }
 
+function forgetActivityCanonicalConversation(canonicalKey) {
+  const normalized = String(canonicalKey || '').trim();
+  if (!normalized) {
+    return false;
+  }
+  state.eventCursorByCanonical.delete(normalized);
+  for (const [sessionKey, rememberedCanonicalKey] of state.activityCanonicalKeysBySession) {
+    if (rememberedCanonicalKey === normalized) {
+      state.activityCanonicalKeysBySession.delete(sessionKey);
+    }
+  }
+  return true;
+}
+
+function rememberActivityCanonicalAlias(sessionKey, canonicalKey) {
+  const key = String(sessionKey || '').trim();
+  if (!key) {
+    return;
+  }
+  state.activityCanonicalKeysBySession.delete(key);
+  state.activityCanonicalKeysBySession.set(key, canonicalKey);
+  while (state.activityCanonicalKeysBySession.size > ACTIVITY_CANONICAL_ALIAS_LIMIT) {
+    state.activityCanonicalKeysBySession.delete(
+      state.activityCanonicalKeysBySession.keys().next().value
+    );
+  }
+}
+
 function rememberActivityCanonicalKey(canonicalKey, ...identities) {
   const normalized = String(canonicalKey || '').trim();
   if (!normalized) {
@@ -1787,7 +2771,7 @@ function rememberActivityCanonicalKey(canonicalKey, ...identities) {
       identity?.originSessionId,
     ]) {
       if (hostId && sessionId) {
-        state.activityCanonicalKeysBySession.set(makeSessionKey(hostId, sessionId), normalized);
+        rememberActivityCanonicalAlias(makeSessionKey(hostId, sessionId), normalized);
       }
     }
   }
@@ -1798,8 +2782,10 @@ function getActivityCanonicalKeyForSession(session) {
   if (!session) {
     return '';
   }
-  const remembered = state.activityCanonicalKeysBySession.get(getSessionKey(session));
+  const sessionKey = getSessionKey(session);
+  const remembered = state.activityCanonicalKeysBySession.get(sessionKey);
   if (remembered) {
+    rememberActivityCanonicalAlias(sessionKey, remembered);
     return remembered;
   }
   const explicit = String(session.canonicalConversationKey || '').trim();
@@ -1834,64 +2820,87 @@ function isHistoryLoading(session) {
   return Boolean(key && state.historyLoading.has(key));
 }
 
-async function unwatchSelectedSession(sessionKey = state.watchedSessionKey) {
-  if (!sessionKey) {
-    return;
-  }
-  const [hostId, sessionId] = sessionKey.split('::');
-  if (!hostId || !sessionId) {
-    return;
-  }
-  if (state.watchedSessionKey === sessionKey) {
-    state.watchedSessionKey = null;
-  }
+async function sendSelectedSessionUnwatch(request) {
   const params = new URLSearchParams({
-    hostId,
-    clientId: getWatchClientId(),
-    viewId: 'primary',
+    hostId: request.hostId,
+    clientId: request.clientId,
+    viewId: request.viewId,
+    watchRevision: String(request.watchRevision),
   });
-  try {
-    await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/watch?${params.toString()}`, {
-      method: 'DELETE',
-      skipAuthHandling: true,
-    });
-  } catch (_) {
-    // Best effort: stale watches expire on the host-agent side.
-  }
+  return fetchJson(`/api/sessions/${encodeURIComponent(request.sessionId)}/watch?${params.toString()}`, {
+    method: 'DELETE',
+    skipAuthHandling: true,
+    keepalive: request.keepalive === true,
+  });
 }
 
-async function watchSelectedSession(session) {
-  const key = getSessionKey(session);
-  if (!session?.hostId || !session?.sessionId || !key) {
-    return;
-  }
-  if (state.watchedSessionKey && state.watchedSessionKey !== key) {
-    await unwatchSelectedSession(state.watchedSessionKey);
-  }
-  state.watchedSessionKey = key;
-  const params = new URLSearchParams({ hostId: session.hostId });
-  try {
-    await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/watch?${params.toString()}`, {
-      method: 'POST',
-      skipAuthHandling: true,
-      body: JSON.stringify({
-        clientId: getWatchClientId(),
-        viewId: 'primary',
-        nativeThreadId: session.nativeThreadId || null,
-        bridgeSessionId: session.bridgeSessionId || null,
-        originSessionId: session.originSessionId || null,
-        sourceSessionId: session.sourceSessionId || null,
-        conversationKey: session.conversationKey || null,
+async function sendSelectedSessionWatch(request) {
+  const params = new URLSearchParams({ hostId: request.hostId });
+  return fetchJson(`/api/sessions/${encodeURIComponent(request.sessionId)}/watch?${params.toString()}`, {
+    method: 'POST',
+    skipAuthHandling: true,
+    body: JSON.stringify({
+      clientId: request.clientId,
+      viewId: request.viewId,
+      watchRevision: request.watchRevision,
+      nativeThreadId: request.nativeThreadId,
+      bridgeSessionId: request.bridgeSessionId,
+      originSessionId: request.originSessionId,
+      sourceSessionId: request.sourceSessionId,
+      conversationKey: request.conversationKey,
+    }),
+  });
+}
+
+function getSelectedSessionWatchController() {
+  if (!state.sessionWatchController) {
+    const createController = window.RemoteCodexSessionWatch?.createSelectedSessionWatchController;
+    if (typeof createController !== 'function') {
+      throw new Error('Selected Session watch controller is unavailable.');
+    }
+    state.sessionWatchController = createController({
+      clientId: getWatchClientId(),
+      viewId: 'primary',
+      renewAfterMs: SESSION_WATCH_RENEW_MS,
+      sendWatch: sendSelectedSessionWatch,
+      sendUnwatch: sendSelectedSessionUnwatch,
+      supportsAtomicReplace: (target) => getHost(target.hostId)?.capabilities?.sessionWatchV2 === true,
+      onError: (error, target, operation) => appendAlertForSession(target.hostId, target.sessionId, {
+        severity: 'warning',
+        source: 'ui',
+        message: `Realtime watch could not be ${operation === 'unwatch' ? 'stopped' : 'started'}: ${error.message}`,
+        timestamp: new Date().toISOString(),
       }),
     });
-  } catch (error) {
-    appendAlertForSession(session.hostId, session.sessionId, {
-      severity: 'warning',
-      source: 'ui',
-      message: `Realtime watch could not be started: ${error.message}`,
-      timestamp: new Date().toISOString(),
-    });
   }
+  return state.sessionWatchController;
+}
+
+async function watchSelectedSession(session, options = {}) {
+  const key = getSessionKey(session);
+  if (!key || key !== getSessionKey(getSelectedSession())) {
+    return;
+  }
+  return getSelectedSessionWatchController().select(session, options);
+}
+
+async function unwatchSelectedSession(options = {}) {
+  if (!state.sessionWatchController) {
+    return;
+  }
+  return state.sessionWatchController.clear(options);
+}
+
+function releaseSelectedSessionWatchNow() {
+  return state.sessionWatchController?.releaseNow({ keepalive: true, silent: true }) || Promise.resolve();
+}
+
+function maintainSelectedSessionWatch() {
+  const selected = getSelectedSession();
+  if (!selected?.hostId || !selected?.sessionId) {
+    return unwatchSelectedSession({ silent: true });
+  }
+  return getSelectedSessionWatchController().renewIfDue(selected);
 }
 
 function sessionLaunchLabel(mode) {
@@ -1904,65 +2913,133 @@ function sessionLaunchLabel(mode) {
   return 'Starting Session...';
 }
 
+function sessionLaunchIntentKey({ hostId, cwd, launchMode, sourceSession } = {}) {
+  const sourceIdentity = sourceSession
+    ? String(
+      sourceSession.runId
+      || sourceSession.activeRunId
+      || sourceSession.nativeThreadId
+      || sourceSession.sessionId
+      || ''
+    ).trim()
+    : '';
+  return JSON.stringify([
+    String(hostId || '').trim(),
+    normalizeConversationPath(cwd),
+    String(launchMode || 'fresh').trim() || 'fresh',
+    sourceIdentity,
+  ]);
+}
+
+function sessionLaunchBusyEntries() {
+  if (state.sessionLaunchBusy instanceof Map) {
+    return Array.from(state.sessionLaunchBusy.values());
+  }
+  return state.sessionLaunchBusy ? [state.sessionLaunchBusy] : [];
+}
+
+function getSessionLaunchBusyForIntent(intentKey) {
+  const key = String(intentKey || '');
+  return sessionLaunchBusyEntries().find((busy) => busy?.intentKey === key) || null;
+}
+
 function getSessionLaunchBusyForSession(session) {
-  const busy = state.sessionLaunchBusy;
-  if (!busy || !session?.hostId) {
+  if (!session?.hostId) {
     return null;
   }
   const key = getSessionKey(session);
-  if (busy.sessionKey && key && busy.sessionKey === key) {
-    return busy;
-  }
-  if (busy.hostId !== session.hostId) {
-    return null;
-  }
-  const identities = new Set([
-    busy.sessionId,
-    busy.sourceSessionId,
-    busy.originSessionId,
-    busy.nativeThreadId,
-    busy.conversationKey,
-  ].map((value) => String(value || '').trim()).filter(Boolean));
-  return [
-    session.sessionId,
-    session.bridgeSessionId,
-    session.nativeThreadId,
-    session.originSessionId,
-    session.sourceSessionId,
-    session.conversationKey,
-  ].some((value) => identities.has(String(value || '').trim()))
-    ? busy
-    : null;
+  return sessionLaunchBusyEntries().find((busy) => {
+    if (busy.sessionKey && key && busy.sessionKey === key) {
+      return true;
+    }
+    if (busy.hostId !== session.hostId) {
+      return false;
+    }
+    const identities = new Set([
+      busy.sessionId,
+      busy.sourceSessionId,
+      busy.originSessionId,
+      busy.nativeThreadId,
+      busy.conversationKey,
+    ].map((value) => String(value || '').trim()).filter(Boolean));
+    return [
+      session.sessionId,
+      session.bridgeSessionId,
+      session.nativeThreadId,
+      session.originSessionId,
+      session.sourceSessionId,
+      session.conversationKey,
+    ].some((value) => identities.has(String(value || '').trim()));
+  }) || null;
 }
 
 function setSessionLaunchBusy(patch) {
-  state.sessionLaunchBusy = {
+  if (!(state.sessionLaunchBusy instanceof Map)) {
+    state.sessionLaunchBusy = new Map();
+  }
+  const next = {
     id: patch.id || makeClientId(),
     startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     ...patch,
   };
+  state.sessionLaunchBusy.set(next.intentKey || next.id, next);
   renderAll();
+  return next;
 }
 
 function updateSessionLaunchBusy(id, patch) {
-  if (!state.sessionLaunchBusy || state.sessionLaunchBusy.id !== id) {
+  const entry = sessionLaunchBusyEntries().find((busy) => busy?.id === id);
+  if (!entry || !(state.sessionLaunchBusy instanceof Map)) {
     return;
   }
-  state.sessionLaunchBusy = {
-    ...state.sessionLaunchBusy,
+  state.sessionLaunchBusy.set(entry.intentKey || entry.id, {
+    ...entry,
     ...patch,
     updatedAt: new Date().toISOString(),
-  };
+  });
   renderAll();
 }
 
 function clearSessionLaunchBusy(id) {
-  if (!state.sessionLaunchBusy || state.sessionLaunchBusy.id !== id) {
+  const entry = sessionLaunchBusyEntries().find((busy) => busy?.id === id);
+  if (!entry || !(state.sessionLaunchBusy instanceof Map)) {
     return;
   }
-  state.sessionLaunchBusy = null;
+  state.sessionLaunchBusy.delete(entry.intentKey || entry.id);
   renderAll();
+}
+
+function renderNewSessionLaunchState() {
+  const cwdInput = el('new-session-cwd');
+  const labelInput = el('new-session-label');
+  const submitButton = el('new-session-submit-button');
+  const browseButton = el('browse-directory-button');
+  const usePathButton = el('use-selected-path-button');
+  const status = el('new-session-status');
+  if (!cwdInput || !submitButton) {
+    return;
+  }
+  const intentKey = sessionLaunchIntentKey({
+    hostId: state.selectedHostId,
+    cwd: cwdInput.value,
+    launchMode: 'fresh',
+    sourceSession: null,
+  });
+  const busy = getSessionLaunchBusyForIntent(intentKey);
+  const disabled = Boolean(busy);
+  cwdInput.disabled = disabled;
+  if (labelInput) labelInput.disabled = disabled;
+  if (browseButton) browseButton.disabled = disabled;
+  if (usePathButton) usePathButton.disabled = disabled;
+  submitButton.disabled = disabled;
+  submitButton.textContent = disabled ? 'Creating Session...' : 'New In Directory';
+  if (status) {
+    status.textContent = disabled
+      ? 'A Session is already being created for this Host and path. Please wait.'
+      : '';
+    status.classList.toggle('hidden', !disabled);
+  }
 }
 
 function parseSessionTime(session) {
@@ -2129,7 +3206,7 @@ function bootstrapModeLabel(value) {
 function describeRuntimeStatus(runtime, stream, session) {
   const connection = stream?.connection || runtime?.connection || (session?.live ? 'connecting' : 'history only');
   const phase = prettyStatusLabel(runtime?.phase || session?.state || 'unknown');
-  const turn = runtime?.currentTurnStatus ? prettyStatusLabel(runtime.currentTurnStatus) : (runtime?.activeTurnId ? 'Active' : 'Idle');
+  const turn = runtime?.currentTurnStatus ? prettyStatusLabel(runtime.currentTurnStatus) : (runtimeIsActive(runtime) ? 'Active' : 'Idle');
   const busy = runtime?.busy ? 'Busy' : 'Idle';
   return {
     connection,
@@ -2190,7 +3267,7 @@ function formatThinkingValue(value, depth = 0) {
 
   if (Array.isArray(value)) {
     return joinThinkingTextParts(value
-      .map((item) => formatThinkingValue(item, depth + 1))
+      .map((item) => (typeof item === 'string' ? item : formatThinkingValue(item, depth + 1)))
       .filter(Boolean));
   }
 
@@ -2229,17 +3306,26 @@ function formatThinkingValue(value, depth = 0) {
 }
 
 function joinThinkingTextParts(parts) {
-  const values = (Array.isArray(parts) ? parts : [])
-    .map((part) => String(part || '').trim())
-    .filter(Boolean);
-  if (!values.length) {
+  const rawValues = (Array.isArray(parts) ? parts : [])
+    .map((part) => String(part || ''))
+    .filter((part) => part.trim());
+  if (!rawValues.length) {
     return '';
   }
-  if (values.some((part) => /\r?\n/.test(part))) {
-    return values.join('\n').trim();
+  if (rawValues.some((part) => /\r?\n/.test(part))) {
+    return rawValues.map((part) => part.trim()).join('\n').trim();
   }
-  const looksTokenized = values.length >= 4 && values.every((part) => part.length <= 32 && !/[.!?。！？:：;；]$/.test(part));
-  return values.join(looksTokenized ? ' ' : '\n').replace(/[ \t]+\n/g, '\n').trim();
+  if (rawValues.some((part) => /^\s|\s$/.test(part))) {
+    return rawValues.join('').trim();
+  }
+  const values = rawValues.map((part) => part.trim());
+  const cjkOnly = values.every((part) => !/[A-Za-z0-9]/.test(part))
+    && values.some((part) => /[\u3400-\u9fff\uf900-\ufaff]/.test(part));
+  if (cjkOnly) return values.join('');
+  return values.join(' ')
+    .replace(/\s+([,.!?;:，。！？；：])/g, '$1')
+    .replace(/([([{])\s+/g, '$1')
+    .trim();
 }
 
 function normalizeThinkingMessage(entry) {
@@ -2305,29 +3391,22 @@ function isThinkingActivityDiagnostic(entry) {
     'reasoning',
     'plan',
     'tool-call',
+    'mcp-tool-call',
+    'dynamic-tool-call',
+    'collab-agent-tool-call',
     'command-output',
     'terminal',
     'web-search',
-    'turn',
-    'thread',
-    'thread-status',
-    'token-usage',
-    'rate-limits',
     'approval',
     'permissions',
     'user-input',
-    'warning',
-    'error',
-    'control',
     'commentary',
-    'runtime-startup',
-    'native-thread-fallback',
   ].includes(kind)
-    || method.startsWith('turn/')
-    || method.startsWith('thread/')
     || method.includes('commandexecution')
-    || method.includes('tool')
-    || method.includes('web_search');
+    || method.includes('function_call')
+    || /item\/(?:filechange|mcptoolcall|dynamictoolcall|collabagenttoolcall)/.test(method)
+    || method.includes('web_search')
+    || method.includes('websearch');
 }
 
 function requestToThinkingDiagnostic(request) {
@@ -2350,6 +3429,11 @@ function requestToThinkingDiagnostic(request) {
     message: request.summary || request.message || request.title || 'Codex requested user action',
     data: request.payload || null,
     turnId: request.payload?.turnId || null,
+    itemId: request.payload?.itemId || null,
+    callId: request.payload?.callId || null,
+    requestId: request.requestId || null,
+    status: request.status || 'pending',
+    final: request.status !== 'pending',
   };
 }
 
@@ -2366,31 +3450,115 @@ function getThinkingDiagnosticsForSession(session) {
   return [...diagnostics, ...requestDiagnostics];
 }
 
-function buildThinkingActivityEntries(diagnostics) {
-  const merged = [];
-  for (const diag of diagnostics || []) {
-    const text = normalizeThinkingMessage(diag);
-    const fileChanges = normalizeFileChanges(diag);
-    if (!text && !fileChanges.length) {
-      continue;
+function firstThinkingField(entry, ...names) {
+  const roots = [
+    entry,
+    entry?.data,
+    entry?.payload,
+    entry?.data?.payload,
+    entry?.data?.item,
+    entry?.item,
+  ];
+  for (const root of roots) {
+    if (!root || typeof root !== 'object') continue;
+    for (const name of names) {
+      if (root[name] !== null && typeof root[name] !== 'undefined' && root[name] !== '') {
+        return root[name];
+      }
     }
-    if (text && !isUserSuitableThinkingText(text, diag)) {
-      continue;
-    }
-    const normalizedKind = isFileChangeDiagnostic(diag) ? 'file-change' : (diag.kind || 'thinking');
-    const previous = merged[merged.length - 1];
-    if (previous && previous.kind === normalizedKind && previous.text === text && !fileChanges.length) {
-      continue;
-    }
-    merged.push({
-      kind: normalizedKind,
-      method: diag.method || null,
-      text: text || 'File changes updated',
-      timestamp: diag.timestamp || null,
-      fileChanges,
-    });
   }
-  return merged;
+  return null;
+}
+
+function normalizeThinkingActivityForModel(entry, index = 0) {
+  if (!entry) return null;
+  const kind = isFileChangeDiagnostic(entry) ? 'file-change' : String(entry.kind || 'thinking');
+  const method = String(entry.method || firstThinkingField(entry, 'method') || '');
+  const deltaLike = /delta/i.test(method);
+  const rawDelta = deltaLike
+    ? (entry.delta ?? entry.data?.delta ?? entry.data?.text ?? entry.payload?.delta ?? entry.message)
+    : null;
+  const text = deltaLike && typeof rawDelta === 'string'
+    ? rawDelta
+    : normalizeThinkingMessage(entry);
+  const fileChanges = normalizeFileChanges(entry);
+  if (!text && !fileChanges.length && !firstThinkingField(entry, 'command', 'query', 'tool', 'name')) {
+    return null;
+  }
+  if (text && !deltaLike && !isUserSuitableThinkingText(text, entry)) {
+    return null;
+  }
+  const normalized = {
+    activityKey: firstThinkingField(entry, 'activityKey'),
+    activityRevision: firstThinkingField(entry, 'activityRevision', 'revision'),
+    canonicalConversationKey: firstThinkingField(entry, 'canonicalConversationKey'),
+    runId: firstThinkingField(entry, 'runId'),
+    turnId: firstThinkingField(entry, 'turnId', 'turn_id'),
+    itemId: firstThinkingField(entry, 'itemId', 'item_id', 'id'),
+    callId: firstThinkingField(entry, 'callId', 'call_id'),
+    requestId: firstThinkingField(entry, 'requestId', 'request_id'),
+    processId: firstThinkingField(entry, 'processId', 'process_id', 'processHandle'),
+    summaryIndex: firstThinkingField(entry, 'summaryIndex', 'summary_index') || 0,
+    kind,
+    itemType: firstThinkingField(entry, 'itemType', 'type'),
+    method,
+    name: firstThinkingField(entry, 'name'),
+    status: firstThinkingField(entry, 'status'),
+    text: text || (fileChanges.length ? 'File changes updated' : ''),
+    command: firstThinkingField(entry, 'command', 'cmd'),
+    cwd: firstThinkingField(entry, 'cwd', 'workdir', 'workingDirectory'),
+    output: firstThinkingField(entry, 'output', 'aggregatedOutput', 'delta'),
+    outputTruncated: firstThinkingField(entry, 'outputTruncated') === true,
+    stdout: firstThinkingField(entry, 'stdout'),
+    stderr: firstThinkingField(entry, 'stderr'),
+    stream: firstThinkingField(entry, 'stream'),
+    exitCode: firstThinkingField(entry, 'exitCode', 'exit_code'),
+    durationMs: firstThinkingField(entry, 'durationMs', 'duration_ms'),
+    server: firstThinkingField(entry, 'server'),
+    tool: firstThinkingField(entry, 'tool', 'name'),
+    namespace: firstThinkingField(entry, 'namespace'),
+    resourceUri: firstThinkingField(entry, 'resourceUri'),
+    senderThreadId: firstThinkingField(entry, 'senderThreadId'),
+    receiverThreadIds: firstThinkingField(entry, 'receiverThreadIds'),
+    prompt: firstThinkingField(entry, 'prompt'),
+    agentsStates: firstThinkingField(entry, 'agentsStates'),
+    model: firstThinkingField(entry, 'model'),
+    reasoningEffort: firstThinkingField(entry, 'reasoningEffort'),
+    arguments: firstThinkingField(entry, 'arguments', 'args'),
+    result: firstThinkingField(entry, 'result'),
+    error: firstThinkingField(entry, 'error'),
+    progress: firstThinkingField(entry, 'progress'),
+    progressTruncated: firstThinkingField(entry, 'progressTruncated') === true,
+    query: firstThinkingField(entry, 'query'),
+    action: firstThinkingField(entry, 'action'),
+    actionData: firstThinkingField(entry, 'actionData'),
+    commandActions: firstThinkingField(entry, 'commandActions', 'command_actions'),
+    fileChanges,
+    final: entry.final === true || /(?:completed|failed|cancelled)$/.test(String(firstThinkingField(entry, 'status') || '').toLowerCase()),
+    success: firstThinkingField(entry, 'success'),
+    timestamp: entry.timestamp || firstThinkingField(entry, 'createdAt', 'startedAt') || null,
+    updatedAt: firstThinkingField(entry, 'updatedAt', 'completedAt') || entry.timestamp || null,
+    source: entry.source || null,
+  };
+  return window.RemoteCodexThinkingEntryModel?.normalizeThinkingActivityEntry
+    ? window.RemoteCodexThinkingEntryModel.normalizeThinkingActivityEntry(normalized, index)
+    : normalized;
+}
+
+function aggregateThinkingActivityEntries(entries) {
+  const normalized = (Array.isArray(entries) ? entries : []).filter(Boolean);
+  if (!window.RemoteCodexThinkingEntryModel?.aggregateThinkingEntries) {
+    return normalized;
+  }
+  return window.RemoteCodexThinkingEntryModel.aggregateThinkingEntries(normalized, {
+    maxEntries: LIVE_THINKING_ACTIVITY_ENTRY_LIMIT,
+  });
+}
+
+function buildThinkingActivityEntries(diagnostics) {
+  return aggregateThinkingActivityEntries((diagnostics || [])
+    .map((entry, index) => normalizeThinkingActivityForModel(entry, index))
+    .filter(Boolean));
 }
 
 function getProjectedThinkingActivities(session) {
@@ -2398,7 +3566,10 @@ function getProjectedThinkingActivities(session) {
   if (!canonicalKey || !state.activityProjection) {
     return [];
   }
-  return state.activityProjection.activitiesFor(canonicalKey).map((activity) => ({
+  return state.activityProjection.activitiesFor(canonicalKey, {
+    limit: LIVE_THINKING_ACTIVITY_ENTRY_LIMIT,
+  }).map((activity, index) => normalizeThinkingActivityForModel({
+    ...activity,
     activityKey: String(activity.activityKey || ''),
     activityRevision: Number(activity.activityRevision || 0),
     kind: activity.kind || 'reasoning',
@@ -2408,21 +3579,22 @@ function getProjectedThinkingActivities(session) {
     turnId: activity.turnId || null,
     itemId: activity.itemId || null,
     final: activity.final === true,
-    fileChanges: [],
-  }));
+    fileChanges: activity.fileChanges || [],
+  }, index)).filter(Boolean);
 }
 
 function mergeProjectedThinkingEntries(diagnostics, projected) {
   const projectedEntries = Array.isArray(projected) ? projected : [];
   const projectedReasoning = projectedEntries.some((entry) => entry.kind === 'reasoning');
-  const diagnosticEntries = buildThinkingActivityEntries((diagnostics || []).filter((entry) => (
+  const diagnosticEntries = (diagnostics || []).filter((entry) => (
     !projectedReasoning || String(entry?.kind || '').toLowerCase() !== 'reasoning'
-  )));
-  return [...diagnosticEntries, ...projectedEntries]
+  )).map((entry, index) => normalizeThinkingActivityForModel(entry, index)).filter(Boolean);
+  const ordered = [...diagnosticEntries, ...projectedEntries]
     .sort((left, right) => (
       Date.parse(left.timestamp || 0) - Date.parse(right.timestamp || 0)
       || String(left.activityKey || '').localeCompare(String(right.activityKey || ''))
     ));
+  return aggregateThinkingActivityEntries(ordered);
 }
 
 function isUserSuitableThinkingText(text, entry = {}) {
@@ -2891,6 +4063,7 @@ function parsePatchApplyUpdatedFiles(value) {
 
 function normalizeFileChanges(entry) {
   const roots = [
+    entry?.fileChanges,
     entry?.data,
     entry?.payload,
     entry?.data?.payload,
@@ -3268,6 +4441,22 @@ function getSessionConversationKey(session) {
     || session.sessionId;
 }
 
+function filterVisibleConversationVariants(sessions) {
+  const variants = Array.isArray(sessions) ? sessions : [];
+  const hasLiveManagedVariant = variants.some((session) => (
+    session?.source === 'managed' && session.live === true
+  ));
+  if (!hasLiveManagedVariant) {
+    return variants;
+  }
+  return variants.filter((session) => !(
+    session?.source === 'managed'
+    && session.live !== true
+    && String(session.state || '').toLowerCase() === 'starting'
+    && getSessionMessageCount(session) === 0
+  ));
+}
+
 function getConversationGroups(hostId) {
   const groups = new Map();
 
@@ -3288,6 +4477,7 @@ function getConversationGroups(hostId) {
 
   return Array.from(groups.values())
     .map((group) => {
+      group.sessions = filterVisibleConversationVariants(group.sessions);
       group.sessions.sort(compareSessions);
       group.totalCount = group.sessions.length;
       group.liveCount = group.sessions.filter((session) => session.live).length;
@@ -4118,6 +5308,7 @@ function applySessionRuntimeConfig(requestSessionKey, response, expectedRunId = 
   if (
     expectedRunId
     && runtimeConfigResponseRunId(response) !== expectedRunId
+    && !(options.acceptCanonicalRunChange === true && runtimeConfigResponseRunId(response))
     && !canApplyCanonicalRuntimeFallback(target, response, expectedRunId, options)
   ) {
     return null;
@@ -4186,6 +5377,173 @@ function captureSessionLifecycleExpectation(session) {
   };
 }
 
+async function loadStableCanonicalSessionForRebind(session, options = {}) {
+  const sessionKey = getSessionKey(session);
+  const maxAttempts = Math.max(1, Math.min(3, Number(options.maxAttempts || 3) || 3));
+  let candidate = state.sessions.find((item) => getSessionKey(item) === sessionKey) || session;
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const canonical = await loadSessionRuntimeConfigForSession(candidate, {
+        allowRebindFallback: true,
+        acceptCanonicalRunChange: true,
+      });
+      if (canonical) {
+        return canonical;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    candidate = state.sessions.find((item) => getSessionKey(item) === sessionKey) || candidate;
+    if (attempt + 1 < maxAttempts) {
+      await delay(40 * (attempt + 1));
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
+  throw sessionContractError(
+    'session_run_state_conflict',
+    'Canonical Session runtime configuration kept changing before Rebind could start.'
+  );
+}
+
+function apiResponsesEndpoint(baseUrl) {
+  const normalized = normalizeApiIdentityBaseUrl(baseUrl);
+  if (!normalized) {
+    return '';
+  }
+  try {
+    const url = new URL(normalized);
+    url.hash = '';
+    url.pathname = `${url.pathname.replace(/\/+$/, '')}/responses`;
+    return url.toString();
+  } catch (_) {
+    return `${normalized.replace(/\/+$/, '')}/responses`;
+  }
+}
+
+function rebindTargetSummary(profileId, apiConfig = null) {
+  if (String(profileId || '') === '__host_environment__') {
+    return browserSafeRebindTarget({
+      kind: 'host_environment',
+      label: 'Host environment',
+      responsesEndpoint: 'Host-resolved /responses endpoint',
+    });
+  }
+  const baseUrl = effectiveApiBaseUrl(apiConfig || {});
+  return browserSafeRebindTarget({
+    kind: 'profile',
+    profileId: apiConfig?.profileId || profileId || null,
+    label: apiConfig?.label || apiConfig?.provider || profileId || 'API profile',
+    provider: apiConfig?.provider || null,
+    providerKind: apiConfig?.providerKind || inferApiProviderKind(apiConfig || {}),
+    baseUrl,
+    responsesEndpoint: apiResponsesEndpoint(baseUrl),
+  });
+}
+
+function rebindTargetMatchesBinding(binding, target) {
+  return target?.kind === 'host_environment'
+    ? binding?.kind === 'host_environment'
+    : apiBindingMatchesProfileIdentity(binding, target);
+}
+
+function rebindTargetDisplayLabel(target) {
+  return target?.kind === 'host_environment'
+    ? t('session.hostEnvironment')
+    : target?.label || target?.provider || 'API profile';
+}
+
+function apiBindingConfirmationLabel(binding) {
+  const safe = browserSafeApiBinding(binding);
+  if (!safe) {
+    return t('session.unknownApiBinding');
+  }
+  const label = safe.kind === 'host_environment'
+    ? safe.label || safe.provider || safe.modelProviderHint || t('session.hostEnvironment')
+    : safe.label || safe.provider || safe.profileId || 'API profile';
+  const baseUrl = effectiveApiBaseUrl(safe);
+  const endpoint = apiResponsesEndpoint(baseUrl);
+  return endpoint ? `${label} (${endpoint})` : label;
+}
+
+function rebindSelectionDisplayValue(selection, key, selectionSource) {
+  if (Object.prototype.hasOwnProperty.call(selection || {}, key)) {
+    return String(selection[key] || '').trim() || 'Auto / default';
+  }
+  return selectionSource === 'current-session' ? 'Keep current' : 'Auto / default';
+}
+
+function formatSessionRebindConfirmation(previousBinding, target, selection = {}, selectionSource = 'current-session') {
+  const sourceLabel = 'Current Session settings';
+  return [
+    t('session.rebindConfirmTitle'),
+    '',
+    formatUiText('session.rebindConfirmFrom', { binding: apiBindingConfirmationLabel(previousBinding) }),
+    formatUiText('session.rebindConfirmTo', { binding: rebindTargetDisplayLabel(target) }),
+    formatUiText('session.rebindConfirmEndpoint', {
+      endpoint: target?.responsesEndpoint || t('session.endpointUnavailable'),
+    }),
+    t('session.rebindRestartWarning'),
+    `Run settings: ${sourceLabel}`,
+    `Model: ${rebindSelectionDisplayValue(selection, 'model', selectionSource)}`,
+    `Thinking: ${rebindSelectionDisplayValue(selection, 'effort', selectionSource)}`,
+    `Summary: ${rebindSelectionDisplayValue(selection, 'summary', selectionSource)}`,
+  ].join('\n');
+}
+
+function recordSessionRebindFailure(session, previousBinding, target, error) {
+  const key = getSessionKey(session);
+  const safePreviousBinding = browserSafeApiBinding(previousBinding || {
+    kind: 'unknown',
+    label: 'Unknown previous binding',
+  });
+  const safeTarget = browserSafeRebindTarget(target);
+  if (!key || !safePreviousBinding || !safeTarget) {
+    return null;
+  }
+  const failure = {
+    hostId: String(session.hostId || '').trim().slice(0, 180),
+    sessionId: String(session.sessionId || '').trim().slice(0, 180),
+    failedAt: new Date().toISOString(),
+    previousBinding: safePreviousBinding,
+    target: safeTarget,
+    errorCode: String(error?.code || error?.body?.code || 'session_rebind_failed').trim().slice(0, 120),
+  };
+  state.sessionRebindFailures.set(key, failure);
+  persistSessionRebindFailures();
+  return failure;
+}
+
+function clearSessionRebindFailure(session) {
+  const key = getSessionKey(session);
+  if (!key || !state.sessionRebindFailures.delete(key)) {
+    return false;
+  }
+  persistSessionRebindFailures();
+  return true;
+}
+
+function confirmResumeAfterFailedRebind(session) {
+  const key = getSessionKey(session);
+  const failure = key ? state.sessionRebindFailures.get(key) || null : null;
+  if (!failure) {
+    return true;
+  }
+  const confirmed = window.confirm([
+    formatUiText('session.rebindFailed', { target: rebindTargetDisplayLabel(failure.target) }),
+    formatUiText('session.rebindResumePrevious', {
+      binding: apiBindingConfirmationLabel(failure.previousBinding),
+    }),
+    t('session.rebindContinue'),
+  ].join('\n'));
+  if (confirmed) {
+    clearSessionRebindFailure(session);
+  }
+  return confirmed;
+}
+
 async function loadCanonicalSessionForLifecycleMutation(session) {
   const sessionKey = getSessionKey(session);
   const current = state.sessions.find((candidate) => getSessionKey(candidate) === sessionKey) || session;
@@ -4250,6 +5608,10 @@ function applyConfirmedSessionStarted(payload, fallbackSession = null) {
     sessionId,
   }));
   if (started?.hostId && started?.sessionId) {
+    const failure = state.sessionRebindFailures.get(getSessionKey(started)) || null;
+    if (failure && rebindTargetMatchesBinding(sessionApiBinding(started), failure.target)) {
+      clearSessionRebindFailure(started);
+    }
     void loadSessionRuntimeConfigForSession(started).catch(() => {});
   }
   return started;
@@ -4511,6 +5873,10 @@ async function runMessageNotificationStorageTransaction(key, callback) {
   });
 }
 
+function isMessageNotificationQuotaError(error) {
+  return window.MessageNotificationClient?.isQuotaExceededError?.(error) === true;
+}
+
 function scheduleMessageNotificationStoreRetry(kind) {
   const isReceipt = kind === 'receipt';
   const timerField = isReceipt ? 'messageReceiptPersistRetryTimer' : 'messageOutboxPersistRetryTimer';
@@ -4526,6 +5892,10 @@ function scheduleMessageNotificationStoreRetry(kind) {
       await Promise.resolve(store?.flush?.());
       if (!isReceipt) void requestMessageNotificationOutboxDrain();
     } catch (error) {
+      if (isMessageNotificationQuotaError(error)) {
+        resetMessageNotificationStoreRetry(kind);
+        return;
+      }
       reportError(error);
       scheduleMessageNotificationStoreRetry(kind);
     }
@@ -4583,19 +5953,9 @@ function notificationOutboxPresenters() {
     persistAssistantReceipt(client.advanceNotifiedReceipt(receipt, projection, item), projection, session);
   };
   return {
-    presentInApp: async (item) => {
-      appendAlertForSession(item.hostId, item.sessionId, {
-        alertId: item.alertId,
-        assistantMessageId: item.assistantMessageId,
-        assistantSeq: item.assistantSeq,
-        canonicalConversationKey: item.canonicalConversationKey,
-        severity: 'info',
-        source: 'assistant-message',
-        message: item.previewText || 'New Codex message',
-        timestamp: item.assistantAt || item.updatedAt || new Date().toISOString(),
-      });
-      queuedUiRenders.alertsWindow = true;
-      queuedUiRenders.sessionDetails = true;
+    presentInApp: async () => {
+      queuedUiRenders.messageNotificationBell = true;
+      queuedUiRenders.conversationNav = true;
       scheduleQueuedUiFlush();
     },
     presentSystem: async (item) => {
@@ -4690,7 +6050,7 @@ function requestMessageNotificationOutboxDrain() {
       if (state.messageNotificationObservedDrainPromise === drain) {
         state.messageNotificationObservedDrainPromise = null;
       }
-      reportError(error);
+      if (!isMessageNotificationQuotaError(error)) reportError(error);
     }
   );
   return drain;
@@ -5212,6 +6572,8 @@ function dedupeAlerts(entries) {
       message: String(entry.message || ''),
       sessionId: entry.sessionId || null,
       hostId: entry.hostId || null,
+      transient: entry.transient === true,
+      turnId: entry.turnId || null,
     };
     const key = normalized.alertId
       || `${normalized.severity}|${normalized.timestamp || ''}|${normalized.message}`;
@@ -5248,9 +6610,15 @@ function alertFingerprint(entry) {
 }
 
 function shouldDisplayAlert(entry) {
+  const severity = String(entry?.severity || 'warning').trim().toLowerCase();
+  const source = String(entry?.source || '').trim().toLowerCase();
   const message = String(entry?.message || '');
+  if (!['warning', 'error'].includes(severity)) {
+    return false;
+  }
   return !(
-    /codex_app_server: failed to initialize sqlite state db/i.test(message)
+    source === 'assistant-message'
+    || /codex_app_server: failed to initialize sqlite state db/i.test(message)
     || /Codex could not find bubblewrap on PATH/i.test(message)
     || /sandbox prerequisites/i.test(message)
     || /concepts\/sandboxing#prerequisites/i.test(message)
@@ -5276,6 +6644,38 @@ function isStaleStartupFailureAlert(entry, session) {
   return !Number.isFinite(recoveredAt) || !Number.isFinite(alertAt) || alertAt < recoveredAt;
 }
 
+function isRecoveredTransientRetryAlert(entry, session) {
+  if (entry?.transient !== true || String(entry?.severity || '').toLowerCase() !== 'warning') {
+    return false;
+  }
+  const message = String(entry?.message || '');
+  if (/no live session for command session\.input\b/i.test(message)) {
+    return false;
+  }
+  const alertTurnId = String(entry?.turnId || '').trim();
+  if (!alertTurnId) {
+    return false;
+  }
+
+  const runtime = getRuntimeForSession(session) || session?.runtime || null;
+  if (!runtime || String(runtime.lastError || '').trim() || String(runtime.lastCodexError || '').trim()) {
+    return false;
+  }
+  const terminalStates = new Set(['error', 'failed', 'quota-exhausted', 'closed']);
+  if ([runtime.phase, runtime.currentTurnStatus]
+    .some((value) => terminalStates.has(String(value || '').trim().toLowerCase()))) {
+    return false;
+  }
+  const recoveredAt = Date.parse(runtime.updatedAt || '');
+  const alertAt = Date.parse(entry?.timestamp || '');
+  if (!Number.isFinite(recoveredAt) || !Number.isFinite(alertAt) || recoveredAt <= alertAt) {
+    return false;
+  }
+
+  const activeTurnId = String(runtime.activeTurnId || '').trim();
+  return activeTurnId !== alertTurnId || runtimeIsActive(runtime);
+}
+
 function getAlertsForSession(session) {
   const key = getSessionKey(session);
   const dismissed = key ? state.dismissedAlerts.get(key) : null;
@@ -5283,6 +6683,7 @@ function getAlertsForSession(session) {
     ? (state.alerts.get(key) || [])
       .filter(shouldDisplayAlert)
       .filter((entry) => !isStaleStartupFailureAlert(entry, session))
+      .filter((entry) => !isRecoveredTransientRetryAlert(entry, session))
       .filter((entry) => !dismissed?.has(alertFingerprint(entry)))
     : [];
 }
@@ -5845,7 +7246,7 @@ function setRuntimeForSession(hostId, sessionId, runtime) {
   const key = makeSessionKey(hostId, sessionId);
   if (!runtime || typeof runtime !== 'object') {
     state.runtime.delete(key);
-    return;
+    return null;
   }
 
   const previous = state.runtime.get(key) || {};
@@ -5901,10 +7302,22 @@ function setRuntimeForSession(hostId, sessionId, runtime) {
   }
 
   state.runtime.set(key, next);
+  return next;
 }
 
 function patchRuntimeForSession(hostId, sessionId, patch) {
-  setRuntimeForSession(hostId, sessionId, patch);
+  return setRuntimeForSession(hostId, sessionId, patch);
+}
+
+function restoreRuntimeSnapshotForSession(hostId, sessionId, runtimeSnapshot) {
+  const key = makeSessionKey(hostId, sessionId);
+  if (!runtimeSnapshot || typeof runtimeSnapshot !== 'object') {
+    state.runtime.delete(key);
+    return null;
+  }
+  const restored = { ...runtimeSnapshot };
+  state.runtime.set(key, restored);
+  return restored;
 }
 
 function getRuntimeForSession(session) {
@@ -5925,12 +7338,18 @@ function normalizeDiagnosticEntry(entry) {
     message: String(entry.message || ''),
     detail: entry.detail || null,
     data: entry.data || null,
+    runId: entry.runId || entry.data?.runId || null,
     turnId: entry.turnId || entry.data?.turnId || null,
+    itemId: entry.itemId || entry.data?.itemId || null,
+    callId: entry.callId || entry.data?.callId || null,
+    requestId: entry.requestId || entry.data?.requestId || null,
+    status: entry.status || entry.data?.status || null,
+    final: entry.final === true,
   };
 }
 
 function diagnosticEntryKey(entry) {
-  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.turnId || ''}`;
+  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.turnId || ''}|${entry.itemId || entry.callId || entry.requestId || ''}`;
 }
 
 function dedupeDiagnostics(entries) {
@@ -6100,9 +7519,10 @@ function checkSelectedSessionStreamHealth() {
     return;
   }
   const selected = getSelectedSession();
-  if (!selected?.live) {
+  if (!selected) {
     return;
   }
+  void maintainSelectedSessionWatch();
   const selectedKey = getSessionKey(selected);
   if (!selectedKey || state.eventSourceKey !== selectedKey || !state.eventSource) {
     return;
@@ -6309,6 +7729,7 @@ async function pingHostApiProfile(hostId, profileId = '') {
   const profile = getApiProfileForHostSelection(hostId, profileId);
   const apiConfig = profile ? {
     provider: profile.provider,
+    providerKind: profile.providerKind,
     baseUrl: profile.baseUrl,
     apiKey: profile.apiKey,
     profileId: profile.profileId,
@@ -6317,6 +7738,8 @@ async function pingHostApiProfile(hostId, profileId = '') {
   if (!apiConfig || (!apiConfig.baseUrl && !apiConfig.apiKey)) {
     throw new Error('Enter a Base URL or API Key before testing.');
   }
+  validateApiConfigForRequest(apiConfig, hostId);
+  const requestKey = apiProfileModelCatalogKeyForConfig(apiConfig, hostId);
 
   state.apiPingBusyHosts.add(hostId);
   state.apiPingResults.set(hostId, { pending: true });
@@ -6332,6 +7755,25 @@ async function pingHostApiProfile(hostId, profileId = '') {
       ok: Boolean(result.ok),
       testedAt: response.timestamp || result.testedAt || new Date().toISOString(),
     });
+    const suggestedBaseUrl = validatedApiBaseUrlSuggestion(result, apiConfig.baseUrl);
+    const activeCatalogRequest = state.apiProfileModelCatalogRequests.get(requestKey) || null;
+    if (
+      suggestedBaseUrl
+      && activeCatalogRequest?.busy !== true
+      && apiProfileModelCatalogKey(profile, hostId) === requestKey
+    ) {
+      state.apiProfileModelCatalogRequests.set(requestKey, {
+        profileId: profile.profileId,
+        hostId,
+        busy: false,
+        error: normalizeModelCatalogError(result.error || result.message),
+        suggestedBaseUrl,
+        suggestionReason: result.suggestionReason,
+      });
+      if (getSelectedApiProfile()?.profileId === profile.profileId) {
+        renderApiProviderEditorState(profile);
+      }
+    }
   } catch (error) {
     state.apiPingResults.set(hostId, {
       ok: false,
@@ -7524,75 +8966,145 @@ function modelCacheKey(session) {
     session?.hostId || 'none',
     session?.sessionId || 'none',
     bindingFingerprint,
+    sessionApiProviderKind(session),
     modelCatalogRunId(session),
   ].map((value) => encodeURIComponent(String(value))).join('::');
 }
 
+function sessionApiProviderKind(session) {
+  const binding = sessionApiBinding(session);
+  if (binding?.providerKind) {
+    return inferApiProviderKind({ providerKind: binding.providerKind });
+  }
+  const profile = binding?.kind === 'profile'
+    ? (state.ui.apiProfiles || []).find((candidate) => (
+      candidate.profileId === binding.profileId
+      && apiBindingMatchesProfileIdentity(binding, candidate)
+    ))
+    : null;
+  return inferApiProviderKind(profile || {
+    provider: binding?.provider || binding?.modelProviderHint || '',
+  });
+}
+
 function localConfigRevision(value) {
   const text = String(value || '');
-  let hash = 2166136261;
+  const hashes = [0x811c9dc5, 0x9e3779b9, 0x85ebca6b, 0xc2b2ae35];
+  const multipliers = [0x01000193, 0x27d4eb2d, 0x165667b1, 0x85ebca77];
   for (let index = 0; index < text.length; index += 1) {
-    hash ^= text.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
+    const code = text.charCodeAt(index);
+    for (let lane = 0; lane < hashes.length; lane += 1) {
+      hashes[lane] = Math.imul(
+        hashes[lane] ^ (code + Math.imul(index + 1, lane + 1)),
+        multipliers[lane]
+      );
+      hashes[lane] ^= hashes[lane] >>> (11 + lane);
+    }
   }
-  return `${text.length}-${(hash >>> 0).toString(36)}`;
+  const digest = hashes.map((hash, lane) => {
+    let value32 = hash ^ (hash >>> 16);
+    value32 = Math.imul(value32, multipliers[(lane + 1) % multipliers.length]);
+    value32 ^= value32 >>> 13;
+    return (value32 >>> 0).toString(16).padStart(8, '0');
+  }).join('');
+  return `${text.length}-${digest}`;
 }
 
 function rebindProfilePreviewIdentity(profile) {
   const config = apiProfileRequestConfig(profile) || {};
   return [
     config.profileId || '',
+    config.providerKind || '',
     String(config.provider || 'OpenAI').trim().toLowerCase(),
-    normalizeApiIdentityBaseUrl(config.baseUrl),
+    effectiveApiBaseUrl(config),
     localConfigRevision(config.apiKey),
   ].map((value) => encodeURIComponent(String(value))).join(':');
 }
 
-function rebindTargetValue(session = getSelectedSession()) {
-  const sessionKey = getSessionKey(session);
-  if (!sessionKey) {
-    return '';
+function activeModelCatalogKey(session) {
+  return modelCacheKey(session);
+}
+
+function getActiveModelCatalog(session) {
+  if (!session) {
+    return null;
   }
-  if (state.codexControls.rebindTargetProfileBySession.has(sessionKey)) {
-    return String(state.codexControls.rebindTargetProfileBySession.get(sessionKey) || '');
-  }
-  return '';
+  return state.codexControls.modelCatalogByKey.get(activeModelCatalogKey(session)) || null;
 }
 
-function selectedRebindProfileId(session = getSelectedSession()) {
-  const profileId = rebindTargetValue(session).trim();
-  return profileId && profileId !== '__host_environment__' ? profileId : '';
+function getSessionControlModelCatalog(session) {
+  return getActiveModelCatalog(session);
 }
 
-function getSelectedRebindProfile(session = getSelectedSession()) {
-  const profileId = selectedRebindProfileId(session);
-  return (state.ui.apiProfiles || []).find((profile) => profile.profileId === profileId) || null;
-}
-
-function canPreviewRebindModels(session) {
-  const profile = getSelectedRebindProfile(session);
+function modelIsSelectableCatalogMember(model) {
   return Boolean(
-    session?.hostId
-    && session?.sessionId
-    && profile
-    && (
-      !sessionApiBinding(session)?.bindingFingerprint
-      || !apiBindingMatchesProfileIdentity(sessionApiBinding(session), profile)
-    )
+    model
+    && model.selectable !== false
+    && model.availability !== 'unavailable'
+    && model.cliSupported !== false
   );
 }
 
-function rebindModelPreviewKey(session) {
-  const profile = getSelectedRebindProfile(session);
-  const sessionKey = getSessionKey(session);
-  if (!profile || !sessionKey) {
-    return '';
-  }
-  return `rebind-preview::${encodeURIComponent(sessionKey)}::${rebindProfilePreviewIdentity(profile)}`;
+function selectableCatalogModels(catalog) {
+  return (catalog?.models || []).filter(modelIsSelectableCatalogMember);
 }
 
-function activeModelCatalogKey(session) {
-  return canPreviewRebindModels(session) ? rebindModelPreviewKey(session) : modelCacheKey(session);
+function modelCatalogSourceModelCount(catalog, originSource) {
+  const origin = String(originSource || '').trim();
+  const sources = (catalog?.sources || [])
+    .filter((source) => (
+      !source?.error
+      && (source?.source === origin || source?.originSource === origin)
+      && Array.isArray(source.models)
+    ))
+    .sort((left, right) => Number(right.source === origin && right.stale !== true)
+      - Number(left.source === origin && left.stale !== true));
+  return sources[0]?.models?.length || 0;
+}
+
+function preferredModelForApiSwitch(catalog, options = {}) {
+  const models = (catalog?.models || []).filter((model) => (
+    modelIsSelectableCatalogMember(model)
+    && model?.visible !== false
+    && model?.hidden !== true
+  ));
+  const modelsById = new Map(models.map((model) => [
+    String(model?.id || model?.model || '').trim(),
+    model,
+  ]).filter(([id]) => id));
+  const usableId = (candidate) => {
+    const id = String(candidate?.id || candidate?.model || candidate || '').trim();
+    return id && modelsById.has(id) ? id : '';
+  };
+  const providerModels = (catalog?.sources || [])
+    .filter((source) => (
+      (source?.source === 'provider' || source?.originSource === 'provider')
+      && !source?.error
+      && (options.requireFreshProvider !== true || (
+        source?.source === 'provider'
+        && source?.stale !== true
+      ))
+    ))
+    .flatMap((source) => Array.isArray(source.models) ? source.models : []);
+  const providerDefault = providerModels.find((model) => model?.isDefault === true && usableId(model));
+  if (providerDefault) {
+    return usableId(providerDefault);
+  }
+  for (const model of providerModels) {
+    const id = usableId(model);
+    if (id) {
+      return id;
+    }
+  }
+  if (options.requireFreshProvider === true) {
+    return '';
+  }
+  const catalogDefault = usableId(catalog?.defaultModel);
+  if (catalogDefault) {
+    return catalogDefault;
+  }
+  const mergedDefault = models.find((model) => model?.isDefault === true);
+  return usableId(mergedDefault) || usableId(models[0]);
 }
 
 function captureModelCatalogRequest(session) {
@@ -7937,6 +9449,8 @@ function normalizeModelOption(model) {
       ? model.reasoningLevels.map((value) => String(value || '').trim()).filter(Boolean)
       : [],
     capabilityKnown: model?.capabilityKnown === true,
+    capabilitySource: String(model?.capabilitySource || model?.capabilityAuthority || '').trim() || null,
+    allowManualEffort: model?.allowManualEffort === true,
     selectable: model?.selectable !== false,
     availability: String(model?.availability || 'unknown'),
     cliSupported: model?.cliSupported ?? 'unknown',
@@ -7948,12 +9462,59 @@ function normalizeModelOption(model) {
   };
 }
 
+function providerInputForModelCatalog(session) {
+  const binding = sessionApiBinding(session);
+  if (binding?.providerKind) {
+    return {
+      provider: binding.provider || binding.modelProviderHint || '',
+      providerKind: binding.providerKind,
+    };
+  }
+  if (binding?.kind === 'profile') {
+    const matchingProfile = getApiProfiles().find((profile) => (
+      profile.profileId === binding.profileId
+      && apiBindingMatchesProfileIdentity(binding, profile)
+    ));
+    return matchingProfile || {
+      provider: binding.provider || '',
+      providerKind: inferApiProviderKind({ provider: binding.provider || '' }),
+    };
+  }
+  return {
+    provider: binding?.provider || binding?.modelProviderHint || '',
+    providerKind: inferApiProviderKind({ provider: binding?.provider || binding?.modelProviderHint || '' }),
+  };
+}
+
+function decorateModelOptionForProvider(session, rawModel) {
+  if (rawModel?.capabilityKnown === true) {
+    return rawModel;
+  }
+  const registry = providerCapabilitiesRegistry();
+  if (!registry?.resolveModelCapability) {
+    return rawModel;
+  }
+  const modelId = String(rawModel?.model || rawModel?.id || '').trim();
+  const capability = registry.resolveModelCapability({
+    providerKind: inferApiProviderKind(providerInputForModelCatalog(session)),
+    modelId,
+  });
+  return {
+    ...rawModel,
+    reasoningLevels: capability.reasoningLevels,
+    capabilityKnown: capability.capabilityKnown,
+    capabilitySource: capability.source,
+    defaultReasoningEffort: capability.defaultReasoningEffort || rawModel?.defaultReasoningEffort || '',
+    allowManualEffort: capability.allowManualEffort,
+  };
+}
+
 function getModelOptions(session) {
   const seen = new Set();
   const models = [];
-  const catalog = state.codexControls.modelCatalogByKey.get(activeModelCatalogKey(session));
+  const catalog = getSessionControlModelCatalog(session);
   for (const rawModel of catalog?.models || []) {
-    const model = normalizeModelOption(rawModel);
+    const model = normalizeModelOption(decorateModelOptionForProvider(session, rawModel));
     if (!model || seen.has(model.model)) {
       continue;
     }
@@ -8012,8 +9573,13 @@ function syncModelSelectFromInput(session) {
     return;
   }
   const value = input.value.trim();
-  const matched = value ? findModelOption(session, value) : null;
-  select.value = matched ? matched.model : '';
+  const matched = value
+    ? Array.from(select.options || []).find((option) => option.value === value)
+    : null;
+  const nextValue = matched ? value : '';
+  if (select.value !== nextValue) {
+    select.value = nextValue;
+  }
 }
 
 function renderComposerModelOptions(session) {
@@ -8023,25 +9589,24 @@ function renderComposerModelOptions(session) {
     return;
   }
 
-  datalist.innerHTML = '';
-  select.innerHTML = '';
-
-  const defaultOption = document.createElement('option');
-  defaultOption.value = '';
-  const models = getModelOptions(session);
+  const allModels = getModelOptions(session);
+  const models = allModels.filter(modelIsSelectableCatalogMember);
   const defaultModel = models.find((model) => model.isDefault) || null;
-  defaultOption.textContent = defaultModel
+  const defaultLabel = defaultModel
     ? `Auto: ${defaultModel.displayName || defaultModel.model}`
-    : 'Model: auto/default';
-  select.appendChild(defaultOption);
-
+    : models.length
+      ? formatUiText('models.autoRuntimeAvailable', { count: models.length })
+      : 'Model: auto/default';
+  const datalistSpecs = [];
   const grouped = new Map();
   for (const model of models) {
-    const option = document.createElement('option');
-    option.value = model.model;
     const effort = model.defaultReasoningEffort ? ` | effort ${model.defaultReasoningEffort}` : '';
-    option.label = `${model.displayName || model.model}${model.isDefault ? ' | default' : ''}${effort}${model.description ? ` | ${model.description}` : ''}`;
-    datalist.appendChild(option);
+    datalistSpecs.push({
+      value: model.model,
+      text: '',
+      label: `${model.displayName || model.model}${model.isDefault ? ' | default' : ''}${effort}${model.description ? ` | ${model.description}` : ''}`,
+      disabled: model.selectable === false,
+    });
 
     const category = inferModelCategory(model);
     if (!grouped.has(category)) {
@@ -8049,20 +9614,37 @@ function renderComposerModelOptions(session) {
     }
     grouped.get(category).push(model);
   }
-
-  for (const [category, categoryModels] of grouped.entries()) {
-    const group = document.createElement('optgroup');
-    group.label = category;
-    for (const model of categoryModels) {
-      const option = document.createElement('option');
-      option.value = model.model;
-      option.textContent = modelSelectLabel(model);
-      option.disabled = model.selectable === false;
-      group.appendChild(option);
-    }
-    select.appendChild(group);
+  const selectSpecs = [{ value: '', text: defaultLabel }];
+  const storedCurrentModel = String(getComposerOptionsForSession(session).model || '').trim();
+  const visibleCurrentModel = String(el('codex-model-input')?.value || '').trim();
+  const currentModel = storedCurrentModel || visibleCurrentModel;
+  const currentModelOption = currentModel
+    ? allModels.find((model) => model.model === currentModel || model.id === currentModel)
+    : null;
+  if (currentModel && !modelIsSelectableCatalogMember(currentModelOption)) {
+    const catalog = getSessionControlModelCatalog(session);
+    const unavailable = currentModelOption?.selectable === false || modelCatalogIsAuthoritative(catalog);
+    selectSpecs.push({
+      label: 'Current selection',
+      options: [{
+        value: currentModel,
+        text: `Current: ${currentModel}${unavailable ? ' | unavailable' : ' | not in loaded catalog'}`,
+        disabled: unavailable,
+      }],
+    });
   }
-
+  for (const [category, categoryModels] of grouped.entries()) {
+    selectSpecs.push({
+      label: category,
+      options: categoryModels.map((model) => ({
+        value: model.model,
+        text: modelSelectLabel(model),
+        disabled: model.selectable === false,
+      })),
+    });
+  }
+  syncOptionTree(datalist, datalistSpecs);
+  syncSelectOptions(select, selectSpecs, select.value);
   syncModelSelectFromInput(session);
 }
 
@@ -8075,33 +9657,195 @@ function supportedEffortValues(model) {
     .filter(Boolean);
 }
 
+function reasoningEffortLabel(value, locale = currentLocale()) {
+  const effort = String(value || '').trim().toLowerCase();
+  const labels = {
+    en: {
+      none: 'Off',
+      minimal: 'Minimal',
+      low: 'Low',
+      medium: 'Medium',
+      high: 'High',
+      xhigh: 'Very high',
+      max: 'Maximum',
+      ultra: 'Ultra / automatic delegation',
+    },
+    'zh-CN': {
+      none: '关闭',
+      minimal: '最低',
+      low: '轻度',
+      medium: '中',
+      high: '高',
+      xhigh: '很高',
+      max: '极高',
+      ultra: '极致 / 自动委派',
+    },
+  };
+  return labels[locale]?.[effort] || labels.en[effort] || effort;
+}
+
+function providerAllowsManualEffortWhenUnknown(session) {
+  const providerKind = inferApiProviderKind(providerInputForModelCatalog(session));
+  return providerCapabilitiesRegistry()?.getProviderPolicy?.(providerKind)?.allowManualEffortWhenUnknown === true;
+}
+
+function reasoningCapabilityForModel(session, modelId = '') {
+  const selectedModel = findModelOption(session, modelId);
+  if (selectedModel) {
+    return selectedModel;
+  }
+  const capability = providerCapabilitiesRegistry()?.resolveModelCapability?.({
+    providerKind: inferApiProviderKind(providerInputForModelCatalog(session)),
+    modelId,
+  });
+  return capability ? normalizeModelOption({
+    id: modelId || '__auto__',
+    ...capability,
+  }) : null;
+}
+
+function reasoningCapabilityForSelection(session) {
+  return reasoningCapabilityForModel(session, el('codex-model-input')?.value.trim() || '');
+}
+
+function assertEffortSelectionIsValid(session, selection = {}) {
+  const submitted = String(selection.effort || '').trim().toLowerCase();
+  if (!submitted) {
+    return;
+  }
+  if (!REASONING_EFFORT_PATTERN.test(submitted)) {
+    throw sessionContractError(
+      'session_effort_invalid',
+      'Thinking effort must start with a letter and contain only lowercase letters, digits, underscores, or hyphens (maximum 32 characters).'
+    );
+  }
+  const capability = reasoningCapabilityForModel(session, String(selection.model || '').trim());
+  const supported = supportedEffortValues(capability);
+  if (capability?.capabilityKnown === true && !supported.includes(submitted)) {
+    throw sessionContractError(
+      'session_effort_unsupported',
+      `Thinking effort "${submitted}" is not supported by the selected model.`
+    );
+  }
+  if (capability?.capabilityKnown !== true && !providerAllowsManualEffortWhenUnknown(session)) {
+    throw sessionContractError(
+      'session_effort_unsupported',
+      'Manual effort values for unknown models are available only for Custom API providers.'
+    );
+  }
+  if (capability?.capabilityKnown !== true && selection.allowUnverifiedEffort !== true) {
+    throw sessionContractError(
+      'session_effort_unverified',
+      'Confirm "Allow unverified effort" before using a value that the current model metadata cannot verify.'
+    );
+  }
+}
+
+function renderManualEffortControlState(session) {
+  const select = el('codex-effort-select');
+  const manualInput = el('codex-effort-manual-input');
+  const unverifiedRow = el('codex-effort-unverified-row');
+  const manualControls = el('composer-manual-effort-controls');
+  if (!select || !manualInput || !unverifiedRow) {
+    return;
+  }
+  const manualMode = select.value === '__manual__';
+  const capability = reasoningCapabilityForSelection(session);
+  const requiresUnverified = manualMode
+    && capability?.capabilityKnown !== true
+    && providerAllowsManualEffortWhenUnknown(session);
+  manualInput.classList.toggle('hidden', !manualMode);
+  unverifiedRow.classList.toggle('hidden', !requiresUnverified);
+  manualControls?.classList.toggle('hidden', !manualMode);
+  if (!requiresUnverified) {
+    el('codex-effort-unverified-checkbox').checked = false;
+  }
+}
+
+function readEffortControlValue(session = getSelectedSession(), options = {}) {
+  const selectValue = String(el('codex-effort-select')?.value || '');
+  const manualMode = selectValue === '__manual__';
+  const submitted = manualMode
+    ? String(el('codex-effort-manual-input')?.value || '').trim().toLowerCase()
+    : selectValue.trim().toLowerCase();
+  const capability = reasoningCapabilityForSelection(session);
+  const allowUnverifiedEffort = manualMode
+    && capability?.capabilityKnown !== true
+    && providerAllowsManualEffortWhenUnknown(session)
+    && el('codex-effort-unverified-checkbox')?.checked === true;
+
+  if (options.validate !== false) {
+    assertEffortSelectionIsValid(session, {
+      model: el('codex-model-input')?.value.trim() || '',
+      effort: submitted,
+      allowUnverifiedEffort,
+    });
+  }
+  return {
+    effort: submitted,
+    effortMode: submitted ? 'manual' : 'auto',
+    allowUnverifiedEffort: Boolean(submitted && allowUnverifiedEffort),
+  };
+}
+
 function renderReasoningEffortOptions(session) {
   const select = el('codex-effort-select');
   if (!select) {
     return;
   }
 
-  const current = select.value;
+  const stored = getComposerOptionsForSession(session);
+  const current = stored.effort || (select.value === '__manual__' ? el('codex-effort-manual-input')?.value : select.value) || '';
   const selectedModel = findModelOption(session, el('codex-model-input')?.value.trim());
-  const supported = selectedModel ? supportedEffortValues(selectedModel) : [];
-  const options = supported.map((value) => ({ value, label: value }));
+  const capability = selectedModel || reasoningCapabilityForSelection(session);
+  const supported = capability ? supportedEffortValues(capability) : [];
+  const options = supported.map((value) => ({ value, label: reasoningEffortLabel(value) }));
 
-  select.innerHTML = '';
-  const defaultOption = document.createElement('option');
-  defaultOption.value = '';
-  defaultOption.textContent = selectedModel?.defaultReasoningEffort
-    ? `Auto / model default (${selectedModel.defaultReasoningEffort})`
+  const defaultLabel = selectedModel?.defaultReasoningEffort
+    ? `Auto / model default (${reasoningEffortLabel(selectedModel.defaultReasoningEffort)})`
     : 'Auto / model default';
-  select.appendChild(defaultOption);
-
-  for (const optionSpec of options) {
-    const option = document.createElement('option');
-    option.value = optionSpec.value;
-    option.textContent = optionSpec.label;
-    select.appendChild(option);
+  const selectSpecs = [
+    { value: '', text: defaultLabel },
+    ...options.map((optionSpec) => ({ value: optionSpec.value, text: optionSpec.label })),
+  ];
+  if (capability?.capabilityKnown !== true && providerAllowsManualEffortWhenUnknown(session)) {
+    selectSpecs.push({ value: '__manual__', text: 'Manual effort...' });
   }
 
-  select.value = options.some((optionSpec) => optionSpec.value === current) ? current : '';
+  const supportedCurrent = options.some((optionSpec) => optionSpec.value === current);
+  const manualUnknownAllowed = capability?.capabilityKnown !== true
+    && providerAllowsManualEffortWhenUnknown(session);
+  if (current && !supportedCurrent && !manualUnknownAllowed) {
+    selectSpecs.push({
+      value: current,
+      text: `Current: ${reasoningEffortLabel(current)} | ${capability?.capabilityKnown === true ? 'unsupported' : 'unverified'}`,
+      disabled: true,
+    });
+  }
+  const nextValue = supportedCurrent
+    ? current
+    : current && manualUnknownAllowed
+      ? '__manual__'
+      : current || '';
+  syncSelectOptions(select, selectSpecs, nextValue);
+  if (el('codex-effort-manual-input')) {
+    const manualValue = select.value === '__manual__' ? current : '';
+    if (el('codex-effort-manual-input').value !== manualValue) {
+      el('codex-effort-manual-input').value = manualValue;
+    }
+  }
+  renderManualEffortControlState(session);
+}
+
+function modelCatalogIsAuthoritative(catalog) {
+  return (catalog?.sources || []).some((source) => (
+    source?.authority === 'authoritative'
+    && source?.complete === true
+    && source?.truncated !== true
+    && !source?.nextCursor
+    && source?.stale !== true
+    && !source?.error
+  ));
 }
 
 function assertModelSelectionIsSelectable(session, modelId) {
@@ -8110,15 +9854,8 @@ function assertModelSelectionIsSelectable(session, modelId) {
     return;
   }
   const model = findModelOption(session, selectedModelId);
-  const catalog = state.codexControls.modelCatalogByKey.get(activeModelCatalogKey(session));
-  const authoritativeAbsence = !model && (catalog?.sources || []).some((source) => (
-    source?.authority === 'authoritative'
-    && source?.complete === true
-    && source?.truncated !== true
-    && !source?.nextCursor
-    && source?.stale !== true
-    && !source?.error
-  ));
+  const catalog = getSessionControlModelCatalog(session);
+  const authoritativeAbsence = !model && modelCatalogIsAuthoritative(catalog);
   if (authoritativeAbsence) {
     throw sessionContractError(
       'session_model_unavailable',
@@ -8136,10 +9873,17 @@ function assertModelSelectionIsSelectable(session, modelId) {
 }
 
 function normalizeComposerOptionValues(options = {}) {
+  const effort = String(options.effort || '').trim().toLowerCase();
+  const requestedEffortMode = String(options.effortMode || '').trim().toLowerCase();
+  const effortMode = ['auto', 'manual'].includes(requestedEffortMode)
+    ? requestedEffortMode
+    : effort ? 'manual' : 'auto';
   return {
     ...DEFAULT_COMPOSER_OPTIONS,
     model: String(options.model || '').trim(),
-    effort: String(options.effort || '').trim() || DEFAULT_COMPOSER_OPTIONS.effort,
+    effort: effortMode === 'manual' ? effort : '',
+    effortMode,
+    allowUnverifiedEffort: effortMode === 'manual' && Boolean(effort) && options.allowUnverifiedEffort === true,
     summary: String(options.summary || '').trim(),
     mode: String(options.mode || '').trim() || DEFAULT_COMPOSER_OPTIONS.mode,
     approvalPolicy: typeof options.approvalPolicy === 'object'
@@ -8185,8 +9929,12 @@ function inferComposerOptionsFromSession(session) {
     ...textInferred,
     ...(session.codexOptions || {}),
     ...(latestTurnControl?.data || {}),
-    model: runtime.model || latestTurnControl?.data?.model || session.codexOptions?.model || '',
-    effort: runtime.effort || latestTurnControl?.data?.effort || session.codexOptions?.effort || textInferred.effort || '',
+    model: runtime.model || latestTurnControl?.data?.model || session.codexOptions?.model || session.requestedSelection?.model || '',
+    effort: runtime.effort || latestTurnControl?.data?.effort || session.codexOptions?.effort || session.requestedSelection?.effort || textInferred.effort || '',
+    effortMode: runtime.effort || latestTurnControl?.data?.effort || session.codexOptions?.effort || session.requestedSelection?.effort || textInferred.effort
+      ? 'manual'
+      : 'auto',
+    allowUnverifiedEffort: session.codexOptions?.allowUnverifiedEffort === true,
     summary: runtime.summary || latestTurnControl?.data?.summary || session.codexOptions?.summary || '',
     approvalPolicy: runtime.approvalPolicy || latestTurnControl?.data?.approvalPolicy || session.codexOptions?.approvalPolicy || '',
     approvalsReviewer: runtime.approvalsReviewer || latestTurnControl?.data?.approvalsReviewer || session.codexOptions?.approvalsReviewer || textInferred.approvalsReviewer || '',
@@ -8196,7 +9944,7 @@ function inferComposerOptionsFromSession(session) {
 }
 
 function getComposerOptionsForSession(session) {
-  const key = getSessionKey(session);
+  const key = resolveComposerSessionKey(getSessionKey(session));
   if (!key) {
     return { ...DEFAULT_COMPOSER_OPTIONS };
   }
@@ -8207,7 +9955,7 @@ function getComposerOptionsForSession(session) {
 }
 
 function refreshInferredComposerOptionsForSession(session) {
-  const key = getSessionKey(session);
+  const key = resolveComposerSessionKey(getSessionKey(session));
   if (!key || state.codexControls.persistedSessionOptionKeys.has(key)) {
     return;
   }
@@ -8232,16 +9980,43 @@ function setSelectIfAvailable(id, value) {
   }
   const stringValue = String(value || '');
   const hasValue = Array.from(node.options || []).some((option) => option.value === stringValue);
-  node.value = hasValue ? stringValue : '';
+  const nextValue = hasValue ? stringValue : '';
+  if (node.value !== nextValue) {
+    node.value = nextValue;
+  }
 }
 
 function applyComposerOptionsToControls(session) {
   const options = getComposerOptionsForSession(session);
   const modelInput = el('codex-model-input');
-  if (modelInput) {
+  if (modelInput && modelInput.value !== (options.model || '')) {
     modelInput.value = options.model || '';
   }
-  setSelectIfAvailable('codex-effort-select', options.effort);
+  const effortSelect = el('codex-effort-select');
+  const effortManual = el('codex-effort-manual-input');
+  const effortUnverified = el('codex-effort-unverified-checkbox');
+  if (effortSelect) {
+    const hasSupportedValue = Array.from(effortSelect.options || []).some((option) => option.value === options.effort);
+    const hasManualOption = Array.from(effortSelect.options || []).some((option) => option.value === '__manual__');
+    const nextEffort = options.effortMode === 'manual' && options.effort && hasSupportedValue
+      ? options.effort
+      : options.effortMode === 'manual' && options.effort && hasManualOption
+        ? '__manual__'
+        : hasSupportedValue ? options.effort : '';
+    if (effortSelect.value !== nextEffort) {
+      effortSelect.value = nextEffort;
+    }
+  }
+  if (effortManual) {
+    const nextManualEffort = options.effortMode === 'manual' ? options.effort : '';
+    if (effortManual.value !== nextManualEffort) {
+      effortManual.value = nextManualEffort;
+    }
+  }
+  if (effortUnverified && effortUnverified.checked !== (options.allowUnverifiedEffort === true)) {
+    effortUnverified.checked = options.allowUnverifiedEffort === true;
+  }
+  renderManualEffortControlState(session);
   setSelectIfAvailable('codex-summary-select', options.summary);
   setSelectIfAvailable('codex-mode-select', options.mode);
   setSelectIfAvailable('codex-approval-policy-select', options.approvalPolicy);
@@ -8251,14 +10026,13 @@ function applyComposerOptionsToControls(session) {
   syncModelSelectFromInput(session);
 }
 
-function saveComposerOptionsFromControls(session = getSelectedSession()) {
-  const key = getSessionKey(session);
-  if (!key) {
-    return;
-  }
-  const next = normalizeComposerOptionValues({
+function readComposerOptionsFromControls(session = getSelectedSession()) {
+  const effortSelection = readEffortControlValue(session, { validate: false });
+  return normalizeComposerOptionValues({
     model: el('codex-model-input')?.value.trim() || '',
-    effort: el('codex-effort-select')?.value || '',
+    effort: effortSelection.effort,
+    effortMode: effortSelection.effortMode,
+    allowUnverifiedEffort: effortSelection.allowUnverifiedEffort,
     summary: el('codex-summary-select')?.value || '',
     mode: el('codex-mode-select')?.value || 'default',
     approvalPolicy: el('codex-approval-policy-select')?.value || 'on-request',
@@ -8266,9 +10040,18 @@ function saveComposerOptionsFromControls(session = getSelectedSession()) {
     sandboxMode: el('codex-sandbox-mode-select')?.value || 'workspaceWrite',
     personality: el('codex-personality-select')?.value || '',
   });
+}
+
+function saveComposerOptionsFromControls(session = getSelectedSession()) {
+  const key = getSessionKey(session);
+  if (!key) {
+    return null;
+  }
+  const next = readComposerOptionsFromControls(session);
   state.codexControls.sessionOptionsByKey.set(key, next);
   state.codexControls.persistedSessionOptionKeys.add(key);
   persistComposerSessionOptions();
+  return next;
 }
 
 function makeObjectPreviewUrl(file) {
@@ -8470,6 +10253,7 @@ function renderAttachmentChips() {
   }
 
   container.classList.toggle('hidden', container.childElementCount === 0);
+  rememberMountedComposerDraft();
 }
 
 function isComposerPlanMode() {
@@ -8477,7 +10261,7 @@ function isComposerPlanMode() {
 }
 
 function getComposerSubmission(session = getSelectedSession()) {
-  const key = typeof session === 'string' ? session : getSessionKey(session);
+  const key = resolveComposerSessionKey(session);
   return key ? state.codexControls.composerSubmissionsBySession.get(key) || null : null;
 }
 
@@ -8497,9 +10281,10 @@ function isComposerSubmitting(session = getSelectedSession()) {
 }
 
 function setComposerSubmission(submission, session = getSelectedSession()) {
-  const key = submission?.sessionKey || (typeof session === 'string' ? session : getSessionKey(session));
+  const key = resolveComposerSessionKey(submission?.sessionKey || session);
   if (key) {
     if (submission) {
+      submission.sessionKey = key;
       state.codexControls.composerSubmissionsBySession.set(key, submission);
     } else {
       state.codexControls.composerSubmissionsBySession.delete(key);
@@ -8511,7 +10296,7 @@ function setComposerSubmission(submission, session = getSelectedSession()) {
 }
 
 function clearComposerSubmissionForSession(sessionOrKey, submissionId = '') {
-  const key = typeof sessionOrKey === 'string' ? sessionOrKey : getSessionKey(sessionOrKey);
+  const key = resolveComposerSessionKey(sessionOrKey);
   if (!key) {
     return false;
   }
@@ -8619,7 +10404,9 @@ function renderComposerModeBanner() {
 
 function renderComposerControls(session, disabled) {
   const submitting = isComposerSubmitting(session);
+  const supportsTurnSelection = sessionSupportsTurnSelectionControls(session);
   refreshInferredComposerOptionsForSession(session);
+  applyComposerOptionsToControls(session);
   renderComposerModelOptions(session);
   applyComposerOptionsToControls(session);
   renderReasoningEffortOptions(session);
@@ -8634,6 +10421,8 @@ function renderComposerControls(session, disabled) {
     'codex-model-input',
     'codex-model-select',
     'codex-effort-select',
+    'codex-effort-manual-input',
+    'codex-effort-unverified-checkbox',
     'codex-summary-select',
     'codex-mode-select',
     'codex-approval-policy-select',
@@ -8657,15 +10446,35 @@ function renderComposerControls(session, disabled) {
     }
   }
 
+  for (const id of [
+    'codex-model-input',
+    'codex-model-select',
+    'codex-effort-select',
+    'codex-effort-manual-input',
+    'codex-effort-unverified-checkbox',
+  ]) {
+    const node = el(id);
+    if (node) {
+      node.disabled = disabled || submitting || !supportsTurnSelection;
+    }
+  }
+
   const modelButton = el('codex-model-refresh-button');
   if (modelButton) {
     const loadingModels = isModelOptionsLoading(session);
-    const canLoadModels = Boolean(sessionApiBinding(session)?.bindingFingerprint)
-      || canPreviewRebindModels(session);
-    modelButton.disabled = disabled || submitting || !session || !canLoadModels || loadingModels;
-    modelButton.textContent = loadingModels
-      ? 'Loading...'
-      : canPreviewRebindModels(session) ? 'Load models' : 'Refresh';
+    const canRefresh = Boolean(
+      supportsTurnSelection
+      && session?.live
+      && sessionApiBinding(session)?.bindingFingerprint
+    );
+    modelButton.disabled = disabled || submitting || !canRefresh || loadingModels;
+    modelButton.textContent = loadingModels ? '\u2026' : '\u21bb';
+    modelButton.title = canRefresh
+      ? loadingModels ? 'Refreshing current Session models...' : 'Refresh current Session models.'
+      : supportsTurnSelection
+        ? 'Current model refresh requires a live Session with a verified API binding.'
+        : 'This runtime does not support per-turn model selection.';
+    modelButton.setAttribute('aria-busy', loadingModels ? 'true' : 'false');
   }
 
   const reviewButton = el('codex-review-button');
@@ -9083,9 +10892,12 @@ function getComposerUploadedFileSections(uploadedFiles = []) {
 }
 
 function getComposerOptions() {
+  const effortSelection = readEffortControlValue(getSelectedSession(), { validate: false });
   return {
     model: el('codex-model-input')?.value.trim() || null,
-    effort: el('codex-effort-select')?.value || null,
+    effort: effortSelection.effort || null,
+    effortMode: effortSelection.effortMode,
+    allowUnverifiedEffort: effortSelection.allowUnverifiedEffort,
     summary: el('codex-summary-select')?.value || null,
     mode: el('codex-mode-select')?.value || 'default',
     approvalPolicy: el('codex-approval-policy-select')?.value || 'on-request',
@@ -9095,24 +10907,333 @@ function getComposerOptions() {
   };
 }
 
+function resolveComposerSessionKey(sessionOrKey) {
+  let key = typeof sessionOrKey === 'string'
+    ? String(sessionOrKey || '')
+    : String(getSessionKey(sessionOrKey) || '');
+  if (!key) return '';
+  const aliases = state.codexControls.composerSessionKeyAliases;
+  const seen = new Set();
+  while (aliases.has(key) && !seen.has(key)) {
+    seen.add(key);
+    key = String(aliases.get(key) || key);
+  }
+  return key;
+}
+
+function findSessionForResolvedComposerKey(sessionOrKey, fallback = null) {
+  const resolvedKey = resolveComposerSessionKey(sessionOrKey);
+  if (!resolvedKey) return fallback;
+  return state.sessions.find((candidate) => getSessionKey(candidate) === resolvedKey)
+    || state.sessions.find((candidate) => (
+      resolveComposerSessionKey(getSessionKey(candidate)) === resolvedKey
+    ))
+    || fallback;
+}
+
+function getMountedComposerSessionKey() {
+  return resolveComposerSessionKey(
+    state.codexControls.mountedComposerSessionKey || getSessionKey(getSelectedSession()) || ''
+  );
+}
+
 function cloneComposerAttachment(attachment) {
   return {
     ...attachment,
   };
 }
 
+function cloneComposerDraft(draft = {}) {
+  return {
+    ...draft,
+    text: String(draft.text || ''),
+    localImagePath: String(draft.localImagePath || ''),
+    attachments: Array.isArray(draft.attachments)
+      ? draft.attachments.map(cloneComposerAttachment)
+      : [],
+  };
+}
+
+function composerDraftHasTemporaryContent(draft) {
+  return Boolean(
+    String(draft?.text || '')
+    || String(draft?.localImagePath || '').trim()
+    || (Array.isArray(draft?.attachments) && draft.attachments.length)
+  );
+}
+
+function releaseComposerDraftResources(draft) {
+  for (const attachment of Array.isArray(draft?.attachments) ? draft.attachments : []) {
+    revokeComposerAttachmentPreview(attachment);
+  }
+}
+
+function pruneComposerDrafts() {
+  const drafts = state.codexControls.composerDraftsBySession;
+  while (drafts.size > COMPOSER_DRAFT_SESSION_LIMIT) {
+    const candidate = Array.from(drafts.keys())
+      .find((key) => key !== state.codexControls.mountedComposerSessionKey);
+    if (!candidate) break;
+    const removed = drafts.get(candidate);
+    drafts.delete(candidate);
+    releaseComposerDraftResources(removed);
+  }
+}
+
+function setComposerDraftForSessionKey(sessionKey, draft) {
+  const key = resolveComposerSessionKey(sessionKey);
+  if (!key) return null;
+  const drafts = state.codexControls.composerDraftsBySession;
+  if (!composerDraftHasTemporaryContent(draft)) {
+    drafts.delete(key);
+    return null;
+  }
+  const next = cloneComposerDraft(draft);
+  drafts.delete(key);
+  drafts.set(key, next);
+  pruneComposerDrafts();
+  return next;
+}
+
 function snapshotComposerDraft(rawText) {
+  const input = el('input-text');
   return {
     text: String(rawText || ''),
     attachments: state.codexControls.attachments.map(cloneComposerAttachment),
     localImagePath: el('codex-local-image-path')?.value || '',
     options: getComposerOptions(),
+    selectionStart: Number.isInteger(input?.selectionStart) ? input.selectionStart : null,
+    selectionEnd: Number.isInteger(input?.selectionEnd) ? input.selectionEnd : null,
     createdAt: new Date().toISOString(),
   };
 }
 
-function setActiveDraftForSession(session, payload) {
-  const key = getSessionKey(session);
+function getComposerDraftForSessionKey(sessionKey) {
+  const key = resolveComposerSessionKey(sessionKey);
+  if (!key) return cloneComposerDraft();
+  if (getMountedComposerSessionKey() === key) {
+    return snapshotComposerDraft(el('input-text')?.value || '');
+  }
+  return cloneComposerDraft(
+    state.codexControls.pendingComposerDraftsBySession.get(key)
+    || state.codexControls.composerDraftsBySession.get(key)
+    || {}
+  );
+}
+
+function appendComposerAttachmentsForSessionKey(sessionKey, attachments = []) {
+  const key = resolveComposerSessionKey(sessionKey);
+  const incoming = attachments.filter(Boolean).map(cloneComposerAttachment);
+  if (!key || !incoming.length) return false;
+  if (getMountedComposerSessionKey() === key) {
+    state.codexControls.attachments.push(...incoming);
+    renderAttachmentChips();
+    return true;
+  }
+  const hadPending = state.codexControls.pendingComposerDraftsBySession.has(key);
+  const draft = getComposerDraftForSessionKey(key);
+  draft.attachments.push(...incoming);
+  const saved = setComposerDraftForSessionKey(key, draft);
+  if (hadPending && saved) {
+    state.codexControls.pendingComposerDraftsBySession.set(key, cloneComposerDraft(saved));
+  }
+  return true;
+}
+
+function patchComposerAttachmentForSessionKey(sessionKey, attachmentIdentity, patch = {}) {
+  const key = resolveComposerSessionKey(sessionKey);
+  if (!key || !attachmentIdentity) return false;
+  const applyPatch = (attachments) => {
+    const attachment = attachments.find((candidate) => (
+      composerAttachmentKey(candidate) === attachmentIdentity
+      || candidate.fileId === attachmentIdentity
+    ));
+    if (!attachment) return false;
+    Object.assign(attachment, patch);
+    return true;
+  };
+  if (getMountedComposerSessionKey() === key) {
+    if (!applyPatch(state.codexControls.attachments)) return false;
+    renderAttachmentChips();
+    return true;
+  }
+  const hadPending = state.codexControls.pendingComposerDraftsBySession.has(key);
+  const draft = getComposerDraftForSessionKey(key);
+  if (!applyPatch(draft.attachments)) return false;
+  const saved = setComposerDraftForSessionKey(key, draft);
+  if (hadPending && saved) {
+    state.codexControls.pendingComposerDraftsBySession.set(key, cloneComposerDraft(saved));
+  }
+  return true;
+}
+
+function clearComposerDraftForSessionKey(sessionKey) {
+  const key = resolveComposerSessionKey(sessionKey);
+  if (!key) return false;
+  if (getMountedComposerSessionKey() === key) {
+    state.codexControls.mountingComposerDraft = true;
+    try {
+      for (const attachment of state.codexControls.attachments) {
+        revokeComposerAttachmentPreview(attachment);
+      }
+      state.codexControls.attachments = [];
+      const input = el('input-text');
+      if (input) {
+        input.value = '';
+        input.selectionStart = 0;
+        input.selectionEnd = 0;
+      }
+      const localImageInput = el('codex-local-image-path');
+      if (localImageInput) localImageInput.value = '';
+      const fileInput = el('codex-image-files');
+      if (fileInput) fileInput.value = '';
+      state.codexControls.composerDraftsBySession.delete(key);
+      state.codexControls.pendingComposerDraftsBySession.delete(key);
+      renderAttachmentChips();
+    } finally {
+      state.codexControls.mountingComposerDraft = false;
+    }
+    updateSlashMenuFromInput();
+    return true;
+  }
+  const saved = state.codexControls.composerDraftsBySession.get(key);
+  const pending = state.codexControls.pendingComposerDraftsBySession.get(key);
+  if (saved) releaseComposerDraftResources(saved);
+  if (pending && pending !== saved) releaseComposerDraftResources(pending);
+  state.codexControls.composerDraftsBySession.delete(key);
+  state.codexControls.pendingComposerDraftsBySession.delete(key);
+  return true;
+}
+
+function rememberMountedComposerDraft() {
+  if (state.codexControls.mountingComposerDraft) return null;
+  const key = resolveComposerSessionKey(state.codexControls.mountedComposerSessionKey);
+  if (!key) return null;
+  return setComposerDraftForSessionKey(
+    key,
+    snapshotComposerDraft(el('input-text')?.value || '')
+  );
+}
+
+function applyMountedComposerDraft(sessionKey, draft = null) {
+  const key = resolveComposerSessionKey(sessionKey);
+  const next = cloneComposerDraft(draft || {});
+  const input = el('input-text');
+  const localImageInput = el('codex-local-image-path');
+  state.codexControls.mountingComposerDraft = true;
+  state.codexControls.mountedComposerSessionKey = key;
+  try {
+    state.codexControls.attachments = next.attachments;
+    if (input) {
+      input.value = next.text;
+      const maximum = input.value.length;
+      const selectionStart = Number.isInteger(next.selectionStart)
+        ? Math.max(0, Math.min(maximum, next.selectionStart))
+        : maximum;
+      const selectionEnd = Number.isInteger(next.selectionEnd)
+        ? Math.max(selectionStart, Math.min(maximum, next.selectionEnd))
+        : selectionStart;
+      input.selectionStart = selectionStart;
+      input.selectionEnd = selectionEnd;
+    }
+    if (localImageInput) localImageInput.value = next.localImagePath;
+    renderAttachmentChips();
+  } finally {
+    state.codexControls.mountingComposerDraft = false;
+  }
+  updateSlashMenuFromInput();
+  return next;
+}
+
+function syncMountedComposerDraftSession(session = getSelectedSession()) {
+  const nextKey = resolveComposerSessionKey(getSessionKey(session) || '');
+  const previousKey = resolveComposerSessionKey(state.codexControls.mountedComposerSessionKey);
+  if (nextKey === previousKey) return false;
+  if (!previousKey && nextKey) {
+    const browserRestoredDraft = snapshotComposerDraft(el('input-text')?.value || '');
+    if (composerDraftHasTemporaryContent(browserRestoredDraft)) {
+      state.codexControls.mountedComposerSessionKey = nextKey;
+      setComposerDraftForSessionKey(nextKey, browserRestoredDraft);
+      return true;
+    }
+  }
+  rememberMountedComposerDraft();
+  const pending = nextKey
+    ? state.codexControls.pendingComposerDraftsBySession.get(nextKey) || null
+    : null;
+  const saved = nextKey
+    ? pending || state.codexControls.composerDraftsBySession.get(nextKey) || null
+    : null;
+  applyMountedComposerDraft(nextKey, saved);
+  if (pending) {
+    state.codexControls.pendingComposerDraftsBySession.delete(nextKey);
+    setComposerDraftForSessionKey(nextKey, pending);
+  }
+  return true;
+}
+
+function moveComposerDraftSessionKey(previousKeyValue, nextKeyValue) {
+  const rawPreviousKey = String(previousKeyValue || '');
+  const rawNextKey = String(nextKeyValue || '');
+  const previousKey = resolveComposerSessionKey(rawPreviousKey);
+  const nextKey = resolveComposerSessionKey(rawNextKey);
+  if (!previousKey || !nextKey || previousKey === nextKey) return false;
+  if (resolveComposerSessionKey(state.codexControls.mountedComposerSessionKey) === previousKey) {
+    rememberMountedComposerDraft();
+    state.codexControls.mountedComposerSessionKey = nextKey;
+  }
+  const aliases = state.codexControls.composerSessionKeyAliases;
+  for (const [alias, target] of aliases) {
+    if (target === previousKey) aliases.set(alias, nextKey);
+  }
+  aliases.set(rawPreviousKey, nextKey);
+  aliases.set(previousKey, nextKey);
+  while (aliases.size > COMPOSER_DRAFT_SESSION_LIMIT * 4) {
+    aliases.delete(aliases.keys().next().value);
+  }
+  for (const drafts of [
+    state.codexControls.composerDraftsBySession,
+    state.codexControls.pendingComposerDraftsBySession,
+    state.codexControls.activeDraftsBySession,
+  ]) {
+    if (!drafts.has(previousKey)) continue;
+    const draft = drafts.get(previousKey);
+    drafts.delete(previousKey);
+    drafts.set(nextKey, draft);
+  }
+  const submission = state.codexControls.composerSubmissionsBySession.get(previousKey) || null;
+  if (submission) {
+    state.codexControls.composerSubmissionsBySession.delete(previousKey);
+    submission.sessionKey = nextKey;
+    state.codexControls.composerSubmissionsBySession.set(nextKey, submission);
+  }
+  const moveMapEntry = (map) => {
+    if (!map || typeof map.has !== 'function' || !map.has(previousKey)) return false;
+    const value = map.get(previousKey);
+    map.delete(previousKey);
+    map.set(nextKey, value);
+    return true;
+  };
+  const moveSetEntry = (set) => {
+    if (!set || typeof set.has !== 'function' || !set.has(previousKey)) return false;
+    set.delete(previousKey);
+    set.add(nextKey);
+    return true;
+  };
+  const movedSessionOptions = moveMapEntry(state.codexControls.sessionOptionsByKey);
+  moveSetEntry(state.codexControls.persistedSessionOptionKeys);
+  moveMapEntry(state.codexControls.apiSwitchNoticesBySession);
+  moveSetEntry(state.sessionApiRebindBusyKeys);
+  moveSetEntry(state.sessionTranscriptFallbackBusyKeys);
+  moveMapEntry(state.sessionRebindFailures);
+  if (movedSessionOptions && typeof persistComposerSessionOptions === 'function') {
+    persistComposerSessionOptions();
+  }
+  return true;
+}
+
+function setActiveDraftForSessionKey(sessionKey, payload) {
+  const key = resolveComposerSessionKey(sessionKey);
   const draft = payload?.composerDraft;
   if (!key || !draft) {
     return;
@@ -9123,15 +11244,19 @@ function setActiveDraftForSession(session, payload) {
   });
 }
 
+function setActiveDraftForSession(session, payload) {
+  setActiveDraftForSessionKey(resolveComposerSessionKey(session), payload);
+}
+
 function clearActiveDraftForSession(session) {
-  const key = getSessionKey(session);
+  const key = resolveComposerSessionKey(session);
   if (key) {
     state.codexControls.activeDraftsBySession.delete(key);
   }
 }
 
 function stashPendingComposerDraftForSession(sessionOrKey, draft) {
-  const key = typeof sessionOrKey === 'string' ? sessionOrKey : getSessionKey(sessionOrKey);
+  const key = resolveComposerSessionKey(sessionOrKey);
   if (!key || !draft) {
     return;
   }
@@ -9153,12 +11278,28 @@ function restoreComposerDraft(draft, options = {}) {
     } else if (draftText) {
       input.value = `${input.value.trimEnd()}\n\n${draftText}`;
     }
+    const maximum = input.value.length;
+    const restoreSavedSelection = options.replace || input.value === draftText;
+    const selectionStart = restoreSavedSelection && Number.isInteger(draft.selectionStart)
+      ? Math.max(0, Math.min(maximum, draft.selectionStart))
+      : maximum;
+    const selectionEnd = restoreSavedSelection && Number.isInteger(draft.selectionEnd)
+      ? Math.max(selectionStart, Math.min(maximum, draft.selectionEnd))
+      : selectionStart;
+    input.selectionStart = selectionStart;
+    input.selectionEnd = selectionEnd;
     input.dispatchEvent(new Event('input', { bubbles: true }));
   }
 
   const nextAttachments = Array.isArray(draft.attachments)
     ? draft.attachments.map(cloneComposerAttachment)
     : [];
+  if (options.replace) {
+    for (const attachment of state.codexControls.attachments) {
+      revokeComposerAttachmentPreview(attachment);
+    }
+    state.codexControls.attachments = [];
+  }
   if (nextAttachments.length) {
     const existingKeys = new Set(state.codexControls.attachments.map(composerAttachmentKey));
     for (const attachment of nextAttachments) {
@@ -9175,8 +11316,8 @@ function restoreComposerDraft(draft, options = {}) {
   }
 
   const localImageInput = el('codex-local-image-path');
-  if (localImageInput && draft.localImagePath && !localImageInput.value.trim()) {
-    localImageInput.value = draft.localImagePath;
+  if (localImageInput && (options.replace || (draft.localImagePath && !localImageInput.value.trim()))) {
+    localImageInput.value = String(draft.localImagePath || '');
     localImageInput.dispatchEvent(new Event('input', { bubbles: true }));
   }
   renderAttachmentChips();
@@ -9184,7 +11325,7 @@ function restoreComposerDraft(draft, options = {}) {
 }
 
 function restorePendingComposerDraftForSession(session) {
-  const key = getSessionKey(session);
+  const key = resolveComposerSessionKey(session);
   if (!key) {
     return false;
   }
@@ -9204,7 +11345,7 @@ function restorePendingComposerDraftForSession(session) {
 }
 
 function restoreActiveDraftForSession(session) {
-  const key = getSessionKey(session);
+  const key = resolveComposerSessionKey(session);
   if (!key) {
     return false;
   }
@@ -9887,8 +12028,10 @@ function renderSlashMenu() {
   }
 }
 
-async function uploadComposerFiles(session) {
-  const uploadAttachments = state.codexControls.attachments
+async function uploadComposerFiles(session, draft = null) {
+  const composerDraft = cloneComposerDraft(draft || getComposerDraftForSessionKey(getSessionKey(session)));
+  const sessionKey = resolveComposerSessionKey(getSessionKey(session));
+  const uploadAttachments = composerDraft.attachments
     .filter((attachment) => attachment.type === 'uploadFile');
   if (!uploadAttachments.length) {
     return [];
@@ -9930,7 +12073,12 @@ async function uploadComposerFiles(session) {
   let uploaded = [];
   if (pending.length) {
     for (const attachment of pending) {
-      const file = await uploadComposerFileInChunks(session, attachment);
+      const attachmentIdentity = composerAttachmentKey(attachment);
+      const file = await uploadComposerFileInChunks(session, attachment, {
+        onProgress: (uploadProgress) => {
+          patchComposerAttachmentForSessionKey(sessionKey, attachmentIdentity, { uploadProgress });
+        },
+      });
       if (file) {
         uploaded.push(file);
       }
@@ -9946,14 +12094,22 @@ async function uploadComposerFiles(session) {
       attachment.uploadCwd = session.cwd;
       attachment.mime = file.mime || attachment.mime;
       attachment.size = file.size || attachment.size;
+      patchComposerAttachmentForSessionKey(sessionKey, composerAttachmentKey(attachment), {
+        remotePath: attachment.remotePath,
+        remoteName: attachment.remoteName,
+        uploadHostId: attachment.uploadHostId,
+        uploadCwd: attachment.uploadCwd,
+        mime: attachment.mime,
+        size: attachment.size,
+        uploadProgress: 1,
+      });
     }
-    renderAttachmentChips();
   }
 
   return [...reusable, ...uploaded];
 }
 
-async function uploadComposerFileInChunks(session, attachment) {
+async function uploadComposerFileInChunks(session, attachment, options = {}) {
   if (!attachment.fileObject && attachment.dataBase64) {
     const response = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/upload`, {
       method: 'POST',
@@ -10010,7 +12166,7 @@ async function uploadComposerFileInChunks(session, attachment) {
       offset = Number(chunk.receivedBytes || end) || end;
       index += 1;
       attachment.uploadProgress = fileObject.size ? offset / fileObject.size : 1;
-      renderAttachmentChips();
+      options.onProgress?.(attachment.uploadProgress);
     }
 
     const complete = await fetchJson(`/api/hosts/${encodeURIComponent(session.hostId)}/files/uploads/${encodeURIComponent(uploadId)}/complete`, {
@@ -10018,6 +12174,7 @@ async function uploadComposerFileInChunks(session, attachment) {
       body: JSON.stringify({}),
     });
     attachment.uploadProgress = 1;
+    options.onProgress?.(1);
     return normalizeTranscriptFiles(complete.files || [])[0] || null;
   } catch (error) {
     if (error.status === 404 && /\/files\/uploads/.test(String(error.url || ''))) {
@@ -10032,16 +12189,17 @@ async function uploadComposerFileInChunks(session, attachment) {
   }
 }
 
-async function buildComposerPayload(session, rawText, overrides = {}) {
-  const composerDraft = snapshotComposerDraft(rawText);
-  const uploadedFiles = await uploadComposerFiles(session);
-  const inputItems = getComposerInputItems(uploadedFiles);
-  const promptCardSections = getComposerPromptCardSections();
-  const textFileSections = getComposerTextFileSections();
-  const inlineFiles = getComposerInlineFiles();
+async function buildComposerPayload(session, rawText, overrides = {}, sourceDraft = null) {
+  const composerDraft = cloneComposerDraft(sourceDraft || snapshotComposerDraft(rawText));
+  composerDraft.text = String(rawText ?? composerDraft.text ?? '');
+  const uploadedFiles = await uploadComposerFiles(session, composerDraft);
+  const inputItems = getComposerInputItems(uploadedFiles, composerDraft);
+  const promptCardSections = getComposerPromptCardSections(composerDraft);
+  const textFileSections = getComposerTextFileSections(composerDraft);
+  const inlineFiles = getComposerInlineFiles(composerDraft);
   const uploadedFileSections = getComposerUploadedFileSections(uploadedFiles);
   const options = {
-    ...getComposerOptions(),
+    ...(composerDraft.options || getComposerOptionsForSession(session)),
     ...overrides,
   };
   const userVisibleText = String(rawText || '').trim();
@@ -10227,6 +12385,7 @@ function insertTextAtCursor(input, text) {
 }
 
 async function handleComposerPaste(event) {
+  const composerSessionKey = getMountedComposerSessionKey();
   const images = getClipboardImageFiles(event);
   if (!images.length) {
     return;
@@ -10242,76 +12401,84 @@ async function handleComposerPaste(event) {
   if (pastedText && event.target === el('input-text')) {
     insertTextAtCursor(event.target, pastedText);
   }
-  await addComposerImageFiles(images);
+  await addComposerImageFiles(images, composerSessionKey);
 }
 
-async function addComposerImageFiles(files) {
+async function addComposerImageFiles(files, sessionKey = getMountedComposerSessionKey()) {
+  const composerSessionKey = resolveComposerSessionKey(sessionKey);
   const incoming = Array.from(files || []).filter((file) => file && String(file.type || '').startsWith('image/'));
   if (!incoming.length) {
     return;
   }
-  const existingImages = state.codexControls.attachments.filter((attachment) => attachment.type === 'image').length;
+  const existingImages = getComposerDraftForSessionKey(composerSessionKey).attachments
+    .filter((attachment) => attachment.type === 'image').length;
   const available = Math.max(0, MAX_COMPOSER_IMAGES - existingImages);
   if (!available) {
     throw new Error(`You can attach up to ${MAX_COMPOSER_IMAGES} images at once.`);
   }
 
   const selected = incoming.slice(0, available);
+  const nextAttachments = [];
   for (const [index, file] of selected.entries()) {
     if (file.size > MAX_COMPOSER_IMAGE_BYTES) {
       throw new Error(`${file.name} is too large for inline upload; limit is ${formatBytes(MAX_COMPOSER_IMAGE_BYTES)} per image.`);
     }
     const url = await readFileAsDataUrl(file);
-    state.codexControls.attachments.push({
+    nextAttachments.push({
       type: 'image',
       url,
       name: file.name || makePastedImageName(index, file.type),
       size: file.size,
     });
   }
-  renderAttachmentChips();
+  appendComposerAttachmentsForSessionKey(composerSessionKey, nextAttachments);
 }
 
-async function addComposerTextFiles(files) {
+async function addComposerTextFiles(files, sessionKey = getMountedComposerSessionKey()) {
+  const composerSessionKey = resolveComposerSessionKey(sessionKey);
   const incoming = Array.from(files || []).filter((file) => file && isTextLikeFile(file));
   if (!incoming.length) {
     return;
   }
-  const existingTextFiles = state.codexControls.attachments.filter((attachment) => attachment.type === 'textFile').length;
+  const existingTextFiles = getComposerDraftForSessionKey(composerSessionKey).attachments
+    .filter((attachment) => attachment.type === 'textFile').length;
   const available = Math.max(0, MAX_COMPOSER_TEXT_FILES - existingTextFiles);
   if (!available) {
     throw new Error(`You can attach up to ${MAX_COMPOSER_TEXT_FILES} text files at once.`);
   }
 
   const selected = incoming.slice(0, available);
+  const nextAttachments = [];
   for (const file of selected) {
     if (file.size > MAX_COMPOSER_TEXT_FILE_BYTES) {
       throw new Error(`${file.name} is too large for inline text upload; limit is ${formatBytes(MAX_COMPOSER_TEXT_FILE_BYTES)} per file.`);
     }
     const text = await readFileAsText(file);
-    state.codexControls.attachments.push({
+    nextAttachments.push({
       type: 'textFile',
       text,
       name: file.name,
       size: file.size,
     });
   }
-  renderAttachmentChips();
+  appendComposerAttachmentsForSessionKey(composerSessionKey, nextAttachments);
 }
 
-async function addComposerFiles(files) {
+async function addComposerFiles(files, sessionKey = getMountedComposerSessionKey()) {
+  const composerSessionKey = resolveComposerSessionKey(sessionKey);
   const allFiles = Array.from(files || []).filter(Boolean);
   if (!allFiles.length) {
     return;
   }
 
-  const existingUploads = state.codexControls.attachments.filter((attachment) => attachment.type === 'uploadFile').length;
+  const existingAttachments = getComposerDraftForSessionKey(composerSessionKey).attachments;
+  const existingUploads = existingAttachments.filter((attachment) => attachment.type === 'uploadFile').length;
   const available = Math.max(0, MAX_COMPOSER_UPLOAD_FILES - existingUploads);
   if (!available) {
     throw new Error(`You can attach up to ${MAX_COMPOSER_UPLOAD_FILES} files at once.`);
   }
   const selected = allFiles.slice(0, available);
-  const totalBytes = state.codexControls.attachments
+  const totalBytes = existingAttachments
     .filter((attachment) => attachment.type === 'uploadFile')
     .reduce((sum, attachment) => sum + (Number(attachment.size || 0) || 0), 0)
     + selected.reduce((sum, file) => sum + (Number(file.size || 0) || 0), 0);
@@ -10319,12 +12486,13 @@ async function addComposerFiles(files) {
     throw new Error(`Attached files are too large; total limit is ${formatBytes(MAX_COMPOSER_UPLOAD_TOTAL_BYTES)}.`);
   }
 
+  const nextAttachments = [];
   for (const file of selected) {
     if (file.size > MAX_COMPOSER_UPLOAD_FILE_BYTES) {
       throw new Error(`${file.name} is too large for remote upload; limit is ${formatBytes(MAX_COMPOSER_UPLOAD_FILE_BYTES)} per file.`);
     }
     const previewUrl = makeObjectPreviewUrl(file);
-    state.codexControls.attachments.push({
+    nextAttachments.push({
       type: 'uploadFile',
       fileId: makeClientId(),
       fileObject: file,
@@ -10336,7 +12504,7 @@ async function addComposerFiles(files) {
       previewObjectUrl: Boolean(previewUrl),
     });
   }
-  renderAttachmentChips();
+  appendComposerAttachmentsForSessionKey(composerSessionKey, nextAttachments);
 }
 
 function isFileDragEvent(event) {
@@ -10365,7 +12533,8 @@ async function handleComposerDrop(event) {
   }
 
   try {
-    await addComposerFiles(event.dataTransfer?.files);
+    const composerSessionKey = getMountedComposerSessionKey();
+    await addComposerFiles(event.dataTransfer?.files, composerSessionKey);
   } catch (error) {
     reportError(error);
   }
@@ -10373,6 +12542,7 @@ async function handleComposerDrop(event) {
 
 function renderSessionDetails() {
   const session = getSelectedSession();
+  syncMountedComposerDraftSession(session);
   renderSessionApiControls(session);
   if (!session && state.sessionDetailsOpen) {
     state.sessionDetailsOpen = false;
@@ -10596,8 +12766,10 @@ function renderSessionDetails() {
 function createRuntimeChip(container, label, value, tone = 'info') {
   const chip = document.createElement('div');
   chip.className = `runtime-chip ${tone}`.trim();
-  chip.innerHTML = `<strong>${label}</strong>${value}`;
+  appendTextElement(chip, 'strong', '', label);
+  chip.appendChild(document.createTextNode(String(value == null ? '' : value)));
   container.appendChild(chip);
+  return chip;
 }
 
 function renderRuntimePanel() {
@@ -10668,6 +12840,8 @@ function renderRuntimePanel() {
   }
 
   const runtimeState = describeRuntimeStatus(runtime, stream, session);
+  const runtimeActive = runtimeIsActive(runtime);
+  const runtimeIssue = runtimeIssuePresentation(runtime);
   const launchBusy = getSessionLaunchBusyForSession(session);
   const connectionSince = formatElapsedSince(getStreamElapsedAnchor(stream) || runtime.runtimeConnectionStartedAt);
   const phaseSince = formatElapsedSince(getRuntimeElapsedAnchor(runtime));
@@ -10681,7 +12855,7 @@ function renderRuntimePanel() {
         : 'info';
   const phaseTone = runtime.phase === 'error' || runtime.phase === 'quota-exhausted'
     ? 'error'
-    : runtime.phase === 'waiting-approval' || runtime.phase === 'waiting-user-input' || runtime.phase === 'reconnecting'
+    : runtime.phase === 'waiting-approval' || runtime.phase === 'waiting-user-input' || runtime.phase === 'retrying' || runtime.phase === 'reconnecting'
       ? 'warning'
       : runtime.busy
         ? 'active'
@@ -10727,7 +12901,7 @@ function renderRuntimePanel() {
     runtime.activeTurnId
       ? `${shortId(runtime.activeTurnId)} | ${runtimeState.turn}`
       : runtimeState.turn,
-    runtime.activeTurnId ? 'active' : 'info'
+    runtimeActive ? 'active' : 'info'
   );
   appendRuntimeChip(
     'Requests',
@@ -10748,8 +12922,8 @@ function renderRuntimePanel() {
   if (pingSince) {
     appendRuntimeChip('Heartbeat', `${pingSince} ago`, 'info');
   }
-  if (runtime.lastCodexError) {
-    appendRuntimeChip('Error', limitText(runtime.lastCodexError, 96), 'error');
+  if (runtimeIssue) {
+    appendRuntimeChip(runtimeIssue.label, limitText(runtimeIssue.message, 96), runtimeIssue.tone);
   } else if (runtime.rateLimits?.rateLimitReachedType) {
     appendRuntimeChip('API', prettyStatusLabel(runtime.rateLimits.rateLimitReachedType), 'warning');
   }
@@ -10783,14 +12957,25 @@ function renderRuntimePanel() {
 function renderThinkingPanel() {
   const session = getSelectedSession();
   if (!session) {
-    return;
+    return false;
   }
 
   const runtime = getRuntimeForSession(session) || {};
   const stream = getStreamStatusForSession(session) || {};
   const showLivePlaceholder = Boolean(session.live && runtimeIsActive(runtime));
+  const log = el('session-log');
   if (!showLivePlaceholder) {
-    return;
+    const stalePlaceholders = Array.from(
+      log?.querySelectorAll?.('.message.thinking[data-thinking-live="placeholder"]') || []
+    );
+    if (!stalePlaceholders.length) {
+      return false;
+    }
+    const scrollSnapshot = captureTranscriptScrollSnapshot();
+    for (const placeholder of stalePlaceholders) placeholder.remove();
+    pruneThinkingUiState(log);
+    restoreTranscriptScrollSnapshot(scrollSnapshot);
+    return true;
   }
 
   const diagnostics = [
@@ -10800,24 +12985,113 @@ function renderThinkingPanel() {
 
   const latestUserEntry = getLatestUserTranscriptEntry(session);
   const liveSegment = buildLiveActivitySegment(session, latestUserEntry, diagnostics);
-  if (!liveSegment && !showLivePlaceholder) {
-    return;
-  }
-
-  const log = el('session-log');
-  const expectedStateKey = `${getSessionKey(session) || session.sessionId || 'session'}::thinking::${liveSegment?.userTimestamp || latestUserEntry?.timestamp || 'live'}`;
+  const placeholderSegment = liveSegment ? null : {
+    userTimestamp: latestUserEntry?.timestamp || 'live',
+    userText: latestUserEntry?.text || '',
+    entries: [],
+    live: true,
+  };
+  const displayedSegment = liveSegment || placeholderSegment;
+  const expectedStateKey = `${getSessionKey(session) || session.sessionId || 'session'}::thinking::${displayedSegment.userTimestamp || 'live'}`;
   const existingCard = log?.querySelector(`.thinking-card[data-thinking-state-key="${cssEscape(expectedStateKey)}"]`);
   const existingMessage = existingCard?.closest('.message.thinking');
   if (!existingMessage) {
-    return;
+    return false;
   }
 
   const scrollSnapshot = captureTranscriptScrollSnapshot();
   patchThinkingMessageElement(
     existingMessage,
-    buildThinkingMessageElement(session, liveSegment, runtime, stream, !liveSegment)
+    buildThinkingMessageElement(session, displayedSegment, runtime, stream, !liveSegment)
   );
   restoreTranscriptScrollSnapshot(scrollSnapshot);
+  return true;
+}
+
+function normalizeAlertSeverity(value, fallback = 'warning') {
+  const normalizedFallback = ['info', 'warning', 'error'].includes(fallback) ? fallback : 'warning';
+  const severity = String(value || '').trim().toLowerCase();
+  return ['info', 'warning', 'error'].includes(severity) ? severity : normalizedFallback;
+}
+
+function appendTextElement(parent, tagName, className, value) {
+  const node = document.createElement(tagName);
+  if (className) {
+    node.className = className;
+  }
+  node.textContent = String(value == null ? '' : value);
+  parent.appendChild(node);
+  return node;
+}
+
+function createAlertListItem(alert = {}) {
+  const severity = normalizeAlertSeverity(alert.severity, 'warning');
+  const item = document.createElement('div');
+  item.className = `alert-item ${severity}`;
+
+  const top = document.createElement('div');
+  top.className = 'alert-top';
+  appendTextElement(top, 'span', 'alert-severity', severity.toUpperCase());
+  appendTextElement(top, 'span', 'alert-time', formatTime(alert.timestamp));
+  item.appendChild(top);
+  appendTextElement(item, 'div', 'alert-message', alert.message || '');
+  appendTextElement(item, 'div', 'alert-source', alert.source || 'runtime');
+  return item;
+}
+
+function createStatusAlertItem(alert = {}) {
+  const severity = normalizeAlertSeverity(alert.severity, 'warning');
+  const item = document.createElement('div');
+  item.className = `status-alert-card ${severity}`;
+
+  const top = document.createElement('div');
+  top.className = 'status-alert-top';
+  appendTextElement(top, 'span', '', severity.toUpperCase());
+  appendTextElement(top, 'span', '', formatTime(alert.timestamp));
+  item.appendChild(top);
+  appendTextElement(item, 'div', 'status-alert-message', alert.message || '');
+  appendTextElement(item, 'div', 'status-alert-source', alert.source || 'runtime');
+  return item;
+}
+
+function createStatusDiagnosticItem(entry = {}) {
+  const severity = normalizeAlertSeverity(entry.severity, 'info');
+  const item = document.createElement('div');
+  item.className = `status-diagnostic-card ${severity}`;
+
+  const top = document.createElement('div');
+  top.className = 'status-diagnostic-top';
+  appendTextElement(top, 'span', '', entry.kind || 'event');
+  appendTextElement(top, 'span', '', formatTime(entry.timestamp));
+  item.appendChild(top);
+  appendTextElement(item, 'div', 'status-diagnostic-method', entry.method || entry.source || 'codex');
+  appendTextElement(item, 'div', 'status-diagnostic-message', entry.message || '');
+  if (entry.detail) {
+    appendTextElement(item, 'div', 'status-diagnostic-detail', entry.detail);
+  }
+  if (entry.data) {
+    appendTextElement(item, 'div', 'status-diagnostic-data', summarizeData(entry.data));
+  }
+  return item;
+}
+
+function createStatusRequestItem(request = {}) {
+  const item = document.createElement('div');
+  item.className = `status-request-card ${request.status === 'pending' ? 'pending' : 'resolved'}`;
+
+  const top = document.createElement('div');
+  top.className = 'status-request-top';
+  appendTextElement(top, 'div', 'status-request-title', request.title || request.method || request.kind || 'Request');
+  appendTextElement(top, 'div', 'status-request-badge', request.status || 'pending');
+  item.appendChild(top);
+  appendTextElement(item, 'div', 'status-request-copy', request.summary || request.message || 'No summary provided.');
+  appendTextElement(
+    item,
+    'div',
+    'status-request-meta',
+    `${request.method || request.kind || 'request'} | ${formatTime(request.updatedAt || request.createdAt)}`
+  );
+  return item;
 }
 
 function renderAlertsWindow() {
@@ -10849,7 +13123,7 @@ function renderAlertsWindow() {
     clearButton.title = alerts.length ? 'Hide current alerts for this session.' : 'No visible alerts to clear.';
   }
 
-  listEl.innerHTML = '';
+  listEl.replaceChildren();
   if (!alerts.length) {
     emptyEl.classList.remove('hidden');
     return;
@@ -10857,17 +13131,7 @@ function renderAlertsWindow() {
 
   emptyEl.classList.add('hidden');
   for (const alert of [...alerts].reverse()) {
-    const item = document.createElement('div');
-    item.className = `alert-item ${alert.severity || 'warning'}`;
-    item.innerHTML = `
-      <div class="alert-top">
-        <span class="alert-severity">${(alert.severity || 'warning').toUpperCase()}</span>
-        <span class="alert-time">${formatTime(alert.timestamp)}</span>
-      </div>
-      <div class="alert-message">${alert.message || ''}</div>
-      <div class="alert-source">${alert.source || 'runtime'}</div>
-    `;
-    listEl.appendChild(item);
+    listEl.appendChild(createAlertListItem(alert));
   }
 }
 
@@ -11481,6 +13745,10 @@ async function endCurrentSession() {
     throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
   }
   const expectation = captureSessionLifecycleExpectation(canonicalSession);
+  const currentRuntime = getRuntimeForSession(canonicalSession) || canonicalSession.runtime || null;
+  const previousRuntime = currentRuntime && typeof currentRuntime === 'object'
+    ? { ...currentRuntime }
+    : null;
 
   patchRuntimeForSession(canonicalSession.hostId, canonicalSession.sessionId, {
     phase: 'ending',
@@ -11503,11 +13771,12 @@ async function endCurrentSession() {
       }),
     });
   } catch (error) {
-    patchRuntimeForSession(canonicalSession.hostId, canonicalSession.sessionId, {
-      phase: 'error',
-      connection: 'ready',
-      lastError: error.message,
-    });
+    restoreRuntimeSnapshotForSession(
+      canonicalSession.hostId,
+      canonicalSession.sessionId,
+      previousRuntime
+    );
+    renderAll();
     throw error;
   }
   await delay(600);
@@ -11529,16 +13798,29 @@ async function endAllRelaySessions() {
   });
 }
 
-function closeSessionActionDialog() {
+function closeSessionActionDialog(options = {}) {
+  if (state.sessionActionDialog.busy && options.force !== true) {
+    return false;
+  }
+  state.sessionActionDialog.operationId += 1;
   state.sessionActionDialog.open = false;
   state.sessionActionDialog.busy = false;
   state.sessionActionDialog.sessions = [];
   state.sessionActionDialog.selectedKeys = new Set();
+  state.sessionActionDialog.profileId = '';
+  state.sessionActionDialog.selection = null;
+  state.sessionActionDialog.phase = 'select';
+  state.sessionActionDialog.resultsByKey = new Map();
   renderSessionActionDialog();
+  return true;
 }
 
 function openSessionActionDialog(options = {}) {
+  if (state.sessionActionDialog.open && state.sessionActionDialog.busy) {
+    return false;
+  }
   const sessions = Array.isArray(options.sessions) ? options.sessions.filter(Boolean) : [];
+  state.sessionActionDialog.operationId += 1;
   state.sessionActionDialog.open = true;
   state.sessionActionDialog.mode = options.mode || 'stop';
   state.sessionActionDialog.title = options.title || 'Select sessions';
@@ -11547,7 +13829,93 @@ function openSessionActionDialog(options = {}) {
   state.sessionActionDialog.sessions = sessions;
   state.sessionActionDialog.selectedKeys = new Set(sessions.map(getSessionKey).filter(Boolean));
   state.sessionActionDialog.busy = false;
+  state.sessionActionDialog.profileId = String(options.profileId || '');
+  state.sessionActionDialog.selection = options.selection
+    ? normalizeRebindSelectionSnapshot(options.selection)
+    : null;
+  state.sessionActionDialog.phase = 'select';
+  state.sessionActionDialog.resultsByKey = new Map();
   renderSessionActionDialog();
+  return true;
+}
+
+function sessionActionOperationIsCurrent(operationId) {
+  return state.sessionActionDialog.open
+    && state.sessionActionDialog.operationId === operationId;
+}
+
+function openApplyCurrentSessionSettingsDialog(session = getSelectedSession()) {
+  if (!session) {
+    throw new Error('Select a Session first.');
+  }
+  const binding = sessionApiBinding(session);
+  const profile = getBoundApiProfileForSession(session);
+  if (!profile) {
+    throw new Error(
+      binding?.kind === 'host_environment'
+        ? 'The current Session uses its Host environment. Switch it to a saved API profile before applying these settings elsewhere.'
+        : 'The current Session API no longer matches a saved profile. Rebind this Session before applying its settings elsewhere.'
+    );
+  }
+  const options = getComposerOptionsForSession(session);
+  const selection = normalizeRebindSelectionSnapshot({
+    model: options.model,
+    effort: options.effort,
+    summary: options.summary,
+    allowUnverifiedEffort: options.allowUnverifiedEffort,
+  });
+  const sourceKey = getSessionKey(session);
+  const sessions = getRelayManagedLiveSessions()
+    .filter((candidate) => getSessionKey(candidate) !== sourceKey);
+  if (!sessions.length) {
+    throw new Error('No other managed live Sessions are available.');
+  }
+  closeSettingsDialog();
+  openSessionActionDialog({
+    mode: 'rebind-profile',
+    profileId: profile.profileId,
+    selection,
+    title: 'Apply current Session settings to live Sessions',
+    subtitle: 'Choose other live Sessions, verify the target API, then Rebind and restart them.',
+    actionLabel: 'Apply and restart',
+    sessions,
+  });
+}
+
+function sessionActionResultLabel(result) {
+  if (!result) return '';
+  const labels = {
+    checking: 'Checking...',
+    ready: 'Ready',
+    applying: 'Applying...',
+    success: 'Applied',
+    skipped: 'Skipped',
+    conflict: 'Conflict',
+    failure: 'Failed',
+  };
+  return [labels[result.status] || result.status, result.message || ''].filter(Boolean).join(' | ');
+}
+
+function renderSessionActionRow(dialog, session) {
+  const key = getSessionKey(session);
+  const host = getHost(session.hostId);
+  const result = dialog.resultsByKey.get(key) || null;
+  const row = document.createElement('label');
+  row.className = 'choice-session-row';
+  if (result?.status) {
+    row.dataset.resultStatus = result.status;
+  }
+  row.innerHTML = `
+    <input type="checkbox" data-session-action-key="${escapeHtml(key)}" ${dialog.selectedKeys.has(key) ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
+    <div class="choice-session-copy">
+      <strong>${escapeHtml(sessionDisplayTitle(session))}</strong>
+      <span title="${escapeHtml(session.sessionId || '')}">${escapeHtml(sessionPlatformLabel(session))} | ${escapeHtml(session.sessionId || '')}</span>
+      <span title="${escapeHtml(session.cwd || '')}">${escapeHtml(session.cwd || '(no path)')}</span>
+      <span>${escapeHtml(session.live ? 'live' : (session.state || 'history'))}${host?.online === false ? ' | host offline' : ''}</span>
+      ${result ? `<span class="choice-session-result">${escapeHtml(sessionActionResultLabel(result))}</span>` : ''}
+    </div>
+  `;
+  return row;
 }
 
 function renderSessionActionDialog() {
@@ -11564,7 +13932,12 @@ function renderSessionActionDialog() {
   const list = el('session-action-dialog-list');
   const empty = el('session-action-dialog-empty');
   const confirm = el('session-action-dialog-confirm-button');
+  const preflight = el('session-action-dialog-preflight-button');
+  const profileSummary = el('session-action-dialog-profile');
+  const resultsSummary = el('session-action-dialog-results');
   const selectAll = el('session-action-select-all-checkbox');
+  const closeButton = el('session-action-dialog-close-button');
+  const cancelButton = el('session-action-dialog-cancel-button');
   list.innerHTML = '';
 
   const sessions = dialog.sessions || [];
@@ -11573,24 +13946,82 @@ function renderSessionActionDialog() {
   selectAll.checked = sessions.length > 0 && selectedCount === sessions.length;
   selectAll.indeterminate = selectedCount > 0 && selectedCount < sessions.length;
   selectAll.disabled = dialog.busy || sessions.length === 0;
-  confirm.disabled = dialog.busy || selectedCount === 0;
-  confirm.textContent = dialog.busy ? 'Working...' : `${dialog.actionLabel || 'Apply'} (${selectedCount})`;
+  closeButton.disabled = dialog.busy;
+  cancelButton.disabled = dialog.busy;
+  const rebindMode = dialog.mode === 'rebind-profile';
+  preflight?.classList.toggle('hidden', !rebindMode);
+  profileSummary?.classList.toggle('hidden', !rebindMode);
+  const resultValues = [...dialog.resultsByKey.values()];
+  const readyCount = sessions.filter((session) => (
+    dialog.selectedKeys.has(getSessionKey(session))
+    && dialog.resultsByKey.get(getSessionKey(session))?.status === 'ready'
+  )).length;
 
-  for (const session of sessions) {
-    const key = getSessionKey(session);
-    const host = getHost(session.hostId);
-    const row = document.createElement('label');
-    row.className = 'choice-session-row';
-    row.innerHTML = `
-      <input type="checkbox" data-session-action-key="${escapeHtml(key)}" ${dialog.selectedKeys.has(key) ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
-      <div class="choice-session-copy">
-        <strong>${escapeHtml(sessionDisplayTitle(session))}</strong>
-        <span>${escapeHtml(sessionPlatformLabel(session))} | ${escapeHtml(shortId(session.sessionId))}</span>
-        <span title="${escapeHtml(session.cwd || '')}">${escapeHtml(session.cwd || '(no path)')}</span>
-        <span>${escapeHtml(session.live ? 'live' : (session.state || 'history'))}${host?.online === false ? ' | host offline' : ''}</span>
-      </div>
-    `;
-    list.appendChild(row);
+  if (rebindMode) {
+    const profile = getApiProfile(dialog.profileId);
+    const selection = normalizeRebindSelectionSnapshot(dialog.selection || {});
+    profileSummary.textContent = profile
+      ? `${profile.label} | Current Session: ${formatSessionDefaultsSummary(selection)}`
+      : 'The selected API profile is no longer available.';
+    const statusCounts = resultValues.reduce((counts, result) => {
+      counts[result.status] = (counts[result.status] || 0) + 1;
+      return counts;
+    }, {});
+    const successCount = statusCounts.success || 0;
+    const failedCount = (statusCounts.failure || 0) + (statusCounts.conflict || 0) + (statusCounts.skipped || 0);
+    const countText = dialog.phase === 'complete' && successCount > 0
+      ? failedCount > 0
+        ? formatUiText('session.batchApplyPartial', { success: successCount, failed: failedCount })
+        : formatUiText('session.batchApplySuccess', { count: successCount })
+      : Object.entries(statusCounts).map(([status, count]) => `${status}: ${count}`).join(' | ');
+    resultsSummary.classList.toggle('hidden', !countText);
+    resultsSummary.textContent = countText;
+    preflight.disabled = dialog.busy || selectedCount === 0 || !profile;
+    preflight.textContent = dialog.phase === 'preflighting' ? 'Preflighting...' : 'Preflight selected';
+    confirm.disabled = dialog.busy || readyCount === 0 || !profile;
+    confirm.textContent = dialog.phase === 'applying'
+      ? 'Applying...'
+      : `${dialog.actionLabel || 'Apply'} (${readyCount})`;
+  } else {
+    profileSummary.textContent = '';
+    resultsSummary.textContent = '';
+    resultsSummary.classList.add('hidden');
+    confirm.disabled = dialog.busy || selectedCount === 0;
+    confirm.textContent = dialog.busy ? 'Working...' : `${dialog.actionLabel || 'Apply'} (${selectedCount})`;
+  }
+
+  if (rebindMode) {
+    const byHost = new Map();
+    for (const session of sessions) {
+      if (!byHost.has(session.hostId)) byHost.set(session.hostId, []);
+      byHost.get(session.hostId).push(session);
+    }
+    for (const [hostId, hostSessions] of byHost.entries()) {
+      const group = document.createElement('section');
+      group.className = 'choice-host-group';
+      const selectedHostCount = hostSessions.filter((session) => dialog.selectedKeys.has(getSessionKey(session))).length;
+      const heading = document.createElement('div');
+      heading.className = 'choice-host-heading';
+      const hostLabel = getHost(hostId)?.label || hostId;
+      heading.innerHTML = `
+        <label>
+          <input type="checkbox" data-session-action-host="${escapeHtml(hostId)}" ${selectedHostCount === hostSessions.length ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
+          <span title="${escapeHtml(hostLabel)}">${escapeHtml(hostLabel)}</span>
+        </label>
+        <small>${selectedHostCount}/${hostSessions.length}</small>
+      `;
+      const hostCheckbox = heading.querySelector('[data-session-action-host]');
+      hostCheckbox.indeterminate = selectedHostCount > 0 && selectedHostCount < hostSessions.length;
+      group.appendChild(heading);
+      for (const session of hostSessions) {
+        group.appendChild(renderSessionActionRow(dialog, session));
+      }
+      list.appendChild(group);
+    }
+  } else {
+    for (const session of sessions) {
+      list.appendChild(renderSessionActionRow(dialog, session));
+    }
   }
   syncModalBodyState();
 }
@@ -11604,6 +14035,10 @@ async function stopManagedSession(session) {
     throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
   }
   const expectation = captureSessionLifecycleExpectation(canonicalSession);
+  const currentRuntime = getRuntimeForSession(canonicalSession) || canonicalSession.runtime || null;
+  const previousRuntime = currentRuntime && typeof currentRuntime === 'object'
+    ? { ...currentRuntime }
+    : null;
   patchRuntimeForSession(canonicalSession.hostId, canonicalSession.sessionId, {
     phase: 'ending',
     connection: 'closing',
@@ -11612,15 +14047,25 @@ async function stopManagedSession(session) {
     waitingOnApproval: false,
     waitingOnUserInput: false,
   });
-  await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/stop`, {
-    method: 'POST',
-    body: JSON.stringify({
-      hostId: canonicalSession.hostId,
-      expectedRunId: expectation.expectedRunId,
-      expectedRunStatus: expectation.expectedRunStatus,
-      expectedBindingFingerprint: expectation.expectedBindingFingerprint,
-    }),
-  });
+  try {
+    await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/stop`, {
+      method: 'POST',
+      body: JSON.stringify({
+        hostId: canonicalSession.hostId,
+        expectedRunId: expectation.expectedRunId,
+        expectedRunStatus: expectation.expectedRunStatus,
+        expectedBindingFingerprint: expectation.expectedBindingFingerprint,
+      }),
+    });
+  } catch (error) {
+    restoreRuntimeSnapshotForSession(
+      canonicalSession.hostId,
+      canonicalSession.sessionId,
+      previousRuntime
+    );
+    renderAll();
+    throw error;
+  }
 }
 
 async function waitForSessionStopped(session, timeoutMs = 15000) {
@@ -11664,8 +14109,351 @@ async function restartManagedSession(session) {
   });
 }
 
+function sessionActionErrorStatus(error) {
+  const code = String(error?.code || '');
+  return /conflict|precondition|pending|stopping|mismatch/.test(code) ? 'conflict' : 'failure';
+}
+
+async function runHostGroupedSessionTasks(sessions, task, concurrency = 2) {
+  const groups = new Map();
+  for (const session of sessions) {
+    if (!groups.has(session.hostId)) groups.set(session.hostId, []);
+    groups.get(session.hostId).push(session);
+  }
+  const entries = [...groups.values()];
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < entries.length) {
+      const group = entries[nextIndex];
+      nextIndex += 1;
+      for (const session of group) {
+        await task(session);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, entries.length) }, worker));
+}
+
+async function validateProfileRebindForSession(session, profile, selectionSnapshot = {}) {
+  const current = state.sessions.find((candidate) => getSessionKey(candidate) === getSessionKey(session)) || session;
+  const canonical = await loadStableCanonicalSessionForRebind(current);
+  const expectation = captureSessionLifecycleExpectation(canonical);
+  const { apiConfig } = resolveLaunchApiConfig({
+    hostId: canonical.hostId,
+    sourceSession: canonical,
+    explicitProfileId: profile.profileId,
+  });
+  // Auto fields remain explicit so the target run does not inherit stale values.
+  const selection = normalizeRebindSelectionSnapshot(selectionSnapshot);
+  const response = await fetchJson(`/api/sessions/${encodeURIComponent(canonical.sessionId)}/rebind/validate`, {
+    method: 'POST',
+    body: JSON.stringify({
+      hostId: canonical.hostId,
+      ...selection,
+      refreshModels: true,
+      apiConfig,
+      expectedRunId: expectation.expectedRunId,
+      expectedRunStatus: expectation.expectedRunStatus,
+      expectedBindingFingerprint: expectation.expectedBindingFingerprint,
+    }),
+  });
+  return { response, selection, apiConfig, expectation, canonical };
+}
+
+async function preflightSessionActionDialog() {
+  const dialog = state.sessionActionDialog;
+  if (dialog.mode !== 'rebind-profile' || dialog.busy) {
+    return;
+  }
+  const profile = getApiProfile(dialog.profileId);
+  if (!profile) {
+    throw new Error('The selected API profile is no longer available.');
+  }
+  const selected = (dialog.sessions || []).filter((session) => dialog.selectedKeys.has(getSessionKey(session)));
+  if (!selected.length) {
+    return;
+  }
+  const operationId = dialog.operationId;
+  dialog.busy = true;
+  dialog.phase = 'preflighting';
+  for (const session of selected) {
+    dialog.resultsByKey.set(getSessionKey(session), { status: 'checking', message: '' });
+  }
+  renderSessionActionDialog();
+  try {
+    await runHostGroupedSessionTasks(selected, async (session) => {
+      if (!sessionActionOperationIsCurrent(operationId)) return;
+      const key = getSessionKey(session);
+      try {
+        const validation = await validateProfileRebindForSession(session, profile, dialog.selection);
+        if (!sessionActionOperationIsCurrent(operationId)) return;
+        const response = validation.response || {};
+        dialog.resultsByKey.set(key, response.requiresInterrupt
+          ? {
+            status: 'skipped',
+            message: response.waitingOnApproval
+              ? 'Waiting for approval'
+              : response.waitingOnUserInput ? 'Waiting for input' : 'Session is busy',
+            validation,
+          }
+          : {
+            status: response.canExecute === false ? 'failure' : 'ready',
+            message: response.canExecute === false ? 'Preflight rejected' : `${response.modelCatalog?.models?.length || 0} models checked`,
+            validation,
+          });
+      } catch (error) {
+        if (!sessionActionOperationIsCurrent(operationId)) return;
+        dialog.resultsByKey.set(key, {
+          status: sessionActionErrorStatus(error),
+          message: error.message || String(error),
+          code: error.code || '',
+        });
+      }
+      renderSessionActionDialog();
+    }, 2);
+  } finally {
+    if (!sessionActionOperationIsCurrent(operationId)) return;
+    dialog.busy = false;
+    dialog.phase = 'preflighted';
+    renderSessionActionDialog();
+  }
+}
+
+function applySessionSelectionToSessionOptions(session, selection = {}) {
+  const key = resolveComposerSessionKey(getSessionKey(session));
+  if (!key) return null;
+  const selected = selection && typeof selection === 'object' ? selection : {};
+  const current = getComposerOptionsForSession(session);
+  const next = { ...current };
+  if (Object.prototype.hasOwnProperty.call(selected, 'model')) {
+    next.model = String(selected.model || '').trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(selected, 'effort')) {
+    const effort = String(selected.effort || '').trim().toLowerCase();
+    next.effort = effort;
+    next.effortMode = effort ? 'manual' : 'auto';
+    next.allowUnverifiedEffort = Boolean(effort && selected.allowUnverifiedEffort === true);
+  }
+  if (Object.prototype.hasOwnProperty.call(selected, 'summary')) {
+    next.summary = String(selected.summary || '').trim();
+  }
+  const normalized = normalizeComposerOptionValues(next);
+  state.codexControls.sessionOptionsByKey.set(key, normalized);
+  state.codexControls.persistedSessionOptionKeys.add(key);
+  persistComposerSessionOptions();
+  return normalized;
+}
+
+function rebindSelectionMatchesRuntime(candidate, expectedSelection) {
+  if (!expectedSelection || typeof expectedSelection !== 'object') {
+    return true;
+  }
+  const expected = normalizeRebindSelectionSnapshot(expectedSelection);
+  const observed = normalizeRebindSelectionSnapshot(candidate || {});
+  return observed.model === expected.model
+    && observed.effort === expected.effort
+    && observed.summary === expected.summary
+    && Boolean(observed.allowUnverifiedEffort) === Boolean(expected.allowUnverifiedEffort);
+}
+
+async function rebindResponseWasAccepted(session, target, previousRunId, expectedSelection = null) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
+      const previous = String(previousRunId || '').trim();
+      const pendingRunId = String(response?.pendingRun?.runId || '').trim();
+      const activeRunId = String(response?.activeRunId || '').trim();
+      const liveRunId = String(response?.runId || '').trim();
+      const latestRunId = [pendingRunId, activeRunId, liveRunId]
+        .find((runId) => runId && runId !== previous) || '';
+      const binding = latestRunId === pendingRunId
+        ? response?.pendingRun?.sessionBinding || null
+        : response?.apiBinding || response?.sessionBinding || null;
+      const requestedSelection = latestRunId === pendingRunId
+        ? response?.pendingRun?.requestedSelection || null
+        : response?.requestedSelection || response?.effectiveSelection || null;
+      if (
+        latestRunId
+        && rebindTargetMatchesBinding(binding, target)
+        && rebindSelectionMatchesRuntime(requestedSelection, expectedSelection)
+      ) {
+        return {
+          hostId: session.hostId,
+          sessionId: session.sessionId,
+          runId: latestRunId,
+          sessionBinding: binding,
+        };
+      }
+    } catch (_) {
+      // A just-accepted run may not be visible until the Relay commits it.
+    }
+    if (attempt === 0) {
+      await delay(120);
+    }
+  }
+  return null;
+}
+
+async function waitForProfileRebindCompletion(session, profile, response) {
+  const expectedRunId = String(response?.runId || '').trim();
+  if (!expectedRunId) {
+    throw sessionContractError('session_run_not_found', 'Rebind did not return a run ID.');
+  }
+  const completed = await waitForSessionReady(
+    session.hostId,
+    response.sessionId || session.sessionId,
+    managedSessionStartTimeoutMs(getHost(session.hostId), 'resume'),
+    { launchResponse: response }
+  );
+  if (!completed?.live) {
+    const failure = completed?.resumeError || {};
+    throw sessionContractError(
+      failure.code || 'session_rebind_failed',
+      failure.error || `Rebind failed while starting run ${shortId(expectedRunId)} (${completed?.state || 'unknown state'}).`
+    );
+  }
+  const runtime = await fetchJson(`/api/sessions/${encodeURIComponent(response.sessionId || session.sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
+  const binding = runtime?.apiBinding || runtime?.sessionBinding || null;
+  if (
+    String(runtime?.runId || '').trim() !== expectedRunId
+    || runtime?.runStatus !== 'live'
+    || !rebindTargetMatchesBinding(binding, profile)
+  ) {
+    throw sessionContractError(
+      'session_run_state_conflict',
+      'Rebind completed with a different run or API binding.'
+    );
+  }
+  return { ...completed, runtimeConfig: runtime, apiBinding: binding };
+}
+
+async function applyProfileRebindSessionActionDialog() {
+  const dialog = state.sessionActionDialog;
+  const profile = getApiProfile(dialog.profileId);
+  if (!profile || dialog.busy) return;
+  const ready = (dialog.sessions || []).filter((session) => (
+    dialog.selectedKeys.has(getSessionKey(session))
+    && dialog.resultsByKey.get(getSessionKey(session))?.status === 'ready'
+  ));
+  if (!ready.length) return;
+  const operationId = dialog.operationId;
+  dialog.busy = true;
+  dialog.phase = 'applying';
+  renderSessionActionDialog();
+  try {
+    await runHostGroupedSessionTasks(ready, async (session) => {
+      if (!sessionActionOperationIsCurrent(operationId)) return;
+      const key = getSessionKey(session);
+      const previousValidation = dialog.resultsByKey.get(key)?.validation || {};
+      let latestValidation = null;
+      let rebindAttempted = false;
+      dialog.resultsByKey.set(key, { status: 'applying', message: '' });
+      renderSessionActionDialog();
+      setSessionApiRebindBusy(session, true);
+      try {
+        // The read-only preflight already returned a short-lived, server-issued
+        // catalog proof. Reuse it for the mutating Rebind so the apply phase
+        // does not run a second validation (and a third provider /models fetch).
+        // Keep the fallback for older Relays that do not return the proof.
+        latestValidation = previousValidation?.response?.modelCatalogReuseToken
+          ? previousValidation
+          : await validateProfileRebindForSession(session, profile, dialog.selection);
+        if (!sessionActionOperationIsCurrent(operationId)) return;
+        if (latestValidation.response?.requiresInterrupt) {
+          dialog.resultsByKey.set(key, { status: 'skipped', message: 'Session became busy after preflight' });
+          return;
+        }
+        rebindAttempted = true;
+        const response = await rebindSessionApi(
+          session,
+          profile.profileId,
+          latestValidation.selection,
+          { ...latestValidation.apiConfig },
+          {
+            requireIdle: true,
+            canonicalSession: latestValidation.canonical,
+            expectation: latestValidation.expectation,
+            modelCatalogReuseToken: latestValidation.response?.modelCatalogReuseToken || null,
+            confirm: false,
+            waitForReady: false,
+          }
+        );
+        await waitForProfileRebindCompletion(session, profile, response);
+        clearSessionRebindFailure(session);
+        applySessionSelectionToSessionOptions(session, response?.clientSelection || latestValidation.selection);
+        dialog.resultsByKey.set(key, { status: 'success', message: 'Rebind live' });
+      } catch (error) {
+        const acceptedResponse = rebindAttempted && rebindFailureMayHaveLostAcceptedResponse(error)
+          ? rebindResponseWithClientSelection(
+            await rebindResponseWasAccepted(
+              session,
+              profile,
+              latestValidation?.response?.currentRunId || previousValidation.currentRunId,
+              latestValidation?.selection
+            ),
+            normalizeRebindSelectionSnapshot(latestValidation?.selection)
+          )
+          : null;
+        let finalError = error;
+        if (acceptedResponse) {
+          try {
+            await waitForProfileRebindCompletion(session, profile, acceptedResponse);
+            clearSessionRebindFailure(session);
+            applySessionSelectionToSessionOptions(session, acceptedResponse.clientSelection);
+            finalError = null;
+          } catch (completionError) {
+            finalError = completionError;
+          }
+        }
+        if (finalError) {
+          const canonical = latestValidation?.canonical || session;
+          recordSessionRebindFailure(
+            canonical,
+            sessionApiBinding(canonical),
+            rebindTargetSummary(profile.profileId, latestValidation?.apiConfig || apiProfileRequestConfig(profile)),
+            finalError
+          );
+        }
+        if (!sessionActionOperationIsCurrent(operationId)) return;
+        dialog.resultsByKey.set(key, finalError
+          ? { status: sessionActionErrorStatus(finalError), message: finalError.message || String(finalError), code: finalError.code || '' }
+          : { status: 'success', message: 'Rebind live; response was interrupted' });
+      } finally {
+        setSessionApiRebindBusy(session, false);
+        if (sessionActionOperationIsCurrent(operationId)) renderSessionActionDialog();
+      }
+    }, 2);
+    await refresh();
+  } finally {
+    if (!sessionActionOperationIsCurrent(operationId)) return;
+    dialog.busy = false;
+    dialog.phase = 'complete';
+    const retryKeys = new Set((dialog.sessions || [])
+      .map((session) => getSessionKey(session))
+      .filter((key) => ['failure', 'conflict', 'skipped'].includes(dialog.resultsByKey.get(key)?.status)));
+    if (retryKeys.size) {
+      dialog.selectedKeys = retryKeys;
+    }
+    renderSessionActionDialog();
+    const completedResults = [...dialog.resultsByKey.values()];
+    const successCount = completedResults.filter((result) => result?.status === 'success').length;
+    const failedCount = completedResults.filter((result) => (
+      ['failure', 'conflict', 'skipped'].includes(result?.status)
+    )).length;
+    if (successCount > 0 || failedCount > 0) {
+      window.alert(failedCount > 0
+        ? formatUiText('session.batchApplyPartial', { success: successCount, failed: failedCount })
+        : formatUiText('session.batchApplySuccess', { count: successCount }));
+    }
+  }
+}
+
 async function runSessionActionDialog() {
   const dialog = state.sessionActionDialog;
+  if (dialog.mode === 'rebind-profile') {
+    await applyProfileRebindSessionActionDialog();
+    return;
+  }
   const selected = (dialog.sessions || []).filter((session) => dialog.selectedKeys.has(getSessionKey(session)));
   if (!selected.length || dialog.busy) {
     return;
@@ -11687,7 +14475,7 @@ async function runSessionActionDialog() {
   }
   await delay(700);
   await refresh();
-  closeSessionActionDialog();
+  closeSessionActionDialog({ force: true });
   if (failures.length) {
     window.alert(`Some session actions failed:\n${failures.join('\n')}`);
   } else {
@@ -11817,6 +14605,8 @@ function renderStatusWindow() {
   syncModalBodyState();
 
   const runtime = getRuntimeForSession(session) || {};
+  const activeTurn = Boolean(session.live && runtimeIsActive(runtime));
+  const runtimeIssue = runtimeIssuePresentation(runtime);
   const host = getHost(session.hostId);
   const stream = getStreamStatusForSession(session) || {};
   const alerts = getAlertsForSession(session);
@@ -11861,9 +14651,9 @@ function renderStatusWindow() {
   renderStatusSummaryCard(
     summaryGrid,
     'Turn',
-    runtime.activeTurnId ? shortId(runtime.activeTurnId) : 'none',
-    runtime.activeTurnId
-      ? `${prettyStatusLabel(runtime.currentTurnStatus || 'inProgress')} | ${formatElapsedSince(runtime.turnStartedAt || runtime.updatedAt) || '0s'}`
+    runtime.activeTurnId ? shortId(runtime.activeTurnId) : (activeTurn ? prettyStatusLabel(runtime.currentTurnStatus || runtime.phase || 'active') : 'none'),
+    activeTurn
+      ? `${prettyStatusLabel(runtime.currentTurnStatus || runtime.phase || 'inProgress')} | ${formatElapsedSince(runtime.turnStartedAt || runtime.updatedAt) || '0s'}`
       : prettyStatusLabel(runtime.currentTurnStatus || 'idle')
   );
   renderStatusSummaryCard(
@@ -11874,7 +14664,7 @@ function renderStatusWindow() {
       ? 'Latest input / window | current estimate'
       : 'Waiting for token usage or task metadata'
   );
-  renderStatusSummaryCard(summaryGrid, 'Runner', getRunnerSummary(session).label, runtime.lastCodexError || '');
+  renderStatusSummaryCard(summaryGrid, 'Runner', getRunnerSummary(session).label, runtimeIssue?.message || '');
 
   const thinkingRecordCount = getThinkingDiagnosticsForSession(session).length;
   el('status-thinking').textContent = thinkingRecordCount
@@ -11903,8 +14693,8 @@ function renderStatusWindow() {
     el('goal-refresh-button'),
     el('goal-clear-button'),
   ].filter(Boolean);
-  interruptButton.disabled = !session.live || !runtime.activeTurnId;
-  interruptButton.textContent = runtime.activeTurnId ? 'Interrupt Active Turn' : 'No Active Turn';
+  interruptButton.disabled = !activeTurn;
+  interruptButton.textContent = activeTurn ? 'Interrupt Active Turn' : 'No Active Turn';
   endSessionButton.disabled = !session.live || runtime.phase === 'ending' || runtime.connection === 'closing';
   endSessionButton.textContent = session.live
     ? (endSessionButton.disabled ? 'Ending Session...' : 'End Live Session')
@@ -11959,19 +14749,7 @@ function renderStatusWindow() {
       requestList.appendChild(empty);
     } else {
       for (const request of [...requests].reverse()) {
-        const item = document.createElement('div');
-        item.className = `status-request-card ${request.status === 'pending' ? 'pending' : 'resolved'}`;
-
-        const title = request.title || request.method || request.kind || 'Request';
-        const summary = request.summary || request.message || '';
-        item.innerHTML = `
-          <div class="status-request-top">
-            <div class="status-request-title">${title}</div>
-            <div class="status-request-badge">${request.status || 'pending'}</div>
-          </div>
-          <div class="status-request-copy">${summary || 'No summary provided.'}</div>
-          <div class="status-request-meta">${request.method || request.kind || 'request'} | ${formatTime(request.updatedAt || request.createdAt)}</div>
-        `;
+        const item = createStatusRequestItem(request);
 
         if (request.payload) {
           const detail = document.createElement('div');
@@ -12092,7 +14870,7 @@ function renderStatusWindow() {
   }
 
   const alertList = el('status-alerts');
-  alertList.innerHTML = '';
+  alertList.replaceChildren();
   if (!alerts.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
@@ -12100,22 +14878,12 @@ function renderStatusWindow() {
     alertList.appendChild(empty);
   } else {
     for (const alert of [...alerts].reverse().slice(0, 16)) {
-      const item = document.createElement('div');
-      item.className = `status-alert-card ${alert.severity || 'warning'}`;
-      item.innerHTML = `
-        <div class="status-alert-top">
-          <span>${(alert.severity || 'warning').toUpperCase()}</span>
-          <span>${formatTime(alert.timestamp)}</span>
-        </div>
-        <div class="status-alert-message">${alert.message || ''}</div>
-        <div class="status-alert-source">${alert.source || 'runtime'}</div>
-      `;
-      alertList.appendChild(item);
+      alertList.appendChild(createStatusAlertItem(alert));
     }
   }
 
   const diagnosticsList = el('status-diagnostics');
-  diagnosticsList.innerHTML = '';
+  diagnosticsList.replaceChildren();
   if (!diagnostics.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
@@ -12123,19 +14891,7 @@ function renderStatusWindow() {
     diagnosticsList.appendChild(empty);
   } else {
     for (const entry of [...diagnostics].reverse().slice(0, 48)) {
-      const item = document.createElement('div');
-      item.className = `status-diagnostic-card ${entry.severity || 'info'}`;
-      item.innerHTML = `
-        <div class="status-diagnostic-top">
-          <span>${entry.kind || 'event'}</span>
-          <span>${formatTime(entry.timestamp)}</span>
-        </div>
-        <div class="status-diagnostic-method">${entry.method || entry.source || 'codex'}</div>
-        <div class="status-diagnostic-message">${entry.message || ''}</div>
-        ${entry.detail ? `<div class="status-diagnostic-detail">${entry.detail}</div>` : ''}
-        ${entry.data ? `<div class="status-diagnostic-data">${summarizeData(entry.data)}</div>` : ''}
-      `;
-      diagnosticsList.appendChild(item);
+      diagnosticsList.appendChild(createStatusDiagnosticItem(entry));
     }
   }
 
@@ -12271,12 +15027,31 @@ function renderDiffLine(line) {
   return row;
 }
 
-function renderFileChangeDetails(fileChanges = []) {
+function thinkingDisclosureStateKey(stateKey, disclosureKey) {
+  return `${stateKey}::disclosure::${disclosureKey}`;
+}
+
+function bindThinkingDisclosure(details, stateKey, disclosureKey, defaultOpen = false) {
+  if (!details || !stateKey || !disclosureKey) return;
+  const storageKey = thinkingDisclosureStateKey(stateKey, disclosureKey);
+  details.dataset.thinkingDisclosureKey = disclosureKey;
+  details.open = state.thinkingDisclosures.has(storageKey)
+    ? state.thinkingDisclosures.get(storageKey) === true
+    : defaultOpen;
+  details.addEventListener('toggle', () => {
+    if (!details.isConnected) return;
+    state.thinkingDisclosures.set(storageKey, details.open);
+  });
+}
+
+function renderFileChangeDetails(fileChanges = [], stateKey = '', disclosurePrefix = 'file') {
   const wrapper = document.createElement('div');
   wrapper.className = 'thinking-file-change-list';
-  for (const change of fileChanges) {
+  for (const [index, change] of fileChanges.entries()) {
     const details = document.createElement('details');
     details.className = 'thinking-file-change-card';
+    const disclosureKey = `${disclosurePrefix}::${change.path || index}`;
+    bindThinkingDisclosure(details, stateKey, disclosureKey, false);
     const additions = toCount(change.additions);
     const deletions = toCount(change.deletions);
     const status = normalizeFileChangeStatus(change.status) || (change.diff ? 'modified' : 'changed');
@@ -12329,6 +15104,24 @@ function isThinkingContentPinnedToBottom(scroller) {
 }
 
 function thinkingEntryViewportKey(entry, index) {
+  const stableKey = entry?.groupKey
+    || entry?.identity?.groupKey
+    || entry?.activityKey
+    || entry?.identity?.activityKey;
+  if (stableKey) {
+    return `thinking|${stableKey}`;
+  }
+  const identityKey = [
+    entry?.identity?.runId || entry?.runId || '',
+    entry?.identity?.turnId || entry?.turnId || '',
+    entry?.identity?.itemId || entry?.itemId || '',
+    entry?.identity?.callId || entry?.callId || '',
+    entry?.identity?.requestId || entry?.requestId || '',
+    entry?.category || entry?.kind || '',
+  ].join('|');
+  if (identityKey.replaceAll('|', '')) {
+    return `thinking|${identityKey}`;
+  }
   return [
     'thinking',
     Number.isFinite(index) ? index : '',
@@ -12345,14 +15138,39 @@ function hasDetachedThinkingScroller(container = el('session-log')) {
     .some((scroller) => !isThinkingContentPinnedToBottom(scroller));
 }
 
+function pruneThinkingUiState(container) {
+  const activeKeys = new Set(
+    Array.from(container?.querySelectorAll?.('.thinking-card[data-thinking-state-key]') || [])
+      .map((card) => card.dataset.thinkingStateKey || '')
+      .filter(Boolean)
+  );
+  for (const keyedState of [
+    state.thinkingPanels,
+    state.thinkingScrollPositions,
+    state.thinkingEntryCounts,
+    state.thinkingEntryVersions,
+  ]) {
+    for (const stateKey of keyedState.keys()) {
+      if (!activeKeys.has(stateKey)) keyedState.delete(stateKey);
+    }
+  }
+  for (const stateKey of state.thinkingUnread) {
+    if (!activeKeys.has(stateKey)) state.thinkingUnread.delete(stateKey);
+  }
+  for (const disclosureStateKey of state.thinkingDisclosures.keys()) {
+    const active = Array.from(activeKeys).some((stateKey) => (
+      disclosureStateKey.startsWith(`${stateKey}::disclosure::`)
+    ));
+    if (!active) state.thinkingDisclosures.delete(disclosureStateKey);
+  }
+}
+
 function getThinkingScrollMachine(stateKey, scroller) {
   if (!stateKey || !scroller || !window.RemoteCodexTranscriptScroll?.createScrollMachine) {
     return null;
   }
-  const current = state.thinkingScrollMachines.get(stateKey);
-  if (current?.node === scroller) {
-    return current.machine;
-  }
+  const current = state.thinkingScrollMachines.get(scroller);
+  if (current) return current;
   const saved = state.thinkingScrollPositions.get(stateKey);
   const snapshot = saved?.machineSnapshot || null;
   const machine = window.RemoteCodexTranscriptScroll.createScrollMachine(scroller, {
@@ -12363,18 +15181,17 @@ function getThinkingScrollMachine(stateKey, scroller) {
     anchorDatasetKey: 'thinkingViewportKey',
     bottomTolerance: 8,
   });
-  state.thinkingScrollMachines.set(stateKey, { node: scroller, machine });
+  state.thinkingScrollMachines.set(scroller, machine);
   return machine;
 }
 
 function updateThinkingScrollState(stateKey, scroller) {
-  if (!stateKey || !scroller) {
+  if (!stateKey || !scroller?.isConnected) {
     return;
   }
   noteMessageReadThinkingScroll();
   const machine = getThinkingScrollMachine(stateKey, scroller);
   const machineSnapshot = machine?.capture() || null;
-  state.thinkingScrollVersions.set(stateKey, machineSnapshot?.userRevision || 0);
   const atBottom = isThinkingContentPinnedToBottom(scroller);
   state.thinkingScrollPositions.set(stateKey, {
     scrollTop: scroller.scrollTop,
@@ -12412,6 +15229,12 @@ function restoreThinkingScrollState(stateKey, scroller, options = {}) {
   const machine = getThinkingScrollMachine(stateKey, scroller);
   const expectedUserRevision = machine?.state().userRevision || 0;
   const restore = () => {
+    if (!scroller.isConnected) {
+      return;
+    }
+    if (state.thinkingScrollPositions.get(stateKey) !== saved) {
+      return;
+    }
     if (machine && machine.state().userRevision !== expectedUserRevision) {
       return;
     }
@@ -12442,6 +15265,9 @@ function recordThinkingTrustedInteraction(stateKey, scroller, event) {
     return;
   }
   window.requestAnimationFrame(() => {
+    if (!scroller.isConnected) {
+      return;
+    }
     machine.recordTrustedInteraction();
     updateThinkingScrollState(stateKey, scroller);
   });
@@ -12756,18 +15582,301 @@ function flashCopyButton(button, label = 'Copied') {
   }, 1200);
 }
 
+function thinkingEntryKey(entry, index = 0) {
+  return String(
+    entry?.groupKey
+      || entry?.identity?.groupKey
+      || entry?.activityKey
+      || entry?.identity?.activityKey
+      || thinkingEntryViewportKey(entry, index)
+  );
+}
+
+function thinkingEntryActivityKeys(entry) {
+  const values = [
+    ...(Array.isArray(entry?.activityKeys) ? entry.activityKeys : []),
+    entry?.activityKey,
+    entry?.identity?.activityKey,
+  ].map((value) => String(value || '')).filter(Boolean);
+  return [...new Set(values)];
+}
+
+function applyThinkingEntryData(node, entry, index = 0) {
+  const entryKey = thinkingEntryKey(entry, index);
+  const activityKeys = thinkingEntryActivityKeys(entry);
+  node.dataset.thinkingEntryKey = entryKey;
+  node.dataset.thinkingViewportKey = thinkingEntryViewportKey(entry, index);
+  node.dataset.thinkingEntryCategory = String(entry?.category || entry?.kind || 'thinking');
+  if (activityKeys.length) {
+    node.dataset.thinkingActivityKey = activityKeys[0];
+    node.dataset.thinkingActivityKeys = activityKeys.join('\u001f');
+    node.dataset.activityRevision = String(entry?.revision || entry?.activityRevision || 0);
+  }
+  return entryKey;
+}
+
+function isThinkingOperationEntry(entry) {
+  const category = String(entry?.category || entry?.kind || '').toLowerCase();
+  return !['reasoning', 'plan', 'commentary'].includes(category)
+    || (Array.isArray(entry?.fileChanges) && entry.fileChanges.length > 0);
+}
+
+function formatThinkingStructuredValue(value) {
+  if (value == null || value === '') return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function appendThinkingOperationField(parent, labelText, value, options = {}) {
+  const text = formatThinkingStructuredValue(value).trim();
+  if (!text) return null;
+  const field = document.createElement('div');
+  field.className = `thinking-operation-field${options.tone ? ` ${options.tone}` : ''}`;
+  field.dataset.thinkingFieldKey = String(labelText || 'value');
+  const label = document.createElement('div');
+  label.className = 'thinking-operation-field-label';
+  label.textContent = labelText;
+  const content = document.createElement(options.preformatted ? 'pre' : 'div');
+  content.className = options.code
+    ? 'thinking-operation-code'
+    : 'thinking-operation-value';
+  content.textContent = text;
+  field.append(label, content);
+  parent.appendChild(field);
+  return field;
+}
+
+function thinkingOperationTitle(entry) {
+  const category = String(entry?.category || entry?.kind || 'tool').toLowerCase();
+  if (category === 'command') {
+    return limitText(String(entry.command || entry.name || entry.text || 'Command').split(/\r?\n/)[0], 120);
+  }
+  if (category === 'file') {
+    const count = Array.isArray(entry.fileChanges) ? entry.fileChanges.length : 0;
+    return count ? `${count} file${count === 1 ? '' : 's'} changed` : 'Workspace changes';
+  }
+  if (category === 'search') {
+    return limitText(entry.query || entry.text || 'Web search', 120);
+  }
+  const toolName = [entry.server || entry.namespace, entry.tool || entry.name].filter(Boolean).join(' / ');
+  return limitText(toolName || entry.name || entry.text || prettyStatusLabel(category), 120);
+}
+
+function thinkingOperationStatus(entry) {
+  const status = String(entry?.status || '').trim();
+  if (status) return status;
+  if (entry?.success === false || entry?.error) return 'failed';
+  if (entry?.final === true || entry?.terminal === true) return 'completed';
+  return 'running';
+}
+
+function thinkingOperationStatusTone(status) {
+  const value = String(status || '').toLowerCase();
+  if (/fail|error|cancel|declin|denied/.test(value)) return 'failed';
+  if (/complete|success|done|approved/.test(value)) return 'completed';
+  return 'running';
+}
+
+function formatThinkingOperationMeta(entry) {
+  const values = [];
+  if (entry?.cwd) values.push(entry.cwd);
+  if (entry?.exitCode !== null && typeof entry?.exitCode !== 'undefined') {
+    values.push(`exit ${entry.exitCode}`);
+  }
+  if (Number.isFinite(Number(entry?.durationMs))) {
+    const duration = Number(entry.durationMs);
+    values.push(duration >= 1000 ? `${(duration / 1000).toFixed(1)}s` : `${duration}ms`);
+  }
+  return values.join(' | ');
+}
+
+function createThinkingOperationEntry(entry, index, stateKey, session) {
+  const details = document.createElement('details');
+  details.className = 'thinking-history-item thinking-operation';
+  const entryKey = applyThinkingEntryData(details, entry, index);
+  bindThinkingDisclosure(details, stateKey, entryKey, false);
+
+  const status = thinkingOperationStatus(entry);
+  const summary = document.createElement('summary');
+  summary.className = 'thinking-operation-summary';
+  const identity = document.createElement('div');
+  identity.className = 'thinking-operation-identity';
+  const kind = document.createElement('span');
+  kind.className = 'thinking-operation-kind';
+  kind.textContent = prettyStatusLabel(entry.category || entry.kind || 'tool');
+  const title = document.createElement('span');
+  title.className = 'thinking-operation-title';
+  title.textContent = thinkingOperationTitle(entry);
+  identity.append(kind, title);
+  const statusNode = document.createElement('span');
+  statusNode.className = `thinking-operation-status ${thinkingOperationStatusTone(status)}`;
+  statusNode.textContent = prettyStatusLabel(status);
+  summary.append(identity, statusNode);
+  details.appendChild(summary);
+
+  const body = document.createElement('div');
+  body.className = 'thinking-operation-body';
+  const meta = formatThinkingOperationMeta(entry);
+  if (meta) {
+    const metaNode = document.createElement('div');
+    metaNode.className = 'thinking-operation-meta';
+    metaNode.textContent = meta;
+    body.appendChild(metaNode);
+  }
+
+  const category = String(entry.category || entry.kind || '').toLowerCase();
+  const overview = String(entry.text || '').trim();
+  const titleText = thinkingOperationTitle(entry);
+  if (overview && overview !== titleText && category !== 'command') {
+    appendThinkingOperationField(body, 'Summary', overview);
+  }
+  appendThinkingOperationField(body, 'Command', entry.command, { code: true, preformatted: true });
+  appendThinkingOperationField(body, 'Directory', entry.cwd, { code: true });
+  appendThinkingOperationField(body, 'Arguments', entry.argumentsText || entry.arguments, { code: true, preformatted: true });
+  appendThinkingOperationField(body, 'Actions', entry.commandActionsText || entry.commandActions, { code: true, preformatted: true });
+  appendThinkingOperationField(body, 'Namespace', entry.namespace);
+  appendThinkingOperationField(body, 'Resource', entry.resourceUri, { code: true });
+  appendThinkingOperationField(body, 'Sender', entry.senderThreadId, { code: true });
+  appendThinkingOperationField(body, 'Receivers', entry.receiverThreadIdsText || entry.receiverThreadIds, { code: true, preformatted: true });
+  appendThinkingOperationField(body, 'Prompt', entry.prompt, { preformatted: true });
+  appendThinkingOperationField(body, 'Model', entry.model);
+  appendThinkingOperationField(body, 'Thinking', entry.reasoningEffort);
+  appendThinkingOperationField(body, 'Agent states', entry.agentsStatesText || entry.agentsStates, { code: true, preformatted: true });
+  appendThinkingOperationField(body, 'Query', entry.query);
+  appendThinkingOperationField(body, 'Action', entry.action);
+  appendThinkingOperationField(body, 'Action data', entry.actionDataText || entry.actionData, { code: true, preformatted: true });
+  appendThinkingOperationField(body, 'Progress', entry.progress);
+
+  const commandFallbackOutput = category === 'command' && !entry.output && !entry.stdout
+    ? overview
+    : '';
+  appendThinkingOperationField(body, 'Output', entry.output || entry.stdout || commandFallbackOutput, {
+    code: true,
+    preformatted: true,
+  });
+  appendThinkingOperationField(body, 'Stderr', entry.stderr, {
+    code: true,
+    preformatted: true,
+    tone: 'failed',
+  });
+  appendThinkingOperationField(body, 'Result', entry.resultText || entry.result, {
+    code: true,
+    preformatted: true,
+  });
+  appendThinkingOperationField(body, 'Error', entry.error, {
+    code: true,
+    preformatted: true,
+    tone: 'failed',
+  });
+
+  if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
+    body.appendChild(renderFileChangeDetails(entry.fileChanges, stateKey, `${entryKey}::file`));
+  }
+  renderFileCards(body, session, entry);
+  details.appendChild(body);
+  return details;
+}
+
+function createThinkingNarrativeEntry(entry, index, stateKey, session) {
+  const item = document.createElement('div');
+  item.className = 'thinking-history-item thinking-narrative';
+  const entryKey = applyThinkingEntryData(item, entry, index);
+  const top = document.createElement('div');
+  top.className = 'thinking-history-top';
+  const kind = document.createElement('span');
+  kind.className = 'thinking-history-kind';
+  kind.textContent = prettyStatusLabel(entry.kind || entry.category || 'thinking');
+  const timestamp = document.createElement('span');
+  timestamp.textContent = formatTime(entry.updatedAt || entry.timestamp);
+  top.append(kind, timestamp);
+  const text = document.createElement('div');
+  text.className = 'thinking-history-text';
+  text.textContent = String(entry.text == null ? '' : entry.text);
+  item.append(top, text);
+  if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
+    item.appendChild(renderFileChangeDetails(entry.fileChanges, stateKey, `${entryKey}::file`));
+  }
+  renderFileCards(item, session, entry);
+  return item;
+}
+
+function createThinkingEntryElement(entry, index, stateKey, session) {
+  return isThinkingOperationEntry(entry)
+    ? createThinkingOperationEntry(entry, index, stateKey, session)
+    : createThinkingNarrativeEntry(entry, index, stateKey, session);
+}
+
+function hashThinkingEntryVersion(value) {
+  const text = String(value == null ? '' : value);
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function thinkingEntriesRenderVersion(entries = []) {
+  const versionParts = entries.map((entry, index) => {
+    const renderedFields = [
+      entry?.text,
+      entry?.status,
+      entry?.command,
+      entry?.cwd,
+      entry?.argumentsText || entry?.arguments,
+      entry?.commandActionsText || entry?.commandActions,
+      entry?.namespace,
+      entry?.resourceUri,
+      entry?.senderThreadId,
+      entry?.receiverThreadIdsText || entry?.receiverThreadIds,
+      entry?.prompt,
+      entry?.model,
+      entry?.reasoningEffort,
+      entry?.agentsStatesText || entry?.agentsStates,
+      entry?.query,
+      entry?.action,
+      entry?.actionDataText || entry?.actionData,
+      entry?.progress,
+      entry?.output,
+      entry?.stdout,
+      entry?.stderr,
+      entry?.resultText || entry?.result,
+      entry?.error,
+      entry?.fileChanges,
+    ];
+    return [
+      thinkingEntryKey(entry, index),
+      entry?.revision || entry?.activityRevision || 0,
+      entry?.updatedAt || entry?.timestamp || '',
+      entry?.final === true ? 1 : 0,
+      entry?.terminal === true ? 1 : 0,
+      entry?.success === false ? 0 : 1,
+      hashThinkingEntryVersion(formatThinkingStructuredValue(renderedFields)),
+    ].join('|');
+  });
+  return hashThinkingEntryVersion(versionParts.join('\u001e'));
+}
+
 function buildThinkingMessageElement(session, segment, runtime, stream, isLivePlaceholder = false) {
   const keyBase = getSessionKey(session) || session.sessionId || 'session';
   const stateKey = `${keyBase}::thinking::${segment?.userTimestamp || 'live'}`;
   const details = document.createElement('details');
   details.className = 'thinking-card';
   details.dataset.thinkingStateKey = stateKey;
+  if (isLivePlaceholder) details.dataset.thinkingLive = 'placeholder';
   const defaultOpen = isLivePlaceholder || !segment?.entries?.length;
   if (state.thinkingPanels.has(stateKey) ? state.thinkingPanels.get(stateKey) : defaultOpen) {
     details.open = true;
   }
 
   details.addEventListener('toggle', () => {
+    if (!details.isConnected) {
+      return;
+    }
     state.thinkingPanels.set(stateKey, details.open);
     if (details.open) {
       const scroller = details.querySelector('.thinking-content');
@@ -12779,13 +15888,21 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
 
   const entries = Array.isArray(segment?.entries) ? segment.entries : [];
   const previousEntryCount = state.thinkingEntryCounts.get(stateKey) || 0;
+  const previousEntryVersion = state.thinkingEntryVersions.get(stateKey) || '';
+  const nextEntryVersion = thinkingEntriesRenderVersion(entries);
   const savedScroll = state.thinkingScrollPositions.get(stateKey);
-  if (entries.length > previousEntryCount && savedScroll && details.open) {
+  const contentChanged = Boolean(previousEntryVersion && previousEntryVersion !== nextEntryVersion);
+  if (
+    (entries.length > previousEntryCount || contentChanged)
+    && savedScroll
+    && details.open
+  ) {
     state.thinkingUnread.add(stateKey);
   }
   state.thinkingEntryCounts.set(stateKey, entries.length);
+  state.thinkingEntryVersions.set(stateKey, nextEntryVersion);
   const preview = entries.length
-    ? entries[entries.length - 1].text
+    ? (entries[entries.length - 1].text || thinkingOperationTitle(entries[entries.length - 1]))
     : `Codex is ${prettyStatusLabel(runtime.phase || 'thinking').toLowerCase()}...`;
   const meta = entries.length
     ? `${entries.length} record${entries.length === 1 ? '' : 's'}`
@@ -12813,26 +15930,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
     const history = document.createElement('div');
     history.className = 'thinking-history-list';
     for (const [index, entry] of entries.entries()) {
-      const item = document.createElement('div');
-      item.className = 'thinking-history-item';
-      item.dataset.thinkingViewportKey = thinkingEntryViewportKey(entry, index);
-      if (entry.activityKey) {
-        item.dataset.thinkingActivityKey = entry.activityKey;
-        item.dataset.activityRevision = String(entry.activityRevision || 0);
-      }
-      item.innerHTML = `
-        <div class="thinking-history-top">
-          <span class="thinking-history-kind">${prettyStatusLabel(entry.kind || 'thinking')}</span>
-          <span>${formatTime(entry.timestamp)}</span>
-        </div>
-        <div class="thinking-history-text">${escapeHtml(entry.text || '')}</div>
-      `;
-      item.querySelector('.thinking-history-text').textContent = String(entry.text == null ? '' : entry.text);
-      if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
-        item.appendChild(renderFileChangeDetails(entry.fileChanges));
-      }
-      renderFileCards(item, session, entry);
-      history.appendChild(item);
+      history.appendChild(createThinkingEntryElement(entry, index, stateKey, session));
     }
     content.appendChild(history);
   } else {
@@ -12883,6 +15981,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   const wrapper = document.createElement('div');
   wrapper.className = 'message thinking';
   wrapper.dataset.viewportKey = stateKey;
+  if (isLivePlaceholder) wrapper.dataset.thinkingLive = 'placeholder';
 
   const metaEl = document.createElement('div');
   metaEl.className = 'message-meta';
@@ -12890,6 +15989,129 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
   wrapper.appendChild(metaEl);
   wrapper.appendChild(details);
   return wrapper;
+}
+
+function captureThinkingDisclosureStates(root, stateKey) {
+  if (!root || !stateKey) return;
+  root.querySelectorAll('details[data-thinking-disclosure-key]').forEach((details) => {
+    const disclosureKey = details.dataset.thinkingDisclosureKey || '';
+    if (disclosureKey) {
+      state.thinkingDisclosures.set(
+        thinkingDisclosureStateKey(stateKey, disclosureKey),
+        details.open
+      );
+    }
+  });
+}
+
+function restoreThinkingDisclosureStates(root, stateKey) {
+  if (!root || !stateKey) return;
+  root.querySelectorAll('details[data-thinking-disclosure-key]').forEach((details) => {
+    const disclosureKey = details.dataset.thinkingDisclosureKey || '';
+    const storageKey = thinkingDisclosureStateKey(stateKey, disclosureKey);
+    if (disclosureKey && state.thinkingDisclosures.has(storageKey)) {
+      details.open = state.thinkingDisclosures.get(storageKey) === true;
+    }
+  });
+}
+
+function syncThinkingEntryAttributes(existing, next) {
+  existing.className = next.className;
+  for (const name of existing.getAttributeNames()) {
+    if (name.startsWith('data-thinking-') || name === 'data-activity-revision') {
+      existing.removeAttribute(name);
+    }
+  }
+  for (const name of next.getAttributeNames()) {
+    if (name.startsWith('data-thinking-') || name === 'data-activity-revision') {
+      existing.setAttribute(name, next.getAttribute(name));
+    }
+  }
+}
+
+function captureThinkingEntryInnerState(root) {
+  const scroll = Array.from(root?.querySelectorAll?.('pre, .thinking-diff-block') || [])
+    .map((node, index) => ({
+      key: node.closest('[data-thinking-field-key]')?.dataset?.thinkingFieldKey
+        || node.closest('[data-thinking-disclosure-key]')?.dataset?.thinkingDisclosureKey
+        || `index:${index}`,
+      index,
+      scrollTop: node.scrollTop || 0,
+      scrollLeft: node.scrollLeft || 0,
+    }));
+  const focusable = Array.from(root?.querySelectorAll?.('summary, button, a, [tabindex]') || []);
+  const focusedIndex = root?.contains?.(document.activeElement)
+    ? focusable.indexOf(document.activeElement)
+    : -1;
+  return { scroll, focusedIndex };
+}
+
+function restoreThinkingEntryInnerState(root, snapshot) {
+  if (!root || !snapshot) return;
+  const nodes = Array.from(root.querySelectorAll('pre, .thinking-diff-block'));
+  const byKey = new Map(nodes.map((node, index) => [
+    node.closest('[data-thinking-field-key]')?.dataset?.thinkingFieldKey
+      || node.closest('[data-thinking-disclosure-key]')?.dataset?.thinkingDisclosureKey
+      || `index:${index}`,
+    node,
+  ]));
+  for (const saved of snapshot.scroll || []) {
+    const node = byKey.get(saved.key) || nodes[saved.index];
+    if (!node) continue;
+    node.scrollTop = saved.scrollTop;
+    node.scrollLeft = saved.scrollLeft;
+  }
+  if (snapshot.focusedIndex >= 0) {
+    const focusable = Array.from(root.querySelectorAll('summary, button, a, [tabindex]'));
+    focusable[snapshot.focusedIndex]?.focus?.({ preventScroll: true });
+  }
+}
+
+function patchThinkingHistoryEntry(existing, next, stateKey) {
+  if (!existing || !next || existing.tagName !== next.tagName) return next;
+  const keepOpen = existing instanceof HTMLDetailsElement ? existing.open : null;
+  const innerState = captureThinkingEntryInnerState(existing);
+  syncThinkingEntryAttributes(existing, next);
+  existing.replaceChildren(...Array.from(next.childNodes));
+  if (keepOpen !== null) {
+    existing.open = keepOpen;
+    const disclosureKey = existing.dataset.thinkingDisclosureKey || '';
+    if (disclosureKey) {
+      state.thinkingDisclosures.set(
+        thinkingDisclosureStateKey(stateKey, disclosureKey),
+        keepOpen
+      );
+    }
+  }
+  restoreThinkingDisclosureStates(existing, stateKey);
+  restoreThinkingEntryInnerState(existing, innerState);
+  return existing;
+}
+
+function patchThinkingHistoryList(existingHistory, nextHistory, stateKey) {
+  const existingByKey = new Map(Array.from(existingHistory.children).map((node) => (
+    [node.dataset.thinkingEntryKey || '', node]
+  )).filter(([key]) => key));
+  const desired = Array.from(nextHistory.children).map((nextNode) => {
+    const key = nextNode.dataset.thinkingEntryKey || '';
+    const existing = key ? existingByKey.get(key) : null;
+    if (existing) existingByKey.delete(key);
+    return existing ? patchThinkingHistoryEntry(existing, nextNode, stateKey) : nextNode;
+  });
+  for (const stale of existingByKey.values()) stale.remove();
+  let cursor = existingHistory.firstChild;
+  for (const node of desired) {
+    if (node === cursor) {
+      cursor = cursor.nextSibling;
+      continue;
+    }
+    existingHistory.insertBefore(node, cursor);
+  }
+  while (cursor) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
+  }
 }
 
 function patchThinkingMessageElement(existingMessage, nextMessage) {
@@ -12900,16 +16122,40 @@ function patchThinkingMessageElement(existingMessage, nextMessage) {
   const nextCard = nextMessage.querySelector('.thinking-card');
   const existingStateKey = existingCard?.dataset?.thinkingStateKey || '';
   const existingScroller = existingMessage.querySelector('.thinking-content[data-thinking-state-key]');
+  const outerSnapshot = captureTranscriptScrollSnapshot();
   if (existingStateKey && existingScroller) {
     preserveThinkingViewportForPatch(existingStateKey, existingScroller);
+    captureThinkingDisclosureStates(existingMessage, existingStateKey);
   }
   const keepOpen = existingCard ? existingCard.open : null;
+  const patchedStateKey = nextCard?.dataset?.thinkingStateKey || existingStateKey;
+  if (existingCard && nextCard) syncThinkingEntryAttributes(existingCard, nextCard);
+  const existingSummary = existingCard?.querySelector(':scope > .thinking-summary');
+  const nextSummary = nextCard?.querySelector(':scope > .thinking-summary');
+  const nextScroller = nextMessage.querySelector('.thinking-content[data-thinking-state-key]');
+  const existingHistory = existingScroller?.querySelector(':scope > .thinking-history-list');
+  const nextHistory = nextScroller?.querySelector(':scope > .thinking-history-list');
 
   existingMessage.className = nextMessage.className;
-  existingMessage.replaceChildren(...Array.from(nextMessage.childNodes));
+  existingMessage.dataset.viewportKey = nextMessage.dataset.viewportKey || '';
+  if (nextMessage.dataset.thinkingLive) {
+    existingMessage.dataset.thinkingLive = nextMessage.dataset.thinkingLive;
+  } else {
+    delete existingMessage.dataset.thinkingLive;
+  }
+  const existingMeta = existingMessage.querySelector(':scope > .message-meta');
+  const nextMeta = nextMessage.querySelector(':scope > .message-meta');
+  if (existingMeta && nextMeta) existingMeta.textContent = nextMeta.textContent;
+  if (existingSummary && nextSummary) {
+    existingSummary.replaceChildren(...Array.from(nextSummary.childNodes));
+  }
+  if (existingHistory && nextHistory) {
+    patchThinkingHistoryList(existingHistory, nextHistory, patchedStateKey);
+  } else if (existingScroller && nextScroller) {
+    existingScroller.replaceChildren(...Array.from(nextScroller.childNodes));
+  }
 
   const patchedCard = existingMessage.querySelector('.thinking-card');
-  const patchedStateKey = patchedCard?.dataset?.thinkingStateKey || nextCard?.dataset?.thinkingStateKey || existingStateKey;
   if (patchedCard && keepOpen !== null) {
     patchedCard.open = keepOpen;
     if (patchedStateKey) {
@@ -12918,8 +16164,10 @@ function patchThinkingMessageElement(existingMessage, nextMessage) {
   }
   const patchedScroller = existingMessage.querySelector('.thinking-content[data-thinking-state-key]');
   if (patchedStateKey && patchedScroller) {
+    restoreThinkingDisclosureStates(existingMessage, patchedStateKey);
     restoreThinkingScrollState(patchedStateKey, patchedScroller, { preserveDetached: true, immediate: true });
   }
+  restoreTranscriptScrollSnapshot(outerSnapshot);
 }
 
 function renderFileCards(container, session, entry) {
@@ -13121,6 +16369,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     empty.className = 'empty-state';
     empty.textContent = 'Select a conversation on the left to inspect it here.';
     log.appendChild(empty);
+    pruneThinkingUiState(log);
     restoreTranscriptScroll(log, { forceScroll: true });
     updateTranscriptUnreadButton('');
     return;
@@ -13200,8 +16449,15 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     const liveSegment = buildLiveActivitySegment(session, null);
     const showLiveActivity = liveSegment || (session.live && runtimeIsActive(runtime));
     if (showLiveActivity) {
-      log.appendChild(buildThinkingMessageElement(session, liveSegment, runtime, stream, !liveSegment));
+      const displayedSegment = liveSegment || {
+        userTimestamp: 'live',
+        userText: '',
+        entries: [],
+        live: true,
+      };
+      log.appendChild(buildThinkingMessageElement(session, displayedSegment, runtime, stream, !liveSegment));
     }
+    pruneThinkingUiState(log);
     restoreTranscriptScroll(log, {
       forceScroll: shouldStickToBottom,
       preserveScroll: options.preserveScroll,
@@ -13286,18 +16542,26 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       const shouldShowLivePlaceholder = Boolean(
         isLatestUser
         && session.live
-        && (runtime.busy || runtime.phase === 'thinking' || runtime.phase === 'planning' || runtime.phase === 'waiting-approval' || runtime.phase === 'waiting-user-input')
+        && runtimeIsActive(runtime)
       );
 
       if (segment || shouldShowLivePlaceholder) {
         const liveSegment = shouldShowLivePlaceholder && !segment
           ? buildLiveActivitySegment(session, latestUserEntry)
           : null;
-        log.appendChild(buildThinkingMessageElement(session, segment || liveSegment, runtime, stream, shouldShowLivePlaceholder && !segment && !liveSegment));
+        const livePlaceholder = shouldShowLivePlaceholder && !segment && !liveSegment;
+        const displayedSegment = segment || liveSegment || {
+          userTimestamp: latestUserEntry?.timestamp || 'live',
+          userText: latestUserEntry?.text || '',
+          entries: [],
+          live: true,
+        };
+        log.appendChild(buildThinkingMessageElement(session, displayedSegment, runtime, stream, livePlaceholder));
       }
     }
   }
 
+  pruneThinkingUiState(log);
   restoreTranscriptScroll(log, {
     forceScroll: shouldForceScroll && !focus,
     shouldStickToBottom: focus ? false : shouldStickToBottom,
@@ -13400,6 +16664,7 @@ function populateApiProfileEditor(profile = getSelectedApiProfile()) {
   const current = profile || getApiProfiles()[0] || normalizeApiProfile();
   el('settings-api-profile-select').value = current.profileId;
   el('settings-api-profile-label').value = current.label || '';
+  el('settings-api-provider-kind').value = current.providerKind || inferApiProviderKind(current);
   el('settings-api-provider').value = current.provider || '';
   el('settings-api-base-url').value = current.baseUrl || '';
   el('settings-api-key').value = current.apiKey || '';
@@ -13407,18 +16672,48 @@ function populateApiProfileEditor(profile = getSelectedApiProfile()) {
     el('settings-api-key-remember').checked = current.rememberApiKey !== false;
   }
   el('settings-delete-api-profile-button').disabled = getApiProfiles().length <= 1;
+  renderApiProviderEditorState(current);
 }
 
-function saveActiveApiProfileFromSettingsForm() {
+function renderApiProviderEditorState(profile = getSelectedApiProfile()) {
+  const providerKind = el('settings-api-provider-kind')?.value
+    || profile?.providerKind
+    || inferApiProviderKind(profile || {});
+  const registry = providerCapabilitiesRegistry();
+  const customRow = el('settings-api-custom-provider-row');
+  customRow?.classList.toggle('hidden', providerKind !== 'custom');
+  renderApiProfileModelCatalogControls(profile);
+
+  const status = el('settings-provider-capability-status');
+  if (status) {
+    if (providerKind === 'openai') {
+      status.textContent = `OpenAI capability registry ${registry?.REGISTRY_VERSION || 'bundled'}; the selected Session verifies model and thinking support against its Rebind target.`;
+    } else if (providerKind === 'custom') {
+      status.textContent = 'Custom providers use the target API catalog; unverified thinking values still require explicit approval.';
+    } else {
+      status.textContent = `${canonicalProviderLabel(providerKind)} model and thinking support is verified from the selected Session before Rebind.`;
+    }
+  }
+}
+
+function saveActiveApiProfileFromSettingsForm(options = {}) {
   const profile = getSelectedApiProfile();
   if (!profile) {
     return null;
   }
-  profile.label = el('settings-api-profile-label').value.trim() || profile.label || 'API Profile';
-  profile.provider = el('settings-api-provider').value.trim() || 'OpenAI';
-  profile.baseUrl = el('settings-api-base-url').value.trim();
-  profile.apiKey = el('settings-api-key').value;
-  profile.rememberApiKey = true;
+  const providerKind = el('settings-api-provider-kind')?.value || 'custom';
+  const providerInput = el('settings-api-provider').value.trim();
+  const draft = {
+    label: el('settings-api-profile-label').value.trim() || profile.label || 'API Profile',
+    providerKind,
+    provider: providerKind !== 'custom' && providerKind === profile.providerKind && providerInput
+      ? providerInput
+      : canonicalProviderLabel(providerKind, providerInput),
+    baseUrl: el('settings-api-base-url').value.trim(),
+    apiKey: el('settings-api-key').value,
+    rememberApiKey: true,
+  };
+  Object.assign(profile, draft);
   return profile;
 }
 
@@ -13481,8 +16776,10 @@ function apiProfileBackupPayload() {
       profileId: profile.profileId,
       label: profile.label,
       provider: profile.provider,
+      providerKind: profile.providerKind,
       baseUrl: profile.baseUrl || '',
       apiKey: profile.apiKey || '',
+      sessionDefaults: normalizeSessionDefaults(profile.sessionDefaults),
     })),
     selectedApiProfileId: settings.selectedApiProfileId,
     defaultApiProfileId: settings.defaultApiProfileId,
@@ -13744,7 +17041,9 @@ function populateSettingsForm() {
 }
 
 function sessionApiRebindBusyKey(session) {
-  return session?.hostId && session?.sessionId ? getSessionKey(session) : '';
+  return session?.hostId && session?.sessionId
+    ? resolveComposerSessionKey(getSessionKey(session))
+    : '';
 }
 
 function isSessionApiRebindBusy(session) {
@@ -13765,8 +17064,147 @@ function setSessionApiRebindBusy(session, busy) {
   return true;
 }
 
+function setSessionApiSwitchNotice(session, message = '', tone = '') {
+  const key = resolveComposerSessionKey(getSessionKey(session));
+  if (!key) {
+    return;
+  }
+  if (!message) {
+    state.codexControls.apiSwitchNoticesBySession.delete(key);
+    return;
+  }
+  state.codexControls.apiSwitchNoticesBySession.set(key, {
+    message: String(message),
+    tone: ['success', 'warning', 'error'].includes(tone) ? tone : '',
+  });
+}
+
+async function switchSessionApiFromComposer(session, targetProfileId, options = {}) {
+  if (!session || isSessionApiRebindBusy(session)) {
+    return null;
+  }
+  const requestSessionKey = getSessionKey(session);
+  const current = state.sessions.find((candidate) => getSessionKey(candidate) === requestSessionKey) || session;
+  syncMountedComposerDraftSession(current);
+  const protectedComposerDraft = snapshotComposerDraft(el('input-text')?.value || '');
+  setComposerDraftForSessionKey(requestSessionKey, protectedComposerDraft);
+  const targetProfile = String(targetProfileId || '').trim();
+  const currentTarget = sessionApiControlValue(current);
+  if (!targetProfile || targetProfile === '__unknown_binding__') {
+    renderSessionApiControls(getSelectedSession());
+    return null;
+  }
+  if (targetProfile === currentTarget && options.force !== true) {
+    renderSessionApiControls(getSelectedSession());
+    return null;
+  }
+  const runtime = getRuntimeForSession(current) || current.runtime || {};
+  if (current.live && runtimeIsActive(runtime)) {
+    setSessionApiSwitchNotice(current, t('session.apiSwitchWaitIdle'), 'warning');
+    renderSessionApiControls(getSelectedSession());
+    return null;
+  }
+  if (!sessionSupportsTurnSelectionControls(current)) {
+    setSessionApiSwitchNotice(current, t('session.turnControlsUnsupported'), 'warning');
+    renderSessionApiControls(getSelectedSession());
+    return null;
+  }
+
+  const profile = targetProfile === '__host_environment__'
+    ? null
+    : (state.ui.apiProfiles || []).find((candidate) => candidate.profileId === targetProfile) || null;
+  if (targetProfile !== '__host_environment__' && !profile) {
+    setSessionApiSwitchNotice(current, 'The selected API profile is no longer available.', 'error');
+    renderSessionApiControls(getSelectedSession());
+    return null;
+  }
+  const apiConfigSnapshot = profile
+    ? { ...apiProfileRequestConfig(profile) }
+    : undefined;
+
+  setSessionApiSwitchNotice(current);
+  setSessionApiRebindBusy(current, true);
+  renderSessionDetails();
+  try {
+    const currentSelection = getComposerOptionsForSession(current);
+    const resetSelection = normalizeRebindSelectionSnapshot({
+      model: '',
+      effort: '',
+      summary: currentSelection?.summary || '',
+    });
+    const response = await rebindSessionApi(current, targetProfile, resetSelection, apiConfigSnapshot, {
+      requireIdle: true,
+    });
+    if (!response) {
+      setSessionApiSwitchNotice(current, t('session.apiSwitchCanceled'));
+      return null;
+    }
+
+    const nextSelection = { ...resetSelection };
+    const resolvedRequestSessionKey = resolveComposerSessionKey(requestSessionKey);
+    const reboundSession = findSessionForResolvedComposerKey(resolvedRequestSessionKey, current);
+    try {
+      let catalog = response?.modelCatalog || null;
+      if (catalog) {
+        applyModelCatalogResponse(captureModelCatalogRequest(reboundSession), catalog);
+      } else {
+        catalog = await loadModelOptionsForSession(reboundSession, { force: true });
+      }
+      nextSelection.model = preferredModelForApiSwitch(catalog, {
+        requireFreshProvider: Boolean(profile),
+      });
+    } catch (_) {
+      // The API switch itself succeeded. Auto remains valid if its live model
+      // catalog cannot be refreshed immediately after restart.
+    }
+    applySessionSelectionToSessionOptions(reboundSession, nextSelection);
+    const target = rebindTargetSummary(targetProfile, apiConfigSnapshot);
+    setSessionApiSwitchNotice(
+      reboundSession,
+      formatUiText('session.apiSwitchSuccessSelection', {
+        target: rebindTargetDisplayLabel(target),
+        model: nextSelection.model || 'Auto / default',
+      }),
+      'success'
+    );
+    return rebindResponseWithClientSelection(response, nextSelection);
+  } catch (error) {
+    const target = rebindTargetSummary(targetProfile, apiConfigSnapshot);
+    const resolvedRequestSessionKey = resolveComposerSessionKey(requestSessionKey);
+    const latestSession = findSessionForResolvedComposerKey(resolvedRequestSessionKey, current);
+    if (error.rebindFailureRecorded !== true) {
+      recordSessionRebindFailure(latestSession, sessionApiBinding(latestSession), target, error);
+    }
+    setSessionApiSwitchNotice(
+      latestSession,
+      `API switch failed: ${error.message || String(error)}`,
+      'error'
+    );
+    reportError(error);
+    return null;
+  } finally {
+    const resolvedRequestSessionKey = resolveComposerSessionKey(requestSessionKey);
+    const latestSession = findSessionForResolvedComposerKey(resolvedRequestSessionKey, current);
+    setSessionApiRebindBusy(current, false);
+    if (getSessionKey(latestSession) !== getSessionKey(current)) {
+      setSessionApiRebindBusy(latestSession, false);
+    }
+    const latestComposerDraft = getComposerDraftForSessionKey(resolvedRequestSessionKey);
+    const draftToRestore = composerDraftHasTemporaryContent(latestComposerDraft)
+      ? latestComposerDraft
+      : protectedComposerDraft;
+    setComposerDraftForSessionKey(resolvedRequestSessionKey, draftToRestore);
+    if (resolveComposerSessionKey(getSessionKey(getSelectedSession())) === resolvedRequestSessionKey) {
+      applyMountedComposerDraft(resolvedRequestSessionKey, draftToRestore);
+    }
+    renderSessionDetails();
+  }
+}
+
 function sessionTranscriptFallbackBusyKey(session) {
-  return session?.hostId && session?.sessionId ? getSessionKey(session) : '';
+  return session?.hostId && session?.sessionId
+    ? resolveComposerSessionKey(getSessionKey(session))
+    : '';
 }
 
 function isSessionTranscriptFallbackBusy(session) {
@@ -13787,110 +17225,171 @@ function setSessionTranscriptFallbackBusy(session, busy) {
   return true;
 }
 
-function rebindTargetIdentity(targetValue) {
-  const value = String(targetValue || '').trim();
-  if (value === '__host_environment__') {
-    return 'host_environment';
-  }
-  const profile = (state.ui.apiProfiles || []).find((candidate) => candidate.profileId === value) || null;
-  return profile ? `profile:${rebindProfilePreviewIdentity(profile)}` : `missing:${value}`;
-}
-
-function clearComposerModelSelection(session) {
-  const sessionKey = getSessionKey(session);
-  if (!sessionKey) {
-    return;
-  }
-  const options = getComposerOptionsForSession(session);
-  state.codexControls.sessionOptionsByKey.set(sessionKey, normalizeComposerOptionValues({
-    ...options,
-    model: '',
-    effort: '',
-  }));
-  persistComposerSessionOptions();
-}
-
-function rememberRebindTarget(session, targetValue) {
-  const sessionKey = getSessionKey(session);
-  if (!sessionKey) {
-    return;
-  }
-  const value = String(targetValue || '__host_environment__');
-  const identity = rebindTargetIdentity(value);
-  const previousIdentity = state.codexControls.rebindTargetIdentityBySession.get(sessionKey);
-  state.codexControls.rebindTargetProfileBySession.set(sessionKey, value);
-  state.codexControls.rebindTargetIdentityBySession.set(sessionKey, identity);
-  if (previousIdentity !== undefined && previousIdentity !== identity) {
-    clearComposerModelSelection(session);
-  }
-}
-
 function renderSessionApiControls(session) {
   const bindingLabel = el('session-api-binding-label');
-  const hostDefaultLabel = el('session-host-default-label');
+  const catalogLabel = el('session-catalog-label');
   const catalogStatus = el('session-catalog-status');
   const rebindSelect = el('session-api-rebind-select');
+  const selectionSummary = el('session-rebind-settings-summary');
   const rebindButton = el('session-api-rebind-button');
+  const applyLiveButton = el('apply-current-session-to-live-button');
   const fallbackButton = el('session-transcript-fallback-button');
-  if (!bindingLabel || !hostDefaultLabel || !catalogStatus || !rebindSelect || !rebindButton || !fallbackButton) {
-    return;
-  }
+  const composerSelectionStatus = el('composer-session-selection-status');
 
   const binding = sessionApiBinding(session);
-  const hostDefault = session ? getApiProfileForHost(session.hostId) : null;
-  const hostDefaultConfig = session ? getApiRequestConfig(session.hostId) : null;
-  if (binding?.kind === 'profile') {
-    bindingLabel.textContent = binding.label || binding.profileId || 'API profile unavailable';
-  } else if (binding?.kind === 'host_environment') {
-    bindingLabel.textContent = binding.label || binding.provider || 'Host environment';
-  } else {
-    bindingLabel.textContent = session ? 'Unknown / rebind required' : 'No Session selected';
+  if (bindingLabel) {
+    if (binding?.kind === 'profile') {
+      bindingLabel.textContent = binding.label || binding.profileId || 'API profile unavailable';
+    } else if (binding?.kind === 'host_environment') {
+      bindingLabel.textContent = binding.label || binding.provider || 'Host environment';
+    } else {
+      bindingLabel.textContent = session ? 'Unknown / rebind required' : 'No Session selected';
+    }
   }
-  hostDefaultLabel.textContent = hostDefaultConfig
-    ? (hostDefault?.label || hostDefault?.provider || 'API profile')
-    : 'Host environment';
 
-  rebindSelect.innerHTML = '';
-  const hostEnvironmentOption = document.createElement('option');
-  hostEnvironmentOption.value = '__host_environment__';
-  hostEnvironmentOption.textContent = 'Host environment';
-  rebindSelect.appendChild(hostEnvironmentOption);
-  for (const profile of state.ui.apiProfiles || []) {
-    const option = document.createElement('option');
-    option.value = profile.profileId;
-    option.textContent = profile.label || profile.provider || profile.profileId;
-    rebindSelect.appendChild(option);
+  const actualApiValue = sessionApiControlValue(session);
+  if (rebindSelect) {
+    const profiles = state.ui.apiProfiles || [];
+    const profileValues = new Set(profiles.map((profile) => String(profile.profileId || '')));
+    const boundProfile = getBoundApiProfileForSession(session);
+    const rebindOptions = [
+      ...(actualApiValue === '__unknown_binding__'
+        ? [{ value: '__unknown_binding__', text: session ? 'Unknown API / choose a profile' : 'No Session selected', disabled: true }]
+        : []),
+      ...(binding?.kind === 'profile' && binding.profileId && !profileValues.has(String(binding.profileId))
+        ? [{ value: String(binding.profileId), text: `${binding.label || binding.profileId} (not saved in this browser)`, disabled: true }]
+        : []),
+      { value: '__host_environment__', text: 'Host environment' },
+      ...profiles.map((profile) => ({
+        value: profile.profileId,
+        text: binding?.kind === 'profile'
+          && binding.profileId === profile.profileId
+          && !boundProfile
+          ? `${profile.label || profile.provider || profile.profileId} (saved profile changed)`
+          : profile.label || profile.provider || profile.profileId,
+      })),
+    ];
+    syncSelectOptions(rebindSelect, rebindOptions, actualApiValue);
   }
-  const availableValues = new Set(Array.from(rebindSelect.options).map((option) => option.value));
-  const rememberedSelection = state.codexControls.rebindTargetProfileBySession.get(getSessionKey(session));
-  const preferredValue = availableValues.has(rememberedSelection)
-    ? rememberedSelection
-    : binding?.kind === 'profile' && availableValues.has(binding.profileId)
-      ? binding.profileId
-      : '__host_environment__';
-  rebindSelect.value = preferredValue;
-  rememberRebindTarget(session, preferredValue);
-  const catalog = session ? state.codexControls.modelCatalogByKey.get(activeModelCatalogKey(session)) : null;
-  if (catalog) {
-    const sourceNames = (catalog.sources || []).map((source) => source?.source).filter(Boolean);
-    const freshness = catalog.cacheState || ((catalog.sources || []).some((source) => source?.stale) ? 'stale' : 'fresh');
-    catalogStatus.textContent = `${catalog.models?.length || 0} models | ${freshness}${sourceNames.length ? ` | ${sourceNames.join(' + ')}` : ''}`;
-  } else if (session?.runtimeConfigError) {
-    catalogStatus.textContent = `Runtime config unavailable: ${session.runtimeConfigError.code || 'request failed'}`;
-  } else {
-    catalogStatus.textContent = session ? 'Not loaded' : 'No Session selected';
+
+  const selectedSettings = getComposerOptionsForSession(session);
+  if (selectionSummary) {
+    const modelLabel = selectedSettings?.model || 'Auto (runtime default)';
+    const effortLabel = selectedSettings?.effort || 'Auto';
+    const summaryLabel = selectedSettings?.summary || 'default';
+    selectionSummary.textContent = session
+      ? `Next turn: model ${modelLabel} | thinking ${effortLabel} | summary ${summaryLabel}`
+      : '';
   }
+
   const rebindBusy = isSessionApiRebindBusy(session);
-  const modelCatalogBusy = isModelOptionsLoading(session);
-  rebindSelect.disabled = !session || rebindBusy || modelCatalogBusy;
-  rebindButton.disabled = !session || rebindBusy || modelCatalogBusy;
-  rebindButton.setAttribute('aria-busy', rebindBusy ? 'true' : 'false');
+  const runtime = getRuntimeForSession(session) || session?.runtime || {};
+  const activeTurn = Boolean(session?.live && runtimeIsActive(runtime));
+  const supportsTurnSelection = sessionSupportsTurnSelectionControls(session);
+  const catalog = session ? getActiveModelCatalog(session) : null;
+  const catalogError = session
+    ? state.codexControls.modelOptionsErrorsByKey.get(activeModelCatalogKey(session)) || ''
+    : '';
+  const catalogBusy = Boolean(session && isModelOptionsLoading(session));
+  if (catalogLabel) {
+    catalogLabel.textContent = session ? t('models.currentLabel') : t('models.sessionLabel');
+  }
+  if (catalogStatus) {
+    if (!supportsTurnSelection && session?.live) {
+      catalogStatus.textContent = t('session.turnControlsUnsupported');
+    } else if (catalogBusy) {
+      catalogStatus.textContent = 'Refreshing models for the current Session...';
+    } else if (catalogError) {
+      catalogStatus.textContent = `Model catalog failed: ${catalogError}`;
+    } else if (catalog) {
+      const availableCount = selectableCatalogModels(catalog).length;
+      const excludedCount = Math.max(0, (catalog.models?.length || 0) - availableCount);
+      const providerCount = modelCatalogSourceModelCount(catalog, 'provider');
+      const runtimeCount = modelCatalogSourceModelCount(catalog, 'live');
+      const sourceNotice = [
+        providerCount ? `API ${providerCount}` : '',
+        runtimeCount ? `runtime ${runtimeCount}` : '',
+      ].filter(Boolean).join(' | ');
+      const savedNotice = catalog.restored === true ? ' | saved catalog; refresh to verify' : '';
+      catalogStatus.textContent = `${availableCount} available models${sourceNotice ? ` | ${sourceNotice}` : ''} | current Session${excludedCount ? ` | ${excludedCount} unavailable hidden` : ''}${savedNotice}`;
+    } else if (session?.runtimeConfigError) {
+      catalogStatus.textContent = `Runtime config unavailable: ${session.runtimeConfigError.code || 'request failed'}`;
+    } else if (session && !binding?.bindingFingerprint) {
+      catalogStatus.textContent = 'Current API is unknown. Choose an API profile in the composer.';
+    } else {
+      catalogStatus.textContent = session ? 'Not loaded' : 'No Session selected';
+    }
+  }
+
+  if (composerSelectionStatus) {
+    const sessionKey = getSessionKey(session);
+    const notice = sessionKey ? state.codexControls.apiSwitchNoticesBySession.get(sessionKey) : null;
+    composerSelectionStatus.className = 'composer-session-selection-status';
+    if (notice?.tone) {
+      composerSelectionStatus.classList.add(notice.tone);
+    }
+    if (notice?.message) {
+      composerSelectionStatus.textContent = notice.message;
+    } else if (!session) {
+      composerSelectionStatus.textContent = 'Select a Session to configure its runtime.';
+    } else if (!supportsTurnSelection) {
+      composerSelectionStatus.textContent = t('session.turnControlsUnsupported');
+      composerSelectionStatus.classList.add('warning');
+    } else if (rebindBusy) {
+      composerSelectionStatus.textContent = t('session.apiSwitchBusy');
+    } else if (activeTurn) {
+      const effective = session.runtimeConfig?.effectiveSelection || session.effectiveSelection || {};
+      composerSelectionStatus.textContent = formatUiText('session.runningSelection', {
+        model: runtime.model || effective.model || 'Auto / default',
+        effort: runtime.effort || effective.effort || 'Auto',
+      });
+    } else {
+      composerSelectionStatus.textContent = formatUiText('session.nextTurnSelection', {
+        model: selectedSettings?.model || 'Auto / default',
+        effort: selectedSettings?.effort || 'Auto',
+      });
+    }
+  }
+
+  if (rebindSelect) {
+    rebindSelect.disabled = !session || rebindBusy || activeTurn || !supportsTurnSelection;
+    rebindSelect.title = activeTurn
+      ? t('session.apiSwitchWaitIdle')
+      : 'Changing API requires a confirmed Session restart.';
+    rebindSelect.setAttribute('aria-busy', rebindBusy ? 'true' : 'false');
+  }
+  if (rebindButton) {
+    const canRestartCurrentApi = actualApiValue !== '__unknown_binding__';
+    rebindButton.disabled = !session || rebindBusy || activeTurn || !supportsTurnSelection || !canRestartCurrentApi;
+    rebindButton.textContent = rebindBusy ? '\u2026' : '\u21bb';
+    rebindButton.title = activeTurn
+      ? t('session.apiSwitchWaitIdle')
+      : 'Restart Session with the current API profile.';
+    rebindButton.setAttribute('aria-busy', rebindBusy ? 'true' : 'false');
+  }
+  if (applyLiveButton) {
+    const sourceKey = getSessionKey(session);
+    const otherLiveCount = getRelayManagedLiveSessions()
+      .filter((candidate) => getSessionKey(candidate) !== sourceKey).length;
+    const boundProfile = getBoundApiProfileForSession(session);
+    applyLiveButton.disabled = !session
+      || rebindBusy
+      || !boundProfile
+      || otherLiveCount === 0;
+    applyLiveButton.title = !boundProfile
+      ? 'Rebind this Session to a saved API profile before applying its settings elsewhere.'
+      : otherLiveCount === 0
+        ? 'No other managed live Sessions are available.'
+        : '';
+  }
 
   const resumeError = session?.resumeError || null;
   const fallbackBusy = isSessionTranscriptFallbackBusy(session);
-  fallbackButton.classList.toggle('hidden', !resumeError?.canTranscriptFallback);
-  fallbackButton.disabled = !session || !resumeError?.canTranscriptFallback || fallbackBusy;
-  fallbackButton.setAttribute('aria-busy', fallbackBusy ? 'true' : 'false');
+  if (fallbackButton) {
+    fallbackButton.classList.toggle('hidden', !resumeError?.canTranscriptFallback);
+    fallbackButton.disabled = !session || !resumeError?.canTranscriptFallback || fallbackBusy;
+    fallbackButton.setAttribute('aria-busy', fallbackBusy ? 'true' : 'false');
+  }
 }
 
 function formatSoftwareUpdateSummary(update) {
@@ -16496,6 +19995,7 @@ function renderAll() {
   if (newSessionButton) {
     newSessionButton.textContent = state.newSessionCollapsed ? 'Show New' : 'Hide New';
   }
+  renderNewSessionLaunchState();
   renderOverview();
   renderHostNav();
   renderConversationNav();
@@ -16661,8 +20161,9 @@ function flushQueuedUiRenders() {
   }
 }
 
-function closeStream(options = {}) {
-  const previousWatchKey = state.watchedSessionKey;
+function closeStream() {
+  discardStaleActivitySnapshotRecoveryTasks();
+  discardStaleStreamDetailRecovery();
   if (state.eventSource) {
     if (state.eventSourceKey) {
       state.streamStatus.set(state.eventSourceKey, {
@@ -16674,12 +20175,9 @@ function closeStream(options = {}) {
     state.eventSource = null;
     state.eventSourceKey = null;
   }
-  if (previousWatchKey && options.unwatch !== false) {
-    unwatchSelectedSession(previousWatchKey).catch(() => {});
-  }
 }
 
-async function resumeSelectedSessionRealtime() {
+async function resumeSelectedSessionRealtime(options = {}) {
   if (state.streamRecoveryInFlight) {
     return;
   }
@@ -16689,19 +20187,453 @@ async function resumeSelectedSessionRealtime() {
   }
   state.streamRecoveryInFlight = true;
   try {
+    const forceDetail = options.forceDetail === true || state.sessionWatchCatchUpRequired;
     const selectedKey = getSessionKey(selected);
     if (selectedKey) {
       state.fullTranscriptLoaded.delete(selectedKey);
     }
-    closeStream({ unwatch: false });
+    closeStream();
     subscribeSession(selected);
-    void watchSelectedSession(selected);
-    if (selected.live) {
-      await showSession(selected, { full: true, preserveScroll: true });
+    void watchSelectedSession(selected, { force: true, silent: true });
+    if (selected.live || forceDetail) {
+      await showSession(selected, { full: true, preserveScroll: true, throwOnError: true });
+      if (forceDetail) {
+        state.sessionWatchCatchUpRequired = false;
+      }
     }
   } finally {
     state.streamRecoveryInFlight = false;
   }
+}
+
+async function withStreamRecoveryTimeout(operation) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), STREAM_RECOVERY_FETCH_TIMEOUT_MS);
+  try {
+    return await operation(controller.signal);
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Session recovery timed out.');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function loadSessionActivitySnapshot(session, options = {}) {
+  if (!session?.hostId || !session?.sessionId) return null;
+  const projectionKeyAtStart = getActivityCanonicalKeyForSession(session);
+  const preserveAfterGeneration = state.activityProjection
+    ?.mutationGeneration(projectionKeyAtStart) || 0;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let cursor = '';
+    let revision = '';
+    let canonicalKey = '';
+    let snapshot = null;
+    const activities = [];
+    let restartRequired = false;
+    for (let pageIndex = 0; pageIndex < 256; pageIndex += 1) {
+      const params = new URLSearchParams({
+        hostId: session.hostId,
+        limit: '64',
+      });
+      if (cursor) params.set('cursor', cursor);
+      if (revision) params.set('revision', revision);
+      snapshot = await fetchJson(
+        `/api/sessions/${encodeURIComponent(session.sessionId)}/activities?${params.toString()}`,
+        { signal: options.signal }
+      );
+      canonicalKey = rememberActivityCanonicalKey(
+        snapshot.canonicalConversationKey || getActivityCanonicalKeyForSession(session),
+        session,
+        snapshot
+      );
+      const responseRevision = String(snapshot.revision ?? '');
+      if (snapshot.restartRequired || (revision && responseRevision !== revision)) {
+        restartRequired = true;
+        break;
+      }
+      revision = responseRevision;
+      activities.push(...(Array.isArray(snapshot.activities) ? snapshot.activities : []));
+      if (!snapshot.hasMore) break;
+      const nextCursor = String(snapshot.nextCursor || '');
+      if (!nextCursor || nextCursor === cursor) {
+        throw new Error('Activity snapshot pagination did not advance.');
+      }
+      cursor = nextCursor;
+    }
+    if (restartRequired) continue;
+    if (canonicalKey && state.activityProjection) {
+      state.activityProjection.replaceSnapshot(canonicalKey, {
+        streamEpoch: snapshot.streamEpoch,
+        activities,
+        preserveAfterGeneration,
+      });
+    }
+    const selected = getSelectedSession();
+    if (selected && getActivityCanonicalKeyForSession(selected) === canonicalKey) {
+      scheduleTranscriptRender({ preserveScroll: true });
+    }
+    return { ...snapshot, activities };
+  }
+  throw new Error('Activity snapshot changed repeatedly while it was being restored.');
+}
+
+async function loadSessionActivityRecords(session, requestedActivities, options = {}) {
+  const targets = [...requestedActivities.entries()];
+  if (
+    !targets.length
+    || targets.length > ACTIVITY_SNAPSHOT_RECOVERY_MAX_TARGETS
+    || targets.some(([token]) => !token)
+  ) {
+    await loadSessionActivitySnapshot(session, options);
+    return new Map(requestedActivities);
+  }
+
+  const responses = await Promise.all(targets.map(async ([token, expectedRevision]) => {
+    const params = new URLSearchParams({
+      hostId: session.hostId,
+      activityToken: token,
+    });
+    const snapshot = await fetchJson(
+      `/api/sessions/${encodeURIComponent(session.sessionId)}/activities?${params.toString()}`,
+      { signal: options.signal }
+    );
+    const activity = Array.isArray(snapshot.activities) ? snapshot.activities[0] : null;
+    return { token, expectedRevision, snapshot, activity };
+  }));
+
+  if (responses.some(({ activity, expectedRevision }) => (
+    !activity || Number(activity.activityRevision || 0) < expectedRevision
+  ))) {
+    await loadSessionActivitySnapshot(session, options);
+    return new Map(requestedActivities);
+  }
+
+  const recoveredRevisions = new Map();
+  let canonicalKey = '';
+  for (const { token, snapshot, activity } of responses) {
+    canonicalKey = rememberActivityCanonicalKey(
+      snapshot.canonicalConversationKey || getActivityCanonicalKeyForSession(session),
+      session,
+      snapshot
+    );
+    state.activityProjection?.applyActivity(canonicalKey, {
+      ...activity,
+      streamEpoch: snapshot.streamEpoch,
+    });
+    recoveredRevisions.set(token, Number(activity.activityRevision || 0));
+  }
+  const selected = getSelectedSession();
+  if (selected && getActivityCanonicalKeyForSession(selected) === canonicalKey) {
+    scheduleTranscriptRender({ preserveScroll: true });
+  }
+  return recoveredRevisions;
+}
+
+function discardStaleActivitySnapshotRecoveryTasks(selectedSession = getSelectedSession()) {
+  const selectedCanonicalKey = getActivityCanonicalKeyForSession(selectedSession);
+  for (const [canonicalKey, task] of state.activitySnapshotRecoveryTasks) {
+    if (canonicalKey === selectedCanonicalKey) continue;
+    if (task.timer) window.clearTimeout(task.timer);
+    state.activitySnapshotRecoveryTasks.delete(canonicalKey);
+    state.eventCursorByCanonical.delete(canonicalKey);
+  }
+  return selectedCanonicalKey;
+}
+
+function activitySnapshotRecoveryPending(task) {
+  return task.fullSnapshotRequired || task.pendingActivities.size > 0;
+}
+
+function armActivitySnapshotRecovery(task, minimumDelayMs = 0) {
+  if (task.timer) window.clearTimeout(task.timer);
+  const dueAt = Math.min(
+    task.lastInvalidatedAt + ACTIVITY_SNAPSHOT_RECOVERY_DEBOUNCE_MS,
+    task.pendingSince + ACTIVITY_SNAPSHOT_RECOVERY_MAX_WAIT_MS
+  );
+  task.timer = window.setTimeout(() => {
+    task.timer = null;
+    void runActivitySnapshotRecovery(task);
+  }, Math.max(minimumDelayMs, dueAt - Date.now(), task.retryNotBefore - Date.now()));
+}
+
+function retryActivitySnapshotRecovery(task) {
+  if (task.timer) window.clearTimeout(task.timer);
+  task.retryAttempt += 1;
+  const delayMs = Math.min(
+    ACTIVITY_SNAPSHOT_RECOVERY_RETRY_MAX_MS,
+    500 * (2 ** Math.min(task.retryAttempt - 1, 6))
+  );
+  task.retryNotBefore = Date.now() + delayMs;
+  task.timer = window.setTimeout(() => {
+    task.timer = null;
+    void runActivitySnapshotRecovery(task);
+  }, delayMs);
+}
+
+async function runActivitySnapshotRecovery(task) {
+  if (
+    state.activitySnapshotRecoveryTasks.get(task.canonicalKey) !== task
+    || discardStaleActivitySnapshotRecoveryTasks() !== task.canonicalKey
+  ) {
+    return;
+  }
+  if (task.inFlight) return;
+
+  const requestedActivities = new Map(task.pendingActivities);
+  const fullSnapshotRequired = task.fullSnapshotRequired;
+  task.pendingActivities.clear();
+  task.fullSnapshotRequired = false;
+  task.inFlight = true;
+  task.pendingSince = 0;
+  task.lastInvalidatedAt = 0;
+  let recoveryError = null;
+  let recoveredRevisions = new Map();
+  try {
+    recoveredRevisions = await withStreamRecoveryTimeout(async (signal) => {
+      if (fullSnapshotRequired) {
+        await loadSessionActivitySnapshot(task.session, { signal });
+        return new Map();
+      }
+      return loadSessionActivityRecords(task.session, requestedActivities, { signal });
+    });
+    task.retryAttempt = 0;
+    task.retryNotBefore = 0;
+    task.errorReported = false;
+  } catch (error) {
+    recoveryError = error;
+    task.fullSnapshotRequired ||= fullSnapshotRequired;
+    for (const [token, revision] of requestedActivities) {
+      task.pendingActivities.set(
+        token,
+        Math.max(revision, Number(task.pendingActivities.get(token) || 0))
+      );
+    }
+    if (!task.pendingSince) task.pendingSince = Date.now();
+    if (!task.lastInvalidatedAt) task.lastInvalidatedAt = task.pendingSince;
+    if (!task.errorReported) {
+      task.errorReported = true;
+      reportError(error);
+    }
+  } finally {
+    task.inFlight = false;
+    if (
+      state.activitySnapshotRecoveryTasks.get(task.canonicalKey) !== task
+      || discardStaleActivitySnapshotRecoveryTasks() !== task.canonicalKey
+    ) {
+      return;
+    }
+    for (const [token, recoveredRevision] of recoveredRevisions) {
+      if (Number(task.pendingActivities.get(token) || 0) <= recoveredRevision) {
+        task.pendingActivities.delete(token);
+      }
+    }
+    if (activitySnapshotRecoveryPending(task)) {
+      if (recoveryError) {
+        retryActivitySnapshotRecovery(task);
+      } else {
+        armActivitySnapshotRecovery(task, ACTIVITY_SNAPSHOT_RECOVERY_DEBOUNCE_MS);
+      }
+    } else {
+      state.activitySnapshotRecoveryTasks.delete(task.canonicalKey);
+    }
+  }
+}
+
+function scheduleActivitySnapshotRecovery(session, event, payload) {
+  const canonicalKey = rememberSessionStreamEvent(session, event, payload);
+  const selected = getSelectedSession();
+  if (!canonicalKey || getActivityCanonicalKeyForSession(selected) !== canonicalKey) {
+    if (canonicalKey) state.eventCursorByCanonical.delete(canonicalKey);
+    discardStaleActivitySnapshotRecoveryTasks(selected);
+    return false;
+  }
+  discardStaleActivitySnapshotRecoveryTasks(selected);
+
+  const now = Date.now();
+  let task = state.activitySnapshotRecoveryTasks.get(canonicalKey);
+  if (!task) {
+    task = {
+      canonicalKey,
+      session: selected,
+      timer: null,
+      inFlight: false,
+      pendingActivities: new Map(),
+      fullSnapshotRequired: false,
+      pendingSince: now,
+      lastInvalidatedAt: now,
+      retryAttempt: 0,
+      retryNotBefore: 0,
+      errorReported: false,
+    };
+    state.activitySnapshotRecoveryTasks.set(canonicalKey, task);
+  } else {
+    task.session = selected;
+    if (!task.pendingSince) task.pendingSince = now;
+    task.lastInvalidatedAt = now;
+  }
+  const recoveryToken = String(payload.activityRecoveryToken || '').trim();
+  if (recoveryToken && !task.fullSnapshotRequired) {
+    task.pendingActivities.set(
+      recoveryToken,
+      Math.max(
+        Number(payload.activityRevision || 0),
+        Number(task.pendingActivities.get(recoveryToken) || 0)
+      )
+    );
+    if (task.pendingActivities.size > ACTIVITY_SNAPSHOT_RECOVERY_MAX_TARGETS) {
+      task.pendingActivities.clear();
+      task.fullSnapshotRequired = true;
+    }
+  } else {
+    task.fullSnapshotRequired = true;
+  }
+  if (!task.inFlight) armActivitySnapshotRecovery(task);
+  return true;
+}
+
+function clearStreamDetailRecoveryRetry() {
+  if (state.streamDetailRecoveryRetryTimer) {
+    window.clearTimeout(state.streamDetailRecoveryRetryTimer);
+  }
+  state.streamDetailRecoveryRetryTimer = null;
+  state.streamDetailRecoveryRetryKey = null;
+  state.streamDetailRecoveryRetryAttempt = 0;
+}
+
+function discardStaleStreamDetailRecovery(selectedSession = getSelectedSession()) {
+  const selectedKey = getSessionKey(selectedSession);
+  for (const [recoveryKey, canonicalKey] of state.streamDetailRecoveryCanonicalKeys) {
+    if (recoveryKey === selectedKey) continue;
+    state.eventCursorByCanonical.delete(canonicalKey);
+    state.streamDetailRecoveryCanonicalKeys.delete(recoveryKey);
+  }
+  if (
+    state.streamDetailRecoveryRetryKey
+    && state.streamDetailRecoveryRetryKey !== selectedKey
+  ) {
+    clearStreamDetailRecoveryRetry();
+  }
+  if (
+    state.streamDetailRecoveryPendingKey
+    && state.streamDetailRecoveryPendingKey !== selectedKey
+  ) {
+    state.streamDetailRecoveryPendingKey = null;
+  }
+  for (const recoveryKey of state.streamActivityRecoveryPendingKeys) {
+    if (recoveryKey !== selectedKey) {
+      state.streamActivityRecoveryPendingKeys.delete(recoveryKey);
+    }
+  }
+  return selectedKey;
+}
+
+function scheduleStreamDetailRecoveryRetry(recoveryKey) {
+  if (!recoveryKey || state.streamDetailRecoveryRetryTimer) return;
+  state.streamDetailRecoveryRetryKey = recoveryKey;
+  state.streamDetailRecoveryRetryAttempt += 1;
+  const delayMs = Math.min(
+    ACTIVITY_SNAPSHOT_RECOVERY_RETRY_MAX_MS,
+    500 * (2 ** Math.min(state.streamDetailRecoveryRetryAttempt - 1, 6))
+  );
+  state.streamDetailRecoveryRetryTimer = window.setTimeout(() => {
+    state.streamDetailRecoveryRetryTimer = null;
+    const selected = getSelectedSession();
+    if (getSessionKey(selected) !== recoveryKey) {
+      discardStaleStreamDetailRecovery(selected);
+      return;
+    }
+    void reconcileSelectedSessionAfterStreamReset(selected, {
+      activities: state.streamActivityRecoveryPendingKeys.has(recoveryKey),
+    }).catch(() => {});
+  }, delayMs);
+}
+
+async function reconcileSelectedSessionAfterStreamReset(session, options = {}) {
+  const requestedKey = getSessionKey(session);
+  if (!requestedKey) return;
+  const selectedAtRequest = getSelectedSession();
+  if (getSessionKey(selectedAtRequest) !== requestedKey) return;
+  state.streamDetailRecoveryCanonicalKeys.set(
+    requestedKey,
+    getActivityCanonicalKeyForSession(selectedAtRequest)
+  );
+  state.streamDetailRecoveryPendingKey = requestedKey;
+  if (options.activities) state.streamActivityRecoveryPendingKeys.add(requestedKey);
+  if (state.streamDetailRecoveryInFlight) return;
+  if (state.streamDetailRecoveryRetryTimer) {
+    window.clearTimeout(state.streamDetailRecoveryRetryTimer);
+    state.streamDetailRecoveryRetryTimer = null;
+  }
+  state.streamDetailRecoveryInFlight = true;
+  let recoveryError = null;
+  let failedRecoveryKey = null;
+  try {
+    while (state.streamDetailRecoveryPendingKey) {
+      const recoveryKey = state.streamDetailRecoveryPendingKey;
+      state.streamDetailRecoveryPendingKey = null;
+      const recoverActivities = state.streamActivityRecoveryPendingKeys.delete(recoveryKey);
+      const selected = getSelectedSession();
+      if (
+        !selected?.hostId
+        || !selected?.sessionId
+        || getSessionKey(selected) !== recoveryKey
+      ) {
+        const canonicalKey = state.streamDetailRecoveryCanonicalKeys.get(recoveryKey);
+        if (canonicalKey) state.eventCursorByCanonical.delete(canonicalKey);
+        state.streamDetailRecoveryCanonicalKeys.delete(recoveryKey);
+        continue;
+      }
+      let detailError = null;
+      let activityError = null;
+      try {
+        state.fullTranscriptLoaded.delete(recoveryKey);
+        await withStreamRecoveryTimeout((signal) => showSession(selected, {
+          full: true,
+          preserveScroll: true,
+          signal,
+          throwOnError: true,
+        }));
+      } catch (error) {
+        detailError = error;
+      }
+      if (recoverActivities) {
+        try {
+          await withStreamRecoveryTimeout((signal) => (
+            loadSessionActivitySnapshot(selected, { signal })
+          ));
+        } catch (error) {
+          activityError = error;
+          state.streamActivityRecoveryPendingKeys.add(recoveryKey);
+        }
+      }
+      if (getSessionKey(getSelectedSession()) !== recoveryKey) {
+        state.streamActivityRecoveryPendingKeys.delete(recoveryKey);
+        if (detailError || activityError) {
+          state.eventCursorByCanonical.delete(getActivityCanonicalKeyForSession(selected));
+        }
+        state.streamDetailRecoveryCanonicalKeys.delete(recoveryKey);
+        continue;
+      }
+      recoveryError = detailError || activityError;
+      if (recoveryError) {
+        failedRecoveryKey = recoveryKey;
+        state.streamDetailRecoveryPendingKey = recoveryKey;
+        state.eventCursorByCanonical.delete(getActivityCanonicalKeyForSession(selected));
+        break;
+      }
+      state.streamDetailRecoveryCanonicalKeys.delete(recoveryKey);
+    }
+  } finally {
+    state.streamDetailRecoveryInFlight = false;
+  }
+  if (recoveryError) {
+    scheduleStreamDetailRecoveryRetry(failedRecoveryKey);
+    throw recoveryError;
+  }
+  clearStreamDetailRecoveryRetry();
 }
 
 function updateSelectedViews(session) {
@@ -16737,28 +20669,17 @@ function patchProjectedThinkingActivity(canonicalKey, activity) {
   if (!selected || getActivityCanonicalKeyForSession(selected) !== canonicalKey) {
     return false;
   }
-  const log = el('session-log');
-  const item = log?.querySelector(
-    `[data-thinking-activity-key="${cssEscape(activity.activityKey || '')}"]`
-  );
-  if (!item) {
+  if (!runtimeIsActive(getRuntimeForSession(selected) || selected.runtime || {})) {
     return false;
   }
-  const outerSnapshot = captureTranscriptScrollSnapshot();
-  const scroller = item.closest('.thinking-content[data-thinking-state-key]');
-  const stateKey = scroller?.dataset?.thinkingStateKey || '';
-  if (scroller && stateKey) {
-    preserveThinkingViewportForPatch(stateKey, scroller);
+  const log = el('session-log');
+  const latestUserEntry = getLatestUserTranscriptEntry(selected);
+  const stateKey = `${getSessionKey(selected) || selected.sessionId || 'session'}::thinking::${latestUserEntry?.timestamp || 'live'}`;
+  if (!log?.querySelector?.(`.thinking-card[data-thinking-state-key="${cssEscape(stateKey)}"]`)) {
+    return false;
   }
-  item.dataset.activityRevision = String(activity.activityRevision || 0);
-  const textNode = item.querySelector('.thinking-history-text');
-  if (textNode) {
-    textNode.textContent = String(activity.text == null ? '' : activity.text);
-  }
-  if (scroller && stateKey) {
-    restoreThinkingScrollState(stateKey, scroller, { preserveDetached: true, immediate: true });
-  }
-  restoreTranscriptScrollSnapshot(outerSnapshot);
+  queuedUiRenders.thinkingPanel = true;
+  scheduleQueuedUiFlush();
   return true;
 }
 
@@ -16798,6 +20719,13 @@ function applySessionStreamReset(session, event, payload) {
   return true;
 }
 
+function sessionStreamResetNeedsRecovery(reason) {
+  return reason === 'cursor_expired'
+    || reason === 'epoch_mismatch'
+    || reason === 'cursor_invalid'
+    || reason === 'canonical_key_changed';
+}
+
 function subscribeSession(session) {
   const key = getSessionKey(session);
   if (!key || state.eventSourceKey === key) {
@@ -16811,7 +20739,15 @@ function subscribeSession(session) {
     eventParams.set('full', '1');
   }
   const canonicalKey = getActivityCanonicalKeyForSession(session);
-  const resumeCursor = state.eventCursorByCanonical.get(canonicalKey);
+  let resumeCursor = state.eventCursorByCanonical.get(canonicalKey);
+  if (
+    resumeCursor
+    && state.activityProjection
+    && !state.activityProjection.hasConversation(canonicalKey)
+  ) {
+    state.eventCursorByCanonical.delete(canonicalKey);
+    resumeCursor = '';
+  }
   if (resumeCursor) {
     eventParams.set('lastEventId', resumeCursor);
   }
@@ -16882,11 +20818,26 @@ function subscribeSession(session) {
   }
 
   state.eventSource.addEventListener('stream.reset', (event) => {
-    applySessionStreamReset(session, event, JSON.parse(event.data));
+    const payload = JSON.parse(event.data);
+    applySessionStreamReset(session, event, payload);
+    if (
+      sessionStreamResetNeedsRecovery(payload.reason)
+      || payload.detailRecoveryRequired
+      || payload.activitiesTruncated
+    ) {
+      reconcileSelectedSessionAfterStreamReset(session, {
+        activities: payload.activitiesTruncated === true,
+      }).catch(reportError);
+    }
   });
 
   state.eventSource.addEventListener('session.activity', (event) => {
-    applyActivityEvent(session, event, JSON.parse(event.data));
+    const payload = JSON.parse(event.data);
+    if (payload.activityTruncated === true) {
+      scheduleActivitySnapshotRecovery(session, event, payload);
+      return;
+    }
+    applyActivityEvent(session, event, payload);
   });
 
   state.eventSource.addEventListener('session.assistant_projection', (event) => {
@@ -16984,8 +20935,12 @@ function subscribeSession(session) {
         updatedAt: payload.timestamp || payload.patch.updatedAt || new Date().toISOString(),
       }
       : payload;
-    patchRuntimeForSession(runtimePayload.hostId || session.hostId, runtimePayload.sessionId || session.sessionId, runtimePayload);
-    const runtimeStopped = !runtimeIsActive(runtimePayload);
+    const mergedRuntime = patchRuntimeForSession(
+      runtimePayload.hostId || session.hostId,
+      runtimePayload.sessionId || session.sessionId,
+      runtimePayload
+    );
+    const runtimeStopped = !runtimeIsActive(mergedRuntime || runtimePayload);
     const status = String(runtimePayload.currentTurnStatus || runtimePayload.phase || '').toLowerCase();
     if (runtimeStopped && status && status !== 'interrupted') {
       clearActiveDraftForSession({
@@ -17067,13 +21022,24 @@ function subscribeSession(session) {
 }
 
 async function showSession(session = getSelectedSession(), options = {}) {
+  if (session && getSessionKey(session) !== getSessionKey(getSelectedSession())) {
+    return;
+  }
   renderSessionDetails();
   renderRuntimePanel();
   renderThinkingPanel();
 
   if (!session) {
+    state.shownSessionKey = null;
     closeStream();
+    void unwatchSelectedSession({ silent: true });
     return;
+  }
+
+  const sessionKey = getSessionKey(session);
+  if (sessionKey && state.shownSessionKey !== sessionKey) {
+    state.fullTranscriptLoaded.delete(sessionKey);
+    state.shownSessionKey = sessionKey;
   }
 
   void loadSessionRuntimeConfigForSession(session).catch(() => {});
@@ -17086,9 +21052,13 @@ async function showSession(session = getSelectedSession(), options = {}) {
   };
   renderTranscript(session, initialTranscriptRenderOptions);
   subscribeSession(session);
-  void watchSelectedSession(session);
 
   try {
+    await watchSelectedSession(session);
+    if (getSessionKey(session) !== getSessionKey(getSelectedSession())) {
+      setHistoryLoading(session, false);
+      return;
+    }
     const shouldFetchDetail = shouldFetchSessionDetailOnOpen(session, options);
     if (!shouldFetchDetail) {
       setHistoryLoading(session, false);
@@ -17113,7 +21083,10 @@ async function showSession(session = getSelectedSession(), options = {}) {
     if (options.fullDiagnostics) {
       detailParams.set('fullDiagnostics', '1');
     }
-    const detail = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/detail?${detailParams.toString()}`);
+    const detail = await fetchJson(
+      `/api/sessions/${encodeURIComponent(session.sessionId)}/detail?${detailParams.toString()}`,
+      { signal: options.signal }
+    );
     const detailSession = mergeSession(detail.session) || session;
     const detailHostId = detailSession.hostId || session.hostId;
     const detailSessionId = detailSession.sessionId || session.sessionId;
@@ -17125,9 +21098,12 @@ async function showSession(session = getSelectedSession(), options = {}) {
       state.fullTranscriptLoaded.add(detailSessionKey);
     }
     if (state.selectedHostId === session.hostId && state.selectedSessionId === session.sessionId && detailSessionId !== session.sessionId) {
+      moveComposerDraftSessionKey(getSessionKey(session), detailSessionKey);
       state.selectedHostId = detailHostId;
       state.selectedSessionId = detailSessionId;
       state.selectedConversationKey = detailSession.conversationKey || state.selectedConversationKey;
+      state.shownSessionKey = detailSessionKey;
+      void watchSelectedSession(detailSession);
     }
     const existing = dedupeTranscript([
       ...getTranscriptForSession(session),
@@ -17184,6 +21160,7 @@ async function showSession(session = getSelectedSession(), options = {}) {
       renderAlertsWindow();
       renderStatusWindow();
     }
+    if (options.throwOnError) throw error;
   }
 }
 
@@ -17910,29 +21887,32 @@ async function fetchSessionExportResponse(session, format, options = {}) {
   return response;
 }
 
-async function attachHistoryMarkdown(session, options = {}) {
+async function attachHistoryMarkdown(session, options = {}, sessionKey = getMountedComposerSessionKey()) {
+  const composerSessionKey = resolveComposerSessionKey(sessionKey);
   const response = await fetchSessionExportResponse(session, 'markdown', options);
   const text = await response.text();
   const title = makeSafeAttachmentName(sessionDisplayTitle(session), shortId(session?.sessionId || 'conversation'));
   const name = `${title}.history.md`;
   const size = textByteLength(text);
-  const textFileCount = state.codexControls.attachments.filter((attachment) => attachment.type === 'textFile').length;
+  const textFileCount = getComposerDraftForSessionKey(composerSessionKey).attachments
+    .filter((attachment) => attachment.type === 'textFile').length;
   if (size <= MAX_COMPOSER_TEXT_FILE_BYTES && textFileCount < MAX_COMPOSER_TEXT_FILES) {
-    state.codexControls.attachments.push({
+    appendComposerAttachmentsForSessionKey(composerSessionKey, [{
       type: 'textFile',
       text,
       name,
       size,
       source: 'historyImport',
       sessionKey: getSessionKey(session),
-    });
+    }]);
     return;
   }
   const blob = new Blob([text], { type: 'text/markdown; charset=utf-8' });
-  await addComposerFiles([fileFromBlob(blob, name, 'text/markdown')]);
+  await addComposerFiles([fileFromBlob(blob, name, 'text/markdown')], composerSessionKey);
 }
 
-async function attachHistoryBundle(session, options = {}) {
+async function attachHistoryBundle(session, options = {}, sessionKey = getMountedComposerSessionKey()) {
+  const composerSessionKey = resolveComposerSessionKey(sessionKey);
   if (options.includeImages === false && options.includeFiles === false) {
     return;
   }
@@ -17942,10 +21922,11 @@ async function attachHistoryBundle(session, options = {}) {
     return;
   }
   const title = makeSafeAttachmentName(sessionDisplayTitle(session), shortId(session?.sessionId || 'conversation'));
-  await addComposerFiles([fileFromBlob(blob, `${title}.history.zip`, 'application/zip')]);
+  await addComposerFiles([fileFromBlob(blob, `${title}.history.zip`, 'application/zip')], composerSessionKey);
 }
 
 async function attachSessionHistory(session, options = {}) {
+  const composerSessionKey = resolveComposerSessionKey(options.composerSessionKey || getMountedComposerSessionKey());
   const exportOptions = {
     includeThinking: options.includeThinking !== false,
     includeImages: options.includeImages !== false,
@@ -17954,9 +21935,9 @@ async function attachSessionHistory(session, options = {}) {
     fullTranscript: true,
     importHistory: true,
   };
-  await attachHistoryMarkdown(session, exportOptions);
+  await attachHistoryMarkdown(session, exportOptions, composerSessionKey);
   if (exportOptions.includeImages || exportOptions.includeFiles) {
-    await attachHistoryBundle(session, exportOptions);
+    await attachHistoryBundle(session, exportOptions, composerSessionKey);
   }
 }
 
@@ -17965,13 +21946,17 @@ async function importCurrentSessionHistory() {
   if (!session) {
     throw new Error('Select a conversation before importing its history.');
   }
+  const composerSessionKey = getMountedComposerSessionKey();
   await attachSessionHistory(session, {
     includeThinking: true,
     includeImages: true,
     includeFiles: true,
+    composerSessionKey,
   });
-  renderAttachmentChips();
-  focusComposerInput();
+  if (getMountedComposerSessionKey() === resolveComposerSessionKey(composerSessionKey)) {
+    renderAttachmentChips();
+    focusComposerInput();
+  }
 }
 
 function defaultHistoryImportOptions() {
@@ -18287,18 +22272,26 @@ async function importSelectedHistorySessions() {
   }
   dialog.busy = true;
   renderHistoryImportDialog();
+  const composerSessionKey = getMountedComposerSessionKey();
   const failures = [];
   for (const group of selected) {
     const session = getHistoryImportSessionForGroup(group);
     try {
-      await attachSessionHistory(session, getHistoryImportOptions(getHistoryImportGroupKey(group)));
+      await attachSessionHistory(session, {
+        ...getHistoryImportOptions(getHistoryImportGroupKey(group)),
+        composerSessionKey,
+      });
     } catch (error) {
       failures.push(`${group.title || sessionDisplayTitle(session)}: ${error.message}`);
     }
   }
-  renderAttachmentChips();
+  if (getMountedComposerSessionKey() === resolveComposerSessionKey(composerSessionKey)) {
+    renderAttachmentChips();
+  }
   closeHistoryImportDialog();
-  focusComposerInput();
+  if (getMountedComposerSessionKey() === resolveComposerSessionKey(composerSessionKey)) {
+    focusComposerInput();
+  }
   if (failures.length) {
     window.alert(`Some history imports failed:\n${failures.join('\n')}`);
   }
@@ -18805,13 +22798,15 @@ async function performRefresh(requestId, baselineSessions) {
   const selected = getSelectedSession();
   const nextKey = getSessionKey(selected);
   if (!nextKey) {
+    state.shownSessionKey = null;
     closeStream();
+    void unwatchSelectedSession({ silent: true });
     renderTranscript(null);
     return;
   }
 
-  const needsStream = Boolean(selected.live || selected.source === 'managed');
-  const streamMismatch = needsStream ? state.eventSourceKey !== nextKey : Boolean(state.eventSourceKey);
+  void maintainSelectedSessionWatch();
+  const streamMismatch = state.eventSourceKey !== nextKey;
   if (nextKey !== previousKey || !state.transcripts.has(nextKey) || streamMismatch) {
     await showSession(selected);
   } else {
@@ -18954,18 +22949,49 @@ function isManagedSessionStarting(session) {
   );
 }
 
+function sessionNativeResumeReadiness(session) {
+  if (!session) {
+    return null;
+  }
+  const candidates = [
+    session.runtimeConfig,
+    getRuntimeForSession(session),
+    session.runtime,
+  ];
+  for (const candidate of candidates) {
+    if (candidate?.nativeResumeReadyKnown === false) {
+      continue;
+    }
+    if (candidate && Object.prototype.hasOwnProperty.call(candidate, 'nativeResumeReady')) {
+      return candidate.nativeResumeReady === true;
+    }
+  }
+  return null;
+}
+
 function isEmptyManagedSessionShell(session) {
   if (!session || session.source !== 'managed' || session.live) {
     return false;
   }
-  const messageCount = Number(session.messageCount || 0);
-  const previewCount = Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0;
-  const transcriptCount = state.transcripts.get(makeSessionKey(session.hostId, session.sessionId))?.length || 0;
-  if (Math.max(messageCount, previewCount, transcriptCount) > 0) {
+  const nativeResumeReady = sessionNativeResumeReadiness(session);
+  if (nativeResumeReady === true) {
     return false;
   }
   const stateText = String(session.state || '').toLowerCase();
+  if (nativeResumeReady === false) {
+    return stateText === 'history-only'
+      || stateText === 'closed'
+      || stateText.startsWith('exited')
+      || stateText.startsWith('failed');
+  }
+  const messageCount = Number(session.messageCount || 0);
+  const previewCount = Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0;
+  const transcriptCount = state.transcripts.get(makeSessionKey(session.hostId, session.sessionId))?.length || 0;
+  if (Math.max(messageCount, previewCount, transcriptCount) > 0 || session.rolloutPath) {
+    return false;
+  }
   return stateText === 'history-only'
+    || stateText === 'stopped'
     || stateText === 'closed'
     || stateText.startsWith('exited')
     || stateText.startsWith('failed');
@@ -18974,6 +23000,10 @@ function isEmptyManagedSessionShell(session) {
 function isFreshLiveManagedSessionWithoutHistory(session) {
   if (!session || session.source !== 'managed' || !session.live) {
     return false;
+  }
+  const nativeResumeReady = sessionNativeResumeReadiness(session);
+  if (nativeResumeReady !== null) {
+    return nativeResumeReady === false;
   }
   const messageCount = Number(session.messageCount || 0);
   const previewCount = Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0;
@@ -18994,11 +23024,25 @@ function shouldFetchSessionDetailOnOpen(session, options = {}) {
 }
 
 function canActivateSessionHistory(session) {
-  return Boolean(session && !session.live && session.cwd && !isManagedSessionStarting(session) && !isEmptyManagedSessionShell(session));
+  return Boolean(
+    session
+    && !session.live
+    && session.cwd
+    && sessionNativeResumeReadiness(session) !== false
+    && !isManagedSessionStarting(session)
+    && !isEmptyManagedSessionShell(session)
+  );
 }
 
 function canForkSession(session) {
-  return Boolean(session && session.cwd && !isManagedSessionStarting(session));
+  return Boolean(
+    session
+    && session.cwd
+    && sessionNativeResumeReadiness(session) !== false
+    && !isManagedSessionStarting(session)
+    && !isEmptyManagedSessionShell(session)
+    && !isFreshLiveManagedSessionWithoutHistory(session)
+  );
 }
 
 function isSessionStartTerminalState(session) {
@@ -19050,6 +23094,27 @@ async function deleteHost(hostId) {
     state.selectedHostId = null;
     state.selectedConversationKey = null;
     state.selectedSessionId = null;
+  }
+
+  const hostSessionPrefix = `${hostId}::`;
+  const activityCanonicalKeys = new Set(
+    state.activityProjection?.conversationKeys?.()
+      .filter((canonicalKey) => canonicalKey.startsWith(hostSessionPrefix)) || []
+  );
+  for (const [sessionKey, canonicalKey] of state.activityCanonicalKeysBySession) {
+    if (sessionKey.startsWith(hostSessionPrefix)) {
+      activityCanonicalKeys.add(canonicalKey);
+      state.activityCanonicalKeysBySession.delete(sessionKey);
+    }
+  }
+  for (const canonicalKey of activityCanonicalKeys) {
+    state.activityProjection?.clearConversation(canonicalKey);
+    forgetActivityCanonicalConversation(canonicalKey);
+  }
+  for (const canonicalKey of state.eventCursorByCanonical.keys()) {
+    if (canonicalKey.startsWith(hostSessionPrefix)) {
+      state.eventCursorByCanonical.delete(canonicalKey);
+    }
   }
 
   for (const key of Array.from(state.transcripts.keys())) {
@@ -19281,16 +23346,6 @@ function shouldRetryConnectorOneTimeCode(payload, result) {
   return /permission denied.*keyboard-interactive|keyboard-interactive.*permission denied|verification|authenticator|passcode|otp|mfa|token|connection closed/.test(text);
 }
 
-function updateConnectorFromActionResult(connectorId, result) {
-  if (!result?.connector) {
-    return;
-  }
-  const index = state.connectors.findIndex((item) => item.connectorId === connectorId);
-  if (index >= 0) {
-    state.connectors[index] = result.connector;
-  }
-}
-
 function connectorActionResultSummary(result) {
   if (!result) {
     return 'No connector action result was returned.';
@@ -19406,7 +23461,6 @@ async function executeConnectorAction(connector, action, payload = connector, op
       }
       lastResult = result;
       state.connectorActionResults.set(connector.connectorId, result);
-      updateConnectorFromActionResult(connector.connectorId, result);
       renderConnectorManager();
 
       const shouldRetry = !promptControl.cancelled
@@ -19590,32 +23644,162 @@ async function joinLiveSession(options = {}) {
 function sessionSelectionRequestBody(session) {
   const options = getComposerOptionsForSession(session);
   assertModelSelectionIsSelectable(session, options.model);
+  assertEffortSelectionIsValid(session, options);
   const selection = {};
   if (options.model) {
     selection.model = options.model;
   }
   if (options.effort) {
     selection.effort = options.effort;
+    if (options.allowUnverifiedEffort) {
+      selection.allowUnverifiedEffort = true;
+    }
+  }
+  if (options.summary) {
+    selection.summary = options.summary;
   }
   return selection;
 }
 
-async function rebindSessionApi(session, profileId, selectionSnapshot = null, apiConfigSnapshot = undefined) {
+function rebindSelectionRequestBody(session, profileId, selectionSource) {
+  return {
+    model: '',
+    effort: '',
+    summary: '',
+    ...sessionSelectionRequestBody(session),
+  };
+}
+
+function normalizeRebindSelectionSnapshot(selection = {}) {
+  const source = selection && typeof selection === 'object' ? selection : {};
+  const effort = String(source.effort || '').trim().toLowerCase();
+  return {
+    model: String(source.model || '').trim(),
+    effort,
+    summary: String(source.summary || '').trim(),
+    ...(effort && source.allowUnverifiedEffort === true ? { allowUnverifiedEffort: true } : {}),
+  };
+}
+
+function resolveFreshSessionSelection(hostId, options = {}, apiConfig = getApiRequestConfig(hostId)) {
+  const explicit = options.selection && typeof options.selection === 'object'
+    ? options.selection
+    : null;
+  if (explicit && ['model', 'effort', 'summary', 'allowUnverifiedEffort'].some((key) => (
+    Object.prototype.hasOwnProperty.call(explicit, key)
+  ))) {
+    const normalized = normalizeComposerOptionValues(explicit);
+    return {
+      ...(normalized.model ? { model: normalized.model } : {}),
+      ...(normalized.effort ? { effort: normalized.effort } : {}),
+      ...(normalized.effort && normalized.allowUnverifiedEffort ? { allowUnverifiedEffort: true } : {}),
+      ...(normalized.summary ? { summary: normalized.summary } : {}),
+    };
+  }
+  return {};
+}
+
+async function waitForExplicitRebindCompletion(session, response, target) {
+  const expectedRunId = String(response?.runId || '').trim();
+  if (!expectedRunId) {
+    throw sessionContractError('session_run_not_found', 'Rebind did not return a run ID.');
+  }
+  const sessionId = response.sessionId || session.sessionId;
+  const completed = await waitForSessionReady(
+    session.hostId,
+    sessionId,
+    managedSessionStartTimeoutMs(getHost(session.hostId), 'resume'),
+    { launchResponse: response }
+  );
+  if (!completed?.live) {
+    const failure = completed?.resumeError || {};
+    throw sessionContractError(
+      failure.code || 'session_rebind_failed',
+      failure.error || `Rebind failed while starting run ${shortId(expectedRunId)} (${completed?.state || 'unknown state'}).`
+    );
+  }
+  const runtime = await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
+  const binding = runtime?.apiBinding || runtime?.sessionBinding || null;
+  const bindingMatches = rebindTargetMatchesBinding(binding, target);
+  if (
+    String(runtime?.runId || '').trim() !== expectedRunId
+    || runtime?.runStatus !== 'live'
+    || !bindingMatches
+  ) {
+    throw sessionContractError(
+      'session_run_state_conflict',
+      'Rebind completed with a different run or API binding.'
+    );
+  }
+  return { ...completed, runtimeConfig: runtime, apiBinding: binding };
+}
+
+async function reconcileAcceptedRebind(session, response, target) {
+  const expectedRunId = String(response?.runId || '').trim();
+  const sessionId = String(response?.sessionId || session?.sessionId || '').trim();
+  if (!expectedRunId || !session?.hostId || !sessionId) {
+    return null;
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const runtime = await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
+      const binding = runtime?.apiBinding || runtime?.sessionBinding || null;
+      const bindingMatches = rebindTargetMatchesBinding(binding, target);
+      if (
+        String(runtime?.runId || '').trim() === expectedRunId
+        && runtime?.runStatus === 'live'
+        && bindingMatches
+      ) {
+        return runtime;
+      }
+    } catch (_) {
+      // The accepted run may still be publishing its canonical runtime state.
+    }
+    if (attempt === 0) {
+      await delay(120);
+    }
+  }
+  return null;
+}
+
+function rebindResponseWithClientSelection(response, selection) {
+  return response
+    ? { ...response, clientSelection: { ...(selection || {}) } }
+    : response;
+}
+
+function rebindFailureMayHaveLostAcceptedResponse(error) {
+  const status = Number(error?.status);
+  return !Number.isInteger(status) || status < 400;
+}
+
+async function rebindSessionApi(session, profileId, selectionSnapshot = null, apiConfigSnapshot = undefined, requestOptions = {}) {
   if (!session?.hostId || !session?.sessionId) {
     throw new Error('Select a Session before rebinding its API.');
   }
   const requestSessionKey = getSessionKey(session);
   const currentSession = state.sessions.find((candidate) => getSessionKey(candidate) === requestSessionKey) || session;
-  const canonicalSession = await loadSessionRuntimeConfigForSession(currentSession, {
-    allowRebindFallback: true,
-  });
-  if (!canonicalSession) {
+  const canonicalSession = requestOptions.canonicalSession
+    || await loadStableCanonicalSessionForRebind(currentSession);
+  if (!canonicalSession || getSessionKey(canonicalSession) !== requestSessionKey) {
     throw sessionContractError(
       'session_run_state_conflict',
       'Canonical Session runtime configuration changed before Rebind could start.'
     );
   }
-  const expectation = captureSessionLifecycleExpectation(canonicalSession);
+  const capturedExpectation = captureSessionLifecycleExpectation(canonicalSession);
+  const expectation = requestOptions.expectation || capturedExpectation;
+  if (
+    expectation.sessionKey !== capturedExpectation.sessionKey
+    || expectation.expectedRunId !== capturedExpectation.expectedRunId
+    || expectation.expectedRunStatus !== capturedExpectation.expectedRunStatus
+    || expectation.expectedBindingFingerprint !== capturedExpectation.expectedBindingFingerprint
+  ) {
+    throw sessionContractError(
+      'session_run_state_conflict',
+      'The captured Rebind expectation does not match the canonical Session runtime.'
+    );
+  }
   const selectedProfileId = String(profileId || '').trim();
   const explicitProfileId = selectedProfileId === '__host_environment__' ? '' : selectedProfileId;
   let apiConfig = null;
@@ -19642,29 +23826,83 @@ async function rebindSessionApi(session, profileId, selectionSnapshot = null, ap
     }
   }
 
-  await verifyHostAvailable(canonicalSession.hostId);
-  const selection = selectionSnapshot && typeof selectionSnapshot === 'object'
+  const previousBinding = sessionApiBinding(canonicalSession);
+  const target = rebindTargetSummary(selectedProfileId, apiConfig);
+  const selectionSource = 'current-session';
+  const rawSelection = selectionSnapshot && typeof selectionSnapshot === 'object'
     ? { ...selectionSnapshot }
-    : sessionSelectionRequestBody(canonicalSession);
+    : rebindSelectionRequestBody(canonicalSession, selectedProfileId, selectionSource);
+  const selection = normalizeRebindSelectionSnapshot(rawSelection);
+  await verifyHostAvailable(canonicalSession.hostId);
+  const confirmed = requestOptions.confirm === false
+    || window.confirm(formatSessionRebindConfirmation(previousBinding, target, selection, selectionSource));
+  if (!confirmed) {
+    return null;
+  }
   const body = {
     hostId: canonicalSession.hostId,
     ...selection,
+    refreshModels: true,
+    requireIdle: requestOptions.requireIdle === true,
     expectedRunId: expectation.expectedRunId,
     expectedRunStatus: expectation.expectedRunStatus,
     expectedBindingFingerprint: expectation.expectedBindingFingerprint,
   };
+  if (requestOptions.modelCatalogReuseToken) {
+    body.modelCatalogReuseToken = String(requestOptions.modelCatalogReuseToken).trim();
+  }
   if (apiConfig) {
     body.apiConfig = apiConfig;
   }
+  let acceptedResponse = null;
   try {
-    const response = await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/rebind`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
+    const response = rebindResponseWithClientSelection(
+      await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/rebind`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+      selection
+    );
+    acceptedResponse = response;
     applyRebindLaunchResponse(expectation, response, canonicalSession);
     renderAll();
+    if (requestOptions.waitForReady !== false) {
+      const completed = await waitForExplicitRebindCompletion(canonicalSession, response, target);
+      mergeSession(completed);
+      clearSessionRebindFailure(canonicalSession);
+    }
     return response;
   } catch (error) {
+    if (acceptedResponse && await reconcileAcceptedRebind(canonicalSession, acceptedResponse, target)) {
+      clearSessionRebindFailure(canonicalSession);
+      renderAll();
+      return acceptedResponse;
+    }
+    if (!acceptedResponse && rebindFailureMayHaveLostAcceptedResponse(error)) {
+      const observedResponse = rebindResponseWithClientSelection(
+        await rebindResponseWasAccepted(
+          canonicalSession,
+          target,
+          expectation.expectedRunId,
+          selection
+        ),
+        selection
+      );
+      if (observedResponse) {
+        try {
+          if (requestOptions.waitForReady !== false) {
+            await waitForExplicitRebindCompletion(canonicalSession, observedResponse, target);
+          }
+          clearSessionRebindFailure(canonicalSession);
+          renderAll();
+          return observedResponse;
+        } catch (completionError) {
+          error = completionError;
+        }
+      }
+    }
+    recordSessionRebindFailure(canonicalSession, previousBinding, target, error);
+    error.rebindFailureRecorded = true;
     const latest = state.sessions.find((candidate) => getSessionKey(candidate) === expectation.sessionKey) || canonicalSession;
     const latestRunId = String(latest?.runId || latest?.activeRunId || latest?.runtimeConfig?.runId || '').trim();
     if (!latestRunId || latestRunId === expectation.expectedRunId) {
@@ -19733,6 +23971,33 @@ async function startTranscriptFallback(session) {
   return response;
 }
 
+function managedLaunchFailureMayHaveLostAcceptedResponse(error) {
+  const status = Number(error?.status);
+  return !Number.isInteger(status) || status < 400 || status >= 500;
+}
+
+async function fetchManagedLaunchWithRetry(hostId, body, onRetry = null) {
+  const url = `/api/hosts/${encodeURIComponent(hostId)}/sessions/start`;
+  try {
+    return await fetchJson(url, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    if (!managedLaunchFailureMayHaveLostAcceptedResponse(error)) {
+      throw error;
+    }
+    if (typeof onRetry === 'function') {
+      onRetry();
+    }
+    await delay(150);
+    return fetchJson(url, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+}
+
 async function startManagedSession(options = {}) {
   let sourceSession = Object.prototype.hasOwnProperty.call(options, 'session')
     ? options.session
@@ -19756,10 +24021,18 @@ async function startManagedSession(options = {}) {
     return null;
   }
 
-  const launchBusyId = makeClientId();
+  const launchIntentKey = sessionLaunchIntentKey({ hostId, cwd, launchMode, sourceSession });
+  const existingLaunch = getSessionLaunchBusyForIntent(launchIntentKey);
+  if (existingLaunch) {
+    updateSessionLaunchBusy(existingLaunch.id, { duplicateAttemptedAt: new Date().toISOString() });
+    return null;
+  }
+
+  const launchBusyId = options.clientRequestId || makeClientId();
   const sourceSessionKey = getSessionKey(sourceSession);
   setSessionLaunchBusy({
     id: launchBusyId,
+    intentKey: launchIntentKey,
     hostId,
     sessionId: sourceSession?.sessionId || null,
     sourceSessionId: sourceSession?.sessionId || null,
@@ -19788,16 +24061,20 @@ async function startManagedSession(options = {}) {
       }
     }
 
-    const body = {
-      cwd,
-      label: label || cwd,
-      launchMode,
-      ...(sourceSession && launchMode !== 'fresh' ? sessionSelectionRequestBody(sourceSession) : {}),
-    };
     const { apiConfig } = resolveLaunchApiConfig({
       hostId,
       sourceSession: launchMode === 'fresh' ? null : sourceSession,
     });
+    const freshSelection = launchMode === 'fresh'
+      ? resolveFreshSessionSelection(hostId, options, apiConfig)
+      : {};
+    const body = {
+      clientRequestId: launchBusyId,
+      cwd,
+      label: label || cwd,
+      launchMode,
+      ...(sourceSession && launchMode !== 'fresh' ? sessionSelectionRequestBody(sourceSession) : freshSelection),
+    };
     if (apiConfig) {
       body.apiConfig = apiConfig;
     }
@@ -19816,9 +24093,8 @@ async function startManagedSession(options = {}) {
       body.nativeThreadId = sourceSession.nativeThreadId || sourceSession.sessionId;
     }
 
-    const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/sessions/start`, {
-      method: 'POST',
-      body: JSON.stringify(body),
+    const response = await fetchManagedLaunchWithRetry(hostId, body, () => {
+      updateSessionLaunchBusy(launchBusyId, { stage: 'retrying-accepted-start' });
     });
     updateSessionLaunchBusy(launchBusyId, {
       stage: 'waiting-live-session',
@@ -19848,8 +24124,22 @@ async function startManagedSession(options = {}) {
         nativeThreadId: response.nativeThreadId || body.nativeThreadId || response.sessionId,
         apiBinding: response.sessionBinding || sourceSession?.apiBinding || null,
         requestedSelection: response.requestedSelection || sourceSession?.requestedSelection || null,
+        codexOptions: normalizeComposerOptionValues({
+          ...(sourceSession?.codexOptions || {}),
+          model: body.model || '',
+          effort: body.effort || '',
+          effortMode: body.effort ? 'manual' : 'auto',
+          allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+          summary: body.summary || '',
+        }),
         apiProfile: apiConfig ? summarizeApiConfigForDisplay(apiConfig) : sourceSession?.apiProfile || null,
       }));
+      if (startingSession) {
+        const startingKey = getSessionKey(startingSession);
+        state.codexControls.sessionOptionsByKey.set(startingKey, normalizeComposerOptionValues(startingSession.codexOptions));
+        state.codexControls.persistedSessionOptionKeys.add(startingKey);
+        persistComposerSessionOptions();
+      }
       if (startingSession && options.selectAfterStart !== false) {
         state.selectedHostId = hostId;
         state.selectedConversationKey = getSessionConversationKey(startingSession);
@@ -19896,7 +24186,10 @@ async function startManagedSession(options = {}) {
       await selectSession(next);
     }
     if (next && (options.initialText || options.initialInputOptions?.inputItems?.length)) {
-      await sendInputToSession(next, options.initialText || '', options.initialInputOptions || {});
+      await sendInputToSession(next, options.initialText || '', {
+        ...getComposerOptionsForSession(next),
+        ...(options.initialInputOptions || {}),
+      });
     }
     return next;
   } catch (error) {
@@ -19925,6 +24218,14 @@ async function resumeFromHistory(options = {}) {
 
   if (session.live) {
     return session;
+  }
+
+  if (isEmptyManagedSessionShell(session)) {
+    throw new Error('This session closed before its first turn was saved. Start a new session from the same workspace instead.');
+  }
+
+  if (!confirmResumeAfterFailedRebind(session)) {
+    return null;
   }
 
   return startManagedSession({
@@ -20031,6 +24332,25 @@ function getActiveTurnBlocker(session) {
   return 'Codex is still working on the previous turn. Use Status to steer or interrupt it, then send the next prompt.';
 }
 
+function runtimeIssuePresentation(runtime = {}) {
+  const message = String(runtime.lastCodexError || '').trim();
+  if (!message) {
+    return null;
+  }
+
+  const terminalStates = new Set(['error', 'quota-exhausted', 'failed']);
+  const isTerminal = [runtime.phase, runtime.currentTurnStatus]
+    .some((value) => terminalStates.has(String(value || '').toLowerCase()));
+  const retryStates = new Set(['retrying', 'reconnecting']);
+  const isRetrying = !isTerminal && [runtime.phase, runtime.currentTurnStatus, runtime.connection]
+    .some((value) => retryStates.has(String(value || '').toLowerCase()));
+  return {
+    label: isRetrying ? 'Retry' : 'Error',
+    message,
+    tone: isRetrying ? 'warning' : 'error',
+  };
+}
+
 function runtimeIsActive(runtime = {}) {
   const phase = String(runtime.phase || '').toLowerCase();
   const activePhase = [
@@ -20083,6 +24403,7 @@ async function sendInputToSession(session, text, options = {}) {
 
   await verifyHostAvailable(session.hostId);
   assertModelSelectionIsSelectable(session, options.model);
+  assertEffortSelectionIsValid(session, options);
   const body = {
     hostId: session.hostId,
     clientRequestId: options.clientRequestId || null,
@@ -20094,6 +24415,7 @@ async function sendInputToSession(session, text, options = {}) {
     mode: options.mode || null,
     model: options.model || null,
     effort: options.effort || null,
+    allowUnverifiedEffort: options.allowUnverifiedEffort === true,
     summary: options.summary || null,
     approvalPolicy: options.approvalPolicy || null,
     approvalsReviewer: options.approvalsReviewer || null,
@@ -20104,7 +24426,7 @@ async function sendInputToSession(session, text, options = {}) {
   };
 
   try {
-    await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
+    return await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
       method: 'POST',
       body: JSON.stringify(body),
     });
@@ -20119,7 +24441,7 @@ async function sendInputToSession(session, text, options = {}) {
 
 async function sendInput(session, text, options = {}) {
   if (!session) {
-    return;
+    return false;
   }
 
   if (isManagedSessionStarting(session)) {
@@ -20131,19 +24453,19 @@ async function sendInput(session, text, options = {}) {
 
   if (!session.live) {
     if (!session.cwd) {
-      reportError(new Error('This history session does not have a workspace path to activate.'));
-      return;
+      throw new Error('This history session does not have a workspace path to activate.');
     }
-    await resumeFromHistory({ session, initialText: text, initialInputOptions: options });
-    return;
+    const resumed = await resumeFromHistory({ session, initialText: text, initialInputOptions: options });
+    return Boolean(resumed);
   }
 
   await sendInputToSession(session, text, options);
+  return true;
 }
 
-async function submitComposerPayload(session, payload, input) {
+async function submitComposerPayload(session, payload) {
   if (!session) {
-    return;
+    return { accepted: false, trackActiveDraft: false };
   }
 
   if (session.live && runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
@@ -20154,25 +24476,16 @@ async function submitComposerPayload(session, payload, input) {
     }
     addSteerQueueItem(session, payload, queuedText || payload.displayText || 'Please inspect the attached file(s).');
     state.codexControls.steerNotice = null;
-    if (input) {
-      input.value = '';
-    }
-    clearComposerFileAttachments();
     renderComposerTurnNotice();
-    return;
+    return { accepted: true, trackActiveDraft: false };
   }
 
   const wasLive = Boolean(session.live);
-  await sendInput(session, payload.text, payload);
-  if (wasLive) {
-    setActiveDraftForSession(session, payload);
-  }
+  const accepted = await sendInput(session, payload.text, payload);
+  if (!accepted) return { accepted: false, trackActiveDraft: false };
   state.codexControls.steerNotice = null;
-  if (input) {
-    input.value = '';
-  }
-  clearComposerFileAttachments();
   renderComposerTurnNotice();
+  return { accepted: true, trackActiveDraft: wasLive };
 }
 
 async function submitComposerInput(input = el('input-text')) {
@@ -20196,36 +24509,34 @@ async function submitComposerInput(input = el('input-text')) {
     draft,
     startedAt: new Date().toISOString(),
   };
+  setComposerDraftForSessionKey(submission.sessionKey, draft);
   setComposerSubmission(submission);
 
-  let payload = null;
-  let clearedText = false;
-  let clearedAttachments = false;
   try {
-    if (input.value) {
-      input.value = '';
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      clearedText = true;
-    }
-
-    payload = await buildComposerPayload(session, draft.text, { clientRequestId: submission.id });
+    const payload = await buildComposerPayload(
+      session,
+      draft.text,
+      { clientRequestId: submission.id },
+      draft
+    );
     if (!payload.text && !payload.inputItems.length) {
       return;
     }
-
-    clearComposerFileAttachments();
-    clearedAttachments = true;
-
-    await submitComposerPayload(session, payload, input);
+    const result = await submitComposerPayload(session, payload);
+    if (!result?.accepted) return;
+    if (result.trackActiveDraft) {
+      setActiveDraftForSessionKey(submission.sessionKey, payload);
+    }
+    clearComposerDraftForSessionKey(submission.sessionKey);
     state.codexControls.recentSubmissions.delete(submission.signature);
   } catch (error) {
-    if (clearedText || clearedAttachments) {
-      const draftToRestore = payload?.composerDraft || submission.draft;
-      if (getSessionKey(getSelectedSession()) === submission.sessionKey) {
-        restoreComposerDraft(draftToRestore, { replace: true });
-      } else {
-        stashPendingComposerDraftForSession(submission.sessionKey, draftToRestore);
-      }
+    const recoveryKey = resolveComposerSessionKey(submission.sessionKey);
+    if (resolveComposerSessionKey(getSessionKey(getSelectedSession())) === recoveryKey) {
+      applyMountedComposerDraft(recoveryKey, submission.draft);
+      setComposerDraftForSessionKey(recoveryKey, submission.draft);
+    } else {
+      setComposerDraftForSessionKey(recoveryKey, submission.draft);
+      stashPendingComposerDraftForSession(recoveryKey, submission.draft);
     }
     throw error;
   } finally {
@@ -20506,127 +24817,30 @@ async function loadModelOptionsForSession(session, options = {}) {
   }
 
   state.codexControls.modelOptionsLoadingKeys.add(key);
+  state.codexControls.modelOptionsErrorsByKey.delete(key);
   state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
   renderSessionDetails();
   try {
     let response;
     if (refresh) {
       await verifyHostAvailable(session.hostId);
-      const launchApi = resolveLaunchApiConfig({ hostId: session.hostId, sourceSession: session });
-      const body = { hostId: session.hostId };
-      if (launchApi.apiConfig) {
-        body.apiConfig = launchApi.apiConfig;
-      }
       response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models/refresh`, {
         method: 'POST',
-        body: JSON.stringify(body),
+        body: JSON.stringify({ hostId: session.hostId }),
       });
     } else {
       response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/models?hostId=${encodeURIComponent(session.hostId)}`);
     }
-    return applyModelCatalogResponse(request, response);
+    const catalog = applyModelCatalogResponse(request, response);
+    if (!catalog && refresh) {
+      throw new Error('The Session runtime changed while models were loading. Retry the refresh.');
+    }
+    return catalog;
+  } catch (error) {
+    state.codexControls.modelOptionsErrorsByKey.set(key, normalizeModelCatalogError(error?.message));
+    throw error;
   } finally {
     state.codexControls.modelOptionsLoadingKeys.delete(key);
-    state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
-    renderSessionDetails();
-  }
-}
-
-async function loadRebindProfileModelOptions(session) {
-  if (!canPreviewRebindModels(session)) {
-    throw sessionContractError(
-      'session_api_binding_unavailable',
-      'Choose an API profile before loading models for Rebind.',
-      { canRebind: true }
-    );
-  }
-
-  const profileId = selectedRebindProfileId(session);
-  const profile = getSelectedRebindProfile(session);
-  const request = {
-    key: rebindModelPreviewKey(session),
-    sessionKey: getSessionKey(session),
-    hostId: String(session.hostId || ''),
-    sessionId: String(session.sessionId || ''),
-    runId: modelCatalogRunId(session),
-    profileId,
-    profileIdentity: rebindProfilePreviewIdentity(profile),
-  };
-  if (state.codexControls.modelOptionsLoadingKeys.has(request.key)) {
-    return state.codexControls.modelCatalogByKey.get(request.key) || null;
-  }
-
-  const { apiConfig } = resolveLaunchApiConfig({
-    hostId: request.hostId,
-    sourceSession: session,
-    explicitProfileId: profileId,
-  });
-  state.codexControls.modelOptionsLoadingKeys.add(request.key);
-  state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
-  renderSessionDetails();
-  try {
-    await verifyHostAvailable(request.hostId);
-    const response = await fetchJson(`/api/hosts/${encodeURIComponent(request.hostId)}/api-test`, {
-      method: 'POST',
-      body: JSON.stringify({ apiConfig }),
-    });
-    const current = state.sessions.find((candidate) => getSessionKey(candidate) === request.sessionKey) || null;
-    if (
-      !current
-      || rebindModelPreviewKey(current) !== request.key
-      || selectedRebindProfileId(current) !== request.profileId
-      || rebindProfilePreviewIdentity(getSelectedRebindProfile(current)) !== request.profileIdentity
-    ) {
-      return null;
-    }
-    const result = response?.result || null;
-    if (!result?.ok) {
-      throw new Error(result?.error || result?.message || 'The selected API profile could not list models.');
-    }
-    const page = result.modelPage;
-    if (!page || !Array.isArray(page.models)) {
-      throw new Error('The selected API returned no recognizable model catalog.');
-    }
-    const fetchedAt = response.timestamp || result.testedAt || new Date().toISOString();
-    const source = {
-      source: 'provider',
-      authority: page.authority || 'authoritative',
-      complete: page.complete === true,
-      truncated: page.truncated === true,
-      nextCursor: page.nextCursor || null,
-      stale: false,
-      error: null,
-      fetchedAt,
-    };
-    const catalog = {
-      hostId: request.hostId,
-      sessionId: request.sessionId,
-      runId: request.runId,
-      previewProfileId: request.profileId,
-      previewProfileIdentity: request.profileIdentity,
-      cacheState: 'profile preview',
-      fetchedAt,
-      models: page.models
-        .map((model) => String(model?.id || model?.model || '').trim())
-        .filter(Boolean)
-        .map((id) => ({
-          id,
-          displayName: id,
-          reasoningLevels: [],
-          capabilityKnown: false,
-          selectable: true,
-          availability: 'available',
-          cliSupported: 'unknown',
-          providerAdvertised: true,
-          visible: true,
-        })),
-      sources: [source],
-    };
-    state.codexControls.modelCatalogByKey.set(request.key, catalog);
-    state.codexControls.modelOptionsRetryAfterBySession.delete(request.key);
-    return catalog;
-  } finally {
-    state.codexControls.modelOptionsLoadingKeys.delete(request.key);
     state.codexControls.modelsLoading = state.codexControls.modelOptionsLoadingKeys.size > 0;
     renderSessionDetails();
   }
@@ -20651,12 +24865,13 @@ function requestModelOptionsForSession(session) {
   });
 }
 
-async function loadModelOptionsForSelectedSession() {
+async function refreshCurrentModelOptionsForSelectedSession() {
   const session = getSelectedSession();
-  if (canPreviewRebindModels(session)) {
-    return loadRebindProfileModelOptions(session);
-  }
   return loadModelOptionsForSession(session, { force: true, refresh: true });
+}
+
+async function refreshVisibleModelOptionsForSelectedSession() {
+  return refreshCurrentModelOptionsForSelectedSession();
 }
 
 async function loadSkillOptionsForSession(session, options = {}) {
@@ -21004,6 +25219,7 @@ el('clear-api-key-button').addEventListener('click', () => {
   }
   profile.apiKey = '';
   profile.rememberApiKey = false;
+  clearApiProfileModelState(profile.profileId);
   el('settings-api-key').value = '';
   if (el('settings-api-key-remember')) {
     el('settings-api-key-remember').checked = false;
@@ -21015,6 +25231,32 @@ el('settings-api-profile-select').addEventListener('change', (event) => {
   saveActiveApiProfileFromSettingsForm();
   state.ui.selectedApiProfileId = event.target.value;
   populateSettingsForm();
+});
+
+el('settings-api-provider-kind')?.addEventListener('change', () => {
+  const kind = el('settings-api-provider-kind').value;
+  if (kind !== 'custom') {
+    el('settings-api-provider').value = canonicalProviderLabel(kind);
+  }
+  renderApiProviderEditorState();
+});
+
+for (const id of ['settings-api-provider', 'settings-api-base-url', 'settings-api-key']) {
+  el(id)?.addEventListener('input', () => {
+    renderApiProviderEditorState();
+  });
+}
+
+el('settings-api-apply-suggested-base-url-button')?.addEventListener('click', () => {
+  applySuggestedApiProfileBaseUrl().catch(reportError);
+});
+
+el('apply-current-session-to-live-button')?.addEventListener('click', () => {
+  try {
+    openApplyCurrentSessionSettingsDialog(getSelectedSession());
+  } catch (error) {
+    reportError(error);
+  }
 });
 
 el('settings-theme-select').addEventListener('change', (event) => {
@@ -21040,6 +25282,8 @@ el('settings-add-api-profile-button').addEventListener('click', () => {
     profileId: makeApiProfileId(),
     label: `API Profile ${getApiProfiles().length + 1}`,
     provider: 'OpenAI',
+    providerKind: 'openai',
+    sessionDefaults: normalizeSessionDefaults(),
   }, getApiProfiles().length);
   state.ui.apiProfiles.push(next);
   state.ui.selectedApiProfileId = next.profileId;
@@ -21067,6 +25311,7 @@ el('settings-delete-api-profile-button').addEventListener('click', () => {
     return;
   }
   state.ui.apiProfiles = profiles.filter((profile) => profile.profileId !== deletedId);
+  clearApiProfileModelState(deletedId);
   if (state.ui.defaultApiProfileId === deletedId) {
     state.ui.defaultApiProfileId = state.ui.apiProfiles[0]?.profileId || 'default';
   }
@@ -21113,7 +25358,12 @@ el('settings-form').addEventListener('submit', (event) => {
   state.ui.locale = el('settings-language-select').value === 'en' ? 'en' : 'zh-CN';
   state.ui.theme = el('settings-theme-select').value === 'dark-tech' ? 'dark-tech' : 'minimal-light';
   state.ui.optimizeSpeedMode = el('settings-optimize-speed-mode').checked;
-  saveActiveApiProfileFromSettingsForm();
+  try {
+    saveActiveApiProfileFromSettingsForm({ validate: true });
+  } catch (error) {
+    reportError(error);
+    return;
+  }
   state.ui.defaultApiProfileId = el('settings-default-api-profile').value || getApiProfiles()[0]?.profileId || 'default';
   for (const select of el('settings-host-api-list').querySelectorAll('[data-host-api-profile-host]')) {
     const hostId = select.dataset.hostApiProfileHost;
@@ -21313,10 +25563,28 @@ el('session-action-select-all-checkbox')?.addEventListener('change', (event) => 
     }
   }
   state.sessionActionDialog.selectedKeys = next;
+  if (state.sessionActionDialog.mode === 'rebind-profile') {
+    state.sessionActionDialog.phase = 'select';
+    state.sessionActionDialog.resultsByKey = new Map();
+  }
   renderSessionActionDialog();
 });
 
 el('session-action-dialog-list')?.addEventListener('change', (event) => {
+  const hostCheckbox = event.target.closest('[data-session-action-host]');
+  if (hostCheckbox) {
+    const hostId = hostCheckbox.dataset.sessionActionHost;
+    for (const session of state.sessionActionDialog.sessions || []) {
+      if (session.hostId !== hostId) continue;
+      const key = getSessionKey(session);
+      if (hostCheckbox.checked) state.sessionActionDialog.selectedKeys.add(key);
+      else state.sessionActionDialog.selectedKeys.delete(key);
+    }
+    state.sessionActionDialog.phase = 'select';
+    state.sessionActionDialog.resultsByKey = new Map();
+    renderSessionActionDialog();
+    return;
+  }
   const checkbox = event.target.closest('[data-session-action-key]');
   if (!checkbox) {
     return;
@@ -21327,7 +25595,19 @@ el('session-action-dialog-list')?.addEventListener('change', (event) => {
   } else {
     state.sessionActionDialog.selectedKeys.delete(key);
   }
+  if (state.sessionActionDialog.mode === 'rebind-profile') {
+    state.sessionActionDialog.phase = 'select';
+    state.sessionActionDialog.resultsByKey = new Map();
+  }
   renderSessionActionDialog();
+});
+
+el('session-action-dialog-preflight-button')?.addEventListener('click', async () => {
+  try {
+    await preflightSessionActionDialog();
+  } catch (error) {
+    reportError(error);
+  }
 });
 
 el('session-action-dialog-confirm-button')?.addEventListener('click', async () => {
@@ -21521,10 +25801,25 @@ el('export-dialog-confirm-button')?.addEventListener('click', () => {
 document.addEventListener('visibilitychange', () => {
   state.messageDocumentVisible = document.visibilityState === 'visible';
   if (document.visibilityState === 'visible') {
+    const hiddenForMs = state.sessionWatchHiddenAt
+      ? Math.max(0, Date.now() - state.sessionWatchHiddenAt)
+      : 0;
+    state.sessionWatchHiddenAt = 0;
+    if (hiddenForMs >= SESSION_WATCH_RENEW_MS * 2) {
+      state.sessionWatchCatchUpRequired = true;
+    }
     void maybeAdvanceReadReceipt(getSelectedSession());
     void requestMessageNotificationOutboxDrain();
     resumeSelectedSessionRealtime().catch(reportError);
+  } else {
+    state.sessionWatchHiddenAt = Date.now();
   }
+});
+
+window.addEventListener('pagehide', () => {
+  state.sessionWatchCatchUpRequired = true;
+  closeStream();
+  void releaseSelectedSessionWatchNow();
 });
 
 window.addEventListener('pageshow', () => {
@@ -22373,7 +26668,7 @@ el('picker-select-button').addEventListener('click', () => {
 
 el('codex-model-refresh-button').addEventListener('click', async () => {
   try {
-    await loadModelOptionsForSelectedSession();
+    await refreshVisibleModelOptionsForSelectedSession();
   } catch (error) {
     reportError(error);
   }
@@ -22384,45 +26679,15 @@ el('session-api-rebind-button')?.addEventListener('click', async () => {
   if (!session || isSessionApiRebindBusy(session)) {
     return;
   }
-  const targetProfile = String(el('session-api-rebind-select')?.value || '__host_environment__');
-  rememberRebindTarget(session, targetProfile);
-  let selectionSnapshot;
-  let apiConfigSnapshot;
-  try {
-    if (targetProfile !== '__host_environment__') {
-      ({ apiConfig: apiConfigSnapshot } = resolveLaunchApiConfig({
-        hostId: session.hostId,
-        sourceSession: session,
-        explicitProfileId: targetProfile,
-      }));
-      apiConfigSnapshot = apiConfigSnapshot ? { ...apiConfigSnapshot } : null;
-    } else {
-      apiConfigSnapshot = null;
-    }
-    selectionSnapshot = sessionSelectionRequestBody(session);
-  } catch (error) {
-    reportError(error);
-    return;
-  }
-  setSessionApiRebindBusy(session, true);
-  renderSessionDetails();
-  try {
-    await rebindSessionApi(session, targetProfile, selectionSnapshot, apiConfigSnapshot);
-  } catch (error) {
-    reportError(error);
-  } finally {
-    setSessionApiRebindBusy(session, false);
-    renderSessionDetails();
-  }
+  await switchSessionApiFromComposer(session, sessionApiControlValue(session), { force: true });
 });
 
-el('session-api-rebind-select')?.addEventListener('change', () => {
+el('session-api-rebind-select')?.addEventListener('change', async (event) => {
   const session = getSelectedSession();
   if (!session) {
     return;
   }
-  rememberRebindTarget(session, el('session-api-rebind-select')?.value || '__host_environment__');
-  renderSessionDetails();
+  await switchSessionApiFromComposer(session, event.target.value || '__host_environment__');
 });
 
 el('session-transcript-fallback-button')?.addEventListener('click', async () => {
@@ -22454,9 +26719,11 @@ el('codex-model-select').addEventListener('change', () => {
 
 el('codex-model-input').addEventListener('input', () => {
   const session = getSelectedSession();
+  setSessionApiSwitchNotice(session);
   syncModelSelectFromInput(session);
   renderReasoningEffortOptions(session);
   saveComposerOptionsFromControls(session);
+  renderSessionApiControls(session);
 });
 
 [
@@ -22469,7 +26736,14 @@ el('codex-model-input').addEventListener('input', () => {
   'codex-personality-select',
 ].forEach((id) => {
   el(id).addEventListener('change', () => {
+    if (id === 'codex-effort-select') {
+      setSessionApiSwitchNotice(getSelectedSession());
+      renderManualEffortControlState(getSelectedSession());
+    }
     saveComposerOptionsFromControls();
+    if (id === 'codex-effort-select' || id === 'codex-summary-select') {
+      renderSessionApiControls(getSelectedSession());
+    }
     if (id === 'codex-mode-select') {
       renderComposerModeBanner();
     }
@@ -22477,6 +26751,19 @@ el('codex-model-input').addEventListener('input', () => {
       renderComposerTurnNotice();
     }
   });
+});
+
+el('codex-effort-manual-input')?.addEventListener('input', () => {
+  setSessionApiSwitchNotice(getSelectedSession());
+  saveComposerOptionsFromControls();
+  renderSessionApiControls(getSelectedSession());
+  renderComposerTurnNotice();
+});
+
+el('codex-effort-unverified-checkbox')?.addEventListener('change', () => {
+  setSessionApiSwitchNotice(getSelectedSession());
+  saveComposerOptionsFromControls();
+  renderComposerTurnNotice();
 });
 
 el('codex-file-picker-button').addEventListener('click', () => {
@@ -22589,8 +26876,9 @@ el('history-import-dialog-confirm-button')?.addEventListener('click', async () =
 });
 
 el('codex-image-files').addEventListener('change', async (event) => {
+  const composerSessionKey = getMountedComposerSessionKey();
   try {
-    await addComposerFiles(event.target.files);
+    await addComposerFiles(event.target.files, composerSessionKey);
   } catch (error) {
     reportError(error);
   } finally {
@@ -22738,6 +27026,7 @@ el('input-text').addEventListener('keydown', (event) => {
 });
 
 el('input-text').addEventListener('input', () => {
+  rememberMountedComposerDraft();
   updateSlashMenuFromInput();
 });
 

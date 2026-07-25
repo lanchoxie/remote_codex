@@ -150,35 +150,27 @@
         <section class="settings-section session-defaults-section">
           <div>
             <div class="settings-section-title" data-i18n-key="settings.sessionDefaultsTitle">Selected Session</div>
-            <div class="settings-section-copy" data-i18n-key="settings.sessionDefaultsCopy">Model and runtime controls target the selected Session. The browser default below is used only for new Sessions.</div>
+            <div class="settings-section-copy" data-i18n-key="settings.sessionDefaultsCopy">Review the selected Session binding and configure advanced run settings.</div>
           </div>
           <div class="session-api-context" role="group" aria-label="Session API and models">
             <div><span>Session API</span><strong id="session-api-binding-label">Unknown</strong></div>
-            <div><span>New Session default (this browser)</span><strong id="session-host-default-label">Not configured</strong></div>
-            <div><span>Model catalog</span><strong id="session-catalog-status">Not loaded</strong></div>
-            <div class="session-api-actions">
-              <select id="session-api-rebind-select" aria-label="API profile for explicit Session rebind"></select>
-              <button id="session-api-rebind-button" type="button" class="secondary-button">Rebind and resume</button>
+            <div><span id="session-catalog-label">Session models</span><strong id="session-catalog-status">Not loaded</strong></div>
+            <div class="session-api-actions selected-session-recovery-actions">
               <button id="session-transcript-fallback-button" type="button" class="secondary-button hidden">Start transcript fallback</button>
             </div>
+            <div id="session-rebind-settings-summary" class="session-rebind-settings-summary" aria-live="polite"></div>
           </div>
           <div class="composer-control-grid settings-control-grid">
-            <input id="codex-model-input" type="hidden" autocomplete="off" />
-            <datalist id="codex-model-options"></datalist>
-            <select id="codex-model-select" aria-label="Supported model">
-              <option value="">Model: auto/default</option>
-            </select>
-            <button id="codex-model-refresh-button" type="button" class="secondary-button">Models</button>
-            <select id="codex-effort-select" aria-label="Reasoning effort">
-              <option value="">Auto / model default</option>
-            </select>
-            <select id="codex-summary-select" aria-label="Reasoning summary">
-              <option value="">Summary: default</option>
-              <option value="auto">Auto summary</option>
-              <option value="concise">Concise</option>
-              <option value="detailed">Detailed</option>
-              <option value="none">No summary</option>
-            </select>
+            <label class="session-control-field">
+              <span>Reasoning summary</span>
+              <select id="codex-summary-select" aria-label="Reasoning summary">
+                <option value="">Summary: default</option>
+                <option value="auto">Auto summary</option>
+                <option value="concise">Concise</option>
+                <option value="detailed">Detailed</option>
+                <option value="none">No summary</option>
+              </select>
+            </label>
             <select id="codex-mode-select" aria-label="Send mode">
               <option value="default">Default mode</option>
               <option value="plan">Plan only</option>
@@ -205,6 +197,9 @@
               <option value="none">None</option>
             </select>
           </div>
+          <div class="settings-inline-actions selected-session-actions">
+            <button id="apply-current-session-to-live-button" type="button" class="secondary-button" data-i18n-key="settings.applyCurrentSessionToLive">Apply current Session settings to other live Sessions</button>
+          </div>
         </section>
 
         <section class="settings-section api-settings-section">
@@ -226,8 +221,17 @@
               <input id="settings-api-profile-label" placeholder="OpenAI main, HPC proxy, lab key..." autocomplete="off" />
             </label>
             <label>
-              <span data-i18n-key="settings.apiProvider">Provider label</span>
-              <input id="settings-api-provider" placeholder="OpenAI or compatible provider" autocomplete="off" />
+              <span data-i18n-key="settings.apiProvider">Provider</span>
+              <select id="settings-api-provider-kind">
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="gemini">Gemini</option>
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+            <label id="settings-api-custom-provider-row" class="hidden">
+              <span>Custom provider label</span>
+              <input id="settings-api-provider" placeholder="OpenAI-compatible, Azure, lab proxy..." autocomplete="off" />
             </label>
             <label>
               <span data-i18n-key="settings.api-base-url">Base URL</span>
@@ -238,6 +242,11 @@
               <input id="settings-api-key" type="password" placeholder="sk-..." autocomplete="off" />
             </label>
           </div>
+          <div id="settings-provider-capability-status" class="settings-warning"></div>
+          <div class="settings-inline-actions api-base-url-suggestion-actions">
+            <button id="settings-api-apply-suggested-base-url-button" type="button" class="secondary-button hidden" data-i18n-key="settings.useDetectedV1">Use detected /v1</button>
+          </div>
+          <div id="settings-api-model-catalog-status" class="settings-warning hidden" aria-live="polite"></div>
           <div class="settings-warning" data-i18n-key="settings.apiRestartTip">Host mappings are defaults for new Sessions only. Existing Sessions keep their run binding; use Session Rebind to change provider or Base URL.</div>
           <div class="settings-profile-toolbar">
             <label>
@@ -351,9 +360,10 @@
               </div>
               <input id="new-session-label" placeholder="Optional conversation title" />
               <div class="inline-actions">
-                <button type="submit">New In Directory</button>
+                <button id="new-session-submit-button" type="submit">New In Directory</button>
                 <button id="use-selected-path-button" type="button" class="secondary-button">Use Selected Path</button>
               </div>
+              <div id="new-session-status" class="meta hidden" role="status" aria-live="polite"></div>
             </form>
           </div>
 
@@ -580,6 +590,42 @@
               <div class="composer-input-wrap">
                 <textarea id="input-text" rows="3" placeholder="Send a follow-up prompt to the live managed session..."></textarea>
                 <div id="slash-command-menu" class="slash-command-menu hidden" role="listbox" aria-label="Slash commands"></div>
+                <div class="composer-session-toolbar" role="group" aria-label="Session API and next turn settings">
+                  <div id="composer-session-selection-status" class="composer-session-selection-status" aria-live="polite">Select a Session to configure its runtime.</div>
+                  <div class="composer-session-control-fields">
+                    <label class="composer-session-control composer-api-control">
+                      <span>API</span>
+                      <div class="composer-session-select-with-action">
+                        <select id="session-api-rebind-select" aria-label="Current Session API profile"></select>
+                        <button id="session-api-rebind-button" type="button" class="secondary-button composer-control-icon-button" aria-label="Restart Session with the current API profile" title="Restart Session with the current API profile">&#8635;</button>
+                      </div>
+                    </label>
+                    <label class="composer-session-control composer-model-control">
+                      <span>Next model</span>
+                      <input id="codex-model-input" type="hidden" autocomplete="off" />
+                      <datalist id="codex-model-options"></datalist>
+                      <div class="composer-session-select-with-action">
+                        <select id="codex-model-select" aria-label="Model for the next turn">
+                          <option value="">Model: auto/default</option>
+                        </select>
+                        <button id="codex-model-refresh-button" type="button" class="secondary-button composer-control-icon-button" aria-label="Refresh current Session models" title="Refresh current Session models">&#8635;</button>
+                      </div>
+                    </label>
+                    <label class="composer-session-control composer-effort-control">
+                      <span>Next thinking</span>
+                      <select id="codex-effort-select" aria-label="Reasoning effort for the next turn">
+                        <option value="">Auto / model default</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div id="composer-manual-effort-controls" class="composer-manual-effort-controls">
+                    <input id="codex-effort-manual-input" class="hidden" aria-label="Manual reasoning effort" placeholder="Custom effort, e.g. high" autocomplete="off" />
+                    <label id="codex-effort-unverified-row" class="settings-checkbox compact hidden">
+                      <input id="codex-effort-unverified-checkbox" type="checkbox" />
+                      <span>Allow unverified effort</span>
+                    </label>
+                  </div>
+                </div>
               </div>
               <div class="composer-action-stack">
                 <button id="codex-plan-button" type="button" class="secondary-button" aria-pressed="false">Plan</button>
@@ -797,10 +843,13 @@
           <input id="session-action-select-all-checkbox" type="checkbox" />
           <span>Select all visible sessions</span>
         </label>
+        <div id="session-action-dialog-profile" class="choice-summary hidden"></div>
+        <div id="session-action-dialog-results" class="choice-summary hidden" aria-live="polite"></div>
         <div id="session-action-dialog-list" class="choice-session-list"></div>
         <div id="session-action-dialog-empty" class="empty-state hidden">No sessions need action.</div>
         <div class="choice-dialog-actions">
           <button id="session-action-dialog-cancel-button" type="button" class="secondary-button">Cancel</button>
+          <button id="session-action-dialog-preflight-button" type="button" class="secondary-button hidden">Preflight selected</button>
           <button id="session-action-dialog-confirm-button" type="button" class="danger-button">Apply</button>
         </div>
       </section>
@@ -1100,9 +1149,12 @@
     <script src="/vendor/markdown-it-14.1.0.min.js"></script>
     <script src="/vendor/dompurify-3.2.6.min.js"></script>
     <script src="/markdown-renderer.js"></script>
+    <script src="/thinking-entry-model.js"></script>
     <script src="/transcript-state.js"></script>
     <script src="/transcript-scroll.js"></script>
     <script src="/message-notification-client.js"></script>
+    <script src="/session-watch-controller.js"></script>
+    <script src="/provider-capabilities.js"></script>
     <script src="/api-profile-backup.js"></script>
     <script src="/app.js"></script>
   </body>

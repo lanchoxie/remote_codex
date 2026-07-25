@@ -10,6 +10,11 @@
   const OUTBOX_SCHEMA_VERSION = 1;
   const OUTBOX_DRAIN_BATCH_SIZE = 50;
   const DEFAULT_PRESENTED_OUTBOX_LIMIT = 1000;
+  const DEFAULT_PENDING_OUTBOX_LIMIT = 2000;
+  const DEFAULT_OUTBOX_BYTE_LIMIT = 512 * 1024;
+  const QUOTA_RETRY_PENDING_LIMIT = 100;
+  const QUOTA_RETRY_BYTE_LIMIT = 64 * 1024;
+  const OUTBOX_PREVIEW_TEXT_LIMIT = 280;
   const DEFAULT_PRESENTED_OUTBOX_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
   function text(value) {
@@ -19,6 +24,40 @@
   function sequence(value) {
     const number = Number(value);
     return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+  }
+
+  function limitedText(value, limit) {
+    return text(value).slice(0, limit);
+  }
+
+  function isQuotaExceededError(error) {
+    const name = text(error?.name).toLowerCase();
+    const message = text(error?.message).toLowerCase();
+    return name === 'quotaexceedederror'
+      || name === 'ns_error_dom_quota_reached'
+      || Number(error?.code) === 22
+      || Number(error?.code) === 1014
+      || (message.includes('storage') && message.includes('quota'))
+      || message.includes('exceeded the quota');
+  }
+
+  function serializedByteLength(value) {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  }
+
+  function serializedOutboxEntryByteLength(id, item) {
+    return serializedByteLength(id) + 1 + serializedByteLength(item);
+  }
+
+  function serializedOutboxByteLength(items) {
+    let total = serializedByteLength({ version: OUTBOX_SCHEMA_VERSION, items: {} });
+    let count = 0;
+    for (const [id, item] of Object.entries(items)) {
+      if (count > 0) total += 1;
+      total += serializedOutboxEntryByteLength(id, item);
+      count += 1;
+    }
+    return total;
   }
 
   function unique(values) {
@@ -559,12 +598,14 @@
       this.runExclusive = options.runExclusive || null;
       this.onLockUnavailable = options.onLockUnavailable || (() => {});
       this.onPersistError = options.onPersistError || (() => {});
+      this.onPersistenceDisabled = options.onPersistenceDisabled || (() => {});
       this.now = options.now || (() => new Date().toISOString());
       this.receipts = new Map();
       this.dirty = false;
       this.batchDepth = 0;
       this.persistPromise = null;
       this.persistAgainRequested = false;
+      this.persistenceDisabled = false;
       try {
         const loaded = this.load();
         const parsed = typeof loaded === 'string'
@@ -680,9 +721,13 @@
     }
 
     reload() {
-      if (this.dirty) return this.values();
+      if (this.dirty || this.persistenceDisabled) return this.values();
       this.receipts = this.readDurable();
       return this.values();
+    }
+
+    isPersistenceDisabled() {
+      return this.persistenceDisabled;
     }
 
     persist() {
@@ -699,6 +744,10 @@
 
     persistUnlocked() {
       if (!this.dirty) return false;
+      if (this.persistenceDisabled) {
+        this.dirty = false;
+        return false;
+      }
       const durable = this.readDurable({ strict: true });
       for (const [key, stored] of durable.entries()) {
         const local = this.receipts.get(key);
@@ -751,10 +800,22 @@
           updatedAt: localUpdated >= storedUpdated ? local.updatedAt : stored.updatedAt,
         });
       }
-      this.save(JSON.stringify({
-        version: RECEIPT_SCHEMA_VERSION,
-        receipts: Object.fromEntries(this.receipts),
-      }));
+      try {
+        this.save(JSON.stringify({
+          version: RECEIPT_SCHEMA_VERSION,
+          receipts: Object.fromEntries(this.receipts),
+        }));
+      } catch (error) {
+        if (!isQuotaExceededError(error)) throw error;
+        this.persistenceDisabled = true;
+        this.dirty = false;
+        try {
+          this.onPersistenceDisabled(error);
+        } catch {
+          // Storage diagnostics must not break in-memory receipt tracking.
+        }
+        return false;
+      }
       this.dirty = false;
       try {
         this.onPersist();
@@ -778,14 +839,43 @@
     return `assistant-alert:${stableHash(`${canonicalConversationKey}\0${assistantMessageId}`)}`;
   }
 
+  function normalizeOutboxItem(value, alertId, now) {
+    if (!value || typeof value !== 'object') return null;
+    const canonicalConversationKey = limitedText(value.canonicalConversationKey, 512);
+    const assistantMessageId = limitedText(value.assistantMessageId, 512);
+    if (!canonicalConversationKey || !assistantMessageId || !alertId) return null;
+    return {
+      alertId,
+      canonicalConversationKey,
+      assistantMessageId,
+      assistantSeq: sequence(value.assistantSeq),
+      assistantAt: limitedText(value.assistantAt, 64),
+      previewText: limitedText(value.previewText, OUTBOX_PREVIEW_TEXT_LIMIT),
+      hostId: limitedText(value.hostId, 256),
+      sessionId: limitedText(value.sessionId, 512),
+      revision: Math.max(1, sequence(value.revision)),
+      status: value.status === 'presented' ? 'presented' : 'pending',
+      updatedAt: limitedText(value.updatedAt, 64) || now,
+    };
+  }
+
+  function compareOutboxOldest(left, right) {
+    return (Date.parse(left[1]?.updatedAt || '') || 0) - (Date.parse(right[1]?.updatedAt || '') || 0)
+      || sequence(left[1]?.assistantSeq) - sequence(right[1]?.assistantSeq)
+      || left[0].localeCompare(right[0]);
+  }
+
   class NotificationOutbox {
     constructor(options = {}) {
       this.load = options.load || (() => ({}));
       this.save = options.save || (() => {});
+      this.clear = options.clear || (() => {});
       this.onPersist = options.onPersist || (() => {});
       this.runExclusive = options.runExclusive || null;
       this.onLockUnavailable = options.onLockUnavailable || (() => {});
       this.onPersistError = options.onPersistError || (() => {});
+      this.onPersistenceDisabled = options.onPersistenceDisabled || (() => {});
+      this.onQuotaRecovered = options.onQuotaRecovered || (() => {});
       this.now = options.now || (() => new Date().toISOString());
       this.presentedLimit = Math.max(
         0,
@@ -795,6 +885,14 @@
         0,
         Number(options.presentedRetentionMs ?? DEFAULT_PRESENTED_OUTBOX_RETENTION_MS) || 0
       );
+      this.pendingLimit = Math.max(
+        1,
+        Number(options.pendingLimit ?? DEFAULT_PENDING_OUTBOX_LIMIT) || DEFAULT_PENDING_OUTBOX_LIMIT
+      );
+      this.byteLimit = Math.max(
+        1024,
+        Number(options.byteLimit ?? DEFAULT_OUTBOX_BYTE_LIMIT) || DEFAULT_OUTBOX_BYTE_LIMIT
+      );
       this.items = {};
       this.drainPromise = null;
       this.drainAgainRequested = false;
@@ -802,17 +900,25 @@
       this.batchDepth = 0;
       this.persistPromise = null;
       this.persistAgainRequested = false;
+      this.persistenceDisabled = false;
+      let normalized = false;
       try {
         const raw = this.load();
         const loaded = typeof raw === 'string' ? JSON.parse(raw || '{}') : (raw || {});
         const source = loaded.items && typeof loaded.items === 'object' ? loaded.items : loaded;
         for (const [id, item] of Object.entries(source || {})) {
-          if (item && typeof item === 'object') this.items[id] = { ...item, alertId: id };
+          const next = normalizeOutboxItem(item, id, this.now());
+          if (!next) {
+            normalized = true;
+            continue;
+          }
+          this.items[id] = next;
+          if (JSON.stringify({ ...item, alertId: id }) !== JSON.stringify(next)) normalized = true;
         }
       } catch {
         this.items = {};
       }
-      if (this.prunePresented()) {
+      if (normalized || this.pruneToLimits()) {
         this.dirty = true;
         try {
           this.flush();
@@ -846,6 +952,70 @@
       return changed;
     }
 
+    prunePending(limit = this.pendingLimit) {
+      const pending = Object.entries(this.items)
+        .filter(([, item]) => item?.status !== 'presented')
+        .sort(compareOutboxOldest);
+      const removeCount = Math.max(0, pending.length - Math.max(0, limit));
+      for (let index = 0; index < removeCount; index += 1) {
+        delete this.items[pending[index][0]];
+      }
+      return removeCount > 0;
+    }
+
+    pruneToByteLimit(limit = this.byteLimit) {
+      let total = serializedOutboxByteLength(this.items);
+      if (total <= limit) return false;
+      const candidates = [
+        ...Object.entries(this.items)
+          .filter(([, item]) => item?.status === 'presented')
+          .sort(compareOutboxOldest),
+        ...Object.entries(this.items)
+          .filter(([, item]) => item?.status !== 'presented')
+          .sort(compareOutboxOldest),
+      ];
+      let changed = false;
+      let count = Object.keys(this.items).length;
+      for (const [id, item] of candidates) {
+        total -= serializedOutboxEntryByteLength(id, item) + (count > 1 ? 1 : 0);
+        delete this.items[id];
+        count -= 1;
+        changed = true;
+        if (total <= limit) break;
+      }
+      return changed;
+    }
+
+    pruneToLimits() {
+      const presentedChanged = this.prunePresented();
+      const pendingChanged = this.prunePending();
+      const bytesChanged = this.pruneToByteLimit();
+      return presentedChanged || pendingChanged || bytesChanged;
+    }
+
+    compactForQuotaRetry() {
+      let changed = false;
+      for (const [id, item] of Object.entries(this.items)) {
+        if (item?.status === 'presented') {
+          delete this.items[id];
+          changed = true;
+          continue;
+        }
+        const previewText = limitedText(item?.previewText, 160);
+        if (previewText !== item.previewText) {
+          this.items[id] = { ...item, previewText };
+          changed = true;
+        }
+      }
+      const pendingChanged = this.prunePending(Math.min(this.pendingLimit, QUOTA_RETRY_PENDING_LIMIT));
+      const bytesChanged = this.pruneToByteLimit(Math.min(this.byteLimit, QUOTA_RETRY_BYTE_LIMIT));
+      return changed || pendingChanged || bytesChanged;
+    }
+
+    isPersistenceDisabled() {
+      return this.persistenceDisabled;
+    }
+
     persist() {
       if (this.persistPromise) {
         if (this.dirty) this.persistAgainRequested = true;
@@ -860,41 +1030,87 @@
 
     persistUnlocked() {
       if (!this.dirty) return false;
+      if (this.persistenceDisabled) {
+        this.pruneToLimits();
+        this.dirty = false;
+        return false;
+      }
       const raw = this.load();
       const loaded = typeof raw === 'string' ? JSON.parse(raw || '{}') : (raw || {});
       const source = loaded.items && typeof loaded.items === 'object' ? loaded.items : loaded;
       for (const [id, durable] of Object.entries(source || {})) {
-        if (!durable || typeof durable !== 'object') continue;
+        const normalizedDurable = normalizeOutboxItem(durable, id, this.now());
+        if (!normalizedDurable) continue;
         const local = this.items[id];
-        const durableRevision = sequence(durable.revision);
+        const durableRevision = sequence(normalizedDurable.revision);
         const localRevision = sequence(local?.revision);
         if (
           !local
           || durableRevision > localRevision
           || (
             durableRevision === localRevision
-            && durable.status === 'presented'
+            && normalizedDurable.status === 'presented'
             && local.status !== 'presented'
           )
         ) {
           if (
             local
             && durableRevision > localRevision
-            && durable.status === 'pending'
+            && normalizedDurable.status === 'pending'
             && this.drainPromise
           ) {
             this.drainAgainRequested = true;
           }
-          this.items[id] = { ...durable, alertId: id };
+          this.items[id] = normalizedDurable;
         }
       }
-      this.prunePresented();
-      this.save({ version: OUTBOX_SCHEMA_VERSION, items: this.items });
+      this.pruneToLimits();
+      let payload = { version: OUTBOX_SCHEMA_VERSION, items: this.items };
+      let quotaRecovered = false;
+      try {
+        this.save(payload);
+      } catch (error) {
+        if (!isQuotaExceededError(error)) throw error;
+        this.compactForQuotaRetry();
+        payload = { version: OUTBOX_SCHEMA_VERSION, items: this.items };
+        try {
+          this.save(payload);
+          quotaRecovered = true;
+        } catch (retryError) {
+          if (!isQuotaExceededError(retryError)) throw retryError;
+          try {
+            this.clear();
+          } catch {
+            // Clearing an obsolete durable snapshot is best effort.
+          }
+          try {
+            this.save(payload);
+            quotaRecovered = true;
+          } catch (finalError) {
+            if (!isQuotaExceededError(finalError)) throw finalError;
+            this.persistenceDisabled = true;
+            this.dirty = false;
+            try {
+              this.onPersistenceDisabled(finalError);
+            } catch {
+              // Storage diagnostics must not break the in-memory outbox.
+            }
+            return false;
+          }
+        }
+      }
       this.dirty = false;
       try {
         this.onPersist();
       } catch {
         // Cross-tab notification is best effort after durable storage succeeds.
+      }
+      if (quotaRecovered) {
+        try {
+          this.onQuotaRecovered();
+        } catch {
+          // Recovery follow-up is best effort after durable storage succeeds.
+        }
       }
       return true;
     }
@@ -938,16 +1154,29 @@
     }
 
     reload() {
-      if (this.dirty) return this.all();
+      if (this.dirty || this.persistenceDisabled) return this.all();
       try {
         const raw = this.load();
         const loaded = typeof raw === 'string' ? JSON.parse(raw || '{}') : (raw || {});
         const source = loaded.items && typeof loaded.items === 'object' ? loaded.items : loaded;
         const next = {};
+        let normalizedChanged = false;
         for (const [id, item] of Object.entries(source || {})) {
-          if (item && typeof item === 'object') next[id] = { ...item, alertId: id };
+          const normalized = normalizeOutboxItem(item, id, this.now());
+          if (!normalized) {
+            normalizedChanged = true;
+            continue;
+          }
+          next[id] = normalized;
+          if (JSON.stringify({ ...item, alertId: id }) !== JSON.stringify(normalized)) {
+            normalizedChanged = true;
+          }
         }
         this.items = next;
+        if (normalizedChanged || this.pruneToLimits()) {
+          this.dirty = true;
+          this.flush();
+        }
       } catch {
         // Keep the last valid in-memory snapshot when storage is temporarily unavailable.
       }
@@ -964,7 +1193,7 @@
       const current = this.items[alertId];
       let changed = false;
       if (!current || current.status !== 'presented') {
-        const next = {
+        const next = normalizeOutboxItem({
           ...current,
           ...message,
           canonicalConversationKey,
@@ -972,7 +1201,7 @@
           alertId,
           status: 'pending',
           updatedAt: this.now(),
-        };
+        }, alertId, this.now());
         const unchanged = current
           && current.status === next.status
           && current.canonicalConversationKey === next.canonicalConversationKey
@@ -1174,6 +1403,7 @@
     applyAssistantProjection,
     drainOutboxWithElection,
     emptyReceipt,
+    isQuotaExceededError,
     mergeAliasReceipts,
     migrateLegacyReceipt,
     normalizeReceipt,

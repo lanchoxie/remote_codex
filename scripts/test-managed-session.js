@@ -160,7 +160,10 @@ async function main() {
       throw new Error('zip export did not include cached file content');
     }
 
-    const chunkedBytes = Buffer.alloc(5 * 1024 * 1024 + 123);
+    // This size exceeds the safe raw payload for the default 8 MiB agent-event
+    // limit after base64 expansion. The download must select chunking without
+    // a caller-provided `chunked=1` override.
+    const chunkedBytes = Buffer.alloc(15_601_186);
     for (let index = 0; index < chunkedBytes.length; index += 1) {
       chunkedBytes[index] = index % 251;
     }
@@ -189,7 +192,11 @@ async function main() {
     if (!chunkedFile?.path) {
       throw new Error('chunked upload did not return a remote path');
     }
-    const chunkedDownloaded = await getBuffer(`/api/hosts/${encodeURIComponent(session.hostId)}/files/download?sessionId=${encodeURIComponent(session.sessionId)}&path=${encodeURIComponent(chunkedFile.path)}&chunked=1`);
+    const chunkedResponse = await getBufferResponse(`/api/hosts/${encodeURIComponent(session.hostId)}/files/download?sessionId=${encodeURIComponent(session.sessionId)}&path=${encodeURIComponent(chunkedFile.path)}`);
+    const chunkedDownloaded = chunkedResponse.buffer;
+    if (chunkedResponse.headers.get('x-codex-transfer-mode') !== 'chunked') {
+      throw new Error('large download did not automatically select chunked transfer mode');
+    }
     if (!chunkedDownloaded.equals(chunkedBytes)) {
       throw new Error('chunked downloaded file content did not match uploaded content');
     }
@@ -925,6 +932,10 @@ async function getJsonNoAuth(pathname) {
 }
 
 async function getBuffer(pathname) {
+  return (await getBufferResponse(pathname)).buffer;
+}
+
+async function getBufferResponse(pathname) {
   const response = await fetch(`${RELAY_URL}${pathname}`, {
     headers: authHeaders(),
   });
@@ -937,7 +948,10 @@ async function getBuffer(pathname) {
     }
     throw new Error(`GET ${pathname} failed with ${response.status}${errorText ? `: ${errorText}` : ''}`);
   }
-  return Buffer.from(await response.arrayBuffer());
+  return {
+    buffer: Buffer.from(await response.arrayBuffer()),
+    headers: response.headers,
+  };
 }
 
 async function getText(pathname) {

@@ -28,6 +28,8 @@
         const token = params.get('token') || '';
         const port = Number(params.get('port') || '19230');
         const recoveryBase = `http://127.0.0.1:${port}`;
+        const PROVIDER_KINDS = new Set(['openai', 'anthropic', 'gemini', 'custom']);
+        const REASONING_EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 
         function readJson(key, fallback) {
           try {
@@ -41,6 +43,55 @@
           return String(value || '').trim().replace(/\/+$/, '');
         }
 
+        function inferProviderKind(provider) {
+          const normalized = String(provider || '')
+            .trim()
+            .toLowerCase()
+            .replace(/[_-]+/g, ' ')
+            .replace(/\s+/g, ' ');
+          if (['openai', 'open ai', 'openai api', 'official openai'].includes(normalized)) return 'openai';
+          if (['anthropic', 'claude', 'anthropic claude', 'anthropic api', 'anthropic/claude'].includes(normalized)) return 'anthropic';
+          if (['gemini', 'google gemini', 'gemini api', 'google ai', 'google/gemini'].includes(normalized)) return 'gemini';
+          return 'custom';
+        }
+
+        function normalizeProviderKind(value, provider) {
+          const providerKind = String(value || '').trim().toLowerCase();
+          return PROVIDER_KINDS.has(providerKind) ? providerKind : inferProviderKind(provider);
+        }
+
+        function normalizeSessionDefaults(value) {
+          const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+          const effortCandidate = String(input.effort || '').trim();
+          const effort = REASONING_EFFORT_PATTERN.test(effortCandidate) ? effortCandidate : '';
+          const requestedMode = String(input.effortMode || '').trim().toLowerCase();
+          const effortMode = requestedMode === 'manual' || requestedMode === 'auto'
+            ? requestedMode
+            : effort ? 'manual' : 'auto';
+          return {
+            model: String(input.model || '').trim().slice(0, 512),
+            effortMode,
+            effort: effortMode === 'manual' ? effort : '',
+            allowUnverifiedEffort: effortMode === 'manual' && Boolean(effort) && input.allowUnverifiedEffort === true,
+            summary: String(input.summary || '').trim().slice(0, 64),
+          };
+        }
+
+        function normalizeStoredProfile(profile = {}, rememberRecoveredKey = false) {
+          const provider = String(profile.provider || 'OpenAI').trim() || 'OpenAI';
+          const apiKey = String(profile.apiKey || '');
+          return {
+            profileId: String(profile.profileId || profile.id || '').trim(),
+            label: String(profile.label || profile.name || provider || 'API Profile').trim(),
+            provider,
+            providerKind: normalizeProviderKind(profile.providerKind, provider),
+            baseUrl: normalizeBaseUrl(profile.baseUrl),
+            apiKey,
+            rememberApiKey: rememberRecoveredKey || profile.rememberApiKey !== false || Boolean(apiKey),
+            sessionDefaults: normalizeSessionDefaults(profile.sessionDefaults),
+          };
+        }
+
         function logicalProfileKey(profile) {
           const label = String(profile?.label || '')
             .normalize('NFKC')
@@ -50,7 +101,9 @@
         }
 
         function mergeProfiles(existing, recovered) {
-          let profiles = Array.isArray(existing.apiProfiles) ? existing.apiProfiles.map((profile) => ({ ...profile })) : [];
+          let profiles = Array.isArray(existing.apiProfiles)
+            ? existing.apiProfiles.map((profile) => normalizeStoredProfile(profile)).filter((profile) => profile.profileId)
+            : [];
           if (
             profiles.length === 1
             && profiles[0].profileId === 'default'
@@ -62,14 +115,8 @@
           const byId = new Map(profiles.map((profile) => [profile.profileId, profile]));
           const byLogical = new Map(profiles.map((profile) => [logicalProfileKey(profile), profile]));
           for (const candidate of recovered) {
-            const normalized = {
-              profileId: String(candidate.profileId || ''),
-              label: String(candidate.label || 'API Profile'),
-              provider: String(candidate.provider || 'OpenAI'),
-              baseUrl: normalizeBaseUrl(candidate.baseUrl),
-              apiKey: String(candidate.apiKey || ''),
-              rememberApiKey: true,
-            };
+            const normalized = normalizeStoredProfile(candidate, true);
+            if (!normalized.profileId) continue;
             const current = byId.get(normalized.profileId) || byLogical.get(logicalProfileKey(normalized));
             if (current) {
               if (!current.apiKey) {

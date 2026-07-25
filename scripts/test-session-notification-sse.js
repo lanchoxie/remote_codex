@@ -173,6 +173,7 @@ async function main() {
   let replay = null;
   let aliasReplay = null;
   let expired = null;
+  let released = null;
   let restarted = null;
   let invalid = null;
   try {
@@ -227,7 +228,6 @@ async function main() {
       .filter((frame) => frame.event.startsWith('session.'))
       .every((frame) => /^[^:]+:\d+$/.test(frame.id)));
     const replayCursor = transcript.id;
-    initial.close();
 
     await postEvents(port, [{
       type: 'session.transcript',
@@ -258,19 +258,25 @@ async function main() {
         conversationKey: SESSION_ID,
       }],
     }]);
+    const canonicalMergeReset = await waitForFrame(
+      initial,
+      (frame) => frame.event === 'stream.reset' && frame.data.reason === 'canonical_key_changed',
+      'canonical merge did not reset the existing winner subscriber'
+    );
+    assert.strictEqual(canonicalMergeReset.data.canonicalConversationKey, `${HOST_ID}::${SESSION_ID}`);
     aliasReplay = openSse(
       port,
       `/api/sessions/bridge-sse-1/events?hostId=${HOST_ID}&lastEventId=${encodeURIComponent(replayReady.data.cursor)}`
     );
-    const aliasSnapshot = await waitForFrame(
+    const aliasReset = await waitForFrame(
       aliasReplay,
-      (frame) => frame.event === 'session.snapshot',
-      'alias URL did not replay canonical ring'
+      (frame) => frame.event === 'stream.reset',
+      'alias URL did not reset the superseded cursor generation'
     );
     const aliasReady = await waitForFrame(aliasReplay, (frame) => frame.event === 'ready', 'missing alias ready');
-    assert.strictEqual(aliasSnapshot.data.sessionId, SESSION_ID);
+    assert.strictEqual(aliasReset.data.reason, 'epoch_mismatch');
+    assert.strictEqual(aliasReset.data.session.sessionId, SESSION_ID);
     assert.strictEqual(aliasReady.data.canonicalConversationKey, `${HOST_ID}::${SESSION_ID}`);
-    assert.strictEqual(aliasReplay.frames.some((frame) => frame.event === 'stream.reset'), false);
     aliasReplay.close();
 
     for (let index = 0; index < 6; index += 1) {
@@ -285,12 +291,37 @@ async function main() {
     }
     expired = openSse(
       port,
-      `/api/sessions/${SESSION_ID}/events?hostId=${HOST_ID}&lastEventId=${encodeURIComponent(replayCursor)}`
+      `/api/sessions/${SESSION_ID}/events?hostId=${HOST_ID}&lastEventId=${encodeURIComponent(aliasReady.data.cursor)}`
     );
     const expiredReset = await waitForFrame(expired, (frame) => frame.event === 'stream.reset', 'missing expired reset');
     assert.strictEqual(expiredReset.data.reason, 'cursor_expired');
     assert.strictEqual(expiredReset.data.assistantProjection.latestAssistantSeq, 1);
     expired.close();
+
+    const releasedCursor = initial.frames.filter((frame) => frame.id).at(-1).id;
+    initial.close();
+    initial = null;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await postEvents(port, [{
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: SESSION_ID,
+      speaker: 'user',
+      text: 'offline gap',
+      timestamp: '2099-02-01T00:03:00.000Z',
+    }]);
+    released = openSse(
+      port,
+      `/api/sessions/${SESSION_ID}/events?hostId=${HOST_ID}&lastEventId=${encodeURIComponent(releasedCursor)}`
+    );
+    const releasedReset = await waitForFrame(
+      released,
+      (frame) => frame.event === 'stream.reset',
+      'offline production event did not invalidate the released stream cursor'
+    );
+    assert.strictEqual(releasedReset.data.reason, 'epoch_mismatch');
+    assert.strictEqual(releasedReset.data.session.latestUserMessage, 'offline gap');
+    released.close();
 
     restarted = openSse(
       port,
@@ -318,6 +349,7 @@ async function main() {
     replay?.close();
     aliasReplay?.close();
     expired?.close();
+    released?.close();
     restarted?.close();
     invalid?.close();
     await stopChild(relay);
