@@ -23,8 +23,10 @@ function runnerIdentityValues(runner) {
 function commandIdentityValues(command = {}) {
   return [
     command.sessionId,
+    command.requestedSessionId,
     command.bridgeSessionId,
     command.nativeThreadId,
+    command.rebindNativeThreadId,
     command.originSessionId,
     command.sourceSessionId,
     command.conversationKey,
@@ -60,6 +62,17 @@ function findRunnerForCommand(liveSessions, command = {}) {
     }
   }
   return null;
+}
+
+function commandsShareSessionRun(left = {}, right = {}) {
+  const leftRunId = String(left.runId || '').trim();
+  const rightRunId = String(right.runId || '').trim();
+  if (leftRunId && rightRunId) {
+    return leftRunId === rightRunId;
+  }
+
+  const leftIdentities = new Set(commandIdentityValues(left));
+  return commandIdentityValues(right).some((identity) => leftIdentities.has(identity));
 }
 
 function retainRunnerForStartRetry(liveSessions, runner, command = {}, error = null) {
@@ -186,6 +199,7 @@ async function stopUniqueLiveRunners(liveSessions, options = {}) {
 function createManagedSessionStartGate() {
   const activeStarts = new Set();
   let shuttingDown = false;
+  let maintenanceOwner = '';
 
   function shutdownError() {
     const error = new Error('Host Agent is shutting down; managed sessions cannot be started.');
@@ -193,13 +207,30 @@ function createManagedSessionStartGate() {
     return error;
   }
 
+  function maintenanceError() {
+    const error = new Error(`Host Agent is in Codex maintenance${maintenanceOwner ? ` (${maintenanceOwner})` : ''}.`);
+    error.code = 'host_agent_maintenance';
+    return error;
+  }
+
+  function findActiveStart(command = {}) {
+    for (const record of activeStarts) {
+      if (!record.finished && commandsShareSessionRun(record.command, command)) {
+        return record;
+      }
+    }
+    return null;
+  }
+
   return {
-    beginStart() {
+    beginStart(command = {}) {
       if (shuttingDown) throw shutdownError();
+      if (maintenanceOwner) throw maintenanceError();
 
       let resolveRunnerOrFinished;
       let resolveFinished;
       const record = {
+        command: { ...command },
         finished: false,
         runner: null,
         runnerOrFinished: new Promise((resolve) => {
@@ -214,6 +245,7 @@ function createManagedSessionStartGate() {
       return {
         assertCanSpawn() {
           if (shuttingDown) throw shutdownError();
+          if (maintenanceOwner) throw maintenanceError();
         },
         setRunner(runner) {
           if (!runner || record.runner || record.finished) return false;
@@ -230,12 +262,41 @@ function createManagedSessionStartGate() {
         },
       };
     },
+    waitForRunner(command = {}) {
+      const record = findActiveStart(command);
+      return record ? record.runnerOrFinished : null;
+    },
     beginShutdown() {
       shuttingDown = true;
       return Array.from(activeStarts);
     },
     isShuttingDown() {
       return shuttingDown;
+    },
+    beginMaintenance(owner) {
+      const normalizedOwner = String(owner || '').trim();
+      if (!normalizedOwner) throw new Error('maintenance owner is required');
+      if (shuttingDown) throw shutdownError();
+      if (maintenanceOwner && maintenanceOwner !== normalizedOwner) throw maintenanceError();
+      maintenanceOwner = normalizedOwner;
+      return true;
+    },
+    endMaintenance(owner) {
+      const normalizedOwner = String(owner || '').trim();
+      if (!maintenanceOwner || maintenanceOwner !== normalizedOwner) return false;
+      maintenanceOwner = '';
+      return true;
+    },
+    maintenanceOwner() {
+      return maintenanceOwner || null;
+    },
+    activeStartCount() {
+      return activeStarts.size;
+    },
+    async waitForActiveStarts() {
+      const starts = Array.from(activeStarts);
+      await Promise.all(starts.map((record) => record.finishedPromise));
+      return starts.length;
     },
     async stopStarts(records, options = {}, seenRunners = new Set()) {
       const settled = await Promise.allSettled((records || []).map(async (record) => {
@@ -266,6 +327,38 @@ function createManagedSessionStartGate() {
         stoppedCount: settled.filter((result) => result.status === 'fulfilled' && result.value).length,
         errors,
       };
+    },
+  };
+}
+
+function createRetryableTerminalReceiptExecutor() {
+  const executions = new Map();
+
+  return {
+    run(key, execute, deliver) {
+      const normalizedKey = String(key || '').trim();
+      if (!normalizedKey) {
+        throw new TypeError('terminal receipt execution key is required');
+      }
+      if (typeof execute !== 'function' || typeof deliver !== 'function') {
+        throw new TypeError('terminal receipt execute and deliver callbacks are required');
+      }
+
+      let execution = executions.get(normalizedKey);
+      if (!execution) {
+        execution = Promise.resolve().then(execute);
+        executions.set(normalizedKey, execution);
+      }
+      return execution.then((receipt) => deliver(receipt));
+    },
+    forget(key) {
+      return executions.delete(String(key || '').trim());
+    },
+    has(key) {
+      return executions.has(String(key || '').trim());
+    },
+    size() {
+      return executions.size;
     },
   };
 }
@@ -448,6 +541,7 @@ module.exports = {
   buildManagedSessionStartedEvent,
   createManagedSessionStartGate,
   createManagedSessionShutdown,
+  createRetryableTerminalReceiptExecutor,
   findRunnerForCommand,
   retainRunnerForStartRetry,
   replayManagedSessionStart,

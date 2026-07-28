@@ -3,7 +3,10 @@ const os = require('os');
 const path = require('path');
 const { readJsonLines, readJsonLinesTail } = require('./jsonl');
 const { pick } = require('./protocol');
-const { normalizeAssistantObservation } = require('./assistant-message-identity');
+const {
+  coalesceRolloutAssistantMirrorRows,
+  normalizeAssistantObservation,
+} = require('./assistant-message-identity');
 
 const TRANSCRIPT_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_READ_LIMIT || 12000);
 const TRANSCRIPT_HEAD_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_HEAD_READ_LIMIT || 500);
@@ -21,6 +24,7 @@ function discoverCodexSessions(options = {}) {
     Object.prototype.hasOwnProperty.call(options, 'metaReadLimit') ? options.metaReadLimit : 250
   ) || 0);
   const discovered = new Map();
+  const internalSessionIds = new Set();
 
   const indexPath = path.join(codexHome, 'session_index.jsonl');
   for (const row of readJsonLines(indexPath, 5000)) {
@@ -56,10 +60,19 @@ function discoverCodexSessions(options = {}) {
     if (!meta || !meta.id) {
       return;
     }
+    if (isInternalApprovalReviewSession(meta)) {
+      internalSessionIds.add(meta.id);
+      discovered.delete(meta.id);
+      return;
+    }
+    if (internalSessionIds.has(meta.id)) {
+      return;
+    }
 
     const preview = includePreview ? extractSessionPreview(filePath) : emptySessionPreview();
     const stats = safeStat(filePath);
     const existing = discovered.get(meta.id) || {};
+    const lineage = subagentMetadata(meta);
     discovered.set(meta.id, {
       ...existing,
       sessionId: meta.id,
@@ -79,7 +92,10 @@ function discoverCodexSessions(options = {}) {
         meta.timestamp
       ),
       messageCount: Math.max(Number(existing.messageCount || 0), preview.messageCount || 0),
-      source: meta.source || existing.source || 'rollout',
+      source: lineage ? 'subagent' : (meta.source || existing.source || 'rollout'),
+      ...(lineage || {}),
+      subagent: Boolean(lineage),
+      readOnly: Boolean(lineage),
       originator: meta.originator || existing.originator || null,
       cliVersion: meta.cli_version || existing.cliVersion || null,
       imported: true,
@@ -138,6 +154,10 @@ function findCodexSessionFile(options = {}) {
     if (!sessionId || !candidates.has(sessionId)) {
       return;
     }
+    const meta = getSessionMeta(filePath, readJsonLines(filePath, 80));
+    if (isInternalApprovalReviewSession(meta)) {
+      return;
+    }
     const stats = safeStat(filePath);
     found = {
       sessionId,
@@ -163,6 +183,10 @@ function readCodexSessionSummary(filePath, options = {}) {
   if (!meta || !meta.id) {
     return null;
   }
+  if (isInternalApprovalReviewSession(meta)) {
+    return null;
+  }
+  const lineage = subagentMetadata(meta);
   const preview = options.preview === false ? emptySessionPreview() : extractSessionPreview(filePath);
   const stats = safeStat(filePath);
   return {
@@ -181,7 +205,10 @@ function readCodexSessionSummary(filePath, options = {}) {
       meta.timestamp
     ),
     messageCount: preview.messageCount || 0,
-    source: meta.source || 'rollout',
+    source: lineage ? 'subagent' : (meta.source || 'rollout'),
+    ...(lineage || {}),
+    subagent: Boolean(lineage),
+    readOnly: Boolean(lineage),
     originator: meta.originator || null,
     cliVersion: meta.cli_version || null,
     imported: true,
@@ -206,11 +233,13 @@ function extractSessionPreview(filePath) {
     messageCount: 0,
   };
 
-  const rows = mergeRowsByTimestampAndType([
+  const rows = coalesceRolloutAssistantMirrorRows(mergeRowsByTimestampAndType([
     ...readJsonLines(filePath, TRANSCRIPT_HEAD_READ_LIMIT),
     ...readJsonLinesTail(filePath, TRANSCRIPT_READ_LIMIT),
-  ]);
-  for (const row of rows) {
+  ]));
+  const nativeThreadId = parseSessionIdFromFilePath(filePath);
+  for (let sourceOrdinal = 0; sourceOrdinal < rows.length; sourceOrdinal += 1) {
+    const row = rows[sourceOrdinal];
     if (!row) {
       continue;
     }
@@ -219,7 +248,11 @@ function extractSessionPreview(filePath) {
     preview.lastTimestamp = latestTimestamp(preview.lastTimestamp, row.timestamp);
     preview.cwd = preview.cwd || getCwdFromRow(row);
 
-    const entry = makeTranscriptEntry(row);
+    const entry = makeTranscriptEntry(row, {
+      nativeThreadId,
+      rolloutPath: filePath,
+      sourceOrdinal,
+    });
     if (!entry) {
       continue;
     }
@@ -240,9 +273,17 @@ function extractSessionPreview(filePath) {
 
 function extractSessionTranscript(filePath, options = {}) {
   const entries = [];
-  for (const row of readJsonLines(filePath, options.maxRows || Infinity)) {
+  const rows = coalesceRolloutAssistantMirrorRows(
+    readJsonLines(filePath, options.maxRows || Infinity)
+  );
+  const nativeThreadId = parseSessionIdFromFilePath(filePath);
+  for (let sourceOrdinal = 0; sourceOrdinal < rows.length; sourceOrdinal += 1) {
+    const row = rows[sourceOrdinal];
     const entry = makeTranscriptEntry(row, {
       maxChars: Object.prototype.hasOwnProperty.call(options, 'maxChars') ? options.maxChars : Infinity,
+      nativeThreadId,
+      rolloutPath: filePath,
+      sourceOrdinal,
     });
     if (entry) {
       entries.push(entry);
@@ -255,12 +296,12 @@ function extractSessionDiagnostics(filePath, options = {}) {
   const headRows = Math.max(0, Number(options.headRows || 0) || 0);
   const tailRows = Math.max(0, Number(options.tailRows || 0) || 0);
   const maxRows = Object.prototype.hasOwnProperty.call(options, 'maxRows') ? options.maxRows : Infinity;
-  const rows = headRows || tailRows
+  const rows = coalesceRolloutAssistantMirrorRows(headRows || tailRows
     ? mergeRowsByTimestampAndType([
       ...readJsonLines(filePath, headRows || 0),
       ...readJsonLinesTail(filePath, tailRows || 0),
     ])
-    : readJsonLines(filePath, maxRows);
+    : readJsonLines(filePath, maxRows));
   const diagnostics = [];
   const seen = new Set();
 
@@ -321,6 +362,58 @@ function getSessionMeta(filePath, rows) {
     timestamp: firstNonEmpty(rows.map((row) => row && row.timestamp)),
     source: 'rollout',
   };
+}
+
+function isInternalApprovalReviewSession(input) {
+  const source = input && typeof input.source === 'object' ? input.source : null;
+  const subagent = source && typeof source.subagent === 'object' ? source.subagent : null;
+  return String(subagent?.other || '').trim().toLowerCase() === 'guardian';
+}
+
+function subagentMetadata(input = {}) {
+  const source = input && typeof input.source === 'object' ? input.source : null;
+  const subagent = source && typeof source.subagent === 'object' ? source.subagent : null;
+  const threadSpawn = subagent && typeof subagent.thread_spawn === 'object'
+    ? subagent.thread_spawn
+    : null;
+  const threadSource = String(input.thread_source || input.threadSource || '').trim().toLowerCase();
+  const parentThreadId = String(
+    input.parent_thread_id
+      || input.parentThreadId
+      || threadSpawn?.parent_thread_id
+      || threadSpawn?.parentThreadId
+      || ''
+  ).trim() || null;
+  const forkedFromId = String(input.forked_from_id || input.forkedFromId || '').trim() || null;
+  const isSubagent = threadSource === 'subagent'
+    || Boolean(parentThreadId)
+    || Boolean(forkedFromId)
+    || Boolean(threadSpawn)
+    || Boolean(subagent && Object.keys(subagent).length);
+  if (!isSubagent) {
+    return null;
+  }
+  return {
+    threadSource: threadSource || 'subagent',
+    parentThreadId,
+    forkedFromId,
+    agentPath: String(input.agent_path || input.agentPath || threadSpawn?.agent_path || threadSpawn?.agentPath || '').trim() || null,
+    agentNickname: String(input.agent_nickname || input.agentNickname || threadSpawn?.agent_nickname || threadSpawn?.agentNickname || '').trim() || null,
+    agentRole: String(input.agent_role || input.agentRole || threadSpawn?.agent_role || threadSpawn?.agentRole || '').trim() || null,
+    multiAgentVersion: String(input.multi_agent_version || input.multiAgentVersion || '').trim() || null,
+    subagentSource: subagent || null,
+  };
+}
+
+function isSubagentSession(input) {
+  return Boolean(
+    input
+    && (
+      String(input.source || '').trim().toLowerCase() === 'subagent'
+      || input.subagent === true
+      || subagentMetadata(input)
+    )
+  );
 }
 
 function parseSessionIdFromFilePath(filePath) {
@@ -402,7 +495,11 @@ function makeTranscriptEntry(row, options = {}) {
       if (!text) {
         return null;
       }
-      return { speaker: 'agent', text, timestamp };
+      return attachAssistantTranscriptIdentity(
+        { speaker: 'agent', text, timestamp, source: 'codex-jsonl' },
+        row,
+        options
+      );
     }
   }
 
@@ -430,14 +527,34 @@ function makeTranscriptEntry(row, options = {}) {
     if (!text) {
       return null;
     }
-    return {
+    return attachAssistantTranscriptIdentity({
       speaker: 'agent',
       text,
       timestamp,
-    };
+      source: 'codex-jsonl',
+    }, row, options);
   }
 
   return null;
+}
+
+function attachAssistantTranscriptIdentity(entry, row, options = {}) {
+  const assistantObservation = normalizeAssistantObservation({
+    ...options,
+    representation: 'rollout',
+    row,
+    role: entry.speaker,
+    text: entry.text,
+    sourceTimestamp: row?.timestamp || entry.timestamp,
+    finalized: true,
+  });
+  if (!assistantObservation) return entry;
+  return {
+    ...entry,
+    assistantMessageId: assistantObservation.assistantMessageId,
+    assistantAt: assistantObservation.assistantAt || entry.timestamp || null,
+    assistantObservation,
+  };
 }
 
 function makeCodexRowEvents(row, context = {}) {
@@ -447,22 +564,11 @@ function makeCodexRowEvents(row, context = {}) {
   }
 
   const isTaskComplete = row.type === 'event_msg' && row.payload?.type === 'task_complete';
-  const transcript = isTaskComplete ? null : makeTranscriptEntry(row);
+  const transcript = isTaskComplete ? null : makeTranscriptEntry(row, context);
   if (transcript) {
-    const assistantObservation = normalizeAssistantObservation({
-      ...context,
-      representation: 'rollout',
-      row,
-      role: transcript.speaker,
-      text: transcript.text,
-      sourceTimestamp: row.timestamp,
-      finalized: true,
-    });
     events.push({
       type: 'session.transcript',
-      entry: assistantObservation
-        ? { ...transcript, assistantObservation }
-        : transcript,
+      entry: transcript,
     });
   }
 
@@ -1215,6 +1321,9 @@ module.exports = {
   extractSessionTranscript,
   findCodexSessionFile,
   getDefaultCodexHome,
+  isInternalApprovalReviewSession,
+  isSubagentSession,
+  subagentMetadata,
   makeCodexRowEvents,
   makeTranscriptEntry,
   readCodexSessionSummary,

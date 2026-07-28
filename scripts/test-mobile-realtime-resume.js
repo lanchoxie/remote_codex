@@ -188,6 +188,26 @@ assertContains(
 );
 assertContains(
   app,
+  "reason === 'cursor_missing'",
+  'a first EventSource connection must recover events emitted before subscription became active'
+);
+assertContains(
+  app,
+  'reconcileDetailTranscriptForSession(',
+  'full detail recovery must reconcile optimistic user echoes against the authoritative Relay transcript'
+);
+assertContains(
+  app,
+  "state.eventSource.addEventListener('session.interrupt_result'",
+  'Interrupt must remain correlated with the Host terminal acknowledgement instead of HTTP enqueue only'
+);
+assertContains(
+  app,
+  'settlePendingInterruptFromInactiveRuntime(runtimeSession, mergedRuntime || runtimePayload)',
+  'an accepted Interrupt must remain locked until the matching runtime becomes inactive'
+);
+assertContains(
+  app,
   "reason === 'canonical_key_changed'",
   'canonical merges should reconcile transcript and request detail beyond the reset projection'
 );

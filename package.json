@@ -1,7 +1,7 @@
 {
   "name": "mobile-codex-remote",
   "private": true,
-  "version": "2.4.8",
+  "version": "2.4.9-dev",
   "description": "Mobile control plane for Codex sessions on PCs and HPC hosts.",
   "type": "commonjs",
   "scripts": {
@@ -12,7 +12,8 @@
     "test:managed": "node scripts/test-managed-session.js",
     "test:host-agent-lease": "node scripts/test-host-agent-instance-lease.js",
     "test:session-record-store": "node scripts/test-atomic-file-replace.js && node scripts/test-session-record-store.js",
-    "test:session-api-model:unit": "node scripts/test-session-record-store.js && node scripts/test-session-provenance.js && node scripts/test-model-catalog-service.js && node scripts/test-rebind-catalog-reuse.js && node scripts/test-provider-capabilities.js && node scripts/test-composer-model-inference.js && node scripts/test-jsonl-utf8-chunks.js",
+    "test:session-api-model:unit": "node scripts/test-session-record-store.js && node scripts/test-session-provenance.js && node scripts/test-input-command-outbox.js && node scripts/test-model-catalog-service.js && node scripts/test-rebind-catalog-reuse.js && node scripts/test-provider-capabilities.js && node scripts/test-composer-model-inference.js && node scripts/test-jsonl-utf8-chunks.js",
+    "test:input-command-outbox": "node scripts/test-input-command-outbox.js",
     "test:session-api-model:integration": "node scripts/test-session-api-host-runner.js && node scripts/test-host-agent-instance-lease.js && node scripts/test-session-api-relay.js && node scripts/test-relay-state-lock.js && node scripts/test-session-api-ui.js && node scripts/test-local-agent-graceful-shutdown.js && node scripts/test-local-agent-graceful-shutdown.js late-shutdown && node scripts/test-target-session-reconstruction.js",
     "test:local-agent-graceful-shutdown:late": "node scripts/test-local-agent-graceful-shutdown.js late-shutdown",
     "test:session-api-model": "npm run test:session-api-model:unit && npm run test:session-api-model:integration",
@@ -20,7 +21,7 @@
     "test:codex-preflight": "node scripts/test-codex-preflight.js",
     "test:install-config": "node scripts/test-install-config.js",
     "test:remote-codex-env": "node scripts/test-remote-codex-env-resolution.js",
-    "test:realtime-sync": "node scripts/test-coalesced-async-task.js && node scripts/test-discovery-coalescing.js && node scripts/test-agent-event-batch-transport.js && node scripts/test-agent-event-ledger.js && node scripts/test-atomic-file-replace.js && node scripts/test-agent-event-persistence.js && node scripts/test-session-watch-registry.js && node scripts/test-session-watch-controller.js && node scripts/test-session-watch-fast-path.js && node scripts/test-session-watch-routing.js && node scripts/test-linux-history-regression.js && node scripts/test-session-watch-batching.js && node scripts/test-realtime-session-sync-performance.js && node scripts/test-activity-recovery-scheduler.js && node scripts/test-mobile-realtime-resume.js",
+    "test:realtime-sync": "node scripts/test-coalesced-async-task.js && node scripts/test-discovery-coalescing.js && node scripts/test-internal-approval-session-filtering.js && node scripts/test-agent-event-batch-transport.js && node scripts/test-agent-event-ledger.js && node scripts/test-atomic-file-replace.js && node scripts/test-agent-event-persistence.js && node scripts/test-session-watch-registry.js && node scripts/test-session-watch-controller.js && node scripts/test-session-watch-fast-path.js && node scripts/test-session-watch-routing.js && node scripts/test-linux-history-regression.js && node scripts/test-session-watch-batching.js && node scripts/test-realtime-session-sync-performance.js && node scripts/test-activity-recovery-scheduler.js && node scripts/test-mobile-realtime-resume.js",
     "test:skills-inventory": "node scripts/test-skill-inventory-discovery.js && node scripts/test-host-skill-inventory-service.js && node scripts/test-skills-inventory-api.js",
     "test:skills-phase2": "node scripts/test-skill-artifact.js && node scripts/test-skill-registry-service.js && node scripts/test-host-skill-adopt.js && node scripts/test-skills-adopt-api.js && node scripts/test-github-skill-import.js && node scripts/test-skills-manager-ui.js",
     "test:skills-phase3": "node scripts/test-skill-artifact.js && node scripts/test-skill-deployment-service.js && node scripts/test-host-skill-deployment.js && node scripts/test-host-agent-skills-manager.js && node scripts/test-skills-deployment-api.js && node scripts/test-skills-manager-ui.js && node scripts/test-slash-skills-cache.js",
@@ -37,7 +38,8 @@
     "test:notifications": "npm run test:notifications:identity && npm run test:notifications:relay && npm run test:notifications:browser && npm run test:realtime-sync",
     "test:api-profile-backup": "node scripts/test-api-profile-backup.js && node scripts/test-api-profile-backup-ui.js",
     "test:session-action-layout": "node scripts/test-session-action-dialog-layout.js",
-    "test:start-windows": "node scripts/test-start-windows-script.js && node scripts/test-dev-instance-isolation.js && node scripts/test-dev-relay-local-agent-guard.js && node scripts/test-relay-lifecycle.js"
+    "test:start-windows": "node scripts/test-start-windows-script.js && node scripts/test-dev-instance-isolation.js && node scripts/test-dev-relay-local-agent-guard.js && node scripts/test-relay-lifecycle.js",
+    "test:host-codex-update": "node scripts/test-codex-installation.js && node scripts/test-host-codex-update.js && node scripts/test-host-codex-update-relay.js"
   },
   "dependencies": {
     "dompurify": "3.2.6",

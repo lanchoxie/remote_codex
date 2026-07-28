@@ -74,6 +74,79 @@
     }
   }
 
+  const COLLABORATION_MESSAGE_TOOLS = new Set([
+    'spawn_agent',
+    'send_message',
+    'followup_task',
+  ]);
+  const ENCRYPTED_COLLABORATION_PLACEHOLDER = '[Encrypted by Codex runtime; plaintext unavailable locally]';
+
+  function collaborationToolName(value) {
+    const normalized = identifier(value).toLowerCase();
+    return normalized.includes('/') ? normalized.split('/').at(-1) : normalized;
+  }
+
+  function looksLikeEncryptedCollaborationPayload(value) {
+    const text = String(value || '').trim();
+    return text.length >= 96
+      && /^gAAAAA[A-Za-z0-9_-]+={0,2}$/.test(text);
+  }
+
+  function parseStructuredValue(value) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return { value: { ...value }, serialized: false };
+    }
+    if (typeof value !== 'string' || !value.trim()) return null;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? { value: parsed, serialized: true }
+        : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function structuredValueIsTruncated(value) {
+    const parsed = parseStructuredValue(value)?.value;
+    if (!parsed || parsed.truncated !== true || typeof parsed.preview !== 'string') {
+      return false;
+    }
+    return Object.keys(parsed).every((key) => key === 'truncated' || key === 'preview');
+  }
+
+  function hasTruncationFlag(sources, keys) {
+    return sources.some((source) => keys.some((key) => object(source)[key] === true));
+  }
+
+  function sanitizeCollaborationPayload(toolName, argumentsValue, promptValue) {
+    const tool = collaborationToolName(toolName);
+    const parsed = COLLABORATION_MESSAGE_TOOLS.has(tool)
+      ? parseStructuredValue(argumentsValue)
+      : null;
+    let encrypted = false;
+    let sanitizedArguments = argumentsValue;
+    if (parsed) {
+      const next = { ...parsed.value };
+      for (const key of ['message', 'prompt']) {
+        if (looksLikeEncryptedCollaborationPayload(next[key])) {
+          next[key] = ENCRYPTED_COLLABORATION_PLACEHOLDER;
+          encrypted = true;
+        }
+      }
+      sanitizedArguments = parsed.serialized ? JSON.stringify(next) : next;
+    }
+    const sanitizedPrompt = looksLikeEncryptedCollaborationPayload(promptValue)
+      ? ENCRYPTED_COLLABORATION_PLACEHOLDER
+      : promptValue;
+    encrypted = encrypted || sanitizedPrompt !== promptValue;
+    return {
+      argumentsValue: sanitizedArguments,
+      promptValue: sanitizedPrompt,
+      encrypted,
+    };
+  }
+
   function statusText(value) {
     if (value && typeof value === 'object') {
       return identifier(value.type || value.status || value.state || value.phase);
@@ -212,7 +285,7 @@
       additions: Number.isFinite(additions) && additions >= 0 ? additions : null,
       deletions: Number.isFinite(deletions) && deletions >= 0 ? deletions : null,
       diff: boundedDiff.value,
-      truncated: boundedDiff.truncated,
+      truncated: change.truncated === true || boundedDiff.truncated,
     };
   }
 
@@ -230,7 +303,7 @@
       payload.files,
       payload.changes,
     ];
-    const result = [];
+    const fileChanges = [];
     const seen = new Set();
     for (const candidate of candidates) {
       const values = Array.isArray(candidate)
@@ -243,11 +316,16 @@
         const key = normalized.path.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
-        result.push(normalized);
-        if (result.length >= limits.maxFileChanges) return result;
+        if (fileChanges.length >= limits.maxFileChanges) {
+          return { fileChanges, truncated: true };
+        }
+        fileChanges.push(normalized);
       }
     }
-    return result;
+    return {
+      fileChanges,
+      truncated: fileChanges.some((change) => change.truncated),
+    };
   }
 
   function normalizeLimits(options = {}) {
@@ -363,6 +441,13 @@
     ]);
     const agentsStatesValue = firstDefined(sources, ['agentsStatesText', 'agentsStates', 'agents_states']);
     const actionDataValue = firstDefined(sources, ['actionDataText', 'actionData', 'action_data']);
+    const promptValue = firstDefined(sources, ['prompt']);
+    const collaborationPayload = sanitizeCollaborationPayload(
+      name || firstDefined(sources, ['tool', 'toolName', 'tool_name']) || method,
+      argumentsValue,
+      promptValue
+    );
+    const collectedFileChanges = collectFileChanges(raw, data, payload, limits);
 
     const normalized = {
       _normalizedThinkingEntry: true,
@@ -396,7 +481,7 @@
       stderr,
       command: plainText(firstDefined(sources, ['command', 'cmd'])),
       cwd: plainText(firstDefined(sources, ['cwd', 'workdir', 'workingDirectory'])),
-      argumentsText: plainText(argumentsValue),
+      argumentsText: plainText(collaborationPayload.argumentsValue),
       commandActionsText: plainText(commandActionsValue),
       durationMs: hasDuration ? Number(durationValue) : null,
       server: plainText(firstDefined(sources, ['server', 'serverName', 'server_name', 'mcpServer'])),
@@ -405,7 +490,14 @@
       resourceUri: plainText(firstDefined(sources, ['resourceUri', 'resource_uri', 'uri'])),
       senderThreadId: plainText(firstDefined(sources, ['senderThreadId', 'sender_thread_id'])),
       receiverThreadIdsText: plainText(receiverThreadIdsValue),
-      prompt: plainText(firstDefined(sources, ['prompt'])),
+      agentThreadId: plainText(firstDefined(sources, ['agentThreadId', 'agent_thread_id'])),
+      agentPath: plainText(firstDefined(sources, ['agentPath', 'agent_path'])),
+      agentNickname: plainText(firstDefined(sources, ['agentNickname', 'agent_nickname'])),
+      agentRole: plainText(firstDefined(sources, ['agentRole', 'agent_role'])),
+      parentThreadId: plainText(firstDefined(sources, ['parentThreadId', 'parent_thread_id'])),
+      subagentKind: plainText(firstDefined(sources, ['subagentKind', 'subagent_kind'])),
+      prompt: plainText(collaborationPayload.promptValue),
+      encryptedPrompt: collaborationPayload.encrypted,
       agentsStatesText: plainText(agentsStatesValue),
       actionDataText: plainText(actionDataValue),
       model: plainText(firstDefined(sources, ['model'])),
@@ -423,9 +515,16 @@
       completedAt: completedAtValue == null ? '' : identifier(completedAtValue),
       timestamp,
       updatedAt,
-      fileChanges: collectFileChanges(raw, data, payload, limits),
+      fileChanges: collectedFileChanges.fileChanges,
       textTruncated: raw.textTruncated === true || data.textTruncated === true,
       outputTruncated: raw.outputTruncated === true || data.outputTruncated === true,
+      progressTruncated: hasTruncationFlag(sources, ['progressTruncated', 'progress_truncated']),
+      argumentsTruncated: hasTruncationFlag(sources, ['argumentsTruncated', 'arguments_truncated'])
+        || structuredValueIsTruncated(argumentsValue),
+      resultTruncated: hasTruncationFlag(sources, ['resultTruncated', 'result_truncated'])
+        || structuredValueIsTruncated(resultValue),
+      fileChangesTruncated: hasTruncationFlag(sources, ['fileChangesTruncated', 'file_changes_truncated'])
+        || collectedFileChanges.truncated,
       _present: {
         status: rawStatus !== undefined || hasSuccess,
         success: hasSuccess,
@@ -532,6 +631,28 @@
     };
   }
 
+  const STABLE_ENTITY_FIELDS = Object.freeze(['itemId', 'callId', 'requestId', 'processId']);
+  const CONTEXT_IDENTITY_FIELDS = Object.freeze(['canonicalConversationKey', 'runId', 'turnId']);
+
+  function structuredActivityPriority(entry) {
+    const hasActivityIdentity = Boolean(
+      entry.activityKey
+      || entry.activityKeys?.length
+      || Number(entry.revision || 0) > 0
+    );
+    if (entry.canonicalConversationKey && hasActivityIdentity) return 2;
+    return hasActivityIdentity ? 1 : 0;
+  }
+
+  function stableEntityIdentityMatches(group, entry) {
+    const identity = group.identity || {};
+    return STABLE_ENTITY_FIELDS.some((field) => (
+      identity[field]
+      && entry[field]
+      && identity[field] === entry[field]
+    ));
+  }
+
   function scopeCompatible(group, entry) {
     const identity = group.identity || {};
     if (
@@ -544,6 +665,21 @@
     if (identity.runId && entry.runId && identity.runId !== entry.runId) return false;
     if (identity.turnId && entry.turnId && identity.turnId !== entry.turnId) return false;
     return true;
+  }
+
+  function narrowAmbiguousContextMatches(groups, matchingKeys, entry) {
+    let narrowed = new Set(matchingKeys);
+    for (const field of CONTEXT_IDENTITY_FIELDS) {
+      if (entry[field]) continue;
+      const explicitValues = new Set([...narrowed]
+        .map((key) => identifier(groups.get(key)?.identity?.[field]))
+        .filter(Boolean));
+      if (explicitValues.size <= 1) continue;
+      narrowed = new Set([...narrowed].filter((key) => (
+        !identifier(groups.get(key)?.identity?.[field])
+      )));
+    }
+    return narrowed;
   }
 
   function mergeBoundedText(current, incoming, mode, maximum, tail = false) {
@@ -580,7 +716,12 @@
         truncated: normalized.truncated || previous.truncated || false,
       });
     }
-    return [...byPath.values()].slice(-limits.maxFileChanges);
+    const fileChanges = [...byPath.values()];
+    return {
+      fileChanges: fileChanges.slice(-limits.maxFileChanges),
+      truncated: fileChanges.length > limits.maxFileChanges
+        || fileChanges.some((change) => change.truncated),
+    };
   }
 
   function createGroup(entry) {
@@ -611,6 +752,12 @@
       resourceUri: '',
       senderThreadId: '',
       receiverThreadIdsText: '',
+      agentThreadId: '',
+      agentPath: '',
+      agentNickname: '',
+      agentRole: '',
+      parentThreadId: '',
+      subagentKind: '',
       prompt: '',
       agentsStatesText: '',
       actionDataText: '',
@@ -633,41 +780,59 @@
       fileChanges: [],
       textTruncated: false,
       outputTruncated: false,
+      progressTruncated: false,
+      argumentsTruncated: false,
+      resultTruncated: false,
+      fileChangesTruncated: false,
       _index: entry._index,
       _events: [],
+      _structuredFieldPriority: Object.create(null),
+      _identityFieldPriority: Object.create(null),
     };
   }
 
   function fillIdentity(group, entry) {
+    const priority = structuredActivityPriority(entry);
     for (const key of [
       'canonicalConversationKey',
       'runId',
       'turnId',
-      'activityKey',
-      'itemId',
-      'callId',
-      'requestId',
-      'processId',
     ]) {
       if (!group.identity[key] && entry[key]) group.identity[key] = entry[key];
+    }
+    for (const key of ['activityKey', ...STABLE_ENTITY_FIELDS]) {
+      if (!entry[key]) continue;
+      const previousPriority = group._identityFieldPriority[key] ?? -1;
+      if (!group.identity[key] || priority > previousPriority) {
+        group.identity[key] = entry[key];
+        group._identityFieldPriority[key] = priority;
+      }
     }
     if (group.identity.summaryIndex == null && entry.summaryIndex != null) {
       group.identity.summaryIndex = entry.summaryIndex;
     }
   }
 
+  function assignPreferredStructuredField(group, entry, field, incoming = entry[field]) {
+    if (incoming === undefined || incoming === null || incoming === '') return false;
+    const priority = structuredActivityPriority(entry);
+    const previousPriority = group._structuredFieldPriority[field] ?? -1;
+    if (group[field] && priority < previousPriority) return false;
+    group[field] = incoming;
+    group._structuredFieldPriority[field] = priority;
+    return true;
+  }
+
   function mergeEntryIntoGroup(group, entry, limits, options = {}) {
     if (!options.replay) group._events.push(entry);
     fillIdentity(group, entry);
-    group.kind = group.kind || entry.kind;
+    assignPreferredStructuredField(group, entry, 'kind');
     group.category = preferredCategory(group.category, entry.category);
-    if (entry.itemType) {
-      group.itemType = entry.itemType;
-      group.identity.itemType = entry.itemType;
+    if (assignPreferredStructuredField(group, entry, 'itemType')) {
+      group.identity.itemType = group.itemType;
     }
-    if (entry.source) {
-      group.source = entry.source;
-      group.identity.source = entry.source;
+    if (assignPreferredStructuredField(group, entry, 'source')) {
+      group.identity.source = group.source;
     }
     if (entry.explicitGroupKey) {
       group.explicitGroupKey = !group.explicitGroupKey
@@ -675,7 +840,7 @@
         : [group.explicitGroupKey, entry.explicitGroupKey].sort()[0];
     }
     if (entry.method) {
-      group.method = entry.method;
+      assignPreferredStructuredField(group, entry, 'method');
       if (!group.methods.includes(entry.method)) group.methods.push(entry.method);
     }
     for (const activityKey of entry.activityKeys || []) {
@@ -696,7 +861,6 @@
         ['output', entry.output],
         ['stdout', entry.stdout],
         ['stderr', entry.stderr],
-        ['resultText', entry.resultText],
       ]) {
         const mergedOutput = mergeBoundedText(
           group[field],
@@ -708,9 +872,25 @@
         group[field] = mergedOutput.value;
         group.outputTruncated ||= entry.outputTruncated || mergedOutput.truncated;
       }
-      group.fileChanges = mergeFileChanges(group.fileChanges, entry.fileChanges, limits);
+      const mergedResult = mergeBoundedText(
+        group.resultText,
+        entry.resultText,
+        entry.outputMode,
+        limits.maxOutputChars,
+        true
+      );
+      group.resultText = mergedResult.value;
+      group.resultTruncated ||= entry.resultTruncated || mergedResult.truncated;
+      const mergedFileChanges = mergeFileChanges(group.fileChanges, entry.fileChanges, limits);
+      group.fileChanges = mergedFileChanges.fileChanges;
+      group.fileChangesTruncated ||= entry.fileChangesTruncated || mergedFileChanges.truncated;
       group.revision = Math.max(group.revision, entry.revision);
     }
+
+    group.progressTruncated ||= entry.progressTruncated;
+    group.argumentsTruncated ||= entry.argumentsTruncated;
+    group.resultTruncated ||= entry.resultTruncated;
+    group.fileChangesTruncated ||= entry.fileChangesTruncated;
 
     for (const field of [
       'name',
@@ -724,6 +904,12 @@
       'resourceUri',
       'senderThreadId',
       'receiverThreadIdsText',
+      'agentThreadId',
+      'agentPath',
+      'agentNickname',
+      'agentRole',
+      'parentThreadId',
+      'subagentKind',
       'prompt',
       'agentsStatesText',
       'actionDataText',
@@ -732,7 +918,7 @@
       'query',
       'action',
     ]) {
-      if (entry[field]) group[field] = entry[field];
+      assignPreferredStructuredField(group, entry, field);
     }
 
     if (!staleRevision) {
@@ -838,6 +1024,12 @@
       resourceUri: group.resourceUri || null,
       senderThreadId: group.senderThreadId || null,
       receiverThreadIdsText: group.receiverThreadIdsText || null,
+      agentThreadId: group.agentThreadId || null,
+      agentPath: group.agentPath || null,
+      agentNickname: group.agentNickname || null,
+      agentRole: group.agentRole || null,
+      parentThreadId: group.parentThreadId || null,
+      subagentKind: group.subagentKind || null,
       prompt: group.prompt || null,
       agentsStatesText: group.agentsStatesText || null,
       actionDataText: group.actionDataText || null,
@@ -860,6 +1052,10 @@
       fileChanges: group.fileChanges.map((change) => ({ ...change })),
       textTruncated: group.textTruncated,
       outputTruncated: group.outputTruncated,
+      progressTruncated: group.progressTruncated,
+      argumentsTruncated: group.argumentsTruncated,
+      resultTruncated: group.resultTruncated,
+      fileChangesTruncated: group.fileChangesTruncated,
     };
   }
 
@@ -880,6 +1076,12 @@
       entry.resourceUri,
       entry.senderThreadId,
       entry.receiverThreadIdsText,
+      entry.agentThreadId,
+      entry.agentPath,
+      entry.agentNickname,
+      entry.agentRole,
+      entry.parentThreadId,
+      entry.subagentKind,
       entry.prompt,
       entry.agentsStatesText,
       entry.actionDataText,
@@ -910,6 +1112,12 @@
       'resourceUri',
       'senderThreadId',
       'receiverThreadIdsText',
+      'agentThreadId',
+      'agentPath',
+      'agentNickname',
+      'agentRole',
+      'parentThreadId',
+      'subagentKind',
       'prompt',
       'agentsStatesText',
       'actionDataText',
@@ -928,14 +1136,21 @@
       const original = String(entry[field] || '');
       const bounded = boundPrefix(original, remaining);
       entry[field] = bounded.value;
-      if (bounded.truncated) entry.textTruncated = true;
+      if (bounded.truncated) {
+        if (field === 'argumentsText') entry.argumentsTruncated = true;
+        else if (field === 'progress') entry.progressTruncated = true;
+        else entry.textTruncated = true;
+      }
       remaining = Math.max(0, remaining - bounded.value.length);
     }
     for (const field of tailFields) {
       const original = String(entry[field] || '');
       const bounded = boundTail(original, remaining);
       entry[field] = bounded.value;
-      if (bounded.truncated) entry.outputTruncated = true;
+      if (bounded.truncated) {
+        if (field === 'resultText') entry.resultTruncated = true;
+        else entry.outputTruncated = true;
+      }
       remaining = Math.max(0, remaining - bounded.value.length);
     }
 
@@ -947,15 +1162,17 @@
         const bounded = boundPrefix(change[field], remaining);
         change[field] = bounded.value;
         change.truncated ||= bounded.truncated;
+        entry.fileChangesTruncated ||= bounded.truncated;
         remaining = Math.max(0, remaining - bounded.value.length);
       }
       const diff = boundPrefix(change.diff, remaining, '\n...[diff truncated]');
       change.diff = diff.value;
       change.truncated ||= diff.truncated;
+      entry.fileChangesTruncated ||= diff.truncated;
       remaining = Math.max(0, remaining - diff.value.length);
       boundedChanges.push(change);
     }
-    if (boundedChanges.length < (entry.fileChanges || []).length) entry.textTruncated = true;
+    if (boundedChanges.length < (entry.fileChanges || []).length) entry.fileChangesTruncated = true;
     entry.fileChanges = boundedChanges;
     return entry;
   }
@@ -999,7 +1216,10 @@
         && entry.progress == null && !entry.query && !entry.action
         && !entry.fileChanges.length && !entry.status && !entry.error
         && !entry.final && !entry.terminal && entry.success == null
-        && entry.exitCode == null && entry.durationMs == null) {
+        && entry.exitCode == null && entry.durationMs == null
+        && !entry.textTruncated && !entry.outputTruncated
+        && !entry.progressTruncated && !entry.argumentsTruncated
+        && !entry.resultTruncated && !entry.fileChangesTruncated) {
         continue;
       }
 
@@ -1012,16 +1232,25 @@
         const group = key ? groups.get(key) : null;
         if (group && scopeCompatible(group, entry)) matchingKeys.add(key);
       }
+      for (const [key, candidate] of groups) {
+        if (
+          stableEntityIdentityMatches(candidate, entry)
+          && scopeCompatible(candidate, entry)
+        ) {
+          matchingKeys.add(key);
+        }
+      }
+      const compatibleMatchingKeys = narrowAmbiguousContextMatches(groups, matchingKeys, entry);
 
       let group;
-      if (!matchingKeys.size) {
+      if (!compatibleMatchingKeys.size) {
         group = createGroup(entry);
         groups.set(group.groupKey, group);
-      } else if (matchingKeys.size === 1) {
-        group = groups.get([...matchingKeys][0]);
+      } else if (compatibleMatchingKeys.size === 1) {
+        group = groups.get([...compatibleMatchingKeys][0]);
       } else {
-        group = replayMergedGroup(groups, [...matchingKeys], limits);
-        const mergedKeys = new Set(matchingKeys);
+        group = replayMergedGroup(groups, [...compatibleMatchingKeys], limits);
+        const mergedKeys = new Set(compatibleMatchingKeys);
         for (const [alias, key] of aliases) {
           if (mergedKeys.has(key)) aliases.set(alias, group.groupKey);
         }

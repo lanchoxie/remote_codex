@@ -197,6 +197,71 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
     assert.strictEqual(runner.runtime.lastError, null, 'same-turn assistant progress must clear a retry error');
     assert.strictEqual(runner.runtime.lastCodexError, null, 'same-turn assistant progress must clear retry metadata');
 
+    const projectedOutputStart = events.length;
+    await runner.handleNotification({
+      method: 'turn/started',
+      params: {
+        turn: { id: 'turn-phase-projection', status: { type: 'inProgress' } },
+      },
+    });
+    await runner.handleNotification({
+      method: 'item/started',
+      params: {
+        turnId: 'turn-phase-projection',
+        item: {
+          id: 'commentary-without-delta-phase',
+          type: 'agentMessage',
+          phase: 'commentary',
+        },
+      },
+    });
+    await runner.handleNotification({
+      method: 'item/agentMessage/delta',
+      params: {
+        turnId: 'turn-phase-projection',
+        itemId: 'commentary-without-delta-phase',
+        delta: 'progress must stay out of the final transcript',
+      },
+    });
+    await runner.handleNotification({
+      method: 'item/started',
+      params: {
+        turnId: 'turn-phase-projection',
+        item: {
+          id: 'final-without-delta-phase',
+          type: 'agentMessage',
+          phase: 'final_answer',
+        },
+      },
+    });
+    await runner.handleNotification({
+      method: 'item/agentMessage/delta',
+      params: {
+        turnId: 'turn-phase-projection',
+        itemId: 'final-without-delta-phase',
+        delta: 'final answer only',
+      },
+    });
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: {
+        turn: { id: 'turn-phase-projection', status: { type: 'completed' } },
+      },
+    });
+    assert.strictEqual(
+      runner.pendingTurnCompletions.has('turn-phase-projection'),
+      true,
+      'turn completion should wait briefly for a potentially late identified assistant item'
+    );
+    await runner.flushPendingTurnCompletion('turn-phase-projection');
+    const projectedOutputs = events.slice(projectedOutputStart)
+      .filter((event) => event.type === 'session.output');
+    assert.deepStrictEqual(
+      projectedOutputs.map((event) => event.chunk),
+      ['final answer only'],
+      'a delta must inherit item/started phase so commentary cannot be concatenated into final output'
+    );
+
     setActiveTurn('turn-terminal-error');
     runner.runtime.waitingOnApproval = true;
     runner.runtime.waitingOnUserInput = true;
@@ -313,7 +378,122 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
   }
 }
 
+async function verifyPendingAcceptanceInterruptAndRuntimeRevision() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-pending-interrupt-'));
+  fs.writeFileSync(path.join(baseHome, 'auth.json'), '{}\n', 'utf8');
+  fs.writeFileSync(path.join(baseHome, 'config.toml'), '', 'utf8');
+  const events = [];
+  const interruptCalls = [];
+  const pendingRunner = new CodexAppServerRunner({
+    hostId: 'runner-pending-interrupt-host',
+    sessionId: 'runner-pending-interrupt-session',
+    bridgeSessionId: 'runner-pending-interrupt-session',
+    runId: 'runner-pending-interrupt-run',
+    title: 'Runner pending interrupt',
+    cwd: process.cwd(),
+    launchMode: 'fresh',
+    codexHome: baseHome,
+    postEvent: async (event) => events.push(event),
+  });
+  pendingRunner.threadId = 'runner-pending-interrupt-thread';
+  pendingRunner.sessionId = pendingRunner.threadId;
+  pendingRunner.nativeThreadId = pendingRunner.threadId;
+  pendingRunner.activeClientRequestId = 'pending-client-request';
+  pendingRunner.runtime.phase = 'submitting-turn';
+  pendingRunner.runtime.busy = true;
+  pendingRunner.rpc = {
+    request: async (method, params) => {
+      if (method === 'turn/interrupt') interruptCalls.push(params);
+      return {};
+    },
+  };
+
+  try {
+    await assert.rejects(
+      pendingRunner.sendInput('must not replace pending request identity', {
+        clientRequestId: 'replacement-request',
+      }),
+      (error) => error?.code === 'session_input_preparing'
+    );
+    assert.strictEqual(pendingRunner.activeClientRequestId, 'pending-client-request');
+
+    const pending = await pendingRunner.interruptTurn({
+      interruptRequestId: 'interrupt-pending-1',
+      expectedClientRequestId: 'pending-client-request',
+    });
+    assert.strictEqual(pending.status, 'pending');
+    assert.strictEqual(pendingRunner.runtime.phase, 'interrupting');
+    assert.strictEqual(interruptCalls.length, 0, 'turn/interrupt must wait until Codex supplies the turn ID');
+
+    await pendingRunner.handleNotification({
+      method: 'turn/started',
+      params: { turn: { id: 'late-native-turn', status: { type: 'inProgress' } } },
+    });
+    assert.deepStrictEqual(interruptCalls, [{
+      threadId: 'runner-pending-interrupt-thread',
+      turnId: 'late-native-turn',
+    }]);
+    assert.strictEqual(pendingRunner.runtime.phase, 'interrupting');
+    assert.strictEqual(pendingRunner.pendingInterruptIntent, null);
+    assert(events.some((event) => (
+      event.type === 'session.interrupt_result'
+      && event.interruptRequestId === 'interrupt-pending-1'
+      && event.status === 'accepted'
+      && event.turnId === 'late-native-turn'
+    )), 'the late turn must publish a matching accepted interrupt result');
+
+    const revisions = events
+      .filter((event) => event.type === 'session.runtime_updated')
+      .map((event) => event.patch?.runtimeRevision);
+    assert(revisions.length >= 2);
+    assert(revisions.every((revision, index) => (
+      Number.isSafeInteger(revision)
+      && revision > 0
+      && (index === 0 || revision > revisions[index - 1])
+    )), 'Runner runtime revisions must increase monotonically');
+
+    const mismatch = await pendingRunner.interruptTurn({
+      interruptRequestId: 'interrupt-stale-target',
+      expectedTurnId: 'different-turn',
+    });
+    assert.strictEqual(mismatch.status, 'no_active');
+    assert.strictEqual(mismatch.reason, 'active_turn_changed');
+    assert.strictEqual(interruptCalls.length, 1, 'a stale interrupt target must not hit the active turn');
+
+    await pendingRunner.handleNotification({
+      method: 'turn/completed',
+      params: { turn: { id: 'late-native-turn', status: { type: 'interrupted' } } },
+    });
+    pendingRunner.activeClientRequestId = 'terminal-before-start-request';
+    pendingRunner.runtime.phase = 'submitting-turn';
+    pendingRunner.runtime.busy = true;
+    const terminalPending = await pendingRunner.interruptTurn({
+      interruptRequestId: 'interrupt-terminal-before-start',
+      expectedClientRequestId: 'terminal-before-start-request',
+    });
+    assert.strictEqual(terminalPending.status, 'pending');
+    await pendingRunner.handleNotification({
+      method: 'turn/completed',
+      params: { turn: { id: 'terminal-without-start', status: { type: 'completed' } } },
+    });
+    assert.strictEqual(interruptCalls.length, 1, 'an already terminal turn must not receive a late interrupt RPC');
+    assert.strictEqual(pendingRunner.pendingInterruptIntent, null);
+    assert.strictEqual(pendingRunner.activeTurnId, null);
+    assert.strictEqual(pendingRunner.activeClientRequestId, null);
+    assert(events.some((event) => (
+      event.type === 'session.interrupt_result'
+      && event.interruptRequestId === 'interrupt-terminal-before-start'
+      && event.status === 'no_active'
+      && event.reason === 'turn_already_completed'
+    )), 'terminal-before-start ordering must explicitly settle the pending interrupt');
+  } finally {
+    pendingRunner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
 verifyRetryRecoveryAndTerminalErrorState()
+  .then(verifyPendingAcceptanceInterruptAndRuntimeRevision)
   .then(() => console.log('runner turn runtime state assertions passed'))
   .catch((error) => {
     console.error(error);

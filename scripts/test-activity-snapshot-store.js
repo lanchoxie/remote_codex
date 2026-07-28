@@ -110,6 +110,69 @@ assert.strictEqual(
   null
 );
 
+const relayRetentionStore = new ActivitySnapshotStore();
+const retainedOutput = relayRetentionStore.accept('epoch-retention', 'h::output', {
+  ...base,
+  itemId: 'large-output',
+  activityRevision: 1,
+  output: 'o'.repeat(128 * 1024),
+});
+assert.strictEqual(retainedOutput.outputTruncated, true, 'Relay output clipping must set outputTruncated');
+assert(
+  retainedOutput.output.endsWith('...[activity truncated]'),
+  'Relay output clipping should retain an explicit marker in the stored preview'
+);
+const retainedStdout = relayRetentionStore.accept('epoch-retention', 'h::stdout', {
+  ...base,
+  itemId: 'large-stdout',
+  activityRevision: 1,
+  stdout: 's'.repeat(96 * 1024),
+});
+assert.strictEqual(retainedStdout.outputTruncated, true, 'Relay stdout clipping must set outputTruncated');
+const retainedStderr = relayRetentionStore.accept('epoch-retention', 'h::stderr', {
+  ...base,
+  itemId: 'large-stderr',
+  activityRevision: 1,
+  stderr: 'e'.repeat(96 * 1024),
+});
+assert.strictEqual(retainedStderr.outputTruncated, true, 'Relay stderr clipping must set outputTruncated');
+const retainedProgress = relayRetentionStore.accept('epoch-retention', 'h::progress', {
+  ...base,
+  itemId: 'large-progress',
+  activityRevision: 1,
+  progress: 'p'.repeat(32 * 1024),
+});
+assert.strictEqual(
+  retainedProgress.progressTruncated,
+  true,
+  'Relay progress clipping must set progressTruncated'
+);
+
+const structuredRetentionStore = new ActivitySnapshotStore({ maxRecordBytes: 1024 });
+const discardedStructured = structuredRetentionStore.accept('epoch-retention', 'h::structured-drop', {
+  ...base,
+  itemId: 'discarded-structured-fields',
+  activityRevision: 1,
+  arguments: { payload: 'a'.repeat(48 * 1024) },
+  result: { payload: 'r'.repeat(48 * 1024) },
+  fileChanges: [{ path: 'src/large.js', diff: `+${'x'.repeat(96 * 1024)}` }],
+});
+assert.strictEqual(
+  discardedStructured.argumentsTruncated,
+  true,
+  'Relay record-budget compaction must disclose discarded tool input'
+);
+assert.strictEqual(
+  discardedStructured.resultTruncated,
+  true,
+  'Relay record-budget compaction must disclose discarded tool results'
+);
+assert.strictEqual(
+  discardedStructured.fileChangesTruncated,
+  true,
+  'Relay record-budget compaction must disclose discarded file changes'
+);
+
 accepted.text = 'mutated outside';
 assert.strictEqual(store.snapshot('h::c')[0].text, 'two', 'accepted records should not expose store state');
 

@@ -813,6 +813,25 @@ async function main() {
   assert.strictEqual(cached.lookup('model-binding-a').availability, 'available');
   assert.strictEqual(cached.cacheState, 'fresh');
 
+  let cacheOnlyFetches = 0;
+  const cacheOnlyService = new ModelCatalogService({
+    store,
+    staleMs: 0,
+    now: () => '2026-07-18T00:00:00.000Z',
+    fetchLivePage: async () => { cacheOnlyFetches += 1; },
+    fetchProviderPage: async () => { cacheOnlyFetches += 1; },
+  });
+  const cacheOnlyCatalog = cacheOnlyService.getCached(request);
+  assert(cacheOnlyCatalog, 'send-path validation should be able to reuse stale verified evidence');
+  assert.strictEqual(cacheOnlyCatalog.cacheState, 'stale');
+  assert.strictEqual(cacheOnlyCatalog.lookup('model-binding-a').availability, 'available');
+  assert.strictEqual(cacheOnlyFetches, 0, 'cache-only validation must never contact the Host or provider');
+  assert.strictEqual(
+    cacheOnlyService.getCached({ ...request, runId: 'missing-cache-run' }),
+    null,
+    'a cache miss must return immediately instead of starting a catalog refresh'
+  );
+
   let inheritedCatalogFetches = 0;
   const inheritedCatalogService = new ModelCatalogService({
     store,

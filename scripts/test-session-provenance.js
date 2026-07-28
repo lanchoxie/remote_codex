@@ -305,6 +305,55 @@ async function main() {
   await assert.rejects(
     service.requestStopRun({
       identity: { hostId: 'host-a', sessionId: 'native-a' },
+      requireExpectedRun: true,
+      expectedRunId: 'run-not-the-parent',
+      expectedBindingFingerprint: asxs.bindingFingerprint,
+      expectedBindingProvided: true,
+      expectedRunStatus: 'live',
+      expectedRunStatusProvided: true,
+      stopRequestId: 'stop-wrong-pending-parent',
+    }),
+    (error) => error instanceof SessionContractError && error.code === 'session_run_changed',
+    'a stale run must not redirect Stop to an unrelated pending child'
+  );
+  await assert.rejects(
+    service.requestStopRun({
+      identity: { hostId: 'host-a', sessionId: 'native-a' },
+      requireExpectedRun: true,
+      expectedRunId: 'run-1',
+      expectedBindingFingerprint: other.bindingFingerprint,
+      expectedBindingProvided: true,
+      expectedRunStatus: 'live',
+      expectedRunStatusProvided: true,
+      stopRequestId: 'stop-wrong-parent-binding',
+    }),
+    (error) => error instanceof SessionContractError && error.code === 'session_run_changed',
+    'a parent binding mismatch must not redirect Stop to its pending child'
+  );
+  const redirectedPendingStop = await service.requestStopRun({
+    identity: { hostId: 'host-a', sessionId: 'native-a' },
+    requireExpectedRun: true,
+    expectedRunId: 'run-1',
+    expectedBindingFingerprint: asxs.bindingFingerprint,
+    expectedBindingProvided: true,
+    expectedRunStatus: 'live',
+    expectedRunStatusProvided: true,
+    stopRequestId: 'stop-redirected-pending-child',
+  });
+  assert.strictEqual(redirectedPendingStop.runId, 'run-2');
+  assert.strictEqual(redirectedPendingStop.redirectedFromRunId, 'run-1');
+  assert.strictEqual(
+    redirectedPendingStop.record.runs['run-2'].stopRequestId,
+    'stop-redirected-pending-child'
+  );
+  await service.cancelStopRun({
+    identity: { hostId: 'host-a', sessionId: 'native-a' },
+    runId: 'run-2',
+    stopRequestId: 'stop-redirected-pending-child',
+  });
+  await assert.rejects(
+    service.requestStopRun({
+      identity: { hostId: 'host-a', sessionId: 'native-a' },
       runId: 'run-1',
       stopRequestId: 'bulk-stop-during-pending-run',
     }),
@@ -313,6 +362,23 @@ async function main() {
   );
   assert.strictEqual(resume.run.apiBinding.bindingFingerprint, asxs.bindingFingerprint);
   assert.strictEqual(resume.record.runs['run-1'].status, 'live', 'planning alone must not stop the prior live run');
+  const pendingStop = await service.requestStopRun({
+    identity: { hostId: 'host-a', sessionId: 'native-a' },
+    requireExpectedRun: true,
+    expectedRunId: 'run-2',
+    expectedBindingFingerprint: asxs.bindingFingerprint,
+    expectedBindingProvided: true,
+    expectedRunStatus: 'pending',
+    expectedRunStatusProvided: true,
+    stopRequestId: 'stop-pending-replacement',
+  });
+  assert.strictEqual(pendingStop.record.runs['run-2'].status, 'pending');
+  assert.strictEqual(pendingStop.record.runs['run-2'].stopRequestId, 'stop-pending-replacement');
+  await service.cancelStopRun({
+    identity: { hostId: 'host-a', sessionId: 'native-a' },
+    runId: 'run-2',
+    stopRequestId: 'stop-pending-replacement',
+  });
   await service.confirmRun({
     identity: { hostId: 'host-a', sessionId: 'native-a' },
     runId: 'run-2',
@@ -833,6 +899,25 @@ async function main() {
   );
   assert.strictEqual(restoredParent.runs['run-parent-live'].status, 'live');
   assert.strictEqual(restoredParent.runs['run-child-pending'].status, 'failed');
+  await service.planRun({
+    identity: { hostId: 'host-parent-restore', sessionId: 'parent-restore' },
+    runId: 'run-child-stopped',
+    launchMode: 'resume',
+  });
+  await service.stopRun({
+    identity: { hostId: 'host-parent-restore', sessionId: 'parent-restore' },
+    runId: 'run-child-stopped',
+  });
+  const parentAfterPendingChildStop = service.getSessionRecord({
+    hostId: 'host-parent-restore',
+    sessionId: 'parent-restore',
+  });
+  assert.strictEqual(
+    parentAfterPendingChildStop.activeRunId,
+    'run-parent-live',
+    'stopping a pending child must restore its still-live parent for its queued Stop terminal event'
+  );
+  assert.strictEqual(parentAfterPendingChildStop.runs['run-child-stopped'].status, 'stopped');
 
   const firstPending = await service.planRun({
     identity: { hostId: 'host-superseded', sessionId: 'superseded' },

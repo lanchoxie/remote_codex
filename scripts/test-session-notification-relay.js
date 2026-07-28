@@ -328,6 +328,99 @@ async function main() {
     );
     assert.deepStrictEqual(compatibleProjection.body.messages, aliasProjection.body.messages);
 
+    await postEvents(port, [{
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: 'native-1',
+      nativeThreadId: 'native-1',
+      source: 'codex-jsonl',
+      speaker: 'assistant',
+      text: 'same identity, rollout-authoritative representation',
+      timestamp: '2099-01-01T00:00:02.100Z',
+      assistantObservation: {
+        ...first,
+        previewText: 'same identity, rollout-authoritative representation',
+      },
+    }], 'same-id-rollout-update');
+    let updatedDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/native-1/detail?hostId=${HOST_ID}`
+    );
+    const firstIdentityEntries = updatedDetail.body.transcript.filter((entry) => (
+      entry.assistantMessageId === first.assistantMessageId
+    ));
+    assert.strictEqual(firstIdentityEntries.length, 1, 'one assistant ID must remain one transcript entry');
+    assert.strictEqual(firstIdentityEntries[0].text, 'same identity, rollout-authoritative representation');
+    assert.strictEqual(firstIdentityEntries[0].source, 'codex-jsonl');
+
+    const transitionalText = 'an older history projection and its identified live message are one reply';
+    await postEvents(port, [{
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: 'native-1',
+      nativeThreadId: 'native-1',
+      source: 'codex-jsonl',
+      speaker: 'assistant',
+      text: transitionalText,
+      timestamp: '2099-01-01T00:01:00.000Z',
+    }], 'legacy-unidentified-history');
+    const identifiedTransition = observation(
+      'assistant-transition-identified',
+      '2099-01-01T00:01:00.100Z',
+      transitionalText
+    );
+    await postEvents(port, [{
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: 'native-1',
+      nativeThreadId: 'native-1',
+      source: 'codex-app-server',
+      speaker: 'assistant',
+      text: transitionalText,
+      timestamp: identifiedTransition.assistantAt,
+      assistantObservation: identifiedTransition,
+    }], 'identified-history-transition');
+    updatedDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/native-1/detail?hostId=${HOST_ID}`
+    );
+    const transitionalEntries = updatedDetail.body.transcript.filter((entry) => entry.text === transitionalText);
+    assert.strictEqual(
+      transitionalEntries.length,
+      1,
+      'a nearby unidentified JSONL copy must be absorbed by its identified assistant message'
+    );
+    assert.strictEqual(transitionalEntries[0].assistantMessageId, identifiedTransition.assistantMessageId);
+
+    const repeatedText = 'two legitimate messages may have exactly the same text';
+    const repeatedA = observation('assistant-repeat-a', '2099-01-01T00:02:00.000Z', repeatedText);
+    const repeatedB = observation('assistant-repeat-b', '2099-01-01T00:02:01.000Z', repeatedText);
+    await postEvents(port, [repeatedA, repeatedB].map((item) => ({
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: 'native-1',
+      nativeThreadId: 'native-1',
+      source: 'codex-app-server',
+      speaker: 'assistant',
+      text: repeatedText,
+      timestamp: item.assistantAt,
+      assistantObservation: item,
+    })), 'distinct-ids-same-text');
+    updatedDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/native-1/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      updatedDetail.body.transcript.filter((entry) => (
+        ['assistant-repeat-a', 'assistant-repeat-b'].includes(entry.assistantMessageId)
+      )).length,
+      2,
+      'different assistant IDs must not be collapsed by text equality or containment'
+    );
+
     console.log('session notification Relay assertions passed');
   } catch (error) {
     error.message += `\nRelay output:\n${output.join('')}`;

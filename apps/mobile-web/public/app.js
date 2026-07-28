@@ -37,9 +37,12 @@ const state = {
   streamDetailRecoveryCanonicalKeys: new Map(),
   activitySnapshotRecoveryTasks: new Map(),
   transcripts: new Map(),
+  transcriptTombstones: new Map(),
   alerts: new Map(),
   dismissedAlerts: new Map(),
   runtime: new Map(),
+  runtimeApplyGenerations: new Map(),
+  runtimeStreamGenerations: new Map(),
   diagnostics: new Map(),
   requests: new Map(),
   receivedFiles: new Map(),
@@ -210,6 +213,10 @@ const state = {
   },
   localAgentActionBusyId: null,
   hostRestartBusyId: null,
+  hostRecoveryResults: new Map(),
+  hostRecoveryResultTimers: new Map(),
+  hostCodexUpdateBusyId: null,
+  hostCodexUpdates: new Map(),
   sessionLaunchBusy: new Map(),
   sessionApiRebindBusyKeys: new Set(),
   sessionRebindFailures: new Map(),
@@ -235,6 +242,10 @@ const state = {
     resultsByKey: new Map(),
     operationId: 0,
     selection: null,
+    hostId: '',
+    codexRuntime: null,
+    codexUpdateOperation: null,
+    updateResult: null,
   },
   exportDialog: {
     open: false,
@@ -294,9 +305,13 @@ const state = {
     mountedComposerSessionKey: '',
     mountingComposerDraft: false,
     activeDraftsBySession: new Map(),
+    sentDraftSnapshotsBySession: new Map(),
     pendingComposerDraftsBySession: new Map(),
     composerSubmissionsBySession: new Map(),
+    interruptBusyKeys: new Set(),
+    interruptOperationsBySession: new Map(),
     inputAnswersByRequest: new Map(),
+    respondingRequestKeys: new Set(),
     recentSubmissions: new Map(),
     steerNotice: null,
     apiSwitchNoticesBySession: new Map(),
@@ -341,6 +356,9 @@ const MAX_COMPOSER_UPLOAD_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const COMPOSER_DRAFT_SESSION_LIMIT = 32;
+const SENT_DRAFT_SNAPSHOT_TTL_MS = 30 * 60 * 1000;
+const SENT_DRAFT_SNAPSHOT_LIMIT = 32;
+const OPTIMISTIC_TRANSCRIPT_GRACE_MS = 30 * 1000;
 const TRANSCRIPT_RENDER_WINDOW = 160;
 const TRANSCRIPT_RENDER_INCREMENT = 160;
 const TRANSCRIPT_RENDER_MIN_WINDOW = 32;
@@ -352,6 +370,10 @@ const CLIENT_DIAGNOSTIC_RECENT_DEDUPE_WINDOW = 200;
 const LIVE_THINKING_DIAGNOSTIC_WINDOW = 240;
 const LIVE_THINKING_ACTIVITY_ENTRY_LIMIT = 160;
 const LIVE_THINKING_TRANSCRIPT_LOOKBACK = 240;
+const THINKING_EXPANDABLE_TEXT_CHAR_LIMIT = 420;
+const THINKING_EXPANDABLE_TEXT_LINE_LIMIT = 8;
+const THINKING_EXPANDABLE_CODE_CHAR_LIMIT = 720;
+const THINKING_EXPANDABLE_CODE_LINE_LIMIT = 12;
 const UI_EVENT_RENDER_DEBOUNCE_MS = 80;
 const TRANSCRIPT_EVENT_RENDER_DEBOUNCE_MS = 160;
 const NAVIGATOR_COLLAPSED_STORAGE_KEY = 'mobile-codex-remote.navigator-collapsed.v2';
@@ -481,6 +503,7 @@ const UI_TEXT = {
     'session.apiSwitchWaitIdle': 'Finish or stop the current turn before switching API.',
     'session.apiSwitchBusy': 'Checking the API and restarting this Session...',
     'session.turnControlsUnsupported': 'This runtime does not support per-turn model or thinking controls.',
+    'session.apiRebindHostUpgrade': 'Restart or update this Host Agent before binding an existing Session to an API.',
     'session.nextTurnSelection': 'Next turn: {model} | thinking {effort}',
     'session.runningSelection': 'Running: {model} | thinking {effort}. Changes below apply to a later turn.',
     'session.rebindFailed': 'The previous Rebind to {target} failed.',
@@ -562,6 +585,7 @@ const UI_TEXT = {
     'session.apiSwitchWaitIdle': '请先等待当前轮次完成或停止当前轮次，再切换 API。',
     'session.apiSwitchBusy': '正在检查 API 并重启当前 Session...',
     'session.turnControlsUnsupported': '当前运行器不支持逐轮模型或推理强度设置。',
+    'session.apiRebindHostUpgrade': '请先重启或更新这个 Host Agent，再为已有 Session 绑定 API。',
     'session.nextTurnSelection': '下一轮：{model} | 推理 {effort}',
     'session.runningSelection': '当前运行：{model} | 推理 {effort}。下方修改将用于之后的轮次。',
     'session.rebindFailed': '上次重新绑定到 {target} 失败。',
@@ -648,6 +672,9 @@ const ZH_STATIC_TEXT = {
   'Alerts': '提醒',
   'Join Running Session': '加入运行会话',
   'Resume From History': '从历史恢复',
+  'Rebind & Resume': '\u91cd\u65b0\u7ed1\u5b9a\u5e76\u6062\u590d',
+  'Rebinding & Resuming...': '\u6b63\u5728\u91cd\u65b0\u7ed1\u5b9a\u5e76\u6062\u590d...',
+  'Update Host Agent': '\u66f4\u65b0 Host Agent',
   'Resuming History...': '正在恢复历史...',
   'Starting Session...': '正在启动会话...',
   'Forking Branch...': '正在派生分支...',
@@ -2300,6 +2327,27 @@ function sessionApiControlValue(session) {
   return '__unknown_binding__';
 }
 
+function preferredHistoryRebindTarget(session) {
+  const apiConfig = getApiRequestConfig(session?.hostId);
+  return apiConfig?.profileId || '__host_environment__';
+}
+
+function hostSupportsSessionApiRebind(session, targetProfileId = '') {
+  if (!session?.hostId) {
+    return false;
+  }
+  const capabilities = getHost(session.hostId)?.capabilities || {};
+  if (
+    capabilities.sessionApiRebindV1 !== true
+    || capabilities.runApiBinding !== true
+    || capabilities.apiCatalog !== true
+  ) {
+    return false;
+  }
+  return targetProfileId !== '__host_environment__'
+    || capabilities.bindingPreflight === true;
+}
+
 function sessionSupportsTurnSelectionControls(session) {
   if (!session) {
     return false;
@@ -2520,17 +2568,43 @@ function getSessionApiProfileSummary(session) {
 }
 
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
+  const { timeoutMs: requestedTimeoutMs, ...requestOptions } = options;
+  const timeoutMs = Math.max(0, Number(requestedTimeoutMs || 0) || 0);
+  const controller = timeoutMs > 0 && !requestOptions.signal ? new AbortController() : null;
+  let timedOut = false;
+  let timeout = null;
+  if (controller) {
+    requestOptions.signal = controller.signal;
+    timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
 
-  const body = await response.json();
+  let response;
+  let body;
+  try {
+    response = await fetch(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(requestOptions.headers || {}),
+      },
+      ...requestOptions,
+    });
+    body = await response.json();
+  } catch (error) {
+    if (timedOut) {
+      const timeoutError = new Error(`Request timed out after ${timeoutMs}ms.`);
+      timeoutError.code = 'request_timeout';
+      timeoutError.url = url;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timeout !== null) window.clearTimeout(timeout);
+  }
   if (!response.ok) {
-    const error = new Error(body.error || `request failed: ${response.status}`);
+    const error = new Error(body.error || body.message || `request failed: ${response.status}`);
     error.status = response.status;
     error.body = body;
     error.url = url;
@@ -3350,14 +3424,14 @@ function normalizeThinkingMessage(entry) {
   }
 
   const candidates = [
-    entry.message,
-    entry.detail,
     entry.data?.text,
     entry.data?.content,
     entry.data?.summary,
     entry.data?.plan,
     entry.data?.delta,
     entry.data?.rawPlan,
+    entry.message,
+    entry.detail,
     entry.data?.command,
     entry.data?.query,
     entry.data?.output,
@@ -3377,6 +3451,15 @@ function normalizeThinkingMessage(entry) {
   return '';
 }
 
+function subagentActivityItem(entry) {
+  const candidates = [entry?.data?.item, entry?.payload?.item, entry?.item];
+  return candidates.find((item) => (
+    item
+    && typeof item === 'object'
+    && String(item.type || '').trim() === 'subAgentActivity'
+  )) || null;
+}
+
 function isThinkingActivityDiagnostic(entry) {
   if (!entry) {
     return false;
@@ -3387,6 +3470,9 @@ function isThinkingActivityDiagnostic(entry) {
 
   const kind = String(entry.kind || '').toLowerCase();
   const method = String(entry.method || '').toLowerCase();
+  if (subagentActivityItem(entry)) {
+    return true;
+  }
   return [
     'reasoning',
     'plan',
@@ -3394,6 +3480,8 @@ function isThinkingActivityDiagnostic(entry) {
     'mcp-tool-call',
     'dynamic-tool-call',
     'collab-agent-tool-call',
+    'collaboration',
+    'subagent',
     'command-output',
     'terminal',
     'web-search',
@@ -3405,6 +3493,7 @@ function isThinkingActivityDiagnostic(entry) {
     || method.includes('commandexecution')
     || method.includes('function_call')
     || /item\/(?:filechange|mcptoolcall|dynamictoolcall|collabagenttoolcall)/.test(method)
+    || method.includes('subagentactivity')
     || method.includes('web_search')
     || method.includes('websearch');
 }
@@ -3472,22 +3561,51 @@ function firstThinkingField(entry, ...names) {
 
 function normalizeThinkingActivityForModel(entry, index = 0) {
   if (!entry) return null;
-  const kind = isFileChangeDiagnostic(entry) ? 'file-change' : String(entry.kind || 'thinking');
+  const subagentItem = subagentActivityItem(entry);
+  const itemTypeHint = String(firstThinkingField(entry, 'itemType', 'item_type', 'type') || '').trim().toLowerCase();
+  const subagent = subagentItem || itemTypeHint === 'subagentactivity';
+  const kind = isFileChangeDiagnostic(entry)
+    ? 'file-change'
+    : subagent
+      ? 'collaboration'
+      : String(entry.kind || 'thinking');
   const method = String(entry.method || firstThinkingField(entry, 'method') || '');
   const deltaLike = /delta/i.test(method);
   const rawDelta = deltaLike
     ? (entry.delta ?? entry.data?.delta ?? entry.data?.text ?? entry.payload?.delta ?? entry.message)
     : null;
-  const text = deltaLike && typeof rawDelta === 'string'
+  const subagentKind = firstThinkingField(entry, 'subagentKind', 'subagent_kind')
+    || subagentItem?.kind
+    || subagentItem?.status
+    || null;
+  const subagentPath = firstThinkingField(entry, 'agentPath', 'agent_path') || subagentItem?.agentPath || subagentItem?.agent_path || null;
+  const subagentNickname = firstThinkingField(entry, 'agentNickname', 'agent_nickname') || subagentItem?.agentNickname || subagentItem?.agent_nickname || null;
+  const subagentThreadId = firstThinkingField(entry, 'agentThreadId', 'agent_thread_id') || subagentItem?.agentThreadId || subagentItem?.agent_thread_id || null;
+  const parentThreadId = firstThinkingField(entry, 'parentThreadId', 'parent_thread_id')
+    || entry.data?.threadId
+    || entry.data?.thread_id
+    || null;
+  const text = subagent
+    ? `Sub-agent ${subagentPath || subagentNickname || subagentThreadId || 'sub-agent'}: ${subagentKind || 'activity'}`
+    : deltaLike && typeof rawDelta === 'string'
     ? rawDelta
     : normalizeThinkingMessage(entry);
   const fileChanges = normalizeFileChanges(entry);
+  const argumentsValue = firstThinkingField(entry, 'arguments', 'args');
+  const resultValue = firstThinkingField(entry, 'result');
+  const argumentsTruncated = firstThinkingField(entry, 'argumentsTruncated') === true
+    || thinkingStructuredValueWasTruncated(argumentsValue);
+  const resultTruncated = firstThinkingField(entry, 'resultTruncated') === true
+    || thinkingStructuredValueWasTruncated(resultValue);
   if (!text && !fileChanges.length && !firstThinkingField(entry, 'command', 'query', 'tool', 'name')) {
     return null;
   }
-  if (text && !deltaLike && !isUserSuitableThinkingText(text, entry)) {
+  if (text && !deltaLike && !subagent && !isUserSuitableThinkingText(text, entry)) {
     return null;
   }
+  const normalizedSubagentStatus = subagent
+    ? String(subagentKind || 'running').trim()
+    : firstThinkingField(entry, 'status');
   const normalized = {
     activityKey: firstThinkingField(entry, 'activityKey'),
     activityRevision: firstThinkingField(entry, 'activityRevision', 'revision'),
@@ -3500,11 +3618,12 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
     processId: firstThinkingField(entry, 'processId', 'process_id', 'processHandle'),
     summaryIndex: firstThinkingField(entry, 'summaryIndex', 'summary_index') || 0,
     kind,
-    itemType: firstThinkingField(entry, 'itemType', 'type'),
+    itemType: firstThinkingField(entry, 'itemType', 'type') || (subagent ? 'subAgentActivity' : null),
     method,
     name: firstThinkingField(entry, 'name'),
-    status: firstThinkingField(entry, 'status'),
+    status: normalizedSubagentStatus,
     text: text || (fileChanges.length ? 'File changes updated' : ''),
+    textTruncated: firstThinkingField(entry, 'textTruncated') === true,
     command: firstThinkingField(entry, 'command', 'cmd'),
     cwd: firstThinkingField(entry, 'cwd', 'workdir', 'workingDirectory'),
     output: firstThinkingField(entry, 'output', 'aggregatedOutput', 'delta'),
@@ -3518,14 +3637,22 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
     tool: firstThinkingField(entry, 'tool', 'name'),
     namespace: firstThinkingField(entry, 'namespace'),
     resourceUri: firstThinkingField(entry, 'resourceUri'),
-    senderThreadId: firstThinkingField(entry, 'senderThreadId'),
-    receiverThreadIds: firstThinkingField(entry, 'receiverThreadIds'),
+    senderThreadId: firstThinkingField(entry, 'senderThreadId') || parentThreadId,
+    receiverThreadIds: firstThinkingField(entry, 'receiverThreadIds') || (subagentThreadId ? [subagentThreadId] : null),
+    agentThreadId: subagentThreadId,
+    agentPath: subagentPath,
+    agentNickname: subagentNickname,
+    agentRole: firstThinkingField(entry, 'agentRole', 'agent_role') || subagentItem?.agentRole || subagentItem?.agent_role || null,
+    parentThreadId,
+    subagentKind,
     prompt: firstThinkingField(entry, 'prompt'),
     agentsStates: firstThinkingField(entry, 'agentsStates'),
     model: firstThinkingField(entry, 'model'),
     reasoningEffort: firstThinkingField(entry, 'reasoningEffort'),
-    arguments: firstThinkingField(entry, 'arguments', 'args'),
-    result: firstThinkingField(entry, 'result'),
+    arguments: argumentsValue,
+    argumentsTruncated,
+    result: resultValue,
+    resultTruncated,
     error: firstThinkingField(entry, 'error'),
     progress: firstThinkingField(entry, 'progress'),
     progressTruncated: firstThinkingField(entry, 'progressTruncated') === true,
@@ -3534,7 +3661,10 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
     actionData: firstThinkingField(entry, 'actionData'),
     commandActions: firstThinkingField(entry, 'commandActions', 'command_actions'),
     fileChanges,
-    final: entry.final === true || /(?:completed|failed|cancelled)$/.test(String(firstThinkingField(entry, 'status') || '').toLowerCase()),
+    fileChangesTruncated: firstThinkingField(entry, 'fileChangesTruncated') === true,
+    final: entry.final === true
+      || (subagent && /item\/completed$/i.test(method))
+      || /(?:completed|failed|cancelled|canceled|interrupted)$/.test(String(normalizedSubagentStatus || '').toLowerCase()),
     success: firstThinkingField(entry, 'success'),
     timestamp: entry.timestamp || firstThinkingField(entry, 'createdAt', 'startedAt') || null,
     updatedAt: firstThinkingField(entry, 'updatedAt', 'completedAt') || entry.timestamp || null,
@@ -4194,7 +4324,7 @@ function normalizeTranscriptFiles(rawFiles) {
 }
 
 function dedupeTranscript(entries) {
-  const seen = new Set();
+  const seen = new Map();
   const deduped = [];
 
   for (const entry of entries || []) {
@@ -4208,16 +4338,29 @@ function dedupeTranscript(entries) {
       text: cleanTranscriptTextForDisplay(entry.text || '', entry.speaker || 'system'),
       timestamp: entry.timestamp || null,
       stream: entry.stream || null,
+      source: entry.source || null,
+      clientRequestId: entry.clientRequestId || null,
+      deliveryStatus: entry.deliveryStatus || null,
+      assistantMessageId: entry.assistantMessageId || null,
+      assistantSeq: Number.isSafeInteger(Number(entry.assistantSeq)) ? Number(entry.assistantSeq) : null,
+      assistantAt: entry.assistantAt || null,
+      notifiable: entry.notifiable === true,
       files,
     };
     if (!normalized.text && !files.length) {
       continue;
     }
-    const key = `${normalized.speaker}|${normalized.timestamp || ''}|${canonicalTranscriptText(normalized.text)}|${files.map((file) => file.path || file.name).join(',')}`;
+    const key = normalized.assistantMessageId
+      ? `assistant|${normalized.assistantMessageId}`
+      : normalized.clientRequestId
+        ? `${normalized.speaker}|request|${normalized.clientRequestId}`
+        : `${normalized.speaker}|${normalized.timestamp || ''}|${canonicalTranscriptText(normalized.text)}|${files.map((file) => file.path || file.name).join(',')}`;
     if (seen.has(key)) {
+      const index = seen.get(key);
+      deduped[index] = { ...deduped[index], ...normalized };
       continue;
     }
-    seen.add(key);
+    seen.set(key, deduped.length);
     deduped.push(normalized);
   }
 
@@ -4244,9 +4387,12 @@ function dedupeTranscript(entries) {
     const sameSpeakerAndFiles = previous
       && previous.speaker === entry.speaker
       && previousFiles === entryFiles;
+    const assistantIdentityPresent = Boolean(
+      previous?.assistantMessageId || entry.assistantMessageId
+    );
     const previousText = canonicalTranscriptText(previous?.text || '');
     const entryText = canonicalTranscriptText(entry.text || '');
-    if (sameSpeakerAndFiles && previousText && entryText && previousText === entryText) {
+    if (!assistantIdentityPresent && sameSpeakerAndFiles && previousText && entryText && previousText === entryText) {
       continue;
     }
 
@@ -4254,6 +4400,7 @@ function dedupeTranscript(entries) {
     const previousTime = Date.parse(previous?.timestamp || '');
     const nearDuplicate = previous
       && sameSpeakerAndFiles
+      && !assistantIdentityPresent
       && previousText
       && entryText
       && Number.isFinite(entryTime)
@@ -4329,13 +4476,17 @@ function getHost(hostId) {
   return state.hosts.find((host) => host.hostId === hostId) || null;
 }
 
-async function verifyHostAvailable(hostId) {
+async function verifyHostAvailable(hostId, options = {}) {
   const host = getHost(hostId);
   if (!host) {
     throw new Error(`Host ${hostId || '(unknown)'} is not registered.`);
   }
   if (!host.online) {
     throw new Error(`Host ${host.label || host.hostId} is offline. Start its agent or restart the HPC connector first.`);
+  }
+
+  if (options.probe === false) {
+    return { ok: true, cached: true };
   }
 
   const result = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/probe`, {
@@ -5647,13 +5798,113 @@ async function loadSessionRuntimeConfigForSession(session, options = {}) {
 
 function setTranscriptForSession(hostId, sessionId, transcript) {
   const key = makeSessionKey(hostId, sessionId);
-  state.transcripts.set(key, dedupeTranscript(transcript));
+  state.transcripts.set(key, dedupeTranscript(transcript).filter((entry) => (
+    !transcriptEntryIsTombstoned(key, entry)
+  )));
 }
 
 function appendTranscriptEntry(hostId, sessionId, entry) {
   const key = makeSessionKey(hostId, sessionId);
+  if (transcriptEntryIsTombstoned(key, entry)) {
+    return false;
+  }
   const existing = state.transcripts.get(key) || [];
   state.transcripts.set(key, dedupeTranscript([...existing, entry]));
+  return true;
+}
+
+const TRANSCRIPT_TOMBSTONE_TTL_MS = 10 * 60 * 1000;
+const TRANSCRIPT_TOMBSTONE_LIMIT = 64;
+
+function pruneTranscriptTombstones(sessionKey) {
+  if (!(state.transcriptTombstones instanceof Map)) state.transcriptTombstones = new Map();
+  const existing = state.transcriptTombstones.get(sessionKey) || new Map();
+  const cutoff = Date.now() - TRANSCRIPT_TOMBSTONE_TTL_MS;
+  for (const [requestId, removedAt] of existing.entries()) {
+    if (Number(removedAt || 0) < cutoff) existing.delete(requestId);
+  }
+  while (existing.size > TRANSCRIPT_TOMBSTONE_LIMIT) {
+    existing.delete(existing.keys().next().value);
+  }
+  if (existing.size) state.transcriptTombstones.set(sessionKey, existing);
+  else state.transcriptTombstones.delete(sessionKey);
+  return existing;
+}
+
+function transcriptEntryIsTombstoned(sessionKey, entry) {
+  const clientRequestId = String(entry?.clientRequestId || '').trim();
+  if (!sessionKey || !clientRequestId || String(entry?.speaker || '').toLowerCase() !== 'user') {
+    return false;
+  }
+  return pruneTranscriptTombstones(sessionKey).has(clientRequestId);
+}
+
+function removeTranscriptEntry(hostId, sessionId, identity = {}) {
+  const key = makeSessionKey(hostId, sessionId);
+  const clientRequestId = String(identity.clientRequestId || '').trim();
+  const speaker = String(identity.speaker || 'user').toLowerCase();
+  if (!key || !clientRequestId || speaker !== 'user') return false;
+  const tombstones = pruneTranscriptTombstones(key);
+  tombstones.set(clientRequestId, Date.now());
+  state.transcriptTombstones.set(key, tombstones);
+  const existing = state.transcripts.get(key) || [];
+  const next = existing.filter((entry) => !(
+    String(entry?.speaker || '').toLowerCase() === speaker
+    && String(entry?.clientRequestId || '').trim() === clientRequestId
+  ));
+  state.transcripts.set(key, next);
+  return next.length !== existing.length;
+}
+
+function composerTracksTranscriptRequest(sessionKey, clientRequestId) {
+  const key = resolveComposerSessionKey(sessionKey);
+  const requestId = String(clientRequestId || '').trim();
+  if (!key || !requestId) return false;
+  const submission = state.codexControls.composerSubmissionsBySession.get(key) || null;
+  const activeDraft = state.codexControls.activeDraftsBySession.get(key) || null;
+  const sentDraft = state.codexControls.sentDraftSnapshotsBySession.get(key) || null;
+  return submission?.id === requestId
+    || activeDraft?.clientRequestId === requestId
+    || sentDraft?.clientRequestId === requestId;
+}
+
+function reconcileDetailTranscriptForSession(hostId, sessionId, serverTranscript, localTranscript, options = {}) {
+  const key = makeSessionKey(hostId, sessionId);
+  const serverEntries = dedupeTranscript(serverTranscript);
+  if (options.authoritative !== true) {
+    return dedupeTranscript([...serverEntries, ...(localTranscript || [])]);
+  }
+
+  const serverRequestKeys = new Set(serverEntries
+    .filter((entry) => entry.clientRequestId)
+    .map((entry) => `${String(entry.speaker || '').toLowerCase()}|${String(entry.clientRequestId).trim()}`));
+  const runtime = options.runtime && typeof options.runtime === 'object' ? options.runtime : {};
+  const runtimeRequestId = String(runtime.clientRequestId || runtime.pendingClientRequestId || '').trim();
+  const nowMs = Number(options.nowMs || Date.now());
+  const retainedLocalEntries = dedupeTranscript(localTranscript).filter((entry) => {
+    const speaker = String(entry?.speaker || '').toLowerCase();
+    const requestId = String(entry?.clientRequestId || '').trim();
+    if (requestId && serverRequestKeys.has(`${speaker}|${requestId}`)) {
+      return false;
+    }
+    if (speaker !== 'user' || !requestId || entry.deliveryStatus !== 'pending') {
+      return true;
+    }
+    if (transcriptEntryIsTombstoned(key, entry)) {
+      return false;
+    }
+    const timestampMs = Date.parse(entry.timestamp || '');
+    const fresh = Number.isFinite(timestampMs)
+      && nowMs >= timestampMs
+      && nowMs - timestampMs <= OPTIMISTIC_TRANSCRIPT_GRACE_MS;
+    return Boolean(
+      fresh
+      && runtimeRequestId === requestId
+      && runtimeIsActive(runtime)
+      && composerTracksTranscriptRequest(key, requestId)
+    );
+  });
+  return dedupeTranscript([...serverEntries, ...retainedLocalEntries]);
 }
 
 function normalizeAssistantProjection(projection = {}, fallbackCanonicalKey = '') {
@@ -6720,7 +6971,7 @@ function isTranscriptPinnedToBottom(log) {
     return true;
   }
   const distanceFromBottom = log.scrollHeight - log.scrollTop - log.clientHeight;
-  return distanceFromBottom < 96;
+  return distanceFromBottom <= 8;
 }
 
 function getScrollableDistance(node) {
@@ -6880,6 +7131,50 @@ function restoreViewportAnchor(node, anchor) {
   return true;
 }
 
+function captureViewportElementOffset(element, node = getTranscriptScrollOwner()) {
+  if (!element?.isConnected || !node) {
+    return null;
+  }
+  const viewport = getScrollOwnerViewportRect(node);
+  const rect = element.getBoundingClientRect();
+  if (!viewport || rect.bottom <= viewport.top || rect.top >= viewport.bottom) {
+    return null;
+  }
+  return {
+    element,
+    node,
+    offset: rect.top - viewport.top,
+  };
+}
+
+function restoreViewportElementOffset(snapshot, element = snapshot?.element) {
+  if (!element?.isConnected || !snapshot?.node) {
+    return false;
+  }
+  const viewport = getScrollOwnerViewportRect(snapshot.node);
+  if (!viewport) {
+    return false;
+  }
+  const delta = (element.getBoundingClientRect().top - viewport.top) - snapshot.offset;
+  if (Math.abs(delta) < 0.5) {
+    return true;
+  }
+  const transcriptOwner = getTranscriptScrollOwner();
+  const machine = snapshot.node === transcriptOwner
+    ? getTranscriptScrollMachine(snapshot.node)
+    : null;
+  const apply = () => scrollOwnerTo(
+    snapshot.node,
+    Math.min(
+      Math.max(0, (snapshot.node.scrollTop || 0) + delta),
+      getScrollableDistance(snapshot.node)
+    )
+  );
+  if (machine) machine.withProgrammaticScroll(apply);
+  else apply();
+  return true;
+}
+
 function transcriptScrollTargetPinned(node) {
   if (!node || getScrollableDistance(node) <= 4) {
     return true;
@@ -6908,7 +7203,8 @@ function captureTranscriptScrollSnapshot() {
 
 function restoreTranscriptRawSnapshot(item) {
   noteMessageReadProgrammaticScroll();
-  if (item.machine && item.machineSnapshot && item.machine.restore(item.machineSnapshot)) {
+  if (item.machine && item.machineSnapshot) {
+    item.machine.restore(item.machineSnapshot);
     return;
   }
   const maxScrollTop = getScrollableDistance(item.node);
@@ -7019,7 +7315,7 @@ function handleTranscriptScrollDetach() {
   }
 }
 
-function recordTranscriptTrustedInteraction(event) {
+function recordTranscriptTrustedInteraction(event, phase = 'complete') {
   if (event?.isTrusted !== true || event?.target?.closest?.('.thinking-content')) {
     return;
   }
@@ -7037,8 +7333,17 @@ function recordTranscriptTrustedInteraction(event) {
   if (!machine) {
     return;
   }
+  if (phase !== 'end') {
+    if (!machine.beginTrustedInteraction()) return;
+    setTranscriptUserDetached(getSessionKey(getSelectedSession()) || '', true);
+    getMessageReadGate()?.detachByUser();
+    handleTranscriptScrollDetach();
+  }
+  if (phase === 'begin') {
+    return;
+  }
   window.requestAnimationFrame(() => {
-    if (!machine.recordTrustedInteraction()) return;
+    if (!machine.settleTrustedInteraction()) return;
     if (machine.state().mode === 'follow' && isTranscriptPinnedAcrossScrollTargets()) {
       establishMessageReadFollow(getSelectedSession(), 'outer-user-boundary');
     } else {
@@ -7084,9 +7389,12 @@ function scrollTranscriptTo(position, options = {}) {
     return;
   }
   const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+  const machine = getTranscriptScrollMachine();
+  if (options.trusted === true) {
+    machine?.beginTrustedInteraction();
+  }
   const applyScroll = () => {
     const key = getSessionKey(getSelectedSession()) || '';
-    const machine = getTranscriptScrollMachine();
     if (position === 'bottom') {
       machine?.establishFollow();
       if (options.trusted === true) {
@@ -7242,15 +7550,48 @@ function transcriptViewportKey(entry, index) {
   ].join('|');
 }
 
-function setRuntimeForSession(hostId, sessionId, runtime) {
+function setRuntimeForSession(hostId, sessionId, runtime, options = {}) {
   const key = makeSessionKey(hostId, sessionId);
+  if (!(state.runtimeApplyGenerations instanceof Map)) state.runtimeApplyGenerations = new Map();
+  if (!(state.runtimeStreamGenerations instanceof Map)) state.runtimeStreamGenerations = new Map();
   if (!runtime || typeof runtime !== 'object') {
     state.runtime.delete(key);
+    state.runtimeApplyGenerations.set(key, (state.runtimeApplyGenerations.get(key) || 0) + 1);
+    if (options.source === 'stream') {
+      state.runtimeStreamGenerations.set(key, (state.runtimeStreamGenerations.get(key) || 0) + 1);
+    }
     return null;
   }
 
   const previous = state.runtime.get(key) || {};
   const updatedAt = runtime.updatedAt || new Date().toISOString();
+  const previousRevision = Number(previous.runtimeRevision || 0);
+  const incomingRevision = Number(runtime.runtimeRevision || 0);
+  const previousRunId = String(previous.runId || '').trim();
+  const incomingRunId = String(runtime.runId || '').trim();
+  if (
+    options.allowStale !== true
+    && Number.isSafeInteger(previousRevision)
+    && previousRevision > 0
+    && Number.isSafeInteger(incomingRevision)
+    && incomingRevision > 0
+    && previousRunId
+    && incomingRunId
+    && previousRunId === incomingRunId
+    && incomingRevision <= previousRevision
+  ) {
+    return previous;
+  }
+  const previousUpdatedAtMs = Date.parse(previous.updatedAt || '');
+  const incomingUpdatedAtMs = Date.parse(updatedAt);
+  if (
+    options.allowStale !== true
+    && Number.isFinite(previousUpdatedAtMs)
+    && Number.isFinite(incomingUpdatedAtMs)
+    && incomingUpdatedAtMs < previousUpdatedAtMs
+  ) {
+    return previous;
+  }
   const next = {
     ...previous,
     ...runtime,
@@ -7302,21 +7643,63 @@ function setRuntimeForSession(hostId, sessionId, runtime) {
   }
 
   state.runtime.set(key, next);
+  state.runtimeApplyGenerations.set(key, (state.runtimeApplyGenerations.get(key) || 0) + 1);
+  if (options.source === 'stream') {
+    state.runtimeStreamGenerations.set(key, (state.runtimeStreamGenerations.get(key) || 0) + 1);
+  }
   return next;
 }
 
-function patchRuntimeForSession(hostId, sessionId, patch) {
-  return setRuntimeForSession(hostId, sessionId, patch);
+function patchRuntimeForSession(hostId, sessionId, patch, options = {}) {
+  return setRuntimeForSession(hostId, sessionId, patch, options);
 }
 
-function restoreRuntimeSnapshotForSession(hostId, sessionId, runtimeSnapshot) {
+function getRuntimeStreamGeneration(hostId, sessionId) {
   const key = makeSessionKey(hostId, sessionId);
+  return state.runtimeStreamGenerations instanceof Map
+    ? state.runtimeStreamGenerations.get(key) || 0
+    : 0;
+}
+
+function getRuntimeApplyGeneration(hostId, sessionId) {
+  const key = makeSessionKey(hostId, sessionId);
+  return state.runtimeApplyGenerations instanceof Map
+    ? state.runtimeApplyGenerations.get(key) || 0
+    : 0;
+}
+
+function restoreRuntimeSnapshotForSession(hostId, sessionId, runtimeSnapshot, options = {}) {
+  const key = makeSessionKey(hostId, sessionId);
+  const current = state.runtime.get(key) || null;
+  const currentApplyGeneration = getRuntimeApplyGeneration(hostId, sessionId);
+  const currentStreamGeneration = getRuntimeStreamGeneration(hostId, sessionId);
+  if (
+    (Number.isSafeInteger(options.expectedApplyGeneration)
+      && currentApplyGeneration !== options.expectedApplyGeneration)
+    || (Number.isSafeInteger(options.expectedStreamGeneration)
+      && currentStreamGeneration !== options.expectedStreamGeneration)
+  ) {
+    return current;
+  }
   if (!runtimeSnapshot || typeof runtimeSnapshot !== 'object') {
     state.runtime.delete(key);
+    state.runtimeApplyGenerations.set(key, currentApplyGeneration + 1);
     return null;
+  }
+  const currentRevision = Number(current?.runtimeRevision || 0);
+  const snapshotRevision = Number(runtimeSnapshot.runtimeRevision || 0);
+  if (
+    current
+    && Number.isSafeInteger(currentRevision)
+    && Number.isSafeInteger(snapshotRevision)
+    && currentRevision > snapshotRevision
+    && String(current.runId || '') === String(runtimeSnapshot.runId || '')
+  ) {
+    return current;
   }
   const restored = { ...runtimeSnapshot };
   state.runtime.set(key, restored);
+  state.runtimeApplyGenerations.set(key, currentApplyGeneration + 1);
   return restored;
 }
 
@@ -7435,6 +7818,15 @@ function setRequestsForSession(hostId, sessionId, requests) {
       state.codexControls.inputAnswersByRequest.delete(draftKey);
     }
   }
+  const activeResponseKeys = new Set(normalized
+    .filter((request) => ['pending', 'responding'].includes(request?.status))
+    .map((request) => sessionRequestResponseKey({ hostId, sessionId }, request))
+    .filter(Boolean));
+  for (const responseKey of state.codexControls.respondingRequestKeys) {
+    if (responseKey.startsWith(`${key}::`) && !activeResponseKeys.has(responseKey)) {
+      state.codexControls.respondingRequestKeys.delete(responseKey);
+    }
+  }
 }
 
 function upsertRequestForSession(hostId, sessionId, request) {
@@ -7459,6 +7851,7 @@ function upsertRequestForSession(hostId, sessionId, request) {
 
 function resolveRequestForSession(hostId, sessionId, request) {
   clearInputAnswerDraft(hostId, sessionId, request?.requestId);
+  state.codexControls.respondingRequestKeys.delete(sessionRequestResponseKey({ hostId, sessionId }, request));
   upsertRequestForSession(hostId, sessionId, request);
 }
 
@@ -8129,28 +8522,153 @@ function isLocalAgentCandidate(host) {
   return Boolean(!host.online && (host.relayLocal || (relayPlatform && host.platform === relayPlatform)));
 }
 
+const HOST_RECOVERY_COPY = {
+  local_agent_start: {
+    label: 'Local Agent start',
+    offline: 'The local Agent has not registered with the Relay after start.',
+  },
+  local_agent_restart: {
+    label: 'Local Agent restart',
+    offline: 'The replacement local Agent has not registered with the Relay after restart.',
+  },
+  hpc_connector_restart: {
+    label: 'HPC connector restart',
+    offline: 'The Host is still offline after the HPC connector restart.',
+  },
+};
+
+function hostRecoveryCopy(recoveryKind) {
+  return HOST_RECOVERY_COPY[recoveryKind] || {
+    label: 'Host recovery',
+    offline: 'The Host is still offline after recovery.',
+  };
+}
+
+function localAgentRecoveryKind(action) {
+  return action === 'restart' ? 'local_agent_restart' : 'local_agent_start';
+}
+
+function ownershipPendingDisplay(result) {
+  const retryAfterMs = Math.max(0, Number(result?.retryAfterMs || 0) || 0);
+  const retryCopy = retryAfterMs > 0
+    ? ` Retry in about ${Math.max(1, Math.ceil(retryAfterMs / 1000))} seconds.`
+    : '';
+  return `${result?.message || 'Local Agent ownership is still pending.'}${retryCopy}`.trim();
+}
+
+function setHostRecoveryResult(hostId, result = null) {
+  if (!hostId) return;
+  const existingTimer = state.hostRecoveryResultTimers.get(hostId);
+  if (existingTimer) {
+    window.clearTimeout(existingTimer);
+    state.hostRecoveryResultTimers.delete(hostId);
+  }
+  if (!result) {
+    state.hostRecoveryResults.delete(hostId);
+  } else {
+    state.hostRecoveryResults.set(hostId, {
+      ...result,
+      updatedAt: new Date().toISOString(),
+    });
+    if (['completed', 'failed', 'cancelled'].includes(result.status)) {
+      const timer = window.setTimeout(() => {
+        state.hostRecoveryResultTimers.delete(hostId);
+        state.hostRecoveryResults.delete(hostId);
+        renderHostNav();
+      }, 30000);
+      state.hostRecoveryResultTimers.set(hostId, timer);
+    }
+  }
+}
+
+function makeHostRecoveryError(hostId, error, code = 'host_recovery_failed') {
+  const next = error instanceof Error ? error : new Error(String(error || 'Host recovery failed.'));
+  next.code = next.code || code;
+  next.hostRecoveryScoped = true;
+  next.hostId = hostId;
+  return next;
+}
+
+function localAgentRecoveryIdentityReady(host, recoveryKind, result) {
+  if (!['local_agent_start', 'local_agent_restart'].includes(recoveryKind)) return true;
+  const localAgent = host?.localAgent || null;
+  const currentPid = Number(localAgent?.pid || 0);
+  const referencePid = Number(result?.localAgent?.pid || 0);
+  if (localAgent?.status !== 'running' || currentPid <= 0) return false;
+  if (recoveryKind === 'local_agent_restart') {
+    return referencePid <= 0 || currentPid !== referencePid;
+  }
+  return referencePid <= 0 || currentPid === referencePid;
+}
+
 async function runLocalAgentAction(host, action) {
   if (!host?.hostId || state.localAgentActionBusyId) {
     return;
   }
   state.localAgentActionBusyId = host.hostId;
+  const recoveryKind = localAgentRecoveryKind(action);
+  const recoveryCopy = hostRecoveryCopy(recoveryKind);
+  setHostRecoveryResult(host.hostId, {
+    status: 'working',
+    message: action === 'stop'
+      ? 'Stopping the local Agent...'
+      : `${recoveryCopy.label} requested...`,
+  });
   renderAll();
   try {
-    await fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/local-agent`, {
+    const result = await fetchJson(`/api/hosts/${encodeURIComponent(host.hostId)}/local-agent`, {
       method: 'POST',
       body: JSON.stringify({
         action,
         label: host.label || host.hostId,
       }),
     });
+    if (result?.status === 'ownership_pending') {
+      setHostRecoveryResult(host.hostId, {
+        status: 'ownership_pending',
+        message: ownershipPendingDisplay(result),
+        retryAfterMs: result.retryAfterMs || 0,
+        ownershipAssessment: result.ownershipAssessment || 'unknown',
+      });
+      await refreshHostSnapshot().catch(() => null);
+      return;
+    }
     if (action === 'stop') {
-      await refresh();
+      setHostRecoveryResult(host.hostId, {
+        status: 'stopping',
+        message: result?.message || 'Waiting for the local Agent to stop.',
+      });
+      await waitForLocalAgentStopped(host.hostId, { timeoutMs: 60000 });
+      setHostRecoveryResult(host.hostId, {
+        status: 'completed',
+        message: 'Local Agent stopped.',
+      });
+      await refreshHostSnapshot().catch(() => null);
     } else {
-      await waitForRecoveredHost(host.hostId, 60000);
-      await refresh();
+      setHostRecoveryResult(host.hostId, {
+        status: 'recovering',
+        message: result?.staleOwnershipRecovered
+          ? `Recovered stale local Agent ownership. ${recoveryCopy.label} is now in progress.`
+          : `${recoveryCopy.label} is in progress.`,
+        staleOwnershipRecovered: result?.staleOwnershipRecovered === true,
+      });
+      await waitForRecoveredHost(host.hostId, {
+        timeoutMs: 60000,
+        recoveryKind,
+        pendingResult: result,
+      });
+      setHostRecoveryResult(host.hostId, {
+        status: 'completed',
+        message: `${recoveryCopy.label} completed; the Host is online.`,
+        staleOwnershipRecovered: result?.staleOwnershipRecovered === true,
+      });
+      await refreshHostSnapshot().catch(() => null);
     }
   } catch (error) {
-    reportError(error);
+    setHostRecoveryResult(host.hostId, {
+      status: 'failed',
+      message: error.message,
+    });
   } finally {
     state.localAgentActionBusyId = null;
     renderAll();
@@ -8217,23 +8735,47 @@ async function runHostConnectorRestart(host, connector) {
     return;
   }
   state.hostRestartBusyId = host.hostId;
+  setHostRecoveryResult(host.hostId, {
+    status: 'working',
+    message: 'HPC connector restart requested...',
+  });
   renderAll();
   try {
     const result = await executeConnectorAction(connector, 'restart', connector, {
       refreshAfter: false,
       selectEditor: false,
+      reportErrors: false,
+      returnCancellationResult: true,
     });
     if (result?.ok) {
-      await waitForRecoveredHost(host.hostId, 90000);
-      await refresh();
+      await waitForRecoveredHost(host.hostId, {
+        timeoutMs: 90000,
+        recoveryKind: 'hpc_connector_restart',
+        pendingResult: result,
+      });
+      setHostRecoveryResult(host.hostId, {
+        status: 'completed',
+        message: 'HPC connector restart completed; the Host is online.',
+      });
+      await refreshHostAndConnectorSnapshots().catch(() => null);
       return;
     }
-    await refresh();
-    if (result) {
-      reportError(new Error(`Restart failed for ${host.label || host.hostId}:\n${connectorActionResultSummary(result)}`));
+    if (result?.status === 'cancelled') {
+      setHostRecoveryResult(host.hostId, {
+        status: 'cancelled',
+        message: result.message || 'HPC connector restart was cancelled.',
+      });
+    } else if (result) {
+      const error = new Error(`HPC connector restart failed for ${host.label || host.hostId}:\n${connectorActionResultSummary(result)}`);
+      setHostRecoveryResult(host.hostId, { status: 'failed', message: error.message });
+    } else {
+      setHostRecoveryResult(host.hostId, {
+        status: 'cancelled',
+        message: 'HPC connector restart was cancelled.',
+      });
     }
   } catch (error) {
-    reportError(error);
+    setHostRecoveryResult(host.hostId, { status: 'failed', message: error.message });
   } finally {
     state.hostRestartBusyId = null;
     renderAll();
@@ -8254,6 +8796,205 @@ async function runHostLifecycleAction(host) {
   }
 }
 
+const ACTIVE_HOST_CODEX_UPDATE_STATUSES = new Set([
+  'planned',
+  'stopping_sessions',
+  'updating',
+  'checking',
+  'installing',
+  'verifying',
+  'updated',
+  'update_failed',
+  'resuming',
+  'interrupted',
+]);
+
+function codexInstallationSourceLabel(source) {
+  return {
+    npm_global: 'npm global',
+    npm_local: 'project local',
+    cursor_extension: 'Cursor extension',
+    bundled_runtime: 'bundled runtime',
+    explicit_unknown: 'explicit binary',
+    unknown: 'unknown source',
+  }[String(source || '').trim()] || 'unknown source';
+}
+
+function codexRuntimeCompatibilityLabel(runtime = {}) {
+  const platformArch = [runtime.platform, runtime.arch].filter(Boolean).join('/');
+  if (runtime.error) {
+    return `${platformArch || 'architecture unknown'} | probe failed`;
+  }
+  if (runtime.version) {
+    return `${platformArch || 'architecture unknown'} | executable verified`;
+  }
+  return `${platformArch || 'architecture unknown'} | compatibility unknown`;
+}
+
+function getHostCodexUpdateDisplay(host) {
+  const local = state.hostCodexUpdates.get(host?.hostId) || null;
+  const persisted = host?.codexUpdate || null;
+  const persistedStatus = String(persisted?.status || persisted?.phase || '').trim().toLowerCase();
+  const persistedTerminal = ['completed', 'completed_with_resume_failures', 'failed', 'cancelled'].includes(persistedStatus);
+  const sameOperation = local?.operationId && local.operationId === persisted?.operationId;
+  const localIsNewer = sameOperation
+    && Date.parse(String(local.updatedAt || '')) > Date.parse(String(persisted.updatedAt || ''));
+  const operation = persistedTerminal ? persisted : (localIsNewer ? local : (persisted || local));
+  if (!operation) return null;
+  return {
+    ...operation,
+    status: String(operation.status || operation.phase || '').trim().toLowerCase(),
+    message: String(operation.message || '').trim(),
+  };
+}
+
+function setHostCodexUpdateDisplay(hostId, patch = null) {
+  if (!patch) {
+    state.hostCodexUpdates.delete(hostId);
+  } else {
+    state.hostCodexUpdates.set(hostId, {
+      ...(state.hostCodexUpdates.get(hostId) || {}),
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  renderHostNav();
+}
+
+function getHostCodexUpdateAction(host) {
+  const operation = getHostCodexUpdateDisplay(host);
+  const status = operation?.status || '';
+  const busy = state.hostCodexUpdateBusyId === host?.hostId;
+  const recoverableStatus = [
+    'planned',
+    'stopping_sessions',
+    'updated',
+    'update_failed',
+    'resuming',
+    'interrupted',
+  ].includes(status);
+  if (recoverableStatus && !busy) {
+    const maintenanceStatus = String(host?.codexMaintenance?.status || '').trim().toLowerCase();
+    const updaterActive = ['checking', 'updating', 'installing', 'verifying'].includes(maintenanceStatus);
+    return {
+      label: updaterActive ? maintenanceStatus.replaceAll('_', ' ') : 'Recover Sessions',
+      disabled: updaterActive || !host?.online,
+      recover: !updaterActive,
+      title: updaterActive
+        ? (host.codexMaintenance?.message || 'The Host updater is still active.')
+        : (operation.message || 'Recover stopped Sessions and finish the interrupted maintenance operation.'),
+    };
+  }
+  if (ACTIVE_HOST_CODEX_UPDATE_STATUSES.has(status)) {
+    return {
+      label: status.replaceAll('_', ' '),
+      disabled: true,
+      recover: false,
+      title: operation.message || `Codex maintenance is ${status}.`,
+    };
+  }
+  if (!host?.online) {
+    return { label: 'Update Codex', disabled: true, recover: false, title: 'Start or reconnect this Host first.' };
+  }
+  if (host.capabilities?.codexUpdateV1 !== true) {
+    return { label: 'Update Codex', disabled: true, recover: false, title: 'Restart this Host Agent with the development build to enable Codex updates.' };
+  }
+  if (!host.codexRuntime) {
+    return { label: 'Update Codex', disabled: true, recover: false, title: 'Codex version has not been reported by this Host yet.' };
+  }
+  if (host.codexRuntime.canAutoUpdate !== true) {
+    return {
+      label: 'Update Codex',
+      disabled: true,
+      recover: false,
+      title: host.codexRuntime.updateReason || 'This Codex installation cannot be updated automatically.',
+    };
+  }
+  return {
+    label: busy ? 'Preparing...' : 'Update Codex',
+    disabled: busy,
+    recover: false,
+    title: 'Update this Host npm-global Codex installation to the latest release.',
+  };
+}
+
+function findCurrentCodexUpdateSession(snapshot) {
+  const key = getSessionKey(snapshot);
+  return state.sessions.find((session) => getSessionKey(session) === key) || null;
+}
+
+function codexUpdateSessionIsStopping(session) {
+  const runtime = getRuntimeForSession(session) || session?.runtime || {};
+  return String(session?.state || '').trim().toLowerCase() === 'ending'
+    || String(runtime.phase || '').trim().toLowerCase() === 'ending'
+    || String(runtime.connection || '').trim().toLowerCase() === 'closing'
+    || String(runtime.currentTurnStatus || '').trim().toLowerCase() === 'stopping';
+}
+
+function openHostCodexRecoveryDialog(host, operation) {
+  const sessions = (operation?.sessions || []).map((snapshot) => {
+    const current = findCurrentCodexUpdateSession(snapshot);
+    return current ? { ...snapshot, ...current } : { ...snapshot, source: 'managed', live: false };
+  });
+  openSessionActionDialog({
+    mode: 'codex-update',
+    hostId: host.hostId,
+    codexRuntime: host.codexRuntime,
+    codexUpdateOperation: operation,
+    title: `Recover Sessions on ${host.label || host.hostId}`,
+    subtitle: 'Resume every Session that was stopped by the interrupted Codex maintenance operation, then release the maintenance gate.',
+    actionLabel: 'Recover Sessions',
+    sessions,
+  });
+  for (const session of sessions) {
+    state.sessionActionDialog.resultsByKey.set(getSessionKey(session), session.live
+      ? (codexUpdateSessionIsStopping(session)
+        ? { status: 'stopping', message: 'Waiting for the pending Stop to finish' }
+        : { status: 'resumed', message: 'Already live' })
+      : { status: 'left-stopped', message: 'Waiting for recovery' });
+  }
+  state.sessionActionDialog.phase = 'recovery';
+  state.sessionActionDialog.updateResult = {
+    message: operation.message || 'Interrupted maintenance requires Session recovery.',
+  };
+  renderSessionActionDialog();
+}
+
+function openHostCodexUpdateDialog(host) {
+  const sessions = getRelayManagedLiveSessions([host.hostId]);
+  openSessionActionDialog({
+    mode: 'codex-update',
+    hostId: host.hostId,
+    codexRuntime: host.codexRuntime,
+    title: `Update Codex on ${host.label || host.hostId}`,
+    subtitle: sessions.length
+      ? `All ${sessions.length} managed live Session(s) on this Host will stop, Codex will update, then each Session will resume.`
+      : 'Codex will update after the Host confirms that no managed Session is live.',
+    actionLabel: 'Stop, update, and resume',
+    sessions,
+  });
+  for (const session of sessions) {
+    if (isFreshLiveManagedSessionWithoutHistory(session)) {
+      state.sessionActionDialog.resultsByKey.set(getSessionKey(session), {
+        status: 'blocked',
+        message: 'Send the first message or end this empty Session before updating Codex.',
+      });
+    }
+  }
+  renderSessionActionDialog();
+}
+
+async function runHostCodexUpdateAction(host) {
+  const action = getHostCodexUpdateAction(host);
+  if (action.disabled) return;
+  if (action.recover) {
+    const operation = getHostCodexUpdateDisplay(host);
+    openHostCodexRecoveryDialog(host, operation);
+    return;
+  }
+  openHostCodexUpdateDialog(host);
+}
+
 function renderHostNav() {
   const hostList = el('host-overview-list');
   hostList.innerHTML = '';
@@ -8264,13 +9005,24 @@ function renderHostNav() {
     const localAgentLabel = host.localAgent?.status
       ? ` | local ${host.localAgent.status}`
       : '';
+    const codexRuntime = host.codexRuntime || {};
+    const codexLabel = codexRuntime.version ? `Codex ${codexRuntime.version}` : 'Codex unknown';
+    const codexSource = codexInstallationSourceLabel(codexRuntime.source);
+    const codexCompatibility = codexRuntimeCompatibilityLabel(codexRuntime);
+    const codexUpdate = getHostCodexUpdateDisplay(host);
+    const hostRecovery = state.hostRecoveryResults.get(host.hostId) || null;
+    const hostRecoveryHtml = hostRecovery
+      ? `<div class="host-recovery-status ${escapeHtml(hostRecovery.status || '')}">${escapeHtml(hostRecovery.message || '')}</div>`
+      : '';
 
     const top = document.createElement('div');
     top.className = 'host-card-top';
     top.innerHTML = `
       <div>
-        <div class="title">${host.label}</div>
-        <div class="sub">${host.platform} | ${host.online ? 'online' : 'offline'}${localAgentLabel} | ${host.sessionCount || 0} dialogs</div>
+        <div class="title">${escapeHtml(host.label || host.hostId)}</div>
+        <div class="sub">${escapeHtml(host.platform || 'unknown')} | ${host.online ? 'online' : 'offline'}${escapeHtml(localAgentLabel)} | ${host.sessionCount || 0} dialogs</div>
+        <div class="host-codex-status ${escapeHtml(codexUpdate?.status || '')}" title="${escapeHtml(codexRuntime.error || codexRuntime.updateReason || codexRuntime.realPath || codexRuntime.binPath || '')}">${escapeHtml(codexLabel)} | ${escapeHtml(codexSource)} | ${escapeHtml(codexCompatibility)}${codexUpdate ? ` | ${escapeHtml(codexUpdate.message || codexUpdate.status)}` : ''}</div>
+        ${hostRecoveryHtml}
       </div>
     `;
 
@@ -8300,6 +9052,20 @@ function renderHostNav() {
       await runHostLifecycleAction(host);
     };
 
+    const codexUpdateButton = createActionButton('Update Codex', 'secondary-button');
+    const codexUpdateAction = getHostCodexUpdateAction(host);
+    codexUpdateButton.textContent = codexUpdateAction.label;
+    codexUpdateButton.disabled = codexUpdateAction.disabled;
+    codexUpdateButton.title = codexUpdateAction.title;
+    codexUpdateButton.onclick = async (event) => {
+      event.stopPropagation();
+      try {
+        await runHostCodexUpdateAction(host);
+      } catch (error) {
+        reportError(error);
+      }
+    };
+
     let stopLocalButton = null;
     if (host.localAgent?.status === 'running' || host.localAgent?.status === 'starting') {
       const localAgent = host.localAgent || null;
@@ -8319,7 +9085,7 @@ function renderHostNav() {
       await deleteHost(host.hostId);
     };
 
-    actions.append(switchButton, restartButton);
+    actions.append(switchButton, restartButton, codexUpdateButton);
     if (stopLocalButton) {
       actions.appendChild(stopLocalButton);
     }
@@ -10267,10 +11033,10 @@ function getComposerSubmission(session = getSelectedSession()) {
 
 function pruneComposerSubmissions() {
   const now = Date.now();
-  for (const [key, submission] of state.codexControls.composerSubmissionsBySession.entries()) {
+  for (const submission of state.codexControls.composerSubmissionsBySession.values()) {
     const startedAtMs = Date.parse(submission?.startedAt || '');
     if (!Number.isFinite(startedAtMs) || now - startedAtMs > COMPOSER_PENDING_SUBMISSION_TTL_MS) {
-      state.codexControls.composerSubmissionsBySession.delete(key);
+      submission.confirmationDelayed = true;
     }
   }
 }
@@ -10326,7 +11092,7 @@ function composerSubmissionSignature(session, draft) {
     .filter(Boolean)
     .sort();
   return JSON.stringify({
-    sessionKey: getSessionKey(session) || '',
+    sessionKey: resolveComposerSessionKey(getSessionKey(session) || ''),
     text: canonicalTranscriptText(draft?.text || ''),
     localImagePath: String(draft?.localImagePath || '').trim(),
     attachments: attachmentKeys,
@@ -10336,11 +11102,6 @@ function composerSubmissionSignature(session, draft) {
 
 function getOrCreateComposerSubmissionId(signature) {
   pruneRecentComposerSubmissions();
-  const existing = state.codexControls.recentSubmissions.get(signature);
-  if (existing?.id) {
-    existing.createdAtMs = Date.now();
-    return existing.id;
-  }
   const id = `composer-${makeClientId()}`;
   state.codexControls.recentSubmissions.set(signature, {
     id,
@@ -10379,18 +11140,33 @@ function renderComposerModeBanner() {
   const activeTurn = Boolean(session?.live && runtimeIsActive(runtime));
   const planMode = isComposerPlanMode();
   const submitting = isComposerSubmitting(session);
+  const submission = submitting ? getComposerSubmission(session) : null;
+  const submissionLabel = submission?.stage === 'confirming'
+    ? 'Confirming...'
+    : submission?.stage === 'queued'
+      ? 'Queued...'
+    : submission?.stage === 'starting'
+      ? 'Starting...'
+      : 'Sending...';
+  const submissionTitle = submission?.stage === 'confirming'
+    ? 'The request may already be queued. Waiting for a matching Relay or Host confirmation.'
+    : submission?.stage === 'queued'
+      ? 'The Relay accepted this prompt. Waiting for the Host to start it.'
+    : submission?.stage === 'starting'
+      ? 'The Host is submitting this prompt to Codex.'
+      : 'Sending this prompt to the Relay.';
 
   if (banner) {
     banner.classList.toggle('hidden', !planMode);
   }
   if (sendButton) {
     sendButton.textContent = submitting
-      ? 'Sending...'
+      ? submissionLabel
       : planMode
       ? activeTurn ? 'Queue Plan' : 'Send Plan'
       : activeTurn ? 'Queue' : 'Send';
     sendButton.title = submitting
-      ? 'Sending this prompt. The composer is locked to prevent duplicates.'
+      ? submissionTitle
       : planMode
       ? 'Plan mode is on. Prompts will ask Codex to plan only until you exit plan mode.'
       : '';
@@ -10486,8 +11262,9 @@ function renderComposerControls(session, disabled) {
   const activeTurn = Boolean(session?.live && runtimeIsActive(runtime));
   const interruptButton = el('codex-interrupt-button');
   if (interruptButton) {
+    const interruptBusy = state.codexControls.interruptBusyKeys?.has(resolveComposerSessionKey(session));
     interruptButton.classList.toggle('hidden', !activeTurn);
-    interruptButton.disabled = disabled || submitting || !activeTurn;
+    interruptButton.disabled = disabled || interruptBusy || !activeTurn;
   }
   const sendButton = el('codex-send-button');
   if (sendButton) {
@@ -10632,7 +11409,8 @@ function renderComposerTurnNotice() {
   }
   const queue = getSelectedSteerQueue();
   const steerNotice = state.codexControls.steerNotice;
-  const show = Boolean(queue.length || steerNotice);
+  const interruptOperation = getInterruptOperation(getSelectedSession());
+  const show = Boolean(queue.length || steerNotice || interruptOperation);
   notice.classList.toggle('hidden', !show);
   if (!show) {
     return;
@@ -10652,8 +11430,13 @@ function renderComposerTurnNotice() {
     forceButton.disabled = queue.some((item) => item.forceSending);
     forceButton.textContent = 'Interrupt & Send First';
   } else {
-    title.textContent = steerNotice?.title || 'Active turn updated';
-    copy.textContent = steerNotice?.message || 'Your message was added to the current Codex turn.';
+    const interruptPresentation = interruptOperationPresentation(interruptOperation);
+    title.textContent = interruptOperation
+      ? interruptPresentation.title
+      : steerNotice?.title || 'Active turn updated';
+    copy.textContent = interruptOperation
+      ? interruptPresentation.message
+      : steerNotice?.message || 'Your message was added to the current Codex turn.';
     forceButton.classList.add('hidden');
     forceButton.disabled = true;
   }
@@ -11195,17 +11978,46 @@ function moveComposerDraftSessionKey(previousKeyValue, nextKeyValue) {
     state.codexControls.composerDraftsBySession,
     state.codexControls.pendingComposerDraftsBySession,
     state.codexControls.activeDraftsBySession,
+    state.codexControls.sentDraftSnapshotsBySession,
   ]) {
     if (!drafts.has(previousKey)) continue;
     const draft = drafts.get(previousKey);
     drafts.delete(previousKey);
     drafts.set(nextKey, draft);
   }
+  if (!(state.transcriptTombstones instanceof Map)) state.transcriptTombstones = new Map();
+  const previousTranscriptTombstones = state.transcriptTombstones.get(previousKey) || null;
+  if (previousTranscriptTombstones) {
+    const nextTranscriptTombstones = state.transcriptTombstones.get(nextKey) || new Map();
+    for (const [requestId, removedAt] of previousTranscriptTombstones.entries()) {
+      nextTranscriptTombstones.set(
+        requestId,
+        Math.max(Number(nextTranscriptTombstones.get(requestId) || 0), Number(removedAt || 0))
+      );
+    }
+    state.transcriptTombstones.delete(previousKey);
+    state.transcriptTombstones.set(nextKey, nextTranscriptTombstones);
+    pruneTranscriptTombstones(nextKey);
+  }
   const submission = state.codexControls.composerSubmissionsBySession.get(previousKey) || null;
   if (submission) {
     state.codexControls.composerSubmissionsBySession.delete(previousKey);
     submission.sessionKey = nextKey;
     state.codexControls.composerSubmissionsBySession.set(nextKey, submission);
+  }
+  for (const [signature, recent] of Array.from(state.codexControls.recentSubmissions.entries())) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(signature);
+    } catch (_) {
+      continue;
+    }
+    if (![rawPreviousKey, previousKey].includes(String(parsed?.sessionKey || ''))) continue;
+    const nextSignature = JSON.stringify({ ...parsed, sessionKey: nextKey });
+    const existingRecent = state.codexControls.recentSubmissions.get(nextSignature);
+    state.codexControls.recentSubmissions.delete(signature);
+    state.codexControls.recentSubmissions.set(nextSignature, existingRecent || recent);
+    if (submission?.signature === signature) submission.signature = nextSignature;
   }
   const moveMapEntry = (map) => {
     if (!map || typeof map.has !== 'function' || !map.has(previousKey)) return false;
@@ -11223,6 +12035,8 @@ function moveComposerDraftSessionKey(previousKeyValue, nextKeyValue) {
   const movedSessionOptions = moveMapEntry(state.codexControls.sessionOptionsByKey);
   moveSetEntry(state.codexControls.persistedSessionOptionKeys);
   moveMapEntry(state.codexControls.apiSwitchNoticesBySession);
+  moveMapEntry(state.codexControls.interruptOperationsBySession);
+  moveSetEntry(state.codexControls.interruptBusyKeys);
   moveSetEntry(state.sessionApiRebindBusyKeys);
   moveSetEntry(state.sessionTranscriptFallbackBusyKeys);
   moveMapEntry(state.sessionRebindFailures);
@@ -11232,15 +12046,85 @@ function moveComposerDraftSessionKey(previousKeyValue, nextKeyValue) {
   return true;
 }
 
+function pruneSentDraftSnapshots() {
+  const snapshots = state.codexControls.sentDraftSnapshotsBySession;
+  const cutoff = Date.now() - SENT_DRAFT_SNAPSHOT_TTL_MS;
+  for (const [key, snapshot] of snapshots.entries()) {
+    const sentAtMs = Date.parse(snapshot?.sentAt || '');
+    if (!Number.isFinite(sentAtMs) || sentAtMs < cutoff) snapshots.delete(key);
+  }
+  while (snapshots.size > SENT_DRAFT_SNAPSHOT_LIMIT) {
+    snapshots.delete(snapshots.keys().next().value);
+  }
+}
+
+function setSentDraftSnapshotForSessionKey(sessionKey, payload) {
+  const key = resolveComposerSessionKey(sessionKey);
+  const draft = payload?.composerDraft;
+  if (!key || !draft) return null;
+  const snapshot = {
+    ...cloneComposerDraft(draft),
+    text: String(draft.text || payload.displayText || payload.text || ''),
+    clientRequestId: String(payload.clientRequestId || '').trim() || null,
+    submissionSignature: String(payload.submissionSignature || '').trim() || null,
+    sentAt: new Date().toISOString(),
+    restoreOnInterruptRequestId: null,
+  };
+  const snapshots = state.codexControls.sentDraftSnapshotsBySession;
+  snapshots.delete(key);
+  snapshots.set(key, snapshot);
+  pruneSentDraftSnapshots();
+  return snapshot;
+}
+
+function getSentDraftSnapshotForSession(sessionOrKey) {
+  pruneSentDraftSnapshots();
+  const key = resolveComposerSessionKey(sessionOrKey);
+  return key ? state.codexControls.sentDraftSnapshotsBySession.get(key) || null : null;
+}
+
+function markSentDraftSnapshotForInterrupt(sessionOrKey, interruptRequestId, clientRequestId = '') {
+  const snapshot = getSentDraftSnapshotForSession(sessionOrKey);
+  const expectedClientRequestId = String(clientRequestId || '').trim();
+  if (!snapshot || (expectedClientRequestId && snapshot.clientRequestId !== expectedClientRequestId)) return false;
+  snapshot.restoreOnInterruptRequestId = String(interruptRequestId || '').trim() || null;
+  return Boolean(snapshot.restoreOnInterruptRequestId);
+}
+
+function clearSentDraftSnapshotInterruptMarker(sessionOrKey, interruptRequestId = '') {
+  const snapshot = getSentDraftSnapshotForSession(sessionOrKey);
+  const expected = String(interruptRequestId || '').trim();
+  if (!snapshot || (expected && snapshot.restoreOnInterruptRequestId !== expected)) return false;
+  snapshot.restoreOnInterruptRequestId = null;
+  return true;
+}
+
+function clearSentDraftSnapshotForSessionRequest(sessionOrKey, clientRequestId = '', options = {}) {
+  const key = resolveComposerSessionKey(sessionOrKey);
+  const snapshot = key ? state.codexControls.sentDraftSnapshotsBySession.get(key) || null : null;
+  const expected = String(clientRequestId || '').trim();
+  if (!key || !snapshot || (expected && snapshot.clientRequestId !== expected)) return false;
+  if (snapshot.restoreOnInterruptRequestId && options.force !== true) return false;
+  state.codexControls.sentDraftSnapshotsBySession.delete(key);
+  return true;
+}
+
 function setActiveDraftForSessionKey(sessionKey, payload) {
   const key = resolveComposerSessionKey(sessionKey);
   const draft = payload?.composerDraft;
   if (!key || !draft) {
     return;
   }
-  state.codexControls.activeDraftsBySession.set(key, {
+  const activeDraft = {
     ...draft,
     text: String(draft.text || payload.displayText || payload.text || ''),
+    clientRequestId: String(payload.clientRequestId || '').trim() || null,
+    submissionSignature: String(payload.submissionSignature || '').trim() || null,
+  };
+  state.codexControls.activeDraftsBySession.set(key, activeDraft);
+  setSentDraftSnapshotForSessionKey(key, {
+    ...payload,
+    composerDraft: activeDraft,
   });
 }
 
@@ -11253,6 +12137,72 @@ function clearActiveDraftForSession(session) {
   if (key) {
     state.codexControls.activeDraftsBySession.delete(key);
   }
+}
+
+function clearActiveDraftForSessionRequest(session, clientRequestId = '') {
+  const key = resolveComposerSessionKey(session);
+  const expected = String(clientRequestId || '').trim();
+  const activeDraft = key ? state.codexControls.activeDraftsBySession.get(key) || null : null;
+  if (!key || !expected || activeDraft?.clientRequestId !== expected) return false;
+  state.codexControls.activeDraftsBySession.delete(key);
+  return true;
+}
+
+function composerDraftContentIdentity(draft = {}) {
+  return JSON.stringify({
+    text: String(draft.text || ''),
+    localImagePath: String(draft.localImagePath || '').trim(),
+    attachments: (Array.isArray(draft.attachments) ? draft.attachments : [])
+      .map(composerAttachmentKey)
+      .filter(Boolean)
+      .sort(),
+  });
+}
+
+function clearComposerDraftIfMatching(sessionOrKey, expectedDraft) {
+  const key = resolveComposerSessionKey(sessionOrKey);
+  if (!key || !expectedDraft) return false;
+  const currentDraft = getComposerDraftForSessionKey(key);
+  if (composerDraftContentIdentity(currentDraft) !== composerDraftContentIdentity(expectedDraft)) {
+    return false;
+  }
+  return clearComposerDraftForSessionKey(key);
+}
+
+function acknowledgeComposerSubmissionForSession(sessionOrKey, clientRequestId = '', options = {}) {
+  const key = resolveComposerSessionKey(sessionOrKey);
+  const expectedRequestId = String(clientRequestId || '').trim();
+  if (!key || !expectedRequestId) return false;
+  const submission = state.codexControls.composerSubmissionsBySession.get(key) || null;
+  const activeDraft = state.codexControls.activeDraftsBySession.get(key) || null;
+  const submissionMatches = submission?.id === expectedRequestId;
+  const activeDraftMatches = activeDraft?.clientRequestId === expectedRequestId;
+  if (!submissionMatches && !activeDraftMatches) return false;
+
+  const retainedDraft = activeDraftMatches ? activeDraft : submission?.draft || null;
+  if (!activeDraftMatches && retainedDraft) {
+    setActiveDraftForSessionKey(key, {
+      clientRequestId: expectedRequestId,
+      submissionSignature: submission?.signature || '',
+      composerDraft: retainedDraft,
+      displayText: retainedDraft.text,
+    });
+  }
+  clearComposerDraftIfMatching(key, retainedDraft);
+
+  if (options.turnActive === true) {
+    clearActiveDraftForSessionRequest(key, expectedRequestId);
+    completeComposerSubmissionForSession(key, expectedRequestId);
+    return true;
+  }
+
+  if (submissionMatches) {
+    submission.stage = options.stage || submission.stage || 'queued';
+    submission.acceptedAt ||= new Date().toISOString();
+    submission.confirmationDelayed = false;
+    setComposerSubmission(submission, key);
+  }
+  return true;
 }
 
 function stashPendingComposerDraftForSession(sessionOrKey, draft) {
@@ -11344,6 +12294,51 @@ function restorePendingComposerDraftForSession(session) {
   return true;
 }
 
+function mergeComposerDraftsForRestore(existingDraft, restoredDraft) {
+  const existing = cloneComposerDraft(existingDraft || {});
+  const restored = cloneComposerDraft(restoredDraft || {});
+  if (!composerDraftHasTemporaryContent(existing)) return restored;
+  const existingText = String(existing.text || '');
+  const restoredText = String(restored.text || '');
+  const attachments = [];
+  const attachmentKeys = new Set();
+  for (const attachment of [...existing.attachments, ...restored.attachments]) {
+    const attachmentKey = composerAttachmentKey(attachment);
+    if (!attachmentKey || attachmentKeys.has(attachmentKey)) continue;
+    attachmentKeys.add(attachmentKey);
+    attachments.push(cloneComposerAttachment(attachment));
+  }
+  return {
+    ...restored,
+    ...existing,
+    text: existingText && restoredText
+      ? `${existingText.trimEnd()}\n\n${restoredText}`
+      : existingText || restoredText,
+    attachments,
+    localImagePath: existing.localImagePath || restored.localImagePath || '',
+    selectionStart: null,
+    selectionEnd: null,
+  };
+}
+
+function restoreSentDraftSnapshotForSession(sessionOrKey, clientRequestId = '') {
+  const key = resolveComposerSessionKey(sessionOrKey);
+  const snapshot = getSentDraftSnapshotForSession(key);
+  const expected = String(clientRequestId || '').trim();
+  if (!key || !snapshot || (expected && snapshot.clientRequestId !== expected)) return false;
+  const selectedKey = resolveComposerSessionKey(getSessionKey(getSelectedSession()) || '');
+  if (selectedKey === key) {
+    if (!restoreComposerDraft(snapshot, { replace: false })) return false;
+    rememberMountedComposerDraft();
+  } else {
+    const mergedDraft = mergeComposerDraftsForRestore(getComposerDraftForSessionKey(key), snapshot);
+    setComposerDraftForSessionKey(key, mergedDraft);
+    stashPendingComposerDraftForSession(key, mergedDraft);
+  }
+  state.codexControls.sentDraftSnapshotsBySession.delete(key);
+  return true;
+}
+
 function restoreActiveDraftForSession(session) {
   const key = resolveComposerSessionKey(session);
   if (!key) {
@@ -11354,6 +12349,58 @@ function restoreActiveDraftForSession(session) {
     return false;
   }
   state.codexControls.activeDraftsBySession.delete(key);
+  return true;
+}
+
+function completeComposerSubmissionForSession(sessionOrKey, submissionId = '') {
+  const submission = getComposerSubmission(sessionOrKey);
+  if (submissionId && submission?.id !== submissionId) return false;
+  if (submission?.signature) {
+    state.codexControls.recentSubmissions.delete(submission.signature);
+  }
+  return clearComposerSubmissionForSession(sessionOrKey, submissionId);
+}
+
+function recoverComposerSubmissionForSession(sessionOrKey, options = {}) {
+  const key = resolveComposerSessionKey(sessionOrKey);
+  if (!key) return false;
+  const submission = state.codexControls.composerSubmissionsBySession.get(key) || null;
+  const activeDraft = state.codexControls.activeDraftsBySession.get(key) || null;
+  const sentDraft = state.codexControls.sentDraftSnapshotsBySession.get(key) || null;
+  const expectedRequestId = String(options.clientRequestId || '').trim();
+  const retainedRequestId = String(
+    submission?.id || activeDraft?.clientRequestId || sentDraft?.clientRequestId || ''
+  ).trim();
+  if (retainedRequestId && !expectedRequestId) {
+    return false;
+  }
+  if (expectedRequestId && retainedRequestId && expectedRequestId !== retainedRequestId) {
+    return false;
+  }
+  const draft = activeDraft || submission?.draft || sentDraft || null;
+  if (!draft) {
+    clearComposerSubmissionForSession(key, expectedRequestId);
+    return false;
+  }
+
+  const selectedKey = resolveComposerSessionKey(getSessionKey(getSelectedSession()) || '');
+  if (selectedKey === key) {
+    restoreComposerDraft(draft, { replace: false });
+    rememberMountedComposerDraft();
+  } else {
+    const mergedDraft = mergeComposerDraftsForRestore(getComposerDraftForSessionKey(key), draft);
+    setComposerDraftForSessionKey(key, mergedDraft);
+    stashPendingComposerDraftForSession(key, mergedDraft);
+  }
+  const submissionSignature = String(
+    submission?.signature || activeDraft?.submissionSignature || ''
+  ).trim();
+  if (submissionSignature) {
+    state.codexControls.recentSubmissions.delete(submissionSignature);
+  }
+  state.codexControls.activeDraftsBySession.delete(key);
+  state.codexControls.sentDraftSnapshotsBySession.delete(key);
+  clearComposerSubmissionForSession(key, retainedRequestId || expectedRequestId);
   return true;
 }
 
@@ -12040,7 +13087,7 @@ async function uploadComposerFiles(session, draft = null) {
     throw new Error('Select a host session before uploading files.');
   }
 
-  await verifyHostAvailable(session.hostId);
+  await verifyHostAvailable(session.hostId, { probe: false });
   const host = getHost(session.hostId);
   if (!host?.capabilities?.fileTransfer) {
     throw new Error(`${formatHostCapabilityName(host)} has not enabled file transfer yet. Restart the relay and this host-agent, then refresh the page. For HPC hosts, use Manage HPC -> Restart Agent.`);
@@ -12685,6 +13732,15 @@ function renderSessionDetails() {
   const canActivateHistory = canActivateSessionHistory(session);
   const canFork = canForkSession(session);
   const launchBusy = getSessionLaunchBusyForSession(session);
+  const historyNeedsApiRebind = Boolean(
+    session
+    && !session.live
+    && sessionApiControlValue(session) === '__unknown_binding__'
+  );
+  const preferredRebindTarget = historyNeedsApiRebind ? preferredHistoryRebindTarget(session) : '';
+  const canRebindHistory = !historyNeedsApiRebind
+    || hostSupportsSessionApiRebind(session, preferredRebindTarget);
+  resumeButton.title = '';
   if (!session) {
     joinButton.disabled = true;
     joinButton.textContent = 'Join Running Session';
@@ -12713,14 +13769,24 @@ function renderSessionDetails() {
     resumeButton.classList.toggle('danger-button', Boolean(session.live));
     resumeButton.classList.toggle('secondary-button', !session.live);
     if (session.live) {
-      resumeButton.disabled = isEnding || Boolean(launchBusy) || isSessionApiRebindBusy(session);
+      resumeButton.disabled = isEnding || Boolean(launchBusy);
       resumeButton.textContent = isEnding ? 'Stopping Session...' : 'Stop Session';
     } else if (launchBusy) {
       resumeButton.disabled = true;
       resumeButton.textContent = sessionLaunchLabel(launchBusy.launchMode);
+    } else if (isSessionApiRebindBusy(session)) {
+      resumeButton.disabled = true;
+      resumeButton.textContent = 'Rebinding & Resuming...';
     } else {
-      resumeButton.disabled = !canActivateHistory;
-      if (canActivateHistory && liveSession) {
+      resumeButton.disabled = !canActivateHistory || !canRebindHistory;
+      resumeButton.title = historyNeedsApiRebind && !canRebindHistory
+        ? t('session.apiRebindHostUpgrade')
+        : '';
+      if (canActivateHistory && historyNeedsApiRebind && canRebindHistory) {
+        resumeButton.textContent = 'Rebind & Resume';
+      } else if (canActivateHistory && historyNeedsApiRebind) {
+        resumeButton.textContent = 'Update Host Agent';
+      } else if (canActivateHistory && liveSession) {
         resumeButton.textContent = 'Resume History Again';
       } else if (canActivateHistory) {
         resumeButton.textContent = 'Resume From History';
@@ -12738,6 +13804,7 @@ function renderSessionDetails() {
   const composerDisabled = !session
     || Boolean(launchBusy)
     || isSessionApiRebindBusy(session)
+    || (historyNeedsApiRebind && !canRebindHistory)
     || (!session.live && !canActivateHistory);
   composer.classList.toggle('disabled', composerDisabled);
   input.disabled = composerDisabled;
@@ -12748,6 +13815,8 @@ function renderSessionDetails() {
     input.placeholder = 'Waiting for this new session to finish starting...';
   } else if (isEmptyManagedSessionShell(session)) {
     input.placeholder = 'This new session closed before any message was sent. Create a new session to continue.';
+  } else if (historyNeedsApiRebind && !canRebindHistory) {
+    input.placeholder = t('session.apiRebindHostUpgrade');
   } else if (session?.live) {
     input.placeholder = 'Send a follow-up prompt to the live managed session...';
   } else if (canActivateHistory) {
@@ -13084,7 +14153,12 @@ function createStatusRequestItem(request = {}) {
   appendTextElement(top, 'div', 'status-request-title', request.title || request.method || request.kind || 'Request');
   appendTextElement(top, 'div', 'status-request-badge', request.status || 'pending');
   item.appendChild(top);
-  appendTextElement(item, 'div', 'status-request-copy', request.summary || request.message || 'No summary provided.');
+  appendTextElement(
+    item,
+    'div',
+    'status-request-copy',
+    limitText(request.summary || request.message || 'No summary provided.', 320)
+  );
   appendTextElement(
     item,
     'div',
@@ -13269,13 +14343,56 @@ function renderStatusSummaryCard(container, label, value, note = '') {
 }
 
 async function respondToSessionRequest(session, request, response) {
-  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/requests/${encodeURIComponent(request.requestId)}/respond`, {
-    method: 'POST',
-    body: JSON.stringify({
-      hostId: session.hostId,
-      response,
-    }),
+  const responseKey = sessionRequestResponseKey(session, request);
+  if (!responseKey || state.codexControls.respondingRequestKeys.has(responseKey)) {
+    return { ok: true, duplicate: true, status: 'responding' };
+  }
+
+  state.codexControls.respondingRequestKeys.add(responseKey);
+  upsertRequestForSession(session.hostId, session.sessionId, {
+    ...request,
+    status: 'responding',
+    updatedAt: new Date().toISOString(),
   });
+  queuedUiRenders.approvalPopup = true;
+  queuedUiRenders.statusWindow = true;
+  queuedUiRenders.sessionDetails = true;
+  scheduleQueuedUiFlush();
+
+  try {
+    const result = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/requests/${encodeURIComponent(request.requestId)}/respond`, {
+      method: 'POST',
+      body: JSON.stringify({
+        hostId: session.hostId,
+        runId: request.runId || null,
+        response,
+      }),
+    });
+    if (result?.duplicate) {
+      state.codexControls.respondingRequestKeys.delete(responseKey);
+      resolveRequestForSession(session.hostId, session.sessionId, {
+        ...request,
+        status: result.status || 'resolved',
+        response,
+        updatedAt: new Date().toISOString(),
+      });
+      queuedUiRenders.approvalPopup = true;
+      queuedUiRenders.statusWindow = true;
+      scheduleQueuedUiFlush();
+    }
+    return result;
+  } catch (error) {
+    state.codexControls.respondingRequestKeys.delete(responseKey);
+    upsertRequestForSession(session.hostId, session.sessionId, {
+      ...request,
+      status: 'pending',
+      updatedAt: new Date().toISOString(),
+    });
+    queuedUiRenders.approvalPopup = true;
+    queuedUiRenders.statusWindow = true;
+    scheduleQueuedUiFlush();
+    throw error;
+  }
 }
 
 async function setGoalAutoApproveForSession(session, enabled, request = null) {
@@ -13326,6 +14443,21 @@ function getInputAnswerDraftKey(session, request) {
   const sessionKey = getSessionKey(session);
   const requestId = String(request?.requestId || '');
   return sessionKey && requestId ? `${sessionKey}::${requestId}` : '';
+}
+
+function sessionRequestResponseKey(session, request) {
+  const sessionKey = getSessionKey(session);
+  const requestId = String(request?.requestId || '').trim();
+  if (!sessionKey || !requestId) return '';
+  return `${sessionKey}::${String(request?.runId || 'legacy-run')}::${requestId}`;
+}
+
+function isSessionRequestResponding(session, request) {
+  const key = sessionRequestResponseKey(session, request);
+  return Boolean(
+    request?.status === 'responding'
+    || (key && state.codexControls.respondingRequestKeys.has(key))
+  );
 }
 
 function clearInputAnswerDraft(hostId, sessionId, requestId) {
@@ -13578,6 +14710,118 @@ function buildPermissionsDeclineResponse() {
   };
 }
 
+function approvalDecisionMap(request) {
+  const supplied = Array.isArray(request?.availableDecisions)
+    ? request.availableDecisions
+    : Array.isArray(request?.payload?.availableDecisions)
+      ? request.payload.availableDecisions
+      : [];
+  const decisions = new Map();
+  for (const option of supplied) {
+    if (typeof option === 'string' && option.trim()) {
+      decisions.set(option.trim(), option.trim());
+    } else if (option && typeof option === 'object') {
+      for (const [name] of Object.entries(option)) {
+        decisions.set(name, option);
+      }
+    }
+  }
+  if (!decisions.size) {
+    for (const name of ['accept', 'acceptForSession', 'decline', 'cancel']) {
+      decisions.set(name, name);
+    }
+  }
+  return decisions;
+}
+
+function activeApprovalGoal(session) {
+  const goal = (getRuntimeForSession(session) || session?.runtime || {}).goal || null;
+  const status = String(goal?.status || '').toLowerCase();
+  return goal && !['complete', 'completed', 'blocked', 'cancelled', 'canceled'].includes(status)
+    ? goal
+    : null;
+}
+
+function renderApprovalRequestDetail(container, request) {
+  container.replaceChildren();
+  const method = String(request?.method || '');
+  const payload = request?.payload && typeof request.payload === 'object' ? request.payload : {};
+  const command = String(payload.command || '').trim();
+  const reason = String(payload.reason || '').trim();
+  const cwd = String(payload.cwd || '').trim();
+  let message = String(request?.message || request?.summary || 'Codex needs a response before it can continue.').trim();
+  let detailLabel = 'Request details';
+  let detailText = '';
+
+  if (method === 'item/commandExecution/requestApproval') {
+    message = reason || `Codex wants to run a command${cwd ? ` in ${cwd}` : ''}.`;
+    detailLabel = 'Review command';
+    detailText = command || String(request?.summary || '').trim();
+  } else if (method === 'item/fileChange/requestApproval') {
+    message = reason || 'Codex wants to modify workspace files.';
+    detailLabel = 'Review file changes';
+    detailText = formatThinkingStructuredValue(payload.fileChanges || payload.changes || request?.summary || '');
+  } else if (method === 'item/permissions/requestApproval') {
+    message = reason || 'Codex is requesting additional permissions.';
+    detailLabel = 'Review requested permissions';
+    detailText = formatThinkingStructuredValue(payload.permissions || payload);
+  } else if (request?.summary && request.summary !== message) {
+    detailText = String(request.summary);
+  }
+
+  const boundedMessage = limitText(message, 240);
+  if (detailText && detailText !== boundedMessage) {
+    const details = document.createElement('details');
+    details.className = 'approval-popup-disclosure';
+    const summary = document.createElement('summary');
+    summary.textContent = detailLabel;
+    const pre = document.createElement('pre');
+    pre.className = 'approval-popup-code';
+    pre.textContent = detailText;
+    details.append(summary, pre);
+    container.appendChild(details);
+  }
+  container.classList.toggle('hidden', !container.childElementCount);
+  return { message: boundedMessage };
+}
+
+function approvalResponseOptions(session, request) {
+  const decisionMap = approvalDecisionMap(request);
+  const options = [];
+  if (decisionMap.has('accept')) {
+    options.push({ label: 'Approve Once', response: { decision: 'accept' } });
+  }
+  if (decisionMap.has('acceptForSession')) {
+    options.push({ label: 'Allow This Session', response: { decision: 'acceptForSession' } });
+  }
+  if (decisionMap.has('acceptWithExecpolicyAmendment')) {
+    options.push({
+      label: 'Approve Suggested Rule',
+      response: { decision: decisionMap.get('acceptWithExecpolicyAmendment') },
+    });
+  }
+  if (decisionMap.has('applyNetworkPolicyAmendment')) {
+    options.push({
+      label: 'Approve Network Rule',
+      response: { decision: decisionMap.get('applyNetworkPolicyAmendment') },
+    });
+  }
+  if (activeApprovalGoal(session) && decisionMap.has('accept')) {
+    options.push({
+      label: 'Auto Approve Goal',
+      response: { decision: 'accept', autoApproveGoal: true },
+      autoApproveGoal: true,
+    });
+  }
+  if (decisionMap.has('decline')) {
+    options.push({ label: 'Decline', response: { decision: 'decline' }, className: 'secondary-button' });
+  }
+  if (decisionMap.has('cancel')) {
+    options.push({ label: 'Cancel Turn', response: { decision: 'cancel' }, className: 'danger-button' });
+  }
+  return options;
+}
+
 function appendApprovalPopupButton(actions, label, className, onClick) {
   const button = document.createElement('button');
   button.type = 'button';
@@ -13616,12 +14860,6 @@ function renderApprovalPopup() {
   }
 
   const title = request.title || request.method || request.kind || 'Codex request';
-  const message = request.message || request.summary || 'Codex needs a response before it can continue.';
-  const detailText = request.summary && request.summary !== message
-    ? request.summary
-    : request.payload
-      ? summarizeData(request.payload)
-      : '';
   const actions = el('approval-popup-actions');
   const requestDraftKey = getInputAnswerDraftKey(session, request);
   const existingInputForm = actions?.querySelector('.user-input-request-form') || null;
@@ -13633,33 +14871,73 @@ function renderApprovalPopup() {
   );
 
   el('approval-popup-title').textContent = title;
-  el('approval-popup-message').textContent = message;
   const detail = el('approval-popup-detail');
-  detail.textContent = detailText;
-  detail.classList.toggle('hidden', !detailText);
+  const presentation = renderApprovalRequestDetail(detail, request);
+  el('approval-popup-message').replaceChildren(document.createTextNode(presentation.message));
   if (keepFocusedInputForm) {
     popup.classList.remove('hidden');
     return;
   }
   actions.innerHTML = '';
+  const responding = isSessionRequestResponding(session, request);
 
   if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
-    appendApprovalPopupButton(actions, 'Approve', '', async () => {
-      await respondToSessionRequest(session, request, { decision: 'accept' });
-    });
-    appendApprovalPopupButton(actions, 'Auto Approve Goal', '', async () => {
-      await approveAndEnableGoalAutoApprove(session, request);
-    });
-    appendApprovalPopupButton(actions, 'Decline', 'secondary-button', async () => {
-      await respondToSessionRequest(session, request, { decision: 'decline' });
-    });
-    appendApprovalPopupButton(actions, 'Cancel Turn', 'secondary-button', async () => {
-      await respondToSessionRequest(session, request, { decision: 'cancel' });
-    });
+    const decisionMap = approvalDecisionMap(request);
+    const availableDecisions = new Set(decisionMap.keys());
+    if (availableDecisions.has('accept')) {
+      const button = appendApprovalPopupButton(actions, 'Approve Once', '', async () => {
+        await respondToSessionRequest(session, request, { decision: 'accept' });
+      });
+      button.disabled = responding;
+    }
+    if (availableDecisions.has('acceptForSession')) {
+      const button = appendApprovalPopupButton(actions, 'Allow This Session', '', async () => {
+        await respondToSessionRequest(session, request, { decision: 'acceptForSession' });
+      });
+      button.disabled = responding;
+    }
+    if (availableDecisions.has('acceptWithExecpolicyAmendment')) {
+      const button = appendApprovalPopupButton(actions, 'Approve Suggested Rule', '', async () => {
+        await respondToSessionRequest(session, request, {
+          decision: decisionMap.get('acceptWithExecpolicyAmendment'),
+        });
+      });
+      button.disabled = responding;
+    }
+    if (availableDecisions.has('applyNetworkPolicyAmendment')) {
+      const button = appendApprovalPopupButton(actions, 'Approve Network Rule', '', async () => {
+        await respondToSessionRequest(session, request, {
+          decision: decisionMap.get('applyNetworkPolicyAmendment'),
+        });
+      });
+      button.disabled = responding;
+    }
+    const goal = activeApprovalGoal(session);
+    if (goal) {
+      if (availableDecisions.has('accept')) {
+        const button = appendApprovalPopupButton(actions, 'Auto Approve Goal', '', async () => {
+          await approveAndEnableGoalAutoApprove(session, request);
+        });
+        button.disabled = responding;
+      }
+    }
+    if (availableDecisions.has('decline')) {
+      const button = appendApprovalPopupButton(actions, 'Decline', 'secondary-button', async () => {
+        await respondToSessionRequest(session, request, { decision: 'decline' });
+      });
+      button.disabled = responding;
+    }
+    if (availableDecisions.has('cancel')) {
+      const button = appendApprovalPopupButton(actions, 'Cancel Turn', 'danger-button', async () => {
+        await respondToSessionRequest(session, request, { decision: 'cancel' });
+      });
+      button.disabled = responding;
+    }
   } else if (request.method === 'item/permissions/requestApproval') {
-    appendApprovalPopupButton(actions, 'Decline Permissions', 'secondary-button', async () => {
+    const button = appendApprovalPopupButton(actions, 'Decline Permissions', 'secondary-button', async () => {
       await respondToSessionRequest(session, request, buildPermissionsDeclineResponse());
     });
+    button.disabled = responding;
   } else if (request.method === 'item/tool/requestUserInput') {
     if (!renderUserInputRequestForm(actions, session, request, { compact: true })) {
       const note = document.createElement('div');
@@ -13669,11 +14947,141 @@ function renderApprovalPopup() {
     }
   }
 
-  appendApprovalPopupButton(actions, 'Open Status', 'secondary-button', async () => {
-    setStatusWindowOpen(true);
-  });
-
   popup.classList.remove('hidden');
+}
+
+function getInterruptOperation(sessionOrKey) {
+  const key = resolveComposerSessionKey(sessionOrKey);
+  return key ? state.codexControls.interruptOperationsBySession.get(key) || null : null;
+}
+
+function interruptOperationPresentation(operation) {
+  const status = String(operation?.status || 'queued').toLowerCase();
+  if (status === 'pending') {
+    return {
+      title: 'Interrupt pending',
+      message: 'Codex has not identified the submitted turn yet. Interrupt remains locked until the Host settles this request.',
+    };
+  }
+  if (status === 'accepted') {
+    return {
+      title: 'Interrupt accepted',
+      message: 'The Host accepted the interrupt. Waiting for the matching turn to finish.',
+    };
+  }
+  if (status === 'no_active') {
+    return {
+      title: 'No active turn',
+      message: 'The Host confirmed that there was no matching active turn to interrupt.',
+    };
+  }
+  if (status === 'failed') {
+    return {
+      title: 'Interrupt failed',
+      message: String(operation?.error || 'The Host could not interrupt the matching turn.'),
+    };
+  }
+  return {
+    title: status === 'queueing' ? 'Queueing interrupt' : 'Interrupt queued',
+    message: 'Waiting for the Host to acknowledge this interrupt request.',
+  };
+}
+
+function scheduleInterruptOperationCleanup(sessionKey, interruptRequestId, delayMs = 6000) {
+  window.setTimeout(() => {
+    const key = resolveComposerSessionKey(sessionKey);
+    const current = key ? state.codexControls.interruptOperationsBySession.get(key) || null : null;
+    if (!current || current.pending || current.interruptRequestId !== interruptRequestId) return;
+    state.codexControls.interruptOperationsBySession.delete(key);
+    renderComposerTurnNotice();
+  }, delayMs);
+}
+
+async function restoreSentDraftAfterInterrupt(session, operation) {
+  try {
+    await waitForActiveTurnToClear(session);
+    operation.draftRestored = restoreSentDraftSnapshotForSession(
+      session,
+      operation.expectedClientRequestId || operation.clientRequestId || ''
+    );
+  } catch (error) {
+    clearSentDraftSnapshotInterruptMarker(session, operation.interruptRequestId);
+    appendAlertForSession(session.hostId, session.sessionId, {
+      severity: 'warning',
+      source: 'ui',
+      message: `Interrupt was accepted, but the original prompt could not be restored yet: ${error.message}`,
+      timestamp: new Date().toISOString(),
+    });
+  } finally {
+    renderComposerControls();
+    renderComposerTurnNotice();
+  }
+}
+
+function applySessionInterruptResult(sessionOrKey, payload = {}) {
+  const key = resolveComposerSessionKey(sessionOrKey);
+  const operation = key ? state.codexControls.interruptOperationsBySession.get(key) || null : null;
+  const interruptRequestId = String(payload.interruptRequestId || '').trim();
+  if (!operation || !interruptRequestId || operation.interruptRequestId !== interruptRequestId) {
+    return false;
+  }
+  const status = ['accepted', 'pending', 'no_active', 'failed'].includes(payload.status)
+    ? payload.status
+    : 'failed';
+  if ((operation.settled || operation.status === 'accepted') && status === 'pending') {
+    return false;
+  }
+  const runtimeSession = findSessionForResolvedComposerKey(key, sessionOrKey) || sessionOrKey;
+  const currentRuntime = runtimeSession && typeof runtimeSession === 'object'
+    ? getRuntimeForSession(runtimeSession) || runtimeSession.runtime || null
+    : null;
+  const acceptedTurnSettled = status === 'accepted' && (
+    payload.turnSettled === true
+    || (currentRuntime && !runtimeIsActive(currentRuntime))
+  );
+  operation.status = status;
+  operation.pending = status === 'pending' || (status === 'accepted' && !acceptedTurnSettled);
+  operation.settled = !operation.pending;
+  operation.reason = payload.reason || null;
+  operation.error = payload.error || null;
+  operation.turnId = payload.turnId || operation.turnId || null;
+  operation.clientRequestId = payload.clientRequestId || operation.clientRequestId || null;
+  operation.updatedAt = payload.timestamp || new Date().toISOString();
+  if (operation.pending) {
+    state.codexControls.interruptBusyKeys.add(key);
+  } else {
+    state.codexControls.interruptBusyKeys.delete(key);
+    if (status === 'failed') {
+      clearSentDraftSnapshotInterruptMarker(key, interruptRequestId);
+    } else if (operation.restoreDraft && !operation.restoreScheduled) {
+      operation.restoreScheduled = true;
+      if (status === 'no_active') {
+        operation.draftRestored = restoreSentDraftSnapshotForSession(
+          key,
+          operation.expectedClientRequestId || operation.clientRequestId || ''
+        );
+      } else {
+        void restoreSentDraftAfterInterrupt(runtimeSession, operation);
+      }
+    }
+    scheduleInterruptOperationCleanup(key, interruptRequestId);
+  }
+  renderComposerControls();
+  renderComposerTurnNotice();
+  return true;
+}
+
+function settlePendingInterruptFromInactiveRuntime(sessionOrKey, runtime) {
+  const operation = getInterruptOperation(sessionOrKey);
+  if (!operation?.pending || runtimeIsActive(runtime || {})) return false;
+  return applySessionInterruptResult(sessionOrKey, {
+    interruptRequestId: operation.interruptRequestId,
+    status: 'accepted',
+    reason: 'runtime_inactive',
+    turnSettled: true,
+    clientRequestId: runtime?.clientRequestId || operation.clientRequestId || null,
+    timestamp: runtime?.updatedAt || new Date().toISOString(),
+  });
 }
 
 async function interruptActiveTurn(options = {}) {
@@ -13682,14 +15090,62 @@ async function interruptActiveTurn(options = {}) {
     return;
   }
 
-  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/interrupt`, {
-    method: 'POST',
-    body: JSON.stringify({
-      hostId: session.hostId,
-    }),
-  });
-  if (options.restoreDraft) {
-    restoreActiveDraftForSession(session);
+  if (!(state.codexControls.interruptBusyKeys instanceof Set)) {
+    state.codexControls.interruptBusyKeys = new Set();
+  }
+  const sessionKey = getSessionKey(session);
+  const resolvedSessionKey = resolveComposerSessionKey(sessionKey);
+  if (state.codexControls.interruptBusyKeys.has(resolvedSessionKey)) return;
+  const interruptRequestId = makeClientId();
+  const runtime = getRuntimeForSession(session) || session.runtime || {};
+  const operation = {
+    interruptRequestId,
+    status: 'queueing',
+    pending: true,
+    restoreDraft: options.restoreDraft === true,
+    restoreScheduled: false,
+    draftRestored: false,
+    expectedClientRequestId: runtime.clientRequestId || runtime.pendingClientRequestId || null,
+    startedAt: new Date().toISOString(),
+  };
+  state.codexControls.interruptOperationsBySession.set(resolvedSessionKey, operation);
+  state.codexControls.interruptBusyKeys.add(resolvedSessionKey);
+  if (operation.restoreDraft) {
+    markSentDraftSnapshotForInterrupt(
+      resolvedSessionKey,
+      interruptRequestId,
+      operation.expectedClientRequestId || ''
+    );
+  }
+  renderComposerControls();
+  renderComposerTurnNotice();
+  try {
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/interrupt`, {
+      method: 'POST',
+      body: JSON.stringify({
+        hostId: session.hostId,
+        interruptRequestId,
+        expectedRunId: session.runId || runtime.runId || null,
+        expectedTurnId: runtime.activeTurnId || null,
+        expectedClientRequestId: runtime.clientRequestId || runtime.pendingClientRequestId || null,
+      }),
+    });
+    const current = getInterruptOperation(resolvedSessionKey);
+    if (current?.interruptRequestId === interruptRequestId && current.pending && current.status === 'queueing') {
+      current.status = 'queued';
+      current.updatedAt = new Date().toISOString();
+    }
+    renderComposerTurnNotice();
+    return response;
+  } catch (error) {
+    applySessionInterruptResult(resolvedSessionKey, {
+      interruptRequestId,
+      status: 'failed',
+      error: error.message,
+      timestamp: new Date().toISOString(),
+    });
+    renderComposerControls();
+    throw error;
   }
 }
 
@@ -13730,9 +15186,6 @@ async function endCurrentSession() {
   if (!session) {
     return;
   }
-  if (isSessionApiRebindBusy(session)) {
-    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
-  }
   if (!session.live) {
     throw new Error(t('session.endAlreadyClosed'));
   }
@@ -13741,9 +15194,6 @@ async function endCurrentSession() {
   }
 
   const canonicalSession = await loadCanonicalSessionForLifecycleMutation(session);
-  if (isSessionApiRebindBusy(session)) {
-    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
-  }
   const expectation = captureSessionLifecycleExpectation(canonicalSession);
   const currentRuntime = getRuntimeForSession(canonicalSession) || canonicalSession.runtime || null;
   const previousRuntime = currentRuntime && typeof currentRuntime === 'object'
@@ -13758,6 +15208,10 @@ async function endCurrentSession() {
     waitingOnApproval: false,
     waitingOnUserInput: false,
   });
+  const rollbackExpectation = {
+    expectedApplyGeneration: getRuntimeApplyGeneration(canonicalSession.hostId, canonicalSession.sessionId),
+    expectedStreamGeneration: getRuntimeStreamGeneration(canonicalSession.hostId, canonicalSession.sessionId),
+  };
   renderAll();
 
   try {
@@ -13774,7 +15228,8 @@ async function endCurrentSession() {
     restoreRuntimeSnapshotForSession(
       canonicalSession.hostId,
       canonicalSession.sessionId,
-      previousRuntime
+      previousRuntime,
+      rollbackExpectation
     );
     renderAll();
     throw error;
@@ -13809,6 +15264,10 @@ function closeSessionActionDialog(options = {}) {
   state.sessionActionDialog.selectedKeys = new Set();
   state.sessionActionDialog.profileId = '';
   state.sessionActionDialog.selection = null;
+  state.sessionActionDialog.hostId = '';
+  state.sessionActionDialog.codexRuntime = null;
+  state.sessionActionDialog.codexUpdateOperation = null;
+  state.sessionActionDialog.updateResult = null;
   state.sessionActionDialog.phase = 'select';
   state.sessionActionDialog.resultsByKey = new Map();
   renderSessionActionDialog();
@@ -13833,6 +15292,10 @@ function openSessionActionDialog(options = {}) {
   state.sessionActionDialog.selection = options.selection
     ? normalizeRebindSelectionSnapshot(options.selection)
     : null;
+  state.sessionActionDialog.hostId = String(options.hostId || '');
+  state.sessionActionDialog.codexRuntime = options.codexRuntime || null;
+  state.sessionActionDialog.codexUpdateOperation = options.codexUpdateOperation || null;
+  state.sessionActionDialog.updateResult = null;
   state.sessionActionDialog.phase = 'select';
   state.sessionActionDialog.resultsByKey = new Map();
   renderSessionActionDialog();
@@ -13892,6 +15355,14 @@ function sessionActionResultLabel(result) {
     skipped: 'Skipped',
     conflict: 'Conflict',
     failure: 'Failed',
+    stopping: 'Stopping...',
+    stopped: 'Stopped',
+    installing: 'Installing...',
+    verifying: 'Verifying...',
+    resuming: 'Resuming...',
+    resumed: 'Resumed',
+    blocked: 'Blocked',
+    'left-stopped': 'Left stopped',
   };
   return [labels[result.status] || result.status, result.message || ''].filter(Boolean).join(' | ');
 }
@@ -13906,7 +15377,7 @@ function renderSessionActionRow(dialog, session) {
     row.dataset.resultStatus = result.status;
   }
   row.innerHTML = `
-    <input type="checkbox" data-session-action-key="${escapeHtml(key)}" ${dialog.selectedKeys.has(key) ? 'checked' : ''} ${dialog.busy ? 'disabled' : ''} />
+    <input type="checkbox" data-session-action-key="${escapeHtml(key)}" ${dialog.selectedKeys.has(key) ? 'checked' : ''} ${dialog.busy || dialog.mode === 'codex-update' || result?.status === 'blocked' ? 'disabled' : ''} />
     <div class="choice-session-copy">
       <strong>${escapeHtml(sessionDisplayTitle(session))}</strong>
       <span title="${escapeHtml(session.sessionId || '')}">${escapeHtml(sessionPlatformLabel(session))} | ${escapeHtml(session.sessionId || '')}</span>
@@ -13949,8 +15420,9 @@ function renderSessionActionDialog() {
   closeButton.disabled = dialog.busy;
   cancelButton.disabled = dialog.busy;
   const rebindMode = dialog.mode === 'rebind-profile';
+  const codexUpdateMode = dialog.mode === 'codex-update';
   preflight?.classList.toggle('hidden', !rebindMode);
-  profileSummary?.classList.toggle('hidden', !rebindMode);
+  profileSummary?.classList.toggle('hidden', !rebindMode && !codexUpdateMode);
   const resultValues = [...dialog.resultsByKey.values()];
   const readyCount = sessions.filter((session) => (
     dialog.selectedKeys.has(getSessionKey(session))
@@ -13982,6 +15454,30 @@ function renderSessionActionDialog() {
     confirm.textContent = dialog.phase === 'applying'
       ? 'Applying...'
       : `${dialog.actionLabel || 'Apply'} (${readyCount})`;
+  } else if (codexUpdateMode) {
+    const runtime = dialog.codexRuntime || getHost(dialog.hostId)?.codexRuntime || {};
+    profileSummary.textContent = `Codex ${runtime.version || 'unknown'} | ${codexInstallationSourceLabel(runtime.source)} | ${codexRuntimeCompatibilityLabel(runtime)}`;
+    const statusCounts = resultValues.reduce((counts, result) => {
+      counts[result.status] = (counts[result.status] || 0) + 1;
+      return counts;
+    }, {});
+    const phaseLabel = dialog.phase && dialog.phase !== 'select'
+      ? dialog.phase.replaceAll('_', ' ')
+      : '';
+    const countText = [
+      phaseLabel,
+      dialog.updateResult?.message || '',
+      Object.entries(statusCounts).map(([status, count]) => `${status}: ${count}`).join(' | '),
+    ].filter(Boolean).join(' | ');
+    resultsSummary.classList.toggle('hidden', !countText);
+    resultsSummary.textContent = countText;
+    selectAll.disabled = true;
+    const blockedCount = statusCounts.blocked || 0;
+    const recoveryMode = Boolean(dialog.codexUpdateOperation?.operationId);
+    confirm.disabled = dialog.busy || blockedCount > 0 || (!recoveryMode && runtime.canAutoUpdate !== true);
+    confirm.textContent = dialog.busy
+      ? 'Working...'
+      : `${dialog.actionLabel || 'Update Codex'}${sessions.length ? ` (${sessions.length})` : ''}`;
   } else {
     profileSummary.textContent = '';
     resultsSummary.textContent = '';
@@ -14027,13 +15523,7 @@ function renderSessionActionDialog() {
 }
 
 async function stopManagedSession(session) {
-  if (isSessionApiRebindBusy(session)) {
-    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
-  }
   const canonicalSession = await loadCanonicalSessionForLifecycleMutation(session);
-  if (isSessionApiRebindBusy(session)) {
-    throw sessionContractError('session_run_pending', 'Wait for the current Session Rebind to finish before stopping it.');
-  }
   const expectation = captureSessionLifecycleExpectation(canonicalSession);
   const currentRuntime = getRuntimeForSession(canonicalSession) || canonicalSession.runtime || null;
   const previousRuntime = currentRuntime && typeof currentRuntime === 'object'
@@ -14047,6 +15537,10 @@ async function stopManagedSession(session) {
     waitingOnApproval: false,
     waitingOnUserInput: false,
   });
+  const rollbackExpectation = {
+    expectedApplyGeneration: getRuntimeApplyGeneration(canonicalSession.hostId, canonicalSession.sessionId),
+    expectedStreamGeneration: getRuntimeStreamGeneration(canonicalSession.hostId, canonicalSession.sessionId),
+  };
   try {
     await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/stop`, {
       method: 'POST',
@@ -14061,7 +15555,8 @@ async function stopManagedSession(session) {
     restoreRuntimeSnapshotForSession(
       canonicalSession.hostId,
       canonicalSession.sessionId,
-      previousRuntime
+      previousRuntime,
+      rollbackExpectation
     );
     renderAll();
     throw error;
@@ -14092,11 +15587,7 @@ async function waitForSessionStopped(session, timeoutMs = 15000) {
 
 async function restartManagedSession(session) {
   await stopManagedSession(session);
-  const stoppedSession = await waitForSessionStopped(session).catch(() => ({
-    ...session,
-    live: false,
-    state: 'stopped',
-  }));
+  const stoppedSession = await waitForSessionStopped(session);
   await startManagedSession({
     session: {
       ...stoppedSession,
@@ -14448,8 +15939,408 @@ async function applyProfileRebindSessionActionDialog() {
   }
 }
 
+async function postHostCodexUpdateAction(hostId, body) {
+  return fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/codex-update`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+async function postHostCodexUpdateSessionProgress(operation, session, status, message = '') {
+  const response = await postHostCodexUpdateAction(operation.hostId, {
+    action: 'session-progress',
+    operationId: operation.operationId,
+    sessionId: session.sessionId,
+    status,
+    message,
+  });
+  return response.operation || operation;
+}
+
+async function resumeCodexUpdateSessions(dialog, operation, stoppedSessions, options = {}) {
+  const failures = [];
+  await postHostCodexUpdateAction(operation.hostId, {
+    action: 'resuming',
+    operationId: operation.operationId,
+    recoveryOnly: options.recoveryOnly === true,
+  });
+  dialog.phase = 'resuming';
+  setHostCodexUpdateDisplay(operation.hostId, {
+    ...operation,
+    status: 'resuming',
+    message: `Resuming ${stoppedSessions.length} managed Session(s).`,
+  });
+  for (const stopped of stoppedSessions) {
+    const key = getSessionKey(stopped);
+    dialog.resultsByKey.set(key, { status: 'resuming', message: '' });
+    renderSessionActionDialog();
+    try {
+      const progressOperation = await postHostCodexUpdateSessionProgress(
+        operation,
+        stopped,
+        'resuming',
+        'Starting native Session resume.'
+      );
+      const progressSession = (progressOperation.sessions || [])
+        .find((session) => session.sessionId === stopped.sessionId);
+      if (!progressSession?.resumeRequestId) {
+        throw new Error('Relay did not allocate an idempotent Session resume request.');
+      }
+      const current = state.sessions.find((session) => getSessionKey(session) === key) || stopped;
+      const started = await startManagedSession({
+        session: { ...current, live: false },
+        launchMode: 'resume',
+        collectionId: '',
+        selectAfterStart: false,
+        maintenanceOperationId: operation.operationId,
+        clientRequestId: progressSession.resumeRequestId,
+      });
+      if (!started) {
+        throw new Error('Session resume is already being submitted; wait for that attempt to finish.');
+      }
+      await waitForSession(
+        operation.hostId,
+        started.sessionId || stopped.sessionId,
+        (candidate) => candidate.live === true && !codexUpdateSessionIsStopping(candidate),
+        60_000,
+        {
+          sessionId: started.sessionId || stopped.sessionId,
+          bridgeSessionId: started.bridgeSessionId || stopped.bridgeSessionId,
+          nativeThreadId: started.nativeThreadId || stopped.nativeThreadId,
+          runId: started.runId || stopped.runId,
+          originSessionId: stopped.originSessionId,
+          sourceSessionId: stopped.sourceSessionId,
+          conversationKey: stopped.conversationKey,
+        }
+      );
+      dialog.resultsByKey.set(key, { status: 'resumed', message: 'Live on updated Codex' });
+      await postHostCodexUpdateSessionProgress(
+        operation,
+        stopped,
+        'resumed',
+        'Session resume started successfully.'
+      ).catch(() => {});
+    } catch (error) {
+      const message = error.message || String(error);
+      failures.push(`${stopped.sessionId}: ${message}`);
+      dialog.resultsByKey.set(key, { status: 'left-stopped', message });
+      await postHostCodexUpdateSessionProgress(operation, stopped, 'resume_failed', message).catch(() => {});
+    }
+    renderSessionActionDialog();
+  }
+  return failures;
+}
+
+async function runHostCodexRecoveryDialog() {
+  const dialog = state.sessionActionDialog;
+  const operation = dialog.codexUpdateOperation;
+  if (!operation?.operationId || dialog.busy) return;
+  const operationUiId = dialog.operationId;
+  dialog.busy = true;
+  dialog.phase = 'resuming';
+  dialog.updateResult = { message: 'Checking interrupted Session state.' };
+  state.hostCodexUpdateBusyId = operation.hostId;
+  renderSessionActionDialog();
+  renderHostNav();
+  const stoppedSessions = [];
+
+  try {
+    await refresh();
+    for (const session of dialog.sessions || []) {
+      let current = findCurrentCodexUpdateSession(session);
+      if (current?.live === true && codexUpdateSessionIsStopping(current)) {
+        dialog.resultsByKey.set(getSessionKey(session), {
+          status: 'stopping',
+          message: 'Waiting for the pending Stop to finish',
+        });
+        renderSessionActionDialog();
+        current = await waitForSessionStopped(current, 30_000);
+      }
+      if (current?.live !== true) {
+        stoppedSessions.push({ ...session, ...(current || {}), live: false });
+      }
+    }
+    dialog.updateResult = { message: `Recovering ${stoppedSessions.length} stopped Session(s).` };
+    renderSessionActionDialog();
+    const resumeFailures = await resumeCodexUpdateSessions(
+      dialog,
+      operation,
+      stoppedSessions,
+      { recoveryOnly: true }
+    );
+    const completionMessage = resumeFailures.length
+      ? `${resumeFailures.length} Session(s) could not be recovered and remain stopped.`
+      : stoppedSessions.length
+        ? `Recovered ${stoppedSessions.length} Session(s).`
+        : 'All Sessions were already live; maintenance is complete.';
+    await completeHostCodexUpdate(operation, {
+      resumeFailures,
+      message: completionMessage,
+    });
+    dialog.phase = 'complete';
+    dialog.updateResult = { message: completionMessage };
+    setHostCodexUpdateDisplay(operation.hostId, null);
+    await refresh();
+    window.alert(completionMessage);
+  } catch (error) {
+    dialog.phase = 'failed';
+    dialog.updateResult = { message: error.message || String(error) };
+  } finally {
+    if (sessionActionOperationIsCurrent(operationUiId)) {
+      dialog.busy = false;
+      state.hostCodexUpdateBusyId = null;
+      renderSessionActionDialog();
+      renderHostNav();
+    }
+  }
+}
+
+async function completeHostCodexUpdate(operation, options = {}) {
+  return postHostCodexUpdateAction(operation.hostId, {
+    action: 'complete',
+    operationId: operation.operationId,
+    updateSucceeded: options.updateSucceeded === true,
+    stopFailures: options.stopFailures || [],
+    resumeFailures: options.resumeFailures || [],
+    message: options.message || '',
+  });
+}
+
+async function runHostCodexUpdateDialog() {
+  const dialog = state.sessionActionDialog;
+  if (dialog.mode !== 'codex-update' || dialog.busy || !dialog.hostId) return;
+  if (dialog.codexUpdateOperation?.operationId) {
+    await runHostCodexRecoveryDialog();
+    return;
+  }
+  const hostId = dialog.hostId;
+  const operationUiId = dialog.operationId;
+  const stoppedSessions = [];
+  const stopFailures = [];
+  let operation = null;
+  let updateSucceeded = false;
+  let applyCompleted = false;
+
+  dialog.busy = true;
+  dialog.phase = 'preparing';
+  dialog.updateResult = { message: 'Preparing Host maintenance.' };
+  state.hostCodexUpdateBusyId = hostId;
+  renderSessionActionDialog();
+  renderHostNav();
+
+  try {
+    const prepared = await postHostCodexUpdateAction(hostId, { action: 'prepare' });
+    operation = prepared.operation;
+    if (!operation?.operationId) {
+      throw new Error('Relay did not return a Codex maintenance operation.');
+    }
+    setHostCodexUpdateDisplay(hostId, operation);
+    await refresh();
+    if (!sessionActionOperationIsCurrent(operationUiId)) return;
+
+    const liveById = new Map(getRelayManagedLiveSessions([hostId])
+      .map((session) => [session.sessionId, session]));
+    dialog.sessions = (operation.sessions || []).map((snapshot) => (
+      liveById.get(snapshot.sessionId) || { ...snapshot, source: 'managed', live: true }
+    ));
+    dialog.selectedKeys = new Set(dialog.sessions.map(getSessionKey));
+    dialog.resultsByKey = new Map(dialog.sessions.map((session) => [
+      getSessionKey(session),
+      { status: 'stopping', message: 'Waiting for confirmed process exit' },
+    ]));
+    dialog.phase = 'stopping_sessions';
+    dialog.updateResult = { message: operation.message || 'Stopping managed Sessions.' };
+    renderSessionActionDialog();
+
+    for (let index = 0; index < dialog.sessions.length; index += 1) {
+      const session = dialog.sessions[index];
+      const key = getSessionKey(session);
+      try {
+        await postHostCodexUpdateSessionProgress(operation, session, 'stopping', 'Waiting for confirmed process exit.');
+        await stopManagedSession(session);
+        const stopped = await waitForSessionStopped(session, 30_000);
+        stoppedSessions.push({ ...session, ...(stopped || {}), live: false });
+        dialog.resultsByKey.set(key, { status: 'stopped', message: 'Process exit confirmed' });
+        await postHostCodexUpdateSessionProgress(operation, session, 'stopped', 'Process exit confirmed.');
+      } catch (error) {
+        const message = error.message || String(error);
+        stopFailures.push(`${session.sessionId}: ${message}`);
+        dialog.resultsByKey.set(key, { status: 'failure', message });
+        await postHostCodexUpdateSessionProgress(operation, session, 'stop_failed', message).catch(() => {});
+        for (const remaining of dialog.sessions.slice(index + 1)) {
+          dialog.resultsByKey.set(getSessionKey(remaining), {
+            status: 'skipped',
+            message: 'Update cancelled because another Session did not stop',
+          });
+          await postHostCodexUpdateSessionProgress(
+            operation,
+            remaining,
+            'skipped',
+            'Update cancelled because another Session did not stop.'
+          ).catch(() => {});
+        }
+        break;
+      }
+      renderSessionActionDialog();
+    }
+
+    if (stopFailures.length) {
+      dialog.updateResult = { message: 'Codex was not changed because a Session did not stop cleanly.' };
+      const resumeFailures = await resumeCodexUpdateSessions(
+        dialog,
+        operation,
+        stoppedSessions,
+        { recoveryOnly: true }
+      );
+      await completeHostCodexUpdate(operation, {
+        updateSucceeded: false,
+        stopFailures,
+        resumeFailures,
+        message: 'Codex update cancelled after a Session stop failure.',
+      });
+      dialog.phase = 'complete';
+      dialog.updateResult = {
+        message: resumeFailures.length
+          ? 'Update cancelled; some previously stopped Sessions remain stopped.'
+          : 'Update cancelled; previously stopped Sessions were resumed.',
+      };
+      setHostCodexUpdateDisplay(hostId, null);
+      await refresh();
+      window.alert(dialog.updateResult.message);
+      return;
+    }
+
+    dialog.phase = 'installing';
+    dialog.updateResult = { message: 'Installing and verifying the latest Codex release.' };
+    for (const session of dialog.sessions) {
+      dialog.resultsByKey.set(getSessionKey(session), { status: 'installing', message: '' });
+      await postHostCodexUpdateSessionProgress(
+        operation,
+        session,
+        'installing',
+        'Installing and verifying the latest Codex release.'
+      );
+    }
+    setHostCodexUpdateDisplay(hostId, {
+      ...operation,
+      status: 'installing',
+      message: 'Installing and verifying the latest Codex release.',
+    });
+    renderSessionActionDialog();
+
+    let applied;
+    try {
+      applied = await postHostCodexUpdateAction(hostId, {
+        action: 'apply',
+        operationId: operation.operationId,
+      });
+      applyCompleted = true;
+    } catch (error) {
+      const status = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/codex-update`).catch(() => null);
+      const persistedStatus = status?.operation?.status || '';
+      if (['updated', 'update_failed', 'completed', 'failed'].includes(persistedStatus)) {
+        applied = {
+          ok: ['updated', 'completed'].includes(persistedStatus),
+          operation: status.operation,
+          result: {
+            ok: ['updated', 'completed'].includes(persistedStatus),
+            error: ['update_failed', 'failed'].includes(persistedStatus) ? status.operation.message : null,
+          },
+        };
+        applyCompleted = true;
+      } else {
+        dialog.phase = 'interrupted';
+        dialog.updateResult = {
+          message: `Update result is unknown: ${error.message}. Sessions remain stopped and the maintenance gate stays active.`,
+        };
+        setHostCodexUpdateDisplay(hostId, status?.operation || {
+          ...operation,
+          status: 'interrupted',
+          message: dialog.updateResult.message,
+        });
+        return;
+      }
+    }
+
+    updateSucceeded = applied.ok === true;
+    operation = applied.operation || operation;
+    dialog.codexRuntime = applied.result?.codexRuntime || getHost(hostId)?.codexRuntime || dialog.codexRuntime;
+    const serverFinalizedWithoutRecovery = (
+      (operation.sessions || []).length === 0
+      && ['completed', 'failed'].includes(operation.status)
+    );
+    if (serverFinalizedWithoutRecovery) {
+      const completionMessage = operation.message || (
+        operation.status === 'completed'
+          ? 'Codex updated; no Sessions required recovery.'
+          : 'Codex update failed; no Sessions required recovery.'
+      );
+      dialog.phase = operation.status === 'completed' ? 'complete' : 'failed';
+      dialog.updateResult = { message: completionMessage };
+      dialog.codexUpdateOperation = null;
+      setHostCodexUpdateDisplay(hostId, null);
+      await refresh();
+      window.alert(completionMessage);
+      return;
+    }
+    dialog.updateResult = {
+      message: updateSucceeded
+        ? `Codex ${applied.result?.version || operation.targetVersion || 'latest'} installed and verified.`
+        : `Codex update failed: ${applied.result?.error || operation.message || 'unknown error'}`,
+    };
+    const resumeFailures = await resumeCodexUpdateSessions(dialog, operation, stoppedSessions);
+    const completionMessage = updateSucceeded
+      ? (resumeFailures.length
+        ? `Codex updated; ${resumeFailures.length} Session(s) remain stopped.`
+        : `Codex updated and ${stoppedSessions.length} Session(s) resumed.`)
+      : (resumeFailures.length
+        ? `Codex update failed; ${resumeFailures.length} Session(s) could not be restored.`
+        : 'Codex update failed; stopped Sessions were restored.');
+    await completeHostCodexUpdate(operation, {
+      updateSucceeded,
+      resumeFailures,
+      message: completionMessage,
+    });
+    dialog.phase = 'complete';
+    dialog.updateResult = { message: completionMessage };
+    setHostCodexUpdateDisplay(hostId, null);
+    await refresh();
+    window.alert(completionMessage);
+  } catch (error) {
+    const recoveryRequired = Boolean(
+      applyCompleted
+      && operation?.operationId
+      && !['completed', 'failed', 'cancelled'].includes(operation.status)
+    );
+    dialog.phase = recoveryRequired ? 'recovery_required' : 'failed';
+    dialog.updateResult = {
+      message: recoveryRequired
+        ? `Codex finished updating, but Session recovery did not complete: ${error.message || String(error)}`
+        : (error.message || String(error)),
+    };
+    if (recoveryRequired) {
+      dialog.codexUpdateOperation = operation;
+      dialog.actionLabel = 'Recover Sessions';
+      setHostCodexUpdateDisplay(hostId, operation);
+    } else if (!operation) {
+      setHostCodexUpdateDisplay(hostId, null);
+    }
+  } finally {
+    if (sessionActionOperationIsCurrent(operationUiId)) {
+      dialog.busy = false;
+      state.hostCodexUpdateBusyId = null;
+      renderSessionActionDialog();
+      renderHostNav();
+    }
+  }
+}
+
 async function runSessionActionDialog() {
   const dialog = state.sessionActionDialog;
+  if (dialog.mode === 'codex-update') {
+    await runHostCodexUpdateDialog();
+    return;
+  }
   if (dialog.mode === 'rebind-profile') {
     await applyProfileRebindSessionActionDialog();
     return;
@@ -14770,25 +16661,24 @@ function renderStatusWindow() {
               item.appendChild(note);
             }
           } else if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
-            const options = [
-              ['Accept', { decision: 'accept' }],
-              ['Allow This Session', { decision: 'acceptForSession' }],
-              ['Auto Approve This Goal', { decision: 'accept', autoApproveGoal: true }],
-              ['Decline', { decision: 'decline' }],
-              ['Cancel Turn', { decision: 'cancel' }],
-            ];
-            for (const [label, response] of options) {
+            const responding = isSessionRequestResponding(session, request);
+            const options = approvalResponseOptions(session, request);
+            for (const option of options) {
               const button = document.createElement('button');
               button.type = 'button';
-              button.className = label === 'Decline' || label === 'Cancel Turn' ? 'secondary-button' : '';
-              button.textContent = label;
+              button.className = option.className || '';
+              button.textContent = option.label;
+              button.disabled = responding;
               button.onclick = async () => {
+                if (isSessionRequestResponding(session, request)) return;
+                button.disabled = true;
                 try {
-                  if (response.autoApproveGoal) {
+                  if (option.autoApproveGoal) {
                     await setGoalAutoApproveForSession(session, true, request);
                   }
-                  await respondToSessionRequest(session, request, response);
+                  await respondToSessionRequest(session, request, option.response);
                 } catch (error) {
+                  button.disabled = false;
                   reportError(error);
                 }
               };
@@ -15044,6 +16934,13 @@ function bindThinkingDisclosure(details, stateKey, disclosureKey, defaultOpen = 
   });
 }
 
+function thinkingDiffPreviewCopy(hiddenLines) {
+  const locale = String(state?.ui?.locale || document.documentElement.lang || '').toLowerCase();
+  return locale.startsWith('zh')
+    ? `... \u8fd8\u6709 ${hiddenLines} \u884c\uff0c\u53ef\u5728\u4e0b\u65b9\u5c55\u5f00 ...`
+    : `... ${hiddenLines} more lines; expand below ...`;
+}
+
 function renderFileChangeDetails(fileChanges = [], stateKey = '', disclosurePrefix = 'file') {
   const wrapper = document.createElement('div');
   wrapper.className = 'thinking-file-change-list';
@@ -15075,22 +16972,97 @@ function renderFileChangeDetails(fileChanges = [], stateKey = '', disclosurePref
     diff.className = 'thinking-diff-block';
     const diffText = String(change.diff || '').trim();
     if (diffText) {
-      for (const line of diffText.split(/\r?\n/).slice(0, 240)) {
-        diff.appendChild(renderDiffLine(line));
+      const lines = diffText.split(/\r?\n/);
+      const diffDisclosureKey = `${disclosureKey}::diff`;
+      const diffStorageKey = stateKey
+        ? thinkingDisclosureStateKey(stateKey, diffDisclosureKey)
+        : '';
+      let expanded = diffStorageKey && state.thinkingDisclosures.has(diffStorageKey)
+        ? state.thinkingDisclosures.get(diffStorageKey) === true
+        : false;
+      const renderLines = () => {
+        diff.replaceChildren();
+        if (expanded) {
+          const expandedDiff = document.createElement('pre');
+          expandedDiff.className = 'thinking-diff-full';
+          expandedDiff.textContent = diffText;
+          diff.appendChild(expandedDiff);
+          return;
+        }
+        const visibleLines = lines.slice(0, 240);
+        for (const line of visibleLines) {
+          diff.appendChild(renderDiffLine(line));
+        }
+        if (!expanded && lines.length > visibleLines.length) {
+          const preview = document.createElement('div');
+          preview.className = 'diff-line hunk';
+          preview.textContent = thinkingDiffPreviewCopy(lines.length - visibleLines.length);
+          diff.appendChild(preview);
+        }
+      };
+      renderLines();
+      details.appendChild(diff);
+      if (lines.length > 240) {
+        const expandButton = document.createElement('button');
+        expandButton.type = 'button';
+        expandButton.className = 'thinking-expand-toggle thinking-diff-expand-toggle secondary-button';
+        expandButton.dataset.thinkingExpandKey = diffDisclosureKey;
+        const updateButton = () => {
+          expandButton.textContent = thinkingExpansionCopy(expanded);
+          expandButton.title = thinkingExpansionCopy(expanded);
+          expandButton.setAttribute('aria-expanded', String(expanded));
+        };
+        updateButton();
+        expandButton.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const transcriptSnapshot = typeof captureTranscriptScrollSnapshot === 'function'
+            ? captureTranscriptScrollSnapshot()
+            : null;
+          const viewportSnapshot = typeof captureViewportElementOffset === 'function'
+            ? captureViewportElementOffset(expandButton)
+            : null;
+          const thinkingScroller = expandButton.closest?.('.thinking-content') || null;
+          const thinkingViewportSnapshot = thinkingScroller
+            && typeof captureViewportElementOffset === 'function'
+            ? captureViewportElementOffset(expandButton, thinkingScroller)
+            : null;
+          expanded = !expanded;
+          if (diffStorageKey) state.thinkingDisclosures.set(diffStorageKey, expanded);
+          renderLines();
+          updateButton();
+          const restore = () => {
+            if (typeof restoreViewportElementOffset === 'function') {
+              restoreViewportElementOffset(thinkingViewportSnapshot);
+            }
+            if (typeof restoreTranscriptScrollSnapshot === 'function') {
+              restoreTranscriptScrollSnapshot(transcriptSnapshot);
+            }
+            if (typeof restoreViewportElementOffset === 'function') {
+              restoreViewportElementOffset(viewportSnapshot);
+            }
+          };
+          if (typeof window.requestAnimationFrame === 'function') {
+            window.requestAnimationFrame(restore);
+          } else {
+            window.setTimeout(restore, 0);
+          }
+        });
+        details.appendChild(expandButton);
       }
-      if (diffText.split(/\r?\n/).length > 240) {
-        const truncated = document.createElement('div');
-        truncated.className = 'diff-line hunk';
-        truncated.textContent = '... diff truncated in mobile view ...';
-        diff.appendChild(truncated);
+      if (change.truncated === true) {
+        const note = document.createElement('div');
+        note.className = 'thinking-source-truncation-note thinking-diff-truncation-note';
+        note.textContent = thinkingSourceTruncationCopy(lines.length > 240);
+        details.appendChild(note);
       }
     } else {
       const empty = document.createElement('div');
       empty.className = 'thinking-text';
       empty.textContent = 'No unified diff body was provided by Codex for this file change.';
       diff.appendChild(empty);
+      details.appendChild(diff);
     }
-    details.appendChild(diff);
     wrapper.appendChild(details);
   }
   return wrapper;
@@ -15173,8 +17145,11 @@ function getThinkingScrollMachine(stateKey, scroller) {
   if (current) return current;
   const saved = state.thinkingScrollPositions.get(stateKey);
   const snapshot = saved?.machineSnapshot || null;
+  const initiallyPinned = saved
+    ? saved.atBottom !== false
+    : isThinkingContentPinnedToBottom(scroller);
   const machine = window.RemoteCodexTranscriptScroll.createScrollMachine(scroller, {
-    initialMode: snapshot?.mode || (saved?.atBottom === false ? 'detached' : 'follow'),
+    initialMode: snapshot?.mode || (initiallyPinned ? 'follow' : 'detached'),
     initialUserRevision: snapshot?.userRevision || 0,
     initialProgrammaticRevision: snapshot?.programmaticRevision || 0,
     anchorSelector: '[data-thinking-viewport-key]',
@@ -15226,8 +17201,12 @@ function restoreThinkingScrollState(stateKey, scroller, options = {}) {
     return;
   }
   const saved = state.thinkingScrollPositions.get(stateKey);
-  const machine = getThinkingScrollMachine(stateKey, scroller);
-  const expectedUserRevision = machine?.state().userRevision || 0;
+  const existingMachine = scroller.isConnected
+    ? getThinkingScrollMachine(stateKey, scroller)
+    : state.thinkingScrollMachines.get(scroller) || null;
+  const expectedUserRevision = existingMachine?.state().userRevision
+    ?? saved?.machineSnapshot?.userRevision
+    ?? 0;
   const restore = () => {
     if (!scroller.isConnected) {
       return;
@@ -15235,6 +17214,7 @@ function restoreThinkingScrollState(stateKey, scroller, options = {}) {
     if (state.thinkingScrollPositions.get(stateKey) !== saved) {
       return;
     }
+    const machine = getThinkingScrollMachine(stateKey, scroller);
     if (machine && machine.state().userRevision !== expectedUserRevision) {
       return;
     }
@@ -15255,7 +17235,7 @@ function restoreThinkingScrollState(stateKey, scroller, options = {}) {
   }
 }
 
-function recordThinkingTrustedInteraction(stateKey, scroller, event) {
+function recordThinkingTrustedInteraction(stateKey, scroller, event, phase = 'complete') {
   if (event?.isTrusted !== true) {
     return;
   }
@@ -15264,11 +17244,18 @@ function recordThinkingTrustedInteraction(stateKey, scroller, event) {
   if (!machine) {
     return;
   }
+  if (phase !== 'end') {
+    if (!machine.beginTrustedInteraction()) return;
+    updateThinkingScrollState(stateKey, scroller);
+  }
+  if (phase === 'begin') {
+    return;
+  }
   window.requestAnimationFrame(() => {
     if (!scroller.isConnected) {
       return;
     }
-    machine.recordTrustedInteraction();
+    machine.settleTrustedInteraction();
     updateThinkingScrollState(stateKey, scroller);
   });
 }
@@ -15279,6 +17266,42 @@ function captureThinkingScrollStates(container) {
   }
   container.querySelectorAll('.thinking-content[data-thinking-state-key]')
     .forEach((scroller) => updateThinkingScrollState(scroller.dataset.thinkingStateKey || '', scroller));
+}
+
+function captureDetachedThinkingViewportOffsets(container) {
+  if (!container) {
+    return [];
+  }
+  const snapshots = [];
+  for (const scroller of container.querySelectorAll('.thinking-content[data-thinking-state-key]')) {
+    const stateKey = scroller.dataset.thinkingStateKey || '';
+    const machine = getThinkingScrollMachine(stateKey, scroller);
+    if (!stateKey || machine?.state().mode !== 'detached') {
+      continue;
+    }
+    const viewport = captureViewportElementOffset(scroller);
+    if (viewport) snapshots.push({ stateKey, viewport });
+  }
+  return snapshots;
+}
+
+function restoreDetachedThinkingViewportOffsets(container, snapshots = []) {
+  if (!container || !Array.isArray(snapshots)) {
+    return;
+  }
+  for (const snapshot of snapshots) {
+    const scroller = container.querySelector(
+      `.thinking-content[data-thinking-state-key="${cssEscape(snapshot.stateKey)}"]`
+    );
+    if (!scroller) {
+      continue;
+    }
+    restoreThinkingScrollState(snapshot.stateKey, scroller, {
+      preserveDetached: true,
+      immediate: true,
+    });
+    restoreViewportElementOffset(snapshot.viewport, scroller);
+  }
 }
 
 function preserveThinkingViewportForPatch(stateKey, scroller) {
@@ -15315,6 +17338,9 @@ function createThinkingScrollActions(details, target, position = 'top', stateKey
       const scroller = details.querySelector('.thinking-content');
       if (scroller) {
         const machine = getThinkingScrollMachine(stateKey, scroller);
+        if (event.isTrusted === true) {
+          machine?.beginTrustedInteraction();
+        }
         if (isBottom) {
           machine?.establishFollow();
         } else {
@@ -15607,6 +17633,7 @@ function applyThinkingEntryData(node, entry, index = 0) {
   node.dataset.thinkingEntryKey = entryKey;
   node.dataset.thinkingViewportKey = thinkingEntryViewportKey(entry, index);
   node.dataset.thinkingEntryCategory = String(entry?.category || entry?.kind || 'thinking');
+  node.dataset.thinkingRenderVersion = thinkingEntryRenderVersion(entry, index);
   if (activityKeys.length) {
     node.dataset.thinkingActivityKey = activityKeys[0];
     node.dataset.thinkingActivityKeys = activityKeys.join('\u001f');
@@ -15631,8 +17658,143 @@ function formatThinkingStructuredValue(value) {
   }
 }
 
+function thinkingExpansionCopy(expanded) {
+  const locale = String(state?.ui?.locale || document.documentElement.lang || '').toLowerCase();
+  if (locale.startsWith('zh')) {
+    return expanded ? '\u6536\u8d77' : '\u5c55\u5f00';
+  }
+  return expanded ? 'Collapse' : 'Expand';
+}
+
+function thinkingSourceTruncationCopy(expandable = false) {
+  const locale = String(state?.ui?.locale || document.documentElement.lang || '').toLowerCase();
+  if (locale.startsWith('zh')) {
+    return expandable
+      ? '\u4e0a\u6e38\u4e3a\u63a7\u5236\u5185\u5b58\u5df2\u53ea\u4fdd\u7559\u90e8\u5206\u5185\u5bb9\uff1b\u5c55\u5f00\u4ec5\u663e\u793a\u5f53\u524d\u5df2\u4fdd\u7559\u7684\u5168\u90e8\u3002'
+      : '\u4e0a\u6e38\u4e3a\u63a7\u5236\u5185\u5b58\u53ea\u4fdd\u7559\u4e86\u90e8\u5206\u5185\u5bb9\uff1b\u6b64\u5904\u5df2\u663e\u793a\u5f53\u524d\u4fdd\u7559\u7684\u5168\u90e8\u3002';
+  }
+  return expandable
+    ? 'The upstream runtime retained only part of this content for memory safety. Expand shows all retained content.'
+    : 'The upstream runtime retained only part of this content for memory safety. All retained content is shown here.';
+}
+
+function thinkingRetainedPreviewCopy() {
+  const locale = String(state?.ui?.locale || document.documentElement.lang || '').toLowerCase();
+  return locale.startsWith('zh')
+    ? '\u4ec5\u6709\u5df2\u4fdd\u7559\u7684\u9884\u89c8\u53ef\u7528\u3002'
+    : 'Only the retained preview is available.';
+}
+
+function thinkingTextNeedsExpansion(value, options = {}) {
+  const text = String(value || '');
+  const preformatted = options.preformatted === true || options.code === true;
+  const maxChars = Math.max(1, Number(options.maxChars || (
+    preformatted ? THINKING_EXPANDABLE_CODE_CHAR_LIMIT : THINKING_EXPANDABLE_TEXT_CHAR_LIMIT
+  )) || 1);
+  const maxLines = Math.max(1, Number(options.maxLines || (
+    preformatted ? THINKING_EXPANDABLE_CODE_LINE_LIMIT : THINKING_EXPANDABLE_TEXT_LINE_LIMIT
+  )) || 1);
+  return text.length > maxChars || text.split(/\r?\n/).length > maxLines;
+}
+
+function thinkingSourceWasTruncated(value, flagged = false) {
+  const text = String(value || '');
+  return flagged === true
+    || /(?:^|\r?\n)\.\.\.\[(?:activity|notification|text|assistant output|diff) truncated\]\s*$/i.test(text)
+    || /^\.\.\.\[earlier output truncated\]\r?\n/i.test(text);
+}
+
+function thinkingStructuredValueWasTruncated(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return value.truncated === true
+    && typeof value.preview === 'string'
+    && keys.every((key) => key === 'truncated' || key === 'preview');
+}
+
+function bindThinkingTextExpansion(container, content, value, options = {}) {
+  if (!container || !content) return null;
+  const text = String(value || '');
+  const disclosureKey = String(options.disclosureKey || '').trim();
+  const storageKey = options.stateKey && disclosureKey
+    ? thinkingDisclosureStateKey(options.stateKey, disclosureKey)
+    : '';
+  const sourceTruncated = thinkingSourceWasTruncated(text, options.truncated);
+  const expandable = thinkingTextNeedsExpansion(text, options);
+  let button = null;
+
+  if (expandable) {
+    container.classList.add('thinking-expandable');
+    container.dataset.thinkingExpandKey = disclosureKey;
+    content.classList.add('thinking-expandable-content');
+    button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'thinking-expand-toggle secondary-button';
+    button.dataset.thinkingExpandKey = disclosureKey;
+    let expanded = storageKey && state.thinkingDisclosures.has(storageKey)
+      ? state.thinkingDisclosures.get(storageKey) === true
+      : options.defaultExpanded === true;
+    const apply = () => {
+      container.classList.toggle('is-expanded', expanded);
+      content.classList.toggle('is-expanded', expanded);
+      button.setAttribute('aria-expanded', String(expanded));
+      button.textContent = thinkingExpansionCopy(expanded);
+      button.title = thinkingExpansionCopy(expanded);
+    };
+    apply();
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const transcriptSnapshot = typeof captureTranscriptScrollSnapshot === 'function'
+        ? captureTranscriptScrollSnapshot()
+        : null;
+      const viewportSnapshot = typeof captureViewportElementOffset === 'function'
+        ? captureViewportElementOffset(button)
+        : null;
+      const thinkingScroller = button.closest?.('.thinking-content') || null;
+      const thinkingViewportSnapshot = thinkingScroller
+        && typeof captureViewportElementOffset === 'function'
+        ? captureViewportElementOffset(button, thinkingScroller)
+        : null;
+      expanded = !expanded;
+      if (storageKey) state.thinkingDisclosures.set(storageKey, expanded);
+      apply();
+      const restore = () => {
+        if (typeof restoreViewportElementOffset === 'function') {
+          restoreViewportElementOffset(thinkingViewportSnapshot);
+        }
+        if (typeof restoreTranscriptScrollSnapshot === 'function') {
+          restoreTranscriptScrollSnapshot(transcriptSnapshot);
+        }
+        if (typeof restoreViewportElementOffset === 'function') {
+          restoreViewportElementOffset(viewportSnapshot);
+        }
+      };
+      if (typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(restore);
+      } else {
+        window.setTimeout(restore, 0);
+      }
+    });
+    container.appendChild(button);
+  }
+
+  if (sourceTruncated) {
+    const note = document.createElement('div');
+    note.className = 'thinking-source-truncation-note';
+    note.textContent = thinkingSourceTruncationCopy(expandable);
+    container.appendChild(note);
+  }
+  return button;
+}
+
 function appendThinkingOperationField(parent, labelText, value, options = {}) {
-  const text = formatThinkingStructuredValue(value).trim();
+  const sourceTruncated = options.truncated === true
+    || thinkingStructuredValueWasTruncated(value);
+  let text = formatThinkingStructuredValue(value).trim();
+  if (!text && sourceTruncated && options.showWhenTruncated === true) {
+    text = thinkingRetainedPreviewCopy();
+  }
   if (!text) return null;
   const field = document.createElement('div');
   field.className = `thinking-operation-field${options.tone ? ` ${options.tone}` : ''}`;
@@ -15646,12 +17808,20 @@ function appendThinkingOperationField(parent, labelText, value, options = {}) {
     : 'thinking-operation-value';
   content.textContent = text;
   field.append(label, content);
+  bindThinkingTextExpansion(field, content, text, {
+    ...options,
+    truncated: sourceTruncated,
+  });
   parent.appendChild(field);
   return field;
 }
 
 function thinkingOperationTitle(entry) {
   const category = String(entry?.category || entry?.kind || 'tool').toLowerCase();
+  if (category === 'collaboration' || category === 'subagent') {
+    const label = entry.agentPath || entry.agentNickname || entry.agentThreadId || 'sub-agent';
+    return limitText(`Sub-agent ${label}`, 120);
+  }
   if (category === 'command') {
     return limitText(String(entry.command || entry.name || entry.text || 'Command').split(/\r?\n/)[0], 120);
   }
@@ -15676,8 +17846,8 @@ function thinkingOperationStatus(entry) {
 
 function thinkingOperationStatusTone(status) {
   const value = String(status || '').toLowerCase();
-  if (/fail|error|cancel|declin|denied/.test(value)) return 'failed';
-  if (/complete|success|done|approved/.test(value)) return 'completed';
+  if (/fail|error|cancel|declin|denied|interrupted/.test(value)) return 'failed';
+  if (/complete|success|done|approved|interacted|spawned|finished/.test(value)) return 'completed';
   return 'running';
 }
 
@@ -15731,43 +17901,72 @@ function createThinkingOperationEntry(entry, index, stateKey, session) {
   const category = String(entry.category || entry.kind || '').toLowerCase();
   const overview = String(entry.text || '').trim();
   const titleText = thinkingOperationTitle(entry);
+  const appendField = (labelText, value, options = {}) => appendThinkingOperationField(
+    body,
+    labelText,
+    value,
+    {
+      ...options,
+      stateKey,
+      disclosureKey: `${entryKey}::field:${labelText}`,
+    }
+  );
   if (overview && overview !== titleText && category !== 'command') {
-    appendThinkingOperationField(body, 'Summary', overview);
+    appendField('Summary', overview, { truncated: entry.textTruncated === true });
   }
-  appendThinkingOperationField(body, 'Command', entry.command, { code: true, preformatted: true });
-  appendThinkingOperationField(body, 'Directory', entry.cwd, { code: true });
-  appendThinkingOperationField(body, 'Arguments', entry.argumentsText || entry.arguments, { code: true, preformatted: true });
-  appendThinkingOperationField(body, 'Actions', entry.commandActionsText || entry.commandActions, { code: true, preformatted: true });
-  appendThinkingOperationField(body, 'Namespace', entry.namespace);
-  appendThinkingOperationField(body, 'Resource', entry.resourceUri, { code: true });
-  appendThinkingOperationField(body, 'Sender', entry.senderThreadId, { code: true });
-  appendThinkingOperationField(body, 'Receivers', entry.receiverThreadIdsText || entry.receiverThreadIds, { code: true, preformatted: true });
-  appendThinkingOperationField(body, 'Prompt', entry.prompt, { preformatted: true });
-  appendThinkingOperationField(body, 'Model', entry.model);
-  appendThinkingOperationField(body, 'Thinking', entry.reasoningEffort);
-  appendThinkingOperationField(body, 'Agent states', entry.agentsStatesText || entry.agentsStates, { code: true, preformatted: true });
-  appendThinkingOperationField(body, 'Query', entry.query);
-  appendThinkingOperationField(body, 'Action', entry.action);
-  appendThinkingOperationField(body, 'Action data', entry.actionDataText || entry.actionData, { code: true, preformatted: true });
-  appendThinkingOperationField(body, 'Progress', entry.progress);
+  appendField('Command', entry.command, { code: true, preformatted: true });
+  appendField('Directory', entry.cwd, { code: true });
+  appendField('Arguments', entry.argumentsText || entry.arguments, {
+    code: true,
+    preformatted: true,
+    truncated: entry.argumentsTruncated === true,
+    showWhenTruncated: true,
+  });
+  appendField('Actions', entry.commandActionsText || entry.commandActions, { code: true, preformatted: true });
+  appendField('Namespace', entry.namespace);
+  appendField('Resource', entry.resourceUri, { code: true });
+  appendField('Sender', entry.senderThreadId, { code: true });
+  appendField('Receivers', entry.receiverThreadIdsText || entry.receiverThreadIds, { code: true, preformatted: true });
+  appendField('Agent thread', entry.agentThreadId, { code: true });
+  appendField('Agent path', entry.agentPath, { code: true });
+  appendField('Agent name', entry.agentNickname);
+  appendField('Agent role', entry.agentRole);
+  appendField('Parent thread', entry.parentThreadId, { code: true });
+  appendField('Agent activity', entry.subagentKind);
+  appendField('Prompt', entry.prompt, { preformatted: true });
+  appendField('Model', entry.model);
+  appendField('Thinking', entry.reasoningEffort);
+  appendField('Agent states', entry.agentsStatesText || entry.agentsStates, { code: true, preformatted: true });
+  appendField('Query', entry.query);
+  appendField('Action', entry.action);
+  appendField('Action data', entry.actionDataText || entry.actionData, { code: true, preformatted: true });
+  appendField('Progress', entry.progress, {
+    truncated: entry.progressTruncated === true,
+    showWhenTruncated: true,
+  });
 
   const commandFallbackOutput = category === 'command' && !entry.output && !entry.stdout
     ? overview
     : '';
-  appendThinkingOperationField(body, 'Output', entry.output || entry.stdout || commandFallbackOutput, {
+  appendField('Output', entry.output || entry.stdout || commandFallbackOutput, {
     code: true,
     preformatted: true,
+    truncated: entry.outputTruncated === true,
+    showWhenTruncated: true,
   });
-  appendThinkingOperationField(body, 'Stderr', entry.stderr, {
+  appendField('Stderr', entry.stderr, {
     code: true,
     preformatted: true,
     tone: 'failed',
+    truncated: Boolean(entry.stderr) && entry.outputTruncated === true,
   });
-  appendThinkingOperationField(body, 'Result', entry.resultText || entry.result, {
+  appendField('Result', entry.resultText || entry.result, {
     code: true,
     preformatted: true,
+    truncated: entry.resultTruncated === true,
+    showWhenTruncated: true,
   });
-  appendThinkingOperationField(body, 'Error', entry.error, {
+  appendField('Error', entry.error, {
     code: true,
     preformatted: true,
     tone: 'failed',
@@ -15775,6 +17974,12 @@ function createThinkingOperationEntry(entry, index, stateKey, session) {
 
   if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
     body.appendChild(renderFileChangeDetails(entry.fileChanges, stateKey, `${entryKey}::file`));
+  }
+  if (entry.fileChangesTruncated === true) {
+    appendField('File changes retention', null, {
+      truncated: true,
+      showWhenTruncated: true,
+    });
   }
   renderFileCards(body, session, entry);
   details.appendChild(body);
@@ -15795,8 +18000,14 @@ function createThinkingNarrativeEntry(entry, index, stateKey, session) {
   top.append(kind, timestamp);
   const text = document.createElement('div');
   text.className = 'thinking-history-text';
-  text.textContent = String(entry.text == null ? '' : entry.text);
+  const narrativeText = String(entry.text == null ? '' : entry.text);
+  text.textContent = narrativeText;
   item.append(top, text);
+  bindThinkingTextExpansion(item, text, narrativeText, {
+    stateKey,
+    disclosureKey: `${entryKey}::text`,
+    truncated: entry.textTruncated === true,
+  });
   if (Array.isArray(entry.fileChanges) && entry.fileChanges.length) {
     item.appendChild(renderFileChangeDetails(entry.fileChanges, stateKey, `${entryKey}::file`));
   }
@@ -15820,44 +18031,58 @@ function hashThinkingEntryVersion(value) {
   return (hash >>> 0).toString(36);
 }
 
+function thinkingEntryRenderVersion(entry, index = 0) {
+  const renderedFields = [
+    entry?.text,
+    entry?.status,
+    entry?.command,
+    entry?.cwd,
+    entry?.argumentsText || entry?.arguments,
+    entry?.commandActionsText || entry?.commandActions,
+    entry?.namespace,
+    entry?.resourceUri,
+    entry?.senderThreadId,
+    entry?.receiverThreadIdsText || entry?.receiverThreadIds,
+    entry?.agentThreadId,
+    entry?.agentPath,
+    entry?.agentNickname,
+    entry?.agentRole,
+    entry?.parentThreadId,
+    entry?.subagentKind,
+    entry?.prompt,
+    entry?.model,
+    entry?.reasoningEffort,
+    entry?.agentsStatesText || entry?.agentsStates,
+    entry?.query,
+    entry?.action,
+    entry?.actionDataText || entry?.actionData,
+    entry?.progress,
+    entry?.output,
+    entry?.stdout,
+    entry?.stderr,
+    entry?.resultText || entry?.result,
+    entry?.error,
+    entry?.fileChanges,
+    entry?.textTruncated,
+    entry?.outputTruncated,
+    entry?.progressTruncated,
+    entry?.argumentsTruncated,
+    entry?.resultTruncated,
+    entry?.fileChangesTruncated,
+  ];
+  return [
+    thinkingEntryKey(entry, index),
+    entry?.revision || entry?.activityRevision || 0,
+    entry?.updatedAt || entry?.timestamp || '',
+    entry?.final === true ? 1 : 0,
+    entry?.terminal === true ? 1 : 0,
+    entry?.success === false ? 0 : 1,
+    hashThinkingEntryVersion(formatThinkingStructuredValue(renderedFields)),
+  ].join('|');
+}
+
 function thinkingEntriesRenderVersion(entries = []) {
-  const versionParts = entries.map((entry, index) => {
-    const renderedFields = [
-      entry?.text,
-      entry?.status,
-      entry?.command,
-      entry?.cwd,
-      entry?.argumentsText || entry?.arguments,
-      entry?.commandActionsText || entry?.commandActions,
-      entry?.namespace,
-      entry?.resourceUri,
-      entry?.senderThreadId,
-      entry?.receiverThreadIdsText || entry?.receiverThreadIds,
-      entry?.prompt,
-      entry?.model,
-      entry?.reasoningEffort,
-      entry?.agentsStatesText || entry?.agentsStates,
-      entry?.query,
-      entry?.action,
-      entry?.actionDataText || entry?.actionData,
-      entry?.progress,
-      entry?.output,
-      entry?.stdout,
-      entry?.stderr,
-      entry?.resultText || entry?.result,
-      entry?.error,
-      entry?.fileChanges,
-    ];
-    return [
-      thinkingEntryKey(entry, index),
-      entry?.revision || entry?.activityRevision || 0,
-      entry?.updatedAt || entry?.timestamp || '',
-      entry?.final === true ? 1 : 0,
-      entry?.terminal === true ? 1 : 0,
-      entry?.success === false ? 0 : 1,
-      hashThinkingEntryVersion(formatThinkingStructuredValue(renderedFields)),
-    ].join('|');
-  });
+  const versionParts = entries.map((entry, index) => thinkingEntryRenderVersion(entry, index));
   return hashThinkingEntryVersion(versionParts.join('\u001e'));
 }
 
@@ -15873,7 +18098,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
     details.open = true;
   }
 
-  details.addEventListener('toggle', () => {
+  details.addEventListener('toggle', (event) => {
     if (!details.isConnected) {
       return;
     }
@@ -15881,7 +18106,12 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
     if (details.open) {
       const scroller = details.querySelector('.thinking-content');
       if (scroller) {
-        restoreThinkingScrollState(stateKey, scroller);
+        restoreThinkingScrollState(stateKey, scroller, { immediate: event.isTrusted === true });
+        if (event.isTrusted === true) {
+          const machine = getThinkingScrollMachine(stateKey, scroller);
+          machine?.beginTrustedInteraction();
+          updateThinkingScrollState(stateKey, scroller);
+        }
       }
     }
   });
@@ -15952,9 +18182,17 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
     noteMessageReadThinkingScroll(session);
     updateThinkingScrollState(stateKey, content);
   }, { passive: true });
-  for (const eventName of ['wheel', 'touchend', 'pointerup']) {
+  content.addEventListener('wheel', (event) => {
+    recordThinkingTrustedInteraction(stateKey, content, event);
+  }, { passive: true });
+  for (const eventName of ['touchstart', 'pointerdown']) {
     content.addEventListener(eventName, (event) => {
-      recordThinkingTrustedInteraction(stateKey, content, event);
+      recordThinkingTrustedInteraction(stateKey, content, event, 'begin');
+    }, { passive: true });
+  }
+  for (const eventName of ['touchend', 'pointerup', 'pointercancel']) {
+    content.addEventListener(eventName, (event) => {
+      recordThinkingTrustedInteraction(stateKey, content, event, 'end');
     }, { passive: true });
   }
   content.addEventListener('keydown', (event) => {
@@ -16096,6 +18334,13 @@ function patchThinkingHistoryList(existingHistory, nextHistory, stateKey) {
     const key = nextNode.dataset.thinkingEntryKey || '';
     const existing = key ? existingByKey.get(key) : null;
     if (existing) existingByKey.delete(key);
+    if (
+      existing
+      && existing.dataset.thinkingRenderVersion
+      && existing.dataset.thinkingRenderVersion === nextNode.dataset.thinkingRenderVersion
+    ) {
+      return existing;
+    }
     return existing ? patchThinkingHistoryEntry(existing, nextNode, stateKey) : nextNode;
   });
   for (const stale of existingByKey.values()) stale.remove();
@@ -16123,6 +18368,12 @@ function patchThinkingMessageElement(existingMessage, nextMessage) {
   const existingStateKey = existingCard?.dataset?.thinkingStateKey || '';
   const existingScroller = existingMessage.querySelector('.thinking-content[data-thinking-state-key]');
   const outerSnapshot = captureTranscriptScrollSnapshot();
+  const thinkingMachine = existingStateKey && existingScroller
+    ? getThinkingScrollMachine(existingStateKey, existingScroller)
+    : null;
+  const thinkingViewportSnapshot = thinkingMachine?.state().mode === 'detached'
+    ? captureViewportElementOffset(existingScroller)
+    : null;
   if (existingStateKey && existingScroller) {
     preserveThinkingViewportForPatch(existingStateKey, existingScroller);
     captureThinkingDisclosureStates(existingMessage, existingStateKey);
@@ -16168,6 +18419,7 @@ function patchThinkingMessageElement(existingMessage, nextMessage) {
     restoreThinkingScrollState(patchedStateKey, patchedScroller, { preserveDetached: true, immediate: true });
   }
   restoreTranscriptScrollSnapshot(outerSnapshot);
+  restoreViewportElementOffset(thinkingViewportSnapshot);
 }
 
 function renderFileCards(container, session, entry) {
@@ -16349,6 +18601,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   const key = getSessionKey(session) || '';
   const previousKey = log.dataset.sessionKey || '';
   captureThinkingScrollStates(log);
+  const thinkingViewportSnapshots = captureDetachedThinkingViewportOffsets(log);
   const switchingSession = previousKey !== key;
   const pinnedToBottom = isTranscriptPinnedAcrossScrollTargets();
   const userDetached = !switchingSession && isTranscriptUserDetached(key);
@@ -16467,6 +18720,9 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     if (!shouldStickToBottom && !focus) {
       restoreTranscriptScrollSnapshot(scrollSnapshot);
     }
+    if (!focus) {
+      restoreDetachedThinkingViewportOffsets(log, thinkingViewportSnapshots);
+    }
     updateTranscriptUnreadButton(key);
     renderTranscriptSearchNavigator(session, [], 0);
     completeTranscriptNotificationRender(session);
@@ -16574,6 +18830,9 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   }
   if (!shouldStickToBottom && !focus) {
     restoreTranscriptScrollSnapshot(scrollSnapshot);
+  }
+  if (!focus) {
+    restoreDetachedThinkingViewportOffsets(log, thinkingViewportSnapshots);
   }
   if (focus) {
     window.setTimeout(() => {
@@ -17098,6 +19357,11 @@ async function switchSessionApiFromComposer(session, targetProfileId, options = 
     renderSessionApiControls(getSelectedSession());
     return null;
   }
+  if (!hostSupportsSessionApiRebind(current, targetProfile)) {
+    setSessionApiSwitchNotice(current, t('session.apiRebindHostUpgrade'), 'warning');
+    renderSessionApiControls(getSelectedSession());
+    return null;
+  }
   const runtime = getRuntimeForSession(current) || current.runtime || {};
   if (current.live && runtimeIsActive(runtime)) {
     setSessionApiSwitchNotice(current, t('session.apiSwitchWaitIdle'), 'warning');
@@ -17286,6 +19550,7 @@ function renderSessionApiControls(session) {
   const runtime = getRuntimeForSession(session) || session?.runtime || {};
   const activeTurn = Boolean(session?.live && runtimeIsActive(runtime));
   const supportsTurnSelection = sessionSupportsTurnSelectionControls(session);
+  const supportsApiRebind = hostSupportsSessionApiRebind(session);
   const catalog = session ? getActiveModelCatalog(session) : null;
   const catalogError = session
     ? state.codexControls.modelOptionsErrorsByKey.get(activeModelCatalogKey(session)) || ''
@@ -17332,6 +19597,9 @@ function renderSessionApiControls(session) {
       composerSelectionStatus.textContent = notice.message;
     } else if (!session) {
       composerSelectionStatus.textContent = 'Select a Session to configure its runtime.';
+    } else if (!supportsApiRebind && sessionApiControlValue(session) === '__unknown_binding__') {
+      composerSelectionStatus.textContent = t('session.apiRebindHostUpgrade');
+      composerSelectionStatus.classList.add('warning');
     } else if (!supportsTurnSelection) {
       composerSelectionStatus.textContent = t('session.turnControlsUnsupported');
       composerSelectionStatus.classList.add('warning');
@@ -17352,19 +19620,28 @@ function renderSessionApiControls(session) {
   }
 
   if (rebindSelect) {
-    rebindSelect.disabled = !session || rebindBusy || activeTurn || !supportsTurnSelection;
-    rebindSelect.title = activeTurn
-      ? t('session.apiSwitchWaitIdle')
-      : 'Changing API requires a confirmed Session restart.';
+    rebindSelect.disabled = !session || rebindBusy || activeTurn || !supportsTurnSelection || !supportsApiRebind;
+    rebindSelect.title = !supportsApiRebind
+      ? t('session.apiRebindHostUpgrade')
+      : activeTurn
+        ? t('session.apiSwitchWaitIdle')
+        : 'Changing API requires a confirmed Session restart.';
     rebindSelect.setAttribute('aria-busy', rebindBusy ? 'true' : 'false');
   }
   if (rebindButton) {
     const canRestartCurrentApi = actualApiValue !== '__unknown_binding__';
-    rebindButton.disabled = !session || rebindBusy || activeTurn || !supportsTurnSelection || !canRestartCurrentApi;
+    rebindButton.disabled = !session
+      || rebindBusy
+      || activeTurn
+      || !supportsTurnSelection
+      || !supportsApiRebind
+      || !canRestartCurrentApi;
     rebindButton.textContent = rebindBusy ? '\u2026' : '\u21bb';
-    rebindButton.title = activeTurn
-      ? t('session.apiSwitchWaitIdle')
-      : 'Restart Session with the current API profile.';
+    rebindButton.title = !supportsApiRebind
+      ? t('session.apiRebindHostUpgrade')
+      : activeTurn
+        ? t('session.apiSwitchWaitIdle')
+        : 'Restart Session with the current API profile.';
     rebindButton.setAttribute('aria-busy', rebindBusy ? 'true' : 'false');
   }
   if (applyLiveButton) {
@@ -17412,25 +19689,12 @@ function formatSoftwareUpdateDetails(update) {
   if (!update) {
     return [];
   }
-  const lines = [
+  return [
     `Package path: ${update.rootDir || 'unknown'}`,
     `Current version: ${update.currentVersion || 'unknown'}`,
     `Current tag: ${update.currentTag || 'none'} (${update.currentCommit || 'unknown commit'})`,
     `Latest stable tag: ${update.latestStableTag || 'not found'}`,
   ];
-  if (Array.isArray(update.trackedChanges) && update.trackedChanges.length) {
-    lines.push(`Tracked changes blocking update: ${update.trackedChanges.join(', ')}`);
-  }
-  if (Array.isArray(update.untrackedFiles) && update.untrackedFiles.length) {
-    lines.push(`Untracked files are left alone: ${update.untrackedFiles.slice(0, 8).join(', ')}${update.untrackedFiles.length > 8 ? ' ...' : ''}`);
-  }
-  if (state.softwareUpdate.lastBackupDir) {
-    lines.push(`Last backup: ${state.softwareUpdate.lastBackupDir}`);
-  }
-  if (state.softwareUpdate.restartScheduled) {
-    lines.push('Restart has been scheduled. Reconnect after the relay comes back online.');
-  }
-  return lines;
 }
 
 function renderSoftwareUpdatePanel() {
@@ -17474,7 +19738,11 @@ function renderSoftwareUpdatePanel() {
 }
 
 function reportSoftwareUpdateError(error) {
-  const message = String(error?.message || error || 'Unknown error').trim();
+  const rawMessage = String(error?.message || error || 'Unknown error').trim();
+  const firstLine = rawMessage.split(/\r?\n/).find((line) => line.trim())?.trim() || 'Unknown error';
+  const message = /filename too long|unable to access|could not open directory/i.test(rawMessage)
+    ? 'Git could not scan a local runtime directory. Retry the update check after this page reloads.'
+    : firstLine.slice(0, 320);
   state.softwareUpdate.status = null;
   state.softwareUpdate.busy = false;
   state.softwareUpdate.message = `Software update unavailable: ${message}`;
@@ -20720,7 +22988,8 @@ function applySessionStreamReset(session, event, payload) {
 }
 
 function sessionStreamResetNeedsRecovery(reason) {
-  return reason === 'cursor_expired'
+  return reason === 'cursor_missing'
+    || reason === 'cursor_expired'
     || reason === 'epoch_mismatch'
     || reason === 'cursor_invalid'
     || reason === 'canonical_key_changed';
@@ -20796,12 +23065,14 @@ function subscribeSession(session) {
     'session.started',
     'session.state_changed',
     'session.transcript',
+    'session.transcript_removed',
     'session.alert',
     'session.runtime',
     'session.runtime_updated',
     'session.diagnostic',
     'session.request',
     'session.request.resolved',
+    'session.interrupt_result',
     'session.activity',
     'session.assistant_projection',
   ];
@@ -20899,11 +23170,19 @@ function subscribeSession(session) {
   state.eventSource.addEventListener('session.transcript', (event) => {
     const payload = JSON.parse(event.data);
     appendTranscriptEntry(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
-    if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
-      clearActiveDraftForSession({
-        hostId: payload.hostId || session.hostId,
-        sessionId: payload.sessionId || session.sessionId,
-      });
+    const completedSession = {
+      hostId: payload.hostId || session.hostId,
+      sessionId: payload.sessionId || session.sessionId,
+    };
+    if (payload.clientRequestId) {
+      if (payload.speaker === 'user') {
+        acknowledgeComposerSubmissionForSession(completedSession, payload.clientRequestId, {
+          stage: 'queued',
+        });
+      } else if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
+        clearActiveDraftForSessionRequest(completedSession, payload.clientRequestId);
+        completeComposerSubmissionForSession(completedSession, payload.clientRequestId);
+      }
     }
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === key) {
@@ -20911,6 +23190,30 @@ function subscribeSession(session) {
       queuedUiRenders.thinkingPanel = true;
       scheduleQueuedUiFlush();
     } else if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
+      scheduleQueuedUiFlush();
+    }
+  });
+
+  state.eventSource.addEventListener('session.transcript_removed', (event) => {
+    const payload = JSON.parse(event.data);
+    const removedSession = {
+      hostId: payload.hostId || session.hostId,
+      sessionId: payload.sessionId || session.sessionId,
+    };
+    removeTranscriptEntry(
+      removedSession.hostId,
+      removedSession.sessionId,
+      payload
+    );
+    if (payload.clientRequestId) {
+      recoverComposerSubmissionForSession(removedSession, {
+        clientRequestId: payload.clientRequestId,
+      });
+    }
+    const selected = getSelectedSession();
+    if (selected && getSessionKey(selected) === makeSessionKey(removedSession.hostId, removedSession.sessionId)) {
+      scheduleTranscriptRender({ preserveScroll: true });
+      queuedUiRenders.thinkingPanel = true;
       scheduleQueuedUiFlush();
     }
   });
@@ -20935,21 +23238,70 @@ function subscribeSession(session) {
         updatedAt: payload.timestamp || payload.patch.updatedAt || new Date().toISOString(),
       }
       : payload;
+    const previousRuntime = getRuntimeForSession({
+      hostId: runtimePayload.hostId || session.hostId,
+      sessionId: runtimePayload.sessionId || session.sessionId,
+    }) || {};
+    const runtimeWasActive = runtimeIsActive(previousRuntime);
     const mergedRuntime = patchRuntimeForSession(
       runtimePayload.hostId || session.hostId,
       runtimePayload.sessionId || session.sessionId,
-      runtimePayload
+      runtimePayload,
+      { source: 'stream' }
     );
     const runtimeStopped = !runtimeIsActive(mergedRuntime || runtimePayload);
-    const status = String(runtimePayload.currentTurnStatus || runtimePayload.phase || '').toLowerCase();
-    if (runtimeStopped && status && status !== 'interrupted') {
-      clearActiveDraftForSession({
-        hostId: runtimePayload.hostId || session.hostId,
-        sessionId: runtimePayload.sessionId || session.sessionId,
+    const runtimeSession = {
+      hostId: runtimePayload.hostId || session.hostId,
+      sessionId: runtimePayload.sessionId || session.sessionId,
+    };
+    const phase = String(mergedRuntime?.phase || runtimePayload.phase || '').toLowerCase();
+    const status = String(mergedRuntime?.currentTurnStatus || runtimePayload.currentTurnStatus || phase).toLowerCase();
+    const submission = getComposerSubmission(runtimeSession);
+    const runtimeSessionKey = resolveComposerSessionKey(runtimeSession);
+    const retainedDraft = runtimeSessionKey
+      ? state.codexControls.activeDraftsBySession.get(runtimeSessionKey) || null
+      : null;
+    const runtimeClientRequestId = String(
+      mergedRuntime?.clientRequestId
+      || mergedRuntime?.pendingClientRequestId
+      || runtimePayload.clientRequestId
+      || runtimePayload.pendingClientRequestId
+      || ''
+    ).trim();
+    const runtimeMatchesSubmission = Boolean(
+      runtimeClientRequestId
+      && (
+        runtimeClientRequestId === submission?.id
+        || runtimeClientRequestId === retainedDraft?.clientRequestId
+      )
+    );
+    const turnActive = Boolean(mergedRuntime?.activeTurnId)
+      || ['thinking', 'planning', 'waiting-approval', 'waiting-user-input', 'interrupting', 'retrying', 'reconnecting'].includes(phase);
+    if (runtimeMatchesSubmission && (phase === 'queued-turn' || phase === 'submitting-turn' || turnActive)) {
+      acknowledgeComposerSubmissionForSession(runtimeSession, runtimeClientRequestId, {
+        stage: phase === 'queued-turn' ? 'queued' : 'starting',
+        turnActive,
       });
+    }
+    if (runtimeWasActive && runtimeStopped) {
+      settlePendingInterruptFromInactiveRuntime(runtimeSession, mergedRuntime || runtimePayload);
+    }
+    if (runtimeStopped && status === 'failed') {
+      recoverComposerSubmissionForSession(runtimeSession, {
+        clientRequestId: runtimeClientRequestId,
+      });
+    } else if (runtimeStopped && status) {
+      clearActiveDraftForSessionRequest(runtimeSession, runtimeClientRequestId);
+      if (runtimeMatchesSubmission) {
+        completeComposerSubmissionForSession(runtimeSession, runtimeClientRequestId);
+      }
+      clearSentDraftSnapshotForSessionRequest(runtimeSession, runtimeClientRequestId);
     }
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === makeSessionKey(runtimePayload.hostId || session.hostId, runtimePayload.sessionId || session.sessionId)) {
+      if (!runtimeWasActive && runtimeIsActive(mergedRuntime || runtimePayload)) {
+        scheduleTranscriptRender({ preserveScroll: true });
+      }
       maybeScheduleQueuedPromptSend(selected);
       refreshInferredComposerOptionsForSession(selected);
     }
@@ -20962,6 +23314,29 @@ function subscribeSession(session) {
 
   state.eventSource.addEventListener('session.runtime_updated', (event) => {
     handleRuntimePayload(JSON.parse(event.data));
+  });
+
+  state.eventSource.addEventListener('session.interrupt_result', (event) => {
+    const payload = JSON.parse(event.data);
+    applySessionInterruptResult({
+      hostId: payload.hostId || session.hostId,
+      sessionId: payload.sessionId || session.sessionId,
+    }, payload);
+  });
+
+  state.eventSource.addEventListener('session.command_failed', (event) => {
+    const payload = JSON.parse(event.data);
+    if (String(payload.operation || '').toLowerCase() === 'input') {
+      recoverComposerSubmissionForSession({
+        hostId: payload.hostId || session.hostId,
+        sessionId: payload.sessionId || session.sessionId,
+      }, {
+        clientRequestId: payload.clientRequestId || '',
+      });
+    }
+    queuedUiRenders.sessionDetails = true;
+    queuedUiRenders.statusWindow = true;
+    scheduleQueuedUiFlush();
   });
 
   state.eventSource.addEventListener('session.diagnostic', (event) => {
@@ -20986,8 +23361,6 @@ function subscribeSession(session) {
     const selected = getSelectedSession();
     const isSelectedSession = Boolean(selected && getSessionKey(selected) === eventSessionKey);
     if (isSelectedSession) {
-      state.statusWindowOpen = false;
-      state.sessionDetailsOpen = true;
       scheduleTranscriptRender({ preserveScroll: true });
       queuedUiRenders.thinkingPanel = true;
       queuedUiRenders.sessionDetails = true;
@@ -21005,6 +23378,10 @@ function subscribeSession(session) {
     const eventHostId = payload.hostId || session.hostId;
     const eventSessionId = payload.sessionId || session.sessionId;
     const eventSessionKey = makeSessionKey(eventHostId, eventSessionId);
+    state.codexControls.respondingRequestKeys.delete(sessionRequestResponseKey({
+      hostId: eventHostId,
+      sessionId: eventSessionId,
+    }, payload));
     resolveRequestForSession(eventHostId, eventSessionId, payload);
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === eventSessionKey) {
@@ -21076,6 +23453,7 @@ async function showSession(session = getSelectedSession(), options = {}) {
 
     const originalSessionKey = getSessionKey(session);
     const shouldLoadFullTranscript = Boolean(options.full || !state.fullTranscriptLoaded.has(originalSessionKey));
+    const detailRuntimeStreamGeneration = getRuntimeStreamGeneration(session.hostId, session.sessionId);
     const detailParams = new URLSearchParams({ hostId: session.hostId });
     if (shouldLoadFullTranscript) {
       detailParams.set('full', '1');
@@ -21109,9 +23487,28 @@ async function showSession(session = getSelectedSession(), options = {}) {
       ...getTranscriptForSession(session),
       ...getTranscriptForSession(detailSession),
     ]);
-    setTranscriptForSession(detailHostId, detailSessionId, [...detail.transcript, ...existing]);
+    const reconciledTranscript = reconcileDetailTranscriptForSession(
+      detailHostId,
+      detailSessionId,
+      detail.transcript || [],
+      existing,
+      {
+        authoritative: shouldLoadFullTranscript || detail.remoteDetail?.fullTranscript === true,
+        runtime: detail.runtime || detailSession.runtime || null,
+      }
+    );
+    setTranscriptForSession(detailHostId, detailSessionId, reconciledTranscript);
     setAlertsForSession(detailHostId, detailSessionId, detail.alerts || []);
-    setRuntimeForSession(detailHostId, detailSessionId, detail.runtime || null);
+    const detailRuntimeCanApply = detailSessionKey === originalSessionKey
+      ? getRuntimeStreamGeneration(detailHostId, detailSessionId) === detailRuntimeStreamGeneration
+      : !state.runtime.has(detailSessionKey);
+    if (detailRuntimeCanApply) {
+      setRuntimeForSession(detailHostId, detailSessionId, detail.runtime || null, { source: 'detail' });
+    }
+    const reconciledRuntime = getRuntimeForSession(detailSession) || detail.runtime || null;
+    if (reconciledRuntime && !runtimeIsActive(reconciledRuntime)) {
+      settlePendingInterruptFromInactiveRuntime(detailSession, reconciledRuntime);
+    }
     mergeDiagnosticsForSession(detailHostId, detailSessionId, getDiagnosticsForSession(session));
     mergeDiagnosticsForSession(detailHostId, detailSessionId, detail.diagnostics || []);
     setRequestsForSession(detailHostId, detailSessionId, detail.requests || []);
@@ -22364,29 +24761,100 @@ async function refreshHostAndConnectorSnapshots() {
   state.hosts = hostsResponse.hosts || [];
   state.dismissedHosts = hostsResponse.dismissedHosts || [];
   state.connectors = connectorsResponse.connectors || [];
+  reconcileHostRecoveryResults();
   renderAll();
 }
 
-async function waitForRecoveredHost(hostId, timeoutMs = 90000) {
+async function refreshHostSnapshot() {
+  const hostsResponse = await fetchJson('/api/hosts');
+  state.hosts = hostsResponse.hosts || [];
+  state.dismissedHosts = hostsResponse.dismissedHosts || [];
+  reconcileHostRecoveryResults();
+  renderAll();
+}
+
+function reconcileHostRecoveryResults() {
+  const hostsById = new Map(state.hosts.map((host) => [host.hostId, host]));
+  for (const [hostId, result] of state.hostRecoveryResults) {
+    const host = hostsById.get(hostId);
+    if (!host) {
+      setHostRecoveryResult(hostId, null);
+      continue;
+    }
+    if (
+      result?.status === 'ownership_pending'
+      && host.online
+      && host.localAgent?.status === 'running'
+      && Number(host.localAgent?.pid || 0) > 0
+    ) {
+      setHostRecoveryResult(hostId, {
+        status: 'completed',
+        message: 'The pending local Agent registered successfully; the Host is online.',
+      });
+    }
+  }
+}
+
+async function waitForRecoveredHost(hostId, options = {}) {
+  const normalizedOptions = typeof options === 'number'
+    ? { timeoutMs: options }
+    : (options || {});
+  const timeoutMs = Math.max(1000, Number(normalizedOptions.timeoutMs || 90000) || 90000);
+  const recoveryKind = normalizedOptions.recoveryKind || 'host_recovery';
+  const copy = hostRecoveryCopy(recoveryKind);
+  const pendingResult = normalizedOptions.pendingResult || null;
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
 
   while (Date.now() < deadline) {
-    await refreshHostAndConnectorSnapshots();
+    try {
+      await refreshHostSnapshot();
+    } catch (error) {
+      lastError = new Error(`${copy.label} could not refresh Host status yet: ${error.message}`);
+      await delay(1500);
+      continue;
+    }
     const host = getHost(hostId);
-    if (host?.online) {
+    if (!localAgentRecoveryIdentityReady(host, recoveryKind, pendingResult)) {
+      const referencePid = Number(pendingResult?.localAgent?.pid || 0);
+      lastError = new Error(
+        recoveryKind === 'local_agent_restart'
+          ? `Local Agent restart is waiting for a replacement process after PID ${referencePid || '(unknown)'}.`
+          : `Local Agent start is waiting for PID ${referencePid || '(unknown)'} to register and report running.`
+      );
+    } else if (host?.online) {
       try {
         return await verifyHostAvailable(hostId);
       } catch (error) {
-        lastError = error;
+        lastError = new Error(`${copy.label} reached the Host, but its health check failed: ${error.message}`);
       }
     } else {
-      lastError = new Error(`Host ${host?.label || hostId} is still offline after connector restart.`);
+      lastError = pendingResult?.status === 'ownership_pending'
+        ? new Error(ownershipPendingDisplay(pendingResult))
+        : new Error(`${copy.offline} Host: ${host?.label || hostId}.`);
     }
     await delay(1500);
   }
 
-  throw lastError || new Error(`Timed out while waiting for host ${hostId} to reconnect.`);
+  throw lastError || new Error(`${copy.label} timed out while waiting for Host ${hostId} to reconnect.`);
+}
+
+async function waitForLocalAgentStopped(hostId, options = {}) {
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || 60000) || 60000);
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      await refreshHostSnapshot();
+      const localAgent = getHost(hostId)?.localAgent || null;
+      if (!localAgent || (localAgent.status === 'stopped' && !localAgent.pid)) return true;
+      lastError = new Error(`Local Agent is still ${localAgent.status || 'stopping'}.`);
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(1000);
+  }
+  throw lastError || new Error(`Timed out while waiting for local Agent ${hostId} to stop.`);
 }
 
 async function recoverHostForSwitch(hostId, cause) {
@@ -22407,16 +24875,34 @@ async function recoverHostForSwitch(hostId, cause) {
     refreshAfter: false,
     selectEditor: false,
     reportMissing: false,
+    reportErrors: false,
+    returnCancellationResult: true,
   });
-  if (!result) {
-    throw new Error(`Recovery for ${host?.label || hostId} was cancelled.`);
+  if (!result || result.status === 'cancelled') {
+    throw makeHostRecoveryError(
+      hostId,
+      new Error(`HPC connector recovery for ${host?.label || hostId} was cancelled.`),
+      'hpc_connector_restart_cancelled'
+    );
   }
   if (!result.ok) {
-    throw new Error(`Host ${host?.label || hostId} is unavailable, and connector ${connector.label || connector.connectorId} could not restart it:\n${connectorActionResultSummary(result)}`);
+    throw makeHostRecoveryError(
+      hostId,
+      new Error(`Host ${host?.label || hostId} is unavailable, and connector ${connector.label || connector.connectorId} could not restart it:\n${connectorActionResultSummary(result)}`),
+      'hpc_connector_restart_failed'
+    );
   }
 
-  await waitForRecoveredHost(hostId);
-  await refresh();
+  try {
+    await waitForRecoveredHost(hostId, {
+      timeoutMs: 90000,
+      recoveryKind: 'hpc_connector_restart',
+      pendingResult: result,
+    });
+  } catch (error) {
+    throw makeHostRecoveryError(hostId, error, 'hpc_connector_restart_failed');
+  }
+  await refreshHostAndConnectorSnapshots().catch(() => null);
   return true;
 }
 
@@ -22429,16 +24915,49 @@ async function recoverLocalAgentForSwitch(hostId) {
   state.localAgentActionBusyId = hostId;
   renderAll();
   try {
-    await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/local-agent`, {
+    const result = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/local-agent`, {
       method: 'POST',
       body: JSON.stringify({
         action: 'start',
         label: host?.label || hostId,
       }),
     });
-    await waitForRecoveredHost(hostId, 60000);
-    await refresh();
+    if (result?.status === 'ownership_pending') {
+      setHostRecoveryResult(hostId, {
+        status: 'ownership_pending',
+        message: ownershipPendingDisplay(result),
+        retryAfterMs: result.retryAfterMs || 0,
+        ownershipAssessment: result.ownershipAssessment || 'unknown',
+      });
+      await refreshHostSnapshot().catch(() => null);
+      throw makeHostRecoveryError(
+        hostId,
+        new Error(ownershipPendingDisplay(result)),
+        'local_agent_ownership_pending'
+      );
+    }
+    setHostRecoveryResult(hostId, {
+      status: 'recovering',
+      message: result?.staleOwnershipRecovered
+        ? 'Recovered stale local Agent ownership. Local Agent start is in progress.'
+        : 'Local Agent start is in progress.',
+    });
+    await waitForRecoveredHost(hostId, {
+      timeoutMs: 60000,
+      recoveryKind: 'local_agent_start',
+      pendingResult: result,
+    });
+    setHostRecoveryResult(hostId, {
+      status: 'completed',
+      message: 'Local Agent start completed; the Host is online.',
+    });
+    await refreshHostSnapshot().catch(() => null);
     return true;
+  } catch (error) {
+    if (!error?.hostRecoveryScoped) {
+      setHostRecoveryResult(hostId, { status: 'failed', message: error.message });
+    }
+    throw makeHostRecoveryError(hostId, error, error?.code || 'local_agent_start_failed');
   } finally {
     state.localAgentActionBusyId = null;
     renderAll();
@@ -23089,6 +25608,7 @@ async function importHostById(hostId) {
 
 async function deleteHost(hostId) {
   await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}`, { method: 'DELETE' });
+  setHostRecoveryResult(hostId, null);
 
   if (state.selectedHostId === hostId) {
     state.selectedHostId = null;
@@ -23122,6 +25642,22 @@ async function deleteHost(hostId) {
       state.transcripts.delete(key);
       state.transcriptVisibleLimits.delete(key);
     }
+  }
+  for (const key of Array.from(state.transcriptTombstones.keys())) {
+    if (key.startsWith(`${hostId}::`)) {
+      state.transcriptTombstones.delete(key);
+    }
+  }
+  for (const map of [
+    state.codexControls.sentDraftSnapshotsBySession,
+    state.codexControls.interruptOperationsBySession,
+  ]) {
+    for (const key of Array.from(map.keys())) {
+      if (key.startsWith(`${hostId}::`)) map.delete(key);
+    }
+  }
+  for (const key of Array.from(state.codexControls.interruptBusyKeys)) {
+    if (key.startsWith(`${hostId}::`)) state.codexControls.interruptBusyKeys.delete(key);
   }
 
   for (const key of Array.from(state.alerts.keys())) {
@@ -23434,11 +25970,24 @@ async function executeConnectorAction(connector, action, payload = connector, op
           interactivePassthrough: usePromptPassthrough,
         });
       } catch (error) {
-        reportError(error);
-        return lastResult;
+        if (options.reportErrors !== false) {
+          reportError(error);
+        }
+        const failure = {
+          ok: false,
+          status: 'input_error',
+          message: error.message || 'Connector input could not be collected.',
+        };
+        state.connectorActionResults.set(connector.connectorId, failure);
+        return options.returnCancellationResult === true ? failure : lastResult;
       }
       if (!actionSecrets) {
-        return lastResult;
+        const cancelled = {
+          ok: false,
+          status: 'cancelled',
+          message: 'Connector action was cancelled before launch.',
+        };
+        return options.returnCancellationResult === true ? cancelled : lastResult;
       }
 
       const askpass = makeConnectorAskpassContext();
@@ -24073,6 +26622,7 @@ async function startManagedSession(options = {}) {
       cwd,
       label: label || cwd,
       launchMode,
+      ...(options.maintenanceOperationId ? { maintenanceOperationId: options.maintenanceOperationId } : {}),
       ...(sourceSession && launchMode !== 'fresh' ? sessionSelectionRequestBody(sourceSession) : freshSelection),
     };
     if (apiConfig) {
@@ -24224,6 +26774,41 @@ async function resumeFromHistory(options = {}) {
     throw new Error('This session closed before its first turn was saved. Start a new session from the same workspace instead.');
   }
 
+  if (sessionApiControlValue(session) === '__unknown_binding__') {
+    const requestSessionKey = getSessionKey(session);
+    const targetProfileId = preferredHistoryRebindTarget(session);
+    if (!hostSupportsSessionApiRebind(session, targetProfileId)) {
+      throw sessionContractError(
+        'session_api_rebind_capability_unavailable',
+        t('session.apiRebindHostUpgrade'),
+        { canRebind: false }
+      );
+    }
+    const response = await switchSessionApiFromComposer(session, targetProfileId, { force: true });
+    if (!response) {
+      return null;
+    }
+    const resumedSession = findSessionForResolvedComposerKey(requestSessionKey)
+      || state.sessions.find((candidate) => (
+        candidate.hostId === session.hostId
+        && candidate.sessionId === (response.sessionId || session.sessionId)
+      ))
+      || null;
+    if (!resumedSession?.live) {
+      throw sessionContractError(
+        'session_run_state_conflict',
+        'Rebind completed, but the resumed Session is not live.'
+      );
+    }
+    if (options.initialText || options.initialInputOptions?.inputItems?.length) {
+      await sendInputToSession(resumedSession, options.initialText || '', {
+        ...(options.initialInputOptions || {}),
+        ...getComposerOptionsForSession(resumedSession),
+      });
+    }
+    return resumedSession;
+  }
+
   if (!confirmResumeAfterFailedRebind(session)) {
     return null;
   }
@@ -24300,6 +26885,12 @@ function getActiveTurnBlocker(session) {
 
   const runtime = getRuntimeForSession(session) || session.runtime || {};
   const phase = String(runtime.phase || '').toLowerCase();
+  if (phase === 'ending' || String(runtime.currentTurnStatus || '').toLowerCase() === 'stopping') {
+    return 'This Session is still stopping. Wait for the Host to confirm success or failure before sending another prompt.';
+  }
+  if (phase === 'stop-failed') {
+    return 'The previous Stop failed. Retry Stop, then Resume the Session before sending another prompt.';
+  }
   const pendingCount = getRequestsForSession(session).filter((request) => request.status === 'pending').length;
   const activePhase = [
     'thinking',
@@ -24309,6 +26900,7 @@ function getActiveTurnBlocker(session) {
     'waiting-user-input',
     'retrying',
     'reconnecting',
+    'interrupting',
     'queued-turn',
     'submitting-turn',
   ].includes(phase);
@@ -24361,6 +26953,7 @@ function runtimeIsActive(runtime = {}) {
     'waiting-user-input',
     'retrying',
     'reconnecting',
+    'interrupting',
     'queued-turn',
     'submitting-turn',
     'running-shell-command',
@@ -24401,7 +26994,6 @@ async function sendInputToSession(session, text, options = {}) {
     throw new Error(blocker);
   }
 
-  await verifyHostAvailable(session.hostId);
   assertModelSelectionIsSelectable(session, options.model);
   assertEffortSelectionIsValid(session, options);
   const body = {
@@ -24424,19 +27016,41 @@ async function sendInputToSession(session, text, options = {}) {
     serviceTier: options.serviceTier || null,
     personality: options.personality || null,
   };
-
-  try {
-    return await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/input`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
-  } catch (error) {
-    if (/still working on the previous turn/i.test(error.message || '')) {
-      openStatusForActiveTurnBlocker();
-      throw new Error('Codex is still working on the previous turn. Open Status to approve, decline, steer, or interrupt the active turn before sending another prompt.');
+  const requestUrl = `/api/sessions/${encodeURIComponent(session.sessionId)}/input`;
+  const requestBody = JSON.stringify(body);
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await fetchJson(requestUrl, {
+        method: 'POST',
+        body: requestBody,
+        timeoutMs: 30_000,
+      });
+    } catch (error) {
+      lastError = error;
+      const status = Number(error?.status || 0);
+      const acceptanceUnknown = error?.code === 'request_timeout'
+        || (!status && !error?.body)
+        || status >= 500;
+      if (acceptanceUnknown && attempt === 0) {
+        await delay(250);
+        continue;
+      }
+      if (acceptanceUnknown) {
+        error.inputAcceptanceUnknown = true;
+      }
+      if (/still working on the previous turn/i.test(error.message || '')) {
+        openStatusForActiveTurnBlocker();
+        const activeTurnError = new Error('Codex is still working on the previous turn. Open Status to approve, decline, steer, or interrupt the active turn before sending another prompt.');
+        activeTurnError.code = error.code || 'session_turn_active';
+        activeTurnError.status = error.status || 409;
+        activeTurnError.body = error.body || null;
+        throw activeTurnError;
+      }
+      throw error;
     }
-    throw error;
   }
+  throw lastError || new Error('Prompt delivery could not be confirmed.');
 }
 
 async function sendInput(session, text, options = {}) {
@@ -24507,10 +27121,12 @@ async function submitComposerInput(input = el('input-text')) {
     signature,
     sessionKey: getSessionKey(session) || '',
     draft,
+    stage: 'preparing',
     startedAt: new Date().toISOString(),
   };
   setComposerDraftForSessionKey(submission.sessionKey, draft);
   setComposerSubmission(submission);
+  let retainSubmissionUntilHostAck = false;
 
   try {
     const payload = await buildComposerPayload(
@@ -24522,25 +27138,55 @@ async function submitComposerInput(input = el('input-text')) {
     if (!payload.text && !payload.inputItems.length) {
       return;
     }
+    payload.submissionSignature = submission.signature;
+    setActiveDraftForSessionKey(submission.sessionKey, payload);
+    submission.stage = 'submitting';
+    setComposerSubmission(submission, submission.sessionKey);
+    clearComposerDraftIfMatching(submission.sessionKey, submission.draft);
+
     const result = await submitComposerPayload(session, payload);
-    if (!result?.accepted) return;
-    if (result.trackActiveDraft) {
-      setActiveDraftForSessionKey(submission.sessionKey, payload);
+    if (!result?.accepted) {
+      recoverComposerSubmissionForSession(submission.sessionKey, { clientRequestId: submission.id });
+      return;
     }
-    clearComposerDraftForSessionKey(submission.sessionKey);
-    state.codexControls.recentSubmissions.delete(submission.signature);
+    if (result.trackActiveDraft) {
+      const resolvedSubmissionKey = resolveComposerSessionKey(submission.sessionKey);
+      acknowledgeComposerSubmissionForSession(resolvedSubmissionKey, submission.id, { stage: 'queued' });
+      const activeSubmission = state.codexControls.composerSubmissionsBySession.get(resolvedSubmissionKey) || null;
+      retainSubmissionUntilHostAck = activeSubmission?.id === submission.id;
+    } else {
+      clearActiveDraftForSessionRequest(submission.sessionKey, submission.id);
+      clearSentDraftSnapshotForSessionRequest(submission.sessionKey, submission.id, { force: true });
+      completeComposerSubmissionForSession(submission.sessionKey, submission.id);
+    }
   } catch (error) {
     const recoveryKey = resolveComposerSessionKey(submission.sessionKey);
-    if (resolveComposerSessionKey(getSessionKey(getSelectedSession())) === recoveryKey) {
-      applyMountedComposerDraft(recoveryKey, submission.draft);
-      setComposerDraftForSessionKey(recoveryKey, submission.draft);
-    } else {
-      setComposerDraftForSessionKey(recoveryKey, submission.draft);
-      stashPendingComposerDraftForSession(recoveryKey, submission.draft);
+    const activeSubmission = state.codexControls.composerSubmissionsBySession.get(recoveryKey) || null;
+    const activeDraft = state.codexControls.activeDraftsBySession.get(recoveryKey) || null;
+    const requestStillTracked = activeSubmission?.id === submission.id
+      || activeDraft?.clientRequestId === submission.id;
+    if (!requestStillTracked) {
+      return;
     }
+    if (error?.inputAcceptanceUnknown === true) {
+      submission.stage = 'confirming';
+      submission.confirmationDelayed = true;
+      setComposerSubmission(submission, recoveryKey);
+      retainSubmissionUntilHostAck = true;
+      appendAlertForSession(session.hostId, session.sessionId, {
+        severity: 'warning',
+        source: 'ui',
+        message: 'Prompt delivery is still being confirmed. It will not be sent again with a new request ID or restored as a failed draft unless the Relay explicitly rejects it.',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    recoverComposerSubmissionForSession(recoveryKey, { clientRequestId: submission.id });
     throw error;
   } finally {
-    clearComposerSubmissionForSession(submission.sessionKey, submission.id);
+    if (!retainSubmissionUntilHostAck) {
+      clearComposerSubmissionForSession(submission.sessionKey, submission.id);
+    }
   }
 }
 
@@ -24556,8 +27202,12 @@ async function waitForActiveTurnToClear(session, timeoutMs = 20000) {
     try {
       const detail = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/detail?hostId=${encodeURIComponent(session.hostId)}`);
       if (detail?.runtime) {
-        setRuntimeForSession(session.hostId, session.sessionId, detail.runtime);
-        lastRuntime = detail.runtime;
+        lastRuntime = setRuntimeForSession(
+          session.hostId,
+          session.sessionId,
+          detail.runtime,
+          { source: 'detail' }
+        ) || lastRuntime;
         if (!runtimeIsActive(lastRuntime)) {
           return true;
         }
@@ -24741,11 +27391,11 @@ async function interruptAndSendQueuedPrompt(itemId) {
 
     removeSteerQueueItem(item.id);
     state.codexControls.steerNotice = {
-      title: 'Fresh turn started',
-      message: 'The previous turn was interrupted and this prompt was sent as a new Codex turn.',
+      title: 'Fresh turn queued',
+      message: 'The previous turn was interrupted and this prompt was queued as the next Codex turn.',
     };
     window.setTimeout(() => {
-      if (state.codexControls.steerNotice?.title === 'Fresh turn started') {
+      if (state.codexControls.steerNotice?.title === 'Fresh turn queued') {
         state.codexControls.steerNotice = null;
         renderComposerTurnNotice();
       }
@@ -24990,6 +27640,16 @@ function sleep(ms) {
 }
 
 function reportError(error) {
+  if (error?.hostRecoveryScoped && error.hostId) {
+    if (!state.hostRecoveryResults.has(error.hostId)) {
+      setHostRecoveryResult(error.hostId, {
+        status: error.code === 'local_agent_ownership_pending' ? 'ownership_pending' : 'failed',
+        message: error.message,
+      });
+    }
+    renderAll();
+    return;
+  }
   const session = getSelectedSession();
   if (session) {
     appendAlertForSession(session.hostId, session.sessionId, {
@@ -26486,8 +29146,12 @@ el('scroll-transcript-bottom-button')?.addEventListener('click', (event) => {
 
 el('session-log')?.addEventListener('scroll', handleTranscriptScrollDetach, { passive: true });
 window.addEventListener('scroll', handleTranscriptScrollDetach, { passive: true });
-for (const eventName of ['wheel', 'touchend', 'pointerup']) {
-  window.addEventListener(eventName, recordTranscriptTrustedInteraction, { passive: true });
+window.addEventListener('wheel', recordTranscriptTrustedInteraction, { passive: true });
+for (const eventName of ['touchstart', 'pointerdown']) {
+  window.addEventListener(eventName, (event) => recordTranscriptTrustedInteraction(event, 'begin'), { passive: true });
+}
+for (const eventName of ['touchend', 'pointerup', 'pointercancel']) {
+  window.addEventListener(eventName, (event) => recordTranscriptTrustedInteraction(event, 'end'), { passive: true });
 }
 window.addEventListener('keydown', (event) => {
   if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {

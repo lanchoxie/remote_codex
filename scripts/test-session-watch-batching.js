@@ -79,6 +79,7 @@ async function main() {
       postedBatchIds.push(options?.batchId || null);
       await delay(POST_LATENCY_MS);
     },
+    assistantMirrorGraceMs: 0,
   });
 
   try {
@@ -138,6 +139,7 @@ async function main() {
         }
         deliveredEvents.push(...events);
       },
+      assistantMirrorGraceMs: 0,
     });
     retryTailer.setWatchedSessions(retrySessions);
     for (const session of retrySessions) {
@@ -161,6 +163,98 @@ async function main() {
     assert(
       retryResult.emittedEvents < expectedEventCount,
       'retry must not reread sessions that the failed poll already queued'
+    );
+
+    const mirrorHome = path.join(root, '.codex-mirror');
+    const mirrorSessionId = '44444444-4444-4444-8444-444444444444';
+    const mirrorPath = rolloutPath(mirrorHome, mirrorSessionId, 'mirror');
+    fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
+    fs.writeFileSync(mirrorPath, '');
+    const mirrorPosted = [];
+    let mirrorNowMs = Date.parse('2026-07-11T12:00:00.000Z');
+    const mirrorTailer = new CodexSessionTailer({
+      codexHome: mirrorHome,
+      hostId: 'mirror-test-host',
+      assistantMirrorGraceMs: 250,
+      nowMs: () => mirrorNowMs,
+      postEvents: async (events) => mirrorPosted.push(...events),
+    });
+    mirrorTailer.setWatchedSessions([{
+      sessionId: mirrorSessionId,
+      nativeThreadId: mirrorSessionId,
+      rolloutPath: mirrorPath,
+    }]);
+    const finalEvent = {
+      timestamp: '2026-07-11T12:00:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'agent_message', phase: 'final', message: 'mirrored answer' },
+    };
+    const finalResponse = {
+      timestamp: '2026-07-11T12:00:00.035Z',
+      type: 'response_item',
+      payload: {
+        id: 'msg-mirror-final',
+        type: 'message',
+        role: 'assistant',
+        phase: 'final',
+        content: [{ type: 'output_text', text: 'mirrored answer' }],
+      },
+    };
+    fs.appendFileSync(mirrorPath, `${JSON.stringify(finalEvent)}\n`);
+    const pendingMirror = await mirrorTailer.poll();
+    assert.strictEqual(pendingMirror.emittedEvents, 0, 'an event_msg at EOF must wait briefly for its response mirror');
+    fs.appendFileSync(mirrorPath, `${JSON.stringify(finalResponse)}\n`);
+    await mirrorTailer.poll();
+    const mirroredTranscripts = mirrorPosted.filter((event) => event.type === 'session.transcript');
+    assert.strictEqual(mirroredTranscripts.length, 1, 'a mirror split across polls must emit one transcript');
+    assert.strictEqual(
+      mirroredTranscripts[0].assistantObservation?.sourceIdentity?.protocolItemId,
+      'msg-mirror-final'
+    );
+
+    const commentaryEvent = {
+      timestamp: '2026-07-11T12:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'agent_message', phase: 'commentary', message: 'checking files' },
+    };
+    const commentaryResponse = {
+      timestamp: '2026-07-11T12:00:01.020Z',
+      type: 'response_item',
+      payload: {
+        id: 'msg-mirror-commentary',
+        type: 'message',
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: 'checking files' }],
+      },
+    };
+    fs.appendFileSync(
+      mirrorPath,
+      `${JSON.stringify(commentaryEvent)}\n${JSON.stringify(commentaryResponse)}\n`
+    );
+    await mirrorTailer.poll();
+    assert.strictEqual(
+      mirrorPosted.filter((event) => event.type === 'session.diagnostic' && event.message === 'checking files').length,
+      1,
+      'commentary mirrors must produce one Thinking diagnostic'
+    );
+
+    const legacyEvent = {
+      timestamp: '2026-07-11T12:00:02.000Z',
+      type: 'event_msg',
+      payload: { type: 'agent_message', message: 'legacy event-only answer' },
+    };
+    const taskComplete = {
+      timestamp: '2026-07-11T12:00:02.100Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', last_agent_message: 'legacy event-only answer' },
+    };
+    fs.appendFileSync(mirrorPath, `${JSON.stringify(legacyEvent)}\n${JSON.stringify(taskComplete)}\n`);
+    await mirrorTailer.poll();
+    assert.strictEqual(
+      mirrorPosted.filter((event) => event.type === 'session.transcript' && event.text === 'legacy event-only answer').length,
+      1,
+      'an unpaired legacy event_msg must remain visible'
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

@@ -182,6 +182,82 @@ function extractContentText(content) {
     .join('\n');
 }
 
+function normalizeRolloutMirrorText(value) {
+  return String(value == null ? '' : value)
+    .replace(/\r\n?/g, '\n')
+    .trim();
+}
+
+function describeRolloutAssistantRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
+  const rowType = text(row.type).toLowerCase();
+  const payloadType = text(payload.type).toLowerCase();
+  if (rowType === 'event_msg' && payloadType === 'agent_message') {
+    const value = normalizeRolloutMirrorText(payload.message);
+    if (!value) return null;
+    return {
+      kind: 'event',
+      text: value,
+      phase: text(payload.phase || payload.channel).toLowerCase(),
+      timestamp: text(row.timestamp || payload.timestamp),
+      protocolItemId: '',
+    };
+  }
+  if (
+    rowType === 'response_item'
+    && payloadType === 'message'
+    && ['assistant', 'agent'].includes(text(payload.role).toLowerCase())
+  ) {
+    const value = normalizeRolloutMirrorText(
+      payload.message || extractContentText(payload.content)
+    );
+    if (!value) return null;
+    return {
+      kind: 'response',
+      text: value,
+      phase: text(payload.phase || payload.channel).toLowerCase(),
+      timestamp: text(row.timestamp || payload.timestamp),
+      protocolItemId: text(payload.id || payload.item_id || payload.itemId),
+    };
+  }
+  return null;
+}
+
+function isRolloutAssistantMirrorPair(eventRow, responseRow, options = {}) {
+  const event = describeRolloutAssistantRow(eventRow);
+  const response = describeRolloutAssistantRow(responseRow);
+  if (
+    event?.kind !== 'event'
+    || response?.kind !== 'response'
+    || !response.protocolItemId
+    || event.phase !== response.phase
+    || event.text !== response.text
+  ) {
+    return false;
+  }
+  const eventMs = Date.parse(event.timestamp);
+  const responseMs = Date.parse(response.timestamp);
+  const maxDeltaMs = Math.max(0, Number(options.maxDeltaMs ?? 1000) || 0);
+  return !Number.isFinite(eventMs)
+    || !Number.isFinite(responseMs)
+    || Math.abs(responseMs - eventMs) <= maxDeltaMs;
+}
+
+function coalesceRolloutAssistantMirrorRows(rows, options = {}) {
+  const values = Array.isArray(rows) ? rows : [];
+  const coalesced = [];
+  for (let index = 0; index < values.length; index += 1) {
+    if (isRolloutAssistantMirrorPair(values[index], values[index + 1], options)) {
+      coalesced.push(values[index + 1]);
+      index += 1;
+      continue;
+    }
+    coalesced.push(values[index]);
+  }
+  return coalesced;
+}
+
 function isTaskComplete(input, row, payload, item) {
   const markers = [
     input.type,
@@ -336,6 +412,9 @@ function normalizeAssistantObservation(input = {}) {
 
 module.exports = {
   assistantMessageIdFor,
+  coalesceRolloutAssistantMirrorRows,
+  describeRolloutAssistantRow,
+  isRolloutAssistantMirrorPair,
   normalizeAssistantObservation,
   sourceFileIdentity,
 };

@@ -3,9 +3,14 @@ const path = require('path');
 const { randomUUID } = require('crypto');
 const { StringDecoder } = require('string_decoder');
 const { makeCodexRowEvents } = require('./codex-discovery');
+const {
+  describeRolloutAssistantRow,
+  isRolloutAssistantMirrorPair,
+} = require('./assistant-message-identity');
 
 const DEFAULT_MAX_BYTES_PER_POLL = 4 * 1024 * 1024;
 const DEFAULT_MAX_EVENTS_PER_BATCH = 64;
+const DEFAULT_ASSISTANT_MIRROR_GRACE_MS = 250;
 
 class CodexSessionTailer {
   constructor(options = {}) {
@@ -16,6 +21,11 @@ class CodexSessionTailer {
     this.maxBytesPerPoll = Number(options.maxBytesPerPoll || DEFAULT_MAX_BYTES_PER_POLL);
     this.maxEventsPerBatch = Math.max(1, Number(options.maxEventsPerBatch || DEFAULT_MAX_EVENTS_PER_BATCH));
     this.assistantCursorIndex = options.assistantCursorIndex || null;
+    this.assistantMirrorGraceMs = Math.max(
+      0,
+      Number(options.assistantMirrorGraceMs ?? DEFAULT_ASSISTANT_MIRROR_GRACE_MS) || 0
+    );
+    this.nowMs = typeof options.nowMs === 'function' ? options.nowMs : () => Date.now();
     this.log = typeof options.log === 'function' ? options.log : () => {};
     this.files = new Map();
     this.watchedSessions = new Map();
@@ -42,6 +52,7 @@ class CodexSessionTailer {
         fileIdentity: tailFileIdentity(session.rolloutPath, stats),
         lastStatSize: stats.size,
         lastMtimeMs: Number(stats.mtimeMs),
+        pendingAssistantMirror: null,
         primed: true,
       });
     }
@@ -68,6 +79,7 @@ class CodexSessionTailer {
           fileIdentity: stats ? tailFileIdentity(normalized.rolloutPath, stats) : null,
           lastStatSize: stats?.size || 0,
           lastMtimeMs: stats ? Number(stats.mtimeMs) : null,
+          pendingAssistantMirror: null,
           primed: true,
         });
       }
@@ -108,6 +120,7 @@ class CodexSessionTailer {
           fileIdentity: stats ? tailFileIdentity(session.rolloutPath, stats) : null,
           lastStatSize: stats?.size || 0,
           lastMtimeMs: stats ? Number(stats.mtimeMs) : null,
+          pendingAssistantMirror: null,
           primed: true,
         };
         this.files.set(session.rolloutPath, state);
@@ -139,20 +152,49 @@ class CodexSessionTailer {
         && state.lastMtimeMs !== null
         && Number(stats.mtimeMs) !== Number(state.lastMtimeMs)
       );
+      const fileEvents = [];
+      const appendRowEvents = (row, events) => {
+        for (const event of events || []) {
+          if (event.type === 'session.transcript' && event.entry?.assistantObservation) {
+            this.assistantCursorIndex?.recordObservation(
+              session,
+              event.entry.assistantObservation
+            );
+          }
+          const payload = this.makeSessionEvent(session, event, row);
+          if (!payload) continue;
+          fileEvents.push(payload);
+          emittedEvents += 1;
+        }
+      };
+      const flushPendingAssistantMirror = () => {
+        const pending = state.pendingAssistantMirror;
+        if (!pending) return false;
+        state.pendingAssistantMirror = null;
+        appendRowEvents(pending.row, pending.events);
+        return true;
+      };
       if (identityChanged || sameSizeRewrite || fileTruncated) {
         resetTailState(state, nextFileIdentity);
         replaced = replaced || identityChanged || sameSizeRewrite;
         truncated = truncated || fileTruncated;
       }
       if (stats.size === state.offset) {
+        if (
+          state.pendingAssistantMirror
+          && this.nowMs() - state.pendingAssistantMirror.queuedAtMs >= this.assistantMirrorGraceMs
+        ) {
+          flushPendingAssistantMirror();
+        }
         state.lastStatSize = stats.size;
         state.lastMtimeMs = Number(stats.mtimeMs);
+        for (const event of fileEvents) this.pendingEvents.push(event);
+        postedBatchCount += await this.flushPendingEvents();
         continue;
       }
 
       const readResult = readFileDelta(session.rolloutPath, state.offset, Math.min(stats.size - state.offset, this.maxBytesPerPoll));
       const lines = consumeJsonlLines(state, readResult.buffer, state.offset);
-      const fileEvents = [];
 
       for (const lineEntry of lines) {
         const trimmed = lineEntry.text.trim();
@@ -163,7 +205,15 @@ class CodexSessionTailer {
         try {
           row = JSON.parse(trimmed);
         } catch (_) {
+          flushPendingAssistantMirror();
           continue;
+        }
+        if (state.pendingAssistantMirror) {
+          if (isRolloutAssistantMirrorPair(state.pendingAssistantMirror.row, row)) {
+            state.pendingAssistantMirror = null;
+          } else {
+            flushPendingAssistantMirror();
+          }
         }
         const events = makeCodexRowEvents(row, {
           nativeThreadId: session.nativeThreadId || session.sessionId,
@@ -172,24 +222,27 @@ class CodexSessionTailer {
           sourceOrdinal: lineEntry.sourceOrdinal,
           observedAt: new Date().toISOString(),
         });
-        for (const event of events) {
-          if (event.type === 'session.transcript' && event.entry?.assistantObservation) {
-            this.assistantCursorIndex?.recordObservation(
-              session,
-              event.entry.assistantObservation
-            );
-          }
-          const payload = this.makeSessionEvent(session, event, row);
-          if (!payload) {
-            continue;
-          }
-          fileEvents.push(payload);
-          emittedEvents += 1;
+        if (describeRolloutAssistantRow(row)?.kind === 'event') {
+          state.pendingAssistantMirror = {
+            row,
+            events,
+            queuedAtMs: this.nowMs(),
+          };
+          continue;
         }
+        appendRowEvents(row, events);
       }
       state.offset = readResult.nextOffset;
       state.lastStatSize = stats.size;
       state.lastMtimeMs = Number(stats.mtimeMs);
+      if (
+        state.pendingAssistantMirror
+        && state.offset >= stats.size
+        && state.partialBytes.length === 0
+        && this.nowMs() - state.pendingAssistantMirror.queuedAtMs >= this.assistantMirrorGraceMs
+      ) {
+        flushPendingAssistantMirror();
+      }
       for (const event of fileEvents) {
         this.pendingEvents.push(event);
       }
@@ -245,6 +298,13 @@ class CodexSessionTailer {
       rolloutPath: session.rolloutPath,
       timestamp: row.timestamp || new Date().toISOString(),
     };
+
+    if (
+      session.live === true
+      && (event.type === 'session.runtime_updated' || event.type === 'session.diagnostic')
+    ) {
+      return null;
+    }
 
     if (event.type === 'session.transcript') {
       return {
@@ -378,6 +438,7 @@ function resetTailState(state, fileIdentity) {
   state.fileIdentity = fileIdentity;
   state.lastStatSize = 0;
   state.lastMtimeMs = null;
+  state.pendingAssistantMirror = null;
 }
 
 function decodeCompleteLine(buffer) {

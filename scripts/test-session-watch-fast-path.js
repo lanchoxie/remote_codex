@@ -18,6 +18,19 @@ function appendJsonl(filePath, row) {
 }
 
 function row(type, message, timestamp) {
+  if (type === 'agent_message') {
+    return {
+      timestamp,
+      type: 'response_item',
+      payload: {
+        id: `msg-${String(timestamp).replace(/[^0-9]/g, '')}`,
+        type: 'message',
+        role: 'assistant',
+        phase: 'final',
+        content: [{ type: 'output_text', text: message }],
+      },
+    };
+  }
   return {
     timestamp,
     type: 'event_msg',
@@ -56,6 +69,21 @@ async function main() {
     hostId: 'test-host',
     postEvent: async (event) => events.push(event),
   });
+
+  const diagnostic = {
+    type: 'session.diagnostic',
+    entry: { kind: 'reasoning', message: 'selected history diagnostic' },
+  };
+  const diagnosticRow = { timestamp: '2026-06-27T00:00:00.000Z' };
+  assert.strictEqual(
+    tailer.makeSessionEvent({ sessionId: sessionA, rolloutPath: fileA, live: true }, diagnostic, diagnosticRow),
+    null,
+    'live managed Sessions must keep app-server as the sole runtime/diagnostic source'
+  );
+  assert(
+    tailer.makeSessionEvent({ sessionId: sessionB, rolloutPath: fileB, live: false, selected: true }, diagnostic, diagnosticRow),
+    'a selected non-live history Session must still receive JSONL diagnostics'
+  );
 
   const primeResult = tailer.prime();
   assert.strictEqual(primeResult.sessionCount, 0, 'prime() should not scan every jsonl when no sessions are watched');

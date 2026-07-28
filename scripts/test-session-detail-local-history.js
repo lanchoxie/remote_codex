@@ -45,4 +45,15 @@ assertContains(
   'explicit remote detail requests should bypass the local-history fast path'
 );
 
+assertContains(
+  relay,
+  "const loadRolloutDiagnostics = !(session.live && session.source === 'managed')",
+  'live managed Session detail must keep app-server diagnostics authoritative instead of re-ingesting rollout Thinking'
+);
+assertContains(
+  relay,
+  'const acceptRemoteRolloutDiagnostics = !(',
+  'remote detail must not persist rollout diagnostics into a live managed Session'
+);
+
 console.log('session detail local history assertions passed');

@@ -160,9 +160,8 @@ async function main() {
       throw new Error('zip export did not include cached file content');
     }
 
-    // This size exceeds the safe raw payload for the default 8 MiB agent-event
-    // limit after base64 expansion. The download must select chunking without
-    // a caller-provided `chunked=1` override.
+    // This matches the production ZIP that exposed the old 16 MiB threshold:
+    // base64 expansion exceeds the default 8 MiB agent-event request limit.
     const chunkedBytes = Buffer.alloc(15_601_186);
     for (let index = 0; index < chunkedBytes.length; index += 1) {
       chunkedBytes[index] = index % 251;

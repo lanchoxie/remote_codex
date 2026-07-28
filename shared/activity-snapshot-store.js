@@ -24,8 +24,8 @@ function boundedText(value, maxLength) {
   return text.length <= maxLength ? text : text.slice(0, maxLength);
 }
 
-function boundedStructuredValue(value, maxBytes) {
-  if (value == null) return null;
+function boundedStructuredValueWithMeta(value, maxBytes) {
+  if (value == null) return { value: null, truncated: false };
   let cloned;
   try {
     cloned = clone(value);
@@ -38,12 +38,21 @@ function boundedStructuredValue(value, maxBytes) {
   } catch (_) {
     serialized = JSON.stringify(String(cloned));
   }
-  if (Buffer.byteLength(serialized, 'utf8') <= maxBytes) return cloned;
+  if (Buffer.byteLength(serialized, 'utf8') <= maxBytes) {
+    return { value: cloned, truncated: false };
+  }
   const bounded = truncateUtf8(serialized, Math.max(256, maxBytes - 96));
   return {
+    value: {
+      truncated: true,
+      preview: bounded.text,
+    },
     truncated: true,
-    preview: bounded.text,
   };
+}
+
+function boundedStructuredValue(value, maxBytes) {
+  return boundedStructuredValueWithMeta(value, maxBytes).value;
 }
 
 function truncateUtf8(value, maxBytes) {
@@ -359,6 +368,16 @@ class ActivitySnapshotStore {
     }
     const textBudget = Math.max(256, this.maxRecordBytes - 4096);
     const truncatedText = truncateUtf8(snapshot.text, textBudget);
+    const truncatedOutput = truncateUtf8(snapshot.output, 96 * 1024);
+    const truncatedStdout = truncateUtf8(snapshot.stdout, 64 * 1024);
+    const truncatedStderr = truncateUtf8(snapshot.stderr, 64 * 1024);
+    const truncatedProgress = truncateUtf8(snapshot.progress, 16 * 1024);
+    const boundedArguments = boundedStructuredValueWithMeta(snapshot.arguments, 32 * 1024);
+    const boundedResult = boundedStructuredValueWithMeta(snapshot.result, 32 * 1024);
+    const boundedFileChanges = boundedStructuredValueWithMeta(
+      snapshot.fileChanges || snapshot.changes,
+      64 * 1024
+    );
     const kind = boundedText(snapshot.kind, 64) || 'reasoning';
     const method = boundedText(snapshot.method, 256) || null;
     const callId = boundedText(snapshot.callId, 512) || null;
@@ -383,10 +402,13 @@ class ActivitySnapshotStore {
       textTruncated: truncatedText.truncated || snapshot.textTruncated === true,
       command: boundedText(snapshot.command, 16 * 1024) || null,
       cwd: boundedText(snapshot.cwd, 4096) || null,
-      output: boundedText(snapshot.output, 96 * 1024) || null,
-      stdout: boundedText(snapshot.stdout, 64 * 1024) || null,
-      stderr: boundedText(snapshot.stderr, 64 * 1024) || null,
-      outputTruncated: snapshot.outputTruncated === true,
+      output: truncatedOutput.text || null,
+      stdout: truncatedStdout.text || null,
+      stderr: truncatedStderr.text || null,
+      outputTruncated: snapshot.outputTruncated === true
+        || truncatedOutput.truncated
+        || truncatedStdout.truncated
+        || truncatedStderr.truncated,
       exitCode: snapshot.exitCode != null && Number.isFinite(Number(snapshot.exitCode))
         ? Number(snapshot.exitCode)
         : null,
@@ -409,32 +431,56 @@ class ActivitySnapshotStore {
       receiverThreadIds: boundedStructuredValue(snapshot.receiverThreadIds, 16 * 1024),
       agentsStates: boundedStructuredValue(snapshot.agentsStates, 32 * 1024),
       actionData: boundedStructuredValue(snapshot.actionData, 16 * 1024),
-      progress: boundedText(snapshot.progress, 16 * 1024) || null,
-      progressTruncated: snapshot.progressTruncated === true,
+      progress: truncatedProgress.text || null,
+      progressTruncated: snapshot.progressTruncated === true || truncatedProgress.truncated,
       success: typeof snapshot.success === 'boolean' ? snapshot.success : null,
       error: boundedStructuredValue(snapshot.error, 24 * 1024),
-      arguments: boundedStructuredValue(snapshot.arguments, 32 * 1024),
-      result: boundedStructuredValue(snapshot.result, 32 * 1024),
+      arguments: boundedArguments.value,
+      argumentsTruncated: snapshot.argumentsTruncated === true || boundedArguments.truncated,
+      result: boundedResult.value,
+      resultTruncated: snapshot.resultTruncated === true || boundedResult.truncated,
       commandActions: boundedStructuredValue(snapshot.commandActions, 16 * 1024),
-      fileChanges: boundedStructuredValue(snapshot.fileChanges || snapshot.changes, 64 * 1024),
+      fileChanges: boundedFileChanges.value,
+      fileChangesTruncated: snapshot.fileChangesTruncated === true || boundedFileChanges.truncated,
       activityRevision,
       final: snapshot.final === true,
       timestamp: boundedText(snapshot.timestamp || snapshot.updatedAt, 128) || null,
     };
     if (recordBytes(normalized) > this.maxRecordBytes) {
-      normalized.output = truncateUtf8(normalized.output, 16 * 1024).text || null;
-      normalized.stdout = truncateUtf8(normalized.stdout, 48 * 1024).text || null;
-      normalized.stderr = truncateUtf8(normalized.stderr, 48 * 1024).text || null;
-      normalized.result = boundedStructuredValue(normalized.result, 8 * 1024);
-      normalized.arguments = boundedStructuredValue(normalized.arguments, 8 * 1024);
-      normalized.fileChanges = boundedStructuredValue(normalized.fileChanges, 16 * 1024);
+      const compactOutput = truncateUtf8(normalized.output, 16 * 1024);
+      const compactStdout = truncateUtf8(normalized.stdout, 48 * 1024);
+      const compactStderr = truncateUtf8(normalized.stderr, 48 * 1024);
+      normalized.output = compactOutput.text || null;
+      normalized.stdout = compactStdout.text || null;
+      normalized.stderr = compactStderr.text || null;
+      normalized.outputTruncated ||= compactOutput.truncated
+        || compactStdout.truncated
+        || compactStderr.truncated;
+      const compactResult = boundedStructuredValueWithMeta(normalized.result, 8 * 1024);
+      const compactArguments = boundedStructuredValueWithMeta(normalized.arguments, 8 * 1024);
+      const compactFileChanges = boundedStructuredValueWithMeta(normalized.fileChanges, 16 * 1024);
+      normalized.result = compactResult.value;
+      normalized.resultTruncated ||= compactResult.truncated;
+      normalized.arguments = compactArguments.value;
+      normalized.argumentsTruncated ||= compactArguments.truncated;
+      normalized.fileChanges = compactFileChanges.value;
+      normalized.fileChangesTruncated ||= compactFileChanges.truncated;
       normalized.agentsStates = null;
       normalized.actionData = null;
     }
     if (recordBytes(normalized) > this.maxRecordBytes) {
+      const discardedOutput = Boolean(normalized.output);
+      const compactStdout = truncateUtf8(normalized.stdout, 24 * 1024);
+      const compactStderr = truncateUtf8(normalized.stderr, 24 * 1024);
       normalized.output = null;
-      normalized.stdout = truncateUtf8(normalized.stdout, 24 * 1024).text || null;
-      normalized.stderr = truncateUtf8(normalized.stderr, 24 * 1024).text || null;
+      normalized.stdout = compactStdout.text || null;
+      normalized.stderr = compactStderr.text || null;
+      normalized.outputTruncated ||= discardedOutput
+        || compactStdout.truncated
+        || compactStderr.truncated;
+      normalized.resultTruncated ||= normalized.result != null;
+      normalized.argumentsTruncated ||= normalized.arguments != null;
+      normalized.fileChangesTruncated ||= normalized.fileChanges != null;
       normalized.result = null;
       normalized.arguments = null;
       normalized.fileChanges = null;

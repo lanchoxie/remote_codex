@@ -123,6 +123,8 @@ const launchRetryBody = functionSource('fetchManagedLaunchWithRetry');
 const newSessionLaunchStateBody = functionSource('renderNewSessionLaunchState');
 const inputBody = functionSource('sendInputToSession');
 const compactBody = functionSource('compactCurrentThread');
+const interruptBody = functionSource('interruptActiveTurn');
+const restoreSentDraftAfterInterruptBody = functionSource('restoreSentDraftAfterInterrupt');
 const endSessionBody = functionSource('endCurrentSession');
 const stopManagedBody = functionSource('stopManagedSession');
 const sessionDetailsBody = functionSource('renderSessionDetails');
@@ -156,8 +158,24 @@ assert(!launchBody.includes('if (!sessionApiBinding(currentSource))'), 'resume m
 assert(!launchBody.includes('sourceSession = currentSource'), 'resume must not fall back to a list projection after runtime-config failure');
 assert(!inputBody.includes('getApiRequestConfig'), 'live input must not resolve the Host default API');
 assert(!inputBody.includes('body.apiConfig'), 'live input must not submit apiConfig');
+assert(!inputBody.includes('verifyHostAvailable'), 'live input must not wait for an active Host probe before Relay queueing');
+assert(inputBody.includes('timeoutMs: 30_000'), 'live input transport must have a bounded browser wait');
 assert(!compactBody.includes('getApiRequestConfig'), 'compact must not resolve the Host default API');
 assert(!compactBody.includes('body.apiConfig'), 'compact must not submit apiConfig');
+assert(
+  interruptBody.includes('const interruptRequestId = makeClientId()')
+    && interruptBody.includes('interruptRequestId,'),
+  'Interrupt must create and reuse one stable request identity'
+);
+assert(interruptBody.includes('expectedRunId:'), 'Interrupt must target the observed Session run');
+assert(interruptBody.includes('expectedTurnId:'), 'Interrupt must target the observed turn when known');
+assert(interruptBody.includes('expectedClientRequestId:'), 'Interrupt must target acceptance-unknown input identity');
+assert(
+  restoreSentDraftAfterInterruptBody.includes('await waitForActiveTurnToClear(session)'),
+  'draft restoration must wait for terminal turn state'
+);
+assert(app.includes("state.eventSource.addEventListener('session.transcript_removed'"));
+assert(app.includes("'session.transcript_removed',"), 'transcript removals must participate in SSE cursor replay');
 assert(runtimeLoadBody.includes('/runtime-config?'), 'selection must load Session runtime config');
 assert(runtimeLoadBody.includes('requestSessionKey'), 'runtime config responses must retain the request Session key');
 assert(
@@ -184,6 +202,7 @@ assert(
   'Rebind must disable the composer model and effort controls while the request is pending'
 );
 assert(fetchBody.includes('error.code'), 'fetchJson must preserve structured error codes');
+assert(fetchBody.includes('AbortController'), 'fetchJson must support bounded request cancellation');
 for (const field of ['stage', 'sessionBinding', 'submittedBinding', 'canRebind', 'canTranscriptFallback']) {
   assert(fetchBody.includes(`error.${field}`), `fetchJson must preserve ${field}`);
 }
@@ -217,11 +236,12 @@ for (const field of ['expectedRunId', 'expectedRunStatus', 'expectedBindingFinge
   assert(endSessionBody.includes(field), `Stop must submit canonical ${field}`);
   assert(stopManagedBody.includes(field), `managed Stop must submit canonical ${field}`);
 }
-assert(endSessionBody.includes('isSessionApiRebindBusy(session)'), 'Stop must reject while the same Session is rebinding');
-assert(stopManagedBody.includes('isSessionApiRebindBusy(session)'), 'managed Stop must reject while the same Session is rebinding');
-assert((endSessionBody.match(/isSessionApiRebindBusy/g) || []).length >= 2, 'Stop must recheck Rebind busy state after loading canonical runtime config');
-assert((stopManagedBody.match(/isSessionApiRebindBusy/g) || []).length >= 2, 'managed Stop must recheck Rebind busy state after loading canonical runtime config');
-assert(sessionDetailsBody.includes('isSessionApiRebindBusy(session)'), 'the main Stop control must stay disabled during Rebind');
+assert(!endSessionBody.includes('isSessionApiRebindBusy(session)'), 'Stop must remain available while a pending Rebind is starting');
+assert(!stopManagedBody.includes('isSessionApiRebindBusy(session)'), 'batch Stop must remain available while a pending Rebind is starting');
+assert(
+  sessionDetailsBody.includes('resumeButton.disabled = isEnding || Boolean(launchBusy);'),
+  'the main Stop control must remain available during a pending Rebind'
+);
 assert(composerControlsBody.includes('disabled || submitting'), 'Models must stay disabled with the rest of the composer during Rebind');
 assert(
   composerControlsBody.indexOf('applyComposerOptionsToControls(session)') < composerControlsBody.indexOf('renderComposerModelOptions(session)'),
@@ -1809,6 +1829,10 @@ assert(functionSource('rebindResponseWasAccepted').includes('rebindSelectionMatc
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('latestValidation?.selection'));
 assert(functionSource('waitForProfileRebindCompletion').includes("runtime?.runStatus !== 'live'"));
 assert(!functionSource('applyProfileRebindSessionActionDialog').includes('restartManagedSession'));
+assert(
+  !functionSource('restartManagedSession').includes("catch(() => ({"),
+  'Restart must never fabricate a stopped Session after the Stop confirmation times out'
+);
 assert(functionSource('runHostGroupedSessionTasks').includes('Math.min(concurrency'));
 assert(functionSource('closeSessionActionDialog').includes('state.sessionActionDialog.busy'));
 assert(functionSource('renderSessionActionDialog').includes('closeButton.disabled = dialog.busy'));
@@ -1997,6 +2021,142 @@ async function verifyEmptyManagedSessionCannotResume() {
   assert.strictEqual(resumeStarts, 0, 'empty-shell Resume must never submit a native resume request');
 }
 
+async function verifyUnknownApiHistoryUsesExplicitRebind() {
+  const state = { sessions: [] };
+  let configuredApi = { profileId: 'profile-b' };
+  let supportsRebind = true;
+  let cancelRebind = false;
+  let ordinaryResumeStarts = 0;
+  const rebindCalls = [];
+  const sentInputs = [];
+  const canonicalByRequestKey = new Map();
+  const helpers = loadHelpers([
+    'sessionApiBinding',
+    'sessionApiControlValue',
+    'preferredHistoryRebindTarget',
+    'resumeFromHistory',
+  ], {
+    state,
+    getApiRequestConfig: () => configuredApi,
+    getSessionKey: (session) => session ? `${session.hostId}::${session.sessionId}` : '',
+    getSelectedSession: () => null,
+    isEmptyManagedSessionShell: () => false,
+    hostSupportsSessionApiRebind: () => supportsRebind,
+    switchSessionApiFromComposer: async (session, targetProfileId, options) => {
+      rebindCalls.push({ session, targetProfileId, options });
+      if (cancelRebind) return null;
+      const requestKey = `${session.hostId}::${session.sessionId}`;
+      const canonical = {
+        ...session,
+        sessionId: `${session.sessionId}-canonical`,
+        live: true,
+        state: 'live',
+      };
+      canonicalByRequestKey.set(requestKey, canonical);
+      state.sessions.push(canonical);
+      return { sessionId: canonical.sessionId, runId: 'rebound-run' };
+    },
+    findSessionForResolvedComposerKey: (key) => canonicalByRequestKey.get(key) || null,
+    getComposerOptionsForSession: () => ({
+      model: 'target-api-model',
+      effort: 'low',
+      summary: 'target-summary',
+    }),
+    sendInputToSession: async (session, text, options) => {
+      sentInputs.push({ session, text, options });
+    },
+    confirmResumeAfterFailedRebind: () => true,
+    startManagedSession: async (options) => {
+      ordinaryResumeStarts += 1;
+      return options.session;
+    },
+    sessionContractError: (code, message, details = {}) => Object.assign(new Error(message), { code, ...details }),
+    t: (key) => key,
+  });
+
+  const legacyNullBinding = {
+    hostId: 'host-a',
+    sessionId: 'legacy-null',
+    source: 'managed',
+    state: 'stopped',
+    live: false,
+    apiBinding: null,
+  };
+  const initialInputItems = [{ type: 'localFile', path: 'C:/workspace/legacy.txt' }];
+  const resumedProfileSession = await helpers.resumeFromHistory({
+    session: legacyNullBinding,
+    initialText: 'resume this legacy prompt',
+    initialInputOptions: {
+      inputItems: initialInputItems,
+      clientRequestId: 'legacy-request-id',
+      model: 'old-api-model',
+      effort: 'xhigh',
+      summary: 'old-summary',
+    },
+  });
+  assert.strictEqual(resumedProfileSession.sessionId, 'legacy-null-canonical');
+  assert.strictEqual(rebindCalls.length, 1, 'null binding history must enter exactly one explicit Rebind');
+  assert.strictEqual(rebindCalls[0].targetProfileId, 'profile-b', 'Host/default API mapping must choose its saved profile');
+  assert.strictEqual(rebindCalls[0].options.force, true, 'history recovery must force Rebind even before a profile is bound');
+  assert.strictEqual(ordinaryResumeStarts, 0, 'unknown history must never fall through to ordinary native Resume');
+  assert.strictEqual(sentInputs.length, 1, 'the first prompt must be sent exactly once after Rebind completes');
+  assert.strictEqual(sentInputs[0].text, 'resume this legacy prompt');
+  assert.strictEqual(sentInputs[0].options.inputItems, initialInputItems, 'attachments must survive the Rebind transaction');
+  assert.strictEqual(sentInputs[0].options.clientRequestId, 'legacy-request-id', 'the original request identity must survive Rebind');
+  assert.strictEqual(sentInputs[0].options.model, 'target-api-model', 'the old API model must not leak into the rebound turn');
+  assert.strictEqual(sentInputs[0].options.effort, 'low', 'the old API thinking effort must not leak into the rebound turn');
+  assert.strictEqual(sentInputs[0].options.summary, 'target-summary');
+
+  configuredApi = null;
+  const legacyUnknownBinding = {
+    ...legacyNullBinding,
+    sessionId: 'legacy-unknown',
+    apiBinding: { kind: 'unknown' },
+  };
+  await helpers.resumeFromHistory({ session: legacyUnknownBinding });
+  assert.strictEqual(
+    rebindCalls.at(-1).targetProfileId,
+    '__host_environment__',
+    'unknown history without a saved profile must explicitly choose the Host environment'
+  );
+
+  cancelRebind = true;
+  const sendsBeforeCancel = sentInputs.length;
+  const canceled = await helpers.resumeFromHistory({
+    session: { ...legacyNullBinding, sessionId: 'legacy-canceled' },
+    initialText: 'must not send after cancel',
+    initialInputOptions: { clientRequestId: 'canceled-request', inputItems: [{ type: 'text' }] },
+  });
+  assert.strictEqual(canceled, null, 'canceling explicit Rebind must leave history stopped');
+  assert.strictEqual(sentInputs.length, sendsBeforeCancel, 'canceling Rebind must not send the pending first prompt');
+  assert.strictEqual(ordinaryResumeStarts, 0, 'canceling Rebind must not silently fall back to ordinary Resume');
+
+  cancelRebind = false;
+  supportsRebind = false;
+  const rebindsBeforeCapabilityFailure = rebindCalls.length;
+  await assert.rejects(
+    helpers.resumeFromHistory({ session: { ...legacyNullBinding, sessionId: 'legacy-old-agent' } }),
+    (error) => error?.code === 'session_api_rebind_capability_unavailable'
+  );
+  assert.strictEqual(
+    rebindCalls.length,
+    rebindsBeforeCapabilityFailure,
+    'an old Agent without the Rebind contract must be rejected before any Rebind request'
+  );
+  assert.strictEqual(ordinaryResumeStarts, 0, 'an old Agent must not receive an unsafe ordinary Resume fallback');
+
+  supportsRebind = true;
+  const knownBinding = {
+    ...legacyNullBinding,
+    sessionId: 'known-profile',
+    apiBinding: { kind: 'profile', profileId: 'profile-a', bindingFingerprint: 'binding-a' },
+  };
+  const rebindsBeforeKnownResume = rebindCalls.length;
+  await helpers.resumeFromHistory({ session: knownBinding });
+  assert.strictEqual(rebindCalls.length, rebindsBeforeKnownResume, 'known bindings must retain the ordinary Resume path');
+  assert.strictEqual(ordinaryResumeStarts, 1);
+}
+
 function verifyAlertHtmlIsRenderedAsText() {
   const dom = new JSDOM('<!doctype html><body></body>');
   const maliciousMessage = [
@@ -2017,6 +2177,7 @@ function verifyAlertHtmlIsRenderedAsText() {
   ], {
     document: dom.window.document,
     formatTime: (value) => String(value || ''),
+    limitText: (value, maxLength) => String(value || '').slice(0, maxLength),
     summarizeData: (value) => JSON.stringify(value),
   });
 
@@ -2694,6 +2855,8 @@ async function verifyStopFailureRestoresCompleteRuntimeSnapshot() {
     updatedAt: '2026-07-20T10:00:00.000Z',
   };
   const runtimeState = new Map();
+  const runtimeApplyGenerations = new Map();
+  const runtimeStreamGenerations = new Map();
   const expectation = {
     expectedRunId: session.runId,
     expectedRunStatus: 'live',
@@ -2706,8 +2869,18 @@ async function verifyStopFailureRestoresCompleteRuntimeSnapshot() {
     'endCurrentSession',
     'stopManagedSession',
   ], {
-    state: { runtime: runtimeState },
+    state: {
+      runtime: runtimeState,
+      runtimeApplyGenerations,
+      runtimeStreamGenerations,
+    },
     makeSessionKey: (hostId, sessionId) => `${hostId}::${sessionId}`,
+    getRuntimeApplyGeneration: (hostId, sessionId) => (
+      runtimeApplyGenerations.get(`${hostId}::${sessionId}`) || 0
+    ),
+    getRuntimeStreamGeneration: (hostId, sessionId) => (
+      runtimeStreamGenerations.get(`${hostId}::${sessionId}`) || 0
+    ),
     getSelectedSession: () => session,
     isSessionApiRebindBusy: () => false,
     sessionContractError: (_code, message) => new Error(message),
@@ -2720,6 +2893,7 @@ async function verifyStopFailureRestoresCompleteRuntimeSnapshot() {
       const key = `${hostId}::${sessionId}`;
       const next = { ...(runtimeState.get(key) || {}), ...patch };
       runtimeState.set(key, next);
+      runtimeApplyGenerations.set(key, (runtimeApplyGenerations.get(key) || 0) + 1);
       return next;
     },
     renderAll: () => { renderCount += 1; },
@@ -2764,6 +2938,7 @@ async function verifyComposerApiSwitchTransaction() {
   let catalogFailure = null;
   let reportedErrors = 0;
   let restoredDraft = null;
+  let submittedTargetProfileId = null;
   const busyTransitions = [];
   const notices = [];
   const helpers = loadHelpers(['switchSessionApiFromComposer'], {
@@ -2787,6 +2962,7 @@ async function verifyComposerApiSwitchTransaction() {
     getRuntimeForSession: () => runtime,
     runtimeIsActive: (value) => value.busy === true,
     sessionSupportsTurnSelectionControls: () => true,
+    hostSupportsSessionApiRebind: () => true,
     setSessionApiSwitchNotice: (_session, message = '', tone = '') => notices.push({ message, tone }),
     renderSessionApiControls: () => {},
     setSessionApiRebindBusy: (_session, busy) => busyTransitions.push(busy),
@@ -2797,8 +2973,9 @@ async function verifyComposerApiSwitchTransaction() {
       effort: String(selection.effort || ''),
       summary: String(selection.summary || ''),
     }),
-    rebindSessionApi: async (_session, _profileId, selection, apiConfig) => {
+    rebindSessionApi: async (_session, profileId, selection, apiConfig) => {
       rebindCalls += 1;
+      submittedTargetProfileId = profileId;
       submittedSelection = selection;
       submittedApiConfig = apiConfig;
       if (rebindResult instanceof Error) throw rebindResult;
@@ -2838,6 +3015,7 @@ async function verifyComposerApiSwitchTransaction() {
     'API switching must clear the previous model and effort before Rebind'
   );
   assert.strictEqual(submittedApiConfig.profileId, 'profile-b');
+  assert.strictEqual(submittedTargetProfileId, 'profile-b');
   assert.deepStrictEqual(busyTransitions.slice(-2), [true, false]);
   assert.strictEqual(notices.at(-1)?.message, 'session.apiSwitchCanceled');
   assert.strictEqual(appliedSelection, null, 'canceling must not change next-turn settings');
@@ -2861,6 +3039,17 @@ async function verifyComposerApiSwitchTransaction() {
     JSON.parse(JSON.stringify(appliedSelection))
   );
   assert.strictEqual(notices.at(-1)?.tone, 'success');
+
+  rebindResult = {
+    modelCatalog: {
+      models: [{ id: 'host-model', isDefault: true }],
+      sources: [{ source: 'runtime', stale: false, models: [{ id: 'host-model' }] }],
+    },
+  };
+  submittedApiConfig = { stale: true };
+  await helpers.switchSessionApiFromComposer(session, '__host_environment__');
+  assert.strictEqual(submittedTargetProfileId, '__host_environment__');
+  assert.strictEqual(submittedApiConfig, undefined, 'Host environment Rebind must not submit a saved profile snapshot');
 
   catalogFailure = new Error('catalog refresh delayed');
   rebindResult = { clientSelection: { model: '', effort: '' } };
@@ -2948,6 +3137,7 @@ function verifyPreferredApiSwitchModel() {
 Promise.resolve()
   .then(verifyBatchApplyReusesPreflightCatalog)
   .then(verifyEmptyManagedSessionCannotResume)
+  .then(verifyUnknownApiHistoryUsesExplicitRebind)
   .then(verifyApiProfileModelPagination)
   .then(verifyValidatedV1Suggestion)
   .then(verifyStableCanonicalRebindRetry)

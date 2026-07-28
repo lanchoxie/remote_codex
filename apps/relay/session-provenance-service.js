@@ -103,7 +103,45 @@ function assertRunMutationExpectation(record, input = {}) {
 
   const activeRunId = String(record?.activeRunId || '').trim() || null;
   const activeRun = activeRunId ? record?.runs?.[activeRunId] || null : null;
-  if (activeRun?.status === 'pending') {
+  const allowPendingExpectedRun = input.allowPendingExpectedRun === true;
+  const expectedBindingFingerprint = String(input.expectedBindingFingerprint || '').trim() || null;
+  if (
+    activeRun?.status === 'pending'
+    && input.redirectPendingChildFromExpectedParent === true
+  ) {
+    const parentRunId = String(activeRun.parentRunId || '').trim() || null;
+    const parentRun = parentRunId ? record?.runs?.[parentRunId] || null : null;
+    const parentRunStatus = parentRun?.stopRequestId
+      ? 'stopping'
+      : String(parentRun?.status || '').trim() || null;
+    if (
+      parentRunId
+      && parentRunId === expectedRunId
+      && bindingFingerprint(parentRun?.apiBinding) === expectedBindingFingerprint
+      && parentRunStatus === expectedRunStatus
+    ) {
+      if (activeRun.stopRequestId) {
+        throw new SessionContractError(
+          'session_run_stopping',
+          `Run ${activeRunId} already has a pending Stop request.`,
+          {
+            statusCode: 409,
+            currentRunId: activeRunId,
+            currentRunStatus: 'stopping',
+            currentBindingFingerprint: bindingFingerprint(activeRun.apiBinding),
+          }
+        );
+      }
+      return {
+        record,
+        run: activeRun,
+        runId: activeRunId,
+        runStatus: activeRun.status,
+        redirectedFromRunId: parentRunId,
+      };
+    }
+  }
+  if (activeRun?.status === 'pending' && !allowPendingExpectedRun) {
     throw new SessionContractError(
       'session_run_pending',
       `Run ${activeRunId} is still pending for this Session.`,
@@ -122,13 +160,12 @@ function assertRunMutationExpectation(record, input = {}) {
       }
     );
   }
-  const currentRunId = activeRun?.status === 'live'
+  const currentRunId = activeRun?.status === 'live' || (allowPendingExpectedRun && activeRun?.status === 'pending')
     ? activeRunId
     : String(record?.latestSuccessfulRunId || activeRunId || '').trim() || null;
   const currentRun = currentRunId ? record?.runs?.[currentRunId] || null : null;
   const currentBindingFingerprint = bindingFingerprint(currentRun?.apiBinding);
   const currentRunStatus = String(currentRun?.status || '').trim() || null;
-  const expectedBindingFingerprint = String(input.expectedBindingFingerprint || '').trim() || null;
   if (
     !currentRunId
     || currentRunId !== expectedRunId
@@ -630,8 +667,12 @@ class SessionProvenanceService {
     return this.store.transact('session.run.stop_requested', (tx) => {
       const canonicalKey = tx.resolveCanonicalKey(input.identity);
       const record = tx.getRecord(canonicalKey);
-      const expectation = assertRunMutationExpectation(record, input);
-      const runId = String(input.runId || expectation?.runId || record?.activeRunId || '').trim();
+      const expectation = assertRunMutationExpectation(record, {
+        ...input,
+        allowPendingExpectedRun: true,
+        redirectPendingChildFromExpectedParent: true,
+      });
+      const runId = String(expectation?.runId || input.runId || record?.activeRunId || '').trim();
       const run = record?.runs?.[runId];
       if (!run) {
         throw new SessionContractError(
@@ -647,7 +688,7 @@ class SessionProvenanceService {
           { statusCode: 409 }
         );
       }
-      if (run.status !== 'live') {
+      if (!['live', 'pending'].includes(run.status)) {
         throw new SessionContractError(
           'session_run_state_conflict',
           `Run ${runId} cannot stop from state ${run.status || 'unknown'}.`,
@@ -678,6 +719,7 @@ class SessionProvenanceService {
       return {
         canonicalKey,
         runId,
+        redirectedFromRunId: expectation?.redirectedFromRunId || null,
         stopRequestId,
         record: structuredClone(record),
       };
@@ -750,7 +792,8 @@ class SessionProvenanceService {
       delete run.stopRequestId;
       delete run.stopRequestedAt;
       if (record.activeRunId === runId) {
-        record.activeRunId = null;
+        const parentRun = run.parentRunId ? record.runs?.[run.parentRunId] : null;
+        record.activeRunId = parentRun?.status === 'live' ? run.parentRunId : null;
       }
       record.updatedAt = this.now();
       clearTranscriptFallbackLock(tx, run, runId, record.updatedAt);

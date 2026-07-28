@@ -1,6 +1,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const appPath = path.join(__dirname, '..', 'apps', 'mobile-web', 'public', 'app.js');
 const stylesPath = path.join(__dirname, '..', 'apps', 'mobile-web', 'public', 'styles.css');
@@ -84,6 +85,11 @@ mustContain(
   thinkingScrollMachine,
   'state.thinkingScrollMachines.set(scroller, machine)',
   'thinking scroll machines should be weakly keyed by their DOM node'
+);
+mustContain(
+  thinkingScrollMachine,
+  'isThinkingContentPinnedToBottom(scroller)',
+  'a first mounted Thinking reader should derive follow mode from its real scroll position'
 );
 assert(
   !thinkingScrollMachine.includes('{ node: scroller, machine }'),
@@ -224,6 +230,85 @@ mustContain(
   "if (cjkOnly) return values.join('')",
   'frontend thinking arrays should not insert artificial spaces between CJK fragments'
 );
+const normalizeThinkingMessage = sliceBetween(
+  'function normalizeThinkingMessage(',
+  'function subagentActivityItem',
+  'normalizeThinkingMessage'
+);
+assert(
+  normalizeThinkingMessage.indexOf('entry.data?.text')
+    < normalizeThinkingMessage.indexOf('entry.message'),
+  'Thinking should prefer complete structured Commentary text over its diagnostic preview'
+);
+const thinkingTextExpansion = sliceBetween(
+  'function bindThinkingTextExpansion(',
+  'function appendThinkingOperationField',
+  'bindThinkingTextExpansion'
+);
+mustContain(
+  thinkingTextExpansion,
+  'content.classList.toggle(\'is-expanded\', expanded)',
+  'long Thinking fields should expand without replacing their retained text'
+);
+mustContain(
+  thinkingTextExpansion,
+  'state.thinkingDisclosures.set(storageKey, expanded)',
+  'Thinking field expansion should survive live keyed patches'
+);
+mustContain(
+  thinkingTextExpansion,
+  'captureTranscriptScrollSnapshot()',
+  'expanding Thinking content should preserve the outer transcript viewport'
+);
+mustContain(
+  thinkingTextExpansion,
+  'captureViewportElementOffset(button)',
+  'expanding Thinking content should keep the clicked control visually anchored'
+);
+mustContain(
+  thinkingTextExpansion,
+  'captureViewportElementOffset(button, thinkingScroller)',
+  'expanding a field should preserve its position inside the nested Thinking scroller'
+);
+mustContain(
+  thinkingTextExpansion,
+  'restoreViewportElementOffset(thinkingViewportSnapshot)',
+  'nested Thinking scroll restoration should run after a field changes height'
+);
+const fileChangeRendering = sliceBetween(
+  'function renderFileChangeDetails(',
+  'function isThinkingContentPinnedToBottom',
+  'renderFileChangeDetails'
+);
+mustContain(
+  fileChangeRendering,
+  "lines.slice(0, 240)",
+  'large diffs should keep a bounded initial preview'
+);
+mustContain(
+  fileChangeRendering,
+  "expandedDiff.textContent = diffText",
+  'expanded diffs should render as one inert text node instead of thousands of per-line elements'
+);
+assert(
+  fileChangeRendering.indexOf("if (expanded) {")
+    < fileChangeRendering.indexOf('for (const line of visibleLines)'),
+  'the full-diff path should return before the line-by-line preview renderer'
+);
+mustContain(
+  fileChangeRendering,
+  'thinking-diff-expand-toggle',
+  'large diff previews should expose an explicit expand control'
+);
+assert(
+  !fileChangeRendering.includes('diff truncated in mobile view'),
+  'the UI should not present an expandable diff preview as permanently truncated'
+);
+mustContain(
+  fileChangeRendering,
+  'captureViewportElementOffset(expandButton, thinkingScroller)',
+  'large diff expansion should preserve the nested Thinking viewport'
+);
 const extractStructuredText = sliceBetweenSource(
   discovery,
   'function extractStructuredText(',
@@ -290,6 +375,144 @@ mustContain(
   app,
   'function restoreTranscriptScrollSnapshot(',
   'thinking patches should restore transcript scroll after DOM updates'
+);
+const restoreTranscriptRawSnapshot = sliceBetween(
+  'function restoreTranscriptRawSnapshot(',
+  'function restoreTranscriptScrollSnapshot(',
+  'restoreTranscriptRawSnapshot'
+);
+mustContain(
+  restoreTranscriptRawSnapshot,
+  'if (item.machine && item.machineSnapshot) {',
+  'machine-backed snapshots should own restoration decisions'
+);
+assert(
+  !restoreTranscriptRawSnapshot.includes('item.machine.restore(item.machineSnapshot)) {'),
+  'a rejected stale machine snapshot must veto raw fallback scrolling'
+);
+const staleRestoreHarness = {
+  noteMessageReadProgrammaticScroll: () => {},
+  getScrollableDistance: () => 1000,
+  scrollOwnerTo: () => { staleRestoreHarness.rawFallbackWrites += 1; },
+  restoreViewportAnchor: () => { staleRestoreHarness.rawFallbackWrites += 1; },
+  rawFallbackWrites: 0,
+};
+vm.createContext(staleRestoreHarness);
+vm.runInContext(restoreTranscriptRawSnapshot, staleRestoreHarness);
+staleRestoreHarness.restoreTranscriptRawSnapshot({
+  node: { scrollTop: 300 },
+  machine: { restore: () => false },
+  machineSnapshot: { userRevision: 1 },
+  scrollTop: 100,
+});
+assert.strictEqual(
+  staleRestoreHarness.rawFallbackWrites,
+  0,
+  'a newer user scroll must not be overwritten after machine restoration rejects a stale snapshot'
+);
+
+const viewportElementHelpers = `${sliceBetween(
+  'function captureViewportElementOffset(',
+  'function restoreViewportElementOffset(',
+  'captureViewportElementOffset'
+)}\n${sliceBetween(
+  'function restoreViewportElementOffset(',
+  'function transcriptScrollTargetPinned(',
+  'restoreViewportElementOffset'
+)}`;
+let elementTop = 300;
+const viewportNode = { scrollTop: 200 };
+const viewportElement = {
+  isConnected: true,
+  getBoundingClientRect: () => ({ top: elementTop, bottom: elementTop + 200 }),
+};
+const transcriptMachineNodes = [];
+const viewportHarness = {
+  getTranscriptScrollOwner: () => viewportNode,
+  getScrollOwnerViewportRect: () => ({ top: 100, bottom: 700 }),
+  getTranscriptScrollMachine: (node) => {
+    transcriptMachineNodes.push(node);
+    return { withProgrammaticScroll: (callback) => callback() };
+  },
+  getScrollableDistance: () => 1000,
+  scrollOwnerTo: (node, top) => { node.scrollTop = top; },
+};
+vm.createContext(viewportHarness);
+vm.runInContext(viewportElementHelpers, viewportHarness);
+const viewportSnapshot = viewportHarness.captureViewportElementOffset(viewportElement, viewportNode);
+elementTop = 350;
+viewportHarness.restoreViewportElementOffset(viewportSnapshot);
+assert.strictEqual(
+  viewportNode.scrollTop,
+  250,
+  'Thinking summary height changes should be offset so the internal reader stays at the same screen position'
+);
+assert.deepStrictEqual(
+  transcriptMachineNodes,
+  [viewportNode],
+  'the transcript owner should keep using its programmatic scroll machine'
+);
+const nestedThinkingNode = { scrollTop: 400 };
+elementTop = 300;
+const nestedViewportSnapshot = viewportHarness.captureViewportElementOffset(
+  viewportElement,
+  nestedThinkingNode
+);
+elementTop = 360;
+viewportHarness.restoreViewportElementOffset(nestedViewportSnapshot);
+assert.strictEqual(
+  nestedThinkingNode.scrollTop,
+  460,
+  'field expansion should restore the clicked control inside the nested Thinking scroller'
+);
+assert.deepStrictEqual(
+  transcriptMachineNodes,
+  [viewportNode],
+  'nested Thinking scrollers must not be registered as transcript scroll machines'
+);
+
+const fullRerenderViewportHelpers = `${sliceBetween(
+  'function captureDetachedThinkingViewportOffsets(',
+  'function restoreDetachedThinkingViewportOffsets(',
+  'captureDetachedThinkingViewportOffsets'
+)}\n${sliceBetween(
+  'function restoreDetachedThinkingViewportOffsets(',
+  'function preserveThinkingViewportForPatch(',
+  'restoreDetachedThinkingViewportOffsets'
+)}`;
+const oldThinkingScroller = { dataset: { thinkingStateKey: 'session::thinking' } };
+const newThinkingScroller = { dataset: { thinkingStateKey: 'session::thinking' } };
+const fullRerenderHarness = {
+  getThinkingScrollMachine: () => ({ state: () => ({ mode: 'detached' }) }),
+  captureViewportElementOffset: () => ({ node: viewportNode, offset: 200 }),
+  restoreThinkingScrollState: (stateKey, scroller) => {
+    fullRerenderHarness.restoredStateKey = stateKey;
+    fullRerenderHarness.restoredScroller = scroller;
+  },
+  restoreViewportElementOffset: (snapshot, scroller) => {
+    fullRerenderHarness.restoredViewport = snapshot;
+    fullRerenderHarness.restoredViewportScroller = scroller;
+  },
+  cssEscape: (value) => value,
+  restoredStateKey: '',
+  restoredScroller: null,
+  restoredViewport: null,
+  restoredViewportScroller: null,
+};
+vm.createContext(fullRerenderHarness);
+vm.runInContext(fullRerenderViewportHelpers, fullRerenderHarness);
+const fullRerenderSnapshots = fullRerenderHarness.captureDetachedThinkingViewportOffsets({
+  querySelectorAll: () => [oldThinkingScroller],
+});
+fullRerenderHarness.restoreDetachedThinkingViewportOffsets({
+  querySelector: () => newThinkingScroller,
+}, fullRerenderSnapshots);
+assert.strictEqual(fullRerenderHarness.restoredStateKey, 'session::thinking');
+assert.strictEqual(fullRerenderHarness.restoredScroller, newThinkingScroller);
+assert.strictEqual(
+  fullRerenderHarness.restoredViewportScroller,
+  newThinkingScroller,
+  'full transcript rerenders should apply the old screen offset to the replacement Thinking scroller'
 );
 mustContain(
   app,
@@ -402,9 +625,39 @@ mustContain(
   'mobile Bottom should finish at the real document maximum instead of trusting one guessed owner'
 );
 mustContain(
+  scrollTranscriptToSource,
+  'machine?.beginTrustedInteraction()',
+  'trusted transcript Top/Bottom actions must invalidate stale async restores'
+);
+mustContain(
   app,
   "window.addEventListener('scroll', handleTranscriptScrollDetach",
   'mobile page scrolling should update transcript detach state'
+);
+const transcriptTrustedInteraction = sliceBetween(
+  'function recordTranscriptTrustedInteraction(',
+  'function getTranscriptJumpTargets',
+  'recordTranscriptTrustedInteraction'
+);
+mustContain(
+  transcriptTrustedInteraction,
+  'machine.beginTrustedInteraction()',
+  'outer transcript user intent must detach synchronously before new messages render'
+);
+mustContain(
+  transcriptTrustedInteraction,
+  'machine.settleTrustedInteraction()',
+  'outer transcript follow mode should settle only after the user scroll is applied'
+);
+assert(
+  transcriptTrustedInteraction.indexOf('machine.beginTrustedInteraction()')
+    < transcriptTrustedInteraction.indexOf('window.requestAnimationFrame'),
+  'outer transcript must enter reader mode before the next animation frame'
+);
+mustContain(
+  app,
+  "for (const eventName of ['touchstart', 'pointerdown'])",
+  'touch and scrollbar gestures should lock the viewport at gesture start'
 );
 mustContain(
   app,
@@ -420,6 +673,11 @@ const restoreThinkingScrollState = sliceBetween(
   'function restoreThinkingScrollState(',
   'function captureThinkingScrollStates',
   'restoreThinkingScrollState'
+);
+mustContain(
+  restoreThinkingScrollState,
+  'const existingMachine = scroller.isConnected\n    ? getThinkingScrollMachine(stateKey, scroller)',
+  'detached Thinking DOM must defer machine creation until layout exists'
 );
 mustContain(
   restoreThinkingScrollState,
@@ -450,6 +708,26 @@ mustContain(
   restoreThinkingScrollState,
   'machine.restore(saved.machineSnapshot)',
   'thinking scroll restoration should use the independent state machine snapshot'
+);
+const thinkingTrustedInteraction = sliceBetween(
+  'function recordThinkingTrustedInteraction(',
+  'function captureThinkingScrollStates',
+  'recordThinkingTrustedInteraction'
+);
+mustContain(
+  thinkingTrustedInteraction,
+  'machine.beginTrustedInteraction()',
+  'Thinking user intent must detach synchronously before a live patch can arrive'
+);
+mustContain(
+  thinkingTrustedInteraction,
+  'machine.settleTrustedInteraction()',
+  'Thinking follow mode should be reconsidered after the browser applies the user scroll'
+);
+assert(
+  thinkingTrustedInteraction.indexOf('machine.beginTrustedInteraction()')
+    < thinkingTrustedInteraction.indexOf('window.requestAnimationFrame'),
+  'Thinking must enter reader mode before the next animation frame'
 );
 mustContain(
   app,
@@ -484,6 +762,16 @@ mustContain(
   thinkingMessagePatch,
   'captureThinkingDisclosureStates(existingMessage, existingStateKey)',
   'tool disclosure state should be captured before live row updates'
+);
+mustContain(
+  thinkingMessagePatch,
+  'captureViewportElementOffset(existingScroller)',
+  'a detached Thinking reader should capture the internal viewport screen position'
+);
+mustContain(
+  thinkingMessagePatch,
+  'restoreViewportElementOffset(thinkingViewportSnapshot)',
+  'summary height changes must not move the Thinking content being read'
 );
 mustContain(
   app,
@@ -531,6 +819,11 @@ mustContain(
   thinkingScrollActions,
   'Math.max(0, scroller.scrollHeight - scroller.clientHeight)',
   'thinking Bottom should target the real maximum internal scroll position'
+);
+mustContain(
+  thinkingScrollActions,
+  'machine?.beginTrustedInteraction()',
+  'trusted Thinking Top/Bottom actions must invalidate stale async restores'
 );
 mustContain(
   styles,
@@ -595,6 +888,21 @@ assert(
 assert(
   thinkingContentOpenBlocks.some((block) => /\bpadding-right\s*:\s*52px\b/.test(block)),
   'narrow mobile Thinking cards should reserve one compact control rail instead of 86px'
+);
+mustContain(
+  styles,
+  '.thinking-expandable-content:not(.is-expanded)',
+  'long Thinking content should be visually collapsed without slicing its DOM text'
+);
+mustContain(
+  styles,
+  '.thinking-operation-code.thinking-expandable-content.is-expanded',
+  'expanded tool input/output should remove the field-level height cap'
+);
+mustContain(
+  styles,
+  '.thinking-source-truncation-note',
+  'upstream retention limits should be disclosed next to affected Thinking content'
 );
 const thinkingRailBlocks = cssBlocksFor('.thinking-scroll-actions.rail');
 assert(
@@ -683,8 +991,18 @@ mustContain(
 );
 mustContain(
   renderTranscript,
+  'const thinkingViewportSnapshots = captureDetachedThinkingViewportOffsets(log)',
+  'full transcript rerenders should capture visible detached Thinking readers'
+);
+mustContain(
+  renderTranscript,
   'restoreTranscriptScrollSnapshot(scrollSnapshot)',
   'transcript rerenders should restore non-bottom readers across desktop and mobile containers'
+);
+mustContain(
+  renderTranscript,
+  'restoreDetachedThinkingViewportOffsets(log, thinkingViewportSnapshots)',
+  'full transcript rerenders should restore the screen position of detached Thinking readers'
 );
 mustContain(
   renderTranscript,

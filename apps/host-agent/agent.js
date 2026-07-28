@@ -28,13 +28,21 @@ const {
   buildManagedSessionStartedEvent,
   createManagedSessionStartGate,
   createManagedSessionShutdown,
+  createRetryableTerminalReceiptExecutor,
   findRunnerForCommand,
   retainRunnerForStartRetry,
   replayManagedSessionStart,
   shouldPublishMissingRunnerStop,
   stopRunnerOnce,
 } = require('./managed-session-lifecycle');
-const { cleanupStaleApiProfileCodexHomes } = require('./codex-app-server-runner');
+const {
+  cleanupStaleApiProfileCodexHomes,
+  resolveDefaultCodexBin,
+} = require('./codex-app-server-runner');
+const {
+  probeCodexInstallation,
+  updateCodexInstallation,
+} = require('../../shared/codex-installation');
 const { normalizeApiConfig } = require('./runtime-utils');
 const {
   attestHostEnvironmentBinding,
@@ -117,11 +125,34 @@ const AGENT_INSTANCE_ID = RELAY_MANAGED_AGENT_INSTANCE_ID || makeId();
 const RELAY_MANAGED_AGENT_TOKEN = String(process.env.RELAY_MANAGED_AGENT_TOKEN || '').trim();
 const RELAY_MANAGED_MARKER_PATH = String(process.env.RELAY_MANAGED_MARKER_PATH || '').trim();
 const RELAY_MANAGED_OWNER_PID = Math.trunc(Number(process.env.RELAY_MANAGED_OWNER_PID || 0));
+const RELAY_MANAGED_OWNER_INSTANCE_ID = String(
+  process.env.RELAY_MANAGED_OWNER_INSTANCE_ID || ''
+).trim();
 const CLEAN_LEGACY_MANAGED_OVERLAYS = String(
   process.env.AGENT_CLEAN_LEGACY_MANAGED_OVERLAYS || ''
 ).trim().toLowerCase() === 'true';
+const CODEX_BIN = resolveDefaultCodexBin(CODEX_HOME);
+const CODEX_RUNTIME_CACHE_MS = Math.max(
+  30_000,
+  Number(process.env.AGENT_CODEX_RUNTIME_CACHE_MS || 5 * 60 * 1000) || 5 * 60 * 1000
+);
+const CODEX_UPDATE_JOURNAL_ROOT = path.join(REMOTE_CODEX_STATE_ROOT, 'codex-updates');
+const ACTIVE_CODEX_MAINTENANCE_STATUSES = new Set(['checking', 'installing', 'verifying', 'updating']);
+const TERMINAL_CODEX_MAINTENANCE_STATUSES = new Set(['updated', 'update_failed']);
+const CODEX_UPDATE_RECOVERY_TIMEOUT_MS = Math.max(
+  60_000,
+  Number(process.env.AGENT_CODEX_UPDATE_RECOVERY_TIMEOUT_MS || 11 * 60 * 1000) || 11 * 60 * 1000
+);
+const CODEX_UPDATE_START_DRAIN_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.AGENT_CODEX_UPDATE_START_DRAIN_TIMEOUT_MS || 60_000) || 60_000
+);
 
 const liveSessions = new Map();
+const activeSessionInputTasks = new Set();
+const sessionInputReceiptExecutor = createRetryableTerminalReceiptExecutor();
+const sessionInputReceiptKeysByCommandId = new Map();
+const runnerCommandEffectTails = new WeakMap();
 const managedSessionStartGate = createManagedSessionStartGate();
 const activeFileUploads = new Map();
 const watchedHistorySessions = new Map();
@@ -145,9 +176,287 @@ const codexTailer = CODEX_TAIL_ENABLED
   })
   : null;
 let lastCommandId = 0;
+let lastFetchedCommandId = 0;
+const deliveredCommandStates = new Map();
+const deferredCommandRetryIds = new Set();
 let relayInstanceId = null;
 let agentLeaseId = null;
 let agentRegistrationPromise = null;
+let codexRuntimeCache = null;
+let codexRuntimeCachedAt = 0;
+const codexUpdateResults = new Map();
+let codexUpdateInFlight = null;
+let codexUpdateState = null;
+let recoveredCodexUpdateNeedsReport = false;
+let recoveredCodexUpdateReportPromise = null;
+
+function codexUpdateJournalPath(operationId) {
+  const safeId = String(operationId || '').trim().replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 180);
+  return safeId ? path.join(CODEX_UPDATE_JOURNAL_ROOT, `${safeId}.jsonl`) : null;
+}
+
+function appendCodexUpdateJournal(stateValue) {
+  const journalPath = codexUpdateJournalPath(stateValue?.operationId);
+  if (!journalPath) return false;
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+  fs.appendFileSync(journalPath, `${JSON.stringify(stateValue)}\n`, { encoding: 'utf8', mode: 0o600 });
+  return true;
+}
+
+function setCodexUpdateState(patch = {}) {
+  const operationId = String(patch.operationId || codexUpdateState?.operationId || '').trim();
+  if (!operationId) return null;
+  codexUpdateState = {
+    ...(codexUpdateState?.operationId === operationId ? codexUpdateState : {}),
+    ...patch,
+    operationId,
+    updatedAt: nowIso(),
+  };
+  appendCodexUpdateJournal(codexUpdateState);
+  return codexUpdateState;
+}
+
+function publicCodexMaintenanceState() {
+  if (!codexUpdateState) return null;
+  return {
+    operationId: codexUpdateState.operationId,
+    status: codexUpdateState.status || null,
+    message: codexUpdateState.message || null,
+    previousVersion: codexUpdateState.previousVersion || null,
+    version: codexUpdateState.version || null,
+    updaterPid: ACTIVE_CODEX_MAINTENANCE_STATUSES.has(codexUpdateState.status)
+      ? Number(codexUpdateState.updaterPid || 0) || null
+      : null,
+    startedAt: codexUpdateState.startedAt || null,
+    updatedAt: codexUpdateState.updatedAt || null,
+  };
+}
+
+function processIdIsAlive(pidValue) {
+  const pid = Math.trunc(Number(pidValue || 0));
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function waitForActiveSessionStartsForUpdate() {
+  let timer = null;
+  try {
+    await Promise.race([
+      managedSessionStartGate.waitForActiveStarts(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('Timed out waiting for active Session starts to finish before Codex update.');
+          error.code = 'codex_update_start_drain_timeout';
+          reject(error);
+        }, CODEX_UPDATE_START_DRAIN_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function recoveredUpdaterDeadline(stateValue) {
+  const explicit = Date.parse(String(stateValue?.deadlineAt || ''));
+  if (Number.isFinite(explicit)) return explicit;
+  const started = Date.parse(String(stateValue?.startedAt || stateValue?.updatedAt || ''));
+  return (Number.isFinite(started) ? started : Date.now()) + CODEX_UPDATE_RECOVERY_TIMEOUT_MS;
+}
+
+function loadLatestCodexUpdateState() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(CODEX_UPDATE_JOURNAL_ROOT, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
+      .map((entry) => {
+        const filePath = path.join(CODEX_UPDATE_JOURNAL_ROOT, entry.name);
+        return { filePath, modifiedAt: fs.statSync(filePath).mtimeMs };
+      })
+      .sort((left, right) => right.modifiedAt - left.modifiedAt);
+  } catch (_) {
+    return null;
+  }
+  for (const entry of entries) {
+    try {
+      const records = fs.readFileSync(entry.filePath, 'utf8')
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch (_) {
+            return null;
+          }
+        })
+        .filter(Boolean);
+      if (records.length) return records[records.length - 1];
+    } catch (_) {
+      // Try an older operation journal.
+    }
+  }
+  return null;
+}
+
+function getCodexRuntime(options = {}) {
+  const force = options.force === true;
+  if (!force && codexRuntimeCache && Date.now() - codexRuntimeCachedAt < CODEX_RUNTIME_CACHE_MS) {
+    return codexRuntimeCache;
+  }
+  codexRuntimeCache = probeCodexInstallation({
+    codexBin: CODEX_BIN,
+    explicit: Boolean(process.env.CODEX_BIN),
+    env: process.env,
+  });
+  codexRuntimeCachedAt = Date.now();
+  return codexRuntimeCache;
+}
+
+function rememberCodexUpdateResult(operationId, result) {
+  codexUpdateResults.set(operationId, result);
+  while (codexUpdateResults.size > 20) {
+    codexUpdateResults.delete(codexUpdateResults.keys().next().value);
+  }
+  return result;
+}
+
+function codexUpdateResultFromState(stateValue, installation) {
+  const previousVersion = String(stateValue?.previousVersion || '').trim() || null;
+  const version = String(installation?.version || '').trim() || null;
+  const changed = Boolean(previousVersion && version && previousVersion !== version);
+  const ok = stateValue?.status === 'updated' && Boolean(version);
+  return {
+    ok,
+    previousVersion,
+    version,
+    changed,
+    ...(ok ? {} : {
+      code: 'codex_update_interrupted',
+      error: stateValue?.status === 'update_failed'
+        ? (stateValue.message || 'Codex update failed.')
+        : 'The previous Agent exited before it recorded a verified Codex update result.',
+    }),
+    codexRuntime: installation,
+  };
+}
+
+function initializeRecoveredCodexUpdate() {
+  const recovered = loadLatestCodexUpdateState();
+  if (!recovered?.operationId) return false;
+  if (
+    !ACTIVE_CODEX_MAINTENANCE_STATUSES.has(recovered.status)
+    && !TERMINAL_CODEX_MAINTENANCE_STATUSES.has(recovered.status)
+  ) {
+    return false;
+  }
+  codexUpdateState = recovered;
+  if (TERMINAL_CODEX_MAINTENANCE_STATUSES.has(recovered.status)) {
+    const result = codexUpdateResultFromState(recovered, getCodexRuntime({ force: true }));
+    rememberCodexUpdateResult(recovered.operationId, result);
+    recoveredCodexUpdateNeedsReport = recovered.reported !== true;
+    return true;
+  }
+  managedSessionStartGate.beginMaintenance(recovered.operationId);
+  codexUpdateInFlight = recovered.operationId;
+  if (processIdIsAlive(recovered.updaterPid)) {
+    recoveredCodexUpdateNeedsReport = true;
+    return true;
+  }
+  const installation = getCodexRuntime({ force: true });
+  const result = codexUpdateResultFromState(recovered, installation);
+  rememberCodexUpdateResult(recovered.operationId, result);
+  setCodexUpdateState({
+    ...recovered,
+    status: result.ok ? 'updated' : 'update_failed',
+    message: result.ok ? `Recovered verified Codex ${result.version}.` : result.error,
+    version: result.version,
+    updaterPid: null,
+  });
+  recoveredCodexUpdateNeedsReport = true;
+  return true;
+}
+
+async function reportRecoveredCodexUpdate() {
+  if (!recoveredCodexUpdateNeedsReport || !codexUpdateState?.operationId) return;
+  const operationId = codexUpdateState.operationId;
+  if (ACTIVE_CODEX_MAINTENANCE_STATUSES.has(codexUpdateState.status)) {
+    while (processIdIsAlive(codexUpdateState.updaterPid)) {
+      if (Date.now() >= recoveredUpdaterDeadline(codexUpdateState)) {
+        const message = 'Recovered Codex updater exceeded its deadline. Its process identity cannot be verified safely, so maintenance remains active.';
+        if (codexUpdateState.message !== message) {
+          setCodexUpdateState({ message, recoveryBlockedAt: nowIso() });
+        }
+        return;
+      }
+      await sleep(1000);
+    }
+    const installation = getCodexRuntime({ force: true });
+    const result = codexUpdateResultFromState(codexUpdateState, installation);
+    rememberCodexUpdateResult(operationId, result);
+    setCodexUpdateState({
+      status: result.ok ? 'updated' : 'update_failed',
+      message: result.ok ? `Recovered verified Codex ${result.version}.` : result.error,
+      version: result.version,
+      updaterPid: null,
+    });
+  }
+  const result = codexUpdateResults.get(operationId) || {
+    ok: codexUpdateState.status === 'updated',
+    previousVersion: codexUpdateState.previousVersion || null,
+    version: codexUpdateState.version || null,
+    changed: Boolean(
+      codexUpdateState.previousVersion
+      && codexUpdateState.version
+      && codexUpdateState.previousVersion !== codexUpdateState.version
+    ),
+    ...(codexUpdateState.status === 'updated' ? {} : {
+      code: 'codex_update_interrupted',
+      error: codexUpdateState.message || 'Codex update was interrupted.',
+    }),
+    codexRuntime: getCodexRuntime(),
+  };
+  try {
+    await postEvent({
+      type: 'host.codex_updated',
+      hostId: HOST_ID,
+      requestId: operationId,
+      operationId,
+      ...result,
+      timestamp: nowIso(),
+    }, { retryOnTransient: true });
+    finalizeRecoveredCodexMaintenance(operationId);
+  } catch (error) {
+    logAgentTransient('[agent] recovered Codex update delivery failed:', error);
+  }
+}
+
+function finalizeRecoveredCodexMaintenance(operationId) {
+  if (codexUpdateState?.operationId !== operationId) return false;
+  try {
+    setCodexUpdateState({ reported: true });
+  } finally {
+    recoveredCodexUpdateNeedsReport = false;
+    if (codexUpdateInFlight === operationId) codexUpdateInFlight = null;
+    managedSessionStartGate.endMaintenance(operationId);
+  }
+  return true;
+}
+
+function scheduleRecoveredCodexUpdateReport() {
+  if (!recoveredCodexUpdateNeedsReport || recoveredCodexUpdateReportPromise) return;
+  recoveredCodexUpdateReportPromise = reportRecoveredCodexUpdate()
+    .catch((error) => {
+      logAgentTransient('[agent] recovered Codex update reconciliation failed:', error);
+    })
+    .finally(() => {
+      recoveredCodexUpdateReportPromise = null;
+    });
+}
 
 function observeRelayInstance(body) {
   const nextRelayInstanceId = String(body?.relayInstanceId || '').trim();
@@ -155,6 +464,9 @@ function observeRelayInstance(body) {
   const changed = Boolean(relayInstanceId && relayInstanceId !== nextRelayInstanceId);
   if (changed) {
     lastCommandId = 0;
+    lastFetchedCommandId = 0;
+    deliveredCommandStates.clear();
+    deferredCommandRetryIds.clear();
   }
   relayInstanceId = nextRelayInstanceId;
   return changed;
@@ -211,8 +523,11 @@ function managedAgentOwnershipMarker() {
     instanceId: metadata.instanceId,
     ownershipToken: metadata.ownershipToken,
     ownerRelayPid: RELAY_MANAGED_OWNER_PID > 0 ? RELAY_MANAGED_OWNER_PID : process.ppid,
+    ownerRelayInstanceId: RELAY_MANAGED_OWNER_INSTANCE_ID || null,
     relayUrl: RELAY_URL,
     startedAt: AGENT_PROCESS_STARTED_AT,
+    processStartedAt: AGENT_PROCESS_STARTED_AT,
+    agentEntrypoint: path.resolve(__filename),
   };
 }
 
@@ -230,12 +545,19 @@ function ensureManagedAgentOwnershipMarker() {
     const tempPath = `${RELAY_MANAGED_MARKER_PATH}.${process.pid}.${makeId()}.tmp`;
     fs.writeFileSync(tempPath, `${JSON.stringify(marker, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     try {
-      fs.renameSync(tempPath, RELAY_MANAGED_MARKER_PATH);
+      fs.linkSync(tempPath, RELAY_MANAGED_MARKER_PATH);
+      fs.rmSync(tempPath, { force: true });
     } catch (error) {
       try {
         fs.rmSync(tempPath, { force: true });
       } catch (_) {
         // Best effort cleanup of an incomplete marker write.
+      }
+      if (error?.code === 'EEXIST') {
+        const existing = JSON.parse(fs.readFileSync(RELAY_MANAGED_MARKER_PATH, 'utf8'));
+        return String(existing?.instanceId || '') === marker.instanceId
+          && String(existing?.ownershipToken || '') === marker.ownershipToken
+          && Number(existing?.pid || 0) === marker.pid;
       }
       throw error;
     }
@@ -258,8 +580,26 @@ function removeManagedAgentOwnershipMarker() {
     ) {
       return false;
     }
-    fs.rmSync(RELAY_MANAGED_MARKER_PATH, { force: true });
-    return true;
+    const claimedPath = `${RELAY_MANAGED_MARKER_PATH}.${process.pid}.${makeId()}.stale-claim`;
+    fs.renameSync(RELAY_MANAGED_MARKER_PATH, claimedPath);
+    const claimed = JSON.parse(fs.readFileSync(claimedPath, 'utf8'));
+    if (
+      String(claimed?.instanceId || '') === marker.instanceId
+      && String(claimed?.ownershipToken || '') === marker.ownershipToken
+      && Number(claimed?.pid || 0) === marker.pid
+    ) {
+      fs.rmSync(claimedPath, { force: true });
+      return true;
+    }
+    try {
+      fs.linkSync(claimedPath, RELAY_MANAGED_MARKER_PATH);
+      fs.rmSync(claimedPath, { force: true });
+    } catch (error) {
+      if (error?.code === 'EEXIST') {
+        fs.rmSync(claimedPath, { force: true });
+      }
+    }
+    return false;
   } catch (_) {
     return false;
   }
@@ -278,6 +618,13 @@ function loadRelayAuthToken() {
 }
 
 function getCapabilities() {
+  const defaultRuntime = resolveManagedRuntime({}, {
+    defaultRuntime: MANAGED_RUNTIME,
+    defaultCommand: MANAGED_COMMAND,
+    defaultArgs: MANAGED_ARGS,
+  });
+  const supportsManagedRuntimeBinding = defaultRuntime.kind !== 'demo';
+  const sessionApiRebindV1 = defaultRuntime.kind === 'codex-app-server';
   return {
     discovery: true,
     hostAgentLeaseV1: true,
@@ -291,6 +638,8 @@ function getCapabilities() {
     requestResponses: true,
     interrupt: true,
     hostProbe: true,
+    codexRuntimeV1: true,
+    codexUpdateV1: true,
     turnControls: true,
     nativePlan: true,
     goalControls: true,
@@ -301,8 +650,9 @@ function getCapabilities() {
     apiTest: true,
     apiCatalog: true,
     bindingPreflight: true,
-    runApiBinding: MANAGED_RUNTIME !== 'demo' && MANAGED_COMMAND !== 'demo',
-    nativeResumeReadiness: MANAGED_RUNTIME !== 'demo' && MANAGED_COMMAND !== 'demo',
+    runApiBinding: supportsManagedRuntimeBinding,
+    nativeResumeReadiness: supportsManagedRuntimeBinding,
+    sessionApiRebindV1,
     review: true,
     imageInput: true,
     fileTransfer: true,
@@ -311,7 +661,7 @@ function getCapabilities() {
     realtimeSessionSync: CODEX_TAIL_ENABLED,
     codexJsonlTail: CODEX_TAIL_ENABLED,
     sessionWatchV2: true,
-    demoMode: MANAGED_RUNTIME === 'demo' || MANAGED_COMMAND === 'demo',
+    demoMode: defaultRuntime.kind === 'demo',
   };
 }
 
@@ -821,6 +1171,8 @@ async function registerHost() {
       label: HOST_LABEL,
       platform: process.platform,
       codexHome: CODEX_HOME,
+      codexRuntime: getCodexRuntime(),
+      codexMaintenance: publicCodexMaintenanceState(),
       skillsRevision: hostSkillInventory.snapshot()?.revision || null,
       capabilities: getCapabilities(),
       agentProcess: managedAgentProcessMetadata(),
@@ -874,6 +1226,8 @@ async function heartbeat() {
       label: HOST_LABEL,
       platform: process.platform,
       codexHome: CODEX_HOME,
+      codexRuntime: getCodexRuntime(),
+      codexMaintenance: publicCodexMaintenanceState(),
       skillsRevision: hostSkillInventory.snapshot()?.revision || null,
       capabilities: getCapabilities(),
       agentProcess: managedAgentProcessMetadata(),
@@ -932,6 +1286,16 @@ async function performDiscovery() {
       title: session.title,
       cwd: session.cwd,
       source: session.source || 'imported',
+      subagent: session.subagent === true,
+      readOnly: session.readOnly === true,
+      threadSource: session.threadSource || null,
+      parentThreadId: session.parentThreadId || null,
+      forkedFromId: session.forkedFromId || null,
+      agentPath: session.agentPath || null,
+      agentNickname: session.agentNickname || null,
+      agentRole: session.agentRole || null,
+      multiAgentVersion: session.multiAgentVersion || null,
+      subagentSource: session.subagentSource || null,
       live: false,
       createdAt: session.createdAt || null,
       updatedAt: session.updatedAt,
@@ -2232,18 +2596,261 @@ async function failManagedSession(sessionId, cwd, message, state = 'failed', run
   }
 }
 
-async function postSessionCommandFailure(command, error, operation, runner = null) {
-  await postEvent({
+function buildSessionCommandFailureEvent(command, error, operation, runner = null, timestamp = nowIso()) {
+  return {
     type: 'session.command_failed',
     hostId: HOST_ID,
     sessionId: command.requestedSessionId || command.sessionId || runner?.sessionId || null,
     runId: runner?.runId || command.runId || null,
+    turnId: runner?.activeTurnId || runner?.runtime?.activeTurnId || null,
+    commandId: command.id || null,
+    clientRequestId: command.clientRequestId || null,
+    stopRequestId: command.stopRequestId || null,
     operation,
     code: error?.code || 'session_command_failed',
     error: error?.message || String(error || 'Session command failed.'),
     canRebind: Boolean(error?.canRebind),
+    timestamp,
+  };
+}
+
+async function postSessionCommandFailure(command, error, operation, runner = null) {
+  await postEvent(
+    buildSessionCommandFailureEvent(command, error, operation, runner),
+    { bestEffort: true }
+  );
+}
+
+function sessionInputReceiptKey(command = {}) {
+  return JSON.stringify([
+    Number(command.id || 0) || null,
+    String(command.clientRequestId || '').trim() || null,
+    String(command.requestedSessionId || command.sessionId || '').trim() || null,
+    String(command.runId || '').trim() || null,
+  ]);
+}
+
+function sessionInputReceiptBatchId(command = {}) {
+  const identity = [
+    command.id || 'no-command-id',
+    command.clientRequestId || 'no-client-request-id',
+    command.runId || 'no-run-id',
+  ].map((value) => encodeURIComponent(String(value)).slice(0, 160));
+  return `session-input-terminal:${HOST_ID}:${identity.join(':')}`.slice(0, 500);
+}
+
+function rememberSessionInputReceiptKey(command, key) {
+  const commandId = Number(command?.id || 0);
+  if (commandId > 0) sessionInputReceiptKeysByCommandId.set(commandId, key);
+}
+
+function forgetAcknowledgedSessionInputReceipts(throughId) {
+  const acknowledgedThroughId = Number(throughId || 0);
+  if (acknowledgedThroughId <= 0) return;
+  for (const [commandId, key] of sessionInputReceiptKeysByCommandId.entries()) {
+    if (commandId > acknowledgedThroughId) continue;
+    sessionInputReceiptKeysByCommandId.delete(commandId);
+    sessionInputReceiptExecutor.forget(key);
+  }
+}
+
+function buildSessionInputRuntimeEvent(command, runner, patch, timestamp = nowIso(), options = {}) {
+  const runtimeClientRequestId = Object.prototype.hasOwnProperty.call(patch, 'clientRequestId')
+    ? patch.clientRequestId
+    : command.clientRequestId || null;
+  const runtimeRevision = typeof runner?.reserveRuntimeRevision === 'function'
+    ? runner.reserveRuntimeRevision()
+    : null;
+  return {
+    type: 'session.runtime_updated',
+    hostId: HOST_ID,
+    sessionId: command.requestedSessionId || command.sessionId,
+    runId: runner?.runId || command.runId || null,
+    commandId: command.id || null,
+    commandClientRequestId: command.clientRequestId || null,
+    inputOutcome: options.inputOutcome || null,
+    clientRequestId: runtimeClientRequestId,
+    ...(runtimeRevision ? { runtimeRevision } : {}),
+    patch: {
+      ...patch,
+      clientRequestId: runtimeClientRequestId,
+      runId: runner?.runId || command.runId || null,
+      ...(runtimeRevision ? { runtimeRevision } : {}),
+    },
+    timestamp,
+  };
+}
+
+function normalizeSessionInterruptResult(command, runner, result) {
+  const normalized = result && typeof result === 'object'
+    ? result
+    : { status: result === true ? 'accepted' : 'no_active' };
+  const status = ['accepted', 'pending', 'no_active', 'failed'].includes(normalized.status)
+    ? normalized.status
+    : 'failed';
+  return {
+    type: 'session.interrupt_result',
+    hostId: HOST_ID,
+    sessionId: command.requestedSessionId || command.sessionId || runner?.sessionId || null,
+    runId: runner?.runId || command.runId || null,
+    interruptRequestId: command.interruptRequestId || normalized.interruptRequestId || null,
+    status,
+    reason: normalized.reason || null,
+    error: normalized.error || null,
+    turnId: normalized.turnId || runner?.activeTurnId || null,
+    clientRequestId: normalized.clientRequestId || runner?.activeClientRequestId || null,
     timestamp: nowIso(),
-  }, { bestEffort: true });
+  };
+}
+
+async function deliverSessionInterruptResult(command, runner, result) {
+  await postEvent(normalizeSessionInterruptResult(command, runner, result), {
+    retryOnTransient: true,
+  });
+}
+
+function buildFailedSessionInputReceipt(command, runner, error) {
+  const timestamp = nowIso();
+  const activeTurnId = String(runner?.activeTurnId || runner?.runtime?.activeTurnId || '').trim() || null;
+  const activeClientRequestId = activeTurnId
+    ? runner?.clientRequestIdForTurn?.(activeTurnId) || runner?.activeClientRequestId || null
+    : null;
+  const activeRuntime = activeTurnId ? {
+    clientRequestId: activeClientRequestId,
+    activeTurnId,
+    busy: true,
+    phase: String(runner?.runtime?.phase || '').trim() || 'thinking',
+    currentTurnStatus: String(runner?.runtime?.currentTurnStatus || '').trim() || 'inProgress',
+    waitingOnApproval: runner?.runtime?.waitingOnApproval === true,
+    waitingOnUserInput: runner?.runtime?.waitingOnUserInput === true,
+    pendingInputSummary: runner?.runtime?.pendingInputSummary || null,
+    lastError: null,
+    lastCodexError: null,
+  } : {
+    activeTurnId: null,
+    busy: false,
+    phase: 'error',
+    currentTurnStatus: 'failed',
+    pendingInputSummary: null,
+    lastCodexError: error?.message || String(error),
+  };
+  return [
+    buildSessionCommandFailureEvent(command, error, 'input', runner, timestamp),
+    buildSessionInputRuntimeEvent(command, runner, {
+      ...activeRuntime,
+      queuedCommandId: null,
+      pendingClientRequestId: null,
+      queuedInputAt: null,
+    }, timestamp),
+  ];
+}
+
+function enqueueRunnerCommandEffect(runner, effect) {
+  if (!runner) return Promise.resolve().then(effect);
+  const previous = runnerCommandEffectTails.get(runner) || Promise.resolve();
+  const current = previous.catch(() => {}).then(effect);
+  const tail = current.catch(() => {});
+  runnerCommandEffectTails.set(runner, tail);
+  void tail.finally(() => {
+    if (runnerCommandEffectTails.get(runner) === tail) {
+      runnerCommandEffectTails.delete(runner);
+    }
+  });
+  return current;
+}
+
+async function executeSessionInputCommand(command, runner) {
+  if (!runner) {
+    const error = new Error(
+      'session is not live on this host-agent; wait for the session to finish starting, then resend'
+    );
+    error.code = 'session_input_runner_unavailable';
+    return buildFailedSessionInputReceipt(command, null, error);
+  }
+
+  try {
+    const turnId = await runner.sendInput(String(command.text || ''), {
+      clientRequestId: command.clientRequestId || null,
+      inputItems: Array.isArray(command.inputItems) ? command.inputItems : [],
+      attachments: Array.isArray(command.attachments) ? command.attachments : [],
+      mode: command.mode || null,
+      model: command.model || null,
+      effort: command.effort || null,
+      summary: command.summary || null,
+      approvalPolicy: command.approvalPolicy || null,
+      approvalsReviewer: command.approvalsReviewer || null,
+      sandboxMode: command.sandboxMode || null,
+      planFallback: command.planFallback || null,
+      serviceTier: command.serviceTier || null,
+      personality: command.personality || null,
+      apiConfig: normalizeApiConfig(command.apiConfig),
+      apiBinding: command.apiBinding || null,
+    });
+    return [buildSessionInputRuntimeEvent(command, runner, {
+      activeTurnId: turnId || runner.activeTurnId || null,
+      busy: Boolean(turnId || runner.activeTurnId),
+      phase: runner.runtime?.phase || (turnId ? 'thinking' : 'idle'),
+      currentTurnStatus: runner.runtime?.currentTurnStatus || (turnId ? 'inProgress' : 'completed'),
+      queuedCommandId: null,
+      pendingClientRequestId: null,
+      queuedInputAt: null,
+      pendingInputSummary: turnId ? runner.runtime?.pendingInputSummary || String(command.text || '').slice(0, 240) : null,
+      lastError: null,
+      lastCodexError: null,
+    }, nowIso(), { inputOutcome: 'accepted' })];
+  } catch (error) {
+    let failure = error;
+    if (runner.stopRequested) {
+      failure = new Error('Prompt submission was cancelled because the Session was stopped before Codex accepted it.');
+      failure.code = 'session_input_cancelled_by_stop';
+    }
+    if (failure.code === 'session_input_acceptance_unknown') {
+      const acceptedTurnId = runner.activeTurnId || runner.runtime?.activeTurnId || null;
+      return [buildSessionInputRuntimeEvent(command, runner, {
+        activeTurnId: acceptedTurnId,
+        busy: true,
+        phase: acceptedTurnId ? runner.runtime?.phase || 'thinking' : 'submitting-turn',
+        currentTurnStatus: acceptedTurnId ? 'inProgress' : 'submitting',
+        queuedCommandId: null,
+        pendingClientRequestId: command.clientRequestId || null,
+        queuedInputAt: null,
+        pendingInputSummary: runner.runtime?.pendingInputSummary || String(command.text || '').slice(0, 240),
+        lastError: null,
+        lastCodexError: null,
+      }, nowIso(), { inputOutcome: 'acceptance_unknown' })];
+    }
+    return buildFailedSessionInputReceipt(command, runner, failure);
+  }
+}
+
+async function deliverSessionInputReceipt(command, receipt) {
+  try {
+    await postEvents(receipt, {
+      batchId: sessionInputReceiptBatchId(command),
+      retryOnTransient: true,
+    });
+  } catch (cause) {
+    const error = cause instanceof Error
+      ? cause
+      : new Error(String(cause || 'Session input terminal receipt delivery failed.'));
+    error.retryCommand = true;
+    throw error;
+  }
+}
+
+function startSessionInputCommand(command, runner = null) {
+  const receiptKey = sessionInputReceiptKey(command);
+  rememberSessionInputReceiptKey(command, receiptKey);
+  let task = null;
+  task = sessionInputReceiptExecutor.run(
+    receiptKey,
+    () => enqueueRunnerCommandEffect(runner, () => executeSessionInputCommand(command, runner)),
+    (receipt) => deliverSessionInputReceipt(command, receipt)
+  ).finally(() => {
+    activeSessionInputTasks.delete(task);
+  });
+  activeSessionInputTasks.add(task);
+  return task;
 }
 
 async function failShutdownCancelledManagedSession(command, sessionId, runId, cwd, runner = null) {
@@ -2276,6 +2883,21 @@ async function startManagedSession(command) {
   let startHandle = null;
   let shutdownFailurePublished = false;
   let startCompletionError = null;
+  const addRunnerIndexes = () => {
+    if (!runner) return;
+    const identities = [
+      bridgeSessionId,
+      announcedSessionId,
+      runId,
+      runner.sessionId,
+      runner.bridgeSessionId,
+      typeof runner.currentSessionId === 'function' ? runner.currentSessionId() : null,
+    ];
+    for (const identity of identities) {
+      const normalized = String(identity || '').trim();
+      if (normalized) liveSessions.set(normalized, runner);
+    }
+  };
   const removeRunnerIndexes = () => {
     if (!runner) return;
     for (const [key, candidate] of liveSessions.entries()) {
@@ -2309,8 +2931,27 @@ async function startManagedSession(command) {
     }
     return bridgeSessionId;
   };
+  const settleUserStoppedStart = async () => {
+    if (!runner) return bridgeSessionId;
+    try {
+      await stopRunnerOnce(runner);
+      removeRunnerIndexes();
+    } catch {
+      // The Stop command owns its structured failure. Keep the runner indexed
+      // so a later Stop retry can find the same process instead of reporting
+      // a history-only Session while that process may still be alive.
+      announcedSessionId = runner.sessionId || announcedSessionId;
+      addRunnerIndexes();
+    }
+    return bridgeSessionId;
+  };
   try {
-    startHandle = managedSessionStartGate.beginStart();
+    startHandle = managedSessionStartGate.beginStart({
+      ...command,
+      sessionId: bridgeSessionId,
+      bridgeSessionId,
+      runId,
+    });
     runner = command.runId
       ? findRunnerForCommand(liveSessions, { runId: command.runId })
       : null;
@@ -2399,11 +3040,12 @@ async function startManagedSession(command) {
     if (managedSessionStartGate.isShuttingDown()) {
       return await cancelStartForShutdown();
     }
+    if (runner.stopRequested) {
+      return await settleUserStoppedStart();
+    }
     runner.createdAt = runner.createdAt || createdAt;
     announcedSessionId = runner.sessionId || bridgeSessionId;
-    liveSessions.set(bridgeSessionId, runner);
-    liveSessions.set(announcedSessionId, runner);
-    liveSessions.set(runId, runner);
+    addRunnerIndexes();
 
     if (managedSessionStartGate.isShuttingDown()) {
       return await cancelStartForShutdown();
@@ -2432,6 +3074,9 @@ async function startManagedSession(command) {
     }
     if (error?.code === 'host_agent_shutting_down' || managedSessionStartGate.isShuttingDown()) {
       return await cancelStartForShutdown();
+    }
+    if (runner?.stopRequested) {
+      return await settleUserStoppedStart();
     }
     if (retainRunnerForStartRetry(liveSessions, runner, {
       ...command,
@@ -2464,6 +3109,224 @@ async function startManagedSession(command) {
   return announcedSessionId;
 }
 
+async function postCodexUpdateEvent(payload, options = {}) {
+  try {
+    await postEvent({
+      hostId: HOST_ID,
+      timestamp: nowIso(),
+      ...payload,
+    }, options);
+  } catch (cause) {
+    const error = cause instanceof Error
+      ? cause
+      : new Error(String(cause || 'Codex update event delivery failed'));
+    error.retryCommand = true;
+    throw error;
+  }
+}
+
+async function handleCodexProbe(command) {
+  const codexRuntime = getCodexRuntime({ force: true });
+  await postCodexUpdateEvent({
+    type: 'host.codex_probed',
+    requestId: command.requestId || makeId(),
+    codexRuntime,
+  });
+}
+
+async function deliverCodexUpdateResultForCommand(command, operationId, result) {
+  try {
+    await postCodexUpdateEvent({
+      type: 'host.codex_updated',
+      requestId: command.requestId || operationId,
+      operationId,
+      ...result,
+    });
+    finalizeRecoveredCodexMaintenance(operationId);
+  } catch (error) {
+    if (codexUpdateState?.operationId === operationId) {
+      recoveredCodexUpdateNeedsReport = true;
+      scheduleRecoveredCodexUpdateReport();
+    }
+    error.retryCommand = true;
+    throw error;
+  }
+}
+
+async function handleCodexUpdate(command) {
+  const operationId = String(command.operationId || command.requestId || '').trim();
+  if (!operationId) {
+    const error = new Error('Codex update operationId is required.');
+    error.code = 'codex_update_operation_required';
+    throw error;
+  }
+
+  const remembered = codexUpdateResults.get(operationId);
+  if (remembered) {
+    await deliverCodexUpdateResultForCommand(command, operationId, remembered);
+    return;
+  }
+  if (codexUpdateInFlight === operationId) {
+    scheduleRecoveredCodexUpdateReport();
+    const recoveredResult = codexUpdateResults.get(operationId);
+    if (!recoveredResult) {
+      const error = new Error(`Codex update ${operationId} is still being reconciled.`);
+      error.code = 'codex_update_recovery_pending';
+      error.retryCommand = true;
+      throw error;
+    }
+    await deliverCodexUpdateResultForCommand(command, operationId, recoveredResult);
+    return;
+  }
+  if (codexUpdateInFlight) {
+    const result = rememberCodexUpdateResult(operationId, {
+      ok: false,
+      code: 'codex_update_busy',
+      error: `Codex update ${codexUpdateInFlight} is already running on this Host.`,
+      codexRuntime: getCodexRuntime(),
+    });
+    await deliverCodexUpdateResultForCommand(command, operationId, result);
+    return;
+  }
+
+  managedSessionStartGate.beginMaintenance(operationId);
+  try {
+    setCodexUpdateState({
+      operationId,
+      status: 'checking',
+      message: 'Waiting for active Session starts to finish.',
+      startedAt: nowIso(),
+      updaterPid: null,
+    });
+    await waitForActiveSessionStartsForUpdate();
+  } catch (error) {
+    const result = rememberCodexUpdateResult(operationId, {
+      ok: false,
+      code: error.code || 'codex_update_preflight_failed',
+      error: error.message || String(error),
+      codexRuntime: getCodexRuntime(),
+    });
+    try {
+      try {
+        setCodexUpdateState({
+          operationId,
+          status: 'update_failed',
+          message: result.error,
+          version: result.codexRuntime?.version || null,
+          updaterPid: null,
+        });
+      } catch (journalError) {
+        logAgentError('[agent] could not persist Codex update preflight failure:', journalError);
+      }
+      await deliverCodexUpdateResultForCommand(command, operationId, result);
+    } finally {
+      managedSessionStartGate.endMaintenance(operationId);
+    }
+    return;
+  }
+
+  const liveRunnerCount = uniqueLiveRunners().length;
+  if (liveRunnerCount > 0) {
+    const result = rememberCodexUpdateResult(operationId, {
+      ok: false,
+      code: 'codex_update_sessions_live',
+      error: `${liveRunnerCount} managed Codex runner(s) are still live; update was not started.`,
+      codexRuntime: getCodexRuntime(),
+    });
+    try {
+      setCodexUpdateState({
+        status: 'update_failed',
+        message: result.error,
+        version: result.codexRuntime?.version || null,
+        updaterPid: null,
+      });
+      await deliverCodexUpdateResultForCommand(command, operationId, result);
+    } finally {
+      managedSessionStartGate.endMaintenance(operationId);
+    }
+    return;
+  }
+
+  codexUpdateInFlight = operationId;
+  try {
+    const current = getCodexRuntime({ force: true });
+    setCodexUpdateState({
+      status: 'checking',
+      message: `Current Codex version: ${current.version || 'unknown'}.`,
+      previousVersion: current.version || null,
+    });
+    await postCodexUpdateEvent({
+      type: 'host.codex_update_progress',
+      requestId: command.requestId || operationId,
+      operationId,
+      phase: 'checking',
+      message: `Current Codex version: ${current.version || 'unknown'}.`,
+      codexRuntime: current,
+    }, { bestEffort: true });
+
+    let result;
+    try {
+      const updated = await updateCodexInstallation(current, {
+        onProgress: (progress) => {
+          setCodexUpdateState({
+            status: progress.phase,
+            message: progress.message,
+          });
+          return postCodexUpdateEvent({
+            type: 'host.codex_update_progress',
+            requestId: command.requestId || operationId,
+            operationId,
+            phase: progress.phase,
+            message: progress.message,
+          }, { bestEffort: true }).catch((error) => {
+            logAgentTransient('[agent] Codex update progress delivery failed:', error);
+          });
+        },
+        onSpawn: ({ pid }) => {
+          setCodexUpdateState({
+            updaterPid: pid,
+            updaterStartedAt: nowIso(),
+            deadlineAt: new Date(Date.now() + CODEX_UPDATE_RECOVERY_TIMEOUT_MS).toISOString(),
+          });
+        },
+      });
+      codexRuntimeCache = updated.installation;
+      codexRuntimeCachedAt = Date.now();
+      result = {
+        ok: true,
+        previousVersion: updated.previousVersion,
+        version: updated.version,
+        changed: updated.changed,
+        codexRuntime: updated.installation,
+        output: updated.output,
+      };
+    } catch (error) {
+      codexRuntimeCache = getCodexRuntime({ force: true });
+      result = {
+        ok: false,
+        code: error.code || 'codex_update_failed',
+        error: error.message || String(error),
+        codexRuntime: codexRuntimeCache,
+      };
+    }
+
+    setCodexUpdateState({
+      status: result.ok ? 'updated' : 'update_failed',
+      message: result.ok
+        ? `Codex ${result.version || 'update'} installed and verified.`
+        : result.error,
+      previousVersion: result.previousVersion || codexUpdateState?.previousVersion || null,
+      version: result.version || result.codexRuntime?.version || null,
+      updaterPid: null,
+    });
+    rememberCodexUpdateResult(operationId, result);
+    await deliverCodexUpdateResultForCommand(command, operationId, result);
+  } finally {
+    codexUpdateInFlight = null;
+    managedSessionStartGate.endMaintenance(operationId);
+  }
+}
+
 async function handleCommand(command) {
   if (!command || !command.type) {
     return;
@@ -2486,9 +3349,20 @@ async function handleCommand(command) {
     return;
   }
 
-  if (command.type === 'session.start') {
-    await startManagedSession(command);
+  if (command.type === 'host.codex_probe') {
+    await handleCodexProbe(command);
     return;
+  }
+
+  if (command.type === 'host.codex_update') {
+    await handleCodexUpdate(command);
+    return;
+  }
+
+  if (command.type === 'session.start') {
+    return {
+      deferAcknowledgement: startManagedSession(command),
+    };
   }
 
   if (command.type === 'host.import') {
@@ -2499,6 +3373,7 @@ async function handleCommand(command) {
   }
 
   if (command.type === 'host.probe') {
+    const codexRuntime = getCodexRuntime({ force: true });
     await postEvent({
       type: 'host.probe',
       hostId: HOST_ID,
@@ -2506,6 +3381,7 @@ async function handleCommand(command) {
       label: HOST_LABEL,
       platform: process.platform,
       capabilities: getCapabilities(),
+      codexRuntime,
       timestamp: nowIso(),
     });
     return;
@@ -2732,6 +3608,24 @@ async function handleCommand(command) {
     }
 
     if (command.type === 'session.stop') {
+      const pendingRunner = managedSessionStartGate.waitForRunner(command);
+      if (pendingRunner) {
+        const startedRunner = await pendingRunner;
+        if (startedRunner) {
+          try {
+            await enqueueRunnerCommandEffect(startedRunner, () => stopRunnerOnce(startedRunner, {
+              suppressTerminalEvent: command.suppressTerminalEvent === true,
+            }));
+          } catch (cause) {
+            const stopError = cause instanceof Error
+              ? cause
+              : new Error(String(cause || 'Managed Session stop failed.'));
+            stopError.code = stopError.code || 'session_stop_incomplete';
+            await postSessionCommandFailure(command, stopError, 'stop', startedRunner);
+          }
+        }
+        return;
+      }
       if (!shouldPublishMissingRunnerStop(command)) return;
       await postEvent({
         type: 'session.state_changed',
@@ -2746,23 +3640,17 @@ async function handleCommand(command) {
     }
 
     if (command.type === 'session.input') {
-      await postEvent({
-        type: 'session.runtime_updated',
-        hostId: HOST_ID,
-        sessionId: command.requestedSessionId || command.sessionId,
-        runId: command.runId || null,
-        patch: {
-          activeTurnId: null,
-          busy: false,
-          phase: 'error',
-          currentTurnStatus: 'failed',
-          queuedCommandId: null,
-          pendingInputSummary: null,
-          lastCodexError: 'session is not live on this host-agent; wait for the session to finish starting, then resend',
-          runId: command.runId || null,
-        },
-        timestamp: nowIso(),
-      }, { bestEffort: true });
+      return {
+        deferAcknowledgement: startSessionInputCommand(command),
+      };
+    }
+
+    if (command.type === 'session.interrupt') {
+      await deliverSessionInterruptResult(command, null, {
+        status: 'no_active',
+        reason: 'runner_unavailable',
+      });
+      return;
     }
 
     await postEvent({
@@ -2776,67 +3664,9 @@ async function handleCommand(command) {
   }
 
   if (command.type === 'session.input') {
-    try {
-      await postEvent({
-        type: 'session.runtime_updated',
-        hostId: HOST_ID,
-        sessionId: command.sessionId,
-        runId: runner.runId || command.runId || null,
-        patch: {
-          busy: true,
-          phase: 'submitting-turn',
-          currentTurnStatus: 'submitting',
-          queuedCommandId: command.id || null,
-          pendingInputSummary: String(command.text || '').slice(0, 240),
-          lastError: null,
-          lastCodexError: null,
-          runId: runner.runId || command.runId || null,
-        },
-        timestamp: nowIso(),
-      }, { bestEffort: true });
-      await runner.sendInput(String(command.text || ''), {
-        inputItems: Array.isArray(command.inputItems) ? command.inputItems : [],
-        attachments: Array.isArray(command.attachments) ? command.attachments : [],
-        mode: command.mode || null,
-        model: command.model || null,
-        effort: command.effort || null,
-        summary: command.summary || null,
-        approvalPolicy: command.approvalPolicy || null,
-        approvalsReviewer: command.approvalsReviewer || null,
-        sandboxMode: command.sandboxMode || null,
-        planFallback: command.planFallback || null,
-        serviceTier: command.serviceTier || null,
-        personality: command.personality || null,
-        apiConfig: normalizeApiConfig(command.apiConfig),
-        apiBinding: command.apiBinding || null,
-      });
-    } catch (error) {
-      await postSessionCommandFailure(command, error, 'input', runner);
-      await postEvent({
-        type: 'session.runtime_updated',
-        hostId: HOST_ID,
-        sessionId: command.sessionId,
-        runId: runner.runId || command.runId || null,
-        patch: {
-          activeTurnId: null,
-          busy: false,
-          phase: 'error',
-          currentTurnStatus: 'failed',
-          pendingInputSummary: null,
-          lastCodexError: error.message || String(error),
-          runId: runner.runId || command.runId || null,
-        },
-        timestamp: nowIso(),
-      }, { bestEffort: true });
-      await postEvent({
-        type: 'session.error',
-        hostId: HOST_ID,
-        sessionId: command.sessionId,
-        message: `Unable to start Codex turn: ${error.message}`,
-        timestamp: nowIso(),
-      });
-    }
-    return;
+    return {
+      deferAcknowledgement: startSessionInputCommand(command, runner),
+    };
   }
 
   if (command.type === 'session.model_list') {
@@ -2940,23 +3770,34 @@ async function handleCommand(command) {
 
   if (command.type === 'session.interrupt') {
     if (typeof runner.interruptTurn === 'function') {
-      await runner.interruptTurn();
+      try {
+        const result = await enqueueRunnerCommandEffect(runner, () => runner.interruptTurn({
+          interruptRequestId: command.interruptRequestId || null,
+          expectedTurnId: command.expectedTurnId || null,
+          expectedClientRequestId: command.expectedClientRequestId || null,
+        }));
+        await deliverSessionInterruptResult(command, runner, result);
+      } catch (error) {
+        await deliverSessionInterruptResult(command, runner, {
+          status: 'failed',
+          error: error?.message || String(error),
+          turnId: runner.activeTurnId || null,
+          clientRequestId: runner.activeClientRequestId || null,
+        });
+      }
       return;
     }
 
-    await postEvent({
-      type: 'session.error',
-      hostId: HOST_ID,
-      sessionId: command.sessionId,
-      message: 'This runner does not support turn interruption.',
-      timestamp: nowIso(),
+    await deliverSessionInterruptResult(command, runner, {
+      status: 'failed',
+      error: 'This runner does not support turn interruption.',
     });
     return;
   }
 
   if (command.type === 'session.steer') {
     if (typeof runner.steerTurn === 'function') {
-      await runner.steerTurn(String(command.text || ''));
+      await enqueueRunnerCommandEffect(runner, () => runner.steerTurn(String(command.text || '')));
       return;
     }
 
@@ -3129,16 +3970,15 @@ async function handleCommand(command) {
 
   if (command.type === 'session.stop') {
     try {
-      await stopRunnerOnce(runner, {
+      await enqueueRunnerCommandEffect(runner, () => stopRunnerOnce(runner, {
         suppressTerminalEvent: command.suppressTerminalEvent === true,
-      });
+      }));
     } catch (cause) {
       const stopError = cause instanceof Error
         ? cause
         : new Error(String(cause || 'Managed Session stop failed.'));
-      stopError.retryCommand = true;
       stopError.code = stopError.code || 'session_stop_incomplete';
-      throw stopError;
+      await postSessionCommandFailure(command, stopError, 'stop', runner);
     }
     return;
   }
@@ -3183,14 +4023,47 @@ async function postCommandFailure(command, error) {
   }
 }
 
+function requestDeferredCommandRetry(commandId, error = null) {
+  const normalizedCommandId = Number(commandId || 0);
+  if (normalizedCommandId <= 0) return;
+  if (deliveredCommandStates.get(normalizedCommandId) === 'pending') {
+    deliveredCommandStates.delete(normalizedCommandId);
+  }
+  deferredCommandRetryIds.add(normalizedCommandId);
+  if (error) {
+    logAgentTransient(
+      `[agent] command ${normalizedCommandId} terminal receipt was not delivered; retrying command:`,
+      error
+    );
+  }
+}
+
+function nextCommandFetchAfter() {
+  if (!deferredCommandRetryIds.size) return lastFetchedCommandId;
+  let earliestRetryId = Number.MAX_SAFE_INTEGER;
+  for (const commandId of deferredCommandRetryIds) {
+    earliestRetryId = Math.min(earliestRetryId, commandId);
+  }
+  return Math.min(lastFetchedCommandId, Math.max(0, earliestRetryId - 1));
+}
+
 async function processPolledCommand(command, expectedRelayInstanceId = '') {
   const commandId = Number(command?.id || 0);
+  if (commandId > 0 && deliveredCommandStates.has(commandId)) {
+    return true;
+  }
+  if (commandId > 0) deferredCommandRetryIds.delete(commandId);
+  let result = null;
   try {
-    await handleCommand(command);
+    result = await handleCommand(command);
   } catch (error) {
-    if (error?.retryCommand) return false;
+    if (error?.retryCommand) {
+      requestDeferredCommandRetry(commandId, error);
+      return false;
+    }
     if (command?.type === 'host.skills.deployment.apply') {
       logAgentTransient('[agent] will retry deployment result delivery:', error);
+      requestDeferredCommandRetry(commandId);
       return false;
     }
     await postCommandFailure(command, error);
@@ -3204,10 +4077,49 @@ async function processPolledCommand(command, expectedRelayInstanceId = '') {
     // already been acknowledged or replaced. Do not advance the new cursor
     // with an old command id.
     lastCommandId = 0;
+    lastFetchedCommandId = 0;
+    deliveredCommandStates.clear();
+    deferredCommandRetryIds.clear();
     return false;
   }
-  lastCommandId = Math.max(lastCommandId, commandId);
+  if (commandId > 0) {
+    if (result?.deferAcknowledgement && typeof result.deferAcknowledgement.then === 'function') {
+      deliveredCommandStates.set(commandId, 'pending');
+      const deliveryEpoch = expectedRelayInstanceId || relayInstanceId || '';
+      const completeDeferredCommand = () => {
+        if (deliveryEpoch && relayInstanceId && deliveryEpoch !== relayInstanceId) return;
+        if (deliveredCommandStates.get(commandId) !== 'pending') return;
+        deliveredCommandStates.set(commandId, 'completed');
+        advanceAcknowledgedCommandId();
+      };
+      const retryDeferredCommand = (error) => {
+        if (deliveryEpoch && relayInstanceId && deliveryEpoch !== relayInstanceId) return;
+        requestDeferredCommandRetry(commandId, error);
+      };
+      result.deferAcknowledgement.then(completeDeferredCommand, retryDeferredCommand);
+    } else {
+      deliveredCommandStates.set(commandId, 'completed');
+      advanceAcknowledgedCommandId();
+    }
+  }
   return true;
+}
+
+function advanceAcknowledgedCommandId() {
+  const ordered = Array.from(deliveredCommandStates.keys())
+    .filter((commandId) => commandId > lastCommandId)
+    .sort((left, right) => left - right);
+  let throughId = lastCommandId;
+  for (const commandId of ordered) {
+    if (deliveredCommandStates.get(commandId) !== 'completed') break;
+    throughId = commandId;
+  }
+  if (throughId <= lastCommandId) return lastCommandId;
+  lastCommandId = throughId;
+  for (const commandId of ordered) {
+    if (commandId <= throughId) deliveredCommandStates.delete(commandId);
+  }
+  return lastCommandId;
 }
 
 async function acknowledgeCommandsBeforeShutdown() {
@@ -3224,6 +4136,7 @@ async function acknowledgeCommandsBeforeShutdown() {
     await ensureHostRegistration();
     return false;
   }
+  forgetAcknowledgedSessionInputReceipts(throughId);
   return true;
 }
 
@@ -3236,12 +4149,17 @@ async function pollCommandsLoop() {
     try {
       const headers = managedAgentRequestHeaders();
       requestLeaseId = String(headers['X-Remote-Codex-Agent-Lease'] || '').trim();
-      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${lastCommandId}&ack=${lastCommandId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}`, {
+      const acknowledgedThroughId = lastCommandId;
+      const fetchAfterId = nextCommandFetchAfter();
+      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${fetchAfterId}&ack=${acknowledgedThroughId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}`, {
         retryOnTransient: true,
         headers,
       });
-      if (observeRelayInstance(result.body)) {
+      const relayEpochChanged = observeRelayInstance(result.body);
+      if (relayEpochChanged) {
         await ensureHostRegistration();
+      } else {
+        forgetAcknowledgedSessionInputReceipts(acknowledgedThroughId);
       }
       const batchRelayInstanceId = String(
         result.body?.relayInstanceId || relayInstanceId || ''
@@ -3258,6 +4176,9 @@ async function pollCommandsLoop() {
           && relayInstanceId !== batchRelayInstanceId
         ) {
           lastCommandId = 0;
+          lastFetchedCommandId = 0;
+          deliveredCommandStates.clear();
+          deferredCommandRetryIds.clear();
           await ensureHostRegistration();
           break;
         }
@@ -3271,6 +4192,7 @@ async function pollCommandsLoop() {
         if (!processed) {
           break;
         }
+        lastFetchedCommandId = Math.max(lastFetchedCommandId, Number(command?.id || 0));
         if (command?.type === 'host.shutdown') {
           return;
         }
@@ -3364,6 +4286,7 @@ async function heartbeatLoop() {
     try {
       pruneExpiredWatchedSessions();
       await heartbeat();
+      scheduleRecoveredCodexUpdateReport();
       await sleep(5000);
     } catch (error) {
       try {
@@ -3427,6 +4350,7 @@ async function main() {
   console.log(`[agent] host ${HOST_ID} connecting to ${RELAY_URL}`);
   console.log(`[agent] codex home ${CODEX_HOME}`);
   ensureManagedAgentOwnershipMarker();
+  initializeRecoveredCodexUpdate();
 
   const overlayCleanup = CLEAN_LEGACY_MANAGED_OVERLAYS
     ? cleanupStaleApiProfileCodexHomes(CODEX_HOME, {
@@ -3446,6 +4370,7 @@ async function main() {
   }
 
   await retryStartupStep('register host', ensureHostRegistration, 12);
+  scheduleRecoveredCodexUpdateReport();
   const heartbeatTask = heartbeatLoop();
   hostSkillInventory.start();
   await runStartupDiscovery();

@@ -20,7 +20,7 @@ function cleanRootDir(rootDir = process.cwd()) {
 
 function gitArgsForRoot(rootDir, args) {
   const safeRoot = cleanRootDir(rootDir).replace(/\\/g, '/');
-  return ['-c', `safe.directory=${safeRoot}`, ...args];
+  return ['-c', `safe.directory=${safeRoot}`, '-c', 'core.longpaths=true', ...args];
 }
 
 function runGit(rootDir, args, options = {}) {
@@ -102,7 +102,13 @@ function getTrackedChanges(rootDir) {
 }
 
 function getUntrackedFiles(rootDir) {
-  const output = runGit(rootDir, ['ls-files', '--others', '--exclude-standard']);
+  const output = runGit(rootDir, [
+    'ls-files',
+    '--others',
+    '--exclude-standard',
+    '--directory',
+    '--no-empty-directory',
+  ]);
   return output
     .split(/\r?\n/)
     .map((line) => line.trim())

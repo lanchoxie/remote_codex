@@ -80,6 +80,7 @@ async function verifyTailProjection(root) {
   const cursor = new CodexAssistantCursorIndex({
     maxBytesPerScan: 4096,
     now: () => '2026-07-16T11:00:10.000Z',
+    assistantMirrorGraceMs: 0,
   });
   const baseline = finishBackfill(cursor, session);
   cursor.acknowledge(baseline);
@@ -89,6 +90,7 @@ async function verifyTailProjection(root) {
     hostId: 'cursor-tail-host',
     assistantCursorIndex: cursor,
     postEvents: async (events) => posted.push(...events),
+    assistantMirrorGraceMs: 0,
   });
   tailer.setWatchedSessions([session]);
 
@@ -232,6 +234,67 @@ async function main() {
     fs.writeFileSync(corruptPath, '{not-json}\n', 'utf8');
     const corrupt = index.scan({ nativeThreadId: 'corrupt', rolloutPath: corruptPath });
     assert.strictEqual(corrupt.cursorUnknown, true, 'an unparsable retained row cannot clear a newer Relay projection');
+
+    const mirrorPath = path.join(root, 'rollout-mirror-pair.jsonl');
+    const mirrorEvent = JSON.stringify({
+      timestamp: '2026-07-16T10:02:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'agent_message', phase: 'final', message: 'cross-scan mirror' },
+    });
+    const mirrorResponse = JSON.stringify({
+      timestamp: '2026-07-16T10:02:00.025Z',
+      type: 'response_item',
+      payload: {
+        id: 'msg-cross-scan',
+        type: 'message',
+        role: 'assistant',
+        phase: 'final',
+        content: [{ type: 'output_text', text: 'cross-scan mirror' }],
+      },
+    });
+    const mirrorEventBytes = Buffer.byteLength(`${mirrorEvent}\n`);
+    fs.writeFileSync(mirrorPath, `${mirrorEvent}\n${mirrorResponse}\n`);
+    const mirrorIndex = new CodexAssistantCursorIndex({
+      maxBytesPerScan: mirrorEventBytes,
+      assistantMirrorGraceMs: 250,
+      now: () => '2026-07-16T10:02:00.100Z',
+    });
+    const mirrorSession = { nativeThreadId: 'mirror-pair', rolloutPath: mirrorPath };
+    const firstMirrorSlice = mirrorIndex.scan(mirrorSession);
+    assert.strictEqual(firstMirrorSlice.observations.length, 0);
+    assert.strictEqual(firstMirrorSlice.cursorUnknown, true, 'an event row at a byte boundary must wait for lookahead');
+    const completedMirror = finishBackfill(mirrorIndex, mirrorSession);
+    assert.strictEqual(completedMirror.observations.length, 1);
+    assert.strictEqual(completedMirror.observations[0].sourceIdentity.protocolItemId, 'msg-cross-scan');
+
+    const legacyMirrorPath = path.join(root, 'rollout-legacy-event-only.jsonl');
+    fs.writeFileSync(
+      legacyMirrorPath,
+      `${JSON.stringify({
+        timestamp: '2026-07-16T10:03:00.000Z',
+        type: 'event_msg',
+        payload: { type: 'agent_message', message: 'legacy cursor answer' },
+      })}\n${taskCompleteRow('legacy cursor answer')}\n`
+    );
+    const legacyMirrorIndex = new CodexAssistantCursorIndex({ maxBytesPerScan: 4096 });
+    const legacyMirrorResult = finishBackfill(legacyMirrorIndex, {
+      nativeThreadId: 'legacy-event-only',
+      rolloutPath: legacyMirrorPath,
+    });
+    assert.strictEqual(legacyMirrorResult.observations.length, 1, 'task_complete must flush an unpaired legacy event');
+
+    const truncatedPendingPath = path.join(root, 'rollout-truncated-pending.jsonl');
+    fs.writeFileSync(truncatedPendingPath, `${mirrorEvent}\n`);
+    const truncatedPendingIndex = new CodexAssistantCursorIndex({
+      maxBytesPerScan: 4096,
+      assistantMirrorGraceMs: 10_000,
+    });
+    const truncatedPendingSession = { nativeThreadId: 'truncated-pending', rolloutPath: truncatedPendingPath };
+    const pendingBeforeTruncate = truncatedPendingIndex.scan(truncatedPendingSession);
+    assert.strictEqual(pendingBeforeTruncate.observations.length, 0);
+    fs.writeFileSync(truncatedPendingPath, '{}\n');
+    const afterPendingTruncate = truncatedPendingIndex.scan(truncatedPendingSession);
+    assert.strictEqual(afterPendingTruncate.observations.length, 0, 'truncate must discard an unmatched row from the replaced file');
 
     const many = index.scanMany([session, otherSession, { sessionId: 'no-path' }]);
     assert.strictEqual(many.length, 2);

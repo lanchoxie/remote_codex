@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { resolveLocalCodexBin } = require('../../shared/codex-preflight');
+const { normalizeAssistantObservation } = require('../../shared/assistant-message-identity');
 const { nowIso } = require('../../shared/protocol');
 const {
   ThinkingActivityAggregator,
@@ -34,12 +35,20 @@ const TURN_START_REQUEST_TIMEOUT_MS = Number(process.env.CODEX_RPC_TURN_START_TI
 const MANAGED_OVERLAY_MARKER_KIND = 'remote-codex-managed-overlay';
 const MANAGED_OVERLAY_MARKER_VERSION = 1;
 const MANAGED_OVERLAY_MARKER_NAME = '.remote-codex-owner';
+const MANAGED_OVERLAY_REMOVE_MAX_RETRIES = 5;
+const MANAGED_OVERLAY_REMOVE_RETRY_DELAY_MS = 100;
+const MANAGED_OVERLAY_BACKGROUND_RETRY_ATTEMPTS = 3;
+const MANAGED_OVERLAY_BACKGROUND_RETRY_DELAY_MS = 500;
 const NOTIFICATION_QUEUE_MAX_ITEMS = 256;
 const NOTIFICATION_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
 const NOTIFICATION_QUEUE_MAX_ITEM_BYTES = 64 * 1024;
 const NOTIFICATION_QUEUE_TERMINAL_RESERVED_ITEMS = 16;
 const NOTIFICATION_QUEUE_TERMINAL_RESERVED_BYTES = 256 * 1024;
 const TURN_BUFFER_MAX_BYTES = 512 * 1024;
+const TURN_COMPLETION_FALLBACK_GRACE_MS = Math.max(
+  25,
+  Number(process.env.CODEX_TURN_COMPLETION_FALLBACK_GRACE_MS || 250) || 250
+);
 const NOTIFICATION_TRUNCATION_SUFFIX = '\n...[notification truncated]';
 const TURN_BUFFER_TRUNCATION_SUFFIX = '\n...[assistant output truncated]';
 const ACTIVITY_COMMAND_MAX_BYTES = 16 * 1024;
@@ -50,6 +59,48 @@ const ACTIVITY_FILE_CHANGES_MAX_BYTES = 128 * 1024;
 const ACTIVITY_STRUCTURED_VALUE_MAX_BYTES = 64 * 1024;
 const ACTIVITY_STRUCTURED_STRING_MAX_BYTES = 8 * 1024;
 const ACTIVITY_MAX_FILE_CHANGES = 128;
+
+function isAppServerAssistantMessageItem(item = {}) {
+  const type = String(item.type || '').replace(/[-_\s]/g, '').toLowerCase();
+  const role = String(item.role || '').trim().toLowerCase();
+  return ['agentmessage', 'assistantmessage'].includes(type)
+    || (type === 'message' && ['agent', 'assistant'].includes(role));
+}
+
+function appServerAssistantMessageText(item = {}, fallback = '') {
+  const direct = String(item.text || item.message || '').trim();
+  if (direct) return direct;
+  const content = Array.isArray(item.content) ? item.content : [];
+  const parts = content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (!part || typeof part !== 'object') return '';
+    return String(part.text || part.output_text || part.outputText || part.content || '');
+  }).filter(Boolean);
+  return (parts.join('\n') || String(fallback || '')).trim();
+}
+
+function forceKillChildProcessTree(child) {
+  if (!child) return false;
+  if (process.platform === 'win32' && child.pid && child.spawnfile) {
+    try {
+      const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+      const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('error', () => {});
+      killer.unref?.();
+    } catch {
+      // The direct SIGKILL request below remains the fallback.
+    }
+  }
+  try {
+    child.kill('SIGKILL');
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function truncateUtf8(value, maxBytes, suffix = '') {
   const text = String(value ?? '');
@@ -231,6 +282,7 @@ function compactOversizedNotification(message, maxBytes) {
       ...identity,
       stream: params.stream || null,
       capReached: typeof params.capReached === 'boolean' ? params.capReached : null,
+      truncated: typeof params.truncated === 'boolean' ? params.truncated : null,
       delta: truncateUtf8(params.delta || '', Math.floor(textBudget / 2), NOTIFICATION_TRUNCATION_SUFFIX),
       deltaBase64: truncateUtf8(params.deltaBase64 || '', Math.floor(textBudget / 2), NOTIFICATION_TRUNCATION_SUFFIX),
     };
@@ -484,6 +536,7 @@ function activityKindForItemType(itemType) {
     mcpToolCall: 'mcp-tool',
     dynamicToolCall: 'tool-call',
     collabAgentToolCall: 'collaboration',
+    subAgentActivity: 'collaboration',
     webSearch: 'web-search',
     imageView: 'image',
     imageGeneration: 'image-generation',
@@ -502,9 +555,11 @@ function normalizeAppServerActivityItem(item, params = {}, lifecycle = 'progress
   const itemId = String(item.id || params.itemId || '').trim();
   const turnId = String(params.turnId || '').trim();
   if (!itemId || !turnId) return null;
-  const toolLike = ['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'webSearch']
+  const toolLike = ['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'subAgentActivity', 'webSearch']
     .includes(itemType);
-  const status = String(item.status || (lifecycle === 'completed' ? 'completed' : 'inProgress'));
+  const status = String(item.status || (itemType === 'subAgentActivity'
+    ? item.kind || (lifecycle === 'completed' ? 'completed' : 'inProgress')
+    : (lifecycle === 'completed' ? 'completed' : 'inProgress')));
   const identity = {
     turnId,
     itemId,
@@ -517,6 +572,9 @@ function normalizeAppServerActivityItem(item, params = {}, lifecycle = 'progress
   };
   const requestId = String(item.requestId || item.request_id || params.requestId || '').trim();
   if (requestId) identity.requestId = requestId;
+  if (item.truncated === true || item.textTruncated === true) {
+    identity.textTruncated = true;
+  }
   if (params.startedAtMs != null) identity.startedAtMs = boundedActivityNumber(params.startedAtMs);
   if (params.completedAtMs != null) identity.completedAtMs = boundedActivityNumber(params.completedAtMs);
   if (item.durationMs != null || item.duration_ms != null) {
@@ -538,7 +596,9 @@ function normalizeAppServerActivityItem(item, params = {}, lifecycle = 'progress
     if (processId) identity.processId = processId;
     if (item.aggregatedOutput != null || item.output != null) {
       identity.output = output;
-      identity.outputTruncated = Buffer.byteLength(String(item.aggregatedOutput || item.output || ''), 'utf8') > ACTIVITY_OUTPUT_MAX_BYTES;
+      identity.outputTruncated = item.truncated === true
+        || item.outputTruncated === true
+        || Buffer.byteLength(String(item.aggregatedOutput || item.output || ''), 'utf8') > ACTIVITY_OUTPUT_MAX_BYTES;
     }
     if (item.exitCode != null || item.exit_code != null) {
       identity.exitCode = boundedActivityNumber(item.exitCode ?? item.exit_code);
@@ -582,6 +642,54 @@ function normalizeAppServerActivityItem(item, params = {}, lifecycle = 'progress
       reasoningEffort: truncateUtf8(item.reasoningEffort || item.reasoning_effort || '', 128, NOTIFICATION_TRUNCATION_SUFFIX) || null,
     });
     text = typeof item.tool === 'string' ? item.tool : summarizeValue(item.tool || 'Collaboration');
+  } else if (itemType === 'subAgentActivity') {
+    const agentThreadId = String(item.agentThreadId || item.agent_thread_id || '').trim() || null;
+    const agentPath = truncateUtf8(
+      item.agentPath || item.agent_path || '',
+      4096,
+      NOTIFICATION_TRUNCATION_SUFFIX
+    ) || null;
+    const agentNickname = truncateUtf8(
+      item.agentNickname || item.agent_nickname || '',
+      512,
+      NOTIFICATION_TRUNCATION_SUFFIX
+    ) || null;
+    const agentRole = truncateUtf8(
+      item.agentRole || item.agent_role || '',
+      512,
+      NOTIFICATION_TRUNCATION_SUFFIX
+    ) || null;
+    const parentThreadId = String(
+      item.parentThreadId
+        || item.parent_thread_id
+        || params.threadId
+        || ''
+    ).trim() || null;
+    const subagentKind = truncateUtf8(
+      item.kind || item.status || lifecycle,
+      128,
+      NOTIFICATION_TRUNCATION_SUFFIX
+    );
+    Object.assign(identity, {
+      agentThreadId,
+      agentPath,
+      agentNickname,
+      agentRole,
+      parentThreadId,
+      subagentKind,
+      senderThreadId: parentThreadId,
+      receiverThreadIds: agentThreadId ? [agentThreadId] : [],
+      tool: 'Sub-agent',
+      agentsStates: {
+        status: subagentKind,
+        agentThreadId,
+        agentPath,
+        agentNickname,
+        agentRole,
+      },
+    });
+    const label = agentPath || agentNickname || agentThreadId || 'sub-agent';
+    text = `Sub-agent ${label}: ${subagentKind}`;
   } else if (itemType === 'webSearch') {
     Object.assign(identity, {
       query: truncateUtf8(item.query || '', ACTIVITY_PROGRESS_MAX_BYTES, NOTIFICATION_TRUNCATION_SUFFIX),
@@ -902,18 +1010,57 @@ const CODEX_SCAN_SKIP_DIRS = new Set([
   'temp',
 ]);
 
-function isExecutableFile(filePath) {
+function isExecutableFile(filePath, platform = process.platform) {
   try {
     const stats = fs.statSync(filePath);
     if (!stats.isFile()) {
       return false;
     }
-    if (process.platform === 'win32') {
+    if (platform === 'win32') {
       return ['.exe', '.cmd', '.bat', '.com'].includes(path.extname(filePath).toLowerCase());
     }
     return Boolean(stats.mode & 0o111);
   } catch {
     return false;
+  }
+}
+
+function elfHeaderMatchesArchitecture(header, arch = process.arch) {
+  if (
+    !Buffer.isBuffer(header)
+    || header.length < 20
+    || header[0] !== 0x7f
+    || header.toString('ascii', 1, 4) !== 'ELF'
+  ) {
+    return true;
+  }
+  const littleEndian = header[5] === 1;
+  const machine = littleEndian ? header.readUInt16LE(18) : header.readUInt16BE(18);
+  if (arch === 'arm64') return machine === 183;
+  if (arch === 'x64') return machine === 62;
+  return true;
+}
+
+function isExecutableCompatibleWithHost(filePath, platform = process.platform, arch = process.arch) {
+  if (!isExecutableFile(filePath, platform)) return false;
+  const normalized = String(filePath || '').replace(/\\/g, '/').toLowerCase();
+  if (arch === 'arm64' && /(?:x86_64|linux-x64|windows-x86_64|darwin-x64)/.test(normalized)) {
+    return false;
+  }
+  if (arch === 'x64' && /(?:aarch64|linux-arm64|windows-arm64|darwin-arm64)/.test(normalized)) {
+    return false;
+  }
+  if (platform !== 'linux') return true;
+  let handle = null;
+  try {
+    handle = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(20);
+    const bytesRead = fs.readSync(handle, header, 0, header.length, 0);
+    return bytesRead < 20 || elfHeaderMatchesArchitecture(header, arch);
+  } catch {
+    return false;
+  } finally {
+    if (handle != null) fs.closeSync(handle);
   }
 }
 
@@ -993,6 +1140,60 @@ function collectCodexExecutables(rootDir, options = {}) {
   return found;
 }
 
+function bundledCodexRelativeCandidates(platform = process.platform, arch = process.arch) {
+  const binName = platform === 'win32' ? 'codex.exe' : 'codex';
+  const platformDirs = [];
+  if (platform === 'linux') {
+    if (arch === 'arm64') {
+      platformDirs.push('linux-arm64', 'aarch64-unknown-linux-gnu', 'aarch64-unknown-linux-musl');
+    } else if (arch === 'x64') {
+      platformDirs.push('linux-x86_64', 'linux-x64', 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl');
+    }
+  } else if (platform === 'darwin') {
+    platformDirs.push(arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64');
+  } else if (platform === 'win32') {
+    platformDirs.push(arch === 'arm64' ? 'windows-arm64' : 'windows-x86_64');
+  }
+  return [
+    ...platformDirs.flatMap((platformDir) => [
+      path.join('.runtime', 'codex', 'bin', platformDir, binName),
+      path.join('.runtime', 'codex', platformDir, binName),
+    ]),
+    path.join('.runtime', 'codex', binName),
+  ];
+}
+
+function codexHomeRelativeCandidates(platform = process.platform, arch = process.arch) {
+  const candidates = [];
+  if (platform === 'linux' && arch === 'arm64') {
+    candidates.push(
+      path.join('bin', 'codex-aarch64-unknown-linux-musl'),
+      path.join('bin', 'codex-aarch64-unknown-linux-gnu')
+    );
+  } else if (platform === 'linux' && arch === 'x64') {
+    candidates.push(
+      path.join('bin', 'codex-x86_64-unknown-linux-musl'),
+      path.join('bin', 'codex-x86_64-unknown-linux-gnu')
+    );
+  }
+  candidates.push(
+    path.join('bin', 'codex'),
+    'codex',
+    path.join('codex', 'bin', 'codex'),
+    path.join('cli', 'codex'),
+    path.join('node_modules', '.bin', 'codex'),
+    path.join('npm', 'bin', 'codex')
+  );
+  return candidates;
+}
+
+function cursorCodexPlatformDirs(platform = process.platform, arch = process.arch) {
+  if (platform === 'linux') return [arch === 'arm64' ? 'linux-arm64' : 'linux-x64'];
+  if (platform === 'darwin') return [arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64'];
+  if (platform === 'win32') return [arch === 'arm64' ? 'windows-arm64' : 'windows-x86_64'];
+  return [];
+}
+
 function resolveDefaultCodexBin(codexHomeOverride = null) {
   if (process.env.CODEX_BIN) {
     return process.env.CODEX_BIN;
@@ -1003,11 +1204,7 @@ function resolveDefaultCodexBin(codexHomeOverride = null) {
   const home = os.homedir();
   const agentRoot = path.resolve(__dirname, '..', '..');
 
-  for (const relativePath of [
-    path.join('.runtime', 'codex', 'codex'),
-    path.join('.runtime', 'codex', 'bin', 'linux-x86_64', 'codex'),
-    path.join('.runtime', 'codex', 'linux-x86_64', 'codex'),
-  ]) {
+  for (const relativePath of bundledCodexRelativeCandidates()) {
     pushUnique(candidates, seen, path.join(agentRoot, relativePath));
   }
 
@@ -1030,16 +1227,7 @@ function resolveDefaultCodexBin(codexHomeOverride = null) {
   }
 
   for (const root of codexRoots) {
-    for (const relativePath of [
-      path.join('bin', 'codex'),
-      'codex',
-      path.join('bin', 'codex-x86_64-unknown-linux-musl'),
-      path.join('bin', 'codex-x86_64-unknown-linux-gnu'),
-      path.join('codex', 'bin', 'codex'),
-      path.join('cli', 'codex'),
-      path.join('node_modules', '.bin', 'codex'),
-      path.join('npm', 'bin', 'codex'),
-    ]) {
+    for (const relativePath of codexHomeRelativeCandidates()) {
       pushUnique(candidates, seen, path.join(root, relativePath));
     }
 
@@ -1070,19 +1258,19 @@ function resolveDefaultCodexBin(codexHomeOverride = null) {
       .reverse();
 
     for (const entry of extensionDirs) {
-      for (const platformDir of ['linux-x64', 'linux-arm64', 'darwin-arm64', 'darwin-x64', 'windows-x86_64']) {
-        const binName = platformDir === 'windows-x86_64' ? 'codex.exe' : 'codex';
+      for (const platformDir of cursorCodexPlatformDirs()) {
+        const binName = platformDir.startsWith('windows-') ? 'codex.exe' : 'codex';
         pushUnique(candidates, seen, path.join(cursorExtensions, entry, 'bin', platformDir, binName));
       }
     }
   }
 
-  const bundledOrExtensionBin = candidates.find((candidate) => isExecutableFile(candidate));
+  const bundledOrExtensionBin = candidates.find((candidate) => isExecutableCompatibleWithHost(candidate));
   if (bundledOrExtensionBin) {
     return bundledOrExtensionBin;
   }
   const pathBin = resolveLocalCodexBin({ pathEnv: process.env.PATH });
-  return isExecutableFile(pathBin) ? pathBin : 'codex';
+  return isExecutableCompatibleWithHost(pathBin) ? pathBin : 'codex';
 }
 
 function buildCodexProcessPath(codexBin) {
@@ -1378,6 +1566,32 @@ function managedOverlayRealPath(value) {
   return resolver(value);
 }
 
+function managedOverlayCleanupError(error, target) {
+  if (error?.code === 'session_overlay_cleanup_failed') return error;
+  const cause = error instanceof Error
+    ? error
+    : new Error(String(error || 'managed Codex overlay cleanup failed'));
+  const failure = new Error(`Owned Codex overlay cleanup failed: ${cause.message}`);
+  failure.code = 'session_overlay_cleanup_failed';
+  failure.path = String(cause.path || target || '');
+  failure.cleanupErrorCode = cause.code || null;
+  failure.cause = cause;
+  return failure;
+}
+
+function removeManagedOverlayDirectory(directory) {
+  try {
+    fs.rmSync(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: MANAGED_OVERLAY_REMOVE_MAX_RETRIES,
+      retryDelay: MANAGED_OVERLAY_REMOVE_RETRY_DELAY_MS,
+    });
+  } catch (error) {
+    throw managedOverlayCleanupError(error, directory);
+  }
+}
+
 function inspectManagedOverlayDirectory(managedRootReal, directory) {
   const stats = fs.lstatSync(directory);
   if (!stats.isDirectory() || stats.isSymbolicLink()) {
@@ -1613,7 +1827,7 @@ function prepareApiProfileCodexHome(baseHome, apiConfig, options = {}) {
           && managedOverlayPathIdentity(inspectManagedOverlayDirectory(managedRootReal, profileHomeDir))
             === managedOverlayPathIdentity(managedOverlayRealPath(profileHomeDir))
         ) {
-          fs.rmSync(profileHomeDir, { recursive: true, force: true });
+          removeManagedOverlayDirectory(profileHomeDir);
         }
       } catch {
         // Preserve the constructor failure; the startup janitor can retry owned cleanup.
@@ -1639,6 +1853,16 @@ function cleanupApiProfileCodexHome(cleanupOwner) {
     || managedRoot === baseHome
   ) {
     return false;
+  }
+  try {
+    const profileStats = fs.lstatSync(profileHomeDir);
+    if (!profileStats.isDirectory() || profileStats.isSymbolicLink()) {
+      return false;
+    }
+  } catch (error) {
+    // An already-absent owned directory is a completed cleanup, not an
+    // unverifiable ownership result.
+    return error?.code === 'ENOENT';
   }
   try {
     const managedRootStats = fs.lstatSync(managedRoot);
@@ -1683,7 +1907,7 @@ function cleanupApiProfileCodexHome(cleanupOwner) {
     return false;
   }
   if (!markerToken || markerToken !== cleanupOwner.ownerToken) return false;
-  fs.rmSync(profileHomeDir, { recursive: true, force: true });
+  removeManagedOverlayDirectory(profileHomeDir);
   return true;
 }
 
@@ -1786,7 +2010,7 @@ function cleanupStaleApiProfileCodexHomes(baseHome, options = {}) {
         ) {
           throw new Error('managed Codex overlay ownership path changed during cleanup');
         }
-        fs.rmSync(profileHomeDir, { recursive: true, force: true });
+        removeManagedOverlayDirectory(profileHomeDir);
         result.removed += 1;
         result.legacyRemoved += 1;
       } catch {
@@ -1817,7 +2041,7 @@ function cleanupStaleApiProfileCodexHomes(baseHome, options = {}) {
       ) {
         throw new Error('managed Codex overlay ownership path changed during cleanup');
       }
-      fs.rmSync(profileHomeDir, { recursive: true, force: true });
+      removeManagedOverlayDirectory(profileHomeDir);
       result.removed += 1;
     } catch (error) {
       result.preserved += 1;
@@ -2336,7 +2560,15 @@ class JsonRpcSession {
   }
 
   respond(id, result) {
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`, 'utf8');
+    if (this.closedError) {
+      return Promise.reject(this.closedError);
+    }
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`, 'utf8', (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
   }
 
   respondError(id, code, message) {
@@ -2492,12 +2724,33 @@ class CodexAppServerRunner {
       this.startRetryFailure = null;
       this.processTreeFallbackRequired = false;
       this.overlayCleaned = false;
+      this.overlayCleanupRetryTimer = null;
+      this.overlayCleanupRetryAttempt = 0;
+      const configuredOverlayCleanupRetries = Number(options.overlayCleanupRetryMaxAttempts);
+      this.overlayCleanupRetryMaxAttempts = Number.isFinite(configuredOverlayCleanupRetries)
+        ? Math.max(0, Math.floor(configuredOverlayCleanupRetries))
+        : MANAGED_OVERLAY_BACKGROUND_RETRY_ATTEMPTS;
+      const configuredOverlayCleanupDelay = Number(options.overlayCleanupRetryDelayMs);
+      this.overlayCleanupRetryDelayMs = Number.isFinite(configuredOverlayCleanupDelay)
+        ? Math.max(1, Math.floor(configuredOverlayCleanupDelay))
+        : MANAGED_OVERLAY_BACKGROUND_RETRY_DELAY_MS;
+      this.overlayCleanupDiagnosticReported = false;
+      this.overlayCleanupLastError = null;
       this.threadId = null;
       this.nativeThreadId = options.nativeThreadId || null;
       this.nativeResumeReady = ['resume', 'fork'].includes(this.launchMode);
       this.activeTurnId = null;
+      this.activeClientRequestId = null;
+      this.clientRequestIdsByTurn = new Map();
+      this.pendingInterruptIntent = null;
+      this.runtimeRevision = 0;
+      this.inputSubmissionInFlight = false;
       this.turnBuffers = new Map();
+      this.turnAssistantTranscriptEmitted = new Set();
+      this.pendingTurnCompletions = new Map();
+      this.turnCompletionFallbackGraceMs = TURN_COMPLETION_FALLBACK_GRACE_MS;
       this.turnBufferTruncated = new Set();
+      this.itemPhases = new Map();
       this.maxTurnBufferBytes = TURN_BUFFER_MAX_BYTES;
       this.turnModes = new Map();
       this.planBuffers = new Map();
@@ -2505,6 +2758,7 @@ class CodexAppServerRunner {
       this.initializeNotificationQueue();
       this.initializeThinkingActivity();
       this.pendingRequests = new Map();
+      this.resolvedRequests = new Map();
       this.modelCapabilities = new Map();
       this.resumePrelude = this.launchMode === 'transcript_fallback'
         ? buildResumePrelude(this.bootstrap)
@@ -2537,6 +2791,7 @@ class CodexAppServerRunner {
         busy: false,
         waitingOnApproval: false,
         waitingOnUserInput: false,
+        runtimeRevision: this.runtimeRevision,
         updatedAt: nowIso(),
       };
     } catch (error) {
@@ -2608,6 +2863,35 @@ class CodexAppServerRunner {
     if (!Array.isArray(this.notificationQueue)) this.initializeNotificationQueue();
   }
 
+  notificationItemKey(params = {}) {
+    const turnId = String(params.turnId || params.turn?.id || this.activeTurnId || '').trim();
+    const itemId = String(params.itemId || params.item?.id || '').trim();
+    return turnId && itemId ? `${turnId}\u0000${itemId}` : '';
+  }
+
+  rememberNotificationItemPhase(params = {}) {
+    if (!(this.itemPhases instanceof Map)) this.itemPhases = new Map();
+    const key = this.notificationItemKey(params);
+    const phase = notificationPhase(params);
+    if (key && phase) this.itemPhases.set(key, phase);
+    return phase;
+  }
+
+  resolvedNotificationPhase(params = {}) {
+    return notificationPhase(params)
+      || this.itemPhases?.get(this.notificationItemKey(params))
+      || '';
+  }
+
+  releaseTurnItemPhases(turnId) {
+    if (!(this.itemPhases instanceof Map)) return;
+    const prefix = `${String(turnId || '').trim()}\u0000`;
+    if (prefix === '\u0000') return;
+    for (const key of this.itemPhases.keys()) {
+      if (key.startsWith(prefix)) this.itemPhases.delete(key);
+    }
+  }
+
   notificationPriority(message) {
     const method = String(message?.method || '');
     if (
@@ -2620,7 +2904,7 @@ class CodexAppServerRunner {
       return 'item-terminal';
     }
     if (method === 'thread/started' || method === 'turn/started') return 'barrier';
-    if (method === 'item/agentMessage/delta' && notificationPhase(message?.params) !== 'commentary') {
+    if (method === 'item/agentMessage/delta' && this.resolvedNotificationPhase(message?.params) !== 'commentary') {
       return 'ordered';
     }
     return 'best-effort';
@@ -2648,7 +2932,7 @@ class CodexAppServerRunner {
       return `${epoch}:rate-limits:${truncateUtf8(params.accountId || 'account', 256)}`;
     }
     if (method === 'item/agentMessage/delta') {
-      return `${epoch}:agent:${turnId}:${itemId}:${notificationPhase(params) || 'final'}`;
+      return `${epoch}:agent:${turnId}:${itemId}:${this.resolvedNotificationPhase(params) || 'final'}`;
     }
     if (method === 'item/reasoning/summaryTextDelta') {
       return `${epoch}:reasoning:${turnId}:${itemId}:${Number(params.summaryIndex ?? 0)}`;
@@ -2709,6 +2993,12 @@ class CodexAppServerRunner {
     ) {
       mergedParams.delta = `${previousParams.delta || ''}${incomingParams.delta || ''}`;
       mergedParams.deltaBase64 = `${previousParams.deltaBase64 || ''}${incomingParams.deltaBase64 || ''}`;
+      if (previousParams.capReached === true || incomingParams.capReached === true) {
+        mergedParams.capReached = true;
+      }
+      if (previousParams.truncated === true || incomingParams.truncated === true) {
+        mergedParams.truncated = true;
+      }
     } else if (method === 'item/mcpToolCall/progress') {
       mergedParams.message = [previousParams.message, incomingParams.message]
         .map((value) => String(value || '').trim())
@@ -2788,6 +3078,9 @@ class CodexAppServerRunner {
 
   enqueueNotification(message) {
     this.ensureNotificationQueue();
+    if (message?.method === 'item/started' || message?.method === 'item/completed') {
+      this.rememberNotificationItemPhase(message.params || {});
+    }
     let queuedMessage = message;
     let bytes = notificationSerializedBytes(queuedMessage);
     if (bytes > this.maxNotificationItemBytes) {
@@ -2924,6 +3217,7 @@ class CodexAppServerRunner {
     const key = String(turnId || '');
     if (!key) return;
     if (!this.turnBufferTruncated) this.turnBufferTruncated = new Set();
+    this.releaseTurnItemPhases(key);
     this.turnBuffers.set(key, '');
     this.turnBufferTruncated.delete(key);
   }
@@ -2956,6 +3250,60 @@ class CodexAppServerRunner {
   clearTurnBuffers() {
     this.turnBuffers.clear();
     this.turnBufferTruncated?.clear();
+    this.itemPhases?.clear();
+    this.turnAssistantTranscriptEmitted?.clear();
+    this.clearPendingTurnCompletions();
+  }
+
+  takePendingTurnCompletion(turnId) {
+    const key = String(turnId || '');
+    const pending = key ? this.pendingTurnCompletions?.get(key) || null : null;
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    this.pendingTurnCompletions.delete(key);
+    return pending;
+  }
+
+  clearPendingTurnCompletions() {
+    for (const pending of this.pendingTurnCompletions?.values?.() || []) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingTurnCompletions?.clear?.();
+  }
+
+  deferTurnCompletion(turnId, params) {
+    const key = String(turnId || '');
+    if (!key) return false;
+    const previous = this.takePendingTurnCompletion(key);
+    const pending = {
+      params: previous ? { ...previous.params, ...params } : params,
+      timer: null,
+    };
+    pending.timer = setTimeout(() => {
+      if (this.pendingTurnCompletions?.get(key) !== pending) return;
+      this.pendingTurnCompletions.delete(key);
+      void this.finalizeTurnCompletion(pending.params, key).catch((error) => {
+        this.notificationLastError = error;
+        console.error(`[codex-runner] deferred turn completion failed: ${error.message || error}`);
+      });
+    }, Math.max(25, Number(this.turnCompletionFallbackGraceMs || TURN_COMPLETION_FALLBACK_GRACE_MS)));
+    pending.timer.unref?.();
+    this.pendingTurnCompletions.set(key, pending);
+    return true;
+  }
+
+  async flushPendingTurnCompletion(turnId) {
+    const pending = this.takePendingTurnCompletion(turnId);
+    if (!pending) return false;
+    await this.finalizeTurnCompletion(pending.params, turnId);
+    return true;
+  }
+
+  async flushAllPendingTurnCompletions() {
+    const keys = Array.from(this.pendingTurnCompletions?.keys?.() || []);
+    for (const turnId of keys) {
+      await this.flushPendingTurnCompletion(turnId);
+    }
   }
 
   activityCanonicalConversationKey() {
@@ -3027,7 +3375,8 @@ class CodexAppServerRunner {
       'exitCode', 'fileChanges', 'changes', 'server', 'tool', 'arguments', 'result', 'error',
       'progress', 'progressTruncated', 'resourceUri', 'namespace', 'success', 'senderThreadId',
       'receiverThreadIds', 'prompt', 'agentsStates', 'query', 'action', 'actionData', 'path', 'review',
-      'model', 'reasoningEffort',
+      'model', 'reasoningEffort', 'agentThreadId', 'agentPath', 'agentNickname', 'agentRole',
+      'parentThreadId', 'subagentKind',
     ]) {
       if (Object.prototype.hasOwnProperty.call(identity, field)) normalized[field] = identity[field];
     }
@@ -3043,6 +3392,12 @@ class CodexAppServerRunner {
       server: 512,
       namespace: 512,
       senderThreadId: 512,
+      agentThreadId: 512,
+      agentPath: 4096,
+      agentNickname: 512,
+      agentRole: 512,
+      parentThreadId: 512,
+      subagentKind: 128,
       path: 4096,
       resourceUri: 4096,
       model: 512,
@@ -3068,7 +3423,19 @@ class CodexAppServerRunner {
       tracked = { activityKey, identity: normalized, finalized: false };
       this.thinkingActivities.set(activityKey, tracked);
     } else {
-      tracked.identity = { ...tracked.identity, ...normalized };
+      const previousIdentity = tracked.identity;
+      tracked.identity = { ...previousIdentity, ...normalized };
+      for (const field of new Set([
+        ...Object.keys(previousIdentity),
+        ...Object.keys(normalized),
+      ])) {
+        if (
+          field.endsWith('Truncated')
+          && (previousIdentity[field] === true || normalized[field] === true)
+        ) {
+          tracked.identity[field] = true;
+        }
+      }
     }
     return tracked;
   }
@@ -3112,10 +3479,14 @@ class CodexAppServerRunner {
       `${previous}${separator}${String(delta ?? '')}`,
       options.maxTextBytes || ACTIVITY_PROGRESS_MAX_BYTES
     );
+    const truncatedField = `${field}Truncated`;
     tracked.identity = {
       ...tracked.identity,
       [field]: bounded.text,
-      [`${field}Truncated`]: bounded.truncated,
+      [truncatedField]: tracked.identity[truncatedField] === true
+        || current?.[truncatedField] === true
+        || options.truncated === true
+        || bounded.truncated,
     };
     tracked.finalized = false;
     aggregator.replaceSnapshot(tracked.identity, current?.text || '', {
@@ -3824,6 +4195,33 @@ class CodexAppServerRunner {
   }
 
   async sendInput(text, options = {}) {
+    if (this.inputSubmissionInFlight || (this.activeClientRequestId && !this.activeTurnId)) {
+      const error = new Error('Codex is still accepting the previous prompt.');
+      error.code = 'session_input_preparing';
+      throw error;
+    }
+    if (this.activeTurnId) {
+      const error = new Error('Codex is still working on the previous turn.');
+      error.code = 'session_turn_active';
+      throw error;
+    }
+    this.inputSubmissionInFlight = true;
+    this.activeClientRequestId = String(options.clientRequestId || '').trim() || null;
+    try {
+      const turnId = await this.sendInputUnchecked(text, options);
+      if (!turnId) this.activeClientRequestId = null;
+      return turnId;
+    } catch (error) {
+      if (error?.code !== 'session_input_acceptance_unknown') {
+        this.activeClientRequestId = null;
+      }
+      throw error;
+    } finally {
+      this.inputSubmissionInFlight = false;
+    }
+  }
+
+  async sendInputUnchecked(text, options = {}) {
     if (!this.threadId) {
       throw new Error('codex thread is not ready yet');
     }
@@ -3835,7 +4233,9 @@ class CodexAppServerRunner {
     this.validateModelSelection(options.model, options.effort);
 
     if (this.activeTurnId) {
-      throw new Error('Codex is still working on the previous turn.');
+      const error = new Error('Codex is still working on the previous turn.');
+      error.code = 'session_turn_active';
+      throw error;
     }
 
     const normalizedItems = normalizeInputItems(text, options);
@@ -3887,47 +4287,6 @@ class CodexAppServerRunner {
     if (collaborationMode) {
       params.collaborationMode = collaborationMode;
     }
-    await this.emitRuntime({
-      busy: true,
-      phase: 'submitting-turn',
-      currentTurnStatus: 'submitting',
-      pendingInputSummary: limitText(effectivePrompt, 240),
-      lastError: null,
-      lastCodexError: null,
-      model: params.model || null,
-      effort: params.effort || null,
-      summary: params.summary || null,
-      collaborationMode: params.collaborationMode || null,
-      approvalPolicy: params.approvalPolicy || null,
-      approvalsReviewer: params.approvalsReviewer || null,
-      sandboxPolicy: params.sandboxPolicy || null,
-    });
-    await this.emitDiagnostic({
-      severity: 'info',
-      source: 'codex',
-      kind: 'control',
-      method: 'turn/start',
-      message: collaborationMode?.mode === 'plan'
-        ? 'Starting a plan-mode turn.'
-        : localPlanFallback
-          ? 'Starting a Local Plan fallback turn.'
-        : 'Starting a Codex turn.',
-      data: {
-        model: params.model || null,
-        effort: params.effort || null,
-        summary: params.summary || null,
-        collaborationMode: params.collaborationMode || null,
-        apiBaseUrl: this.apiConfig?.baseUrl || null,
-        apiProviderKey: this.apiProviderKey || null,
-        codexHomeProfile: this.runtime.codexHomeProfile || null,
-        approvalPolicy: params.approvalPolicy || null,
-        approvalsReviewer: params.approvalsReviewer || null,
-        sandboxPolicy: params.sandboxPolicy || null,
-        localPlanFallback,
-        inputTypes: params.input.map((item) => item.type),
-      },
-    });
-
     let turn = null;
     try {
       turn = await this.rpc.request('turn/start', params, TURN_START_REQUEST_TIMEOUT_MS);
@@ -3938,14 +4297,14 @@ class CodexAppServerRunner {
         && String(options.planFallback || '').trim() === 'local'
         && shouldUseLocalPlanFallback(error)
       ) {
-        await this.emitDiagnostic({
+        this.emitDiagnostic({
           severity: 'warning',
           source: 'codex',
           kind: 'control',
           method: 'turn/start',
           message: `Native Codex Plan turn failed; retrying with Local Plan fallback: ${error.message}`,
           data: { error: error.message, collaborationMode },
-        });
+        }).catch(() => {});
         const fallbackParams = normalizeTurnStartParams(
           this.threadId,
           this.cwd,
@@ -3957,34 +4316,14 @@ class CodexAppServerRunner {
             sandboxMode: 'readOnly',
           }
         );
-        await this.emitRuntime({
-          busy: true,
-          phase: 'submitting-turn',
-          currentTurnStatus: 'submitting',
-          pendingInputSummary: limitText(prompt, 240),
-          lastError: null,
-          lastCodexError: null,
-          model: fallbackParams.model || null,
-          effort: fallbackParams.effort || null,
-          summary: fallbackParams.summary || null,
-          collaborationMode: null,
-          approvalPolicy: fallbackParams.approvalPolicy || null,
-          approvalsReviewer: fallbackParams.approvalsReviewer || null,
-          sandboxPolicy: fallbackParams.sandboxPolicy || null,
-        });
         turn = await this.rpc.request('turn/start', fallbackParams, TURN_START_REQUEST_TIMEOUT_MS);
         Object.keys(params).forEach((key) => delete params[key]);
         Object.assign(params, fallbackParams);
         collaborationMode = null;
       } else {
-        await this.emitRuntime({
-          activeTurnId: null,
-          busy: false,
-          phase: 'error',
-          currentTurnStatus: 'failed',
-          pendingInputSummary: null,
-          lastCodexError: error.message || String(error),
-        }).catch(() => {});
+        error.code ||= /^Timed out waiting for turn\/start/i.test(String(error.message || ''))
+          ? 'session_input_acceptance_unknown'
+          : 'session_turn_start_failed';
         throw error;
       }
     }
@@ -3993,9 +4332,12 @@ class CodexAppServerRunner {
     const becameNativeResumeReady = this.runtime.nativeResumeReady !== true;
     if (turnId) {
       this.activeTurnId = turnId;
+      if (this.activeClientRequestId) {
+        this.clientRequestIdsByTurn.set(turnId, this.activeClientRequestId);
+      }
       this.resetTurnBuffer(turnId);
       this.turnModes.set(turnId, collaborationMode?.mode || mode || 'default');
-      await this.emitRuntime({
+      this.emitRuntime({
         ...(becameNativeResumeReady ? { nativeResumeReady: true } : {}),
         activeTurnId: turnId,
         busy: true,
@@ -4012,11 +4354,37 @@ class CodexAppServerRunner {
         sandboxPolicy: params.sandboxPolicy || null,
         reasoningSummary: null,
         planSummary: null,
-      });
+      }).catch(() => {});
     } else if (becameNativeResumeReady) {
-      await this.emitRuntime({ nativeResumeReady: true });
+      this.emitRuntime({ nativeResumeReady: true }).catch(() => {});
     }
-    await this.postEvent({
+    this.emitDiagnostic({
+      severity: 'info',
+      source: 'codex',
+      kind: 'control',
+      method: 'turn/start',
+      message: collaborationMode?.mode === 'plan'
+        ? 'Started a plan-mode turn.'
+        : localPlanFallback
+          ? 'Started a Local Plan fallback turn.'
+          : 'Started a Codex turn.',
+      data: {
+        turnId,
+        model: params.model || null,
+        effort: params.effort || null,
+        summary: params.summary || null,
+        collaborationMode: params.collaborationMode || null,
+        apiBaseUrl: this.apiConfig?.baseUrl || null,
+        apiProviderKey: this.apiProviderKey || null,
+        codexHomeProfile: this.runtime.codexHomeProfile || null,
+        approvalPolicy: params.approvalPolicy || null,
+        approvalsReviewer: params.approvalsReviewer || null,
+        sandboxPolicy: params.sandboxPolicy || null,
+        localPlanFallback,
+        inputTypes: params.input.map((item) => item.type),
+      },
+    }).catch(() => {});
+    this.postEvent({
       type: 'session.selection_confirmed',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
@@ -4160,9 +4528,113 @@ class CodexAppServerRunner {
 
   cleanupManagedOverlay() {
     if (this.overlayCleaned) return false;
-    const cleaned = cleanupApiProfileCodexHome(this.apiProfileCleanupOwner);
-    if (cleaned) this.overlayCleaned = true;
+    const cleanupOwner = this.apiProfileCleanupOwner;
+    if (!cleanupOwner) return false;
+    const cleaned = cleanupApiProfileCodexHome(cleanupOwner);
+    if (cleaned) {
+      this.overlayCleaned = true;
+      this.overlayCleanupRetryAttempt = 0;
+      this.overlayCleanupLastError = null;
+      if (this.overlayCleanupRetryTimer) {
+        clearTimeout(this.overlayCleanupRetryTimer);
+        this.overlayCleanupRetryTimer = null;
+      }
+    }
     return cleaned;
+  }
+
+  scheduleManagedOverlayCleanupRetry(context) {
+    if (
+      this.overlayCleaned
+      || !this.apiProfileCleanupOwner
+      || this.overlayCleanupRetryTimer
+    ) {
+      return Boolean(this.overlayCleanupRetryTimer);
+    }
+    if (this.overlayCleanupRetryAttempt >= this.overlayCleanupRetryMaxAttempts) {
+      return false;
+    }
+    const nextAttempt = this.overlayCleanupRetryAttempt + 1;
+    const delayMs = this.overlayCleanupRetryDelayMs * nextAttempt;
+    this.overlayCleanupRetryTimer = setTimeout(() => {
+      this.overlayCleanupRetryTimer = null;
+      if (this.overlayCleaned || !this.apiProfileCleanupOwner) return;
+      this.overlayCleanupRetryAttempt = nextAttempt;
+      try {
+        if (this.cleanupManagedOverlay()) return;
+        const error = new Error('Owned Codex overlay ownership could not be verified during retry.');
+        error.code = 'session_overlay_cleanup_unverified';
+        throw error;
+      } catch (error) {
+        const failure = managedOverlayCleanupError(
+          error,
+          this.apiProfileCleanupOwner.profileHomeDir
+        );
+        failure.cleanupContext = context;
+        this.overlayCleanupLastError = failure;
+        if (!this.scheduleManagedOverlayCleanupRetry(context)) {
+          console.error(
+            '[codex-runner] managed overlay cleanup retries exhausted'
+            + ' (' + context + '): '
+            + (failure.cause?.message || failure.message)
+          );
+        }
+      }
+    }, delayMs);
+    this.overlayCleanupRetryTimer.unref?.();
+    return true;
+  }
+
+  deferManagedOverlayCleanup(error, context) {
+    const target = this.apiProfileCleanupOwner?.profileHomeDir || this.profileHomeDir;
+    const failure = managedOverlayCleanupError(error, target);
+    failure.cleanupContext = context;
+    this.overlayCleanupLastError = failure;
+    const retryScheduled = this.scheduleManagedOverlayCleanupRetry(context);
+    if (!this.overlayCleanupDiagnosticReported) {
+      this.overlayCleanupDiagnosticReported = true;
+      void this.emitDiagnostic({
+        severity: 'warning',
+        source: 'runtime',
+        kind: 'managed-overlay-cleanup',
+        message: retryScheduled
+          ? 'Managed Codex session files could not be removed immediately; cleanup will retry in the background.'
+          : 'Managed Codex session files could not be removed; startup recovery will retry later.',
+        detail: failure.cause?.message || failure.message,
+        data: {
+          code: failure.cleanupErrorCode || failure.cause?.code || null,
+          path: failure.path || target || null,
+          context,
+          retryScheduled,
+        },
+      }).catch((diagnosticError) => {
+        console.error(
+          '[codex-runner] managed overlay cleanup diagnostic failed: '
+          + (diagnosticError?.message || diagnosticError)
+        );
+      });
+    }
+    if (!retryScheduled) {
+      console.error(
+        '[codex-runner] managed overlay cleanup deferred to startup recovery'
+        + ' (' + context + '): '
+        + (failure.cause?.message || failure.message)
+      );
+    }
+    return failure;
+  }
+
+  cleanupManagedOverlayAfterExit(context) {
+    if (this.overlayCleaned || !this.apiProfileCleanupOwner) return true;
+    try {
+      if (this.cleanupManagedOverlay()) return true;
+      const error = new Error('Owned Codex overlay ownership could not be verified after process exit.');
+      error.code = 'session_overlay_cleanup_unverified';
+      throw error;
+    } catch (error) {
+      this.deferManagedOverlayCleanup(error, context);
+      return false;
+    }
   }
 
   applyStopOptions(options = {}) {
@@ -4204,32 +4676,13 @@ class CodexAppServerRunner {
       );
       if (remaining) terminalErrors.push(remaining);
     };
-    let activityFlushError = null;
-    try {
-      await this.drainNotifications();
-      if (this.agentEventsSuppressed) {
-        await this.discardThinkingActivities();
-      } else {
-        await this.finalizeThinkingActivities();
-      }
-    } catch (error) {
-      activityFlushError = error;
-    }
-    if (this.agentEventsSuppressed && this.thinkingActivities.size) {
+    if (
+      this.agentEventsSuppressed
+      && (this.thinkingActivities.size || this.activitySnapshotDeliveryErrors?.size)
+    ) {
       await this.discardThinkingActivities();
     }
     const finishStop = () => {
-      const remainingActivityError = errorWithoutSuppressedTerminalDelivery(
-        activityFlushError,
-        this.agentEventsSuppressed
-      );
-      if (
-        remainingActivityError
-        && this.activitySnapshotDeliveryErrors?.size
-        && !terminalErrors.includes(remainingActivityError)
-      ) {
-        terminalErrors.push(remainingActivityError);
-      }
       throwTerminalErrors(terminalErrors, 'Codex runner stop did not complete cleanly.');
     };
     const child = this.child;
@@ -4299,7 +4752,7 @@ class CodexAppServerRunner {
         timer.unref?.();
         child.once('exit', finish);
         child.once('error', finish);
-        child.kill('SIGKILL');
+        forceKillChildProcessTree(child);
       });
     }
     if (this.terminationPromise) {
@@ -4325,56 +4778,115 @@ class CodexAppServerRunner {
     finishStop();
   }
 
-  async interruptTurn() {
-    if (!this.threadId || !this.activeTurnId) {
-      return false;
+  async interruptActiveTurn(options = {}) {
+    const interruptedTurnId = String(this.activeTurnId || '').trim();
+    if (!this.threadId || !interruptedTurnId) {
+      return {
+        status: 'no_active',
+        interruptRequestId: options.interruptRequestId || null,
+        turnId: null,
+        clientRequestId: this.activeClientRequestId || null,
+      };
     }
-
-    const interruptedTurnId = this.activeTurnId;
-    await this.emitRuntime({
+    const interruptedClientRequestId = this.clientRequestIdForTurn(interruptedTurnId);
+    const previousRuntime = this.runtime;
+    const interruptingPatch = {
+      clientRequestId: interruptedClientRequestId,
       busy: true,
       phase: 'interrupting',
       currentTurnStatus: 'inProgress',
-    });
-    await this.rpc.request('turn/interrupt', {
-      threadId: this.threadId,
-      turnId: interruptedTurnId,
-    });
-    let activityFlushError = null;
+    };
+    this.runtime = {
+      ...this.runtime,
+      ...interruptingPatch,
+      updatedAt: nowIso(),
+    };
     try {
-      await this.drainNotifications();
-      await this.finalizeThinkingActivities({ turnId: interruptedTurnId });
+      await this.rpc.request('turn/interrupt', {
+        threadId: this.threadId,
+        turnId: interruptedTurnId,
+      });
     } catch (error) {
-      activityFlushError = error;
+      this.runtime = previousRuntime;
+      throw error;
     }
     if (this.activeTurnId === interruptedTurnId) {
-      this.activeTurnId = null;
-      this.releaseTurnBuffer(interruptedTurnId);
-      this.turnModes.delete(interruptedTurnId);
-      this.planBuffers.delete(interruptedTurnId);
-      this.reasoningBuffers.delete(interruptedTurnId);
+      await this.emitRuntime(interruptingPatch);
     }
-    await this.emitDiagnostic({
+    this.emitDiagnostic({
       severity: 'warning',
       source: 'codex',
       kind: 'control',
       method: 'turn/interrupt',
-      message: 'Interrupt requested for the active turn.',
-    });
-    await this.resolvePendingRequestsForClosedTurn(
-      'interrupted',
-      'Request closed because the Codex turn was interrupted.'
-    );
-    await this.emitRuntime({
-      activeTurnId: null,
-      busy: false,
-      waitingOnApproval: false,
-      waitingOnUserInput: false,
-      phase: 'interrupted',
-      currentTurnStatus: 'interrupted',
-    });
-    if (activityFlushError) throw activityFlushError;
-    return true;
+      message: 'Interrupt accepted; waiting for the matching turn terminal event.',
+    }).catch(() => {});
+    return {
+      status: 'accepted',
+      interruptRequestId: options.interruptRequestId || null,
+      turnId: interruptedTurnId,
+      clientRequestId: interruptedClientRequestId,
+    };
+  }
+
+  async interruptTurn(options = {}) {
+    const expectedTurnId = String(options.expectedTurnId || '').trim();
+    const expectedClientRequestId = String(options.expectedClientRequestId || '').trim();
+    const activeTurnId = String(this.activeTurnId || '').trim();
+    const activeClientRequestId = activeTurnId
+      ? String(this.clientRequestIdForTurn(activeTurnId) || '').trim()
+      : String(this.activeClientRequestId || '').trim();
+
+    if (
+      (expectedTurnId && activeTurnId && expectedTurnId !== activeTurnId)
+      || (expectedClientRequestId && activeClientRequestId && expectedClientRequestId !== activeClientRequestId)
+    ) {
+      return {
+        status: 'no_active',
+        interruptRequestId: options.interruptRequestId || null,
+        turnId: activeTurnId || null,
+        clientRequestId: activeClientRequestId || null,
+        reason: 'active_turn_changed',
+      };
+    }
+
+    if (activeTurnId) {
+      return this.interruptActiveTurn(options);
+    }
+
+    if (this.threadId && activeClientRequestId) {
+      this.pendingInterruptIntent = {
+        interruptRequestId: options.interruptRequestId || null,
+        expectedClientRequestId: expectedClientRequestId || activeClientRequestId,
+        requestedAt: nowIso(),
+      };
+      await this.emitRuntime({
+        clientRequestId: activeClientRequestId,
+        activeTurnId: null,
+        busy: true,
+        phase: 'interrupting',
+        currentTurnStatus: 'submitting',
+      });
+      await this.emitDiagnostic({
+        severity: 'warning',
+        source: 'codex',
+        kind: 'control',
+        method: 'turn/interrupt',
+        message: 'Interrupt is pending until Codex identifies the submitted turn.',
+      });
+      return {
+        status: 'pending',
+        interruptRequestId: options.interruptRequestId || null,
+        turnId: null,
+        clientRequestId: activeClientRequestId,
+      };
+    }
+
+    return {
+      status: 'no_active',
+      interruptRequestId: options.interruptRequestId || null,
+      turnId: null,
+      clientRequestId: activeClientRequestId || null,
+    };
   }
 
   async steerTurn(text) {
@@ -4556,10 +5068,15 @@ class CodexAppServerRunner {
     const key = String(requestId || '');
     const pending = this.pendingRequests.get(key);
     if (!pending) {
+      if (this.resolvedRequests.has(key)) {
+        return {
+          ok: true,
+          duplicate: true,
+          requestId: key,
+        };
+      }
       throw new Error(`No pending Codex request found for ${key}`);
     }
-
-    this.pendingRequests.delete(key);
 
     if (pending.method === 'item/tool/requestUserInput') {
       await this.rpc.respond(pending.message.id, {
@@ -4586,6 +5103,15 @@ class CodexAppServerRunner {
       });
     } else {
       throw new Error(`Unsupported pending request method: ${pending.method}`);
+    }
+
+    this.pendingRequests.delete(key);
+    this.resolvedRequests.set(key, {
+      method: pending.method,
+      resolvedAt: Date.now(),
+    });
+    while (this.resolvedRequests.size > 64) {
+      this.resolvedRequests.delete(this.resolvedRequests.keys().next().value);
     }
 
     await this.emitRequestResolved({
@@ -4615,6 +5141,10 @@ class CodexAppServerRunner {
     const pendingEntries = Array.from(this.pendingRequests.entries());
     this.pendingRequests.clear();
     for (const [requestId, pending] of pendingEntries) {
+      this.resolvedRequests.set(requestId, {
+        method: pending.method,
+        resolvedAt: Date.now(),
+      });
       await this.emitRequestResolved({
         requestId,
         status: status || 'expired',
@@ -4644,6 +5174,146 @@ class CodexAppServerRunner {
     };
   }
 
+  clientRequestIdForTurn(turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    if (!normalizedTurnId) return null;
+    return (this.clientRequestIdsByTurn instanceof Map
+      ? this.clientRequestIdsByTurn.get(normalizedTurnId)
+      : null)
+      || (normalizedTurnId === String(this.activeTurnId || '').trim()
+        ? this.activeClientRequestId
+        : null)
+      || null;
+  }
+
+  bindClientRequestIdToTurn(turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    const clientRequestId = String(this.activeClientRequestId || '').trim();
+    if (normalizedTurnId && clientRequestId) {
+      if (!(this.clientRequestIdsByTurn instanceof Map)) {
+        this.clientRequestIdsByTurn = new Map();
+      }
+      this.clientRequestIdsByTurn.set(normalizedTurnId, clientRequestId);
+    }
+    return clientRequestId || null;
+  }
+
+  adoptPendingTurnIdentity(turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    if (!normalizedTurnId || this.activeTurnId || !this.activeClientRequestId) return false;
+    this.activeTurnId = normalizedTurnId;
+    this.bindClientRequestIdToTurn(normalizedTurnId);
+    if (!this.turnBuffers.has(normalizedTurnId)) this.resetTurnBuffer(normalizedTurnId);
+    return true;
+  }
+
+  async resolvePendingInterruptForTerminalTurn(turnId, status = 'completed') {
+    const intent = this.pendingInterruptIntent;
+    if (!intent) return false;
+    const clientRequestId = this.clientRequestIdForTurn(turnId);
+    if (
+      intent.expectedClientRequestId
+      && clientRequestId
+      && intent.expectedClientRequestId !== clientRequestId
+    ) {
+      return false;
+    }
+    this.pendingInterruptIntent = null;
+    await this.postEvent({
+      type: 'session.interrupt_result',
+      hostId: this.hostId,
+      sessionId: this.currentSessionId(),
+      runId: this.runId,
+      interruptRequestId: intent.interruptRequestId || null,
+      status: 'no_active',
+      reason: `turn_already_${String(status || 'completed')}`,
+      turnId: turnId || null,
+      clientRequestId: clientRequestId || null,
+      timestamp: nowIso(),
+    });
+    return true;
+  }
+
+  releaseClientRequestIdForTurn(turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    if (!normalizedTurnId) return null;
+    const clientRequestId = this.clientRequestIdForTurn(normalizedTurnId);
+    this.clientRequestIdsByTurn?.delete?.(normalizedTurnId);
+    if (
+      normalizedTurnId === String(this.activeTurnId || '').trim()
+      || (clientRequestId && clientRequestId === this.activeClientRequestId)
+    ) {
+      this.activeClientRequestId = null;
+    }
+    if (
+      clientRequestId
+      && this.pendingInterruptIntent?.expectedClientRequestId === clientRequestId
+    ) {
+      this.pendingInterruptIntent = null;
+    }
+    return clientRequestId;
+  }
+
+  async applyPendingInterruptIntent(turnId) {
+    const intent = this.pendingInterruptIntent;
+    if (!intent) return false;
+    const clientRequestId = this.clientRequestIdForTurn(turnId);
+    if (
+      intent.expectedClientRequestId
+      && intent.expectedClientRequestId !== clientRequestId
+    ) {
+      this.pendingInterruptIntent = null;
+      await this.postEvent({
+        type: 'session.interrupt_result',
+        hostId: this.hostId,
+        sessionId: this.currentSessionId(),
+        runId: this.runId,
+        interruptRequestId: intent.interruptRequestId || null,
+        status: 'no_active',
+        reason: 'active_turn_changed',
+        turnId: turnId || null,
+        clientRequestId: clientRequestId || null,
+        timestamp: nowIso(),
+      });
+      return false;
+    }
+
+    this.pendingInterruptIntent = null;
+    try {
+      const result = await this.interruptActiveTurn(intent);
+      await this.postEvent({
+        type: 'session.interrupt_result',
+        hostId: this.hostId,
+        sessionId: this.currentSessionId(),
+        runId: this.runId,
+        ...result,
+        timestamp: nowIso(),
+      });
+      return result.status === 'accepted';
+    } catch (error) {
+      await this.emitRuntime({
+        clientRequestId: clientRequestId || null,
+        activeTurnId: turnId || null,
+        busy: Boolean(turnId),
+        phase: turnId ? 'thinking' : 'idle',
+        currentTurnStatus: turnId ? 'inProgress' : 'idle',
+      }).catch(() => {});
+      await this.postEvent({
+        type: 'session.interrupt_result',
+        hostId: this.hostId,
+        sessionId: this.currentSessionId(),
+        runId: this.runId,
+        interruptRequestId: intent.interruptRequestId || null,
+        status: 'failed',
+        error: error?.message || String(error),
+        turnId: turnId || null,
+        clientRequestId: clientRequestId || null,
+        timestamp: nowIso(),
+      });
+      return false;
+    }
+  }
+
   async emitActiveTurnRecoveryIfNeeded(turnId, patch = {}) {
     if (!this.runtime.lastError && !this.runtime.lastCodexError) {
       return false;
@@ -4659,6 +5329,9 @@ class CodexAppServerRunner {
   async handleNotification(message) {
     const method = message.method;
     const params = message.params || {};
+    if (method === 'item/started' || method === 'item/completed') {
+      this.rememberNotificationItemPhase(params);
+    }
 
     if (method === 'thread/started' && params.thread?.id) {
       this.threadId = params.thread.id;
@@ -4687,6 +5360,7 @@ class CodexAppServerRunner {
       const type = status?.type || 'unknown';
       if (type === 'systemError') {
         const turnId = params.turnId || this.activeTurnId;
+        const clientRequestId = this.clientRequestIdForTurn(turnId);
         const errorText = String(
           params.error?.message
           || status?.message
@@ -4707,6 +5381,7 @@ class CodexAppServerRunner {
           'Request closed because the Codex thread entered a system error state.'
         );
         await this.emitRuntime({
+          clientRequestId,
           threadStatus: status,
           phase: 'error',
           activeTurnId: null,
@@ -4715,14 +5390,20 @@ class CodexAppServerRunner {
           waitingOnUserInput: false,
           currentTurnStatus: 'failed',
           pendingInputSummary: null,
+          pendingClientRequestId: null,
           queuedCommandId: null,
+          queuedInputAt: null,
           lastError: errorText,
           lastCodexError: codexError,
         });
+        this.releaseClientRequestIdForTurn(turnId);
         await this.postEvent({
           type: 'session.error',
           hostId: this.hostId,
           sessionId: this.currentSessionId(),
+          runId: this.runId,
+          turnId: turnId || null,
+          clientRequestId,
           message: errorText,
           timestamp: nowIso(),
         });
@@ -4808,10 +5489,22 @@ class CodexAppServerRunner {
 
     if (method === 'turn/started') {
       this.activeTurnId = params.turn?.id || params.turnId || this.activeTurnId;
+      this.bindClientRequestIdToTurn(this.activeTurnId);
       if (this.activeTurnId && !this.turnBuffers.has(this.activeTurnId)) {
         this.resetTurnBuffer(this.activeTurnId);
       }
       const turnMode = this.activeTurnId ? this.turnModes.get(this.activeTurnId) : '';
+      if (await this.applyPendingInterruptIntent(this.activeTurnId)) {
+        await this.emitDiagnostic({
+          severity: 'info',
+          source: 'codex',
+          kind: 'turn',
+          method,
+          message: `Turn started and pending interrupt was applied${this.activeTurnId ? `: ${this.activeTurnId}` : ''}`,
+          data: params.turn || null,
+        });
+        return;
+      }
       await this.emitRuntime({
         activeTurnId: this.activeTurnId,
         busy: true,
@@ -4865,7 +5558,7 @@ class CodexAppServerRunner {
       if (text) {
         await this.emitActiveTurnRecoveryIfNeeded(turnId, { phase: 'thinking' });
       }
-      if (notificationPhase(params) === 'commentary') {
+      if (this.resolvedNotificationPhase(params) === 'commentary') {
         if (text) {
           await this.emitDiagnostic({
             severity: 'info',
@@ -4891,7 +5584,8 @@ class CodexAppServerRunner {
     if (method === 'item/commandExecution/outputDelta' || method === 'process/outputDelta' || method === 'command/exec/outputDelta') {
       const turnId = params.turnId || this.activeTurnId;
       const outputDelta = String(params.delta || params.deltaBase64 || '');
-      if (outputDelta) {
+      const outputTruncated = params.capReached === true || params.truncated === true;
+      if (outputDelta || outputTruncated) {
         await this.emitActiveTurnRecoveryIfNeeded(turnId);
         const commandActivityIdentity = {
           turnId,
@@ -4906,12 +5600,13 @@ class CodexAppServerRunner {
             ? { processId: params.processId || params.processHandle }
             : {}),
           ...(params.source ? { source: params.source } : {}),
+          ...(outputTruncated ? { outputTruncated: true } : {}),
         };
         this.appendActivityFieldDelta(
           commandActivityIdentity,
           'output',
           outputDelta,
-          { maxTextBytes: ACTIVITY_OUTPUT_MAX_BYTES }
+          { maxTextBytes: ACTIVITY_OUTPUT_MAX_BYTES, truncated: outputTruncated }
         );
         const outputStream = String(params.stream || '').toLowerCase();
         if (outputStream === 'stdout' || outputStream === 'stderr') {
@@ -5149,6 +5844,50 @@ class CodexAppServerRunner {
     if (method === 'item/completed') {
       const turnId = params.turnId || this.activeTurnId;
       const itemId = params.item?.id || params.itemId;
+      if (isAppServerAssistantMessageItem(params.item)) {
+        const phase = this.resolvedNotificationPhase({ ...params, itemId });
+        const text = appServerAssistantMessageText(
+          params.item,
+          turnId ? this.turnBuffers.get(turnId) : ''
+        );
+        if (phase !== 'commentary' && text && itemId) {
+          const timestamp = nowIso();
+          const assistantObservation = normalizeAssistantObservation({
+            nativeThreadId: this.nativeThreadId || this.threadId || this.currentSessionId(),
+            protocolTurnId: turnId,
+            protocolItemId: itemId,
+            role: 'assistant',
+            phase: phase || 'final',
+            text,
+            finalized: true,
+            sourceTimestamp: params.item?.timestamp || timestamp,
+            observedAt: timestamp,
+          });
+          if (assistantObservation) {
+            await this.postEvent({
+              type: 'session.transcript',
+              hostId: this.hostId,
+              sessionId: this.currentSessionId(),
+              nativeThreadId: this.nativeThreadId || this.threadId || this.currentSessionId(),
+              runId: this.runId,
+              clientRequestId: this.clientRequestIdForTurn(turnId),
+              source: 'codex-app-server',
+              speaker: 'agent',
+              text,
+              assistantObservation,
+              timestamp,
+            });
+            if (turnId) {
+              if (!(this.turnAssistantTranscriptEmitted instanceof Set)) {
+                this.turnAssistantTranscriptEmitted = new Set();
+              }
+              this.turnAssistantTranscriptEmitted.add(turnId);
+            }
+          }
+        }
+        await this.flushPendingTurnCompletion(turnId);
+        return;
+      }
       if (params.item?.type === 'reasoning') {
         await this.emitActiveTurnRecoveryIfNeeded(turnId);
         const summaries = Array.isArray(params.item.summary) ? params.item.summary : [];
@@ -5192,53 +5931,14 @@ class CodexAppServerRunner {
 
     if (method === 'turn/completed') {
       const turnId = params.turn?.id || params.turnId || this.activeTurnId;
-      let activityFlushError = null;
-      try {
-        await this.finalizeThinkingActivities({ turnId });
-      } catch (error) {
-        activityFlushError = error;
-      }
+      this.adoptPendingTurnIdentity(turnId);
+      await this.resolvePendingInterruptForTerminalTurn(turnId, params.turn?.status?.type || 'completed');
       const text = turnId ? (this.turnBuffers.get(turnId) || '').trim() : '';
-      if (text) {
-        await this.emitOutput(text, 'stdout');
+      if (text && !this.turnAssistantTranscriptEmitted?.has(turnId)) {
+        this.deferTurnCompletion(turnId, params);
+        return;
       }
-      if (turnId) {
-        this.releaseTurnBuffer(turnId);
-        this.turnModes.delete(turnId);
-        this.planBuffers.delete(turnId);
-        this.reasoningBuffers.delete(turnId);
-      }
-      if (turnId && turnId === this.activeTurnId) {
-        this.activeTurnId = null;
-      }
-      await this.resolvePendingRequestsForClosedTurn(
-        params.turn?.status?.type === 'failed' ? 'failed' : 'expired',
-        `Request closed because the turn completed as ${params.turn?.status?.type || 'completed'}.`
-      );
-      await this.emitRuntime({
-        activeTurnId: null,
-        busy: false,
-        waitingOnApproval: false,
-        waitingOnUserInput: false,
-        phase: params.turn?.status?.type === 'interrupted'
-          ? 'interrupted'
-          : params.turn?.status?.type === 'failed'
-            ? 'error'
-            : 'idle',
-        currentTurnStatus: params.turn?.status?.type || 'completed',
-        ...(params.turn?.status?.type === 'failed'
-          ? {}
-          : { lastError: null, lastCodexError: null }),
-      });
-      await this.emitDiagnostic({
-        severity: params.turn?.status?.type === 'failed' ? 'error' : 'info',
-        source: 'codex',
-        kind: 'turn',
-        method,
-        message: `Turn completed: ${params.turn?.status?.type || 'completed'}`,
-        data: params.turn || null,
-      });
-      if (activityFlushError) throw activityFlushError;
+      await this.finalizeTurnCompletion(params, turnId);
       return;
     }
 
@@ -5261,6 +5961,15 @@ class CodexAppServerRunner {
 
     if (method === 'error') {
       const turnId = params.turnId || this.activeTurnId;
+      this.adoptPendingTurnIdentity(turnId);
+      if (!params.willRetry) {
+        await this.resolvePendingInterruptForTerminalTurn(turnId, 'failed');
+      }
+      const affectsActiveTurn = Boolean(
+        turnId
+        && String(turnId) === String(this.activeTurnId || '')
+      );
+      const clientRequestId = this.clientRequestIdForTurn(turnId);
       const pieces = [params.error?.message || 'codex error'];
       if (params.error?.additionalDetails) {
         pieces.push(params.error.additionalDetails);
@@ -5268,8 +5977,29 @@ class CodexAppServerRunner {
       const text = pieces.filter(Boolean).join('\n');
       const codexError = describeCodexError(params.error?.codexErrorInfo || null);
       let activityFlushError = null;
+      if (!affectsActiveTurn) {
+        await this.finalizeThinkingActivities({ turnId }).catch(() => {});
+        this.releaseTurnBuffer(turnId);
+        this.releaseTurnItemPhases(turnId);
+        this.turnModes.delete(turnId);
+        this.planBuffers.delete(turnId);
+        this.reasoningBuffers.delete(turnId);
+        this.releaseClientRequestIdForTurn(turnId);
+        await this.emitDiagnostic({
+          severity: 'info',
+          source: 'codex',
+          kind: 'error',
+          method,
+          message: `Ignored late error for inactive turn ${turnId || '(unknown)'}: ${text}`,
+          detail: codexError || null,
+          data: params.error || null,
+          turnId: turnId || null,
+        });
+        return;
+      }
       if (params.willRetry) {
         await this.emitRuntime({
+          clientRequestId,
           phase: String(codexError || '').startsWith('responseStreamDisconnected') ? 'reconnecting' : 'retrying',
           lastError: text,
           lastCodexError: codexError,
@@ -5293,6 +6023,7 @@ class CodexAppServerRunner {
           'Request closed because the Codex turn failed.'
         );
         await this.emitRuntime({
+          clientRequestId,
           phase: codexError === 'usageLimitExceeded' || codexError === 'contextWindowExceeded' ? 'quota-exhausted' : 'error',
           activeTurnId: null,
           busy: false,
@@ -5300,14 +6031,20 @@ class CodexAppServerRunner {
           waitingOnUserInput: false,
           currentTurnStatus: 'failed',
           pendingInputSummary: null,
+          pendingClientRequestId: null,
           queuedCommandId: null,
+          queuedInputAt: null,
           lastError: text,
           lastCodexError: codexError,
         });
+        this.releaseClientRequestIdForTurn(turnId);
         await this.postEvent({
           type: 'session.error',
           hostId: this.hostId,
           sessionId: this.currentSessionId(),
+          runId: this.runId,
+          turnId: turnId || null,
+          clientRequestId,
           message: text,
           timestamp: nowIso(),
         });
@@ -5322,6 +6059,7 @@ class CodexAppServerRunner {
         data: params.error || null,
       });
       if (turnId && !params.willRetry) {
+        this.turnAssistantTranscriptEmitted?.delete(turnId);
         this.releaseTurnBuffer(turnId);
         this.turnModes.delete(turnId);
         this.planBuffers.delete(turnId);
@@ -5341,6 +6079,79 @@ class CodexAppServerRunner {
     });
   }
 
+  async finalizeTurnCompletion(params, turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    const completesActiveTurn = Boolean(
+      normalizedTurnId
+      && normalizedTurnId === String(this.activeTurnId || '').trim()
+    );
+    const completedClientRequestId = this.clientRequestIdForTurn(normalizedTurnId);
+    let activityFlushError = null;
+    try {
+      await this.finalizeThinkingActivities({ turnId });
+    } catch (error) {
+      activityFlushError = error;
+    }
+    const text = turnId ? (this.turnBuffers.get(turnId) || '').trim() : '';
+    if (text && !this.turnAssistantTranscriptEmitted?.has(turnId)) {
+      await this.emitOutput(text, 'stdout', {
+        clientRequestId: this.clientRequestIdForTurn(turnId),
+      });
+    }
+    if (turnId) {
+      this.turnAssistantTranscriptEmitted?.delete(turnId);
+      this.releaseTurnBuffer(turnId);
+      this.releaseTurnItemPhases(turnId);
+      this.turnModes.delete(turnId);
+      this.planBuffers.delete(turnId);
+      this.reasoningBuffers.delete(turnId);
+    }
+    if (completesActiveTurn) {
+      this.activeTurnId = null;
+    }
+    if (completesActiveTurn) {
+      await this.resolvePendingRequestsForClosedTurn(
+        params.turn?.status?.type === 'failed' ? 'failed' : 'expired',
+        `Request closed because the turn completed as ${params.turn?.status?.type || 'completed'}.`
+      );
+      await this.emitRuntime({
+        clientRequestId: completedClientRequestId,
+        activeTurnId: null,
+        busy: false,
+        waitingOnApproval: false,
+        waitingOnUserInput: false,
+        phase: params.turn?.status?.type === 'interrupted'
+          ? 'interrupted'
+          : params.turn?.status?.type === 'failed'
+            ? 'error'
+            : 'idle',
+        currentTurnStatus: params.turn?.status?.type || 'completed',
+        pendingInputSummary: null,
+        pendingClientRequestId: null,
+        queuedCommandId: null,
+        queuedInputAt: null,
+        ...(params.turn?.status?.type === 'failed'
+          ? {}
+          : { lastError: null, lastCodexError: null }),
+      });
+    }
+    this.releaseClientRequestIdForTurn(normalizedTurnId);
+    await this.emitDiagnostic({
+      severity: params.turn?.status?.type === 'failed' && completesActiveTurn ? 'error' : 'info',
+      source: 'codex',
+      kind: 'turn',
+      method: 'turn/completed',
+      message: completesActiveTurn
+        ? `Turn completed: ${params.turn?.status?.type || 'completed'}`
+        : `Ignored late completion for inactive turn ${normalizedTurnId || '(unknown)'}.`,
+      data: {
+        ...(params.turn || {}),
+        activeRuntimeChanged: completesActiveTurn,
+      },
+    });
+    if (activityFlushError) throw activityFlushError;
+  }
+
   async handleServerRequest(message) {
     const method = message.method;
     const params = message.params || {};
@@ -5350,6 +6161,7 @@ class CodexAppServerRunner {
         ? params.questions.map((question) => question.header || question.id || 'question').join(', ')
         : 'question';
       const requestId = String(message.id);
+      this.resolvedRequests.delete(requestId);
       this.pendingRequests.set(requestId, {
         message,
         method,
@@ -5380,6 +6192,7 @@ class CodexAppServerRunner {
 
     if (method === 'item/commandExecution/requestApproval') {
       const requestId = String(message.id);
+      this.resolvedRequests.delete(requestId);
       const command = String(params.command || '').trim();
       this.pendingRequests.set(requestId, {
         message,
@@ -5400,6 +6213,7 @@ class CodexAppServerRunner {
         message: params.reason || command || 'Command approval required',
         summary: command || params.reason || null,
         payload: params,
+        availableDecisions: params.availableDecisions || [],
       });
       await this.emitAlert({
         severity: 'warning',
@@ -5411,6 +6225,7 @@ class CodexAppServerRunner {
 
     if (method === 'item/fileChange/requestApproval') {
       const requestId = String(message.id);
+      this.resolvedRequests.delete(requestId);
       const fileChanges = normalizeAppServerFileChanges(params.fileChanges);
       this.pendingRequests.set(requestId, {
         message,
@@ -5431,6 +6246,7 @@ class CodexAppServerRunner {
         message: params.reason || params.grantRoot || 'File change approval required',
         summary: params.reason || params.grantRoot || null,
         payload: params,
+        availableDecisions: params.availableDecisions || [],
       });
       if (fileChanges.length) {
         await this.emitDiagnostic({
@@ -5457,6 +6273,7 @@ class CodexAppServerRunner {
 
     if (method === 'item/permissions/requestApproval') {
       const requestId = String(message.id);
+      this.resolvedRequests.delete(requestId);
       this.pendingRequests.set(requestId, {
         message,
         method,
@@ -5512,6 +6329,7 @@ class CodexAppServerRunner {
     const terminalErrors = [];
     try {
       await this.drainNotifications();
+      await this.flushAllPendingTurnCompletions();
       if (this.agentEventsSuppressed) {
         await this.discardThinkingActivities();
       } else {
@@ -5527,7 +6345,6 @@ class CodexAppServerRunner {
     if (this.agentEventsSuppressed && this.thinkingActivities.size) {
       await this.discardThinkingActivities();
     }
-    let overlayCleanupError = null;
     try {
       updateApiProfileCodexHomeOwnership(this.apiProfileCleanupOwner, {
         childPid: this.child?.pid || null,
@@ -5537,15 +6354,10 @@ class CodexAppServerRunner {
       // Ownership metadata is advisory once the child has confirmed exit.
       // Cleanup still verifies the original owner token before removal.
     }
-    try {
-      if (!this.cleanupManagedOverlay() && this.apiProfileCleanupOwner) {
-        overlayCleanupError = new Error('Owned Codex overlay could not be removed after process exit.');
-        overlayCleanupError.code = 'session_overlay_cleanup_failed';
-      }
-    } catch (error) {
-      overlayCleanupError = error;
-    }
     this.activeTurnId = null;
+    this.activeClientRequestId = null;
+    this.clientRequestIdsByTurn?.clear?.();
+    this.pendingInterruptIntent = null;
     this.clearTurnBuffers();
     this.turnModes.clear();
     this.planBuffers.clear();
@@ -5568,6 +6380,10 @@ class CodexAppServerRunner {
         phase: 'closed',
         currentTurnStatus: 'closed',
         pendingInputSummary: null,
+        pendingClientRequestId: null,
+        queuedCommandId: null,
+        queuedInputAt: null,
+        clientRequestId: null,
       }).catch(() => {});
       if (typeof this.onTerminated === 'function') {
         try {
@@ -5594,29 +6410,13 @@ class CodexAppServerRunner {
         }
       }
     } finally {
-      if (!this.overlayCleaned) {
-        try {
-          if (this.cleanupManagedOverlay()) overlayCleanupError = null;
-        } catch (error) {
-          overlayCleanupError = error;
-        }
-      }
+      this.cleanupManagedOverlayAfterExit('process-exit');
     }
-    if (overlayCleanupError) terminalErrors.push(overlayCleanupError);
     throwTerminalErrors(terminalErrors, 'Codex runner termination did not complete cleanly.');
   }
 
   async finalizePreSpawnCancellation() {
     const terminalErrors = [];
-    try {
-      if (!this.overlayCleaned && !this.cleanupManagedOverlay() && this.apiProfileCleanupOwner) {
-        const error = new Error('Owned Codex overlay could not be removed after startup cancellation.');
-        error.code = 'session_overlay_cleanup_failed';
-        terminalErrors.push(error);
-      }
-    } catch (error) {
-      terminalErrors.push(error);
-    }
     if (typeof this.onTerminated === 'function') {
       try {
         this.onTerminated(null, null);
@@ -5639,15 +6439,17 @@ class CodexAppServerRunner {
         terminalErrors.push(retryableTerminalDeliveryError(error));
       }
     }
+    this.cleanupManagedOverlayAfterExit('startup-cancellation');
     throwTerminalErrors(terminalErrors, 'Codex startup cancellation did not complete cleanly.');
   }
 
-  async emitOutput(text, stream) {
+  async emitOutput(text, stream, options = {}) {
     await this.postEvent({
       type: 'session.output',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
       runId: this.runId,
+      clientRequestId: options.clientRequestId || null,
       stream,
       chunk: text,
       timestamp: nowIso(),
@@ -5677,19 +6479,30 @@ class CodexAppServerRunner {
     });
   }
 
+  reserveRuntimeRevision() {
+    this.runtimeRevision = Math.max(0, Number(this.runtimeRevision || 0)) + 1;
+    return this.runtimeRevision;
+  }
+
   async emitRuntime(patch) {
+    const runtimeRevision = this.reserveRuntimeRevision();
+    const runtimePatch = this.activeClientRequestId && !Object.prototype.hasOwnProperty.call(patch, 'clientRequestId')
+      ? { ...patch, clientRequestId: this.activeClientRequestId, runtimeRevision }
+      : { ...patch, runtimeRevision };
+    const timestamp = nowIso();
     this.runtime = {
       ...this.runtime,
-      ...patch,
-      updatedAt: nowIso(),
+      ...runtimePatch,
+      updatedAt: timestamp,
     };
     await this.postEvent({
       type: 'session.runtime_updated',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
       runId: this.runId,
-      patch,
-      timestamp: nowIso(),
+      runtimeRevision,
+      patch: runtimePatch,
+      timestamp,
     });
   }
 
@@ -5724,6 +6537,7 @@ class CodexAppServerRunner {
       message: entry.message || '',
       summary: entry.summary || null,
       payload: entry.payload || null,
+      availableDecisions: entry.availableDecisions || entry.payload?.availableDecisions || [],
       response: entry.response || null,
       timestamp: nowIso(),
     });
@@ -5764,10 +6578,18 @@ async function startCodexAppServerSession(options) {
       failure.processTreeFallbackRequired = true;
     }
     if (
-      !runner.overlayCleaned
-      && (!runner.child || runner.childExitConfirmed)
+      runner.overlayCleanupLastError
+      && failure
+      && typeof failure === 'object'
     ) {
-      runner.cleanupManagedOverlay();
+      const cleanupFailure = runner.overlayCleanupLastError;
+      failure.overlayCleanupFailure = {
+        code: cleanupFailure.code,
+        cleanupErrorCode: cleanupFailure.cleanupErrorCode || cleanupFailure.cause?.code || null,
+        path: cleanupFailure.path || null,
+        context: cleanupFailure.cleanupContext || 'startup-cancellation',
+        retryScheduled: Boolean(runner.overlayCleanupRetryTimer),
+      };
     }
     if (
       failure?.processTreeFallbackRequired === true
@@ -5789,12 +6611,17 @@ async function startCodexAppServerSession(options) {
 }
 
 module.exports = {
+  bundledCodexRelativeCandidates,
+  codexHomeRelativeCandidates,
+  cursorCodexPlatformDirs,
+  elfHeaderMatchesArchitecture,
   buildCodexStateDatabaseDiagnostic,
   CodexAppServerRunner,
   classifyCodexStateDatabaseStderr,
   cleanupApiProfileCodexHome,
   cleanupStaleApiProfileCodexHomes,
   isMissingNativeRolloutError,
+  isExecutableCompatibleWithHost,
   normalizeAppServerFileChanges,
   normalizeTurnStartParams,
   prepareApiProfileCodexHome,

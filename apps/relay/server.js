@@ -36,7 +36,13 @@ const {
   normalizeConnectorSecretsInput,
   saveConnectorSecrets,
 } = require('../../shared/connector-secrets');
-const { extractSessionDiagnostics, extractSessionTranscript, makeTranscriptEntry } = require('../../shared/codex-discovery');
+const {
+  extractSessionDiagnostics,
+  extractSessionTranscript,
+  isInternalApprovalReviewSession,
+  isSubagentSession,
+  makeTranscriptEntry,
+} = require('../../shared/codex-discovery');
 const { makeId, nowIso, sessionKey } = require('../../shared/protocol');
 const {
   applyStableTagUpdate,
@@ -65,6 +71,7 @@ const {
 } = require('../../shared/api-binding');
 const { downloadGithubSkill, normalizeGithubSkillSource } = require('./github-skill-source');
 const { AgentEventLedger } = require('./agent-event-ledger');
+const { InputCommandOutbox } = require('./input-command-outbox');
 const { HostAgentLeaseRegistry } = require('./host-agent-lease');
 const { ModelCatalogError, ModelCatalogService } = require('./model-catalog-service');
 const { RebindCatalogReuseStore } = require('./rebind-catalog-reuse');
@@ -107,6 +114,7 @@ function enabledEnvironmentFlag(name, defaultValue) {
 
 const RUN_ID_REQUIRED_SESSION_EVENT_TYPES = new Set([
   'session.command_failed',
+  'session.interrupt_result',
   'session.output',
   'session.runtime_updated',
   'session.selection_confirmed',
@@ -145,7 +153,9 @@ if (comparablePhysicalPath(SESSION_RECORD_STORE_ROOT) === comparablePhysicalPath
 const SESSION_LOGS_PATH = relayOwnedStatePath('SESSION_LOGS_PATH', process.env.SESSION_LOGS_PATH || path.join(RELAY_STATE_ROOT, 'session-logs.json'));
 const SESSION_DIAGNOSTICS_PATH = relayOwnedStatePath('SESSION_DIAGNOSTICS_PATH', process.env.SESSION_DIAGNOSTICS_PATH || path.join(RELAY_STATE_ROOT, 'session-diagnostics.json'));
 const DISMISSED_HOSTS_PATH = relayOwnedStatePath('DISMISSED_HOSTS_PATH', process.env.DISMISSED_HOSTS_PATH || path.join(RELAY_STATE_ROOT, 'dismissed-hosts.json'));
+const CODEX_UPDATE_OPERATIONS_PATH = relayOwnedStatePath('CODEX_UPDATE_OPERATIONS_PATH', process.env.CODEX_UPDATE_OPERATIONS_PATH || path.join(RELAY_STATE_ROOT, 'codex-update-operations.json'));
 const AGENT_EVENT_LEDGER_PATH = relayOwnedStatePath('AGENT_EVENT_LEDGER_PATH', process.env.AGENT_EVENT_LEDGER_PATH || path.join(RELAY_STATE_ROOT, 'agent-event-ledger.jsonl'));
+const INPUT_COMMAND_OUTBOX_PATH = relayOwnedStatePath('INPUT_COMMAND_OUTBOX_PATH', process.env.INPUT_COMMAND_OUTBOX_PATH || path.join(RELAY_STATE_ROOT, 'input-command-outbox.jsonl'));
 const CONNECTORS_PATH = relayOwnedStatePath('CONNECTORS_PATH', process.env.CONNECTORS_PATH || path.join(RELAY_STATE_ROOT, 'connectors.json'));
 const CONNECTOR_SECRETS_PATH = relayOwnedStatePath('CONNECTOR_SECRETS_PATH', process.env.CONNECTOR_SECRETS_PATH || path.join(RELAY_STATE_ROOT, 'connector-secrets.json'));
 const SKILL_FAVORITES_PATH = relayOwnedStatePath('SKILL_FAVORITES_PATH', process.env.SKILL_FAVORITES_PATH || path.join(RELAY_STATE_ROOT, 'skill-favorites.json'));
@@ -163,6 +173,14 @@ const SKILL_GITHUB_TOKEN = process.env.REMOTE_CODEX_GITHUB_TOKEN || process.env.
 const RECEIVED_FILES_ROOT = path.join(RELAY_STATE_ROOT, 'received-files');
 const RECEIVED_FILES_MANIFEST_PATH = path.join(RECEIVED_FILES_ROOT, 'manifest.json');
 const LOCAL_AGENT_LOG_ROOT = path.join(RELAY_STATE_ROOT, 'local-agents');
+const LOCAL_AGENT_ENTRYPOINT = path.resolve(__dirname, '..', 'host-agent', 'agent.js');
+const LOCAL_AGENT_IDENTITY_ENTRYPOINT = truthyEnv(process.env.RELAY_TEST_CONTROL_ENABLED)
+  && String(process.env.RELAY_TEST_LOCAL_AGENT_IDENTITY_ENTRYPOINT || '').trim()
+  ? path.resolve(process.env.RELAY_TEST_LOCAL_AGENT_IDENTITY_ENTRYPOINT)
+  : LOCAL_AGENT_ENTRYPOINT;
+const LOCAL_AGENT_PROCESS_START_TOLERANCE_MS = 5000;
+const LOCAL_AGENT_PROCESS_IDENTITY_CACHE_MS = 5000;
+const LOCAL_AGENT_PROCESS_IDENTITY_CACHE_LIMIT = 128;
 const RELAY_OWNER_PATH = path.join(RELAY_STATE_ROOT, 'relay-owner.json');
 const RELAY_REPO_ROOT = canonicalPhysicalPath(path.join(__dirname, '..', '..'));
 const RELAY_AUTH_TOKEN_PATH = relayOwnedStatePath('RELAY_AUTH_TOKEN_PATH', process.env.RELAY_AUTH_TOKEN_PATH || path.join(RELAY_STATE_ROOT, 'relay-auth-token.txt'));
@@ -254,6 +272,9 @@ const MISSING_MANAGED_DISCOVERY_CONFIRMATION_MS = Math.max(
 const TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS = truthyEnv(process.env.RELAY_TEST_CONTROL_ENABLED)
   ? Math.max(0, Number(process.env.RELAY_TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS || 0) || 0)
   : 0;
+const TEST_INPUT_PREPARE_DELAY_MS = truthyEnv(process.env.RELAY_TEST_CONTROL_ENABLED)
+  ? Math.max(0, Number(process.env.RELAY_TEST_INPUT_PREPARE_DELAY_MS || 0) || 0)
+  : 0;
 const SESSION_STOP_FALLBACK_MS = Number(process.env.RELAY_SESSION_STOP_FALLBACK_MS || 15000);
 const INPUT_REQUEST_DEDUPE_TTL_MS = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_TTL_MS || 2 * 60 * 1000);
 const INPUT_REQUEST_DEDUPE_LIMIT = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_LIMIT || 500);
@@ -329,6 +350,22 @@ const LOCAL_AGENT_FORCE_EXIT_WAIT_MS = Math.max(
 );
 const COMMAND_QUEUE_TTL_MS = Number(process.env.RELAY_COMMAND_QUEUE_TTL_MS || 10 * 60 * 1000);
 const COMMAND_QUEUE_MAX_LENGTH = Number(process.env.RELAY_COMMAND_QUEUE_MAX_LENGTH || 1000);
+const HOST_CODEX_UPDATE_TIMEOUT_MS = Math.max(
+  60_000,
+  Number(process.env.HOST_CODEX_UPDATE_TIMEOUT_MS || 12 * 60 * 1000) || 12 * 60 * 1000
+);
+const ACTIVE_CODEX_UPDATE_STATUSES = new Set([
+  'planned',
+  'stopping_sessions',
+  'updating',
+  'checking',
+  'installing',
+  'verifying',
+  'updated',
+  'update_failed',
+  'resuming',
+  'interrupted',
+]);
 const SKILL_ADOPTION_RETENTION_MS = Number(process.env.SKILL_ADOPTION_RETENTION_MS || 60 * 60 * 1000);
 const COMMAND_PRIORITY = Object.freeze({
   high: 0,
@@ -1494,11 +1531,18 @@ function normalizeStoredTranscriptEntry(entry) {
   }
   const assistantSeq = Number(entry.assistantSeq);
   const assistantMessageId = String(entry.assistantMessageId || '').trim();
+  const clientRequestId = normalizeClientRequestId(entry.clientRequestId);
+  const deliveryStatus = ['pending', 'accepted'].includes(String(entry.deliveryStatus || '').trim())
+    ? String(entry.deliveryStatus).trim()
+    : null;
   return {
     timestamp: entry.timestamp || nowIso(),
     speaker,
     text,
     stream: entry.stream || null,
+    source: String(entry.source || '').trim() || null,
+    clientRequestId: clientRequestId || null,
+    ...(deliveryStatus ? { deliveryStatus } : {}),
     files,
     ...(assistantMessageId ? {
       assistantMessageId,
@@ -1618,23 +1662,81 @@ function compactTranscriptEntries(entries) {
   const compacted = [];
   for (const entry of sortTranscriptEntries(entries || [])) {
     const previous = compacted[compacted.length - 1];
-    if (!isAdjacentTranscriptDuplicate(previous, entry)) {
-      compacted.push(entry);
+    if (isAdjacentTranscriptDuplicate(previous, entry)) {
+      if (
+        previous?.assistantMessageId
+        || entry?.assistantMessageId
+        || previous?.clientRequestId
+        || entry?.clientRequestId
+      ) {
+        compacted[compacted.length - 1] = mergeAdjacentTranscriptDuplicate(previous, entry);
+      }
+      continue;
     }
+    compacted.push(entry);
   }
   return compacted;
+}
+
+function mergeAdjacentTranscriptDuplicate(previous, entry) {
+  const identified = (entry?.assistantMessageId || entry?.clientRequestId) ? entry : previous;
+  const other = identified === entry ? previous : entry;
+  return normalizeStoredTranscriptEntry({
+    ...other,
+    ...identified,
+    files: mergeExportTranscriptFiles(previous?.files, entry?.files),
+    source: identified?.source || other?.source || null,
+  }) || identified || previous;
 }
 
 function isAdjacentTranscriptDuplicate(previous, entry) {
   if (!previous || !entry || previous.speaker !== entry.speaker) {
     return false;
   }
+  const previousRequestId = String(previous.clientRequestId || '').trim();
+  const entryRequestId = String(entry.clientRequestId || '').trim();
+  if (previousRequestId && entryRequestId) {
+    return previousRequestId === entryRequestId;
+  }
+  const previousAssistantId = String(previous.assistantMessageId || '').trim();
+  const entryAssistantId = String(entry.assistantMessageId || '').trim();
+  if (previousAssistantId || entryAssistantId) {
+    if (
+      previousAssistantId
+      && entryAssistantId
+      && previousAssistantId === entryAssistantId
+    ) {
+      return true;
+    }
+    if (previousAssistantId && entryAssistantId) {
+      return false;
+    }
+    const previousText = canonicalTranscriptText(previous.text);
+    const entryText = canonicalTranscriptText(entry.text);
+    const previousTime = Date.parse(previous.timestamp || '');
+    const entryTime = Date.parse(entry.timestamp || '');
+    const near = Number.isFinite(previousTime)
+      && Number.isFinite(entryTime)
+      && Math.abs(entryTime - previousTime) <= 5000;
+    return Boolean(
+      near
+      && ['agent', 'assistant'].includes(String(previous.speaker || '').toLowerCase())
+      && previousText
+      && previousText === entryText
+    );
+  }
   const previousFiles = (previous.files || []).map((file) => file.path || file.name || '').join(',');
   const entryFiles = (entry.files || []).map((file) => file.path || file.name || '').join(',');
 
   const previousText = canonicalTranscriptText(previous.text);
   const entryText = canonicalTranscriptText(entry.text);
-  if (previousFiles === entryFiles && previousText && entryText && previousText === entryText) {
+  if (
+    previousFiles === entryFiles
+    && previousText
+    && entryText
+    && previousText === entryText
+    && !(previousRequestId || entryRequestId)
+  ) {
     return true;
   }
 
@@ -1708,7 +1810,16 @@ function compareTranscriptEntries(a, b) {
 
 function loadSessionLogs() {
   try {
-    const parsed = JSON.parse(fs.readFileSync(SESSION_LOGS_PATH, 'utf8'));
+    let raw;
+    try {
+      raw = fs.readFileSync(SESSION_LOGS_PATH, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const recovered = recoverMissingFileFromBackup(SESSION_LOGS_PATH);
+      if (!recovered.recovered) return new Map();
+      raw = fs.readFileSync(SESSION_LOGS_PATH, 'utf8');
+    }
+    const parsed = JSON.parse(raw);
     const rawLogs = parsed && typeof parsed.logs === 'object' ? parsed.logs : {};
     const logs = new Map();
     const persistedLogs = {};
@@ -1754,10 +1865,28 @@ function saveSessionLogs() {
     }
   }
   fs.mkdirSync(path.dirname(SESSION_LOGS_PATH), { recursive: true });
-  fs.writeFileSync(SESSION_LOGS_PATH, JSON.stringify({
+  const serialized = `${JSON.stringify({
     savedAt: nowIso(),
     logs,
-  }, null, 2), 'utf8');
+  }, null, 2)}\n`;
+  const tempPath = `${SESSION_LOGS_PATH}.${process.pid}.${makeId()}.tmp`;
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(tempPath, 'wx');
+    fs.writeFileSync(descriptor, serialized, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    replaceFileWithBackup(tempPath, SESSION_LOGS_PATH);
+    checkpointPersistedInputTranscriptProjections();
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+    try {
+      fs.unlinkSync(tempPath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 function loadDismissedHosts() {
@@ -1821,6 +1950,244 @@ function restoreDismissedHost(hostId) {
     throw error;
   }
   return true;
+}
+
+function normalizeHostCodexRuntime(input) {
+  if (!input || typeof input !== 'object') return null;
+  const text = (value, max = 1024) => {
+    const normalized = String(value == null ? '' : value).trim();
+    return normalized ? redactSecretText(normalized).slice(0, max) : null;
+  };
+  return {
+    version: text(input.version, 120),
+    rawVersion: text(input.rawVersion, 512),
+    source: text(input.source, 80),
+    packageManager: text(input.packageManager, 80),
+    binPath: text(input.binPath, 2048),
+    realPath: text(input.realPath, 2048),
+    packageRoot: text(input.packageRoot, 2048),
+    platform: text(input.platform, 80),
+    arch: text(input.arch, 80),
+    probedAt: text(input.probedAt, 80),
+    canAutoUpdate: input.canAutoUpdate === true,
+    updateReason: text(input.updateReason, 1200),
+    error: text(input.error, 1200),
+  };
+}
+
+function normalizeHostCodexMaintenance(input) {
+  if (!input || typeof input !== 'object') return null;
+  const operationId = String(input.operationId || '').trim();
+  if (!operationId) return null;
+  return {
+    operationId,
+    status: String(input.status || '').trim().toLowerCase() || null,
+    message: redactSecretText(String(input.message || '')).slice(0, 2000) || null,
+    previousVersion: String(input.previousVersion || '').trim().slice(0, 120) || null,
+    version: String(input.version || '').trim().slice(0, 120) || null,
+    updaterPid: Number(input.updaterPid || 0) || null,
+    startedAt: String(input.startedAt || '').trim() || null,
+    updatedAt: String(input.updatedAt || '').trim() || null,
+  };
+}
+
+function normalizeCodexUpdateSession(input = {}) {
+  const sessionId = String(input.sessionId || '').trim();
+  if (!sessionId) return null;
+  return {
+    hostId: String(input.hostId || '').trim() || null,
+    sessionId,
+    runId: String(input.runId || '').trim() || null,
+    bridgeSessionId: String(input.bridgeSessionId || '').trim() || null,
+    nativeThreadId: String(input.nativeThreadId || '').trim() || null,
+    originSessionId: String(input.originSessionId || '').trim() || null,
+    sourceSessionId: String(input.sourceSessionId || '').trim() || null,
+    conversationKey: String(input.conversationKey || '').trim() || null,
+    title: redactSecretText(String(input.title || '').trim()).slice(0, 512) || null,
+    cwd: redactSecretText(String(input.cwd || '').trim()).slice(0, 2048) || null,
+    nativeResumeReady: input.nativeResumeReady === true,
+    nativeResumeReadyKnown: input.nativeResumeReadyKnown === true,
+    bindingFingerprint: String(input.bindingFingerprint || '').trim().slice(0, 256) || null,
+    requestedSelection: input.requestedSelection && typeof input.requestedSelection === 'object'
+      ? {
+        model: String(input.requestedSelection.model || '').trim().slice(0, 256) || null,
+        effort: String(input.requestedSelection.effort || '').trim().slice(0, 80) || null,
+        summary: String(input.requestedSelection.summary || '').trim().slice(0, 80) || null,
+      }
+      : null,
+    resumeAttempt: Math.max(0, Math.trunc(Number(input.resumeAttempt || 0) || 0)),
+    resumeRequestId: String(input.resumeRequestId || '').trim().slice(0, 160) || null,
+    status: String(input.status || 'live').trim().toLowerCase().slice(0, 80),
+    message: redactSecretText(String(input.message || '')).slice(0, 1200) || null,
+  };
+}
+
+function normalizeCodexUpdateOperation(input = {}) {
+  const hostId = String(input.hostId || '').trim();
+  const operationId = String(input.operationId || '').trim();
+  if (!hostId || !operationId) return null;
+  const rawStatus = String(input.status || 'planned').trim().toLowerCase();
+  return {
+    operationId,
+    hostId,
+    status: rawStatus,
+    phase: String(input.phase || rawStatus).trim().toLowerCase(),
+    message: redactSecretText(String(input.message || '')).slice(0, 2000),
+    currentVersion: String(input.currentVersion || '').trim().slice(0, 120) || null,
+    targetVersion: String(input.targetVersion || '').trim().slice(0, 120) || null,
+    updateSucceeded: typeof input.updateSucceeded === 'boolean' ? input.updateSucceeded : null,
+    sessions: (Array.isArray(input.sessions) ? input.sessions : [])
+      .map(normalizeCodexUpdateSession)
+      .filter(Boolean),
+    blockedSessionIds: (Array.isArray(input.blockedSessionIds) ? input.blockedSessionIds : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+    stopFailures: (Array.isArray(input.stopFailures) ? input.stopFailures : [])
+      .map((value) => redactSecretText(String(value || '')).slice(0, 1200))
+      .filter(Boolean),
+    resumeFailures: (Array.isArray(input.resumeFailures) ? input.resumeFailures : [])
+      .map((value) => redactSecretText(String(value || '')).slice(0, 1200))
+      .filter(Boolean),
+    createdAt: String(input.createdAt || nowIso()).trim() || nowIso(),
+    updatedAt: String(input.updatedAt || nowIso()).trim() || nowIso(),
+    completedAt: String(input.completedAt || '').trim() || null,
+  };
+}
+
+function finalizeCodexUpdateWithoutRecovery(operation) {
+  if (
+    !operation
+    || operation.sessions.length > 0
+    || !['updated', 'update_failed'].includes(operation.status)
+  ) {
+    return operation;
+  }
+  const succeeded = operation.status === 'updated';
+  const status = succeeded ? 'completed' : 'failed';
+  return {
+    ...operation,
+    status,
+    phase: status,
+    message: operation.message || (
+      succeeded
+        ? 'Codex update completed; no Sessions required recovery.'
+        : 'Codex update failed; no Sessions required recovery.'
+    ),
+    completedAt: operation.completedAt || operation.updatedAt || nowIso(),
+  };
+}
+
+function loadCodexUpdateOperations() {
+  try {
+    let raw;
+    try {
+      raw = fs.readFileSync(CODEX_UPDATE_OPERATIONS_PATH, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const recovered = recoverMissingFileFromBackup(CODEX_UPDATE_OPERATIONS_PATH);
+      if (!recovered.recovered) return new Map();
+      raw = fs.readFileSync(CODEX_UPDATE_OPERATIONS_PATH, 'utf8');
+    }
+    const parsed = JSON.parse(raw);
+    if (Number(parsed?.version) !== 1 || !Array.isArray(parsed.operations)) {
+      throw new Error('invalid Host Codex update state schema');
+    }
+    return new Map(parsed.operations
+      .map((operation) => normalizeCodexUpdateOperation(operation))
+      .filter(Boolean)
+      .map((operation) => finalizeCodexUpdateWithoutRecovery(operation))
+      .map((operation) => [operation.hostId, operation]));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return new Map();
+    throw new Error(`failed to load Host Codex update state: ${error.message || error}`);
+  }
+}
+
+function saveCodexUpdateOperations() {
+  fs.mkdirSync(path.dirname(CODEX_UPDATE_OPERATIONS_PATH), { recursive: true });
+  const tempPath = `${CODEX_UPDATE_OPERATIONS_PATH}.${process.pid}.${makeId()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify({
+      version: 1,
+      savedAt: nowIso(),
+      operations: Array.from(state.codexUpdateOperations.values()),
+    }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    replaceFileWithBackup(tempPath, CODEX_UPDATE_OPERATIONS_PATH);
+  } finally {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch (_) {
+      // The atomic replacement normally consumes the temporary file.
+    }
+  }
+}
+
+function publicCodexUpdateOperation(operation) {
+  return operation ? normalizeCodexUpdateOperation(operation) : null;
+}
+
+function currentCodexUpdateOperation(hostId) {
+  return state.codexUpdateOperations.get(String(hostId || '').trim()) || null;
+}
+
+function activeCodexUpdateOperation(hostId) {
+  const operation = currentCodexUpdateOperation(hostId);
+  return operation && ACTIVE_CODEX_UPDATE_STATUSES.has(operation.status) ? operation : null;
+}
+
+function storeCodexUpdateOperation(input) {
+  const operation = finalizeCodexUpdateWithoutRecovery(normalizeCodexUpdateOperation({
+    ...input,
+    updatedAt: nowIso(),
+  }));
+  if (!operation) throw new Error('invalid Host Codex update operation');
+  state.codexUpdateOperations.set(operation.hostId, operation);
+  saveCodexUpdateOperations();
+  return operation;
+}
+
+function reconcileHostCodexMaintenance(hostId, input) {
+  const maintenance = normalizeHostCodexMaintenance(input);
+  const host = state.hosts.get(hostId);
+  if (host) {
+    host.codexMaintenance = maintenance;
+    state.hosts.set(hostId, host);
+  }
+  if (!maintenance) return null;
+  const operation = currentCodexUpdateOperation(hostId);
+  if (!operation || operation.operationId !== maintenance.operationId) return maintenance;
+  const updaterActive = ['checking', 'updating', 'installing', 'verifying'].includes(maintenance.status);
+  const updaterTerminal = ['updated', 'update_failed'].includes(maintenance.status);
+  if (
+    updaterActive
+    && ['updating', 'checking', 'installing', 'verifying'].includes(operation.status)
+    && (
+      operation.status !== maintenance.status
+      || operation.message !== maintenance.message
+    )
+  ) {
+    patchCodexUpdateOperation(operation, {
+      status: maintenance.status,
+      phase: maintenance.status,
+      message: maintenance.message || `Host updater is ${maintenance.status}.`,
+    });
+  } else if (
+    updaterTerminal
+    && ['updating', 'checking', 'installing', 'verifying'].includes(operation.status)
+  ) {
+    patchCodexUpdateOperation(operation, {
+      status: maintenance.status,
+      phase: maintenance.status,
+      updateSucceeded: maintenance.status === 'updated',
+      targetVersion: maintenance.version || null,
+      message: maintenance.message || (
+        maintenance.status === 'updated'
+          ? `Codex ${maintenance.version || 'update'} installed and verified.`
+          : 'Codex update failed.'
+      ),
+    });
+  }
+  return maintenance;
 }
 
 function boundedDiagnosticIdentity(value) {
@@ -2041,6 +2408,13 @@ const agentEventLedger = new AgentEventLedger({
   limit: AGENT_EVENT_BATCH_DEDUPE_LIMIT,
   autoLoad: false,
 });
+const inputCommandOutbox = new InputCommandOutbox({
+  filePath: INPUT_COMMAND_OUTBOX_PATH,
+  commandQueueTtlMs: COMMAND_QUEUE_TTL_MS,
+  dedupeTtlMs: INPUT_REQUEST_DEDUPE_TTL_MS,
+  entryLimit: Math.max(INPUT_REQUEST_DEDUPE_LIMIT, COMMAND_QUEUE_MAX_LENGTH),
+  autoLoad: false,
+});
 
 const state = {
   hosts: new Map(),
@@ -2062,6 +2436,7 @@ const state = {
   sessionRequests: new Map(),
   pendingDirectoryRequests: new Map(),
   pendingHostProbes: new Map(),
+  pendingCodexUpdateRequests: new Map(),
   pendingApiTestRequests: new Map(),
   pendingApiCatalogRequests: new Map(),
   pendingBindingPreflightRequests: new Map(),
@@ -2081,6 +2456,10 @@ const state = {
   sessionDiscoveryRequests: new Map(),
   missingManagedDiscoveryRuns: new Map(),
   inputRequestCache: new Map(),
+  inputRequestReservations: new Map(),
+  inputRequestsInFlight: new Map(),
+  pendingInputProjectionCheckpoints: new Map(),
+  inputCommandOutbox,
   agentEventLedger,
   appliedAgentEventBatches: agentEventLedger.applied,
   partialAgentEventBatches: agentEventLedger.partial,
@@ -2090,6 +2469,7 @@ const state = {
   askpassActions: new Map(),
   connectorActionsInFlight: new Map(),
   connectors: new Map(),
+  codexUpdateOperations: new Map(),
   connectorSecrets: new Map(),
   sessionCollections: new Map(),
   skillFavorites: new Map(),
@@ -2124,8 +2504,32 @@ function consumeRebindCatalogReuseToken(tokenValue, input = {}) {
 
 function loadPersistedRelayState() {
   state.agentEventLedger.load();
+  const recoveredInputs = state.inputCommandOutbox.load();
+  for (const entry of recoveredInputs.pendingCommands) {
+    const queue = state.commandQueues.get(entry.hostId) || [];
+    if (!queue.some((command) => Number(command?.id || 0) === entry.originalCommandId)) {
+      queue.push(entry.command);
+    }
+    state.commandQueues.set(entry.hostId, pruneCommandQueue(queue));
+  }
+  for (const cacheRecord of recoveredInputs.cacheRecords) {
+    state.inputRequestCache.set(cacheRecord.cacheKey, {
+      createdAtMs: cacheRecord.createdAtMs,
+      fingerprint: cacheRecord.fingerprint,
+      hostId: cacheRecord.hostId,
+      scopeKey: cacheRecord.scopeKey,
+      clientRequestId: cacheRecord.clientRequestId,
+      payload: cacheRecord.payload,
+    });
+  }
+  state.nextCommandId = Math.max(
+    state.nextCommandId,
+    Number(recoveredInputs.maxCommandId || 0) + 1
+  );
   state.dismissedHosts = loadDismissedHosts();
+  state.codexUpdateOperations = loadCodexUpdateOperations();
   state.sessionLogs = loadSessionLogs();
+  reconcileRecoveredInputTranscriptProjections(recoveredInputs.projectionWork || []);
   state.sessionDiagnostics = loadSessionDiagnostics();
   state.connectorSecrets = loadConnectorSecrets(CONNECTOR_SECRETS_PATH);
   state.skillFavorites = loadSkillFavorites();
@@ -2550,7 +2954,36 @@ function managedLaunchRequestFingerprint(input = {}) {
 
 function inputRequestCacheKey(hostId, sessionId, clientRequestId, runId = '') {
   const requestId = normalizeClientRequestId(clientRequestId);
-  return requestId ? `${hostId}::${sessionId}::${runId || '-'}::${requestId}` : '';
+  return requestId ? `${hostId}::${sessionId}::${requestId}` : '';
+}
+
+let inputSubmissionReservationOrdinal = 0;
+
+function nextInputSubmissionReservationOrdinal() {
+  inputSubmissionReservationOrdinal += 1;
+  return inputSubmissionReservationOrdinal;
+}
+
+function inputRequestConflictError(message = '') {
+  return new SessionContractError(
+    'input_request_id_conflict',
+    message || 'The same clientRequestId was reused with different prompt content.',
+    { statusCode: 409 }
+  );
+}
+
+function inputReservationConflictError() {
+  return new SessionContractError(
+    'session_input_identity_conflict',
+    'The Session identity changed while multiple prompts were being prepared. The conflicting prompt was not queued.',
+    { statusCode: 409 }
+  );
+}
+
+function earlierInputReservation(left, right) {
+  const leftOrdinal = Number(left?.ordinal || Number.MAX_SAFE_INTEGER);
+  const rightOrdinal = Number(right?.ordinal || Number.MAX_SAFE_INTEGER);
+  return leftOrdinal <= rightOrdinal ? left : right;
 }
 
 function pruneInputRequestCache() {
@@ -2569,7 +3002,7 @@ function pruneInputRequestCache() {
   }
 }
 
-function getCachedInputRequest(cacheKey) {
+function getCachedInputRequest(cacheKey, fingerprint = '') {
   if (!cacheKey) {
     return null;
   }
@@ -2582,18 +3015,432 @@ function getCachedInputRequest(cacheKey) {
     state.inputRequestCache.delete(cacheKey);
     return null;
   }
+  if (entry.conflictCode) {
+    throw new SessionContractError(
+      entry.conflictCode,
+      entry.conflictMessage || 'Conflicting input requests were found while the Session identity changed.',
+      { statusCode: 409 }
+    );
+  }
+  if (fingerprint && entry.fingerprint && entry.fingerprint !== fingerprint) {
+    throw inputRequestConflictError();
+  }
   return entry.payload || null;
 }
 
-function rememberInputRequest(cacheKey, payload) {
+function rememberInputRequest(cacheKey, fingerprint, payload, identity = {}) {
   if (!cacheKey) {
     return;
   }
   pruneInputRequestCache();
   state.inputRequestCache.set(cacheKey, {
     createdAtMs: Date.now(),
+    fingerprint,
     payload,
+    hostId: String(identity.hostId || '').trim(),
+    scopeKey: String(identity.scopeKey || '').trim(),
+    clientRequestId: normalizeClientRequestId(identity.clientRequestId) || null,
   });
+}
+
+function inputRequestFingerprint(body = {}) {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    text: String(body.text || ''),
+    displayText: String(body.displayText || ''),
+    inputItems: Array.isArray(body.inputItems) ? body.inputItems : [],
+    uploadedFiles: Array.isArray(body.uploadedFiles) ? body.uploadedFiles : [],
+    inlineFiles: Array.isArray(body.inlineFiles) ? body.inlineFiles : [],
+    inlineFileRefs: Array.isArray(body.inlineFileRefs) ? body.inlineFileRefs : [],
+    mode: String(body.mode || ''),
+    model: String(body.model || ''),
+    effort: String(body.effort || ''),
+    allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+    summary: String(body.summary || ''),
+    approvalPolicy: body.approvalPolicy || null,
+    approvalsReviewer: String(body.approvalsReviewer || ''),
+    sandboxMode: String(body.sandboxMode || ''),
+    planFallback: String(body.planFallback || ''),
+    serviceTier: String(body.serviceTier || ''),
+    personality: String(body.personality || ''),
+  })).digest('hex');
+}
+
+function reserveInputRequest(cacheKey, fingerprint, identity = {}) {
+  const ordinal = nextInputSubmissionReservationOrdinal();
+  if (!cacheKey) {
+    return {
+      owner: true,
+      cacheKey: '',
+      fingerprint,
+      promise: null,
+      ordinal,
+      hostId: String(identity.hostId || '').trim(),
+      scopeKey: String(identity.scopeKey || '').trim(),
+      clientRequestId: null,
+      keys: new Set(),
+    };
+  }
+  const existing = state.inputRequestsInFlight.get(cacheKey);
+  if (existing) {
+    if (existing.cancelledError) throw existing.cancelledError;
+    if (existing.fingerprint !== fingerprint) {
+      throw inputRequestConflictError();
+    }
+    return { ...existing, owner: false };
+  }
+  let resolveRequest;
+  let rejectRequest;
+  const promise = new Promise((resolve, reject) => {
+    resolveRequest = resolve;
+    rejectRequest = reject;
+  });
+  promise.catch(() => {});
+  const reservation = {
+    owner: true,
+    cacheKey,
+    fingerprint,
+    promise,
+    resolveRequest,
+    rejectRequest,
+    createdAtMs: Date.now(),
+    ordinal,
+    hostId: String(identity.hostId || '').trim(),
+    scopeKey: String(identity.scopeKey || '').trim(),
+    clientRequestId: normalizeClientRequestId(identity.clientRequestId) || null,
+    keys: new Set([cacheKey]),
+    cancelledError: null,
+    settled: false,
+  };
+  state.inputRequestsInFlight.set(cacheKey, reservation);
+  return reservation;
+}
+
+function settleInputRequest(reservation, error, payload = null) {
+  if (!reservation?.cacheKey) return;
+  if (reservation.settled) return;
+  reservation.settled = true;
+  for (const key of reservation.keys || [reservation.cacheKey]) {
+    if (state.inputRequestsInFlight.get(key) === reservation) {
+      state.inputRequestsInFlight.delete(key);
+    }
+  }
+  if (error) reservation.rejectRequest(error);
+  else reservation.resolveRequest(payload);
+}
+
+function inputRequestPayloadCommandId(entry) {
+  const id = Number(entry?.payload?.command?.id || 0);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function migrateInputRequestCacheScope(loserKey, winnerKey) {
+  for (const [cacheKey, entry] of Array.from(state.inputRequestCache.entries())) {
+    if (!entry || entry.scopeKey !== loserKey || !entry.hostId || !entry.clientRequestId) continue;
+    const nextKey = inputRequestCacheKey(entry.hostId, winnerKey, entry.clientRequestId);
+    if (!nextKey || nextKey === cacheKey) {
+      entry.scopeKey = winnerKey;
+      continue;
+    }
+    const existing = state.inputRequestCache.get(nextKey);
+    state.inputRequestCache.delete(cacheKey);
+    entry.scopeKey = winnerKey;
+    if (!existing || existing === entry) {
+      state.inputRequestCache.set(nextKey, entry);
+      continue;
+    }
+    const sameFingerprint = Boolean(
+      entry.fingerprint
+      && existing.fingerprint
+      && entry.fingerprint === existing.fingerprint
+    );
+    const entryCommandId = inputRequestPayloadCommandId(entry);
+    const existingCommandId = inputRequestPayloadCommandId(existing);
+    if (sameFingerprint && (!entryCommandId || !existingCommandId || entryCommandId === existingCommandId)) {
+      const preferred = existing.payload ? existing : entry;
+      preferred.scopeKey = winnerKey;
+      preferred.createdAtMs = Math.min(
+        Number(existing.createdAtMs || Date.now()),
+        Number(entry.createdAtMs || Date.now())
+      );
+      state.inputRequestCache.set(nextKey, preferred);
+      continue;
+    }
+    state.inputRequestCache.set(nextKey, {
+      ...existing,
+      scopeKey: winnerKey,
+      createdAtMs: Math.min(
+        Number(existing.createdAtMs || Date.now()),
+        Number(entry.createdAtMs || Date.now())
+      ),
+      conflictCode: sameFingerprint
+        ? 'session_input_identity_conflict'
+        : 'input_request_id_conflict',
+      conflictMessage: sameFingerprint
+        ? 'The same prompt was already queued under conflicting Session identities.'
+        : 'The same clientRequestId was reused with different prompt content.',
+    });
+  }
+}
+
+function migrateInputRequestsInFlightScope(loserKey, winnerKey) {
+  const reservations = [...new Set(state.inputRequestsInFlight.values())];
+  for (const reservation of reservations) {
+    if (
+      !reservation
+      || reservation.scopeKey !== loserKey
+      || !reservation.hostId
+      || !reservation.clientRequestId
+    ) {
+      continue;
+    }
+    const previousKey = reservation.cacheKey;
+    const nextKey = inputRequestCacheKey(
+      reservation.hostId,
+      winnerKey,
+      reservation.clientRequestId
+    );
+    if (!nextKey || nextKey === previousKey) {
+      reservation.scopeKey = winnerKey;
+      continue;
+    }
+    const existing = state.inputRequestsInFlight.get(nextKey);
+    if (!existing || existing === reservation) {
+      if (state.inputRequestsInFlight.get(previousKey) === reservation) {
+        state.inputRequestsInFlight.delete(previousKey);
+      }
+      reservation.cacheKey = nextKey;
+      reservation.scopeKey = winnerKey;
+      reservation.keys?.add(nextKey);
+      state.inputRequestsInFlight.set(nextKey, reservation);
+      continue;
+    }
+
+    const primary = earlierInputReservation(reservation, existing);
+    const secondary = primary === reservation ? existing : reservation;
+    const conflict = reservation.fingerprint === existing.fingerprint
+      ? inputReservationConflictError()
+      : inputRequestConflictError();
+    secondary.cancelledError ||= conflict;
+    if (state.inputRequestsInFlight.get(previousKey) === reservation) {
+      state.inputRequestsInFlight.delete(previousKey);
+    }
+    for (const key of secondary.keys || []) {
+      if (state.inputRequestsInFlight.get(key) === secondary) {
+        state.inputRequestsInFlight.delete(key);
+      }
+    }
+    primary.cacheKey = nextKey;
+    primary.scopeKey = winnerKey;
+    primary.keys?.add(nextKey);
+    state.inputRequestsInFlight.set(nextKey, primary);
+  }
+}
+
+function migrateSessionInputReservationScope(loserKey, winnerKey) {
+  const reservation = state.inputRequestReservations.get(loserKey);
+  if (!reservation) return;
+  const existing = state.inputRequestReservations.get(winnerKey);
+  if (!existing || existing === reservation) {
+    if (state.inputRequestReservations.get(loserKey) === reservation) {
+      state.inputRequestReservations.delete(loserKey);
+    }
+    reservation.key = winnerKey;
+    reservation.keys?.add(winnerKey);
+    state.inputRequestReservations.set(winnerKey, reservation);
+    return;
+  }
+
+  const primary = earlierInputReservation(reservation, existing);
+  const secondary = primary === reservation ? existing : reservation;
+  secondary.cancelledError ||= inputReservationConflictError();
+  if (state.inputRequestReservations.get(loserKey) === reservation) {
+    state.inputRequestReservations.delete(loserKey);
+  }
+  for (const key of secondary.keys || []) {
+    if (state.inputRequestReservations.get(key) === secondary) {
+      state.inputRequestReservations.delete(key);
+    }
+  }
+  primary.key = winnerKey;
+  primary.keys?.add(winnerKey);
+  state.inputRequestReservations.set(winnerKey, primary);
+}
+
+function migrateInputRequestScope(loserKey, winnerKey) {
+  const loser = String(loserKey || '').trim();
+  const winner = String(winnerKey || '').trim();
+  if (!loser || !winner || loser === winner) return;
+  const separator = loser.indexOf('::');
+  const winnerSeparator = winner.indexOf('::');
+  const hostId = separator > 0 ? loser.slice(0, separator) : '';
+  const winnerHostId = winnerSeparator > 0 ? winner.slice(0, winnerSeparator) : '';
+  if (hostId && winnerHostId === hostId) {
+    state.inputCommandOutbox.migrateScope(hostId, loser, winner);
+  }
+  migrateInputRequestCacheScope(loser, winner);
+  migrateInputRequestsInFlightScope(loser, winner);
+  migrateSessionInputReservationScope(loser, winner);
+}
+
+function inputSessionScopeKey(hostId, sessionId) {
+  return resolveCanonicalConversationKey(hostId, sessionId)
+    || resolveSessionKey(hostId, sessionId)
+    || sessionKey(hostId, sessionId);
+}
+
+function reserveSessionInput(hostId, sessionId, runId, clientRequestId, scopeKey = '', ordinal = 0) {
+  const key = scopeKey || inputSessionScopeKey(hostId, sessionId);
+  const existing = state.inputRequestReservations.get(key);
+  if (existing) {
+    return {
+      ok: false,
+      code: 'session_input_preparing',
+      error: 'A prompt for this Session is already being prepared. Wait for it to be queued before trying again.',
+      clientRequestId: existing.clientRequestId || null,
+    };
+  }
+
+  const runtimeKey = resolveSessionKey(hostId, sessionId);
+  const runtime = state.sessionRuntime.get(runtimeKey)
+    || state.sessionRuntime.get(key)
+    || {};
+  const phase = String(runtime.phase || '').trim().toLowerCase();
+  if (phase === 'stop-failed') {
+    return {
+      ok: false,
+      code: 'session_stop_failed',
+      error: 'The previous Stop failed and this runtime cannot accept new prompts. Retry Stop, then Resume the Session.',
+      phase,
+    };
+  }
+  const terminalPhase = ['idle', 'completed', 'error', 'interrupted', 'closed', 'stop-failed'].includes(phase);
+  const pending = Boolean(
+    runtime.busy === true
+    || runtime.activeTurnId
+    || runtime.waitingOnApproval === true
+    || runtime.waitingOnUserInput === true
+    || (runtime.queuedCommandId && !terminalPhase)
+  );
+  if (pending) {
+    return {
+      ok: false,
+      code: 'session_turn_active',
+      error: 'Codex is still working on the previous turn. Wait for it to finish or interrupt it before sending another prompt.',
+      queuedCommandId: runtime.queuedCommandId || null,
+      phase: runtime.phase || null,
+      activeTurnId: runtime.activeTurnId || null,
+      busy: runtime.busy === true,
+    };
+  }
+
+  const reservation = {
+    ok: true,
+    key,
+    keys: new Set([key]),
+    token: makeId(),
+    ordinal: Number(ordinal || 0) || nextInputSubmissionReservationOrdinal(),
+    hostId: String(hostId || '').trim(),
+    sessionId: String(sessionId || '').trim(),
+    runId: String(runId || '').trim() || null,
+    runtimeKey,
+    runtimeRevision: normalizedRuntimeRevision(runtime),
+    runtimeRunId: String(runtime.runId || '').trim() || null,
+    clientRequestId: normalizeClientRequestId(clientRequestId) || null,
+    cancelledError: null,
+  };
+  state.inputRequestReservations.set(key, reservation);
+  return reservation;
+}
+
+function releaseSessionInputReservation(reservation) {
+  if (!reservation?.ok || !reservation.key) return false;
+  let released = false;
+  for (const key of reservation.keys || [reservation.key]) {
+    const current = state.inputRequestReservations.get(key);
+    if (current?.token !== reservation.token) continue;
+    state.inputRequestReservations.delete(key);
+    released = true;
+  }
+  return released;
+}
+
+function assertInputSubmissionOwnership(hostId, sessionId, requestReservation, inputReservation) {
+  const currentScopeKey = inputSessionScopeKey(hostId, sessionId);
+  if (currentScopeKey && currentScopeKey !== inputReservation.key) {
+    migrateInputRequestScope(inputReservation.key, currentScopeKey);
+  }
+  if (requestReservation?.cancelledError) throw requestReservation.cancelledError;
+  if (
+    requestReservation?.cacheKey
+    && state.inputRequestsInFlight.get(requestReservation.cacheKey) !== requestReservation
+  ) {
+    throw inputReservationConflictError();
+  }
+  if (inputReservation?.cancelledError) throw inputReservation.cancelledError;
+  const current = state.inputRequestReservations.get(inputReservation.key);
+  if (!current || current.token !== inputReservation.token) {
+    throw inputReservationConflictError();
+  }
+  return true;
+}
+
+function assertInputRuntimeStillAvailable(hostId, sessionId, expectedRunId, inputReservation) {
+  const runtimeKey = resolveSessionKey(hostId, sessionId);
+  const runtime = state.sessionRuntime.get(runtimeKey)
+    || state.sessionRuntime.get(inputReservation?.key)
+    || {};
+  const phase = String(runtime.phase || '').trim().toLowerCase();
+  if (phase === 'stop-failed') {
+    throw new SessionContractError(
+      'session_stop_failed',
+      'The previous Stop failed and this runtime cannot accept new prompts. Retry Stop, then Resume the Session.',
+      { statusCode: 409, phase }
+    );
+  }
+  const terminalPhase = ['idle', 'completed', 'error', 'interrupted', 'closed', 'stop-failed'].includes(phase);
+  const pending = Boolean(
+    runtime.busy === true
+    || runtime.activeTurnId
+    || runtime.waitingOnApproval === true
+    || runtime.waitingOnUserInput === true
+    || (runtime.queuedCommandId && !terminalPhase)
+  );
+  if (pending) {
+    throw new SessionContractError(
+      'session_turn_active',
+      'Codex started another turn while this prompt was being prepared. Wait for it to finish or interrupt it before retrying.',
+      {
+        statusCode: 409,
+        queuedCommandId: runtime.queuedCommandId || null,
+        phase: runtime.phase || null,
+        activeTurnId: runtime.activeTurnId || null,
+        busy: runtime.busy === true,
+      }
+    );
+  }
+
+  const expected = String(expectedRunId || '').trim();
+  const capturedRunId = String(inputReservation?.runtimeRunId || '').trim();
+  const currentRunId = String(runtime.runId || '').trim();
+  const capturedRevision = Number(inputReservation?.runtimeRevision || 0);
+  const currentRevision = normalizedRuntimeRevision(runtime);
+  if (
+    capturedRunId !== currentRunId
+    || capturedRevision !== currentRevision
+  ) {
+    throw new SessionContractError(
+      'session_runtime_changed',
+      'The Session runtime changed while this prompt was being prepared. Review the current state and retry.',
+      {
+        statusCode: 409,
+        expectedRunId: expected || null,
+        capturedRuntimeRunId: capturedRunId || null,
+        currentRunId: currentRunId || null,
+        expectedRuntimeRevision: capturedRevision || null,
+        currentRuntimeRevision: currentRevision || null,
+      }
+    );
+  }
 }
 
 function getHostCapabilityError(hostId, capability, message) {
@@ -2619,10 +3466,15 @@ function getHostList() {
   ensureLocalRelayHost();
   return Array.from(state.hosts.values()).map((host) => ({
     ...host,
+    codexRuntime: normalizeHostCodexRuntime(host.codexRuntime),
+    codexMaintenance: normalizeHostCodexMaintenance(host.codexMaintenance),
+    codexUpdate: publicCodexUpdateOperation(currentCodexUpdateOperation(host.hostId)),
     online: hostOnline(host),
     localAgentStartEnabled: LOCAL_AGENT_START_ENABLED,
     localAgent: publicLocalAgentRecord(state.localAgents.get(host.hostId)),
     sessionCount: Array.from(state.sessions.values()).filter((session) => session.hostId === host.hostId).length,
+    liveSessionCount: Array.from(state.sessions.values()).filter((session) => session.hostId === host.hostId && session.live).length,
+    managedLiveSessionCount: getRelayManagedLiveSessions(host.hostId).length,
   })).sort((a, b) => a.label.localeCompare(b.label));
 }
 
@@ -4338,6 +5190,8 @@ function getSessionsForHost(hostId, options = {}) {
   const optimize = options.optimize !== false;
   const sessions = Array.from(state.sessions.values())
     .filter((session) => session.hostId === hostId)
+    .filter((session) => !isInternalApprovalReviewSession(session))
+    .filter((session) => !isSubagentSession(session))
     .sort((a, b) => String(b.lastUpdatedAt || '').localeCompare(String(a.lastUpdatedAt || '')));
   return optimize
     ? sessions.map(publicSessionListRecord)
@@ -4470,6 +5324,8 @@ function searchSessions(options = {}) {
 
   const sessions = Array.from(state.sessions.values())
     .filter((session) => !hostId || session.hostId === hostId)
+    .filter((session) => !isInternalApprovalReviewSession(session))
+    .filter((session) => !isSubagentSession(session))
     .filter((session) => {
       if (!allowedKeys.size) {
         return true;
@@ -4611,6 +5467,10 @@ async function searchSessionsHydrated(options = {}) {
       const remote = await pending;
       if (remote && Array.isArray(remote.results)) {
         remote.results = filterSearchResultsForCollection(remote.results, options.collectionId || '');
+        remote.results = remote.results.filter((result) => (
+          !isInternalApprovalReviewSession(getSession(hostId, result?.sessionId))
+          && !isSubagentSession(getSession(hostId, result?.sessionId))
+        ));
         for (const result of remote.results) {
           if (result?.sessionId) {
             const existing = getSession(hostId, result.sessionId);
@@ -4832,38 +5692,120 @@ function normalizeLocalAgentProcessMetadata(input) {
   };
 }
 
-function readLocalAgentOwnershipMarker(hostId) {
+function inspectLocalAgentOwnershipMarkerFile(markerPath, hostId) {
+  try {
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    if (
+      marker?.kind === 'remote-codex-local-agent-owner'
+      && Number(marker.version) === 1
+      && String(marker.hostId || '') === String(hostId || '')
+    ) {
+      return {
+        status: 'present',
+        marker: { ...marker, markerPath },
+        error: null,
+      };
+    }
+    const error = new Error(`invalid local Agent ownership marker at ${markerPath}`);
+    error.code = 'local_agent_ownership_marker_invalid';
+    return { status: 'unknown', marker: null, error };
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return { status: 'absent', marker: null, error: null };
+    }
+    return { status: 'unknown', marker: null, error };
+  }
+}
+
+function readLocalAgentOwnershipMarkerFile(markerPath, hostId) {
+  return inspectLocalAgentOwnershipMarkerFile(markerPath, hostId).marker;
+}
+
+function restoreClaimedLocalAgentOwnershipMarker(hostId) {
+  let names = [];
+  try {
+    names = fs.readdirSync(LOCAL_AGENT_LOG_ROOT);
+  } catch (_) {
+    return false;
+  }
+  const candidates = [];
   for (const markerPath of localAgentOwnershipMarkerPaths(hostId)) {
-    try {
-      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-      if (
-        marker?.kind === 'remote-codex-local-agent-owner'
-        && Number(marker.version) === 1
-        && String(marker.hostId || '') === String(hostId || '')
-      ) {
-        return { ...marker, markerPath };
+    const prefix = `${path.basename(markerPath)}.`;
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith('.stale-claim')) continue;
+      const claimPath = path.join(LOCAL_AGENT_LOG_ROOT, name);
+      const marker = readLocalAgentOwnershipMarkerFile(claimPath, hostId);
+      if (!marker) continue;
+      let modifiedAtMs = 0;
+      try {
+        modifiedAtMs = fs.statSync(claimPath).mtimeMs || 0;
+      } catch (_) {
+        // Keep a valid claim eligible even if stat metadata is unavailable.
       }
-    } catch (_) {
-      // Try the legacy collision-prone basename before treating ownership as absent.
+      candidates.push({ claimPath, markerPath, marker, modifiedAtMs });
     }
   }
-  return null;
+  candidates.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+  for (const candidate of candidates) {
+    try {
+      fs.linkSync(candidate.claimPath, candidate.markerPath);
+      fs.rmSync(candidate.claimPath, { force: true });
+      return true;
+    } catch (error) {
+      if (error?.code === 'EEXIST') return true;
+    }
+  }
+  return false;
+}
+
+function inspectLocalAgentOwnershipMarkerRead(hostId) {
+  const markerPaths = localAgentOwnershipMarkerPaths(hostId);
+  const scan = () => {
+    let unknown = null;
+    for (const markerPath of markerPaths) {
+      const inspection = inspectLocalAgentOwnershipMarkerFile(markerPath, hostId);
+      if (inspection.status === 'present') return inspection;
+      if (inspection.status === 'unknown' && !unknown) unknown = inspection;
+    }
+    return unknown || { status: 'absent', marker: null, error: null };
+  };
+
+  const initial = scan();
+  if (initial.status === 'present') return initial;
+  if (restoreClaimedLocalAgentOwnershipMarker(hostId)) {
+    const restored = scan();
+    if (restored.status !== 'absent') return restored;
+  }
+  return initial;
+}
+
+function readLocalAgentOwnershipMarker(hostId) {
+  return inspectLocalAgentOwnershipMarkerRead(hostId).marker;
 }
 
 function writeLocalAgentOwnershipMarker(record) {
   const markerPath = localAgentOwnershipMarkerPath(record.hostId);
-  const existing = readLocalAgentOwnershipMarker(record.hostId);
-  if (existing) {
-    if (processIsAlive(existing.pid)) {
-      if (
-        String(existing.instanceId || '') !== String(record.instanceId || '')
-        || String(existing.ownershipToken || '') !== String(record.ownershipToken || '')
-      ) {
-        throw new Error(`live local agent ownership marker already exists for ${record.hostId}`);
-      }
-    } else {
-      fs.rmSync(existing.markerPath, { force: true });
-    }
+  const inspection = inspectUnclaimedLocalAgentOwnershipMarker(record.hostId);
+  const existing = inspection.marker;
+  if (existing && localAgentOwnershipMarkerMatchesRecord(existing, record)) {
+    record.ownershipMarkerPath = existing.markerPath;
+    return {
+      markerPath: existing.markerPath,
+      staleOwnershipRecovered: inspection.staleOwnershipRecovered === true,
+    };
+  }
+  const unresolvedOwnership = !existing
+    && !['absent', 'recovered'].includes(inspection.status);
+  if (existing || unresolvedOwnership) {
+    const error = new Error(
+      ['unknown', 'marker_changed'].includes(inspection.status)
+        ? `local agent ownership marker identity could not be verified for ${record.hostId}`
+        : `live local agent ownership marker already exists for ${record.hostId}`
+    );
+    error.code = ['unknown', 'marker_changed'].includes(inspection.status)
+      ? 'local_agent_ownership_unknown'
+      : 'local_agent_ownership_conflict';
+    throw error;
   }
   const marker = {
     kind: 'remote-codex-local-agent-owner',
@@ -4873,43 +5815,140 @@ function writeLocalAgentOwnershipMarker(record) {
     instanceId: record.instanceId,
     ownershipToken: record.ownershipToken,
     ownerRelayPid: process.pid,
+    ownerRelayInstanceId: RELAY_INSTANCE_ID,
     relayUrl: record.relayUrl,
     startedAt: record.startedAt,
+    processStartedAt: record.startedAt,
+    agentEntrypoint: LOCAL_AGENT_ENTRYPOINT,
   };
   fs.mkdirSync(path.dirname(markerPath), { recursive: true });
   const tempPath = `${markerPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   fs.writeFileSync(tempPath, `${JSON.stringify(marker, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   try {
-    fs.renameSync(tempPath, markerPath);
+    // A hard link publishes the complete temp file without overwriting a marker
+    // that appeared after the ownership assessment.
+    fs.linkSync(tempPath, markerPath);
+    fs.rmSync(tempPath, { force: true });
   } catch (error) {
+    const racedMarker = readLocalAgentOwnershipMarker(record.hostId);
     try {
       fs.rmSync(tempPath, { force: true });
     } catch (_) {
       // Best effort cleanup of an incomplete marker write.
     }
+    if (racedMarker && localAgentOwnershipMarkerMatchesRecord(racedMarker, record)) {
+      record.ownershipMarkerPath = racedMarker.markerPath;
+      return {
+        markerPath: racedMarker.markerPath,
+        staleOwnershipRecovered: inspection.staleOwnershipRecovered === true,
+      };
+    }
     throw error;
   }
   record.ownershipMarkerPath = markerPath;
-  return markerPath;
+  return {
+    markerPath,
+    staleOwnershipRecovered: inspection.staleOwnershipRecovered === true,
+  };
+}
+
+function localAgentOwnershipMarkerMatchesSnapshot(marker, snapshot) {
+  return Boolean(
+    marker
+    && snapshot
+    && String(marker.markerPath || '') === String(snapshot.markerPath || '')
+    && Number(marker.pid || 0) === Number(snapshot.pid || 0)
+    && String(marker.instanceId || '') === String(snapshot.instanceId || '')
+    && String(marker.ownershipToken || '') === String(snapshot.ownershipToken || '')
+    && String(marker.startedAt || '') === String(snapshot.startedAt || '')
+    && String(marker.processStartedAt || '') === String(snapshot.processStartedAt || '')
+    && String(marker.agentEntrypoint || '') === String(snapshot.agentEntrypoint || '')
+    && String(marker.ownerRelayInstanceId || '') === String(snapshot.ownerRelayInstanceId || '')
+    && String(marker.relayUrl || '') === String(snapshot.relayUrl || '')
+  );
+}
+
+function localAgentOwnershipMarkerMatchesRecord(marker, record) {
+  return Boolean(
+    marker
+    && record
+    && Number(marker.pid || 0) === Number(record.pid || record.lastPid || 0)
+    && String(marker.instanceId || '') === String(record.instanceId || '')
+    && String(marker.ownershipToken || '') === String(record.ownershipToken || '')
+  );
+}
+
+function removeLocalAgentOwnershipMarkerIfUnchanged(snapshot) {
+  if (!snapshot?.hostId || !snapshot.markerPath) {
+    return { removed: false, changed: false, marker: null };
+  }
+  const current = readLocalAgentOwnershipMarker(snapshot.hostId);
+  if (!localAgentOwnershipMarkerMatchesSnapshot(current, snapshot)) {
+    return { removed: false, changed: true, marker: current };
+  }
+  const claimedPath = `${current.markerPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.stale-claim`;
+  try {
+    // Rename atomically claims whichever marker is present at deletion time.
+    // The claimed content is verified again before it is discarded.
+    fs.renameSync(current.markerPath, claimedPath);
+  } catch (error) {
+    return {
+      removed: false,
+      changed: ['ENOENT', 'EEXIST'].includes(error?.code),
+      marker: readLocalAgentOwnershipMarker(snapshot.hostId),
+      error,
+    };
+  }
+
+  let claimed = null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(claimedPath, 'utf8'));
+    claimed = { ...parsed, markerPath: current.markerPath };
+  } catch (_) {
+    claimed = null;
+  }
+  if (!localAgentOwnershipMarkerMatchesSnapshot(claimed, snapshot)) {
+    try {
+      fs.linkSync(claimedPath, current.markerPath);
+      fs.rmSync(claimedPath, { force: true });
+    } catch (error) {
+      if (error?.code === 'EEXIST') {
+        // A newer marker already occupies the canonical path and wins.
+        fs.rmSync(claimedPath, { force: true });
+      } else {
+        return {
+          removed: false,
+          changed: true,
+          marker: readLocalAgentOwnershipMarker(snapshot.hostId) || claimed,
+          error,
+        };
+      }
+    }
+    return {
+      removed: false,
+      changed: true,
+      marker: readLocalAgentOwnershipMarker(snapshot.hostId) || claimed,
+    };
+  }
+
+  try {
+    fs.rmSync(claimedPath, { force: true });
+  } catch (_) {
+    // The canonical ownership path is already clear. A claim-file cleanup
+    // failure cannot make that PID authoritative again.
+  }
+  return {
+    removed: true,
+    changed: false,
+    marker: readLocalAgentOwnershipMarker(snapshot.hostId),
+  };
 }
 
 function removeLocalAgentOwnershipMarker(record) {
   if (!record?.hostId) return false;
   const marker = readLocalAgentOwnershipMarker(record.hostId);
-  if (!marker) return false;
-  if (
-    String(marker.instanceId || '') !== String(record.instanceId || '')
-    || String(marker.ownershipToken || '') !== String(record.ownershipToken || '')
-    || Number(marker.pid || 0) !== Number(record.pid || record.lastPid || 0)
-  ) {
-    return false;
-  }
-  try {
-    fs.rmSync(marker.markerPath, { force: true });
-    return true;
-  } catch (_) {
-    return false;
-  }
+  if (!localAgentOwnershipMarkerMatchesRecord(marker, record)) return false;
+  return removeLocalAgentOwnershipMarkerIfUnchanged(marker).removed;
 }
 
 function processIsAlive(pid) {
@@ -4923,16 +5962,245 @@ function processIsAlive(pid) {
   }
 }
 
+let linuxClockTicksPerSecond = null;
+let linuxBootTimeMs = null;
+const localAgentOwnershipAssessmentCache = new Map();
+
+function windowsPowerShellPath() {
+  const systemRoot = String(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows');
+  return path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+function probeWindowsLocalAgentProcessIdentity(pid) {
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$targetPid = ${pid}`,
+    "$result = [ordered]@{ startedAtMs = $null; executable = ''; commandLine = '' }",
+    "try { $cim = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $targetPid) -ErrorAction Stop; if ($null -ne $cim) { $result.startedAtMs = ([DateTimeOffset]$cim.CreationDate).ToUnixTimeMilliseconds(); $result.executable = [string]$cim.ExecutablePath; $result.commandLine = [string]$cim.CommandLine } } catch {}",
+    "if ($null -eq $result.startedAtMs) { try { $processInfo = Get-Process -Id $targetPid -ErrorAction Stop; $result.startedAtMs = ([DateTimeOffset]$processInfo.StartTime).ToUnixTimeMilliseconds(); try { $result.executable = [string]$processInfo.Path } catch {} } catch {} }",
+    '$result | ConvertTo-Json -Compress',
+  ].join('; ');
+  const result = spawnSync(windowsPowerShellPath(), [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    script,
+  ], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 5000,
+    maxBuffer: 1024 * 1024,
+  });
+  let parsed = null;
+  if (!result.error && result.status === 0) {
+    const line = String(result.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+    try {
+      parsed = JSON.parse(line);
+    } catch (_) {
+      parsed = null;
+    }
+  }
+  const alive = processIsAlive(pid);
+  const startedAtMs = Number(parsed?.startedAtMs || 0) || null;
+  const executable = String(parsed?.executable || '').trim() || null;
+  const commandLine = String(parsed?.commandLine || '').trim() || null;
+  return {
+    alive,
+    startedAtMs,
+    executable,
+    commandLine,
+    verified: Boolean(alive && startedAtMs && commandLine),
+  };
+}
+
+function readLinuxProcessStartTicks(pid) {
+  const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').trim();
+  const commandEnd = stat.lastIndexOf(')');
+  if (commandEnd < 0) throw new Error(`invalid /proc/${pid}/stat`);
+  const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+  const ticks = Number(fields[19]);
+  if (!Number.isFinite(ticks) || ticks < 0) throw new Error(`invalid process start ticks for ${pid}`);
+  return ticks;
+}
+
+function getLinuxClockTicksPerSecond() {
+  if (linuxClockTicksPerSecond) return linuxClockTicksPerSecond;
+  const result = spawnSync('getconf', ['CLK_TCK'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 2000,
+  });
+  const ticks = Number(String(result.stdout || '').trim());
+  if (result.error || result.status !== 0 || !Number.isFinite(ticks) || ticks <= 0) {
+    throw new Error('Linux clock tick rate is unavailable');
+  }
+  linuxClockTicksPerSecond = ticks;
+  return linuxClockTicksPerSecond;
+}
+
+function getLinuxBootTimeMs() {
+  if (linuxBootTimeMs) return linuxBootTimeMs;
+  const match = fs.readFileSync('/proc/stat', 'utf8').match(/^btime\s+(\d+)$/m);
+  if (!match) throw new Error('Linux boot time is unavailable');
+  linuxBootTimeMs = Number(match[1]) * 1000;
+  return linuxBootTimeMs;
+}
+
+function probeLinuxLocalAgentProcessIdentity(pid) {
+  if (!processIsAlive(pid)) {
+    return {
+      alive: false,
+      startedAtMs: null,
+      executable: null,
+      commandLine: null,
+      argv: null,
+      verified: false,
+    };
+  }
+  let firstStartTicks = null;
+  let secondStartTicks = null;
+  let startedAtMs = null;
+  let executable = null;
+  let commandLine = null;
+  let argv = null;
+  try {
+    firstStartTicks = readLinuxProcessStartTicks(pid);
+    const commandBuffer = fs.readFileSync(`/proc/${pid}/cmdline`);
+    argv = commandBuffer.toString('utf8').split('\0').filter(Boolean);
+    commandLine = argv.join(' ').trim() || null;
+    executable = String(fs.readlinkSync(`/proc/${pid}/exe`) || '').trim() || null;
+    secondStartTicks = readLinuxProcessStartTicks(pid);
+    if (firstStartTicks === secondStartTicks) {
+      startedAtMs = getLinuxBootTimeMs()
+        + (firstStartTicks * 1000 / getLinuxClockTicksPerSecond());
+    }
+  } catch (_) {
+    // Permission and procfs availability failures are reported as unknown.
+  }
+  const alive = processIsAlive(pid);
+  const stableIdentity = firstStartTicks != null
+    && secondStartTicks != null
+    && firstStartTicks === secondStartTicks;
+  return {
+    alive,
+    startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : null,
+    executable,
+    commandLine,
+    argv,
+    verified: Boolean(alive && stableIdentity && startedAtMs && commandLine),
+  };
+}
+
+function probeLocalAgentProcessIdentity(pid) {
+  const normalizedPid = Math.trunc(Number(pid || 0));
+  if (normalizedPid <= 0 || !processIsAlive(normalizedPid)) {
+    return { alive: false, startedAtMs: null, executable: null, commandLine: null, verified: false };
+  }
+  if (process.platform === 'win32') {
+    return probeWindowsLocalAgentProcessIdentity(normalizedPid);
+  }
+  if (process.platform === 'linux') {
+    return probeLinuxLocalAgentProcessIdentity(normalizedPid);
+  }
+  return {
+    alive: processIsAlive(normalizedPid),
+    startedAtMs: null,
+    executable: null,
+    commandLine: null,
+    verified: false,
+  };
+}
+
+function normalizeProcessIdentityPath(value) {
+  const normalized = String(value || '').trim().replace(/\\/g, '/');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function windowsCommandLineArguments(commandLine, limit = Number.POSITIVE_INFINITY) {
+  const args = [];
+  const tokenPattern = /"([^"]*)"|([^\s"]+)/g;
+  let match = tokenPattern.exec(String(commandLine || ''));
+  while (match && args.length < limit) {
+    args.push(match[1] == null ? match[2] : match[1]);
+    match = tokenPattern.exec(String(commandLine || ''));
+  }
+  return args;
+}
+
+function processIdentityMatchesLocalAgentEntrypoint(identity) {
+  if (process.platform === 'win32') {
+    const argv = windowsCommandLineArguments(identity?.commandLine, 3);
+    return normalizeProcessIdentityPath(argv[1])
+      === normalizeProcessIdentityPath(LOCAL_AGENT_IDENTITY_ENTRYPOINT);
+  }
+  if (process.platform === 'linux' && Array.isArray(identity?.argv)) {
+    return normalizeProcessIdentityPath(identity.argv[1])
+      === normalizeProcessIdentityPath(LOCAL_AGENT_IDENTITY_ENTRYPOINT);
+  }
+  return false;
+}
+
+function assessLocalAgentOwnershipMarker(marker) {
+  const cacheKey = JSON.stringify([
+    String(marker?.markerPath || ''),
+    Number(marker?.pid || 0),
+    String(marker?.instanceId || ''),
+    String(marker?.ownershipToken || ''),
+    String(marker?.processStartedAt || marker?.startedAt || ''),
+  ]);
+  const cached = localAgentOwnershipAssessmentCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < LOCAL_AGENT_PROCESS_IDENTITY_CACHE_MS) {
+    return cached.assessment;
+  }
+  const identity = probeLocalAgentProcessIdentity(marker?.pid);
+  let assessment = null;
+  if (!identity.alive) {
+    assessment = { status: 'stale', identity };
+  } else {
+    const markerStartedAtMs = Date.parse(marker?.processStartedAt || marker?.startedAt || '');
+    const hasStartIdentity = Number.isFinite(markerStartedAtMs) && markerStartedAtMs > 0
+      && Number.isFinite(identity.startedAtMs) && identity.startedAtMs > 0;
+    const entrypointMatches = processIdentityMatchesLocalAgentEntrypoint(identity);
+    if (
+      hasStartIdentity
+      && Math.abs(identity.startedAtMs - markerStartedAtMs) > LOCAL_AGENT_PROCESS_START_TOLERANCE_MS
+    ) {
+      assessment = { status: 'pid_reused', identity };
+    } else if (identity.commandLine && !entrypointMatches) {
+      assessment = { status: 'pid_reused', identity };
+    } else if (
+      identity.verified
+      && hasStartIdentity
+      && entrypointMatches
+    ) {
+      assessment = { status: 'live_agent', identity };
+    } else {
+      assessment = { status: 'unknown', identity };
+    }
+  }
+  localAgentOwnershipAssessmentCache.set(cacheKey, {
+    cachedAt: Date.now(),
+    assessment,
+  });
+  while (localAgentOwnershipAssessmentCache.size > LOCAL_AGENT_PROCESS_IDENTITY_CACHE_LIMIT) {
+    localAgentOwnershipAssessmentCache.delete(localAgentOwnershipAssessmentCache.keys().next().value);
+  }
+  return assessment;
+}
+
 function localAgentProcessIsAlive(record) {
   if (!record) return false;
-  if (
-    record.process
-    && record.process.exitCode === null
-    && record.process.signalCode === null
-  ) {
-    return true;
+  if (record.process) {
+    return record.process.exitCode === null
+      && record.process.signalCode === null;
   }
-  return processIsAlive(record.pid);
+  const marker = readLocalAgentOwnershipMarker(record.hostId);
+  if (!localAgentOwnershipMarkerMatchesRecord(marker, record)) return false;
+  const assessment = assessLocalAgentOwnershipMarker(marker);
+  // An unverifiable identity stays fail-closed: it may still be the adopted
+  // Agent, so callers must not delete its marker or start a duplicate.
+  return ['live_agent', 'unknown'].includes(assessment.status);
 }
 
 function spawnAndWait(command, args) {
@@ -5104,9 +6372,13 @@ function trackLocalAgentForRelayShutdown(record, signal = 'shutdown') {
 function reconcileRegisteredLocalAgent(hostId, label, input) {
   const existing = state.localAgents.get(hostId);
   if (!input || input.relayManaged !== true) {
+    const hasLiveRecord = localAgentProcessIsAlive(existing);
+    const ownershipInspection = hasLiveRecord
+      ? null
+      : inspectUnclaimedLocalAgentOwnershipMarker(hostId);
     if (
-      localAgentProcessIsAlive(existing)
-      || inspectUnclaimedLocalAgentOwnershipMarker(hostId)
+      hasLiveRecord
+      || Boolean(ownershipInspection?.marker)
     ) {
       return {
         ok: false,
@@ -5162,17 +6434,51 @@ function reconcileRegisteredLocalAgent(hostId, label, input) {
 }
 
 function inspectUnclaimedLocalAgentOwnershipMarker(hostId) {
-  const marker = readLocalAgentOwnershipMarker(hostId);
-  if (!marker) return null;
-  if (!processIsAlive(marker.pid)) {
-    try {
-      fs.rmSync(marker.markerPath, { force: true });
-    } catch (_) {
-      // A stale marker cannot justify adopting or killing a process.
+  let staleOwnershipRecovered = false;
+  let recoveredReason = null;
+  const maximumMarkers = localAgentOwnershipMarkerPaths(hostId).length;
+  for (let attempt = 0; attempt <= maximumMarkers; attempt += 1) {
+    const marker = readLocalAgentOwnershipMarker(hostId);
+    if (!marker) {
+      return {
+        status: staleOwnershipRecovered ? 'recovered' : 'absent',
+        marker: null,
+        identity: null,
+        staleOwnershipRecovered,
+        recoveredReason,
+      };
     }
-    return null;
+    const assessment = assessLocalAgentOwnershipMarker(marker);
+    if (!['stale', 'pid_reused'].includes(assessment.status)) {
+      return {
+        ...assessment,
+        marker,
+        staleOwnershipRecovered,
+        recoveredReason,
+      };
+    }
+
+    const removal = removeLocalAgentOwnershipMarkerIfUnchanged(marker);
+    if (!removal.removed) {
+      return {
+        status: removal.changed ? 'marker_changed' : 'unknown',
+        marker: removal.marker || readLocalAgentOwnershipMarker(hostId),
+        identity: assessment.identity,
+        staleOwnershipRecovered,
+        recoveredReason,
+        error: removal.error || null,
+      };
+    }
+    staleOwnershipRecovered = true;
+    recoveredReason = assessment.status;
   }
-  return marker;
+  return {
+    status: 'unknown',
+    marker: readLocalAgentOwnershipMarker(hostId),
+    identity: null,
+    staleOwnershipRecovered,
+    recoveredReason,
+  };
 }
 
 function agentPollOwnershipAttestation(req) {
@@ -5202,8 +6508,11 @@ function agentLeaseCredentials(req, body = null) {
 
 function authorizeLocalAgentOwnership(hostId, req) {
   const existing = state.localAgents.get(hostId);
-  const marker = inspectUnclaimedLocalAgentOwnershipMarker(hostId);
   const hasLiveRecord = localAgentProcessIsAlive(existing);
+  const ownershipInspection = hasLiveRecord
+    ? null
+    : inspectUnclaimedLocalAgentOwnershipMarker(hostId);
+  const marker = ownershipInspection?.marker || null;
   const hasLiveOwnership = hasLiveRecord || Boolean(marker);
   const attestation = agentPollOwnershipAttestation(req);
   if (!hasLiveOwnership) {
@@ -5583,22 +6892,56 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
   }
 
   const existing = state.localAgents.get(normalizedHostId);
-  if (!existing) {
-    const unclaimedMarker = inspectUnclaimedLocalAgentOwnershipMarker(normalizedHostId);
-    if (unclaimedMarker) {
-      return {
-        ok: true,
-        hostId: normalizedHostId,
-        status: 'ownership_pending',
-        message: 'A live ownership marker is waiting for its Agent register/heartbeat handshake.',
-        localAgent: null,
-      };
+  let staleOwnershipRecovered = false;
+  let existingProcessIsVerifiedLive = localAgentHasAuthoritativeProcessIdentity(existing);
+  if (!existingProcessIsVerifiedLive) {
+    const ownershipInspection = inspectUnclaimedLocalAgentOwnershipMarker(normalizedHostId);
+    staleOwnershipRecovered = ownershipInspection.staleOwnershipRecovered === true;
+    if (ownershipInspection.marker) {
+      const markerBelongsToExisting = localAgentOwnershipMarkerMatchesRecord(
+        ownershipInspection.marker,
+        existing
+      );
+      const adoptedAgentIdentityIsClaimed = markerBelongsToExisting
+        && existing?.recovered === true
+        && ownershipInspection.status === 'unknown';
+      if (
+        markerBelongsToExisting
+        && (ownershipInspection.status === 'live_agent' || adoptedAgentIdentityIsClaimed)
+      ) {
+        existingProcessIsVerifiedLive = true;
+      } else {
+        const retryAfterMs = ownershipInspection.status === 'live_agent' ? 3000 : 5000;
+        const message = ownershipInspection.status === 'live_agent'
+          ? 'A verified local Agent is still starting and waiting for its register/heartbeat handshake.'
+          : ownershipInspection.status === 'marker_changed'
+            ? 'Local Agent ownership changed while it was being checked. No replacement was started.'
+            : 'Local Agent ownership exists, but its process identity could not be verified. No replacement was started.';
+        return {
+          ok: true,
+          hostId: normalizedHostId,
+          status: 'ownership_pending',
+          ownershipAssessment: ownershipInspection.status,
+          retryAfterMs,
+          staleOwnershipRecovered,
+          message,
+          localAgent: null,
+        };
+      }
+    }
+    if (existing && staleOwnershipRecovered) {
+      existing.lastPid = existing.pid || existing.lastPid || null;
+      existing.process = null;
+      existing.pid = null;
+      existing.status = 'exited';
+      existing.updatedAt = nowIso();
+      existing.message = 'Recovered stale local Agent ownership; preparing a replacement.';
     }
   }
   if (existing) {
     clearLocalAgentRestartTimer(existing);
   }
-  if (localAgentProcessIsAlive(existing)) {
+  if (existingProcessIsVerifiedLive) {
     if (!restart) {
       return {
         ok: true,
@@ -5627,7 +6970,7 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
   const stderrFd = fs.openSync(errorLogPath, 'a');
   let child;
   try {
-    child = spawn(process.execPath, [path.join(__dirname, '..', 'host-agent', 'agent.js')], {
+    child = spawn(process.execPath, [LOCAL_AGENT_ENTRYPOINT], {
       cwd: process.cwd(),
       stdio: ['ignore', stdoutFd, stderrFd],
       detached: process.platform === 'win32',
@@ -5650,6 +6993,7 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
         RELAY_MANAGED_AGENT_TOKEN: ownershipToken,
         RELAY_MANAGED_MARKER_PATH: ownershipMarkerPath,
         RELAY_MANAGED_OWNER_PID: String(process.pid),
+        RELAY_MANAGED_OWNER_INSTANCE_ID: RELAY_INSTANCE_ID,
       },
     });
   } finally {
@@ -5689,24 +7033,8 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
     exitCompletionPromise: null,
     recovered: false,
   };
-  state.localAgents.set(normalizedHostId, record);
-  try {
-    writeLocalAgentOwnershipMarker(record);
-  } catch (error) {
-    record.status = 'error';
-    record.message = `failed to persist local agent ownership: ${error.message || error}`;
-    record.updatedAt = nowIso();
-    void forceKillProcessTree(child.pid).catch(() => {});
-    return {
-      ok: false,
-      hostId: normalizedHostId,
-      status: 'ownership_error',
-      message: record.message,
-      localAgent: publicLocalAgentRecord(record),
-    };
-  }
-
   child.on('spawn', () => {
+    if (record.desiredState === 'stopped') return;
     record.status = 'running';
     record.updatedAt = nowIso();
     record.message = 'local host-agent is running';
@@ -5715,7 +7043,9 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
     record.status = 'error';
     record.updatedAt = nowIso();
     record.message = error.message || 'failed to start local host-agent';
-    scheduleLocalAgentRestart(normalizedHostId, `process error: ${record.message}`, LOCAL_AGENT_EXIT_RESTART_DELAY_MS);
+    if (record.autoRestart !== false && record.desiredState !== 'stopped') {
+      scheduleLocalAgentRestart(normalizedHostId, `process error: ${record.message}`, LOCAL_AGENT_EXIT_RESTART_DELAY_MS);
+    }
   });
   child.on('exit', (code, signal) => {
     if (state.localAgents.get(normalizedHostId) !== record) {
@@ -5723,6 +7053,31 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
     }
     void completeLocalAgentExit(record, code, signal);
   });
+  state.localAgents.set(normalizedHostId, record);
+  try {
+    const markerWrite = writeLocalAgentOwnershipMarker(record);
+    staleOwnershipRecovered = staleOwnershipRecovered
+      || markerWrite.staleOwnershipRecovered === true;
+  } catch (error) {
+    record.status = 'error';
+    record.desiredState = 'stopped';
+    record.autoRestart = false;
+    record.restartAfterStop = false;
+    record.message = `failed to persist local agent ownership: ${error.message || error}`;
+    record.updatedAt = nowIso();
+    record.forceKillPromise = forceKillProcessTree(child.pid).catch((killError) => {
+      record.message = `${record.message}; cleanup failed: ${killError.message || killError}`;
+      record.updatedAt = nowIso();
+      return killError;
+    });
+    return {
+      ok: false,
+      hostId: normalizedHostId,
+      status: 'ownership_error',
+      message: record.message,
+      localAgent: publicLocalAgentRecord(record),
+    };
+  }
 
   const host = state.hosts.get(normalizedHostId) || {
     hostId: normalizedHostId,
@@ -5742,6 +7097,7 @@ function startLocalAgent({ hostId, label, restart = false, reason = '' } = {}) {
     hostId: normalizedHostId,
     status: 'starting',
     message: `Starting local host-agent for ${normalizedHostId}.`,
+    staleOwnershipRecovered,
     localAgent: publicLocalAgentRecord(record),
   };
 }
@@ -5798,10 +7154,13 @@ function rememberSessionAlias(hostId, aliasSessionId, canonicalSessionId) {
   const aliasKey = sessionKey(hostId, alias);
   const canonicalKey = resolveSessionKey(hostId, canonical);
   if (aliasKey !== canonicalKey) {
+    const previousSessionKey = resolveSessionKey(hostId, alias);
     const previousRealtimeKey = resolveCanonicalConversationKey(hostId, alias);
     state.sessionAliases.set(aliasKey, canonicalKey);
     const nextRealtimeKey = resolveCanonicalConversationKey(hostId, canonical);
-    mergeCanonicalRealtimeKeys(previousRealtimeKey, nextRealtimeKey);
+    for (const previousKey of new Set([previousSessionKey, previousRealtimeKey])) {
+      mergeCanonicalRealtimeKeys(previousKey, nextRealtimeKey);
+    }
   }
 }
 
@@ -5844,6 +7203,7 @@ function canonicalAliasesFor(identity, canonicalKey) {
 
 function mergeCanonicalRealtimeKeys(loserKey, winnerKey) {
   if (!loserKey || !winnerKey || loserKey === winnerKey) return;
+  migrateInputRequestScope(loserKey, winnerKey);
   state.activitySnapshots.mergeCanonicalKey(
     state.sessionEventStream.epoch,
     loserKey,
@@ -6428,10 +7788,13 @@ function getSessionDetail(hostId, sessionId, options = {}) {
   const runtime = state.sessionRuntime.get(key) || null;
   const persistedDiagnostics = options.skipDiagnostics ? [] : (state.sessionDiagnostics.get(key) || []);
   const diagnosticLimit = options.fullDiagnostics ? Infinity : SESSION_DETAIL_DIAGNOSTIC_LIMIT;
+  const loadRolloutDiagnostics = !(session.live && session.source === 'managed');
   const diagnostics = options.skipDiagnostics
     ? []
     : compactSessionDiagnostics([
-      ...loadSessionDiagnosticsFromRollout(session, { full: options.fullDiagnostics, limit: diagnosticLimit }),
+      ...(loadRolloutDiagnostics
+        ? loadSessionDiagnosticsFromRollout(session, { full: options.fullDiagnostics, limit: diagnosticLimit })
+        : []),
       ...persistedDiagnostics,
     ], { limit: diagnosticLimit });
   if (!options.skipDiagnostics && diagnostics.length) {
@@ -6565,9 +7928,15 @@ function mergeRemoteSessionDetail(hostId, sessionId, detail, remoteDetail, optio
   const remoteTranscript = (Array.isArray(remoteDetail.transcript) ? remoteDetail.transcript : [])
     .map(normalizeStoredTranscriptEntry)
     .filter(Boolean);
-  const remoteDiagnostics = (Array.isArray(remoteDetail.diagnostics) ? remoteDetail.diagnostics : [])
-    .map(normalizeStoredSessionDiagnostic)
-    .filter(Boolean);
+  const acceptRemoteRolloutDiagnostics = !(
+    detail.session?.live === true
+    && detail.session?.source === 'managed'
+  );
+  const remoteDiagnostics = acceptRemoteRolloutDiagnostics
+    ? (Array.isArray(remoteDetail.diagnostics) ? remoteDetail.diagnostics : [])
+      .map(normalizeStoredSessionDiagnostic)
+      .filter(Boolean)
+    : [];
 
   if (remoteTranscript.length) {
     setSessionLog(hostId, effectiveSessionId, remoteTranscript, { merge: true });
@@ -6606,6 +7975,23 @@ function mergeRemoteSessionDetail(hostId, sessionId, detail, remoteDetail, optio
   };
 }
 
+function refreshSessionDetailControlProjection(hostId, sessionId, detail) {
+  const effectiveSessionId = detail?.session?.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+  const current = getSessionDetail(hostId, effectiveSessionId, {
+    skipDiagnostics: true,
+    skipRemoteDetail: true,
+  });
+  if (!current) return detail;
+  return {
+    ...detail,
+    session: current.session,
+    alerts: current.alerts,
+    runtime: current.runtime,
+    requests: current.requests,
+    receivedFiles: current.receivedFiles,
+  };
+}
+
 async function getSessionDetailHydrated(hostId, sessionId, options = {}) {
   let detail = getSessionDetail(hostId, sessionId, options);
   if (!detail) {
@@ -6630,7 +8016,7 @@ async function getSessionDetailHydrated(hostId, sessionId, options = {}) {
     };
   }
 
-  return detail;
+  return refreshSessionDetailControlProjection(hostId, sessionId, detail);
 }
 
 function exportTimestamp(value) {
@@ -7525,6 +8911,12 @@ function normalizeFileTransferRefs(rawFiles) {
 }
 
 function transcriptFingerprint(entry) {
+  if (entry.assistantMessageId) {
+    return `assistant|${entry.assistantMessageId}`;
+  }
+  if (entry.clientRequestId) {
+    return `request|${entry.speaker || 'system'}|${entry.clientRequestId}`;
+  }
   return `${entry.speaker || 'system'}|${entry.timestamp || ''}|${canonicalTranscriptText(entry.text || '')}|${(entry.files || []).map((file) => file.path || file.name || '').join(',')}`;
 }
 
@@ -7580,6 +8972,25 @@ function setSessionAlerts(hostId, sessionId, entries) {
   state.sessionAlerts.set(key, mergeByFingerprint(alerts, (entry) => `${entry.severity || 'warning'}|${entry.timestamp || ''}|${entry.message || ''}`, 100));
 }
 
+function normalizedRuntimeRevision(runtime) {
+  const revision = Number(runtime?.runtimeRevision || 0);
+  return Number.isSafeInteger(revision) && revision > 0 ? revision : 0;
+}
+
+function runtimePatchHasStaleRevision(existing, incoming) {
+  const existingRevision = normalizedRuntimeRevision(existing);
+  const incomingRevision = normalizedRuntimeRevision(incoming);
+  if (!existingRevision || !incomingRevision) return false;
+  const existingRunId = String(existing?.runId || '').trim();
+  const incomingRunId = String(incoming?.runId || '').trim();
+  return Boolean(
+    existingRunId
+    && incomingRunId
+    && existingRunId === incomingRunId
+    && incomingRevision <= existingRevision
+  );
+}
+
 function setSessionRuntime(hostId, sessionId, runtime) {
   const key = resolveSessionKey(hostId, sessionId);
   if (!runtime || typeof runtime !== 'object') {
@@ -7588,6 +8999,9 @@ function setSessionRuntime(hostId, sessionId, runtime) {
   }
 
   const existing = state.sessionRuntime.get(key) || {};
+  if (runtimePatchHasStaleRevision(existing, runtime)) {
+    return existing;
+  }
   const next = {
     ...existing,
     ...runtime,
@@ -7642,6 +9056,10 @@ function emitSessionDiagnostic(hostId, sessionId, entry) {
 
 function emitSessionRuntimePatch(hostId, sessionId, patch = {}) {
   const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const existing = state.sessionRuntime.get(resolveSessionKey(hostId, effectiveSessionId)) || {};
+  if (runtimePatchHasStaleRevision(existing, patch)) {
+    return existing;
+  }
   const timestamp = patch.updatedAt || nowIso();
   const runtime = setSessionRuntime(hostId, effectiveSessionId, {
     ...patch,
@@ -7675,7 +9093,12 @@ function upsertSessionRequest(hostId, sessionId, entry) {
     message: entry.message || null,
     summary: entry.summary || null,
     payload: entry.payload || null,
+    availableDecisions: entry.availableDecisions || entry.payload?.availableDecisions || [],
     response: entry.response || null,
+    runId: entry.runId || null,
+    turnId: entry.turnId || null,
+    itemId: entry.itemId || null,
+    callId: entry.callId || null,
   };
 
   const index = existing.findIndex((item) => String(item.requestId || '') === nextEntry.requestId);
@@ -7701,6 +9124,66 @@ function emitSessionRequest(hostId, sessionId, entry) {
   };
   broadcastSessionEvent(hostId, sessionId, 'session.request', payload);
   return payload;
+}
+
+function findSessionRequest(hostId, sessionId, requestId) {
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const request = (state.sessionRequests.get(sessionKey(hostId, effectiveSessionId)) || [])
+    .find((item) => String(item.requestId || '') === String(requestId || '')) || null;
+  return { effectiveSessionId, request };
+}
+
+function claimSessionRequestResponse(hostId, sessionId, requestId, response, options = {}) {
+  const { effectiveSessionId, request } = findSessionRequest(hostId, sessionId, requestId);
+  if (!request) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: 'This Codex request is no longer available.',
+      code: 'session_request_not_found',
+      effectiveSessionId,
+    };
+  }
+
+  const session = getSession(hostId, effectiveSessionId);
+  const requestRunId = String(request.runId || '').trim();
+  const currentRunId = String(session?.runId || '').trim();
+  const submittedRunId = String(options.runId || '').trim();
+  if (
+    (submittedRunId && requestRunId && submittedRunId !== requestRunId)
+    || (requestRunId && currentRunId && requestRunId !== currentRunId)
+  ) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: 'This approval belongs to an earlier Session run.',
+      code: 'session_request_stale_run',
+      effectiveSessionId,
+      request,
+    };
+  }
+
+  if (request.status !== 'pending') {
+    return {
+      ok: true,
+      duplicate: true,
+      effectiveSessionId,
+      request,
+    };
+  }
+
+  const responding = emitSessionRequest(hostId, effectiveSessionId, {
+    ...request,
+    status: 'responding',
+    updatedAt: nowIso(),
+    response: response || null,
+  });
+  return {
+    ok: true,
+    claimed: true,
+    effectiveSessionId,
+    request: responding,
+  };
 }
 
 function goalAutoApproveKey(hostId, sessionId) {
@@ -7775,16 +9258,23 @@ function maybeAutoApproveSessionRequest(hostId, sessionId, requestEntry) {
   if (!requestId) {
     return false;
   }
+  const response = {
+    decision: 'accept',
+    autoApproved: true,
+    scope: 'goal',
+  };
+  const claim = claimSessionRequestResponse(hostId, sessionId, requestId, response, {
+    runId: requestEntry?.runId || null,
+  });
+  if (!claim.claimed) {
+    return false;
+  }
   enqueueCommand(hostId, {
     type: 'session.request.respond',
-    sessionId,
+    sessionId: claim.effectiveSessionId,
     requestId,
-    response: {
-      decision: 'accept',
-      autoApproved: true,
-      scope: 'goal',
-    },
-    ...sessionIdentityPatch(hostId, sessionId),
+    response,
+    ...sessionIdentityPatch(hostId, claim.effectiveSessionId),
   });
   return true;
 }
@@ -7804,7 +9294,12 @@ function resolveSessionRequest(hostId, sessionId, requestId, patch = {}) {
     message: patch.message ?? existing?.message ?? null,
     summary: patch.summary ?? existing?.summary ?? null,
     payload: patch.payload ?? existing?.payload ?? null,
+    availableDecisions: patch.availableDecisions ?? existing?.availableDecisions ?? [],
     response: patch.response ?? existing?.response ?? null,
+    runId: patch.runId ?? existing?.runId ?? null,
+    turnId: patch.turnId ?? existing?.turnId ?? null,
+    itemId: patch.itemId ?? existing?.itemId ?? null,
+    callId: patch.callId ?? existing?.callId ?? null,
   });
   const payload = {
     ...resolved,
@@ -7818,7 +9313,7 @@ function resolveSessionRequest(hostId, sessionId, requestId, patch = {}) {
 function resolvePendingSessionRequests(hostId, sessionId, patch = {}) {
   const key = sessionKey(hostId, sessionId);
   const requests = state.sessionRequests.get(key) || [];
-  const pending = requests.filter((item) => item.status === 'pending');
+  const pending = requests.filter((item) => ['pending', 'responding'].includes(item.status));
   for (const request of pending) {
     resolveSessionRequest(hostId, sessionId, request.requestId, {
       status: patch.status || 'expired',
@@ -7840,7 +9335,48 @@ function appendSessionLog(hostId, sessionId, entry) {
   if (!nextEntry) {
     return null;
   }
-  if (isAdjacentTranscriptDuplicate(existing[existing.length - 1], nextEntry)) {
+  if (nextEntry.assistantMessageId) {
+    const existingIndex = existing.findIndex((candidate) => (
+      candidate.assistantMessageId === nextEntry.assistantMessageId
+    ));
+    if (existingIndex >= 0) {
+      const previous = existing[existingIndex];
+      const previousIsRollout = previous.source === 'codex-jsonl';
+      const incomingIsRollout = nextEntry.source === 'codex-jsonl';
+      const merged = normalizeStoredTranscriptEntry(
+        previousIsRollout && !incomingIsRollout
+          ? { ...nextEntry, ...previous }
+          : { ...previous, ...nextEntry }
+      );
+      existing[existingIndex] = merged;
+      state.sessionLogs.set(
+        key,
+        compactTranscriptEntries(existing).slice(-SESSION_LOG_ENTRY_LIMIT)
+      );
+      const session = getSession(hostId, sessionId);
+      if (session) {
+        session.messageCount = Math.max(Number(session.messageCount || 0), state.sessionLogs.get(key)?.length || 0);
+        session.lastUpdatedAt = merged.timestamp || nowIso();
+        state.sessions.set(key, session);
+      }
+      scheduleSessionLogsSave();
+      return merged;
+    }
+  }
+  const adjacent = existing[existing.length - 1] || null;
+  if (isAdjacentTranscriptDuplicate(adjacent, nextEntry)) {
+    if (
+      adjacent?.assistantMessageId
+      || nextEntry.assistantMessageId
+      || adjacent?.clientRequestId
+      || nextEntry.clientRequestId
+    ) {
+      const merged = mergeAdjacentTranscriptDuplicate(adjacent, nextEntry);
+      existing[existing.length - 1] = merged;
+      state.sessionLogs.set(key, existing.slice(-SESSION_LOG_ENTRY_LIMIT));
+      scheduleSessionLogsSave();
+      return merged;
+    }
     return null;
   }
   existing.push(nextEntry);
@@ -7909,18 +9445,21 @@ function prunePendingUserTranscriptEchoesForKey(key) {
 
 function recordPendingUserTranscriptEcho(hostId, sessionId, entry) {
   const key = sessionKey(hostId, sessionId);
+  const clientRequestId = normalizeClientRequestId(entry?.clientRequestId) || null;
   const fullText = cleanStoredTranscriptText(entry?.fullText || '', 'user');
   const displayText = cleanStoredTranscriptText(entry?.displayText || '', 'user');
   const fullCanonical = canonicalTranscriptText(fullText);
   const displayCanonical = canonicalTranscriptText(displayText);
-  if (!fullCanonical && !displayCanonical) {
+  if (!clientRequestId && !fullCanonical && !displayCanonical) {
     return;
   }
   const records = prunePendingUserTranscriptEchoesForKey(key);
   records.push({
     createdAt: Date.now(),
+    clientRequestId,
     fullCanonical,
     displayCanonical,
+    status: 'pending',
   });
   state.pendingUserTranscriptEchoes.set(key, records.slice(-PENDING_USER_TRANSCRIPT_ECHO_LIMIT));
 }
@@ -7938,12 +9477,20 @@ function consumePendingUserTranscriptEcho(hostId, sessionId, entry) {
   if (!entryCanonical) {
     return false;
   }
-  const index = records.findIndex((record) => (
-    (record.fullCanonical && entryCanonical === record.fullCanonical)
-    || (record.displayCanonical && entryCanonical === record.displayCanonical)
-  ));
+  const entryRequestId = normalizeClientRequestId(entry.clientRequestId) || null;
+  const index = records.findIndex((record) => {
+    if (entryRequestId && record.clientRequestId) {
+      return entryRequestId === record.clientRequestId;
+    }
+    if (entryRequestId) return false;
+    return (record.fullCanonical && entryCanonical === record.fullCanonical)
+      || (record.displayCanonical && entryCanonical === record.displayCanonical);
+  });
   if (index < 0) {
     return false;
+  }
+  if (records[index].status === 'rejected') {
+    return true;
   }
   records.splice(index, 1);
   if (records.length) {
@@ -7952,6 +9499,209 @@ function consumePendingUserTranscriptEcho(hostId, sessionId, entry) {
     state.pendingUserTranscriptEchoes.delete(key);
   }
   return true;
+}
+
+function markPendingUserTranscriptEchoRejected(hostId, sessionId, clientRequestId, entry = null) {
+  const normalizedRequestId = normalizeClientRequestId(clientRequestId) || null;
+  if (!normalizedRequestId) return false;
+  const key = sessionKey(hostId, sessionId);
+  const records = prunePendingUserTranscriptEchoesForKey(key);
+  let record = records.find((candidate) => candidate.clientRequestId === normalizedRequestId) || null;
+  if (!record) {
+    const text = cleanStoredTranscriptText(entry?.text || '', 'user');
+    const canonical = canonicalTranscriptText(text);
+    record = {
+      createdAt: Date.now(),
+      clientRequestId: normalizedRequestId,
+      fullCanonical: canonical,
+      displayCanonical: canonical,
+      status: 'rejected',
+    };
+    records.push(record);
+  } else {
+    record.status = 'rejected';
+    record.createdAt = Date.now();
+  }
+  state.pendingUserTranscriptEchoes.set(key, records.slice(-PENDING_USER_TRANSCRIPT_ECHO_LIMIT));
+  return true;
+}
+
+function markUserTranscriptAccepted(hostId, sessionId, clientRequestId) {
+  const normalizedRequestId = normalizeClientRequestId(clientRequestId) || null;
+  if (!normalizedRequestId) return false;
+  const key = resolveSessionKey(hostId, sessionId);
+  const existing = state.sessionLogs.get(key) || [];
+  let changed = false;
+  const next = existing.map((entry) => {
+    if (
+      entry?.speaker !== 'user'
+      || entry.clientRequestId !== normalizedRequestId
+      || entry.deliveryStatus === 'accepted'
+    ) {
+      return entry;
+    }
+    changed = true;
+    return normalizeStoredTranscriptEntry({ ...entry, deliveryStatus: 'accepted' }) || entry;
+  });
+  if (!changed) return false;
+  state.sessionLogs.set(key, next);
+  refreshSessionMessageSummaries(hostId, sessionId, next);
+  scheduleSessionLogsSave();
+  return true;
+}
+
+function queueInputTranscriptProjectionCheckpoint(entry) {
+  const hostId = String(entry?.hostId || '').trim();
+  const commandId = Number(entry?.originalCommandId || entry?.commandId || 0);
+  const clientRequestId = normalizeClientRequestId(entry?.clientRequestId);
+  const outcome = String(entry?.projectionOutcome || '').trim();
+  if (!hostId || !Number.isSafeInteger(commandId) || commandId <= 0 || !clientRequestId || !outcome) {
+    return false;
+  }
+  state.pendingInputProjectionCheckpoints.set(`${hostId}::${commandId}`, {
+    hostId,
+    commandId,
+    clientRequestId,
+    outcome,
+  });
+  return true;
+}
+
+function checkpointPersistedInputTranscriptProjections() {
+  for (const [key, checkpoint] of state.pendingInputProjectionCheckpoints.entries()) {
+    const result = state.inputCommandOutbox.markProjectionApplied(
+      checkpoint.hostId,
+      checkpoint.commandId,
+      checkpoint.clientRequestId,
+      checkpoint.outcome
+    );
+    if (result.recorded || ['duplicate', 'missing'].includes(result.reason)) {
+      state.pendingInputProjectionCheckpoints.delete(key);
+    }
+  }
+}
+
+function recoveredInputProjectionSessionIds(entry) {
+  const command = entry?.command || {};
+  return [...new Set([
+    entry?.transcriptProjection?.sessionId,
+    entry?.completedSessionId,
+    command.requestedSessionId,
+    command.sessionId,
+    command.bridgeSessionId,
+    command.nativeThreadId,
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function reconcileRecoveredInputTranscriptProjections(projectionWork = []) {
+  let changed = false;
+  for (const entry of projectionWork) {
+    const requestId = normalizeClientRequestId(entry?.clientRequestId);
+    const outcome = String(entry?.projectionOutcome || '').trim();
+    const projection = normalizeStoredTranscriptEntry({
+      ...(entry?.transcriptProjection || {}),
+      speaker: 'user',
+      clientRequestId: requestId,
+      deliveryStatus: outcome === 'accepted' ? 'accepted' : 'pending',
+    });
+    if (!requestId || !projection || !['pending', 'accepted', 'acceptance_unknown', 'rejected'].includes(outcome)) {
+      continue;
+    }
+    const sessionIds = recoveredInputProjectionSessionIds(entry);
+    let found = false;
+    for (const sessionId of sessionIds) {
+      const key = resolveSessionKey(entry.hostId, sessionId);
+      const entries = state.sessionLogs.get(key) || [];
+      found ||= entries.some((candidate) => (
+        candidate?.speaker === 'user' && candidate.clientRequestId === requestId
+      ));
+      if (outcome === 'rejected') {
+        const rejectedEntry = entries.find((entry) => (
+          entry?.speaker === 'user'
+          && entry.clientRequestId === requestId
+          && entry.deliveryStatus !== 'accepted'
+        )) || null;
+        markPendingUserTranscriptEchoRejected(
+          entry.hostId,
+          sessionId,
+          requestId,
+          rejectedEntry
+        );
+      }
+      const next = outcome === 'rejected'
+        ? entries.filter((entry) => !(
+          entry?.speaker === 'user'
+          && entry.clientRequestId === requestId
+          && entry.deliveryStatus !== 'accepted'
+        ))
+        : outcome === 'accepted'
+          ? entries.map((entry) => (
+            entry?.speaker === 'user' && entry.clientRequestId === requestId
+              ? normalizeStoredTranscriptEntry({ ...entry, deliveryStatus: 'accepted' }) || entry
+              : entry
+          ))
+          : entries;
+      if (JSON.stringify(next) === JSON.stringify(entries)) continue;
+      changed = true;
+      if (next.length) state.sessionLogs.set(key, next);
+      else state.sessionLogs.delete(key);
+    }
+    if (outcome !== 'rejected' && !found) {
+      const sessionId = projection.sessionId || sessionIds[0];
+      if (sessionId) {
+        const key = resolveSessionKey(entry.hostId, sessionId);
+        const entries = state.sessionLogs.get(key) || [];
+        state.sessionLogs.set(
+          key,
+          compactTranscriptEntries([...entries, projection]).slice(-SESSION_LOG_ENTRY_LIMIT)
+        );
+        changed = true;
+      }
+    }
+    if (outcome === 'pending' || outcome === 'acceptance_unknown') {
+      recordPendingUserTranscriptEcho(entry.hostId, projection.sessionId || sessionIds[0], {
+        clientRequestId: requestId,
+        fullText: entry?.command?.text || projection.text,
+        displayText: projection.text,
+      });
+    }
+    queueInputTranscriptProjectionCheckpoint(entry);
+  }
+  if (projectionWork.length) saveSessionLogs();
+  return changed;
+}
+
+function rejectPendingUserTranscript(hostId, sessionId, clientRequestId, reason = '') {
+  const normalizedRequestId = normalizeClientRequestId(clientRequestId) || null;
+  if (!normalizedRequestId) return null;
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const key = resolveSessionKey(hostId, effectiveSessionId);
+  const existing = state.sessionLogs.get(key) || [];
+  const removed = existing.find((entry) => (
+    entry?.speaker === 'user'
+    && entry.clientRequestId === normalizedRequestId
+    && entry.deliveryStatus !== 'accepted'
+  )) || null;
+  markPendingUserTranscriptEchoRejected(hostId, effectiveSessionId, normalizedRequestId, removed);
+  if (!removed) return null;
+
+  const next = existing.filter((entry) => entry !== removed);
+  state.sessionLogs.set(key, next);
+  scheduleSessionLogsSave();
+  const session = refreshSessionMessageSummaries(hostId, effectiveSessionId, next);
+  const payload = {
+    hostId,
+    sessionId: effectiveSessionId,
+    speaker: 'user',
+    clientRequestId: normalizedRequestId,
+    reason: reason || 'input_rejected',
+    timestamp: nowIso(),
+  };
+  broadcastSessionEvent(hostId, effectiveSessionId, 'session.transcript_removed', payload);
+  if (session) {
+    broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', session);
+  }
+  return payload;
 }
 
 function emitSessionAlert(hostId, sessionId, entry) {
@@ -7978,7 +9728,7 @@ function buildResumeTranscript(entries, options = {}) {
   const maxEntryChars = Number(options.maxEntryChars ?? RESUME_TRANSCRIPT_MAX_ENTRY_CHARS);
   const maxTotalChars = Number(options.maxTotalChars ?? RESUME_TRANSCRIPT_MAX_TOTAL_CHARS);
   const filtered = entries
-    .filter((entry) => entry && entry.text)
+    .filter((entry) => entry && entry.text && entry.deliveryStatus !== 'pending')
     .map((entry) => ({
       speaker: entry.speaker || 'system',
       text: String(entry.text || ''),
@@ -8159,6 +9909,36 @@ function moveSessionArtifacts(hostId, fromSessionId, toSessionId) {
       updatedAt: nowIso(),
     });
     state.sessionRuntime.delete(fromKey);
+  }
+
+  const fromEchoes = state.pendingUserTranscriptEchoes.get(fromKey) || [];
+  const toEchoes = state.pendingUserTranscriptEchoes.get(toKey) || [];
+  if (fromEchoes.length || toEchoes.length) {
+    const mergedEchoes = new Map();
+    for (const record of [...toEchoes, ...fromEchoes]) {
+      const identity = record.clientRequestId
+        || `${record.fullCanonical || ''}|${record.displayCanonical || ''}`;
+      const previous = mergedEchoes.get(identity);
+      if (!previous) {
+        mergedEchoes.set(identity, { ...record });
+        continue;
+      }
+      mergedEchoes.set(identity, {
+        ...(Number(previous.createdAt || 0) > Number(record.createdAt || 0) ? record : previous),
+        ...(Number(previous.createdAt || 0) > Number(record.createdAt || 0) ? previous : record),
+        status: previous.status === 'rejected' || record.status === 'rejected'
+          ? 'rejected'
+          : record.status || previous.status || 'pending',
+        createdAt: Math.max(Number(previous.createdAt || 0), Number(record.createdAt || 0)),
+      });
+    }
+    state.pendingUserTranscriptEchoes.set(
+      toKey,
+      Array.from(mergedEchoes.values())
+        .sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0))
+        .slice(-PENDING_USER_TRANSCRIPT_ECHO_LIMIT)
+    );
+    state.pendingUserTranscriptEchoes.delete(fromKey);
   }
 
   const fromDiagnostics = state.sessionDiagnostics.get(fromKey) || [];
@@ -8538,7 +10318,9 @@ function refreshSessionMessageSummaries(hostId, sessionId, transcript = []) {
   if (!session) {
     return null;
   }
-  const latestUser = [...transcript].reverse().find((entry) => entry.speaker === 'user' && entry.text);
+  const latestUser = [...transcript].reverse().find((entry) => (
+    entry.speaker === 'user' && entry.text && entry.deliveryStatus !== 'pending'
+  ));
   const latestAgent = [...transcript].reverse().find((entry) => (entry.speaker === 'agent' || entry.speaker === 'assistant') && entry.text);
   const latestUserMessage = latestUser?.text || null;
   const latestAgentMessage = latestAgent?.text || null;
@@ -8589,7 +10371,7 @@ function maybeInferAndPersistSessionTitle(hostId, sessionId, transcript = []) {
 function inferSessionTitleFromTranscript(session, transcript = []) {
   const candidates = [];
   for (const entry of Array.isArray(transcript) ? transcript : []) {
-    if (!entry || entry.speaker !== 'user') {
+    if (!entry || entry.speaker !== 'user' || entry.deliveryStatus === 'pending') {
       continue;
     }
     const text = cleanStoredTranscriptText(entry.text || '', 'user');
@@ -8610,7 +10392,7 @@ function inferSessionTitleFromTranscript(session, transcript = []) {
     }
   }
 
-  if (session?.source?.subagent || session?.originator === 'subagent') {
+  if (isInternalApprovalReviewSession(session)) {
     return 'Approval review';
   }
 
@@ -11030,6 +12812,28 @@ function awaitHostProbe(requestId, timeoutMs = 5000) {
   });
 }
 
+function awaitCodexUpdateRequest(requestId, timeoutMs = HOST_CODEX_UPDATE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      state.pendingCodexUpdateRequests.delete(requestId);
+      reject(new Error('Host Codex update timed out while waiting for the Host Agent'));
+    }, timeoutMs);
+    timer.unref?.();
+    state.pendingCodexUpdateRequests.set(requestId, {
+      resolve: (payload) => {
+        clearTimeout(timer);
+        state.pendingCodexUpdateRequests.delete(requestId);
+        resolve(payload);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        state.pendingCodexUpdateRequests.delete(requestId);
+        reject(error);
+      },
+    });
+  });
+}
+
 function awaitSessionApiRequest(pendingMap, requestId, label, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -11291,6 +13095,36 @@ async function requestHostBindingPreflight(hostId, expectedBinding = null) {
     );
   }
   return publicBinding(payload.binding);
+}
+
+function assertHostSupportsSessionApiRebind(hostId, apiConfig = null) {
+  const capabilities = state.hosts.get(hostId)?.capabilities || {};
+  const missing = [];
+  if (capabilities.sessionApiRebindV1 !== true) missing.push('sessionApiRebindV1');
+  if (capabilities.runApiBinding !== true) missing.push('runApiBinding');
+  if (capabilities.apiCatalog !== true) missing.push('apiCatalog');
+  if (!apiConfig && capabilities.bindingPreflight !== true) missing.push('bindingPreflight');
+  if (!missing.length) {
+    return true;
+  }
+  throw new SessionContractError(
+    'session_api_rebind_capability_unavailable',
+    `Restart or update this Host Agent before binding an existing Session to an API. Missing: ${missing.join(', ')}.`,
+    { statusCode: 409, canRebind: false }
+  );
+}
+
+function assertNoExplicitRebindRuntimeOverride(body = {}) {
+  const command = String(body.command || '').trim();
+  const args = Array.isArray(body.args) ? body.args.filter((value) => String(value || '').trim()) : [];
+  if (!command && !args.length) {
+    return true;
+  }
+  throw new SessionContractError(
+    'session_rebind_runtime_override_unsupported',
+    'Session Rebind must use the Host Agent default Codex app-server runtime.',
+    { statusCode: 400, canRebind: true }
+  );
 }
 
 function publicModelCatalog(catalog) {
@@ -12188,7 +14022,7 @@ function upsertSession(hostId, patch, options = {}) {
   return next;
 }
 
-function enqueueCommand(hostId, command) {
+function enqueueCommand(hostId, command, options = {}) {
   const queue = state.commandQueues.get(hostId) || [];
   const next = {
     ...command,
@@ -12196,6 +14030,28 @@ function enqueueCommand(hostId, command) {
     createdAt: nowIso(),
     priority: commandPriority(command),
   };
+  if (next.type === 'session.input' && next.clientRequestId) {
+    try {
+      state.inputCommandOutbox.recordQueued({
+        hostId,
+        scopeKey: String(options.inputScopeKey || '').trim(),
+        clientRequestId: next.clientRequestId,
+        fingerprint: String(options.inputFingerprint || '').trim(),
+        command: next,
+        transcriptProjection: options.transcriptProjection,
+      });
+    } catch (cause) {
+      const error = new SessionContractError(
+        cause?.code || 'input_command_persistence_failed',
+        String(cause?.code || '').startsWith('input_command_outbox_')
+          ? (cause.message || 'The prompt could not be stored in the durable input queue.')
+          : 'The prompt could not be stored in the durable input queue. Retry after Relay storage recovers.',
+        { statusCode: 503 }
+      );
+      error.cause = cause;
+      throw error;
+    }
+  }
   queue.push(next);
   state.commandQueues.set(hostId, pruneCommandQueue(queue));
   return next;
@@ -12674,64 +14530,47 @@ function scheduleStopFallback(hostId, sessionId, options = {}) {
         markSessionClosed(hostId, sessionId);
         return;
       }
-      if (stopRequestId) {
-        const cancelled = await state.provenance.cancelStopRun({
-          identity: { hostId, sessionId },
-          runId: expectedRunId,
-          stopRequestId,
-        });
-        if (cancelled.transitioned !== true) {
-          return;
-        }
-      } else if (!session?.live || (session.state !== 'ending' && runtime?.phase !== 'ending')) {
+      if (stopRequestId && run?.stopRequestId !== stopRequestId) {
+        return;
+      }
+      if (!stopRequestId && (!session?.live || (session.state !== 'ending' && runtime?.phase !== 'ending'))) {
         return;
       }
 
-      const restored = upsertSession(hostId, {
+      const delayed = upsertSession(hostId, {
         sessionId: session?.sessionId || sessionId,
-        state: options.previousState || 'running',
+        state: 'ending',
         live: true,
         runId: expectedRunId,
         lastUpdatedAt: nowIso(),
-      }, { preserveManagedLive: false });
-      const runtimeBase = runtime || options.previousRuntime || {};
-      const previousRuntime = options.previousRuntime || {};
-      const stopStateProjected = runtimeBase.phase === 'ending'
-        || runtimeBase.connection === 'closing'
-        || runtimeBase.currentTurnStatus === 'stopping';
-      const hasPreviousRuntime = Boolean(options.previousRuntime && typeof options.previousRuntime === 'object');
-      const restoredRuntimeBase = stopStateProjected && hasPreviousRuntime
-        ? { ...runtimeBase, ...previousRuntime }
-        : {
-          ...runtimeBase,
-          ...(stopStateProjected ? {
-            phase: 'idle',
-            connection: 'ready',
-            busy: false,
-            activeTurnId: null,
-            currentTurnStatus: 'idle',
-            waitingOnApproval: false,
-            waitingOnUserInput: false,
-          } : {}),
-        };
-      const restoredRuntime = setSessionRuntime(hostId, restored.sessionId, {
-        ...restoredRuntimeBase,
-        phase: restoredRuntimeBase.phase || 'idle',
-        connection: restoredRuntimeBase.connection || 'ready',
-        runId: expectedRunId || restoredRuntimeBase.runId || null,
+      });
+      const delayedRuntime = setSessionRuntime(hostId, delayed.sessionId, {
+        ...(runtime || {}),
+        phase: 'ending',
+        connection: 'closing',
+        busy: false,
+        activeTurnId: null,
+        currentTurnStatus: 'stopping',
+        waitingOnApproval: false,
+        waitingOnUserInput: false,
+        pendingInputSummary: null,
+        queuedCommandId: null,
+        stopDelayed: true,
+        stopDelayedAt: nowIso(),
+        runId: expectedRunId || runtime?.runId || null,
         updatedAt: nowIso(),
       });
-      broadcastSessionEvent(hostId, restored.sessionId, 'session.runtime_updated', {
+      broadcastSessionEvent(hostId, delayed.sessionId, 'session.runtime_updated', {
         hostId,
-        sessionId: restored.sessionId,
-        patch: restoredRuntime,
+        sessionId: delayed.sessionId,
+        patch: delayedRuntime,
         timestamp: nowIso(),
       });
-      broadcastSessionEvent(hostId, restored.sessionId, 'session.snapshot', restored);
-      emitSessionAlert(hostId, restored.sessionId, {
+      broadcastSessionEvent(hostId, delayed.sessionId, 'session.snapshot', delayed);
+      emitSessionAlert(hostId, delayed.sessionId, {
         severity: 'warning',
         source: 'relay',
-        message: 'Stop was not confirmed by the Host; the Session remains available for retry.',
+        message: 'Stop is taking longer than expected. The Session remains unavailable for new prompts until the Host confirms success or failure.',
         timestamp: nowIso(),
       });
     })()).catch((error) => {
@@ -12745,6 +14584,63 @@ function scheduleStopFallback(hostId, sessionId, options = {}) {
   return timer;
 }
 
+function projectStopFailedSession(hostId, sessionId, options = {}) {
+  const timestamp = options.timestamp || nowIso();
+  const currentSession = getSession(hostId, sessionId);
+  const effectiveSessionId = currentSession?.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+  const runId = String(options.runId || currentSession?.runId || '').trim() || null;
+  const message = String(
+    options.message
+      || 'The Host could not confirm that this Session stopped. Retry Stop, then Resume the Session.'
+  );
+  const failedSession = upsertSession(hostId, {
+    sessionId: effectiveSessionId,
+    state: 'stop-failed',
+    live: true,
+    runId,
+    lastUpdatedAt: timestamp,
+  }, { preserveManagedLive: false });
+  const runtimeKey = resolveSessionKey(hostId, failedSession.sessionId);
+  const previousRuntime = state.sessionRuntime.get(runtimeKey)
+    || state.sessionRuntime.get(sessionKey(hostId, failedSession.sessionId))
+    || {};
+  const failedRuntime = setSessionRuntime(hostId, failedSession.sessionId, {
+    ...previousRuntime,
+    phase: 'stop-failed',
+    connection: options.connection || 'unknown',
+    busy: false,
+    activeTurnId: null,
+    currentTurnStatus: 'stop-failed',
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+    pendingInputSummary: null,
+    queuedCommandId: null,
+    pendingClientRequestId: null,
+    stopDelayed: false,
+    lastError: message,
+    runId,
+    updatedAt: timestamp,
+  });
+  if (options.broadcast !== false) {
+    broadcastSessionEvent(hostId, failedSession.sessionId, 'session.runtime_updated', {
+      hostId,
+      sessionId: failedSession.sessionId,
+      patch: failedRuntime,
+      timestamp,
+    });
+    broadcastSessionEvent(hostId, failedSession.sessionId, 'session.snapshot', failedSession);
+  }
+  if (options.alert !== false) {
+    emitSessionAlert(hostId, failedSession.sessionId, {
+      severity: 'error',
+      source: options.source || 'runtime',
+      message,
+      timestamp,
+    });
+  }
+  return { session: failedSession, runtime: failedRuntime };
+}
+
 function runtimePatchWithPendingStopPriority(hostId, sessionId, eventRunId, patch = {}) {
   const record = state.provenance?.getSessionRecord({ hostId, sessionId });
   const activeRunId = String(record?.activeRunId || '').trim();
@@ -12754,6 +14650,27 @@ function runtimePatchWithPendingStopPriority(hostId, sessionId, eventRunId, patc
     || state.sessionRuntime.get(sessionKey(hostId, sessionId))
     || null;
   const hostUsesDurableRunBinding = state.hosts.get(hostId)?.capabilities?.runApiBinding === true;
+  const failedStopProjection = (
+    String(session?.state || '').toLowerCase() === 'stop-failed'
+    || String(runtime?.phase || '').toLowerCase() === 'stop-failed'
+    || String(runtime?.currentTurnStatus || '').toLowerCase() === 'stop-failed'
+  );
+  if (failedStopProjection) {
+    return {
+      ...patch,
+      phase: 'stop-failed',
+      connection: runtime?.connection || 'unknown',
+      busy: false,
+      activeTurnId: null,
+      currentTurnStatus: 'stop-failed',
+      waitingOnApproval: false,
+      waitingOnUserInput: false,
+      pendingInputSummary: null,
+      queuedCommandId: null,
+      pendingClientRequestId: null,
+      lastError: runtime?.lastError || patch.lastError || null,
+    };
+  }
   const legacyStopProjection = !hostUsesDurableRunBinding && (
     String(session?.state || '').toLowerCase() === 'ending'
     || String(runtime?.phase || '').toLowerCase() === 'ending'
@@ -12836,14 +14753,10 @@ function beginSessionStop(hostId, sessionId, options = {}) {
     });
   }
 
-  const stopCandidates = Array.from(new Set([
-    session?.bridgeSessionId,
-    effectiveSessionId,
-    session?.nativeThreadId,
-  ].map((value) => String(value || '').trim()).filter(Boolean)));
-  const commands = stopCandidates.map((candidateSessionId) => enqueueCommand(hostId, {
+  const command = enqueueCommand(hostId, {
     type: 'session.stop',
-    sessionId: candidateSessionId,
+    stopRequestId: options.stopRequestId || null,
+    sessionId: session?.bridgeSessionId || effectiveSessionId || session?.nativeThreadId,
     requestedSessionId: effectiveSessionId,
     runId: targetRunId,
     bridgeSessionId: session?.bridgeSessionId || null,
@@ -12851,7 +14764,8 @@ function beginSessionStop(hostId, sessionId, options = {}) {
     originSessionId: session?.originSessionId || null,
     sourceSessionId: session?.sourceSessionId || null,
     conversationKey: session?.conversationKey || null,
-  }));
+  });
+  const commands = [command];
   scheduleStopFallback(hostId, effectiveSessionId, {
     runId: targetRunId,
     stopRequestId: options.stopRequestId || null,
@@ -12871,6 +14785,287 @@ function getRelayManagedLiveSessions(hostId = '') {
   return Array.from(state.sessions.values())
     .filter((session) => session.live && session.source === 'managed')
     .filter((session) => !normalizedHostId || session.hostId === normalizedHostId);
+}
+
+function codexUpdateSessionSnapshot(session) {
+  const runtimeConfig = sessionRuntimeConfig(session.hostId, session.sessionId) || {};
+  return normalizeCodexUpdateSession({
+    hostId: session.hostId,
+    sessionId: session.sessionId,
+    runId: runtimeConfig.runId || session.runId || null,
+    bridgeSessionId: session.bridgeSessionId,
+    nativeThreadId: session.nativeThreadId,
+    originSessionId: session.originSessionId,
+    sourceSessionId: session.sourceSessionId,
+    conversationKey: session.conversationKey,
+    title: session.title,
+    cwd: session.cwd,
+    nativeResumeReady: runtimeConfig.nativeResumeReady === true,
+    nativeResumeReadyKnown: runtimeConfig.nativeResumeReadyKnown === true,
+    bindingFingerprint: runtimeConfig.sessionBinding?.bindingFingerprint || null,
+    requestedSelection: runtimeConfig.requestedSelection || null,
+    status: 'live',
+  });
+}
+
+function liveUnmanagedSessionsForHost(hostId) {
+  return Array.from(state.sessions.values())
+    .filter((session) => session.hostId === hostId && session.live && session.source !== 'managed');
+}
+
+function assertHostLaunchAllowed(hostId, maintenanceOperationId = '') {
+  const operation = activeCodexUpdateOperation(hostId);
+  if (!operation) return;
+  if (
+    operation.status === 'resuming'
+    && String(maintenanceOperationId || '').trim() === operation.operationId
+  ) {
+    return;
+  }
+  throw new SessionContractError(
+    'host_codex_maintenance',
+    `Host ${hostId} is in Codex maintenance (${operation.status}).`,
+    {
+      statusCode: 423,
+      operationId: operation.operationId,
+      maintenanceStatus: operation.status,
+    }
+  );
+}
+
+function hostCodexUpdateError(code, message, details = {}) {
+  return new SessionContractError(code, message, {
+    statusCode: details.statusCode || 409,
+    ...details,
+  });
+}
+
+function requireCodexUpdateOperation(hostId, operationId) {
+  const operation = currentCodexUpdateOperation(hostId);
+  if (!operation || operation.operationId !== String(operationId || '').trim()) {
+    throw hostCodexUpdateError(
+      'codex_update_operation_not_found',
+      'Host Codex update operation was not found.',
+      { statusCode: 404 }
+    );
+  }
+  return operation;
+}
+
+function patchCodexUpdateOperation(operation, patch = {}) {
+  return storeCodexUpdateOperation({
+    ...operation,
+    ...patch,
+    operationId: operation.operationId,
+    hostId: operation.hostId,
+    createdAt: operation.createdAt,
+  });
+}
+
+function prepareHostCodexUpdate(hostId) {
+  const host = state.hosts.get(hostId);
+  if (!host) {
+    throw hostCodexUpdateError('host_not_found', 'Host was not found.', { statusCode: 404 });
+  }
+  if (!hostOnline(host)) {
+    throw hostCodexUpdateError('host_offline', `Host ${host.label || hostId} is offline.`);
+  }
+  if (host.capabilities?.codexUpdateV1 !== true) {
+    throw hostCodexUpdateError(
+      'codex_update_agent_upgrade_required',
+      'Restart this Host Agent with the 8897 development build before updating Codex.'
+    );
+  }
+  const codexRuntime = normalizeHostCodexRuntime(host.codexRuntime);
+  if (!codexRuntime?.canAutoUpdate) {
+    throw hostCodexUpdateError(
+      'codex_update_unsupported',
+      codexRuntime?.updateReason || 'This Codex installation cannot be updated automatically.'
+    );
+  }
+  const active = activeCodexUpdateOperation(hostId);
+  if (active) {
+    throw hostCodexUpdateError(
+      'codex_update_in_progress',
+      `Codex maintenance ${active.operationId} is already ${active.status}.`,
+      { operation: publicCodexUpdateOperation(active) }
+    );
+  }
+  const unmanaged = liveUnmanagedSessionsForHost(hostId);
+  if (unmanaged.length) {
+    throw hostCodexUpdateError(
+      'codex_update_unmanaged_sessions_live',
+      `${unmanaged.length} live Session(s) are not Relay-managed and cannot be stopped safely.`,
+      { sessionIds: unmanaged.map((session) => session.sessionId) }
+    );
+  }
+  const sessions = getRelayManagedLiveSessions(hostId).map(codexUpdateSessionSnapshot);
+  const blockedSessionIds = sessions
+    .filter((session) => session.nativeResumeReady !== true)
+    .map((session) => session.sessionId);
+  if (blockedSessionIds.length) {
+    throw hostCodexUpdateError(
+      'codex_update_unresumable_sessions',
+      `${blockedSessionIds.length} live Session(s) have no native rollout yet and cannot be resumed after update.`,
+      { sessions, blockedSessionIds }
+    );
+  }
+  return storeCodexUpdateOperation({
+    operationId: makeId(),
+    hostId,
+    status: 'stopping_sessions',
+    phase: 'stopping_sessions',
+    message: sessions.length
+      ? `Waiting for ${sessions.length} managed Session(s) to stop.`
+      : 'No managed Sessions need to be stopped.',
+    currentVersion: codexRuntime.version,
+    sessions,
+    blockedSessionIds: [],
+    createdAt: nowIso(),
+  });
+}
+
+function codexUpdaterIsActive(hostId, operationId) {
+  const maintenance = normalizeHostCodexMaintenance(state.hosts.get(hostId)?.codexMaintenance);
+  return Boolean(
+    maintenance
+    && maintenance.operationId === operationId
+    && ['checking', 'updating', 'installing', 'verifying'].includes(maintenance.status)
+  );
+}
+
+function codexUpdateSessionsStillStopping(operation) {
+  return operation.sessions.filter((snapshot) => {
+    const session = getSession(operation.hostId, snapshot.sessionId);
+    if (!session) return false;
+    const runtime = state.sessionRuntime.get(resolveSessionKey(operation.hostId, session.sessionId))
+      || state.sessionRuntime.get(sessionKey(operation.hostId, session.sessionId))
+      || null;
+    return String(session.state || '').trim().toLowerCase() === 'ending'
+      || String(runtime?.phase || '').trim().toLowerCase() === 'ending'
+      || String(runtime?.connection || '').trim().toLowerCase() === 'closing'
+      || String(runtime?.currentTurnStatus || '').trim().toLowerCase() === 'stopping';
+  });
+}
+
+function codexUpdateResumeRequestId(operationId, sessionId, attempt) {
+  const digest = crypto.createHash('sha256')
+    .update(`${operationId}\0${sessionId}\0${attempt}`)
+    .digest('hex')
+    .slice(0, 32);
+  return `codex-update:${attempt}:${digest}`;
+}
+
+function codexUpdateRecoveryState(operation) {
+  const pending = [];
+  const failures = [];
+  for (const snapshot of operation.sessions) {
+    const current = getSession(operation.hostId, snapshot.sessionId);
+    if (current?.live === true && !codexUpdateSessionsStillStopping({
+      ...operation,
+      sessions: [snapshot],
+    }).length) {
+      continue;
+    }
+    if (['resume_failed', 'left_stopped'].includes(snapshot.status)) {
+      failures.push(snapshot);
+    } else {
+      pending.push(snapshot);
+    }
+  }
+  return { pending, failures };
+}
+
+function updateCodexOperationSessionProgress(operation, input = {}) {
+  if (!ACTIVE_CODEX_UPDATE_STATUSES.has(operation.status)) {
+    throw hostCodexUpdateError(
+      'codex_update_invalid_state',
+      `Session progress cannot change after operation is ${operation.status}.`
+    );
+  }
+  const sessionId = String(input.sessionId || '').trim();
+  const allowedStatuses = new Set([
+    'live',
+    'stopping',
+    'stopped',
+    'stop_failed',
+    'installing',
+    'resuming',
+    'resumed',
+    'resume_failed',
+    'left_stopped',
+    'skipped',
+  ]);
+  const status = String(input.status || '').trim().toLowerCase();
+  if (!sessionId || !allowedStatuses.has(status)) {
+    throw hostCodexUpdateError(
+      'codex_update_session_progress_invalid',
+      'A known operation Session and valid progress status are required.',
+      { statusCode: 400 }
+    );
+  }
+  const statusRank = new Map([
+    ['live', 0],
+    ['stopping', 1],
+    ['stopped', 2],
+    ['stop_failed', 2],
+    ['skipped', 2],
+    ['installing', 3],
+    ['resuming', 4],
+    ['resumed', 5],
+    ['resume_failed', 5],
+    ['left_stopped', 5],
+  ]);
+  let found = false;
+  const sessions = operation.sessions.map((session) => {
+    if (session.sessionId !== sessionId) return session;
+    found = true;
+    const currentStatus = String(session.status || 'live').trim().toLowerCase();
+    const retryingRecovery = ['resume_failed', 'left_stopped'].includes(currentStatus)
+      && status === 'resuming';
+    const returningToLive = ['stop_failed', 'skipped'].includes(currentStatus)
+      && status === 'live';
+    const currentSession = getSession(operation.hostId, sessionId);
+    const retryingExitedResume = currentStatus === 'resumed'
+      && status === 'resuming'
+      && currentSession?.live !== true;
+    if (
+      currentStatus === 'resumed' && status !== 'resumed' && !retryingExitedResume
+      || (
+        !retryingRecovery
+        && !retryingExitedResume
+        && !returningToLive
+        && statusRank.get(status) < statusRank.get(currentStatus)
+      )
+    ) {
+      throw hostCodexUpdateError(
+        'codex_update_session_progress_regression',
+        `Session ${sessionId} progress cannot move from ${currentStatus} back to ${status}.`
+      );
+    }
+    const startsResumeAttempt = status === 'resuming' && currentStatus !== 'resuming';
+    const resumeAttempt = startsResumeAttempt
+      ? Math.max(0, Number(session.resumeAttempt || 0)) + 1
+      : Math.max(0, Number(session.resumeAttempt || 0));
+    const resumeRequestId = startsResumeAttempt
+      ? codexUpdateResumeRequestId(operation.operationId, sessionId, resumeAttempt)
+      : session.resumeRequestId || null;
+    return normalizeCodexUpdateSession({
+      ...session,
+      status,
+      message: input.message || '',
+      resumeAttempt,
+      resumeRequestId,
+    });
+  });
+  if (!found) {
+    throw hostCodexUpdateError(
+      'codex_update_session_not_found',
+      'Session is not part of this Codex update operation.',
+      { statusCode: 404 }
+    );
+  }
+  return patchCodexUpdateOperation(operation, { sessions });
 }
 
 function getCommands(hostId, afterId = 0) {
@@ -12920,6 +15115,13 @@ function ackCommands(hostId, throughId = 0) {
     return 0;
   }
   const queue = state.commandQueues.get(hostId) || [];
+  if (queue.some((command) => (
+    command?.type === 'session.input'
+    && command.clientRequestId
+    && Number(command.id || 0) <= id
+  ))) {
+    state.inputCommandOutbox.ackThrough(hostId, id);
+  }
   const next = pruneCommandQueue(queue.filter((command) => Number(command?.id || 0) > id));
   state.commandQueues.set(hostId, next);
   return Math.max(0, queue.length - next.length);
@@ -12938,6 +15140,28 @@ function removeQueuedCommandById(hostId, commandId, expectedType = '') {
   }));
   state.commandQueues.set(hostId, next);
   return removed;
+}
+
+function completeQueuedSessionInputFromEvent(event) {
+  const isInputFailure = event?.type === 'session.command_failed' && event.operation === 'input';
+  const isInputReceipt = event?.type === 'session.runtime_updated'
+    && ['accepted', 'acceptance_unknown'].includes(event?.inputOutcome);
+  const commandId = Number(event?.commandId || 0);
+  const clientRequestId = normalizeClientRequestId(
+    isInputFailure ? event?.clientRequestId : event?.commandClientRequestId
+  );
+  if ((!isInputFailure && !isInputReceipt) || commandId <= 0 || !clientRequestId) {
+    return false;
+  }
+  const completion = state.inputCommandOutbox.markCompleted(event.hostId, commandId, clientRequestId, {
+    sessionId: event.sessionId || null,
+    outcome: isInputFailure ? 'rejected' : event.inputOutcome,
+  });
+  if (!completion.recorded && completion.reason === 'missing') {
+    return null;
+  }
+  removeQueuedCommandById(event.hostId, commandId, 'session.input');
+  return completion.entry || null;
 }
 
 function sendSessionSse(res, event) {
@@ -13385,11 +15609,14 @@ function assertRebindRunExpectation(record, body = {}) {
 }
 
 function sessionAcceptsLiveControl(hostId, session) {
+  if (isSubagentSession(session) || session?.readOnly === true) {
+    return false;
+  }
   const { run, runId } = sessionRunRecord(hostId, session?.sessionId, { includePending: true });
   if (run?.stopRequestId) {
     return false;
   }
-  if (session?.state === 'ending') {
+  if (session?.state === 'ending' || session?.state === 'stop-failed') {
     return false;
   }
   if (session?.live) {
@@ -13558,7 +15785,7 @@ async function validateLiveRequestedSelection(hostId, sessionId, liveRun, body =
   if (!selection.model && !selection.effort) {
     return null;
   }
-  const catalog = await state.modelCatalog.get({
+  const catalog = state.modelCatalog.getCached({
     hostId,
     identity: { hostId, sessionId },
     sessionId,
@@ -13567,12 +15794,18 @@ async function validateLiveRequestedSelection(hostId, sessionId, liveRun, body =
     runId: liveRun.runId,
     ...modelCatalogInputPolicy(null, liveRun.binding),
   });
+  if (!catalog) {
+    return null;
+  }
   return state.modelCatalog.validateSelection(catalog, selection, {
     allowUnverifiedEffort: body.allowUnverifiedEffort === true,
   });
 }
 
 async function resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind) {
+  if (explicitRebind) {
+    assertHostSupportsSessionApiRebind(hostId, apiConfig);
+  }
   if (apiConfig) {
     return makeSubmittedProfileBinding(apiConfig);
   }
@@ -13631,6 +15864,7 @@ function assertIdleBatchRebind(hostId, sourceSessionId, targetSessionId, sourceS
 }
 
 async function planManagedLaunch(hostId, body = {}, options = {}) {
+  assertHostLaunchAllowed(hostId, body.maintenanceOperationId);
   const sourceSessionId = String(
     options.sourceSessionId
     || body.sourceSessionId
@@ -13664,6 +15898,13 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
       'session_history_unavailable',
       'Saved Session history is unavailable.',
       { statusCode: 404 }
+    ), 'resolve-history');
+  }
+  if (isSubagentSession(sourceDetail?.session) || sourceDetail?.session?.readOnly === true) {
+    throw stageSessionError(new SessionContractError(
+      'subagent_session_read_only',
+      'Sub-agent sessions are read-only projections. Continue from the parent Session Thinking panel.',
+      { statusCode: 409 }
     ), 'resolve-history');
   }
 
@@ -13704,6 +15945,9 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
   const apiConfig = normalizeApiConfig(body.apiConfig);
   const explicitRebind = options.explicitRebind === true;
   const requireExpectedRun = explicitRebind || options.requireExpectedRun === true;
+  if (explicitRebind) {
+    assertNoExplicitRebindRuntimeOverride(body);
+  }
 
   let submittedBinding;
   try {
@@ -13941,6 +16185,7 @@ async function validateManagedRebind(hostId, sourceSessionId, body = {}) {
   }
 
   const apiConfig = normalizeApiConfig(body.apiConfig);
+  assertNoExplicitRebindRuntimeOverride(body);
   let submittedBinding;
   try {
     submittedBinding = await resolveLaunchBinding(hostId, apiConfig, observed.record, true);
@@ -14185,8 +16430,8 @@ async function enqueueManagedLaunch(plan, body = {}) {
     runId: plan.runId,
     cwd: plan.cwd,
     label: body.label || plan.sourceSession?.title || plan.cwd || plan.targetSessionId,
-    command: body.command || null,
-    args: body.args || [],
+    command: plan.explicitRebind ? null : body.command || null,
+    args: plan.explicitRebind ? [] : body.args || [],
     createdAt,
     originSessionId: plan.originSessionId,
     sourceSessionId: plan.sourceSessionId,
@@ -14447,6 +16692,283 @@ async function handleRequest(req, res) {
       dismissedHosts: Array.from(state.dismissedHosts.values()).sort(),
     });
     return;
+  }
+
+  if (url.pathname.match(/^\/api\/hosts\/[^/]+\/codex-update$/)) {
+    const hostId = decodeURIComponent(url.pathname.split('/')[3]);
+    if (req.method === 'GET') {
+      const host = state.hosts.get(hostId);
+      if (!host) {
+        sendJson(res, 404, { error: 'host not found' });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        hostId,
+        codexRuntime: normalizeHostCodexRuntime(host.codexRuntime),
+        operation: publicCodexUpdateOperation(currentCodexUpdateOperation(hostId)),
+      });
+      return;
+    }
+    if (req.method === 'POST') {
+      const body = await readBody(req);
+      const action = String(body.action || 'prepare').trim().toLowerCase();
+      try {
+        if (action === 'prepare') {
+          const operation = prepareHostCodexUpdate(hostId);
+          sendJson(res, 200, { ok: true, operation: publicCodexUpdateOperation(operation) });
+          return;
+        }
+
+        const operation = requireCodexUpdateOperation(hostId, body.operationId);
+        if (action === 'session-progress') {
+          const next = updateCodexOperationSessionProgress(operation, body);
+          sendJson(res, 200, { ok: true, operation: publicCodexUpdateOperation(next) });
+          return;
+        }
+        if (action === 'apply') {
+          if (['updated', 'update_failed', 'completed', 'failed'].includes(operation.status)) {
+            sendJson(res, 200, {
+              ok: ['updated', 'completed'].includes(operation.status),
+              operation: publicCodexUpdateOperation(operation),
+            });
+            return;
+          }
+          if (!['planned', 'stopping_sessions'].includes(operation.status)) {
+            throw hostCodexUpdateError(
+              'codex_update_invalid_state',
+              `Codex update cannot start while operation is ${operation.status}.`
+            );
+          }
+          const remainingManaged = getRelayManagedLiveSessions(hostId);
+          const remainingUnmanaged = liveUnmanagedSessionsForHost(hostId);
+          if (remainingManaged.length || remainingUnmanaged.length) {
+            throw hostCodexUpdateError(
+              'codex_update_sessions_live',
+              `${remainingManaged.length + remainingUnmanaged.length} Session(s) are still live; Codex was not changed.`,
+              {
+                managedSessionIds: remainingManaged.map((session) => session.sessionId),
+                unmanagedSessionIds: remainingUnmanaged.map((session) => session.sessionId),
+              }
+            );
+          }
+          const host = state.hosts.get(hostId);
+          if (!host || !hostOnline(host)) {
+            throw hostCodexUpdateError('host_offline', 'Host went offline before Codex update started.');
+          }
+          const requestId = makeId();
+          patchCodexUpdateOperation(operation, {
+            status: 'updating',
+            phase: 'updating',
+            message: 'Host Agent is starting the Codex update.',
+          });
+          const pending = awaitCodexUpdateRequest(requestId);
+          enqueueCommand(hostId, {
+            type: 'host.codex_update',
+            requestId,
+            operationId: operation.operationId,
+          });
+          let result;
+          try {
+            result = await pending;
+          } catch (error) {
+            const current = currentCodexUpdateOperation(hostId) || operation;
+            if (['updated', 'update_failed'].includes(current.status)) {
+              sendJson(res, 200, {
+                ok: current.status === 'updated',
+                result: {
+                  ok: current.status === 'updated',
+                  operationId: current.operationId,
+                  version: current.targetVersion || null,
+                  error: current.status === 'update_failed' ? current.message : null,
+                  recovered: true,
+                },
+                operation: publicCodexUpdateOperation(current),
+              });
+              return;
+            }
+            patchCodexUpdateOperation(current, {
+              status: 'interrupted',
+              phase: 'interrupted',
+              message: error.message || 'Host Codex update response was interrupted.',
+            });
+            throw hostCodexUpdateError(
+              'codex_update_timeout',
+              error.message || 'Host Codex update timed out.',
+              { statusCode: 504 }
+            );
+          }
+          sendJson(res, 200, {
+            ok: result.ok === true,
+            result,
+            operation: publicCodexUpdateOperation(currentCodexUpdateOperation(hostId)),
+          });
+          return;
+        }
+
+        if (action === 'resuming') {
+          if (
+            operation.sessions.length === 0
+            && ['completed', 'failed'].includes(operation.status)
+          ) {
+            sendJson(res, 200, {
+              ok: operation.status === 'completed',
+              operation: publicCodexUpdateOperation(operation),
+            });
+            return;
+          }
+          if (['updating', 'checking', 'installing', 'verifying'].includes(operation.status)) {
+            throw hostCodexUpdateError(
+              'codex_update_still_running',
+              `Codex update is still ${operation.status}.`
+            );
+          }
+          if (codexUpdaterIsActive(hostId, operation.operationId)) {
+            throw hostCodexUpdateError(
+              'codex_update_still_running',
+              'Host Agent still reports an active Codex updater.'
+            );
+          }
+          const stillStopping = codexUpdateSessionsStillStopping(operation);
+          if (stillStopping.length) {
+            throw hostCodexUpdateError(
+              'codex_update_sessions_still_stopping',
+              `${stillStopping.length} Session(s) are still stopping; wait for confirmed process exit before recovery.`,
+              { sessionIds: stillStopping.map((session) => session.sessionId) }
+            );
+          }
+          const recoveryOnly = body.recoveryOnly === true;
+          if (
+            !['updated', 'update_failed', 'resuming'].includes(operation.status)
+            && !(recoveryOnly && ['planned', 'stopping_sessions', 'interrupted'].includes(operation.status))
+          ) {
+            throw hostCodexUpdateError(
+              'codex_update_invalid_state',
+              `Session recovery cannot start while operation is ${operation.status}.`
+            );
+          }
+          const next = patchCodexUpdateOperation(operation, {
+            status: 'resuming',
+            phase: 'resuming',
+            message: operation.sessions.length
+              ? `Resuming ${operation.sessions.length} managed Session(s).`
+              : 'No managed Sessions need to be resumed.',
+          });
+          sendJson(res, 200, { ok: true, operation: publicCodexUpdateOperation(next) });
+          return;
+        }
+
+        if (action === 'complete') {
+          if (operation.status !== 'resuming') {
+            if (['completed', 'completed_with_resume_failures', 'failed', 'cancelled'].includes(operation.status)) {
+              sendJson(res, 200, {
+                ok: operation.status === 'completed',
+                operation: publicCodexUpdateOperation(operation),
+              });
+              return;
+            }
+            throw hostCodexUpdateError(
+              'codex_update_invalid_state',
+              `Codex maintenance cannot complete while operation is ${operation.status}.`
+            );
+          }
+          if (codexUpdaterIsActive(hostId, operation.operationId)) {
+            throw hostCodexUpdateError(
+              'codex_update_still_running',
+              'Host Agent still reports an active Codex updater.'
+            );
+          }
+          const stillStopping = codexUpdateSessionsStillStopping(operation);
+          if (stillStopping.length) {
+            throw hostCodexUpdateError(
+              'codex_update_sessions_still_stopping',
+              `${stillStopping.length} Session(s) are still stopping; maintenance cannot complete yet.`,
+              { sessionIds: stillStopping.map((session) => session.sessionId) }
+            );
+          }
+          const recovery = codexUpdateRecoveryState(operation);
+          if (recovery.pending.length) {
+            throw hostCodexUpdateError(
+              'codex_update_recovery_pending',
+              `${recovery.pending.length} Session(s) have not reached a live or explicit recovery-failed state.`,
+              { sessionIds: recovery.pending.map((session) => session.sessionId) }
+            );
+          }
+          const resumeFailures = recovery.failures.map((session) => (
+            `${session.sessionId}: ${session.message || 'Session remains stopped.'}`
+          ));
+          const stopFailures = Array.isArray(body.stopFailures) ? body.stopFailures : [];
+          const updateSucceeded = operation.updateSucceeded === true;
+          const status = updateSucceeded
+            ? (resumeFailures.length ? 'completed_with_resume_failures' : 'completed')
+            : 'failed';
+          const next = patchCodexUpdateOperation(operation, {
+            status,
+            phase: status,
+            message: String(body.message || (
+              status === 'completed'
+                ? 'Codex update and Session resume completed.'
+                : status === 'completed_with_resume_failures'
+                  ? 'Codex updated, but some Sessions could not be resumed.'
+                  : 'Codex maintenance failed; stopped Sessions were offered for recovery.'
+            )),
+            stopFailures,
+            resumeFailures,
+            completedAt: nowIso(),
+          });
+          sendJson(res, 200, { ok: status === 'completed', operation: publicCodexUpdateOperation(next) });
+          return;
+        }
+
+        if (action === 'cancel') {
+          if (!ACTIVE_CODEX_UPDATE_STATUSES.has(operation.status)) {
+            throw hostCodexUpdateError(
+              'codex_update_invalid_state',
+              `Completed Codex maintenance cannot be changed from ${operation.status} to cancelled.`
+            );
+          }
+          if (
+            ['updating', 'checking', 'installing', 'verifying'].includes(operation.status)
+            || codexUpdaterIsActive(hostId, operation.operationId)
+          ) {
+            throw hostCodexUpdateError(
+              'codex_update_cannot_cancel',
+              'Codex package installation is already running and cannot be cancelled safely.'
+            );
+          }
+          if (body.confirmAbandonStoppedSessions !== true && operation.sessions.some((session) => (
+            ['stopping', 'stopped', 'installing', 'resuming', 'resume_failed', 'left_stopped'].includes(session.status)
+          ))) {
+            throw hostCodexUpdateError(
+              'codex_update_recovery_required',
+              'Recover or explicitly abandon stopped Sessions before clearing maintenance.'
+            );
+          }
+          const next = patchCodexUpdateOperation(operation, {
+            status: 'cancelled',
+            phase: 'cancelled',
+            message: String(body.message || 'Codex maintenance was cancelled.'),
+            completedAt: nowIso(),
+          });
+          sendJson(res, 200, { ok: true, operation: publicCodexUpdateOperation(next) });
+          return;
+        }
+
+        sendJson(res, 400, { error: 'action must be prepare, session-progress, apply, resuming, complete, or cancel' });
+      } catch (error) {
+        sendJson(res, Number(error.statusCode || 500), {
+          error: error.message || 'Host Codex update failed',
+          code: error.code || 'codex_update_failed',
+          operation: error.operation || publicCodexUpdateOperation(currentCodexUpdateOperation(hostId)),
+          sessions: error.sessions || undefined,
+          blockedSessionIds: error.blockedSessionIds || undefined,
+          sessionIds: error.sessionIds || undefined,
+          managedSessionIds: error.managedSessionIds || undefined,
+          unmanagedSessionIds: error.unmanagedSessionIds || undefined,
+        });
+      }
+      return;
+    }
   }
 
   if (req.method === 'GET' && url.pathname === '/api/stats') {
@@ -16031,6 +18553,7 @@ async function handleRequest(req, res) {
     if (action === 'status') {
       sendJson(res, 200, {
         ok: true,
+        action,
         hostId,
         host: state.hosts.get(hostId) || null,
         localAgent: publicLocalAgentRecord(state.localAgents.get(hostId)),
@@ -16050,7 +18573,7 @@ async function handleRequest(req, res) {
     const result = action === 'stop'
       ? stopLocalAgent(hostId)
       : startLocalAgent({ hostId, label, restart: action === 'restart' });
-    sendJson(res, result.ok === false ? 400 : 200, result);
+    sendJson(res, result.ok === false ? 400 : 200, { ...result, action });
     return;
   }
 
@@ -16189,12 +18712,15 @@ async function handleRequest(req, res) {
       label: body.label || body.hostId,
       platform: body.platform || process.platform,
       codexHome: body.codexHome || existingHost?.codexHome || '',
+      codexRuntime: normalizeHostCodexRuntime(body.codexRuntime) || existingHost?.codexRuntime || null,
+      codexMaintenance: normalizeHostCodexMaintenance(body.codexMaintenance) || null,
       skillsRevision: body.skillsRevision || state.skillInventories.get(body.hostId)?.revision || existingHost?.skillsRevision || null,
       capabilities: body.capabilities || {},
       registeredAt: existingHost?.registeredAt || nowIso(),
       lastSeenAt: nowIso(),
     };
     state.hosts.set(body.hostId, host);
+    reconcileHostCodexMaintenance(body.hostId, body.codexMaintenance);
     attachMatchingConnectorsToHost(host);
     const registeredQueue = pruneCommandQueue(state.commandQueues.get(body.hostId) || []);
     state.commandQueues.set(
@@ -16265,10 +18791,13 @@ async function handleRequest(req, res) {
       host.label = body.label || host.label || body.hostId;
       host.platform = body.platform || host.platform || 'unknown';
       host.codexHome = body.codexHome || host.codexHome || '';
+      host.codexRuntime = normalizeHostCodexRuntime(body.codexRuntime) || host.codexRuntime || null;
+      host.codexMaintenance = normalizeHostCodexMaintenance(body.codexMaintenance);
       host.skillsRevision = body.skillsRevision || state.skillInventories.get(body.hostId)?.revision || host.skillsRevision || null;
       host.capabilities = body.capabilities || host.capabilities || {};
       host.lastSeenAt = nowIso();
       state.hosts.set(body.hostId, host);
+      reconcileHostCodexMaintenance(body.hostId, body.codexMaintenance);
       attachMatchingConnectorsToHost(host);
     } else if (body.hostId) {
       const nextHost = {
@@ -16276,12 +18805,15 @@ async function handleRequest(req, res) {
         label: body.label || body.hostId,
         platform: body.platform || 'unknown',
         codexHome: body.codexHome || '',
+        codexRuntime: normalizeHostCodexRuntime(body.codexRuntime),
+        codexMaintenance: normalizeHostCodexMaintenance(body.codexMaintenance),
         skillsRevision: body.skillsRevision || state.skillInventories.get(body.hostId)?.revision || null,
         capabilities: body.capabilities || {},
         registeredAt: nowIso(),
         lastSeenAt: nowIso(),
       };
       state.hosts.set(body.hostId, nextHost);
+      reconcileHostCodexMaintenance(body.hostId, body.codexMaintenance);
       attachMatchingConnectorsToHost(nextHost);
     }
     if (body.hostId) {
@@ -16720,7 +19252,6 @@ async function handleRequest(req, res) {
       sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
-
     const session = getSession(hostId, sessionId);
     if (!session) {
       sendJson(res, 404, { error: 'session not found' });
@@ -16730,7 +19261,6 @@ async function handleRequest(req, res) {
       sendJson(res, 409, { error: 'session is not live' });
       return;
     }
-
     const host = state.hosts.get(hostId);
     if (!host?.capabilities?.skillList) {
       sendJson(res, 409, { error: 'this host agent needs to be restarted before it can list Codex skills' });
@@ -16765,15 +19295,72 @@ async function handleRequest(req, res) {
       sendJson(res, 400, { error: 'hostId is required' });
       return;
     }
+    const session = getSession(hostId, sessionId);
+    const effectiveSessionId = session?.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (isSubagentSession(session) || session.readOnly === true) {
+      sendSessionContractError(
+        res,
+        new SessionContractError(
+          'subagent_session_read_only',
+          'Sub-agent sessions are read-only projections. Continue from the parent Session Thinking panel.',
+          { statusCode: 409 }
+        ),
+        'validate-subagent-session'
+      );
+      return;
+    }
+    const inputFingerprint = inputRequestFingerprint(body);
+    const rawInputRequestId = String(body.clientRequestId || '').trim();
+    const providedInputRequestId = normalizeClientRequestId(rawInputRequestId);
+    if (rawInputRequestId && providedInputRequestId !== rawInputRequestId) {
+      sendJson(res, 400, {
+        error: 'clientRequestId must be at most 160 letters, numbers, dots, colons, underscores, or hyphens.',
+      });
+      return;
+    }
+    const normalizedInputRequestId = providedInputRequestId || makeId();
+    let inputScopeKey = resolveCanonicalConversationKey(hostId, session || sessionId)
+      || inputSessionScopeKey(hostId, effectiveSessionId);
+    let inputCacheKey = inputRequestCacheKey(
+      hostId,
+      inputScopeKey,
+      normalizedInputRequestId
+    );
+    try {
+      const cachedInput = getCachedInputRequest(inputCacheKey, inputFingerprint);
+      if (cachedInput) {
+        sendJson(res, 200, cachedInput);
+        return;
+      }
+    } catch (error) {
+      sendSessionContractError(res, error, 'dedupe-input-request');
+      return;
+    }
     const hostError = getHostUnavailableError(hostId);
     if (hostError) {
       sendJson(res, hostError.statusCode, { error: hostError.error });
       return;
     }
-
-    const session = getSession(hostId, sessionId);
-    if (!session) {
-      sendJson(res, 404, { error: 'session not found' });
+    const inputSessionRuntime = state.sessionRuntime.get(
+      resolveSessionKey(hostId, session.sessionId || sessionId)
+    ) || state.sessionRuntime.get(sessionKey(hostId, session.sessionId || sessionId)) || null;
+    if (
+      String(session.state || '').trim().toLowerCase() === 'stop-failed'
+      || String(inputSessionRuntime?.phase || '').trim().toLowerCase() === 'stop-failed'
+    ) {
+      sendSessionContractError(
+        res,
+        new SessionContractError(
+          'session_stop_failed',
+          'The previous Stop failed and this runtime cannot accept new prompts. Retry Stop, then Resume the Session.',
+          { statusCode: 409 }
+        ),
+        'validate-live-command'
+      );
       return;
     }
     if (!sessionAcceptsLiveControl(hostId, session)) {
@@ -16788,11 +19375,27 @@ async function handleRequest(req, res) {
       sendSessionContractError(res, error, 'validate-live-command');
       return;
     }
-    const inputCacheKey = inputRequestCacheKey(hostId, sessionId, body.clientRequestId, liveRun.runId);
-    const cachedInput = getCachedInputRequest(inputCacheKey);
-    if (cachedInput) {
-      sendJson(res, 200, cachedInput);
-      return;
+    const validatedInputScopeKey = resolveCanonicalConversationKey(hostId, liveRun.record || session)
+      || inputSessionScopeKey(hostId, effectiveSessionId);
+    if (validatedInputScopeKey !== inputScopeKey) {
+      migrateInputRequestScope(inputScopeKey, validatedInputScopeKey);
+      inputScopeKey = validatedInputScopeKey;
+      inputCacheKey = inputRequestCacheKey(
+        hostId,
+        inputScopeKey,
+        normalizedInputRequestId,
+        liveRun.runId
+      );
+      try {
+        const migratedCachedInput = getCachedInputRequest(inputCacheKey, inputFingerprint);
+        if (migratedCachedInput) {
+          sendJson(res, 200, migratedCachedInput);
+          return;
+        }
+      } catch (error) {
+        sendSessionContractError(res, error, 'dedupe-input-request');
+        return;
+      }
     }
 
     const text = String(body.text || '');
@@ -16827,58 +19430,78 @@ async function handleRequest(req, res) {
       sendJson(res, 409, { error: 'this host agent needs to be restarted before it can use Codex turn controls' });
       return;
     }
+    let requestReservation;
     try {
-      if (!liveRun.compatibilityRuntime) {
-        await validateLiveRequestedSelection(hostId, session.sessionId || sessionId, liveRun, body);
-        await recordLiveRequestedSelection(hostId, session.sessionId || sessionId, liveRun.runId, body);
-      }
+      requestReservation = reserveInputRequest(inputCacheKey, inputFingerprint, {
+        hostId,
+        scopeKey: inputScopeKey,
+        clientRequestId: normalizedInputRequestId,
+      });
     } catch (error) {
-      sendSessionContractError(res, error, 'record-requested-selection');
+      sendSessionContractError(res, error, 'reserve-input-request');
       return;
     }
-    const inlineImageFiles = cacheInlineImageInputFiles(hostId, sessionId, inputItems);
-    const inlineTextFiles = cacheInlineTextFiles(hostId, sessionId, body.inlineFiles || body.inlineFileRefs || []);
-    const transcriptFiles = normalizeFileTransferRefs([...uploadedFiles, ...inlineImageFiles, ...inlineTextFiles]);
-    const effectiveSessionId = session.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
-    recordPendingUserTranscriptEcho(hostId, effectiveSessionId, {
-      fullText: text,
-      displayText: transcriptText,
-    });
-
-    emitTranscriptEntry(hostId, effectiveSessionId, {
-      speaker: 'user',
-      text: transcriptText,
-      files: transcriptFiles,
-      timestamp: nowIso(),
-    });
-    const next = upsertSession(hostId, {
-      sessionId: effectiveSessionId,
-      latestUserMessage: transcriptText,
-      apiProfile: session.apiProfile || null,
-      apiBinding: liveRun.binding,
-      requestedSelection: {
-        model: String(body.model || '').trim() || null,
-        effort: String(body.effort || '').trim() || null,
-        source: 'user',
-      },
-      codexOptions: {
-        model: String(body.model || '').trim() || null,
-        effort: String(body.effort || '').trim() || null,
-        allowUnverifiedEffort: body.allowUnverifiedEffort === true,
-        summary: String(body.summary || '').trim() || null,
-        mode: String(body.mode || '').trim() || null,
-        approvalPolicy: typeof body.approvalPolicy === 'object' ? body.approvalPolicy : String(body.approvalPolicy || '').trim() || null,
-        approvalsReviewer: String(body.approvalsReviewer || '').trim() || null,
-        sandboxMode: String(body.sandboxMode || '').trim() || null,
-        serviceTier: String(body.serviceTier || '').trim() || null,
-        personality: String(body.personality || '').trim() || null,
-      },
-      lastUpdatedAt: nowIso(),
-    });
-    broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', next);
-
-    const command = enqueueCommand(hostId, {
+    if (!requestReservation.owner) {
+      try {
+        sendJson(res, 200, await requestReservation.promise);
+      } catch (error) {
+        sendSessionContractError(res, error, 'replay-input-request');
+      }
+      return;
+    }
+    try {
+      assertHostLaunchAllowed(hostId);
+    } catch (error) {
+      settleInputRequest(requestReservation, error);
+      sendSessionContractError(res, error, 'validate-host-maintenance');
+      return;
+    }
+    const inputReservation = reserveSessionInput(
+      hostId,
+      effectiveSessionId,
+      liveRun.runId,
+      normalizedInputRequestId,
+      inputScopeKey,
+      requestReservation.ordinal
+    );
+    if (!inputReservation.ok) {
+      const error = new SessionContractError(
+        inputReservation.code || 'session_input_rejected',
+        inputReservation.error || 'The Session cannot accept another prompt yet.',
+        { statusCode: 409, ...inputReservation }
+      );
+      settleInputRequest(requestReservation, error);
+      sendSessionContractError(res, error, 'reserve-session-input');
+      return;
+    }
+    let acceptedResponsePayload = null;
+    try {
+      if (TEST_INPUT_PREPARE_DELAY_MS > 0) {
+        await new Promise((resolve) => setTimeout(resolve, TEST_INPUT_PREPARE_DELAY_MS));
+      }
+      if (!liveRun.compatibilityRuntime) {
+        await validateLiveRequestedSelection(hostId, effectiveSessionId, liveRun, body);
+        await recordLiveRequestedSelection(hostId, effectiveSessionId, liveRun.runId, body);
+      }
+      assertInputSubmissionOwnership(
+        hostId,
+        effectiveSessionId,
+        requestReservation,
+        inputReservation
+      );
+      assertInputRuntimeStillAvailable(
+        hostId,
+        effectiveSessionId,
+        liveRun.runId,
+        inputReservation
+      );
+      const inlineImageFiles = cacheInlineImageInputFiles(hostId, sessionId, inputItems);
+      const inlineTextFiles = cacheInlineTextFiles(hostId, sessionId, body.inlineFiles || body.inlineFileRefs || []);
+      const transcriptFiles = normalizeFileTransferRefs([...uploadedFiles, ...inlineImageFiles, ...inlineTextFiles]);
+      const transcriptTimestamp = nowIso();
+      const command = enqueueCommand(hostId, {
       type: 'session.input',
+      clientRequestId: normalizedInputRequestId,
       sessionId: session.sessionId || sessionId,
       requestedSessionId: sessionId,
       bridgeSessionId: session.bridgeSessionId || null,
@@ -16901,31 +19524,116 @@ async function handleRequest(req, res) {
       planFallback: String(body.planFallback || '').trim() || null,
       serviceTier: String(body.serviceTier || '').trim() || null,
       personality: String(body.personality || '').trim() || null,
-    });
-    emitSessionRuntimePatch(hostId, effectiveSessionId, {
-      phase: 'queued-turn',
-      busy: true,
-      currentTurnStatus: 'queued',
-      queuedCommandId: command.id,
-      queuedInputAt: command.createdAt,
-      pendingInputSummary: transcriptText.slice(0, 240),
-      runId: session.runId || null,
-    });
-    emitSessionDiagnostic(hostId, effectiveSessionId, {
-      severity: 'info',
-      source: 'relay',
-      kind: 'control',
-      method: 'session.input/queued',
-      message: `Queued Codex turn command ${command.id}.`,
-      data: {
-        commandId: command.id,
-        mode: String(body.mode || '').trim() || null,
-        inputTypes: inputItems.map((item) => item.type),
-      },
-    });
-    const responsePayload = { ok: true, command };
-    rememberInputRequest(inputCacheKey, responsePayload);
-    sendJson(res, 200, responsePayload);
+      }, {
+        inputScopeKey: requestReservation.scopeKey || inputReservation.key,
+        inputFingerprint,
+        transcriptProjection: {
+          sessionId: effectiveSessionId,
+          text: transcriptText,
+          files: transcriptFiles,
+          timestamp: transcriptTimestamp,
+          clientRequestId: normalizedInputRequestId,
+          deliveryStatus: 'pending',
+        },
+      });
+      acceptedResponsePayload = {
+        ok: true,
+        clientRequestId: command.clientRequestId || null,
+        command,
+      };
+      rememberInputRequest(requestReservation.cacheKey, inputFingerprint, acceptedResponsePayload, {
+        hostId,
+        scopeKey: requestReservation.scopeKey || inputReservation.key,
+        clientRequestId: normalizedInputRequestId,
+      });
+      recordPendingUserTranscriptEcho(hostId, effectiveSessionId, {
+        clientRequestId: normalizedInputRequestId,
+        fullText: text,
+        displayText: transcriptText,
+      });
+
+      emitTranscriptEntry(hostId, effectiveSessionId, {
+        speaker: 'user',
+        clientRequestId: normalizedInputRequestId,
+        deliveryStatus: 'pending',
+        text: transcriptText,
+        files: transcriptFiles,
+        timestamp: transcriptTimestamp,
+      });
+      queueInputTranscriptProjectionCheckpoint({
+        hostId,
+        originalCommandId: command.id,
+        clientRequestId: normalizedInputRequestId,
+        projectionOutcome: 'pending',
+      });
+      const next = upsertSession(hostId, {
+        sessionId: effectiveSessionId,
+        apiProfile: session.apiProfile || null,
+        apiBinding: liveRun.binding,
+        requestedSelection: {
+          model: String(body.model || '').trim() || null,
+          effort: String(body.effort || '').trim() || null,
+          source: 'user',
+        },
+        codexOptions: {
+          model: String(body.model || '').trim() || null,
+          effort: String(body.effort || '').trim() || null,
+          allowUnverifiedEffort: body.allowUnverifiedEffort === true,
+          summary: String(body.summary || '').trim() || null,
+          mode: String(body.mode || '').trim() || null,
+          approvalPolicy: typeof body.approvalPolicy === 'object' ? body.approvalPolicy : String(body.approvalPolicy || '').trim() || null,
+          approvalsReviewer: String(body.approvalsReviewer || '').trim() || null,
+          sandboxMode: String(body.sandboxMode || '').trim() || null,
+          serviceTier: String(body.serviceTier || '').trim() || null,
+          personality: String(body.personality || '').trim() || null,
+        },
+        lastUpdatedAt: nowIso(),
+      });
+      broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', next);
+
+      emitSessionRuntimePatch(hostId, effectiveSessionId, {
+        phase: 'queued-turn',
+        busy: true,
+        currentTurnStatus: 'queued',
+        queuedCommandId: command.id,
+        pendingClientRequestId: normalizedInputRequestId,
+        clientRequestId: normalizedInputRequestId,
+        queuedInputAt: command.createdAt,
+        pendingInputSummary: transcriptText.slice(0, 240),
+        lastError: null,
+        lastCodexError: null,
+        runId: liveRun.runId || null,
+      });
+      emitSessionDiagnostic(hostId, effectiveSessionId, {
+        severity: 'info',
+        source: 'relay',
+        kind: 'control',
+        method: 'session.input/queued',
+        message: `Queued Codex turn command ${command.id}.`,
+        data: {
+          commandId: command.id,
+          clientRequestId: command.clientRequestId || null,
+          mode: String(body.mode || '').trim() || null,
+          inputTypes: inputItems.map((item) => item.type),
+        },
+      });
+      settleInputRequest(requestReservation, null, acceptedResponsePayload);
+      sendJson(res, 200, acceptedResponsePayload);
+      return;
+    } catch (error) {
+      if (acceptedResponsePayload) {
+        console.error(
+          `[relay] input command ${acceptedResponsePayload.command?.id || '(unknown)'} was durably queued but its UI projection failed: ${error.message || error}`
+        );
+        settleInputRequest(requestReservation, null, acceptedResponsePayload);
+        sendJson(res, 200, acceptedResponsePayload);
+        return;
+      }
+      settleInputRequest(requestReservation, error);
+      sendSessionContractError(res, error, 'queue-input-request');
+    } finally {
+      releaseSessionInputReservation(inputReservation);
+    }
     return;
   }
 
@@ -17116,16 +19824,51 @@ async function handleRequest(req, res) {
     }
 
     const session = getSession(hostId, sessionId);
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (!sessionAcceptsLiveControl(hostId, session)) {
+      sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+    const effectiveSessionId = session.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+    const runtime = state.sessionRuntime.get(resolveSessionKey(hostId, effectiveSessionId)) || session.runtime || {};
+    const currentRunId = String(session.runId || runtime.runId || '').trim();
+    const expectedRunId = String(body.expectedRunId || '').trim();
+    if (expectedRunId && currentRunId && expectedRunId !== currentRunId) {
+      sendSessionContractError(res, new SessionContractError(
+        'session_run_changed',
+        'The Session run changed before Interrupt could be queued.',
+        { statusCode: 409, expectedRunId, currentRunId }
+      ), 'interrupt-session');
+      return;
+    }
+    const rawInterruptRequestId = String(body.interruptRequestId || '').trim();
+    const providedInterruptRequestId = normalizeClientRequestId(rawInterruptRequestId);
+    if (rawInterruptRequestId && providedInterruptRequestId !== rawInterruptRequestId) {
+      sendJson(res, 400, { error: 'interruptRequestId is invalid.' });
+      return;
+    }
+    const interruptRequestId = providedInterruptRequestId || makeId();
     const command = enqueueCommand(hostId, {
       type: 'session.interrupt',
-      sessionId,
+      interruptRequestId,
+      sessionId: effectiveSessionId,
       bridgeSessionId: session?.bridgeSessionId || null,
       nativeThreadId: session?.nativeThreadId || null,
       originSessionId: session?.originSessionId || null,
       sourceSessionId: session?.sourceSessionId || null,
       conversationKey: session?.conversationKey || null,
+      runId: currentRunId || null,
+      expectedTurnId: String(body.expectedTurnId || runtime.activeTurnId || '').trim() || null,
+      expectedClientRequestId: normalizeClientRequestId(
+        body.expectedClientRequestId
+        || runtime.clientRequestId
+        || runtime.pendingClientRequestId
+      ) || null,
     });
-    sendJson(res, 200, { ok: true, command });
+    sendJson(res, 200, { ok: true, interruptRequestId, command });
     return;
   }
 
@@ -17366,10 +20109,30 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const session = getSession(hostId, sessionId);
+    const claim = claimSessionRequestResponse(hostId, sessionId, requestId, body.response || null, {
+      runId: body.runId || null,
+    });
+    if (!claim.ok) {
+      sendJson(res, claim.statusCode || 409, {
+        error: claim.error,
+        code: claim.code,
+      });
+      return;
+    }
+    if (claim.duplicate) {
+      sendJson(res, 200, {
+        ok: true,
+        duplicate: true,
+        status: claim.request?.status || 'resolved',
+      });
+      return;
+    }
+
+    const effectiveSessionId = claim.effectiveSessionId;
+    const session = getSession(hostId, effectiveSessionId);
     const command = enqueueCommand(hostId, {
       type: 'session.request.respond',
-      sessionId,
+      sessionId: effectiveSessionId,
       requestId,
       response: body.response || null,
       nativeThreadId: session?.nativeThreadId || null,
@@ -17379,7 +20142,11 @@ async function handleRequest(req, res) {
       conversationKey: session?.conversationKey || null,
       runId: session?.runId || null,
     });
-    sendJson(res, 200, { ok: true, command });
+    sendJson(res, 200, {
+      ok: true,
+      status: 'responding',
+      command,
+    });
     return;
   }
 
@@ -17970,7 +20737,10 @@ async function applyAgentEvent(event) {
         continue;
       }
       const existing = getSession(event.hostId, session.sessionId);
-      const discoverySource = session.source === 'managed'
+      const subagent = isSubagentSession(session);
+      const discoverySource = subagent
+        ? 'subagent'
+        : session.source === 'managed'
         ? 'managed'
         : session.source === 'vscode'
           ? 'vscode'
@@ -17990,6 +20760,16 @@ async function applyAgentEvent(event) {
         apiProfile: session.apiProfile || existing?.apiProfile || null,
         selection: session.codexOptions || existing?.codexOptions || null,
         modelProviderHint: session.modelProvider || session.modelProviderHint || null,
+        subagent: subagent || existing?.subagent === true,
+        readOnly: subagent || existing?.readOnly === true,
+        threadSource: session.threadSource || existing?.threadSource || null,
+        parentThreadId: session.parentThreadId || existing?.parentThreadId || null,
+        forkedFromId: session.forkedFromId || existing?.forkedFromId || null,
+        agentPath: session.agentPath || existing?.agentPath || null,
+        agentNickname: session.agentNickname || existing?.agentNickname || null,
+        agentRole: session.agentRole || existing?.agentRole || null,
+        multiAgentVersion: session.multiAgentVersion || existing?.multiAgentVersion || null,
+        subagentSource: session.subagentSource || existing?.subagentSource || null,
       };
       const storedDiscovery = state.provenance.getSessionRecord({
         hostId: event.hostId,
@@ -18052,7 +20832,7 @@ async function applyAgentEvent(event) {
       const publishDiscoveredLive = discoveryPublishesLive(session, mergedDiscovery.record);
       const isCurrentlyLive = publishDiscoveredLive
         && sessionOwnershipIdentityValues(session).some((identity) => publishedLiveSessionIds.has(identity));
-      const preserveManagedState = current
+      const preserveManagedState = !subagent && current
         && current.source === 'managed'
         && (current.live || current.state === 'starting')
         && (
@@ -18070,9 +20850,19 @@ async function applyAgentEvent(event) {
           ? current.title || session.sessionId
           : mergedDiscovery.record?.title || session.title || session.sessionId,
         cwd: preserveManagedState ? current.cwd || null : mergedDiscovery.record?.cwd || session.cwd || null,
-        source: preserveManagedState ? current.source : (session.source || 'imported'),
-        state: preserveManagedState ? current.state : (publishDiscoveredLive ? 'running' : 'imported'),
-        live: preserveManagedState ? current.live : publishDiscoveredLive,
+        source: preserveManagedState ? current.source : discoverySource,
+        state: subagent ? 'subagent' : (preserveManagedState ? current.state : (publishDiscoveredLive ? 'running' : 'imported')),
+        live: subagent ? false : (preserveManagedState ? current.live : publishDiscoveredLive),
+        subagent: subagent || existing?.subagent === true,
+        readOnly: subagent || existing?.readOnly === true,
+        threadSource: session.threadSource || existing?.threadSource || null,
+        parentThreadId: session.parentThreadId || existing?.parentThreadId || null,
+        forkedFromId: session.forkedFromId || existing?.forkedFromId || null,
+        agentPath: session.agentPath || existing?.agentPath || null,
+        agentNickname: session.agentNickname || existing?.agentNickname || null,
+        agentRole: session.agentRole || existing?.agentRole || null,
+        multiAgentVersion: session.multiAgentVersion || existing?.multiAgentVersion || null,
+        subagentSource: session.subagentSource || existing?.subagentSource || null,
         createdAt: preserveManagedState ? current.createdAt || discoveredCreatedAt : discoveredCreatedAt,
         lastUpdatedAt: preserveManagedState ? current.lastUpdatedAt || nowIso() : session.updatedAt || nowIso(),
         messageCount: Math.max(Number(current?.messageCount || 0), Number(session.messageCount || 0), Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0),
@@ -18168,7 +20958,82 @@ async function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'host.codex_probed') {
+    const host = state.hosts.get(event.hostId);
+    if (host) {
+      host.codexRuntime = normalizeHostCodexRuntime(event.codexRuntime) || host.codexRuntime || null;
+      host.lastSeenAt = nowIso();
+      state.hosts.set(event.hostId, host);
+    }
+    return;
+  }
+
+  if (event.type === 'host.codex_update_progress' && event.operationId) {
+    const host = state.hosts.get(event.hostId);
+    if (host && event.codexRuntime) {
+      host.codexRuntime = normalizeHostCodexRuntime(event.codexRuntime) || host.codexRuntime || null;
+      state.hosts.set(event.hostId, host);
+    }
+    const operation = currentCodexUpdateOperation(event.hostId);
+    if (
+      operation?.operationId === event.operationId
+      && ['updating', 'checking', 'installing', 'verifying'].includes(operation.status)
+    ) {
+      const phase = String(event.phase || 'updating').trim().toLowerCase();
+      patchCodexUpdateOperation(operation, {
+        status: ACTIVE_CODEX_UPDATE_STATUSES.has(phase) ? phase : 'updating',
+        phase,
+        message: redactSecretText(String(event.message || 'Updating Codex.')).slice(0, 2000),
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'host.codex_updated' && event.operationId) {
+    const codexRuntime = normalizeHostCodexRuntime(event.codexRuntime);
+    const host = state.hosts.get(event.hostId);
+    if (host) {
+      host.codexRuntime = codexRuntime || host.codexRuntime || null;
+      host.lastSeenAt = nowIso();
+      state.hosts.set(event.hostId, host);
+    }
+    const operation = currentCodexUpdateOperation(event.hostId);
+    if (
+      operation?.operationId === event.operationId
+      && ['updating', 'checking', 'installing', 'verifying', 'interrupted'].includes(operation.status)
+    ) {
+      patchCodexUpdateOperation(operation, {
+        status: event.ok === true ? 'updated' : 'update_failed',
+        phase: event.ok === true ? 'updated' : 'update_failed',
+        updateSucceeded: event.ok === true,
+        targetVersion: String(event.version || codexRuntime?.version || '').trim() || null,
+        message: event.ok === true
+          ? `Codex ${event.version || codexRuntime?.version || 'update'} installed and verified.`
+          : redactSecretText(String(event.error || 'Codex update failed.')).slice(0, 2000),
+      });
+    }
+    const pending = state.pendingCodexUpdateRequests.get(event.requestId);
+    if (pending) {
+      pending.resolve({
+        ok: event.ok === true,
+        operationId: event.operationId,
+        previousVersion: event.previousVersion || null,
+        version: event.version || codexRuntime?.version || null,
+        changed: event.changed === true,
+        code: event.code || null,
+        error: event.error || null,
+        codexRuntime,
+      });
+    }
+    return;
+  }
+
   if (event.type === 'host.probe' && event.requestId) {
+    const host = state.hosts.get(event.hostId);
+    if (host && event.codexRuntime) {
+      host.codexRuntime = normalizeHostCodexRuntime(event.codexRuntime) || host.codexRuntime || null;
+      state.hosts.set(event.hostId, host);
+    }
     const pending = state.pendingHostProbes.get(event.requestId);
     if (pending) {
       pending.resolve({
@@ -18177,6 +21042,7 @@ async function applyAgentEvent(event) {
         label: event.label || null,
         platform: event.platform || null,
         capabilities: event.capabilities || null,
+        codexRuntime: normalizeHostCodexRuntime(event.codexRuntime),
       });
     }
     return;
@@ -18500,6 +21366,36 @@ async function applyAgentEvent(event) {
     });
     return;
   }
+  const terminalInputCompletion = completeQueuedSessionInputFromEvent(event);
+  const terminalInputMatched = Boolean(terminalInputCompletion);
+  if (
+    event.type === 'session.command_failed'
+    && event.operation === 'input'
+    && event.clientRequestId
+    && (terminalInputMatched || !event.commandId)
+  ) {
+    rejectPendingUserTranscript(
+      event.hostId,
+      resolveSessionId(event.hostId, sessionId),
+      event.clientRequestId,
+      event.code || 'input_rejected'
+    );
+  } else if (
+    event.type === 'session.runtime_updated'
+    && terminalInputMatched
+    && event.inputOutcome === 'accepted'
+    && event.commandClientRequestId
+  ) {
+    markUserTranscriptAccepted(
+      event.hostId,
+      resolveSessionId(event.hostId, sessionId),
+      event.commandClientRequestId
+    );
+  }
+  if (terminalInputCompletion) {
+    queueInputTranscriptProjectionCheckpoint(terminalInputCompletion);
+    scheduleSessionLogsSave(0);
+  }
 
   if (event.type === 'session.command_failed') {
     const effectiveSessionId = resolveSessionId(event.hostId, sessionId);
@@ -18537,10 +21433,42 @@ async function applyAgentEvent(event) {
       broadcastSessionEvent(event.hostId, failedSession.sessionId, 'session.state_changed', failedSession);
       broadcastSessionEvent(event.hostId, failedSession.sessionId, 'session.snapshot', failedSession);
     }
+    if (event.operation === 'stop') {
+      const record = state.provenance?.getSessionRecord({
+        hostId: event.hostId,
+        sessionId: currentSession?.sessionId || effectiveSessionId,
+      });
+      const run = event.runId ? record?.runs?.[event.runId] || null : null;
+      if (run?.status === 'stopped') return;
+      const stopRequestId = String(event.stopRequestId || run?.stopRequestId || '').trim();
+      if (stopRequestId && event.runId) {
+        const cancelled = await state.provenance.cancelStopRun({
+          identity: { hostId: event.hostId, sessionId: currentSession?.sessionId || effectiveSessionId },
+          runId: event.runId,
+          stopRequestId,
+        });
+        if (cancelled.transitioned !== true) return;
+      }
+      projectStopFailedSession(
+        event.hostId,
+        currentSession?.sessionId || effectiveSessionId,
+        {
+          runId: event.runId || currentSession?.runId || null,
+          message,
+          connection: 'ready',
+          timestamp: event.timestamp || nowIso(),
+          alert: false,
+        }
+      );
+    }
+    const transientInputConflict = event.operation === 'input'
+      && ['session_turn_active', 'session_input_preparing'].includes(code);
     emitSessionAlert(event.hostId, effectiveSessionId, {
-      severity: 'error',
+      severity: transientInputConflict ? 'warning' : 'error',
       source: 'runtime',
       message,
+      transient: transientInputConflict,
+      turnId: event.turnId || null,
       timestamp: event.timestamp || nowIso(),
     });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.command_failed', {
@@ -18549,6 +21477,33 @@ async function applyAgentEvent(event) {
       error: message,
       timestamp: event.timestamp || nowIso(),
     });
+    return;
+  }
+
+  if (event.type === 'session.interrupt_result') {
+    const effectiveSessionId = resolveSessionId(event.hostId, sessionId);
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    const status = ['accepted', 'pending', 'no_active', 'failed'].includes(event.status)
+      ? event.status
+      : 'failed';
+    const payload = {
+      ...event,
+      hostId: event.hostId,
+      sessionId: effectiveSessionId,
+      status,
+      timestamp: event.timestamp || nowIso(),
+    };
+    if (status === 'failed') {
+      emitSessionAlert(event.hostId, effectiveSessionId, {
+        severity: 'error',
+        source: 'runtime',
+        message: event.error || 'Codex turn interruption failed.',
+        timestamp: payload.timestamp,
+      });
+    }
+    broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.interrupt_result', payload);
     return;
   }
 
@@ -18898,6 +21853,7 @@ async function applyAgentEvent(event) {
       if (classifyOutputSpeaker(event.chunk || '', event.stream || 'stdout') === 'agent') {
         emitTranscriptEntry(event.hostId, effectiveSessionId, {
           speaker: 'agent',
+          clientRequestId: event.clientRequestId || null,
           text: event.chunk || '',
           stream: event.stream || 'stdout',
           timestamp: event.timestamp || nowIso(),
@@ -18960,6 +21916,7 @@ async function applyAgentEvent(event) {
       });
       emitTranscriptEntry(event.hostId, effectiveSessionId, {
         speaker,
+        clientRequestId: event.clientRequestId || null,
         text: event.chunk || '',
         stream: event.stream || 'stdout',
         timestamp: event.timestamp || nowIso(),
@@ -18987,6 +21944,8 @@ async function applyAgentEvent(event) {
       speaker: event.speaker || 'system',
       text: event.text || '',
       stream: event.stream || null,
+      source: event.source || null,
+      clientRequestId: event.clientRequestId || null,
       files: event.files || event.attachments || [],
       timestamp: event.timestamp || nowIso(),
     });
@@ -19022,6 +21981,8 @@ async function applyAgentEvent(event) {
       normalizedTranscript = normalizeStoredTranscriptEntry({
         ...normalizedTranscript,
         ...assignedEntry,
+        source: event.source || normalizedTranscript.source || null,
+        clientRequestId: event.clientRequestId || normalizedTranscript.clientRequestId || null,
       });
     }
     if (consumePendingUserTranscriptEcho(event.hostId, effectiveSessionId, normalizedTranscript)) {
@@ -19220,6 +22181,31 @@ async function applyAgentEvent(event) {
       return;
     }
     const existing = getSession(event.hostId, effectiveSessionId);
+    if (
+      event.source === 'codex-jsonl'
+      && existing?.live === true
+      && existing?.source === 'managed'
+    ) {
+      // The app-server runner owns live control state. Rollout tail state is
+      // retained for history/recovery only and must not revive or hide a live
+      // error, Stop, or completed turn on legacy Hosts.
+      return;
+    }
+    const runtimePatch = runtimePatchWithPendingStopPriority(
+      event.hostId,
+      effectiveSessionId,
+      event.runId,
+      event.patch || {}
+    );
+    const existingRuntime = state.sessionRuntime.get(resolveSessionKey(event.hostId, effectiveSessionId)) || {};
+    const incomingRuntime = {
+      ...runtimePatch,
+      runId: event.runId || runtimePatch.runId || existing?.runId || null,
+      updatedAt: event.timestamp || nowIso(),
+    };
+    if (runtimePatchHasStaleRevision(existingRuntime, incomingRuntime)) {
+      return;
+    }
     upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
       title: existing?.title || effectiveSessionId,
@@ -19230,16 +22216,16 @@ async function applyAgentEvent(event) {
       lastUpdatedAt: event.timestamp || nowIso(),
       nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
     });
-    const runtimePatch = runtimePatchWithPendingStopPriority(
-      event.hostId,
-      effectiveSessionId,
-      event.runId,
-      event.patch || {}
+    const runtime = setSessionRuntime(event.hostId, effectiveSessionId, incomingRuntime);
+    const runtimeClientRequestId = normalizeClientRequestId(
+      runtime?.clientRequestId
+      || runtime?.pendingClientRequestId
+      || event.clientRequestId
+      || event.patch?.clientRequestId
     );
-    const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
-      ...runtimePatch,
-      updatedAt: event.timestamp || nowIso(),
-    });
+    if (runtimeClientRequestId && runtime?.activeTurnId && runtime?.busy !== false) {
+      markUserTranscriptAccepted(event.hostId, effectiveSessionId, runtimeClientRequestId);
+    }
     maybeClearGoalAutoApproveForRuntime(event.hostId, effectiveSessionId, runtime);
     const phase = String(runtime?.phase || '').toLowerCase();
     const turnIsInactive = !runtime?.activeTurnId
@@ -19337,6 +22323,7 @@ async function applyAgentEvent(event) {
       message: event.message || null,
       summary: event.summary || null,
       payload: event.payload || null,
+      availableDecisions: event.availableDecisions || event.payload?.availableDecisions || [],
       response: event.response || null,
       runId: event.runId || event.payload?.runId || null,
       turnId: event.turnId || event.payload?.turnId || null,
@@ -19606,12 +22593,19 @@ async function reconcileStopRequestsAfterRestart() {
         stopRequestId: run.stopRequestId,
       });
       if (result.transitioned) {
+        projectStopFailedSession(record.hostId, sessionId, {
+          runId,
+          message: 'Relay restarted before the Host confirmed this Stop. The Session remains blocked to avoid sending into an unknown runtime; retry Stop, then Resume it.',
+          connection: 'unknown',
+          broadcast: false,
+          source: 'relay',
+        });
         reconciled += 1;
       }
     }
   }
   if (reconciled > 0) {
-    console.warn(`[relay] cleared ${reconciled} unconfirmed Session Stop request(s) after restart`);
+    console.warn(`[relay] marked ${reconciled} unconfirmed Session Stop request(s) as stop-failed after restart`);
   }
 }
 

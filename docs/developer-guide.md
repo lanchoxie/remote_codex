@@ -39,7 +39,7 @@ npm run dev
 
 The development Agent uses its own `CODEX_HOME`, Remote Codex state, Host ID,
 owner marker, and Relay URL. Relay auth files, connectors, session data, skill
-state, SSH known-hosts data, logs, and browser auth cookies are also isolated by
+state, SSH multiplex files, logs, and browser auth cookies are also isolated by
 state root or port. Never override those development paths to point at the
 production state tree. Physical paths are checked after resolving Windows
 junctions and symbolic links, so aliases to the production tree are rejected.

@@ -2,6 +2,9 @@ const assert = require('assert');
 
 const {
   assistantMessageIdFor,
+  coalesceRolloutAssistantMirrorRows,
+  describeRolloutAssistantRow,
+  isRolloutAssistantMirrorPair,
   normalizeAssistantObservation,
   sourceFileIdentity,
 } = require('../shared/assistant-message-identity');
@@ -9,6 +12,52 @@ const {
   makeCodexRowEvents,
   makeTranscriptEntry,
 } = require('../shared/codex-discovery');
+
+const mirroredEventRow = {
+  timestamp: '2026-07-16T08:59:59.980Z',
+  type: 'event_msg',
+  payload: {
+    type: 'agent_message',
+    phase: 'final',
+    message: 'one mirrored final answer',
+  },
+};
+const mirroredResponseRow = {
+  timestamp: '2026-07-16T09:00:00.000Z',
+  type: 'response_item',
+  payload: {
+    id: 'msg-mirror-1',
+    type: 'message',
+    role: 'assistant',
+    phase: 'final',
+    content: [{ type: 'output_text', text: 'one mirrored final answer' }],
+  },
+};
+assert.strictEqual(describeRolloutAssistantRow(mirroredEventRow)?.kind, 'event');
+assert.strictEqual(describeRolloutAssistantRow(mirroredResponseRow)?.kind, 'response');
+assert.strictEqual(isRolloutAssistantMirrorPair(mirroredEventRow, mirroredResponseRow), true);
+assert.deepStrictEqual(
+  coalesceRolloutAssistantMirrorRows([mirroredEventRow, mirroredResponseRow]),
+  [mirroredResponseRow],
+  'strict adjacent mirrors must retain only the protocol-identified response row'
+);
+for (const mismatchedResponse of [
+  { ...mirroredResponseRow, payload: { ...mirroredResponseRow.payload, phase: 'commentary' } },
+  { ...mirroredResponseRow, payload: { ...mirroredResponseRow.payload, content: [{ type: 'output_text', text: 'different' }] } },
+  { ...mirroredResponseRow, timestamp: '2026-07-16T09:00:02.000Z' },
+  { ...mirroredResponseRow, payload: { ...mirroredResponseRow.payload, id: null } },
+]) {
+  assert.strictEqual(isRolloutAssistantMirrorPair(mirroredEventRow, mismatchedResponse), false);
+}
+const sameTextDifferentItem = {
+  ...mirroredResponseRow,
+  payload: { ...mirroredResponseRow.payload, id: 'msg-mirror-2' },
+};
+assert.deepStrictEqual(
+  coalesceRolloutAssistantMirrorRows([mirroredResponseRow, sameTextDifferentItem]),
+  [mirroredResponseRow, sameTextDifferentItem],
+  'two protocol items with identical text are distinct messages, not mirrors'
+);
 
 const common = {
   nativeThreadId: 'thread-1',
@@ -354,6 +403,15 @@ assert.strictEqual(
   }).assistantMessageId,
   'presentation cleanup must not change the immutable fallback identity'
 );
+const identifiedTranscript = makeTranscriptEntry(mirroredResponseRow, rowContext);
+assert.strictEqual(
+  identifiedTranscript.assistantMessageId,
+  makeCodexRowEvents(mirroredResponseRow, rowContext)
+    .find((event) => event.type === 'session.transcript')
+    .entry.assistantObservation.assistantMessageId,
+  'history extraction and live tailing must preserve the same protocol assistant identity'
+);
+assert.strictEqual(identifiedTranscript.source, 'codex-jsonl');
 
 const taskComplete = {
   timestamp: '2026-07-16T09:00:07.000Z',

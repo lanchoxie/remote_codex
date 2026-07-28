@@ -6,7 +6,7 @@ const { chromium } = require('@playwright/test');
 const root = path.join(__dirname, '..');
 const css = fs.readFileSync(path.join(root, 'apps/mobile-web/public/styles.css'), 'utf8');
 const fullSessionId = '019f35ea-7d58-7fc0-905d-5cb971de1184';
-const longPath = '/dm_data/home/spst/xiety/GNN_li-lib/grid_sample_concen7_diff_temp/long_workspace_name_without_breaks';
+const longPath = '/dm_data/home/spst/example-user/GNN_li-lib/grid_sample_concen7_diff_temp/long_workspace_name_without_breaks';
 const hostGroups = ['dm', 'hkl'].map((hostId, hostIndex) => {
   const rows = Array.from({ length: 5 }, (_, rowIndex) => {
     const sessionId = hostIndex === 0 && rowIndex === 0
@@ -80,6 +80,48 @@ const fixture = `<!doctype html>
   </body>
 </html>`;
 
+const longUpdateError = `Software update unavailable: ${'tmp/relay-8897/codex-home/.remote-codex-managed/'.repeat(12)}Filename too long`;
+const settingsFixture = `<!doctype html>
+<html data-theme="minimal-light">
+  <body class="modal-open">
+    <div class="settings-overlay">
+      <form class="settings-modal">
+        <div class="settings-header">
+          <div><h1>Language, API, and Session</h1><p>These preferences are stored in this browser only.</p></div>
+          <button type="button">Close</button>
+        </div>
+        <section class="settings-section settings-update-section">
+          <div class="settings-update-copy">
+            <div class="settings-section-title">Software update <span class="settings-update-badge">Experimental / Untested</span></div>
+            <div class="settings-section-copy">Check the latest stable tag, back up local data, then update the source.</div>
+          </div>
+          <div class="settings-update-panel">
+            <div class="settings-update-summary">${longUpdateError}</div>
+            <div class="settings-update-details"><div>${longPath.repeat(8)}</div></div>
+          </div>
+        </section>
+        <section class="settings-section host-settings-section">
+          <div class="settings-host-management">
+            <div class="compact-list">
+              <article class="host-card">
+                <div class="host-card-top"><div><div class="title">development_host_with_a_deliberately_long_unbroken_label</div><div class="sub">linux arm64 online</div></div></div>
+                <div class="host-codex-status">${longUpdateError}</div>
+                <div class="host-actions">
+                  <button class="action-button">Switch</button>
+                  <button class="action-button">Restart</button>
+                  <button class="action-button">Update Codex</button>
+                  <button class="action-button">Recover Sessions</button>
+                  <button class="action-button">Delete</button>
+                </div>
+              </article>
+            </div>
+          </div>
+        </section>
+      </form>
+    </div>
+  </body>
+</html>`;
+
 async function inspectViewport(browser, width, height) {
   const page = await browser.newPage({ viewport: { width, height } });
   await page.setContent(fixture);
@@ -142,12 +184,70 @@ async function inspectViewport(browser, width, height) {
   await page.close();
 }
 
+async function inspectSettingsViewport(browser, width, height) {
+  const page = await browser.newPage({ viewport: { width, height } });
+  await page.setContent(settingsFixture);
+  await page.addStyleTag({ content: css });
+  const metrics = await page.evaluate(() => {
+    const bounds = (selector) => {
+      const node = document.querySelector(selector);
+      const rect = node.getBoundingClientRect();
+      return {
+        width: rect.width,
+        clientWidth: node.clientWidth,
+        scrollWidth: node.scrollWidth,
+        left: rect.left,
+        right: rect.right,
+      };
+    };
+    return {
+      body: bounds('body'),
+      modal: bounds('.settings-modal'),
+      updateSection: bounds('.settings-update-section'),
+      updateCopy: bounds('.settings-update-copy'),
+      updatePanel: bounds('.settings-update-panel'),
+      updateSummary: bounds('.settings-update-summary'),
+      hostList: bounds('.settings-host-management .compact-list'),
+      hostCard: bounds('.host-card'),
+      hostActions: bounds('.host-actions'),
+      actionButtons: [...document.querySelectorAll('.host-actions .action-button')].map((node) => {
+        const rect = node.getBoundingClientRect();
+        return { width: rect.width, left: rect.left, right: rect.right };
+      }),
+    };
+  });
+
+  for (const [name, box] of Object.entries(metrics)) {
+    if (name === 'actionButtons') continue;
+    assert(box.scrollWidth <= box.clientWidth + 1, `${width}px ${name} overflows horizontally`);
+    assert(box.right <= width + 1, `${width}px ${name} escapes the viewport`);
+    assert(box.left >= -1, `${width}px ${name} starts outside the viewport`);
+  }
+  assert(metrics.modal.width <= width, `${width}px settings modal is wider than the viewport`);
+  assert(
+    metrics.updateCopy.width >= metrics.updateSection.clientWidth * 0.8,
+    `${width}px Software update copy is squeezed to ${metrics.updateCopy.width}px`,
+  );
+  if (width <= 560) {
+    for (const button of metrics.actionButtons) {
+      assert(
+        Math.abs(button.width - metrics.hostActions.clientWidth) <= 2,
+        `${width}px Host action button did not stretch to the container`,
+      );
+    }
+  }
+  await page.close();
+}
+
 (async () => {
   const browser = await chromium.launch(browserLaunchOptions());
   try {
     await inspectViewport(browser, 591, 720);
     await inspectViewport(browser, 390, 720);
     await inspectViewport(browser, 320, 640);
+    await inspectSettingsViewport(browser, 591, 720);
+    await inspectSettingsViewport(browser, 390, 720);
+    await inspectSettingsViewport(browser, 320, 640);
   } finally {
     await browser.close();
   }

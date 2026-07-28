@@ -22,16 +22,32 @@ const context = {
   window: dom.window,
   document: dom.window.document,
   HTMLDetailsElement: dom.window.HTMLDetailsElement,
-  state: { thinkingDisclosures: new Map() },
+  state: { thinkingDisclosures: new Map(), ui: { locale: 'en' } },
+  THINKING_EXPANDABLE_TEXT_CHAR_LIMIT: 420,
+  THINKING_EXPANDABLE_TEXT_LINE_LIMIT: 8,
+  THINKING_EXPANDABLE_CODE_CHAR_LIMIT: 720,
+  THINKING_EXPANDABLE_CODE_LINE_LIMIT: 12,
+  normalizeFileChanges: () => [],
   prettyStatusLabel: (value) => String(value || '').replace(/-/g, ' '),
   limitText: (value, maximum) => String(value || '').slice(0, maximum),
   formatTime: (value) => String(value || ''),
+  captureTranscriptScrollSnapshot: () => null,
+  restoreTranscriptScrollSnapshot: () => {},
+  captureViewportElementOffset: () => null,
+  restoreViewportElementOffset: () => {},
   renderFileCards: () => {},
   renderFileChangeDetails: () => dom.window.document.createElement('div'),
 };
 vm.createContext(context);
 for (const name of [
   'joinThinkingTextParts',
+  'formatThinkingValue',
+  'normalizeThinkingMessage',
+  'subagentActivityItem',
+  'firstThinkingField',
+  'isFileChangeDiagnostic',
+  'isUserSuitableThinkingText',
+  'normalizeThinkingActivityForModel',
   'thinkingDisclosureStateKey',
   'bindThinkingDisclosure',
   'thinkingEntryViewportKey',
@@ -40,13 +56,22 @@ for (const name of [
   'applyThinkingEntryData',
   'isThinkingOperationEntry',
   'formatThinkingStructuredValue',
+  'thinkingExpansionCopy',
+  'thinkingSourceTruncationCopy',
+  'thinkingRetainedPreviewCopy',
+  'thinkingTextNeedsExpansion',
+  'thinkingSourceWasTruncated',
+  'thinkingStructuredValueWasTruncated',
+  'bindThinkingTextExpansion',
   'appendThinkingOperationField',
   'thinkingOperationTitle',
   'thinkingOperationStatus',
   'thinkingOperationStatusTone',
   'formatThinkingOperationMeta',
   'createThinkingOperationEntry',
+  'createThinkingNarrativeEntry',
   'hashThinkingEntryVersion',
+  'thinkingEntryRenderVersion',
   'thinkingEntriesRenderVersion',
   'captureThinkingDisclosureStates',
   'restoreThinkingDisclosureStates',
@@ -72,6 +97,17 @@ assert.strictEqual(context.joinThinkingTextParts(['正在', '检查', '文件'])
 assert.strictEqual(
   context.joinThinkingTextParts(['first line\nsecond line', 'third line']),
   'first line\nsecond line\nthird line'
+);
+
+const fullCommentary = `complete commentary ${'detail '.repeat(100)}`.trim();
+assert.strictEqual(
+  context.normalizeThinkingMessage({
+    kind: 'commentary',
+    message: '300-character diagnostic preview',
+    data: { text: fullCommentary },
+  }),
+  fullCommentary,
+  'Thinking must prefer the complete structured text over the diagnostic preview'
 );
 
 const baseEntry = {
@@ -118,6 +154,15 @@ originalOutput.scrollLeft = 23;
 const originalSummary = first.querySelector(':scope > summary');
 originalSummary.tabIndex = 0;
 originalSummary.focus();
+const originalBody = first.querySelector('.thinking-operation-body');
+const unchangedHistory = dom.window.document.createElement('div');
+unchangedHistory.appendChild(context.createThinkingOperationEntry(baseEntry, 0, 'session::thinking', {}));
+context.patchThinkingHistoryList(history, unchangedHistory, 'session::thinking');
+assert.strictEqual(
+  first.querySelector('.thinking-operation-body'),
+  originalBody,
+  'unchanged keyed Thinking rows should retain their DOM and reader-local state'
+);
 const nextHistory = dom.window.document.createElement('div');
 const next = context.createThinkingOperationEntry({
   ...baseEntry,
@@ -140,6 +185,110 @@ assert.strictEqual(
   'narrow patches should restore keyboard focus inside an expanded operation'
 );
 
+const longOutput = Array.from({ length: 40 }, (_, index) => `output line ${index}`).join('\n');
+const expandable = context.createThinkingOperationEntry({
+  ...baseEntry,
+  groupKey: 'command:expandable',
+  activityKeys: ['activity-expandable'],
+  output: longOutput,
+  outputTruncated: true,
+}, 0, 'session::expandable', {});
+dom.window.document.body.appendChild(expandable);
+const outputField = expandable.querySelector('[data-thinking-field-key="Output"]');
+const outputContent = outputField.querySelector('.thinking-operation-code');
+const outputToggle = outputField.querySelector('.thinking-expand-toggle');
+assert(outputToggle, 'long tool output should expose an expand control');
+assert.strictEqual(outputToggle.getAttribute('aria-expanded'), 'false');
+assert.strictEqual(outputContent.textContent, longOutput, 'collapsed output must retain its complete text in the DOM');
+assert(outputField.querySelector('.thinking-source-truncation-note'), 'upstream truncation must be disclosed');
+outputToggle.click();
+assert.strictEqual(outputToggle.getAttribute('aria-expanded'), 'true');
+assert(outputContent.classList.contains('is-expanded'));
+
+const structuredTruncation = context.createThinkingOperationEntry({
+  ...baseEntry,
+  groupKey: 'tool:structured-truncation',
+  category: 'tool',
+  output: null,
+  arguments: {
+    truncated: true,
+    preview: 'retained request input',
+  },
+  progress: null,
+  progressTruncated: true,
+  stderr: 'retained stderr output',
+  outputTruncated: true,
+  result: null,
+  resultTruncated: true,
+  fileChangesTruncated: true,
+}, 0, 'session::structured-truncation', {});
+assert(
+  structuredTruncation
+    .querySelector('[data-thinking-field-key="Arguments"]')
+    ?.querySelector('.thinking-source-truncation-note'),
+  'structured retention markers must disclose that request input was truncated upstream'
+);
+assert(
+  structuredTruncation
+    .querySelector('[data-thinking-field-key="Stderr"]')
+    ?.querySelector('.thinking-source-truncation-note'),
+  'stderr-only output must disclose an upstream output truncation flag'
+);
+for (const label of ['Progress', 'Result', 'File changes retention']) {
+  const retainedField = structuredTruncation.querySelector(`[data-thinking-field-key="${label}"]`);
+  assert(retainedField, `${label} should remain visible when its retained value was fully discarded`);
+  assert(
+    retainedField.querySelector('.thinking-source-truncation-note'),
+    `${label} should disclose that only retained content is available`
+  );
+}
+const literalTruncationJson = context.createThinkingOperationEntry({
+  ...baseEntry,
+  groupKey: 'command:literal-truncation-json',
+  output: '{"truncated": true, "meaning": "ordinary command output"}',
+  outputTruncated: false,
+}, 0, 'session::literal-truncation-json', {});
+assert.strictEqual(
+  literalTruncationJson.querySelector('.thinking-source-truncation-note'),
+  null,
+  'ordinary command output containing a truncated property must not trigger a false retention warning'
+);
+
+const expandableHistory = dom.window.document.createElement('div');
+expandableHistory.appendChild(expandable);
+const updatedExpandableHistory = dom.window.document.createElement('div');
+const updatedLongOutput = `${longOutput}\nlate retained output`;
+updatedExpandableHistory.appendChild(context.createThinkingOperationEntry({
+  ...baseEntry,
+  groupKey: 'command:expandable',
+  activityKeys: ['activity-expandable'],
+  output: updatedLongOutput,
+  outputTruncated: true,
+  activityRevision: 2,
+}, 0, 'session::expandable', {}));
+context.patchThinkingHistoryList(expandableHistory, updatedExpandableHistory, 'session::expandable');
+const patchedExpandable = expandableHistory.firstElementChild;
+assert.strictEqual(
+  patchedExpandable.querySelector('.thinking-expand-toggle').getAttribute('aria-expanded'),
+  'true',
+  'expanded tool fields must stay expanded after a live keyed patch'
+);
+assert.strictEqual(
+  patchedExpandable.querySelector('[data-thinking-field-key="Output"] pre').textContent,
+  updatedLongOutput
+);
+
+const longNarrativeText = `commentary ${'full text '.repeat(80)}`.trim();
+const narrative = context.createThinkingNarrativeEntry({
+  groupKey: 'commentary:expandable',
+  kind: 'commentary',
+  text: longNarrativeText,
+  textTruncated: false,
+  timestamp: '2026-07-27T10:00:00.000Z',
+}, 0, 'session::narrative', {});
+assert.strictEqual(narrative.querySelector('.thinking-history-text').textContent, longNarrativeText);
+assert(narrative.querySelector('.thinking-expand-toggle'), 'long Commentary should expose an expand control');
+
 const changedTextKey = context.thinkingEntryViewportKey({
   ...baseEntry,
   text: 'a completely different live payload',
@@ -150,5 +299,55 @@ assert.notStrictEqual(
   context.thinkingEntriesRenderVersion([{ ...baseEntry, text: 'second revision', activityRevision: 2 }]),
   'same-row content growth must change the render version used for unread state'
 );
+
+const rawSubagent = context.normalizeThinkingActivityForModel({
+  timestamp: '2026-07-25T08:32:06.887Z',
+  kind: 'notification',
+  method: 'item/completed',
+  data: {
+    item: {
+      type: 'subAgentActivity',
+      id: 'subagent-interacted',
+      kind: 'interacted',
+      agentThreadId: 'child-thread',
+      agentPath: '/root/review_code',
+    },
+    threadId: 'parent-thread',
+    turnId: 'turn-subagent',
+  },
+}, 0);
+assert(rawSubagent, 'legacy notification-shaped sub-agent activity must remain visible in Thinking');
+assert.strictEqual(rawSubagent.kind, 'collaboration');
+assert.strictEqual(rawSubagent.status, 'interacted');
+assert.strictEqual(rawSubagent.final, true);
+assert.strictEqual(rawSubagent.agentThreadId, 'child-thread');
+assert.strictEqual(rawSubagent.agentPath, '/root/review_code');
+assert.strictEqual(rawSubagent.parentThreadId, 'parent-thread');
+const renderedSubagent = context.createThinkingOperationEntry(rawSubagent, 0, 'session::subagent', {});
+assert(renderedSubagent.textContent.includes('Sub-agent /root/review_code'));
+assert(renderedSubagent.querySelector('.thinking-operation-status').classList.contains('completed'));
+
+const interruptedSubagent = context.normalizeThinkingActivityForModel({
+  kind: 'notification',
+  method: 'item/completed',
+  data: {
+    item: {
+      type: 'subAgentActivity',
+      id: 'subagent-interrupted',
+      kind: 'interrupted',
+      agentThreadId: 'child-thread',
+      agentPath: '/root/review_code',
+    },
+    threadId: 'parent-thread',
+    turnId: 'turn-subagent',
+  },
+}, 1);
+const renderedInterrupted = context.createThinkingOperationEntry(
+  interruptedSubagent,
+  1,
+  'session::subagent',
+  {}
+);
+assert(renderedInterrupted.querySelector('.thinking-operation-status').classList.contains('failed'));
 
 console.log('thinking entry rendering assertions passed');

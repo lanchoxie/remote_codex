@@ -61,15 +61,20 @@ assert.strictEqual(projection.applyActivity(structuredKey, {
   cwd: 'D:/workspace',
   output: '<literal output>',
   outputTruncated: true,
+  progress: 'partial progress',
+  progressTruncated: true,
   exitCode: 0,
   durationMs: 18,
   processId: 'process-structured',
   stream: 'stderr',
   success: false,
   arguments: { target: '<literal>' },
+  argumentsTruncated: true,
   result: { ok: true },
+  resultTruncated: true,
   commandActions: [{ type: 'read', path: 'package.json' }],
   fileChanges: [{ path: 'src/app.js', diff: '-old\n+new' }],
+  fileChangesTruncated: true,
   final: true,
 }), true);
 const projectedStructured = projection.activitiesFor(structuredKey)[0];
@@ -93,7 +98,39 @@ assert.deepStrictEqual(projectedStructured.result, { ok: true });
 assert.deepStrictEqual(projectedStructured.commandActions, [{ type: 'read', path: 'package.json' }]);
 assert.deepStrictEqual(projectedStructured.fileChanges, [{ path: 'src/app.js', diff: '-old\n+new' }]);
 assert.strictEqual(projectedStructured.outputTruncated, true);
+assert.strictEqual(projectedStructured.progressTruncated, true);
+assert.strictEqual(projectedStructured.argumentsTruncated, true);
+assert.strictEqual(projectedStructured.resultTruncated, true);
+assert.strictEqual(projectedStructured.fileChangesTruncated, true);
 assert.strictEqual(projectedStructured.success, false);
+
+const metadataBounded = createTranscriptActivityProjection({
+  maxRecordBytes: 1024,
+  maxTotalBytes: 4096,
+});
+const metadataBoundedKey = 'host-a::metadata-bounded';
+metadataBounded.applyReset(metadataBoundedKey, { streamEpoch: 'metadata-bounded', activities: [] });
+assert.strictEqual(metadataBounded.applyActivity(metadataBoundedKey, {
+  streamEpoch: 'metadata-bounded',
+  activityKey: 'metadata-bounded-activity',
+  activityRevision: 1,
+  turnId: 'turn-metadata-bounded',
+  itemId: 'item-metadata-bounded',
+  text: 'retained summary',
+  output: 'o'.repeat(4096),
+  arguments: { payload: 'a'.repeat(4096) },
+  result: { payload: 'r'.repeat(4096) },
+  fileChanges: [{ path: 'src/large.js', diff: `+${'x'.repeat(4096)}` }],
+}), true);
+const locallyCompacted = metadataBounded.activitiesFor(metadataBoundedKey)[0];
+assert.strictEqual(locallyCompacted.output, null);
+assert.strictEqual(locallyCompacted.arguments, null);
+assert.strictEqual(locallyCompacted.result, null);
+assert.strictEqual(locallyCompacted.fileChanges, null);
+assert.strictEqual(locallyCompacted.outputTruncated, true);
+assert.strictEqual(locallyCompacted.argumentsTruncated, true);
+assert.strictEqual(locallyCompacted.resultTruncated, true);
+assert.strictEqual(locallyCompacted.fileChangesTruncated, true);
 
 assert.strictEqual(projection.applyActivity(canonicalKey, {
   ...base,

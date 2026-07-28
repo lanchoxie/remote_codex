@@ -8,8 +8,61 @@ const { spawn, spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const HOST_ID = 'graceful-local-agent-test';
-const AGENT_SOURCE = fs.readFileSync(path.join(ROOT, 'apps', 'host-agent', 'agent.js'), 'utf8');
+const AGENT_PATH = path.join(ROOT, 'apps', 'host-agent', 'agent.js');
+const OWNERSHIP_FAULT_HOOK = path.join(ROOT, 'scripts', 'fixtures', 'local-agent-ownership-faults.js');
+const AGENT_SOURCE = fs.readFileSync(AGENT_PATH, 'utf8');
 const RELAY_SOURCE = fs.readFileSync(path.join(ROOT, 'apps', 'relay', 'server.js'), 'utf8');
+
+const ownershipWriteSource = RELAY_SOURCE.slice(
+  RELAY_SOURCE.indexOf('function writeLocalAgentOwnershipMarker'),
+  RELAY_SOURCE.indexOf('function localAgentOwnershipMarkerMatchesSnapshot')
+);
+const ownershipInspectSource = RELAY_SOURCE.slice(
+  RELAY_SOURCE.indexOf('function inspectUnclaimedLocalAgentOwnershipMarker'),
+  RELAY_SOURCE.indexOf('function agentPollOwnershipAttestation')
+);
+const recoveredProcessAliveSource = RELAY_SOURCE.slice(
+  RELAY_SOURCE.indexOf('function localAgentProcessIsAlive'),
+  RELAY_SOURCE.indexOf('function spawnAndWait')
+);
+const linuxAgentIdentitySource = RELAY_SOURCE.slice(
+  RELAY_SOURCE.indexOf('function processIdentityMatchesLocalAgentEntrypoint'),
+  RELAY_SOURCE.indexOf('function assessLocalAgentOwnershipMarker')
+);
+const compareDeleteSource = RELAY_SOURCE.slice(
+  RELAY_SOURCE.indexOf('function localAgentOwnershipMarkerMatchesSnapshot'),
+  RELAY_SOURCE.indexOf('function localAgentOwnershipMarkerMatchesRecord')
+);
+assert(
+  /inspectUnclaimedLocalAgentOwnershipMarker/.test(ownershipWriteSource)
+    && /assessLocalAgentOwnershipMarker/.test(ownershipInspectSource),
+  'marker inspection and marker writing must share the process identity assessment path'
+);
+assert(
+  /marker\.pid/.test(compareDeleteSource)
+    && /marker\.instanceId/.test(compareDeleteSource)
+    && /marker\.ownershipToken/.test(compareDeleteSource)
+    && /marker\.markerPath/.test(compareDeleteSource),
+  'stale marker deletion must re-check path, pid, instanceId, and ownershipToken'
+);
+assert(
+  !/forceKill|taskkill|process\.kill/.test(ownershipInspectSource),
+  'unclaimed marker inspection must never terminate the PID named by a marker'
+);
+assert(
+  /readLocalAgentOwnershipMarker\(record\.hostId\)/.test(recoveredProcessAliveSource)
+    && /localAgentOwnershipMarkerMatchesRecord\(marker, record\)/.test(recoveredProcessAliveSource)
+    && /assessLocalAgentOwnershipMarker\(marker\)/.test(recoveredProcessAliveSource)
+    && /\['live_agent', 'unknown'\]\.includes\(assessment\.status\)/.test(recoveredProcessAliveSource)
+    && !/\bprocessIsAlive\s*\(\s*record\.pid/.test(recoveredProcessAliveSource),
+  'recovered Agent liveness must require marker identity assessment instead of trusting a reused PID'
+);
+assert(
+  /process\.platform === 'linux'/.test(linuxAgentIdentitySource)
+    && /identity\?\.argv/.test(linuxAgentIdentitySource)
+    && /identity\.argv\[1\]/.test(linuxAgentIdentitySource),
+  'Linux Agent identity must match argv[1] to the exact Agent entrypoint'
+);
 
 const localRelayHostIdSource = RELAY_SOURCE.slice(
   RELAY_SOURCE.indexOf('function getLocalRelayHostId'),
@@ -111,8 +164,8 @@ const sessionStopSource = AGENT_SOURCE.slice(
 );
 assert(
   /stopRunnerOnce\(runner/.test(sessionStopSource)
-    && /stopError\.retryCommand\s*=\s*true/.test(sessionStopSource),
-  'session.stop must share Host shutdown cleanup and stay durable when it fails'
+    && /postSessionCommandFailure\(command, stopError, 'stop', runner\)/.test(sessionStopSource),
+  'session.stop must share Host shutdown cleanup and report a retryable terminal outcome without blocking later commands'
 );
 const managedStartSource = AGENT_SOURCE.slice(
   AGENT_SOURCE.indexOf('async function startManagedSession'),
@@ -253,6 +306,21 @@ async function stopChild(child, signal = 'SIGTERM') {
   child.stderr?.destroy();
 }
 
+async function removeTempTree(tempRoot) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    try {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(error?.code)) throw error;
+      lastError = error;
+      await delay(100);
+    }
+  }
+  throw lastError || new Error(`failed to remove temporary tree: ${tempRoot}`);
+}
+
 function processAlive(pid) {
   try {
     process.kill(Number(pid), 0);
@@ -370,6 +438,18 @@ async function main() {
 
     const ownedMarker = findOwnershipMarker(tempRoot, HOST_ID);
     assert(ownedMarker, `ownership marker missing for ${HOST_ID}`);
+    const markerHealth = await requestJson(port, 'GET', '/health');
+    assert.strictEqual(
+      ownedMarker.marker.ownerRelayInstanceId,
+      markerHealth.body?.instanceId,
+      'new ownership markers must identify their Relay instance without relying on Relay PID'
+    );
+    assert(Number.isFinite(Date.parse(ownedMarker.marker.processStartedAt)), 'marker processStartedAt must be parseable');
+    assert.strictEqual(
+      path.resolve(ownedMarker.marker.agentEntrypoint),
+      path.resolve(AGENT_PATH),
+      'new ownership markers must record the absolute Agent entrypoint'
+    );
     const eventSessionId = `event-attestation-${Date.now()}`;
     const mixedSessionId = `${eventSessionId}-mixed`;
     const discoveryEvent = (hostId, sessionId) => ({
@@ -571,6 +651,8 @@ async function main() {
         && host.lastSeenAt !== lastSeenBeforeRecoveryStart
       ));
     }, 15000);
+    const recoveryMarkerBeforeCrash = findOwnershipMarker(tempRoot, HOST_ID);
+    assert(recoveryMarkerBeforeCrash, `ownership marker missing before Relay crash for ${HOST_ID}`);
 
     await stopChild(relay, 'SIGKILL');
     assert.strictEqual(
@@ -618,6 +700,18 @@ async function main() {
     assert.strictEqual(adopted.statusCode, 200, JSON.stringify(adopted.body));
     assert.strictEqual(adopted.body?.status, 'already_running', JSON.stringify(adopted.body));
     assert.strictEqual(Number(adopted.body?.localAgent?.pid), recoveredPid, JSON.stringify(adopted.body));
+    const recoveryMarkerAfterAdoption = findOwnershipMarker(tempRoot, HOST_ID);
+    assert.strictEqual(Number(recoveryMarkerAfterAdoption?.marker?.pid), recoveredPid);
+    assert.strictEqual(
+      recoveryMarkerAfterAdoption?.marker?.instanceId,
+      recoveryMarkerBeforeCrash.marker.instanceId,
+      'Relay restart adoption must retain the real Agent instance instead of spawning a duplicate'
+    );
+    assert.strictEqual(
+      recoveryMarkerAfterAdoption?.marker?.ownershipToken,
+      recoveryMarkerBeforeCrash.marker.ownershipToken,
+      'Relay restart adoption must retain the original ownership token'
+    );
 
     const timeoutCountBeforeRecoveryRestart = (output.join('').match(/graceful shutdown timed out/g) || []).length;
     const recoveryRestart = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/local-agent`, {
@@ -711,30 +805,49 @@ async function main() {
     }, 15000);
 
     const unclaimedHostId = 'unclaimed-live-marker-test';
-    const unclaimed = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    const ownerRoot = path.join(tempRoot, 'local-agents');
+    fs.mkdirSync(ownerRoot, { recursive: true });
+    const unclaimedMarkerPath = path.join(ownerRoot, `${unclaimedHostId}.owner.json`);
+    const unreachableRelayPort = await getOpenPort();
+    const unclaimedInstanceId = 'unclaimed-instance';
+    const unclaimedOwnershipToken = 'unclaimed-token';
+    const unclaimed = spawn(process.execPath, [AGENT_PATH], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        RELAY_URL: `http://127.0.0.1:${unreachableRelayPort}`,
+        HOST_ID: unclaimedHostId,
+        HOST_LABEL: 'Unclaimed real local Agent',
+        RELAY_MANAGED_LOCAL_AGENT: 'true',
+        RELAY_MANAGED_AGENT_INSTANCE_ID: unclaimedInstanceId,
+        RELAY_MANAGED_AGENT_TOKEN: unclaimedOwnershipToken,
+        RELAY_MANAGED_MARKER_PATH: unclaimedMarkerPath,
+        RELAY_MANAGED_OWNER_PID: '999999',
+        RELAY_MANAGED_OWNER_INSTANCE_ID: 'previous-relay-instance',
+        AUTO_START_SESSION: 'false',
+        POLL_INTERVAL_MS: '60000',
+        DISCOVERY_INTERVAL_MS: '60000',
+        CODEX_TAIL_ENABLED: 'false',
+        CODEX_HOME: path.join(tempRoot, 'unclaimed-codex-home'),
+        REMOTE_CODEX_STATE_ROOT: path.join(tempRoot, 'unclaimed-agent-state'),
+      },
       stdio: 'ignore',
       windowsHide: true,
     });
-    unclaimed.unref();
     agentPids.add(Number(unclaimed.pid));
-    const ownerRoot = path.join(tempRoot, 'local-agents');
-    fs.mkdirSync(ownerRoot, { recursive: true });
-    fs.writeFileSync(path.join(ownerRoot, `${unclaimedHostId}.owner.json`), `${JSON.stringify({
-      kind: 'remote-codex-local-agent-owner',
-      version: 1,
-      hostId: unclaimedHostId,
-      pid: unclaimed.pid,
-      instanceId: 'unclaimed-instance',
-      ownershipToken: 'unclaimed-token',
-      ownerRelayPid: 999999,
-      relayUrl: `http://127.0.0.1:${port}`,
-      startedAt: new Date().toISOString(),
-    }, null, 2)}\n`);
+    const realUnclaimedMarker = await waitFor(() => findOwnershipMarker(tempRoot, unclaimedHostId), 5000);
+    realUnclaimedMarker.marker.relayUrl = `http://127.0.0.1:${port}`;
+    fs.writeFileSync(realUnclaimedMarker.markerPath, `${JSON.stringify(realUnclaimedMarker.marker, null, 2)}\n`);
     const unclaimedRestart = await requestJson(port, 'POST', `/api/hosts/${unclaimedHostId}/local-agent`, {
       action: 'restart',
     });
     assert.strictEqual(unclaimedRestart.body?.status, 'ownership_pending', JSON.stringify(unclaimedRestart.body));
-    assert.strictEqual(processAlive(unclaimed.pid), true, 'unverified marker PID must never be killed');
+    assert(
+      ['live_agent', 'unknown'].includes(unclaimedRestart.body?.ownershipAssessment),
+      JSON.stringify(unclaimedRestart.body)
+    );
+    assert(Number(unclaimedRestart.body?.retryAfterMs) > 0, JSON.stringify(unclaimedRestart.body));
+    assert.strictEqual(processAlive(unclaimed.pid), true, 'a verified unclaimed Agent must remain alive for adoption');
     const unclaimedStart = await requestJson(port, 'POST', `/api/hosts/${unclaimedHostId}/local-agent`, {
       action: 'start',
     });
@@ -756,7 +869,7 @@ async function main() {
       {
         'X-Remote-Codex-Agent-Managed': '1',
         'X-Remote-Codex-Agent-Pid': String(unclaimed.pid),
-        'X-Remote-Codex-Agent-Instance': 'unclaimed-instance',
+        'X-Remote-Codex-Agent-Instance': unclaimedInstanceId,
         'X-Remote-Codex-Agent-Token': 'wrong-token',
       }
     );
@@ -770,8 +883,8 @@ async function main() {
       {
         'X-Remote-Codex-Agent-Managed': '1',
         'X-Remote-Codex-Agent-Pid': String(unclaimed.pid),
-        'X-Remote-Codex-Agent-Instance': 'unclaimed-instance',
-        'X-Remote-Codex-Agent-Token': 'unclaimed-token',
+        'X-Remote-Codex-Agent-Instance': unclaimedInstanceId,
+        'X-Remote-Codex-Agent-Token': unclaimedOwnershipToken,
       }
     );
     assert.strictEqual(verifiedPoll.statusCode, 200, JSON.stringify(verifiedPoll.body));
@@ -793,7 +906,7 @@ async function main() {
         relayManaged: true,
         pid: unclaimed.pid,
         parentPid: process.pid,
-        instanceId: 'unclaimed-instance',
+        instanceId: unclaimedInstanceId,
         ownershipToken: 'wrong-token',
         relayUrl: `http://127.0.0.1:${port}`,
       },
@@ -806,13 +919,56 @@ async function main() {
         relayManaged: true,
         pid: unclaimed.pid,
         instanceId: 'different-instance',
-        ownershipToken: 'unclaimed-token',
+        ownershipToken: unclaimedOwnershipToken,
         relayUrl: `http://127.0.0.1:${port}`,
       },
     });
     assert.strictEqual(mismatchedHeartbeat.statusCode, 409, JSON.stringify(mismatchedHeartbeat.body));
     assert.strictEqual(mismatchedHeartbeat.body?.code, 'local_agent_ownership_mismatch');
     assert.strictEqual(processAlive(unclaimed.pid), true, 'mismatched attestation must not affect its PID');
+
+    const reusedHostId = 'pid-reused-marker-test';
+    const unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    agentPids.add(Number(unrelated.pid));
+    const reusedMarkerPath = path.join(ownerRoot, `${reusedHostId}.owner.json`);
+    fs.writeFileSync(reusedMarkerPath, `${JSON.stringify({
+      kind: 'remote-codex-local-agent-owner',
+      version: 1,
+      hostId: reusedHostId,
+      pid: unrelated.pid,
+      instanceId: 'old-agent-instance',
+      ownershipToken: 'old-agent-token',
+      ownerRelayPid: 999999,
+      relayUrl: `http://127.0.0.1:${port}`,
+      startedAt: new Date(Date.now() - 120000).toISOString(),
+    }, null, 2)}\n`);
+    const recoveredReuse = await requestJson(port, 'POST', `/api/hosts/${reusedHostId}/local-agent`, {
+      action: 'start',
+      label: 'PID reuse recovery',
+    });
+    assert.strictEqual(recoveredReuse.statusCode, 200, JSON.stringify(recoveredReuse.body));
+    assert.strictEqual(recoveredReuse.body?.status, 'starting', JSON.stringify(recoveredReuse.body));
+    assert.strictEqual(recoveredReuse.body?.staleOwnershipRecovered, true, JSON.stringify(recoveredReuse.body));
+    const replacementPid = Number(recoveredReuse.body?.localAgent?.pid);
+    agentPids.add(replacementPid);
+    assert(replacementPid > 0 && replacementPid !== Number(unrelated.pid), JSON.stringify(recoveredReuse.body));
+    assert.strictEqual(processAlive(unrelated.pid), true, 'PID-reuse recovery must not kill the unrelated process');
+    await waitFor(async () => {
+      const hosts = await requestJson(port, 'GET', '/api/hosts');
+      return (hosts.body?.hosts || []).some((host) => host.hostId === reusedHostId && host.lastSeenAt);
+    }, 15000);
+    const replacementMarker = findOwnershipMarker(tempRoot, reusedHostId);
+    assert.strictEqual(Number(replacementMarker?.marker?.pid), replacementPid, JSON.stringify(replacementMarker));
+    assert.notStrictEqual(replacementMarker?.marker?.instanceId, 'old-agent-instance');
+    await requestJson(port, 'POST', `/api/hosts/${reusedHostId}/local-agent`, { action: 'stop' });
+    await waitFor(async () => {
+      const status = await requestJson(port, 'POST', `/api/hosts/${reusedHostId}/local-agent`, { action: 'status' });
+      return status.body?.localAgent?.status === 'stopped' && status.body?.localAgent?.pid == null;
+    }, 10000);
+    assert.strictEqual(processAlive(unrelated.pid), true, 'stopping the replacement must not kill the reused marker PID');
     console.log('local-agent graceful shutdown assertions passed');
   } catch (error) {
     error.message += `\nRelay output:\n${output.join('')}`;
@@ -820,6 +976,267 @@ async function main() {
   } finally {
     await stopChild(relay);
     for (const pid of agentPids) forceKillTree(pid);
+    await removeTempTree(tempRoot);
+  }
+}
+
+function ownershipFaultNodeOptions() {
+  return [
+    String(process.env.NODE_OPTIONS || '').trim(),
+    `--require=${OWNERSHIP_FAULT_HOOK}`,
+  ].filter(Boolean).join(' ');
+}
+
+async function testUnknownOwnershipIdentity() {
+  const port = await getOpenPort();
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'local-agent-ownership-unknown-'));
+  const output = [];
+  const hostId = 'ownership-identity-unknown-test';
+  const unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  const markerRoot = path.join(tempRoot, 'local-agents');
+  const markerPath = path.join(markerRoot, `${hostId}.owner.json`);
+  fs.mkdirSync(markerRoot, { recursive: true });
+  const marker = {
+    kind: 'remote-codex-local-agent-owner',
+    version: 1,
+    hostId,
+    pid: unrelated.pid,
+    instanceId: 'unknown-owner-instance',
+    ownershipToken: 'unknown-owner-token',
+    ownerRelayPid: 999999,
+    relayUrl: `http://127.0.0.1:${port}`,
+    startedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`);
+  const relay = spawn(process.execPath, [path.join(ROOT, 'apps', 'relay', 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_OPTIONS: ownershipFaultNodeOptions(),
+      PORT: String(port),
+      RELAY_STATE_ROOT: tempRoot,
+      ...localAgentIsolationEnvironment(tempRoot),
+      RELAY_AUTH_DISABLED: 'true',
+      RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
+      RELAY_TEST_OWNERSHIP_UNKNOWN_PID: String(unrelated.pid),
+      LOCAL_AGENT_AUTO_START_SESSION: 'false',
+      POLL_INTERVAL_MS: '60000',
+      CODEX_TAIL_ENABLED: 'false',
+      LOCAL_CODEX_HOME: path.join(tempRoot, 'codex-home'),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  relay.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')));
+  relay.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')));
+
+  try {
+    await waitFor(async () => {
+      if (relay.exitCode != null) throw new Error(`Relay exited early: ${relay.exitCode}`);
+      const health = await requestJson(port, 'GET', '/health');
+      return health.statusCode === 200 && health.body?.ok;
+    });
+    for (const action of ['start', 'restart']) {
+      const response = await requestJson(port, 'POST', `/api/hosts/${hostId}/local-agent`, { action });
+      assert.strictEqual(response.statusCode, 200, JSON.stringify(response.body));
+      assert.strictEqual(response.body?.status, 'ownership_pending', JSON.stringify(response.body));
+      assert.strictEqual(response.body?.ownershipAssessment, 'unknown', JSON.stringify(response.body));
+      assert(Number(response.body?.retryAfterMs) > 0, JSON.stringify(response.body));
+      assert.strictEqual(response.body?.localAgent, null, JSON.stringify(response.body));
+    }
+    const currentMarker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    assert.strictEqual(currentMarker.pid, marker.pid);
+    assert.strictEqual(currentMarker.instanceId, marker.instanceId);
+    assert.strictEqual(currentMarker.ownershipToken, marker.ownershipToken);
+    assert.strictEqual(processAlive(unrelated.pid), true, 'unknown identity must remain fail-closed without killing its PID');
+    console.log('local-agent unknown ownership identity assertions passed');
+  } catch (error) {
+    error.message += `\nRelay output:\n${output.join('')}`;
+    throw error;
+  } finally {
+    await stopChild(relay);
+    forceKillTree(unrelated.pid);
+    await removeTempTree(tempRoot);
+  }
+}
+
+async function testOwnershipMarkerReplacementRace() {
+  const port = await getOpenPort();
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'local-agent-ownership-race-'));
+  const output = [];
+  const hostId = 'ownership-marker-race-test';
+  const replacementOwner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  const markerRoot = path.join(tempRoot, 'local-agents');
+  const markerPath = path.join(markerRoot, `${hostId}.owner.json`);
+  const replacementPath = path.join(tempRoot, 'replacement-marker.json');
+  const triggerPath = path.join(tempRoot, 'replace-marker.trigger');
+  fs.mkdirSync(markerRoot, { recursive: true });
+  const staleMarker = {
+    kind: 'remote-codex-local-agent-owner',
+    version: 1,
+    hostId,
+    pid: replacementOwner.pid,
+    instanceId: 'stale-instance',
+    ownershipToken: 'stale-token',
+    ownerRelayPid: 999999,
+    relayUrl: `http://127.0.0.1:${port}`,
+    startedAt: new Date(Date.now() - 120000).toISOString(),
+  };
+  const replacementMarker = {
+    ...staleMarker,
+    ownershipToken: 'replacement-token',
+  };
+  fs.writeFileSync(markerPath, `${JSON.stringify(staleMarker, null, 2)}\n`);
+  fs.writeFileSync(replacementPath, `${JSON.stringify(replacementMarker, null, 2)}\n`);
+  const relay = spawn(process.execPath, [path.join(ROOT, 'apps', 'relay', 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_OPTIONS: ownershipFaultNodeOptions(),
+      PORT: String(port),
+      RELAY_STATE_ROOT: tempRoot,
+      ...localAgentIsolationEnvironment(tempRoot),
+      RELAY_AUTH_DISABLED: 'true',
+      RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
+      RELAY_TEST_OWNERSHIP_RACE_MARKER_PATH: markerPath,
+      RELAY_TEST_OWNERSHIP_RACE_REPLACEMENT_PATH: replacementPath,
+      RELAY_TEST_OWNERSHIP_RACE_TRIGGER_PATH: triggerPath,
+      RELAY_TEST_OWNERSHIP_RACE_INJECTION_POINT: 'rename',
+      LOCAL_AGENT_AUTO_START_SESSION: 'false',
+      POLL_INTERVAL_MS: '60000',
+      CODEX_TAIL_ENABLED: 'false',
+      LOCAL_CODEX_HOME: path.join(tempRoot, 'codex-home'),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  relay.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')));
+  relay.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')));
+
+  try {
+    await waitFor(async () => {
+      if (relay.exitCode != null) throw new Error(`Relay exited early: ${relay.exitCode}`);
+      const health = await requestJson(port, 'GET', '/health');
+      return health.statusCode === 200 && health.body?.ok;
+    });
+    fs.writeFileSync(triggerPath, 'replace on next marker read');
+    const response = await requestJson(port, 'POST', `/api/hosts/${hostId}/local-agent`, { action: 'start' });
+    assert.strictEqual(response.statusCode, 200, JSON.stringify(response.body));
+    assert.strictEqual(response.body?.status, 'ownership_pending', JSON.stringify(response.body));
+    assert.strictEqual(response.body?.ownershipAssessment, 'marker_changed', JSON.stringify(response.body));
+    assert.strictEqual(response.body?.localAgent, null, JSON.stringify(response.body));
+    const retained = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    assert.strictEqual(retained.pid, replacementMarker.pid);
+    assert.strictEqual(retained.instanceId, replacementMarker.instanceId);
+    assert.strictEqual(retained.ownershipToken, replacementMarker.ownershipToken);
+    assert.strictEqual(processAlive(replacementOwner.pid), true, 'marker replacement race must not kill the new marker PID');
+    console.log('local-agent ownership marker replacement assertions passed');
+  } catch (error) {
+    error.message += `\nRelay output:\n${output.join('')}`;
+    throw error;
+  } finally {
+    await stopChild(relay);
+    forceKillTree(replacementOwner.pid);
+    await removeTempTree(tempRoot);
+  }
+}
+
+async function testWriterRecoversMarkerCreatedAfterInitialInspection() {
+  const port = await getOpenPort();
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'local-agent-ownership-writer-'));
+  const output = [];
+  const hostId = 'ownership-writer-recovery-test';
+  const unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  const agentPids = new Set();
+  const markerRoot = path.join(tempRoot, 'local-agents');
+  const markerPath = path.join(markerRoot, `${hostId}.owner.json`);
+  const replacementPath = path.join(tempRoot, 'writer-marker.json');
+  fs.mkdirSync(markerRoot, { recursive: true });
+  const reusedMarker = {
+    kind: 'remote-codex-local-agent-owner',
+    version: 1,
+    hostId,
+    pid: unrelated.pid,
+    instanceId: 'writer-reused-instance',
+    ownershipToken: 'writer-reused-token',
+    ownerRelayPid: 999999,
+    ownerRelayInstanceId: 'writer-old-relay',
+    relayUrl: `http://127.0.0.1:${port}`,
+    startedAt: new Date(Date.now() - 120000).toISOString(),
+    processStartedAt: new Date(Date.now() - 120000).toISOString(),
+    agentEntrypoint: AGENT_PATH,
+  };
+  fs.writeFileSync(replacementPath, `${JSON.stringify(reusedMarker, null, 2)}\n`);
+  const relay = spawn(process.execPath, [path.join(ROOT, 'apps', 'relay', 'server.js')], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_OPTIONS: ownershipFaultNodeOptions(),
+      PORT: String(port),
+      RELAY_STATE_ROOT: tempRoot,
+      ...localAgentIsolationEnvironment(tempRoot),
+      RELAY_AUTH_DISABLED: 'true',
+      RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
+      RELAY_TEST_OWNERSHIP_WRITER_MARKER_PATH: markerPath,
+      RELAY_TEST_OWNERSHIP_WRITER_REPLACEMENT_PATH: replacementPath,
+      RELAY_TEST_OWNERSHIP_WRITER_AGENT_ENTRYPOINT: AGENT_PATH,
+      LOCAL_AGENT_AUTO_START_SESSION: 'false',
+      POLL_INTERVAL_MS: '60000',
+      CODEX_TAIL_ENABLED: 'false',
+      LOCAL_CODEX_HOME: path.join(tempRoot, 'codex-home'),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  relay.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')));
+  relay.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')));
+
+  try {
+    await waitFor(async () => {
+      if (relay.exitCode != null) throw new Error(`Relay exited early: ${relay.exitCode}`);
+      const health = await requestJson(port, 'GET', '/health');
+      return health.statusCode === 200 && health.body?.ok;
+    });
+    assert.strictEqual(fs.existsSync(markerPath), false, 'the writer marker must appear only after Agent spawn');
+    const response = await requestJson(port, 'POST', `/api/hosts/${hostId}/local-agent`, {
+      action: 'start',
+      label: 'Writer recovery test',
+    });
+    assert.strictEqual(response.statusCode, 200, JSON.stringify(response.body));
+    assert.strictEqual(response.body?.status, 'starting', JSON.stringify(response.body));
+    assert.strictEqual(response.body?.staleOwnershipRecovered, true, JSON.stringify(response.body));
+    const agentPid = Number(response.body?.localAgent?.pid);
+    agentPids.add(agentPid);
+    assert(agentPid > 0 && agentPid !== Number(unrelated.pid), JSON.stringify(response.body));
+    assert.strictEqual(processAlive(unrelated.pid), true, 'writer recovery must not kill the PID from the reused marker');
+    const currentMarker = findOwnershipMarker(tempRoot, hostId);
+    assert.strictEqual(Number(currentMarker?.marker?.pid), agentPid, JSON.stringify(currentMarker));
+    assert.notStrictEqual(currentMarker?.marker?.ownershipToken, reusedMarker.ownershipToken);
+    await waitFor(async () => {
+      const hosts = await requestJson(port, 'GET', '/api/hosts');
+      return (hosts.body?.hosts || []).some((host) => host.hostId === hostId && host.lastSeenAt);
+    }, 15000);
+    await requestJson(port, 'POST', `/api/hosts/${hostId}/local-agent`, { action: 'stop' });
+    await waitFor(async () => {
+      const status = await requestJson(port, 'POST', `/api/hosts/${hostId}/local-agent`, { action: 'status' });
+      return status.body?.localAgent?.status === 'stopped' && status.body?.localAgent?.pid == null;
+    }, 10000);
+    assert.strictEqual(processAlive(unrelated.pid), true, 'stopping the recovered Agent must not kill the reused marker PID');
+    console.log('local-agent writer ownership recovery assertions passed');
+  } catch (error) {
+    error.message += `\nRelay output:\n${output.join('')}`;
+    throw error;
+  } finally {
+    await stopChild(relay);
+    for (const pid of agentPids) forceKillTree(pid);
+    await stopChild(unrelated, 'SIGKILL');
+    await removeTempTree(tempRoot);
   }
 }
 
@@ -1135,6 +1552,7 @@ async function testRelayJoinsLateManagedAgent() {
       ...localAgentIsolationEnvironment(tempRoot),
       RELAY_AUTH_DISABLED: 'true',
       RELAY_TEST_CONTROL_ENABLED: 'true',
+      RELAY_TEST_LOCAL_AGENT_IDENTITY_ENTRYPOINT: lateFixturePath,
       RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
       RELAY_LOCAL_AGENT_SHUTDOWN_GRACE_MS: '8000',
       RELAY_LOCAL_AGENT_FORCE_EXIT_WAIT_MS: '3000',
@@ -1197,6 +1615,7 @@ async function testRelayJoinsLateManagedAgent() {
     const markerRoot = path.join(tempRoot, 'local-agents');
     const markerPath = path.join(markerRoot, `${lateHostId}.owner.json`);
     fs.mkdirSync(markerRoot, { recursive: true });
+    const lateStartedAt = new Date().toISOString();
     fs.writeFileSync(markerPath, `${JSON.stringify({
       kind: 'remote-codex-local-agent-owner',
       version: 1,
@@ -1206,7 +1625,9 @@ async function testRelayJoinsLateManagedAgent() {
       ownershipToken: lateOwnershipToken,
       ownerRelayPid: relay.pid,
       relayUrl: `http://127.0.0.1:${port}`,
-      startedAt: new Date().toISOString(),
+      startedAt: lateStartedAt,
+      processStartedAt: lateStartedAt,
+      agentEntrypoint: lateFixturePath,
     }, null, 2)}\n`);
     const lateRegistration = await requestJson(port, 'POST', '/api/agent/register', {
       hostId: lateHostId,
@@ -1218,7 +1639,7 @@ async function testRelayJoinsLateManagedAgent() {
         instanceId: lateInstanceId,
         ownershipToken: lateOwnershipToken,
         relayUrl: `http://127.0.0.1:${port}`,
-        startedAt: new Date().toISOString(),
+        startedAt: lateStartedAt,
       },
     });
     assert.strictEqual(lateRegistration.statusCode, 409, JSON.stringify(lateRegistration.body));
@@ -1347,11 +1768,21 @@ async function testForcedProcessTreeShutdown() {
 const selectedScenario = String(process.argv[2] || '').trim();
 const testRun = selectedScenario === 'core'
   ? Promise.resolve().then(main)
+  : selectedScenario === 'ownership-identity'
+  ? Promise.resolve()
+    .then(testUnknownOwnershipIdentity)
+    .then(testOwnershipMarkerReplacementRace)
+    .then(testWriterRecoversMarkerCreatedAfterInitialInspection)
+  : selectedScenario === 'writer-race'
+  ? Promise.resolve().then(testWriterRecoversMarkerCreatedAfterInitialInspection)
   : selectedScenario === 'forced-tree'
   ? Promise.resolve().then(testForcedProcessTreeShutdown)
   : selectedScenario === 'late-shutdown'
     ? Promise.resolve().then(testRelayJoinsLateManagedAgent)
   : main()
+    .then(testUnknownOwnershipIdentity)
+    .then(testOwnershipMarkerReplacementRace)
+    .then(testWriterRecoversMarkerCreatedAfterInitialInspection)
     .then(testOwnershipRevocationSuppressesStaleEvents)
     .then(testUnreachedShutdownPreservesEarlierCommands)
     .then(testRelayStaysAliveWhenAgentTreeCannotBeKilled)

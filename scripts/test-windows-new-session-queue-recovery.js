@@ -45,14 +45,33 @@ const earlyInputStart = agent.indexOf("if (command.type === 'session.input')", n
 const earlyInputEnd = agent.indexOf("message: `no live session for command ${command.type}`", earlyInputStart);
 assert(noRunnerStart >= 0 && earlyInputStart > noRunnerStart && earlyInputEnd > earlyInputStart, 'host-agent should have a no-runner session.input recovery block');
 const earlyInputBlock = agent.slice(earlyInputStart, earlyInputEnd);
+const failedReceiptStart = agent.indexOf('function buildSessionInputRuntimeEvent');
+const failedReceiptEnd = agent.indexOf('async function executeSessionInputCommand', failedReceiptStart);
+assert(failedReceiptStart >= 0 && failedReceiptEnd > failedReceiptStart, 'host-agent should build one structured input failure receipt');
+const failedReceiptBlock = agent.slice(failedReceiptStart, failedReceiptEnd);
 
 assertContains(
-  earlyInputBlock,
+  failedReceiptBlock,
   'sessionId: command.requestedSessionId || command.sessionId',
   'host-agent should clear the queued runtime state on the same UI session id that relay marked queued'
 );
-assertContains(earlyInputBlock, 'queuedCommandId: null', 'host-agent should clear the queued command marker after an undeliverable input');
-assertContains(earlyInputBlock, 'pendingInputSummary: null', 'host-agent should clear the pending input summary after an undeliverable input');
+assertContains(failedReceiptBlock, 'queuedCommandId: null', 'host-agent should clear the queued command marker after an undeliverable input');
+assertContains(failedReceiptBlock, 'pendingInputSummary: null', 'host-agent should clear the pending input summary after an undeliverable input');
+assertContains(
+  failedReceiptBlock,
+  "buildSessionCommandFailureEvent(command, error, 'input'",
+  'an undeliverable input should report the structured command failure in the same terminal receipt'
+);
+assertContains(
+  earlyInputBlock,
+  'deferAcknowledgement: startSessionInputCommand(command)',
+  'missing-runner input should use the retryable terminal receipt path'
+);
+assert(
+  earlyInputBlock.indexOf('deferAcknowledgement: startSessionInputCommand(command)')
+    < earlyInputBlock.indexOf('}'),
+  'missing-runner input must return before the generic no-live-session error path'
+);
 
 assertContains(
   runner,

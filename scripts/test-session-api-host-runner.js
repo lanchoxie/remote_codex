@@ -32,7 +32,10 @@ const {
   startCodexAppServerSession,
   updateApiProfileCodexHomeOwnership,
 } = require('../apps/host-agent/codex-app-server-runner');
-const { startManagedRuntimeSession } = require('../apps/host-agent/runtime-adapters');
+const {
+  resolveManagedRuntime,
+  startManagedRuntimeSession,
+} = require('../apps/host-agent/runtime-adapters');
 const {
   buildApiProcessEnvironment,
   normalizeApiConfig,
@@ -543,13 +546,81 @@ const liveInputStart = agentSource.indexOf("if (command.type === 'session.input'
 const liveInputEnd = agentSource.indexOf("if (command.type === 'session.model_list')", liveInputStart);
 assert(liveInputStart >= 0 && liveInputEnd > liveInputStart, 'Host agent must have a live session.input handler');
 const liveInputBlock = agentSource.slice(liveInputStart, liveInputEnd);
+const asyncInputStart = agentSource.indexOf('async function executeSessionInputCommand');
+const asyncInputEnd = agentSource.indexOf('async function failShutdownCancelledManagedSession', asyncInputStart);
+const asyncInputBlock = agentSource.slice(asyncInputStart, asyncInputEnd);
 assert(
-  liveInputBlock.includes('lastError: null') && liveInputBlock.includes('lastCodexError: null'),
+  asyncInputBlock.includes('lastError: null') && asyncInputBlock.includes('lastCodexError: null'),
   'accepting session.input must clear stale runtime errors before submitting the new turn'
+);
+assert(
+  liveInputBlock.includes('deferAcknowledgement: startSessionInputCommand(command, runner)')
+    && asyncInputBlock.includes('activeSessionInputTasks.add(task)'),
+  'session.input must run asynchronously so command polling can reach Stop while turn/start is pending'
+);
+assert(
+  agentSource.includes('lastFetchedCommandId')
+    && agentSource.includes('advanceAcknowledgedCommandId()')
+    && agentSource.includes("deliveredCommandStates.set(commandId, 'pending')"),
+  'Host input commands must remain unacknowledged until Codex accepts or rejects turn/start'
+);
+assert(
+  agentSource.includes('result.deferAcknowledgement.then(completeDeferredCommand, retryDeferredCommand)')
+    && agentSource.includes('requestDeferredCommandRetry(commandId, error)')
+    && agentSource.includes('nextCommandFetchAfter()'),
+  'a rejected deferred command must be fetched again instead of being advanced as a completed ACK'
+);
+assert(
+  asyncInputBlock.includes('sessionInputReceiptExecutor.run(')
+    && agentSource.includes('batchId: sessionInputReceiptBatchId(command)')
+    && agentSource.includes('postEvents(receipt'),
+  'input execution must be cached separately from its stable terminal receipt delivery'
+);
+assert(
+  asyncInputBlock.includes('clientRequestId: command.clientRequestId || null'),
+  'Host runtime and runner submission must preserve the composer request identity'
 );
 assert(
   agentSource.includes('nativeResumeReadiness:'),
   'new Host agents must negotiate native readiness before Relay trusts an unmaterialized state'
+);
+const getCapabilitiesSource = agentSource.slice(
+  agentSource.indexOf('function getCapabilities()'),
+  agentSource.indexOf('function normalizeSkillId')
+);
+assert(
+  getCapabilitiesSource.includes('const defaultRuntime = resolveManagedRuntime({}, {')
+    && getCapabilitiesSource.includes('defaultRuntime: MANAGED_RUNTIME')
+    && getCapabilitiesSource.includes('defaultCommand: MANAGED_COMMAND')
+    && getCapabilitiesSource.includes('defaultArgs: MANAGED_ARGS'),
+  'Host capability negotiation must resolve the effective default managed runtime'
+);
+assert(
+  getCapabilitiesSource.includes("const sessionApiRebindV1 = defaultRuntime.kind === 'codex-app-server'")
+    && getCapabilitiesSource.includes('sessionApiRebindV1,'),
+  'only the codex-app-server runtime may advertise safe Session API Rebind support'
+);
+assert(
+  getCapabilitiesSource.includes("const supportsManagedRuntimeBinding = defaultRuntime.kind !== 'demo'")
+    && getCapabilitiesSource.includes('runApiBinding: supportsManagedRuntimeBinding')
+    && getCapabilitiesSource.includes('nativeResumeReadiness: supportsManagedRuntimeBinding')
+    && getCapabilitiesSource.includes("demoMode: defaultRuntime.kind === 'demo'"),
+  'Host API binding and demo capabilities must derive from the resolved default runtime kind'
+);
+assert.strictEqual(
+  resolveManagedRuntime({}, { defaultRuntime: 'codex-app-server' }).kind,
+  'codex-app-server'
+);
+assert.notStrictEqual(
+  resolveManagedRuntime({}, { defaultRuntime: 'demo' }).kind,
+  'codex-app-server'
+);
+assert.notStrictEqual(
+  resolveManagedRuntime({}, {
+    defaultRuntime: 'process',
+    defaultCommand: process.execPath,
+  }).kind,
+  'codex-app-server'
 );
 const runnerSource = fs.readFileSync('apps/host-agent/codex-app-server-runner.js', 'utf8');
 assert(!runnerSource.includes("const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])"));
@@ -683,7 +754,7 @@ assert(
   'shutdown-owned startup cancellation must publish an explicit terminal failure'
 );
 assert(
-  managedStartSource.includes('managedSessionStartGate.beginStart()')
+  managedStartSource.includes('managedSessionStartGate.beginStart({')
     && managedStartSource.includes('startHandle.assertCanSpawn()')
     && managedStartSource.includes('onRunnerCreated:'),
   'managed starts must enter the shutdown gate before a runtime can be spawned'
@@ -699,7 +770,7 @@ const polledCommandSource = agentSource.slice(
   agentSource.indexOf('async function pollCommandsLoop()')
 );
 assert(
-  /catch \(error\) \{\s*if \(error\?\.retryCommand\) return false;/.test(polledCommandSource),
+  /catch \(error\) \{\s*if \(error\?\.retryCommand\) \{[\s\S]{0,180}requestDeferredCommandRetry\(commandId, error\);[\s\S]{0,80}return false;/.test(polledCommandSource),
   'retryable replay delivery failure must not advance the command acknowledgement'
 );
 
@@ -891,6 +962,55 @@ async function verifyOverlayCleanupDoesNotWaitForRelayDelivery() {
   fs.rmSync(baseHome, { recursive: true, force: true });
 }
 
+async function verifyCodexStopSignalsBeforeNotificationDrain() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-stop-before-drain-'));
+  let releaseDrain = null;
+  const drainGate = new Promise((resolve) => { releaseDrain = resolve; });
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-stop-before-drain',
+    sessionId: 'session-stop-before-drain',
+    runId: 'run-stop-before-drain',
+    title: 'Stop before notification drain',
+    cwd: process.cwd(),
+    codexHome: baseHome,
+    postEvent: async () => {},
+  });
+  const child = new EventEmitter();
+  child.pid = 830110;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.killed = false;
+  child.kill = () => {
+    child.killed = true;
+    queueMicrotask(() => {
+      child.signalCode = 'SIGTERM';
+      child.emit('exit', null, 'SIGTERM');
+    });
+    return true;
+  };
+  runner.child = child;
+  runner.startCompleted = true;
+  runner.drainNotifications = async () => drainGate;
+  child.once('exit', (code, signal) => runner.handleExit(code, signal).catch(() => {}));
+  try {
+    const stopping = runner.stop();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(
+      child.killed,
+      true,
+      'Stop must signal the app-server before waiting on Relay notification delivery'
+    );
+    releaseDrain();
+    await stopping;
+  } finally {
+    releaseDrain();
+    if (!runner.overlayCleaned && (!runner.child || runner.childExitConfirmed)) {
+      runner.cleanupManagedOverlay();
+    }
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
 async function verifyManagedOverlayCleanupRetriesAfterFailure() {
   const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-overlay-cleanup-retry-'));
   const runner = new CodexAppServerRunner({
@@ -906,16 +1026,29 @@ async function verifyManagedOverlayCleanupRetriesAfterFailure() {
   const overlayRoot = runner.profileHomeDir;
   const originalRmSync = fs.rmSync;
   let attempts = 0;
+  let removalOptions = null;
   fs.rmSync = function failFirstOwnedOverlayRemoval(target, options) {
     if (path.resolve(String(target)) === path.resolve(overlayRoot) && attempts++ === 0) {
       const error = new Error('simulated owned overlay removal failure');
       error.code = 'EPERM';
+      error.path = overlayRoot;
+      removalOptions = options;
       throw error;
     }
     return originalRmSync.call(fs, target, options);
   };
   try {
-    assert.throws(() => runner.cleanupManagedOverlay(), /simulated owned overlay removal failure/);
+    assert.throws(
+      () => runner.cleanupManagedOverlay(),
+      (error) => (
+        error?.code === 'session_overlay_cleanup_failed'
+        && error?.cause?.code === 'EPERM'
+        && error?.cause?.path === overlayRoot
+        && /simulated owned overlay removal failure/.test(error.message)
+      )
+    );
+    assert.strictEqual(removalOptions?.maxRetries, 5);
+    assert.strictEqual(removalOptions?.retryDelay, 100);
     assert.strictEqual(runner.overlayCleaned, false, 'a failed removal must remain retryable');
     assert.strictEqual(fs.existsSync(path.join(runner.codexHome, 'auth.json')), true);
     assert.strictEqual(runner.cleanupManagedOverlay(), true, 'a later cleanup attempt must remove the owned overlay');
@@ -923,6 +1056,197 @@ async function verifyManagedOverlayCleanupRetriesAfterFailure() {
     assert.strictEqual(fs.existsSync(overlayRoot), false);
   } finally {
     fs.rmSync = originalRmSync;
+    originalRmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+function simulatedOverlayBusyError(overlayRoot) {
+  const error = new Error('simulated goals SQLite file lock');
+  error.code = 'EBUSY';
+  error.path = path.join(overlayRoot, '.codex', 'goals_1.sqlite');
+  return error;
+}
+
+async function waitForRunnerCondition(predicate, message, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.strictEqual(predicate(), true, message);
+}
+
+async function verifyTransientOverlayBusyDoesNotFailStoppedSession() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-overlay-ebusy-transient-'));
+  const events = [];
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-overlay-ebusy-transient',
+    sessionId: 'session-overlay-ebusy-transient',
+    runId: 'run-overlay-ebusy-transient',
+    title: 'Transient overlay EBUSY',
+    cwd: process.cwd(),
+    codexHome: baseHome,
+    apiConfig: { profileId: 'overlay-ebusy-transient', provider: 'OpenAI', apiKey: 'secret' },
+    overlayCleanupRetryMaxAttempts: 3,
+    overlayCleanupRetryDelayMs: 1,
+    postEvent: async (event) => events.push(event),
+  });
+  const overlayRoot = runner.profileHomeDir;
+  const originalRmSync = fs.rmSync;
+  let attempts = 0;
+  fs.rmSync = function failTransientOwnedOverlayRemoval(target, options) {
+    if (path.resolve(String(target)) === path.resolve(overlayRoot)) {
+      attempts += 1;
+      if (attempts <= 2) throw simulatedOverlayBusyError(overlayRoot);
+    }
+    return originalRmSync.call(fs, target, options);
+  };
+  runner.child = { pid: 830120 };
+  runner.startCompleted = true;
+  runner.stopRequested = true;
+  try {
+    await assert.doesNotReject(() => runner.handleExit(null, 'SIGTERM'));
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === 'session.state_changed').map((event) => event.state),
+      ['history-only'],
+      'a transient overlay lock must not replace the stopped terminal state'
+    );
+    assert.strictEqual(
+      events.some((event) => event.type === 'session.command_failed'),
+      false,
+      'overlay cleanup housekeeping must not become a command failure'
+    );
+    await waitForRunnerCondition(
+      () => runner.overlayCleaned,
+      'background cleanup should remove the overlay after the transient lock clears'
+    );
+    assert.strictEqual(attempts, 3);
+    assert.strictEqual(fs.existsSync(overlayRoot), false);
+    const diagnostic = events.find(
+      (event) => event.type === 'session.diagnostic' && event.kind === 'managed-overlay-cleanup'
+    );
+    assert(diagnostic, 'the transient lock should emit one cleanup diagnostic');
+    assert.strictEqual(diagnostic.severity, 'warning');
+    assert.strictEqual(diagnostic.data?.code, 'EBUSY');
+    assert.strictEqual(diagnostic.data?.retryScheduled, true);
+  } finally {
+    fs.rmSync = originalRmSync;
+    if (runner.overlayCleanupRetryTimer) clearTimeout(runner.overlayCleanupRetryTimer);
+    if (!runner.overlayCleaned) runner.cleanupManagedOverlay();
+    originalRmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyPersistentOverlayBusyRemainsNonTerminal() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-overlay-ebusy-persistent-'));
+  const events = [];
+  const logs = [];
+  const originalConsoleError = console.error;
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-overlay-ebusy-persistent',
+    sessionId: 'session-overlay-ebusy-persistent',
+    runId: 'run-overlay-ebusy-persistent',
+    title: 'Persistent overlay EBUSY',
+    cwd: process.cwd(),
+    codexHome: baseHome,
+    apiConfig: { profileId: 'overlay-ebusy-persistent', provider: 'OpenAI', apiKey: 'secret' },
+    overlayCleanupRetryMaxAttempts: 2,
+    overlayCleanupRetryDelayMs: 1,
+    postEvent: async (event) => events.push(event),
+  });
+  const overlayRoot = runner.profileHomeDir;
+  const originalRmSync = fs.rmSync;
+  let attempts = 0;
+  fs.rmSync = function failPersistentOwnedOverlayRemoval(target, options) {
+    if (path.resolve(String(target)) === path.resolve(overlayRoot)) {
+      attempts += 1;
+      throw simulatedOverlayBusyError(overlayRoot);
+    }
+    return originalRmSync.call(fs, target, options);
+  };
+  runner.child = { pid: 830121 };
+  runner.startCompleted = true;
+  runner.stopRequested = true;
+  console.error = (...args) => logs.push(args.join(' '));
+  try {
+    await assert.doesNotReject(() => runner.handleExit(null, 'SIGTERM'));
+    await waitForRunnerCondition(
+      () => attempts === 3,
+      'persistent cleanup should stop after the configured initial attempt and two retries'
+    );
+    assert.deepStrictEqual(
+      events.filter((event) => event.type === 'session.state_changed').map((event) => event.state),
+      ['history-only']
+    );
+    assert.strictEqual(
+      events.filter((event) => event.type === 'session.diagnostic'
+        && event.kind === 'managed-overlay-cleanup').length,
+      1,
+      'persistent cleanup failure should emit one diagnostic instead of repeated alerts'
+    );
+    assert.strictEqual(events.some((event) => event.type === 'session.command_failed'), false);
+    assert.strictEqual(fs.existsSync(overlayRoot), true, 'locked overlay must remain for startup recovery');
+    assert(logs.some((line) => /cleanup retries exhausted/.test(line)));
+  } finally {
+    console.error = originalConsoleError;
+    fs.rmSync = originalRmSync;
+    if (runner.overlayCleanupRetryTimer) clearTimeout(runner.overlayCleanupRetryTimer);
+    if (!runner.overlayCleaned) runner.cleanupManagedOverlay();
+    originalRmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyOverlayBusyDoesNotReplacePrimaryStartupError() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-overlay-startup-error-'));
+  const originalRmSync = fs.rmSync;
+  const originalConsoleError = console.error;
+  const startupError = new Error('simulated primary app-server startup failure');
+  startupError.code = 'session_primary_startup_failure';
+  let runner = null;
+  const logs = [];
+  fs.rmSync = function failStartupOwnedOverlayRemoval(target, options) {
+    if (
+      runner
+      && path.resolve(String(target)) === path.resolve(runner.profileHomeDir)
+    ) {
+      throw simulatedOverlayBusyError(runner.profileHomeDir);
+    }
+    return originalRmSync.call(fs, target, options);
+  };
+  console.error = (...args) => logs.push(args.join(' '));
+  try {
+    await assert.rejects(
+      startCodexAppServerSession({
+        hostId: 'host-overlay-startup-error',
+        sessionId: 'session-overlay-startup-error',
+        runId: 'run-overlay-startup-error',
+        title: 'Primary startup error',
+        cwd: process.cwd(),
+        codexHome: baseHome,
+        apiConfig: { profileId: 'overlay-startup-error', provider: 'OpenAI', apiKey: 'secret' },
+        overlayCleanupRetryMaxAttempts: 0,
+        postEvent: async () => {},
+        onRunnerCreated: (createdRunner) => {
+          runner = createdRunner;
+          runner.start = async () => { throw startupError; };
+        },
+      }),
+      (error) => error === startupError,
+      'cleanup EBUSY must not replace the primary startup error'
+    );
+    assert(runner);
+    assert.strictEqual(runner.overlayCleaned, false);
+    assert.strictEqual(runner.overlayCleanupLastError?.cause?.code, 'EBUSY');
+    assert.strictEqual(startupError.overlayCleanupFailure?.code, 'session_overlay_cleanup_failed');
+    assert.strictEqual(startupError.overlayCleanupFailure?.cleanupErrorCode, 'EBUSY');
+    assert.strictEqual(startupError.overlayCleanupFailure?.retryScheduled, false);
+    assert(logs.some((line) => /deferred to startup recovery/.test(line)));
+  } finally {
+    console.error = originalConsoleError;
+    fs.rmSync = originalRmSync;
+    if (runner) {
+      if (runner.overlayCleanupRetryTimer) clearTimeout(runner.overlayCleanupRetryTimer);
+      if (!runner.overlayCleaned) runner.cleanupManagedOverlay();
+    }
     originalRmSync(baseHome, { recursive: true, force: true });
   }
 }
@@ -2553,22 +2877,22 @@ async function verifyManagedOverlayShortPathBudgetAndMetadata() {
   const baseHome = path.join(parent, 'b'.repeat(fillerLength));
   fs.mkdirSync(baseHome, { recursive: true });
   const apiConfig = {
-    profileId: 'minemine-profile-with-a-production-length-identifier',
-    label: 'MineMine acceptance profile',
-    provider: 'MineMine OpenAI compatible API',
+    profileId: 'synthetic-profile-with-a-production-length-identifier',
+    label: 'Synthetic acceptance profile',
+    provider: 'Synthetic OpenAI-compatible API',
     providerKind: 'custom',
-    baseUrl: 'https://hpc.example.invalid/v1',
+    baseUrl: 'http://192.0.2.44:8080/v1',
     apiKey: 'path-budget-secret-must-not-appear-in-owner-marker',
   };
   const metadata = {
     hostId: 'windows-acceptance-host',
-    sessionId: '019f7617-85ff-7eb2-85bd-7575191e4f46-session-metadata-suffix',
-    bridgeSessionId: 'bridge-session-019f7617-85ff-7eb2-85bd-7575191e4f46',
-    nativeThreadId: '019f7617-85ff-7eb2-85bd-7575191e4f46',
-    sourceSessionId: 'source-session-019f7617-85ff-7eb2-85bd-7575191e4f46',
-    originSessionId: 'origin-session-019f7617-85ff-7eb2-85bd-7575191e4f46',
-    conversationKey: 'conversation-019f7617-85ff-7eb2-85bd-7575191e4f46',
-    runId: 'run-019f7617-85ff-7eb2-85bd-7575191e4f46-production-suffix',
+    sessionId: '01900000-0000-7000-8000-000000000001-session-metadata-suffix',
+    bridgeSessionId: 'bridge-session-01900000-0000-7000-8000-000000000001',
+    nativeThreadId: '01900000-0000-7000-8000-000000000001',
+    sourceSessionId: 'source-session-01900000-0000-7000-8000-000000000001',
+    originSessionId: 'origin-session-01900000-0000-7000-8000-000000000001',
+    conversationKey: 'conversation-01900000-0000-7000-8000-000000000001',
+    runId: 'run-01900000-0000-7000-8000-000000000001-production-suffix',
     launchMode: 'fresh_rebind',
   };
   let first = null;
@@ -2997,6 +3321,180 @@ async function verifyRuntimeErrorsClearAfterTurnRecovery() {
   }
 }
 
+async function verifyAssistantTranscriptIdentityAndSubmissionLock() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-assistant-identity-'));
+  fs.writeFileSync(path.join(baseHome, 'auth.json'), '{}\n', 'utf8');
+  fs.writeFileSync(path.join(baseHome, 'config.toml'), '', 'utf8');
+  const events = [];
+  let releaseTurnStart;
+  const turnStartGate = new Promise((resolve) => { releaseTurnStart = resolve; });
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-assistant-identity',
+    sessionId: 'bridge-assistant-identity',
+    bridgeSessionId: 'bridge-assistant-identity',
+    runId: 'run-assistant-identity',
+    title: 'Assistant identity',
+    cwd: process.cwd(),
+    launchMode: 'fresh',
+    codexHome: baseHome,
+    postEvent: async (event) => events.push(event),
+  });
+  runner.threadId = 'thread-assistant-identity';
+  runner.sessionId = runner.threadId;
+  runner.nativeThreadId = runner.threadId;
+  runner.rpc = {
+    request: async (method) => {
+      assert.strictEqual(method, 'turn/start');
+      await turnStartGate;
+      return { turn: { id: 'turn-assistant-identity' } };
+    },
+  };
+
+  try {
+    const firstSubmission = runner.sendInput('one prompt', { clientRequestId: 'composer-request-1' });
+    await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(
+      runner.sendInput('duplicate prompt', { clientRequestId: 'composer-request-1' }),
+      /still accepting the previous prompt/,
+      'two asynchronous Host commands must not pass turn\/start before activeTurnId is known'
+    );
+    releaseTurnStart();
+    assert.strictEqual(await firstSubmission, 'turn-assistant-identity');
+    await runner.handleNotification({
+      method: 'item/completed',
+      params: {
+        threadId: runner.threadId,
+        turnId: 'turn-assistant-identity',
+        item: {
+          id: 'msg-assistant-identity',
+          type: 'agentMessage',
+          role: 'assistant',
+          phase: 'final',
+          content: [{ type: 'output_text', text: 'one final answer' }],
+        },
+      },
+    });
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: runner.threadId,
+        turn: { id: 'turn-assistant-identity', status: { type: 'completed' } },
+      },
+    });
+    const transcripts = events.filter((event) => event.type === 'session.transcript');
+    assert.strictEqual(transcripts.length, 1);
+    assert.strictEqual(transcripts[0].clientRequestId, 'composer-request-1');
+    assert.strictEqual(transcripts[0].assistantObservation?.sourceIdentity?.protocolItemId, 'msg-assistant-identity');
+    assert.strictEqual(
+      events.some((event) => event.type === 'session.output' && event.chunk === 'one final answer'),
+      false,
+      'turn/completed must not project the same final answer through legacy stdout after item/completed'
+    );
+    assert(
+      events.some((event) => event.type === 'session.runtime_updated' && event.patch?.clientRequestId === 'composer-request-1'),
+      'runtime updates must retain the composer request identity through terminal completion'
+    );
+  } finally {
+    runner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyTurnCompletionOutOfOrderFallback() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-turn-completion-order-'));
+  fs.writeFileSync(path.join(baseHome, 'auth.json'), '{}\n', 'utf8');
+  fs.writeFileSync(path.join(baseHome, 'config.toml'), '', 'utf8');
+  const events = [];
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-turn-completion-order',
+    sessionId: 'bridge-turn-completion-order',
+    bridgeSessionId: 'bridge-turn-completion-order',
+    runId: 'run-turn-completion-order',
+    title: 'Turn completion order',
+    cwd: process.cwd(),
+    launchMode: 'fresh',
+    codexHome: baseHome,
+    postEvent: async (event) => events.push(event),
+  });
+  runner.threadId = 'thread-turn-completion-order';
+  runner.sessionId = runner.threadId;
+  runner.nativeThreadId = runner.threadId;
+  runner.turnCompletionFallbackGraceMs = 25;
+
+  try {
+    const reorderedTurnId = 'turn-completed-before-item';
+    runner.activeTurnId = reorderedTurnId;
+    runner.activeClientRequestId = 'request-completed-before-item';
+    runner.turnBuffers.set(reorderedTurnId, 'identified answer');
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: runner.threadId,
+        turn: { id: reorderedTurnId, status: { type: 'completed' } },
+      },
+    });
+    assert.strictEqual(
+      events.some((event) => event.type === 'session.output' && event.chunk === 'identified answer'),
+      false,
+      'turn/completed must wait briefly for a late identified assistant item'
+    );
+    assert.strictEqual(runner.pendingTurnCompletions.has(reorderedTurnId), true);
+
+    await runner.handleNotification({
+      method: 'item/completed',
+      params: {
+        threadId: runner.threadId,
+        turnId: reorderedTurnId,
+        item: {
+          id: 'msg-completed-after-turn',
+          type: 'agentMessage',
+          role: 'assistant',
+          phase: 'final',
+          content: [{ type: 'output_text', text: 'identified answer' }],
+        },
+      },
+    });
+    const identifiedTranscripts = events.filter((event) => (
+      event.type === 'session.transcript'
+      && event.assistantObservation?.sourceIdentity?.protocolItemId === 'msg-completed-after-turn'
+    ));
+    assert.strictEqual(identifiedTranscripts.length, 1);
+    assert.strictEqual(identifiedTranscripts[0].clientRequestId, 'request-completed-before-item');
+    assert.strictEqual(
+      events.some((event) => event.type === 'session.output' && event.chunk === 'identified answer'),
+      false,
+      'a late item/completed inside the grace window must suppress the legacy stdout mirror'
+    );
+    assert.strictEqual(runner.pendingTurnCompletions.has(reorderedTurnId), false);
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'completed');
+
+    const fallbackTurnId = 'turn-without-assistant-item';
+    runner.activeTurnId = fallbackTurnId;
+    runner.activeClientRequestId = 'request-without-assistant-item';
+    runner.turnBuffers.set(fallbackTurnId, 'legacy fallback answer');
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: {
+        threadId: runner.threadId,
+        turn: { id: fallbackTurnId, status: { type: 'completed' } },
+      },
+    });
+    assert.strictEqual(runner.pendingTurnCompletions.has(fallbackTurnId), true);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.strictEqual(runner.pendingTurnCompletions.has(fallbackTurnId), false);
+    assert.strictEqual(
+      events.filter((event) => event.type === 'session.output' && event.chunk === 'legacy fallback answer').length,
+      1,
+      'older app-server streams without item/completed must still emit one bounded fallback answer'
+    );
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'completed');
+  } finally {
+    runner.clearPendingTurnCompletions();
+    runner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
 async function verifyAdaptiveFreshRebindThreadOpen() {
   const createRunner = (baseHome, postEvent = async () => {}) => new CodexAppServerRunner({
     hostId: 'host-adaptive-rebind',
@@ -3415,8 +3913,12 @@ async function verifyFactoryTimeoutPreservesLiveChildOverlay() {
 verifyPagedRunnerCapabilities()
   .then(verifyIntentionalCodexStopIsSingleTerminalOutcome)
   .then(verifyCodexStopSuppressionUpgradesMonotonically)
+  .then(verifyCodexStopSignalsBeforeNotificationDrain)
   .then(verifyOverlayCleanupDoesNotWaitForRelayDelivery)
   .then(verifyManagedOverlayCleanupRetriesAfterFailure)
+  .then(verifyTransientOverlayBusyDoesNotFailStoppedSession)
+  .then(verifyPersistentOverlayBusyRemainsNonTerminal)
+  .then(verifyOverlayBusyDoesNotReplacePrimaryStartupError)
   .then(verifyOwnerMarkerAtomicUpdatePreservesAuthoritativeMarker)
   .then(verifyOwnershipUpdateFailureStillFinalizesRunner)
   .then(verifyCodexTerminalDeliveryFailureRequestsCommandRetry)
@@ -3456,6 +3958,8 @@ verifyPagedRunnerCapabilities()
   .then(verifyManagedOverlayJanitorRequiresAttestationForLegacyMarkers)
   .then(verifyNativeResumeReadyAfterFirstTurnStart)
   .then(verifyRuntimeErrorsClearAfterTurnRecovery)
+  .then(verifyAssistantTranscriptIdentityAndSubmissionLock)
+  .then(verifyTurnCompletionOutOfOrderFallback)
   .then(verifyAdaptiveFreshRebindThreadOpen)
   .then(verifyStartReplayResendsAttestedConfirmation)
   .then(verifyRejectedRunnerStartupKillsSpawnedChild)

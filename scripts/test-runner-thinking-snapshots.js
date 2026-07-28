@@ -17,6 +17,9 @@ function createRunnerHarness(suffix) {
     activeTurnId: `turn-${suffix}`,
     threadId: `thread-${suffix}`,
     turnBuffers: new Map([[`turn-${suffix}`, '']]),
+    turnAssistantTranscriptEmitted: new Set(),
+    pendingTurnCompletions: new Map(),
+    turnCompletionFallbackGraceMs: 25,
     turnBufferTruncated: new Set(),
     turnModes: new Map(),
     planBuffers: new Map(),
@@ -317,6 +320,7 @@ async function verifyTerminalBarrierAndOutputOrder() {
   });
   delivery.release();
   await runner.drainNotifications();
+  await new Promise((resolve) => setTimeout(resolve, 40));
 
   const finalActivityIndex = events.findIndex(
     (event) => event.type === 'session.activity_snapshot' && event.final === true
@@ -432,6 +436,7 @@ async function verifyCriticalTerminalEvictsItemTerminals() {
 
   delivery.release();
   await runner.drainNotifications();
+  await new Promise((resolve) => setTimeout(resolve, 40));
   assert.strictEqual(
     runner.turnBuffers.has('turn-critical-terminal'),
     false,
@@ -603,7 +608,22 @@ async function verifyInterrupt() {
   const { runner, events } = createRunnerHarness('interrupt');
   runner.rpc = { request: async () => ({}) };
   await feedReasoning(runner, 'interrupt', ['interrupt', ' text']);
-  assert.strictEqual(await runner.interruptTurn(), true);
+  assert.strictEqual((await runner.interruptTurn()).status, 'accepted');
+  assert.strictEqual(
+    snapshots(events).some((event) => event.final),
+    false,
+    'an interrupt RPC acknowledgement must not finalize Thinking before the turn terminal event'
+  );
+  assert(events.some(
+    (event) => event.type === 'session.runtime_updated' && event.patch?.phase === 'interrupting'
+  ), 'an accepted interrupt should keep the active turn projected as interrupting');
+  await runner.handleNotification({
+    method: 'turn/completed',
+    params: {
+      threadId: 'thread-interrupt',
+      turn: { id: 'turn-interrupt', status: { type: 'interrupted' } },
+    },
+  });
   assertFinalSnapshot(events, 'interrupt text', 'interrupt');
   const finalIndex = events.findIndex((event) => event.type === 'session.activity_snapshot' && event.final);
   const terminalIndex = events.findIndex(
@@ -637,7 +657,7 @@ async function verifyTerminalError() {
 async function verifyStop() {
   const { runner, events } = createRunnerHarness('stop');
   await feedReasoning(runner, 'stop', ['stop', ' text']);
-  runner.terminationPromise = Promise.resolve();
+  runner.terminationPromise = runner.finalizeExit(0, null);
   await runner.stop();
   assertFinalSnapshot(events, 'stop text', 'runner stop');
 }
@@ -723,6 +743,95 @@ async function verifyStructuredCommandActivity() {
   assert.strictEqual(final.durationMs, 450);
   assert.strictEqual(final.startedAtMs, 1000);
   assert.strictEqual(final.completedAtMs, 1450);
+}
+
+async function verifyNativeCommandOutputTruncationIsSticky() {
+  const { runner, events } = createRunnerHarness('native-output-truncation');
+  const base = {
+    threadId: 'thread-native-output-truncation',
+    turnId: 'turn-native-output-truncation',
+    itemId: 'command-native-output-truncation',
+  };
+  const method = 'item/commandExecution/outputDelta';
+  const merged = runner.mergeNotificationMessages({
+    method,
+    params: { ...base, delta: 'partial ', capReached: true },
+  }, {
+    method,
+    params: { ...base, delta: 'output', capReached: false },
+  });
+  assert.strictEqual(
+    merged.params.capReached,
+    true,
+    'coalescing a later uncapped delta must retain an earlier native capReached marker'
+  );
+  await runner.handleNotification(merged);
+  await runner.handleNotification({
+    method,
+    params: { ...base, delta: ' after cap' },
+  });
+  await runner.handleNotification({
+    method: 'item/completed',
+    params: {
+      ...base,
+      item: {
+        type: 'commandExecution',
+        id: base.itemId,
+        command: 'emit capped output',
+        status: 'completed',
+        aggregatedOutput: 'partial output after cap',
+        exitCode: 0,
+      },
+    },
+  });
+  const cappedFinal = events.filter((event) => (
+    event.type === 'session.activity_snapshot' && event.itemId === base.itemId
+  )).at(-1);
+  assert(cappedFinal, 'native capReached output should emit a final command activity');
+  assert.strictEqual(cappedFinal.output, 'partial output after cap');
+  assert.strictEqual(
+    cappedFinal.outputTruncated,
+    true,
+    'later deltas and an unflagged completion must not clear native capReached truncation'
+  );
+
+  const second = createRunnerHarness('native-output-truncated');
+  const truncatedBase = {
+    threadId: 'thread-native-output-truncated',
+    turnId: 'turn-native-output-truncated',
+    itemId: 'command-native-output-truncated',
+  };
+  await second.runner.handleNotification({
+    method,
+    params: { ...truncatedBase, delta: '', truncated: true },
+  });
+  await second.runner.handleNotification({
+    method,
+    params: { ...truncatedBase, delta: 'retained tail', truncated: false },
+  });
+  await second.runner.handleNotification({
+    method: 'item/completed',
+    params: {
+      ...truncatedBase,
+      item: {
+        type: 'commandExecution',
+        id: truncatedBase.itemId,
+        command: 'emit truncated output',
+        status: 'completed',
+        aggregatedOutput: 'retained tail',
+        exitCode: 0,
+      },
+    },
+  });
+  const truncatedFinal = second.events.filter((event) => (
+    event.type === 'session.activity_snapshot' && event.itemId === truncatedBase.itemId
+  )).at(-1);
+  assert(truncatedFinal, 'native truncated output should emit a final command activity');
+  assert.strictEqual(
+    truncatedFinal.outputTruncated,
+    true,
+    'an empty native truncated delta must form a sticky outputTruncated marker'
+  );
 }
 
 async function verifyStructuredFileAndMcpActivities() {
@@ -820,6 +929,47 @@ async function verifyStructuredFileAndMcpActivities() {
   assert.strictEqual(mcp.durationMs, 90);
 }
 
+async function verifySubagentActivityProjection() {
+  const { runner, events } = createRunnerHarness('subagent');
+  const base = {
+    threadId: 'thread-subagent',
+    turnId: 'turn-subagent',
+  };
+  const item = {
+    type: 'subAgentActivity',
+    id: 'subagent-1',
+    kind: 'interacted',
+    status: 'interacted',
+    agentThreadId: 'child-1',
+    agentPath: '/root/review_code',
+    agentNickname: 'Tesla',
+    agentRole: 'reviewer',
+    parentThreadId: 'thread-subagent',
+  };
+  await runner.handleNotification({
+    method: 'item/started',
+    params: { ...base, item: { ...item, kind: 'spawned', status: 'spawned' } },
+  });
+  await runner.handleNotification({
+    method: 'item/completed',
+    params: { ...base, completedAtMs: 1500, item },
+  });
+
+  const final = events.filter((event) => (
+    event.type === 'session.activity_snapshot' && event.itemId === 'subagent-1'
+  )).at(-1);
+  assert(final, 'sub-agent lifecycle should emit an activity snapshot');
+  assert.strictEqual(final.final, true);
+  assert.strictEqual(final.kind, 'collaboration');
+  assert.strictEqual(final.itemType, 'subAgentActivity');
+  assert.strictEqual(final.subagentKind, 'interacted');
+  assert.strictEqual(final.agentThreadId, 'child-1');
+  assert.strictEqual(final.agentPath, '/root/review_code');
+  assert.strictEqual(final.parentThreadId, 'thread-subagent');
+  assert.strictEqual(final.senderThreadId, 'thread-subagent');
+  assert.deepStrictEqual(final.receiverThreadIds, ['child-1']);
+}
+
 async function verifyStructuredActivityBoundsAndOversizedCompaction() {
   const { runner, events } = createRunnerHarness('structured-bounds');
   runner.initializeNotificationQueue({
@@ -856,6 +1006,11 @@ async function verifyStructuredActivityBoundsAndOversizedCompaction() {
   assert(final, 'oversized item completion should survive notification compaction');
   assert.strictEqual(final.itemType, 'commandExecution');
   assert(Buffer.byteLength(final.output, 'utf8') <= 128 * 1024);
+  assert.strictEqual(
+    final.outputTruncated,
+    true,
+    'notification compaction must disclose that command output is only partially retained'
+  );
   assert(Buffer.byteLength(JSON.stringify(final.arguments || null), 'utf8') <= 64 * 1024);
 }
 
@@ -875,7 +1030,9 @@ async function main() {
   await verifyStop();
   await verifyProcessExit();
   await verifyStructuredCommandActivity();
+  await verifyNativeCommandOutputTruncationIsSticky();
   await verifyStructuredFileAndMcpActivities();
+  await verifySubagentActivityProjection();
   await verifyStructuredActivityBoundsAndOversizedCompaction();
   console.log('runner thinking snapshot assertions passed');
 }

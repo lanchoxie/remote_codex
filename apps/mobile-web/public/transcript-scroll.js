@@ -85,6 +85,7 @@
         anchorKey: anchor?.dataset?.[anchorDatasetKey] || '',
         anchorOffset: anchorRect ? finite(anchorRect.top) - containerTop() : 0,
         bottomGap: bottomGap(),
+        scrollTop: scrollTop(),
         proportionalPosition: max > 0 ? scrollTop() / max : 0,
         userRevision,
         programmaticRevision,
@@ -126,7 +127,10 @@
           return;
         }
         setScrollTop(clamp(
-          finite(snapshot.proportionalPosition) * maximumScrollTop(),
+          finite(
+            snapshot.scrollTop,
+            finite(snapshot.proportionalPosition) * maximumScrollTop()
+          ),
           0,
           maximumScrollTop()
         ));
@@ -134,10 +138,22 @@
       return true;
     }
 
-    function recordTrustedInteraction() {
+    function beginTrustedInteraction() {
       if (programmaticDepth > 0) return false;
       userRevision += 1;
+      mode = 'detached';
+      return true;
+    }
+
+    function settleTrustedInteraction() {
+      if (programmaticDepth > 0) return false;
       mode = atBottom() ? 'follow' : 'detached';
+      return true;
+    }
+
+    function recordTrustedInteraction() {
+      if (!beginTrustedInteraction()) return false;
+      settleTrustedInteraction();
       return true;
     }
 
@@ -161,11 +177,13 @@
     }
 
     return {
+      beginTrustedInteraction,
       capture,
       detach,
       establishFollow,
       restore,
       recordTrustedInteraction,
+      settleTrustedInteraction,
       withProgrammaticScroll,
       guardAsync,
       state: () => ({ mode, userRevision, programmaticRevision, programmatic: programmaticDepth > 0 }),

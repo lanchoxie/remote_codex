@@ -7,6 +7,7 @@ const { spawnSync } = require('child_process');
 const updater = require('../shared/updater');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
+const updaterSource = fs.readFileSync(path.join(REPO_ROOT, 'shared', 'updater.js'), 'utf8');
 const serverSource = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'relay', 'server.js'), 'utf8');
 const appSource = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'mobile-web', 'public', 'app.js'), 'utf8');
 const htmlSource = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'mobile-web', 'public', 'index.html'), 'utf8');
@@ -129,6 +130,30 @@ function testDifferentOwnerRepositoryUsesCommandScopedTrust() {
   }
 }
 
+function testDeepUntrackedDirectoryIsCollapsed() {
+  const root = initRepo();
+  const directoryName = 'runtime-cache';
+  const nestedSegments = Array.from({ length: 40 }, (_, index) => `nested-${String(index).padStart(2, '0')}`);
+  const leafPath = path.join(root, directoryName, ...nestedSegments, 'runtime-state.json');
+  fs.mkdirSync(path.dirname(leafPath), { recursive: true });
+  fs.writeFileSync(leafPath, '{"ok":true}\n', 'utf8');
+
+  const status = updater.getLocalUpdateStatus({ rootDir: root, fetch: false });
+  assert.strictEqual(status.updateAvailable, true);
+  assert.deepStrictEqual(status.untrackedFiles, [`${directoryName}/`]);
+  assert.ok(
+    !status.untrackedFiles.some((entry) => entry.includes('runtime-state.json')),
+    'status should not enumerate files inside a wholly untracked runtime directory',
+  );
+}
+
+function testGitOptionsEnableCommandScopedLongPaths() {
+  assert.match(
+    updaterSource,
+    /return \['-c', `safe\.directory=\$\{safeRoot\}`, '-c', 'core\.longpaths=true', \.\.\.args\]/,
+  );
+}
+
 function testCleanHeadAheadOfLatestStableDoesNotDowngrade() {
   const root = initRepo();
   run('git', ['checkout', 'v2.4.4'], root);
@@ -210,6 +235,8 @@ function testSettingsUpdateUiExists() {
 testStableTagsIgnorePrerelease();
 testStatusReportsLatestStableTag();
 testDifferentOwnerRepositoryUsesCommandScopedTrust();
+testDeepUntrackedDirectoryIsCollapsed();
+testGitOptionsEnableCommandScopedLongPaths();
 testCleanHeadAheadOfLatestStableDoesNotDowngrade();
 testDirtyTrackedFilesBlockUpdate();
 testUpdateBacksUpDataBeforeCheckout();

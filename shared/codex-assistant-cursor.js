@@ -1,9 +1,14 @@
 const fs = require('fs');
 const path = require('path');
 const { StringDecoder } = require('string_decoder');
-const { normalizeAssistantObservation } = require('./assistant-message-identity');
+const {
+  describeRolloutAssistantRow,
+  isRolloutAssistantMirrorPair,
+  normalizeAssistantObservation,
+} = require('./assistant-message-identity');
 
 const DEFAULT_MAX_BYTES_PER_SCAN = 256 * 1024;
+const DEFAULT_ASSISTANT_MIRROR_GRACE_MS = 250;
 
 function positiveInteger(value, fallback) {
   const number = Math.trunc(Number(value));
@@ -47,12 +52,34 @@ function createCursor(fileKey, fileIdentity, previous = null) {
     sourceOrdinal: 0,
     observedIds: new Set(),
     pendingObservations: previous?.pendingObservations || new Map(),
+    pendingAssistantMirror: null,
     projectionRevision: Math.max(0, Number(previous?.projectionRevision || 0)) + 1,
     lastStatSize: 0,
     lastMtimeMs: null,
     unavailable: false,
     parseError: false,
   };
+}
+
+function observationTimeMs(value) {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function retainObservation(cursor, observation) {
+  if (!observation || cursor.observedIds.has(observation.assistantMessageId)) {
+    return false;
+  }
+  cursor.observedIds.add(observation.assistantMessageId);
+  cursor.pendingObservations.set(observation.assistantMessageId, observation);
+  return true;
+}
+
+function flushPendingAssistantMirror(cursor) {
+  const pending = cursor.pendingAssistantMirror;
+  if (!pending) return false;
+  cursor.pendingAssistantMirror = null;
+  return retainObservation(cursor, pending.observation);
 }
 
 function wireIdentity(session = {}, fileKey = '') {
@@ -93,6 +120,10 @@ class CodexAssistantCursorIndex {
     this.now = typeof options.now === 'function'
       ? options.now
       : () => new Date().toISOString();
+    this.assistantMirrorGraceMs = Math.max(
+      0,
+      Number(options.assistantMirrorGraceMs ?? DEFAULT_ASSISTANT_MIRROR_GRACE_MS) || 0
+    );
     this.files = new Map();
     this.scanManyStart = 0;
     this.metrics = {
@@ -144,13 +175,24 @@ class CodexAssistantCursorIndex {
     cursor.unavailable = false;
 
     if (stat.size === cursor.offset) {
+      const pendingAgeMs = cursor.pendingAssistantMirror
+        ? observationTimeMs(this.now()) - cursor.pendingAssistantMirror.queuedAtMs
+        : 0;
+      const mirrorFlushed = Boolean(
+        cursor.pendingAssistantMirror
+        && pendingAgeMs >= this.assistantMirrorGraceMs
+        && flushPendingAssistantMirror(cursor)
+      );
+      if (mirrorFlushed) cursor.projectionRevision += 1;
       cursor.lastStatSize = stat.size;
       cursor.lastMtimeMs = Number(stat.mtimeMs);
       return projectCursor(cursor, session, {
         bytesRead: 0,
         replaced,
         truncated,
-        cursorUnknown: cursor.partialBytes.length > 0 || cursor.parseError,
+        cursorUnknown: cursor.partialBytes.length > 0
+          || cursor.parseError
+          || Boolean(cursor.pendingAssistantMirror),
       });
     }
 
@@ -220,8 +262,16 @@ class CodexAssistantCursorIndex {
       try {
         row = JSON.parse(line);
       } catch (_) {
+        flushPendingAssistantMirror(cursor);
         cursor.parseError = true;
         continue;
+      }
+      if (cursor.pendingAssistantMirror) {
+        if (isRolloutAssistantMirrorPair(cursor.pendingAssistantMirror.row, row)) {
+          cursor.pendingAssistantMirror = null;
+        } else {
+          flushPendingAssistantMirror(cursor);
+        }
       }
       const observation = normalizeAssistantObservation({
         representation: 'rollout',
@@ -234,11 +284,18 @@ class CodexAssistantCursorIndex {
         observedAt: this.now(),
         finalized: true,
       });
-      if (!observation || cursor.observedIds.has(observation.assistantMessageId)) {
+      if (!observation) {
         continue;
       }
-      cursor.observedIds.add(observation.assistantMessageId);
-      cursor.pendingObservations.set(observation.assistantMessageId, observation);
+      if (describeRolloutAssistantRow(row)?.kind === 'event') {
+        cursor.pendingAssistantMirror = {
+          row,
+          observation,
+          queuedAtMs: observationTimeMs(this.now()),
+        };
+        continue;
+      }
+      retainObservation(cursor, observation);
     }
 
     cursor.partialBytes = Buffer.from(combined.subarray(lineStart));
@@ -260,6 +317,14 @@ class CodexAssistantCursorIndex {
     const unreadBytes = latestStat && latestStat.isFile()
       ? cursor.offset < latestStat.size
       : true;
+    if (
+      cursor.pendingAssistantMirror
+      && !unreadBytes
+      && cursor.partialBytes.length === 0
+      && observationTimeMs(this.now()) - cursor.pendingAssistantMirror.queuedAtMs >= this.assistantMirrorGraceMs
+    ) {
+      flushPendingAssistantMirror(cursor);
+    }
     return projectCursor(cursor, session, {
       bytesRead,
       replaced,
@@ -267,7 +332,8 @@ class CodexAssistantCursorIndex {
       cursorUnknown: changedDuringRead
         || unreadBytes
         || cursor.partialBytes.length > 0
-        || cursor.parseError,
+        || cursor.parseError
+        || Boolean(cursor.pendingAssistantMirror),
     });
   }
 

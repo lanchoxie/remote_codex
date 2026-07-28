@@ -222,6 +222,83 @@ const mergedRuntime = runtimeStoreContext.patchRuntimeForSession('host-a', 'sess
 assert.strictEqual(mergedRuntime.phase, 'thinking');
 assert.strictEqual(mergedRuntime.activeTurnId, 'turn-a');
 assert.strictEqual(runtimeSemantics.runtimeIsActive(mergedRuntime), true);
+const completedRuntime = runtimeStoreContext.patchRuntimeForSession('host-a', 'session-a', {
+  phase: 'idle',
+  activeTurnId: null,
+  busy: false,
+  currentTurnStatus: 'completed',
+  updatedAt: '2026-07-20T12:00:02.000Z',
+}, { source: 'stream' });
+assert.strictEqual(runtimeStoreContext.getRuntimeStreamGeneration('host-a', 'session-a'), 1);
+const rejectedStaleRuntime = runtimeStoreContext.patchRuntimeForSession('host-a', 'session-a', {
+  phase: 'thinking',
+  activeTurnId: 'turn-a',
+  busy: true,
+  currentTurnStatus: 'inProgress',
+  updatedAt: '2026-07-20T12:00:01.500Z',
+}, { source: 'stream' });
+assert.strictEqual(rejectedStaleRuntime, completedRuntime, 'an older runtime projection must be ignored');
+assert.strictEqual(rejectedStaleRuntime.phase, 'idle');
+assert.strictEqual(runtimeStoreContext.getRuntimeStreamGeneration('host-a', 'session-a'), 1);
+
+const revisionFive = runtimeStoreContext.patchRuntimeForSession('host-a', 'session-a', {
+  runId: 'run-revision',
+  runtimeRevision: 5,
+  phase: 'idle',
+  activeTurnId: null,
+  busy: false,
+  updatedAt: '2026-07-20T12:00:03.000Z',
+}, { source: 'stream' });
+const rejectedOlderRevision = runtimeStoreContext.patchRuntimeForSession('host-a', 'session-a', {
+  runId: 'run-revision',
+  runtimeRevision: 4,
+  phase: 'thinking',
+  activeTurnId: 'stale-turn',
+  busy: true,
+  updatedAt: '2026-07-20T12:00:04.000Z',
+}, { source: 'stream' });
+assert.strictEqual(rejectedOlderRevision, revisionFive, 'runtime revision must beat a newer wall-clock timestamp');
+assert.strictEqual(rejectedOlderRevision.phase, 'idle');
+const blockedRollback = runtimeStoreContext.restoreRuntimeSnapshotForSession('host-a', 'session-a', {
+  runId: 'run-revision',
+  runtimeRevision: 3,
+  phase: 'ending',
+  busy: false,
+});
+assert.strictEqual(blockedRollback, revisionFive, 'optimistic rollback must not overwrite a newer authoritative revision');
+
+const rollbackSnapshot = { ...revisionFive };
+runtimeStoreContext.patchRuntimeForSession('host-a', 'session-a', {
+  phase: 'ending',
+  connection: 'closing',
+  busy: false,
+  activeTurnId: null,
+  updatedAt: '2026-07-20T12:00:03.100Z',
+});
+const rollbackExpectation = {
+  expectedApplyGeneration: runtimeStoreContext.getRuntimeApplyGeneration('host-a', 'session-a'),
+  expectedStreamGeneration: runtimeStoreContext.getRuntimeStreamGeneration('host-a', 'session-a'),
+};
+const authoritativeStop = runtimeStoreContext.patchRuntimeForSession('host-a', 'session-a', {
+  runId: 'run-revision',
+  phase: 'closed',
+  connection: 'closed',
+  busy: false,
+  activeTurnId: null,
+  updatedAt: '2026-07-20T12:00:03.200Z',
+}, { source: 'stream' });
+const blockedEqualRevisionRollback = runtimeStoreContext.restoreRuntimeSnapshotForSession(
+  'host-a',
+  'session-a',
+  rollbackSnapshot,
+  rollbackExpectation
+);
+assert.strictEqual(
+  blockedEqualRevisionRollback,
+  authoritativeStop,
+  'stream generation CAS must block rollback when an authoritative update retains the same runtime revision'
+);
+assert.strictEqual(blockedEqualRevisionRollback.phase, 'closed');
 
 const runtimeEventHandler = sliceBetween(
   'const handleRuntimePayload = (payload) => {',
@@ -235,6 +312,26 @@ assert(
 assert(
   runtimeEventHandler.includes('runtimeIsActive(mergedRuntime || runtimePayload)'),
   'partial token/error patches must not be mistaken for a stopped turn'
+);
+assert(
+  runtimeEventHandler.includes("{ source: 'stream' }"),
+  'SSE runtime updates must advance the per-Session stream generation'
+);
+assert(
+  runtimeEventHandler.includes("mergedRuntime?.phase || runtimePayload.phase"),
+  'ignored stale events must not drive lifecycle side effects from their old phase'
+);
+assert(
+  runtimeEventHandler.includes('!runtimeWasActive && runtimeIsActive(mergedRuntime || runtimePayload)'),
+  'the first active runtime projection must create the transcript Thinking placeholder even if transcript SSE is late'
+);
+assert(
+  runtimeEventHandler.includes('scheduleTranscriptRender({ preserveScroll: true })'),
+  'active runtime transition must request a full transcript render without moving the reader'
+);
+assert(
+  app.includes('getRuntimeStreamGeneration(detailHostId, detailSessionId) === detailRuntimeStreamGeneration'),
+  'a detail response must not overwrite runtime when SSE advanced during the request'
 );
 
 console.log('diagnostic render throttle checks passed');

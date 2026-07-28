@@ -234,9 +234,12 @@
         success: typeof event.success === 'boolean' ? event.success : null,
         error: event.error == null ? null : clone(event.error),
         arguments: event.arguments == null ? null : clone(event.arguments),
+        argumentsTruncated: event.argumentsTruncated === true,
         result: event.result == null ? null : clone(event.result),
+        resultTruncated: event.resultTruncated === true,
         commandActions: event.commandActions == null ? null : clone(event.commandActions),
         fileChanges: event.fileChanges == null ? null : clone(event.fileChanges),
+        fileChangesTruncated: event.fileChangesTruncated === true,
         final: event.final === true,
         timestamp: event.timestamp || event.updatedAt
           ? String(event.timestamp || event.updatedAt)
@@ -244,6 +247,12 @@
       };
       let metadataBytes = utf8Bytes(JSON.stringify(normalized));
       if (metadataBytes > maxRecordBytes) {
+        normalized.outputTruncated ||= normalized.output != null
+          || normalized.stdout != null
+          || normalized.stderr != null;
+        normalized.resultTruncated ||= normalized.result != null;
+        normalized.argumentsTruncated ||= normalized.arguments != null;
+        normalized.fileChangesTruncated ||= normalized.fileChanges != null;
         normalized.output = null;
         normalized.stdout = null;
         normalized.stderr = null;

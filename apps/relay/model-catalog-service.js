@@ -491,6 +491,18 @@ class ModelCatalogService {
     return request;
   }
 
+  getCached(input = {}) {
+    if (!input.hostId || !input.bindingFingerprint) {
+      return null;
+    }
+    const cached = this.readCache(input, catalogKey(input));
+    if (!cached) {
+      return null;
+    }
+    const cacheState = this.cacheAge(cached) <= this.staleMs ? 'fresh' : 'stale';
+    return this.catalogFromCache(cached, cacheState, input);
+  }
+
   readCache(input, key) {
     const record = this.store.readRecord(input.identity || {
       hostId: input.hostId,

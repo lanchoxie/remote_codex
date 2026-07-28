@@ -381,6 +381,75 @@ function verifyStructuredOnlyEntriesSurvive() {
   assert.strictEqual(entries[0].reasoningEffort, 'high');
 }
 
+function makeFernetLikeToken() {
+  const token = Buffer.alloc(73, 0);
+  token[0] = 0x80;
+  token.writeBigUInt64BE(1785132736n, 1);
+  for (let index = 9; index < token.length; index += 1) {
+    token[index] = index;
+  }
+  return token.toString('base64url');
+}
+
+function verifyEncryptedCollaborationMessagesAreRedacted() {
+  const encryptedMessage = makeFernetLikeToken();
+  const unavailablePlaceholder = '[Encrypted by Codex runtime; plaintext unavailable locally]';
+
+  for (const name of ['spawn_agent', 'send_message', 'followup_task']) {
+    const normalized = normalizeThinkingActivityEntry(event({
+      kind: 'tool-call',
+      method: `response_item/function_call/${name}`,
+      name,
+      callId: `${name}-encrypted-call`,
+      text: name,
+      arguments: {
+        task_name: 'child-task',
+        target: '/root/child-task',
+        message: encryptedMessage,
+      },
+      prompt: encryptedMessage,
+    }));
+
+    assert(
+      !normalized.argumentsText.includes(encryptedMessage),
+      `${name} arguments must not expose an opaque Codex message`
+    );
+    assert(
+      normalized.argumentsText.includes(unavailablePlaceholder),
+      `${name} arguments should explain that the encrypted message is unavailable locally`
+    );
+    assert.strictEqual(
+      normalized.prompt,
+      unavailablePlaceholder,
+      `${name} prompt should use the local-unavailability placeholder`
+    );
+  }
+
+  const plaintextMessage = 'Inspect the child task and report the result.';
+  const plaintext = normalizeThinkingActivityEntry(event({
+    kind: 'tool-call',
+    method: 'response_item/function_call/send_message',
+    name: 'send_message',
+    callId: 'send-message-plaintext-call',
+    text: 'send_message',
+    arguments: {
+      target: '/root/child-task',
+      message: plaintextMessage,
+    },
+    prompt: plaintextMessage,
+  }));
+
+  assert(
+    plaintext.argumentsText.includes(plaintextMessage),
+    'plain-text collaboration arguments must remain visible'
+  );
+  assert.strictEqual(
+    plaintext.prompt,
+    plaintextMessage,
+    'plain-text collaboration prompts must remain visible'
+  );
+}
+
 function verifyGroupKeyIsOrderIndependent() {
   const diagnostic = event({
     kind: 'tool-call',
@@ -421,6 +490,96 @@ function verifyGroupKeyIsOrderIndependent() {
   assert.strictEqual(toolFirst[0].category, 'tool');
   assert.strictEqual(genericFirst[0].identity.itemType, 'mcpToolCall');
   assert.strictEqual(genericFirst[0].identity.source, 'codex');
+}
+
+function verifyProjectedAndUnscopedDiagnosticMerge() {
+  for (const identityField of ['itemId', 'callId', 'requestId', 'processId']) {
+    const projected = event({
+      canonicalConversationKey: 'host-a::native-conversation-a',
+      runId: 'run-projected',
+      turnId: 'turn-projected',
+      kind: 'tool-call',
+      method: 'session.activity',
+      activityKey: `projected-${identityField}`,
+      activityRevision: 3,
+      [identityField]: `shared-${identityField}`,
+      itemType: 'mcpToolCall',
+      source: 'codex-app-server',
+      tool: 'workspace.read_file',
+      arguments: { path: 'src/projected.js' },
+      command: 'read src/projected.js',
+      text: 'Read src/projected.js',
+      status: 'completed',
+      final: true,
+    });
+    const diagnostic = event({
+      canonicalConversationKey: '',
+      runId: 'run-projected',
+      turnId: 'turn-projected',
+      kind: 'tool-call',
+      method: 'session.diagnostic',
+      [identityField]: `shared-${identityField}`,
+      itemType: 'genericDiagnostic',
+      source: 'relay-diagnostic',
+      tool: 'generic diagnostic tool',
+      arguments: { raw: true },
+      command: 'generic diagnostic command',
+      text: 'Read src/projected.js',
+    });
+
+    for (const values of [[projected, diagnostic], [diagnostic, projected]]) {
+      const entries = aggregateThinkingEntries(values);
+      assert.strictEqual(
+        entries.length,
+        1,
+        `${identityField} should merge a canonical projected activity with its unscoped diagnostic`
+      );
+      assert.strictEqual(entries[0].identity.canonicalConversationKey, projected.canonicalConversationKey);
+      assert.strictEqual(entries[0].identity[identityField], projected[identityField]);
+      assert.strictEqual(entries[0].activityKey, projected.activityKey);
+      assert.strictEqual(entries[0].itemType, 'mcpToolCall');
+      assert.strictEqual(entries[0].source, 'codex-app-server');
+      assert.strictEqual(entries[0].tool, 'workspace.read_file');
+      assert(entries[0].argumentsText.includes('src/projected.js'));
+      assert.strictEqual(entries[0].command, 'read src/projected.js');
+    }
+  }
+}
+
+function verifyExplicitScopeAndRuntimeConflictsStaySeparate() {
+  const sharedIdentity = {
+    kind: 'tool-call',
+    callId: 'same-call-id',
+    text: 'same diagnostic text',
+  };
+  const differentScopes = aggregateThinkingEntries([
+    event({ ...sharedIdentity, canonicalConversationKey: 'host-a::conversation-a' }),
+    event({ ...sharedIdentity, canonicalConversationKey: 'host-a::conversation-b' }),
+  ]);
+  assert.strictEqual(differentScopes.length, 2, 'two explicit canonical scopes must never merge');
+
+  const ambiguousUnscopedBridge = aggregateThinkingEntries([
+    event({ ...sharedIdentity, canonicalConversationKey: 'host-a::conversation-a' }),
+    event({ ...sharedIdentity, canonicalConversationKey: 'host-a::conversation-b' }),
+    event({ ...sharedIdentity, canonicalConversationKey: '' }),
+  ]);
+  assert.strictEqual(
+    ambiguousUnscopedBridge.length,
+    3,
+    'an unscoped diagnostic must not bridge two explicitly different conversations'
+  );
+
+  const differentRuns = aggregateThinkingEntries([
+    event({ ...sharedIdentity, canonicalConversationKey: '', runId: 'run-a' }),
+    event({ ...sharedIdentity, canonicalConversationKey: '', runId: 'run-b' }),
+  ]);
+  assert.strictEqual(differentRuns.length, 2, 'different explicit run IDs must not merge');
+
+  const differentTurns = aggregateThinkingEntries([
+    event({ ...sharedIdentity, canonicalConversationKey: '', turnId: 'turn-a' }),
+    event({ ...sharedIdentity, canonicalConversationKey: '', turnId: 'turn-b' }),
+  ]);
+  assert.strictEqual(differentTurns.length, 2, 'different explicit turn IDs must not merge');
 }
 
 function verifyStaleTerminalRevisionCannotRegressState() {
@@ -528,6 +687,125 @@ function verifySingleEntryTotalBound() {
   );
 }
 
+function verifyStructuredAndExplicitTruncationFlags() {
+  const entries = aggregateThinkingEntries([
+    event({
+      kind: 'tool-call',
+      callId: 'structured-truncation-call',
+      arguments: JSON.stringify({ truncated: true, preview: '{"path":"README.md"}' }),
+      result: { truncated: true, preview: '{"value":"partial result"}' },
+      output: '{"truncated":true}',
+      progress: 'partial progress',
+      payload: {
+        progress_truncated: true,
+        file_changes_truncated: true,
+      },
+    }),
+  ]);
+  assert.strictEqual(entries.length, 1);
+  assert.strictEqual(entries[0].argumentsTruncated, true);
+  assert.strictEqual(entries[0].resultTruncated, true);
+  assert.strictEqual(entries[0].progressTruncated, true);
+  assert.strictEqual(entries[0].fileChangesTruncated, true);
+  assert.strictEqual(
+    entries[0].outputTruncated,
+    false,
+    'ordinary output strings must not be scanned for structured truncation markers'
+  );
+  const legitimateField = aggregateThinkingEntries([event({
+    kind: 'tool-call',
+    callId: 'legitimate-truncated-property',
+    arguments: { path: 'README.md', truncated: true },
+  })])[0];
+  assert.strictEqual(
+    legitimateField.argumentsTruncated,
+    false,
+    'a legitimate structured property named truncated must not impersonate a retention marker'
+  );
+}
+
+function verifyTruncationFlagsAggregateAcrossLifecycleEvents() {
+  const entries = aggregateThinkingEntries([
+    event({
+      kind: 'tool-call',
+      callId: 'truncation-lifecycle-call',
+      arguments: { path: 'src/app.js' },
+      resultText: 'partial result',
+      progress: 'working',
+      fileChanges: [{ path: 'src/app.js', diff: '+first' }],
+    }),
+    event({
+      kind: 'tool-call',
+      callId: 'truncation-lifecycle-call',
+      argumentsTruncated: true,
+      resultTruncated: true,
+      progressTruncated: true,
+      fileChangesTruncated: true,
+    }),
+  ]);
+  assert.strictEqual(entries.length, 1, 'flag-only lifecycle events should join their activity group');
+  assert.strictEqual(entries[0].argumentsTruncated, true);
+  assert.strictEqual(entries[0].resultTruncated, true);
+  assert.strictEqual(entries[0].progressTruncated, true);
+  assert.strictEqual(entries[0].fileChangesTruncated, true);
+}
+
+function verifyFileChangeCollectionReportsDroppedChanges() {
+  const entries = aggregateThinkingEntries([
+    event({
+      kind: 'file-change',
+      requestId: 'bounded-file-changes',
+      fileChanges: [
+        { path: 'src/a.js', diff: '+a' },
+        { path: 'src/b.js', diff: '+b' },
+        { path: 'src/c.js', diff: '+c' },
+      ],
+    }),
+  ], { maxFileChanges: 2 });
+  assert.strictEqual(entries[0].fileChanges.length, 2);
+  assert.strictEqual(entries[0].fileChangesTruncated, true);
+}
+
+function verifyTotalBudgetSetsFieldSpecificFlags() {
+  const long = 'x'.repeat(300);
+  const options = {
+    maxTextChars: 512,
+    maxOutputChars: 512,
+    maxDiffChars: 512,
+    maxTotalChars: 128,
+  };
+
+  const argumentsEntry = aggregateThinkingEntries([
+    event({ kind: 'tool-call', callId: 'bounded-arguments', arguments: { value: long } }),
+  ], options)[0];
+  assert.strictEqual(argumentsEntry.argumentsTruncated, true);
+  assert.strictEqual(argumentsEntry.textTruncated, false);
+  assert.strictEqual(argumentsEntry.outputTruncated, false);
+
+  const resultEntry = aggregateThinkingEntries([
+    event({ kind: 'tool-call', callId: 'bounded-result', resultText: long }),
+  ], options)[0];
+  assert.strictEqual(resultEntry.resultTruncated, true);
+  assert.strictEqual(resultEntry.outputTruncated, false);
+
+  const progressEntry = aggregateThinkingEntries([
+    event({ kind: 'tool-call', callId: 'bounded-progress', progress: long }),
+  ], options)[0];
+  assert.strictEqual(progressEntry.progressTruncated, true);
+  assert.strictEqual(progressEntry.textTruncated, false);
+
+  const fileEntry = aggregateThinkingEntries([
+    event({
+      kind: 'file-change',
+      requestId: 'bounded-file-diff',
+      fileChanges: [{ path: 'src/file.js', status: 'modified', diff: long }],
+    }),
+  ], options)[0];
+  assert.strictEqual(fileEntry.fileChangesTruncated, true);
+  assert.strictEqual(fileEntry.textTruncated, false);
+  assert.strictEqual(fileEntry.fileChanges[0].truncated, true);
+}
+
 verifyBrowserGlobal();
 verifyStableIdentity();
 verifyTextAggregation();
@@ -537,9 +815,16 @@ verifyFileAndSearchGrouping();
 verifyEntryAndTotalBounds();
 verifyNormalizedInputsUseCurrentOrder();
 verifyStructuredOnlyEntriesSurvive();
+verifyEncryptedCollaborationMessagesAreRedacted();
 verifyGroupKeyIsOrderIndependent();
+verifyProjectedAndUnscopedDiagnosticMerge();
+verifyExplicitScopeAndRuntimeConflictsStaySeparate();
 verifyStaleTerminalRevisionCannotRegressState();
 verifySingleEntryTotalBound();
+verifyStructuredAndExplicitTruncationFlags();
+verifyTruncationFlagsAggregateAcrossLifecycleEvents();
+verifyFileChangeCollectionReportsDroppedChanges();
+verifyTotalBudgetSetsFieldSpecificFlags();
 
 const normalized = normalizeThinkingActivityEntry({
   kind: 'reasoning',
