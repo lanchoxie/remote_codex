@@ -1,7 +1,7 @@
 {
   "name": "mobile-codex-remote",
   "private": true,
-  "version": "2.4.9-dev",
+  "version": "2.4.9",
   "description": "Mobile control plane for Codex sessions on PCs and HPC hosts.",
   "type": "commonjs",
   "scripts": {
@@ -21,7 +21,7 @@
     "test:codex-preflight": "node scripts/test-codex-preflight.js",
     "test:install-config": "node scripts/test-install-config.js",
     "test:remote-codex-env": "node scripts/test-remote-codex-env-resolution.js",
-    "test:realtime-sync": "node scripts/test-coalesced-async-task.js && node scripts/test-discovery-coalescing.js && node scripts/test-internal-approval-session-filtering.js && node scripts/test-agent-event-batch-transport.js && node scripts/test-agent-event-ledger.js && node scripts/test-atomic-file-replace.js && node scripts/test-agent-event-persistence.js && node scripts/test-session-watch-registry.js && node scripts/test-session-watch-controller.js && node scripts/test-session-watch-fast-path.js && node scripts/test-session-watch-routing.js && node scripts/test-linux-history-regression.js && node scripts/test-session-watch-batching.js && node scripts/test-realtime-session-sync-performance.js && node scripts/test-activity-recovery-scheduler.js && node scripts/test-mobile-realtime-resume.js",
+    "test:realtime-sync": "node scripts/test-coalesced-async-task.js && node scripts/test-discovery-incremental-index.js && node scripts/test-discovery-coalescing.js && node scripts/test-internal-approval-session-filtering.js && node scripts/test-agent-event-batch-transport.js && node scripts/test-agent-event-ledger.js && node scripts/test-atomic-file-replace.js && node scripts/test-agent-event-persistence.js && node scripts/test-session-watch-registry.js && node scripts/test-session-watch-controller.js && node scripts/test-session-watch-fast-path.js && node scripts/test-session-watch-routing.js && node scripts/test-linux-history-regression.js && node scripts/test-session-watch-batching.js && node scripts/test-realtime-session-sync-performance.js && node scripts/test-activity-recovery-scheduler.js && node scripts/test-mobile-realtime-resume.js",
     "test:skills-inventory": "node scripts/test-skill-inventory-discovery.js && node scripts/test-host-skill-inventory-service.js && node scripts/test-skills-inventory-api.js",
     "test:skills-phase2": "node scripts/test-skill-artifact.js && node scripts/test-skill-registry-service.js && node scripts/test-host-skill-adopt.js && node scripts/test-skills-adopt-api.js && node scripts/test-github-skill-import.js && node scripts/test-skills-manager-ui.js",
     "test:skills-phase3": "node scripts/test-skill-artifact.js && node scripts/test-skill-deployment-service.js && node scripts/test-host-skill-deployment.js && node scripts/test-host-agent-skills-manager.js && node scripts/test-skills-deployment-api.js && node scripts/test-skills-manager-ui.js && node scripts/test-slash-skills-cache.js",

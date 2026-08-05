@@ -526,6 +526,12 @@ function buildSshCommandParts(connector, options = {}) {
   if (options.preferredAuthentications) {
     args.push('-o', `PreferredAuthentications=${options.preferredAuthentications}`);
   }
+  if (options.pubkeyAuthentication) {
+    args.push('-o', `PubkeyAuthentication=${options.pubkeyAuthentication}`);
+  }
+  if (options.identityAgent) {
+    args.push('-o', `IdentityAgent=${options.identityAgent}`);
+  }
   if (options.controlMaster) {
     args.push('-o', `ControlMaster=${options.controlMaster}`);
   }
@@ -539,7 +545,7 @@ function buildSshCommandParts(connector, options = {}) {
     args.push('-o', `StreamLocalBindUnlink=${options.streamLocalBindUnlink}`);
   }
   if (connector.auth?.keyPath) {
-    args.push('-i', connector.auth.keyPath);
+    args.push('-o', `IdentityFile=${connector.auth.keyPath}`);
     args.push('-o', 'IdentitiesOnly=yes');
     args.push('-o', 'IdentityAgent=none');
   }

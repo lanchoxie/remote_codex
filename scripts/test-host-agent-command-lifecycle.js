@@ -61,7 +61,7 @@ async function verifyTerminalReceiptRetryDoesNotRepeatExecution() {
   assert.strictEqual(executor.forget('input-command-7'), true);
 }
 
-function verifyAgentIntegrationSource() {
+async function verifyAgentIntegrationSource() {
   const source = fs.readFileSync('apps/host-agent/agent.js', 'utf8');
   const handleStart = source.indexOf("if (command.type === 'session.start')");
   const handleStartEnd = source.indexOf("if (command.type === 'host.import')", handleStart);
@@ -98,6 +98,23 @@ function verifyAgentIntegrationSource() {
   );
   assert(source.includes("inputOutcome: 'accepted'"));
   assert(source.includes("inputOutcome: 'acceptance_unknown'"));
+  assert(
+    source.includes('function currentRunnerActiveRuntime(runner)')
+      && source.includes('!runner?.isTerminalTurnId?.(candidateTurnId)'),
+    'input receipts must derive active runtime from the current non-terminal runner snapshot'
+  );
+  const inputExecutionStart = source.indexOf('async function executeSessionInputCommand');
+  const inputExecutionEnd = source.indexOf('async function deliverSessionInputReceipt', inputExecutionStart);
+  const inputExecutionBlock = source.slice(inputExecutionStart, inputExecutionEnd);
+  assert(
+    inputExecutionBlock.includes('const runnerRuntime = currentRunnerActiveRuntime(runner);')
+      && !inputExecutionBlock.includes('activeTurnId: turnId || runner.activeTurnId || null'),
+    'accepted input receipts must not use a historical turn/start response as active runtime state'
+  );
+  assert(
+    inputExecutionBlock.includes("runner?.runtime?.phase === 'submitting-turn'"),
+    'acceptance-unknown receipts may report busy only from a current submitting runtime snapshot'
+  );
   const deliveryStart = source.indexOf('async function deliverSessionInputReceipt');
   const deliveryEnd = source.indexOf('function startSessionInputCommand', deliveryStart);
   const deliveryBlock = source.slice(deliveryStart, deliveryEnd);
@@ -151,6 +168,57 @@ function verifyAgentIntegrationSource() {
   assert.strictEqual(context.retryHarness.state(2), 'completed', 'later completed work must remain cached, not rerun');
   assert.strictEqual(context.retryHarness.fetchAfter(), 0, 'polling must rewind to the rejected command');
   assert.strictEqual(context.retryHarness.completeRetry(), 2, 'successful redelivery should release the contiguous ACK barrier');
+
+  const receiptRuntimeStart = source.indexOf('function buildSessionInputRuntimeEvent');
+  const receiptRuntimeEnd = source.indexOf('function normalizeSessionInterruptResult', receiptRuntimeStart);
+  const executeInputStart = source.indexOf('async function executeSessionInputCommand');
+  const executeInputEnd = source.indexOf('async function deliverSessionInputReceipt', executeInputStart);
+  const receiptContext = {};
+  vm.runInNewContext(`
+    const HOST_ID = 'receipt-test-host';
+    const nowIso = () => 'receipt-test-time';
+    const normalizeApiConfig = (value) => value;
+    ${source.slice(receiptRuntimeStart, receiptRuntimeEnd)}
+    ${source.slice(executeInputStart, executeInputEnd)}
+    globalThis.runInputReceipt = executeSessionInputCommand;
+  `, receiptContext);
+  const acceptedReceipt = await receiptContext.runInputReceipt({
+    sessionId: 'receipt-session',
+    runId: 'receipt-run',
+    clientRequestId: 'receipt-request',
+    text: 'terminal response',
+  }, {
+    activeTurnId: null,
+    activeClientRequestId: null,
+    runtime: { activeTurnId: 'terminal-history', busy: false, phase: 'idle' },
+    isTerminalTurnId: (turnId) => turnId === 'terminal-history',
+    reserveRuntimeRevision: () => 1,
+    sendInput: async () => 'terminal-history',
+  });
+  assert.strictEqual(acceptedReceipt[0].inputOutcome, 'accepted');
+  assert.strictEqual(acceptedReceipt[0].patch.activeTurnId, null);
+  assert.strictEqual(acceptedReceipt[0].patch.busy, false);
+
+  const unknownReceipt = await receiptContext.runInputReceipt({
+    sessionId: 'receipt-session',
+    runId: 'receipt-run',
+    clientRequestId: 'unknown-request',
+    text: 'unknown response',
+  }, {
+    activeTurnId: null,
+    activeClientRequestId: null,
+    runtime: { activeTurnId: 'terminal-history', busy: false, phase: 'idle' },
+    isTerminalTurnId: (turnId) => turnId === 'terminal-history',
+    reserveRuntimeRevision: () => 2,
+    sendInput: async () => {
+      const error = new Error('timed out');
+      error.code = 'session_input_acceptance_unknown';
+      throw error;
+    },
+  });
+  assert.strictEqual(unknownReceipt[0].inputOutcome, 'acceptance_unknown');
+  assert.strictEqual(unknownReceipt[0].patch.activeTurnId, null);
+  assert.strictEqual(unknownReceipt[0].patch.busy, false);
 }
 
 verifyPendingStartLookup()

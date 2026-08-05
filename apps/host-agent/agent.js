@@ -5,10 +5,9 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const {
-  discoverCodexSessions,
+  CodexSessionDiscoveryIndex,
   extractSessionDiagnostics,
   extractSessionTranscript,
-  findCodexSessionFile,
   getDefaultCodexHome,
   makeTranscriptEntry,
   readCodexSessionSummary,
@@ -157,6 +156,8 @@ const managedSessionStartGate = createManagedSessionStartGate();
 const activeFileUploads = new Map();
 const watchedHistorySessions = new Map();
 const watchedSessionRevisions = new Map();
+const codexDiscoveryIndexes = new Map();
+const publishedAssistantCursors = new Map();
 let lastWatchPerformanceReportAt = 0;
 let hostSkillInventory = null;
 let hostSkillDeployment = null;
@@ -189,6 +190,76 @@ let codexUpdateInFlight = null;
 let codexUpdateState = null;
 let recoveredCodexUpdateNeedsReport = false;
 let recoveredCodexUpdateReportPromise = null;
+
+function discoveryIndexForHome(codexHome) {
+  const home = path.resolve(String(codexHome || CODEX_HOME));
+  const key = process.platform === 'win32' ? home.toLowerCase() : home;
+  let record = codexDiscoveryIndexes.get(key);
+  if (!record) {
+    record = {
+      index: new CodexSessionDiscoveryIndex({
+        codexHome: home,
+        preview: CODEX_DISCOVERY_LIST_PREVIEW,
+        metaReadLimit: CODEX_DISCOVERY_LIST_META_LIMIT,
+      }),
+      lastScanAt: 0,
+    };
+    codexDiscoveryIndexes.set(key, record);
+  }
+  return record;
+}
+
+function scanCodexHomeIndex(codexHome, options = {}) {
+  const record = discoveryIndexForHome(codexHome);
+  const maxAgeMs = Math.max(0, Number(options.maxAgeMs ?? 5000) || 0);
+  if (
+    options.force !== true
+    && record.index.initialized
+    && Date.now() - record.lastScanAt < maxAgeMs
+  ) {
+    return {
+      initial: false,
+      sessions: record.index.sessions,
+      changedSessions: record.index.sessions.filter((session) => (
+        record.index.pendingChanges.has(String(session.sessionId || '').trim())
+      )),
+      removedSessionIds: Array.from(record.index.pendingRemovals.keys()),
+      cacheStats: { parsedFiles: 0, reusedFiles: 0, removedFiles: 0 },
+      changeTokens: new Map(record.index.pendingChanges),
+      removalTokens: new Map(record.index.pendingRemovals),
+    };
+  }
+  const scan = record.index.scan();
+  record.lastScanAt = Date.now();
+  return scan;
+}
+
+function assistantCursorFingerprint(cursor = {}) {
+  return JSON.stringify([
+    cursor.fileIdentity || null,
+    Number(cursor.cursorOffset || 0),
+    Number(cursor.projectionRevision || 0),
+    cursor.cursorUnknown === true,
+    cursor.replaced === true,
+    cursor.truncated === true,
+  ]);
+}
+
+function cursorNeedsDiscoveryPublication(cursor = {}) {
+  const fileKey = normalizedFileKey(cursor.rolloutPath || '');
+  if (!fileKey) return false;
+  const fingerprint = assistantCursorFingerprint(cursor);
+  if (publishedAssistantCursors.get(fileKey) === fingerprint && !cursor.observations?.length) {
+    return false;
+  }
+  return Boolean(
+    cursor.observations?.length
+    || cursor.bytesRead > 0
+    || cursor.replaced
+    || cursor.truncated
+    || (cursor.cursorUnknown === false && publishedAssistantCursors.has(fileKey))
+  );
+}
 
 function codexUpdateJournalPath(operationId) {
   const safeId = String(operationId || '').trim().replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 180);
@@ -1097,8 +1168,12 @@ async function postAgentEventPayload(body, label, options = {}) {
 }
 
 async function postEvent(event, options = {}) {
-  const batchId = String(options.batchId || '').trim() || `event:${HOST_ID}:${makeId()}`;
-  await postAgentEventPayload({ event, batchId }, event?.type || 'event', options);
+  const batchId = String(options.batchId || '').trim()
+    || (event?.type === 'session.diagnostic' ? '' : `event:${HOST_ID}:${makeId()}`);
+  await postAgentEventPayload({
+    event,
+    ...(batchId ? { batchId } : {}),
+  }, event?.type || 'event', options);
 }
 
 async function postEvents(events, options = {}) {
@@ -1266,59 +1341,73 @@ async function releaseAgentLease() {
 }
 
 async function performDiscovery() {
-  const discoveredSessions = discoverCodexSessions({
-    codexHome: CODEX_HOME,
-    preview: CODEX_DISCOVERY_LIST_PREVIEW,
-    metaReadLimit: CODEX_DISCOVERY_LIST_META_LIMIT,
-  });
+  const discoveryRecord = discoveryIndexForHome(CODEX_HOME);
+  const discoveryScan = scanCodexHomeIndex(CODEX_HOME, { force: true });
+  const discoveredSessions = discoveryScan.sessions;
+  const discoveredRolloutPaths = new Set(discoveredSessions
+    .map((session) => normalizedFileKey(session.rolloutPath || ''))
+    .filter(Boolean));
+  for (const fileKey of publishedAssistantCursors.keys()) {
+    if (!discoveredRolloutPaths.has(fileKey)) publishedAssistantCursors.delete(fileKey);
+  }
   const cursorResults = assistantCursorIndex.scanMany(discoveredSessions);
+  const publishedCursorResults = cursorResults.filter(cursorNeedsDiscoveryPublication);
   const cursorByPath = new Map(cursorResults.map((result) => [
     normalizedFileKey(result.rolloutPath),
     result,
   ]));
-  const sessions = discoveredSessions.map((session) => {
-    const cursor = session.rolloutPath
-      ? cursorByPath.get(normalizedFileKey(session.rolloutPath))
-      : null;
-    return {
-      sessionId: session.sessionId,
-      nativeThreadId: session.nativeThreadId || session.sessionId,
-      title: session.title,
-      cwd: session.cwd,
-      source: session.source || 'imported',
-      subagent: session.subagent === true,
-      readOnly: session.readOnly === true,
-      threadSource: session.threadSource || null,
-      parentThreadId: session.parentThreadId || null,
-      forkedFromId: session.forkedFromId || null,
-      agentPath: session.agentPath || null,
-      agentNickname: session.agentNickname || null,
-      agentRole: session.agentRole || null,
-      multiAgentVersion: session.multiAgentVersion || null,
-      subagentSource: session.subagentSource || null,
-      live: false,
-      createdAt: session.createdAt || null,
-      updatedAt: session.updatedAt,
-      messageCount: session.messageCount || 0,
-      latestUserMessage: session.latestUserMessage || null,
-      latestAgentMessage: session.latestAgentMessage || null,
-      transcriptPreview: session.transcriptPreview || [],
-      rolloutPath: session.rolloutPath || null,
-      originSessionId: session.originSessionId || null,
-      conversationKey: session.conversationKey || session.sessionId,
-      ...(cursor ? {
-        assistantCursor: {
-          observations: cursor.observations,
-          cursorOffset: cursor.cursorOffset,
-          cursorUnknown: cursor.cursorUnknown,
-          fileIdentity: cursor.fileIdentity,
-          replaced: cursor.replaced,
-          truncated: cursor.truncated,
-          projectionRevision: cursor.projectionRevision,
-        },
-      } : {}),
-    };
-  });
+  const changedSessionIds = new Set(discoveryScan.changedSessions.map((session) => session.sessionId));
+  const publishedCursorPaths = new Set(publishedCursorResults.map((cursor) => (
+    normalizedFileKey(cursor.rolloutPath)
+  )));
+  const sessions = discoveredSessions
+    .filter((session) => (
+      changedSessionIds.has(session.sessionId)
+      || publishedCursorPaths.has(normalizedFileKey(session.rolloutPath || ''))
+    ))
+    .map((session) => {
+      const cursor = session.rolloutPath
+        ? cursorByPath.get(normalizedFileKey(session.rolloutPath))
+        : null;
+      return {
+        sessionId: session.sessionId,
+        nativeThreadId: session.nativeThreadId || session.sessionId,
+        title: session.title,
+        cwd: session.cwd,
+        source: session.source || 'imported',
+        subagent: session.subagent === true,
+        readOnly: session.readOnly === true,
+        threadSource: session.threadSource || null,
+        parentThreadId: session.parentThreadId || null,
+        forkedFromId: session.forkedFromId || null,
+        agentPath: session.agentPath || null,
+        agentNickname: session.agentNickname || null,
+        agentRole: session.agentRole || null,
+        multiAgentVersion: session.multiAgentVersion || null,
+        subagentSource: session.subagentSource || null,
+        live: false,
+        createdAt: session.createdAt || null,
+        updatedAt: session.updatedAt,
+        messageCount: session.messageCount || 0,
+        latestUserMessage: session.latestUserMessage || null,
+        latestAgentMessage: session.latestAgentMessage || null,
+        transcriptPreview: session.transcriptPreview || [],
+        rolloutPath: session.rolloutPath || null,
+        originSessionId: session.originSessionId || null,
+        conversationKey: session.conversationKey || session.sessionId,
+        ...(cursor && publishedCursorPaths.has(normalizedFileKey(session.rolloutPath)) ? {
+          assistantCursor: {
+            observations: cursor.observations,
+            cursorOffset: cursor.cursorOffset,
+            cursorUnknown: cursor.cursorUnknown,
+            fileIdentity: cursor.fileIdentity,
+            replaced: cursor.replaced,
+            truncated: cursor.truncated,
+            projectionRevision: cursor.projectionRevision,
+          },
+        } : {}),
+      };
+    });
 
   const seenRunners = new Set();
   for (const runner of liveSessions.values()) {
@@ -1373,7 +1462,14 @@ async function performDiscovery() {
     batchId: `session.discovery:${discoveryId}`,
     retryOnTransient: true,
   });
-  assistantCursorIndex.acknowledgeMany(cursorResults);
+  discoveryRecord.index.acknowledge(discoveryScan);
+  assistantCursorIndex.acknowledgeMany(publishedCursorResults);
+  for (const cursor of publishedCursorResults) {
+    publishedAssistantCursors.set(
+      normalizedFileKey(cursor.rolloutPath),
+      assistantCursorFingerprint(cursor)
+    );
+  }
 }
 
 const runCoalescedDiscovery = createCoalescedAsyncTask(performDiscovery);
@@ -1384,6 +1480,8 @@ function sendDiscovery() {
 
 function collectSessionIdentityCandidates(input = {}) {
   return [
+    ...(Array.isArray(input.rolloutSessionIds) ? input.rolloutSessionIds : []),
+    input.rolloutSessionId,
     input.sessionId,
     input.nativeThreadId,
     input.bridgeSessionId,
@@ -1391,6 +1489,37 @@ function collectSessionIdentityCandidates(input = {}) {
     input.sourceSessionId,
     input.conversationKey,
   ].map((value) => String(value || '').trim()).filter(Boolean);
+}
+
+function managedTailSession(found, runner) {
+  if (!found?.rolloutPath || !runner) {
+    return found;
+  }
+  return {
+    ...found,
+    live: true,
+    transcriptOwner: 'managed-runner',
+    ...(runner.runId ? { runId: runner.runId } : {}),
+    managedRuntimeActive: Boolean(
+      runner.activeTurnId
+      || runner.activeClientRequestId
+      || runner.runtime?.busy
+    ),
+    managedTurnOwner: (turnId) => {
+      const normalizedTurnId = String(turnId || '').trim();
+      return Boolean(
+        normalizedTurnId
+        && (
+          normalizedTurnId === String(runner.activeTurnId || '').trim()
+          || runner.isTerminalTurnId?.(normalizedTurnId)
+          || runner.clientRequestIdsByTurn?.has?.(normalizedTurnId)
+          || runner.turnBuffers?.has?.(normalizedTurnId)
+          || runner.turnModes?.has?.(normalizedTurnId)
+          || runner.pendingTurnCompletions?.has?.(normalizedTurnId)
+        )
+      );
+    },
+  };
 }
 
 function commandCodexHomeCandidates(input = {}) {
@@ -1410,20 +1539,16 @@ function commandCodexHomeCandidates(input = {}) {
 }
 
 function resolveSessionFileFromCandidates(input = {}) {
+  const identities = collectSessionIdentityCandidates(input);
   for (const codexHome of commandCodexHomeCandidates(input)) {
-    for (const candidate of collectSessionIdentityCandidates(input)) {
-      const found = findCodexSessionFile({
-        codexHome,
-        sessionId: candidate,
-        nativeThreadId: candidate,
-        bridgeSessionId: candidate,
-        originSessionId: candidate,
-        sourceSessionId: candidate,
-        conversationKey: candidate,
-      });
-      if (found) {
-        return found;
-      }
+    const record = discoveryIndexForHome(codexHome);
+    let found = record.index.find(identities);
+    if (!found) {
+      scanCodexHomeIndex(codexHome, { force: true });
+      found = record.index.find(identities);
+    }
+    if (found) {
+      return found;
     }
   }
   return null;
@@ -1445,15 +1570,6 @@ function resolveDiscoveredSession(command = {}) {
     }) || found;
   }
 
-  for (const codexHome of commandCodexHomeCandidates(command)) {
-    const discovered = discoverCodexSessions({ codexHome }).find((session) => (
-      candidates.has(String(session.sessionId || ''))
-      || candidates.has(String(session.nativeThreadId || ''))
-    ));
-    if (discovered) {
-      return discovered;
-    }
-  }
   return null;
 }
 
@@ -1461,6 +1577,7 @@ async function handleSessionWatch(command = {}) {
   const requestId = command.requestId || makeId();
   const requestedSessionId = String(command.sessionId || command.nativeThreadId || '').trim();
   const found = resolveSessionFileFromCandidates(command);
+  const runner = findRunnerForCommand(liveSessions, command);
   const watchOptions = {
     ownerRevisions: watchedSessionRevisions,
     ttlMs: SESSION_WATCH_TTL_MS,
@@ -1492,7 +1609,7 @@ async function handleSessionWatch(command = {}) {
   }
 
   const watchResult = upsertSessionWatch(watchedHistorySessions, command, {
-    ...found,
+    ...managedTailSession(found, runner),
     sessionId: found.sessionId,
     nativeThreadId: found.nativeThreadId || found.sessionId,
     conversationKey: command.conversationKey || found.conversationKey || null,
@@ -1562,10 +1679,7 @@ function resolveLiveTailSessions() {
       conversationKey: runner.conversationKey,
     });
     if (found?.rolloutPath) {
-      sessions.push({
-        ...found,
-        live: true,
-      });
+      sessions.push(managedTailSession(found, runner));
     }
   }
   return sessions;
@@ -1748,7 +1862,7 @@ async function searchDiscoveredSessions(command = {}) {
   const terms = normalizeSearchTerms(query);
   const maxSessions = Math.max(1, Math.min(200, Number(command.maxSessions || 80) || 80));
   const maxMatchesPerSession = Math.max(1, Math.min(20, Number(command.maxMatchesPerSession || 5) || 5));
-  const sessions = discoverCodexSessions({ codexHome: CODEX_HOME });
+  const sessions = scanCodexHomeIndex(CODEX_HOME, { force: true }).sessions;
   const results = [];
 
   for (const session of sessions) {
@@ -2614,11 +2728,19 @@ function buildSessionCommandFailureEvent(command, error, operation, runner = nul
   };
 }
 
-async function postSessionCommandFailure(command, error, operation, runner = null) {
-  await postEvent(
-    buildSessionCommandFailureEvent(command, error, operation, runner),
-    { bestEffort: true }
-  );
+async function postSessionCommandFailure(command, error, operation, runner = null, options = {}) {
+  try {
+    await postEvent(
+      buildSessionCommandFailureEvent(command, error, operation, runner),
+      { bestEffort: options.bestEffort !== false }
+    );
+  } catch (deliveryError) {
+    if (options.retryCommand === true) {
+      deliveryError.retryCommand = true;
+      deliveryError.code = deliveryError.code || 'session_terminal_delivery_failed';
+    }
+    throw deliveryError;
+  }
 }
 
 function sessionInputReceiptKey(command = {}) {
@@ -2681,6 +2803,20 @@ function buildSessionInputRuntimeEvent(command, runner, patch, timestamp = nowIs
   };
 }
 
+function currentRunnerActiveRuntime(runner) {
+  const runtime = runner?.runtime || {};
+  const candidateTurnId = String(runner?.activeTurnId || runtime.activeTurnId || '').trim();
+  const activeTurnId = candidateTurnId && !runner?.isTerminalTurnId?.(candidateTurnId)
+    ? candidateTurnId
+    : null;
+  return {
+    activeTurnId,
+    busy: Boolean(activeTurnId) && runtime.busy !== false,
+    phase: String(runtime.phase || '').trim(),
+    currentTurnStatus: String(runtime.currentTurnStatus || '').trim(),
+  };
+}
+
 function normalizeSessionInterruptResult(command, runner, result) {
   const normalized = result && typeof result === 'object'
     ? result
@@ -2711,16 +2847,17 @@ async function deliverSessionInterruptResult(command, runner, result) {
 
 function buildFailedSessionInputReceipt(command, runner, error) {
   const timestamp = nowIso();
-  const activeTurnId = String(runner?.activeTurnId || runner?.runtime?.activeTurnId || '').trim() || null;
+  const runnerRuntime = currentRunnerActiveRuntime(runner);
+  const activeTurnId = runnerRuntime.activeTurnId;
   const activeClientRequestId = activeTurnId
     ? runner?.clientRequestIdForTurn?.(activeTurnId) || runner?.activeClientRequestId || null
     : null;
   const activeRuntime = activeTurnId ? {
     clientRequestId: activeClientRequestId,
-    activeTurnId,
-    busy: true,
-    phase: String(runner?.runtime?.phase || '').trim() || 'thinking',
-    currentTurnStatus: String(runner?.runtime?.currentTurnStatus || '').trim() || 'inProgress',
+      activeTurnId,
+      busy: true,
+    phase: runnerRuntime.phase || 'thinking',
+    currentTurnStatus: runnerRuntime.currentTurnStatus || 'inProgress',
     waitingOnApproval: runner?.runtime?.waitingOnApproval === true,
     waitingOnUserInput: runner?.runtime?.waitingOnUserInput === true,
     pendingInputSummary: runner?.runtime?.pendingInputSummary || null,
@@ -2734,8 +2871,12 @@ function buildFailedSessionInputReceipt(command, runner, error) {
     pendingInputSummary: null,
     lastCodexError: error?.message || String(error),
   };
+  const failureEvent = buildSessionCommandFailureEvent(command, error, 'input', runner, timestamp);
+  if (error?.code === 'session_input_cancelled_by_stop') {
+    return [failureEvent];
+  }
   return [
-    buildSessionCommandFailureEvent(command, error, 'input', runner, timestamp),
+    failureEvent,
     buildSessionInputRuntimeEvent(command, runner, {
       ...activeRuntime,
       queuedCommandId: null,
@@ -2768,8 +2909,14 @@ async function executeSessionInputCommand(command, runner) {
     return buildFailedSessionInputReceipt(command, null, error);
   }
 
+  if (runner.stopRequested) {
+    const error = new Error('Prompt submission was cancelled because the Session was already stopping.');
+    error.code = 'session_input_cancelled_by_stop';
+    return buildFailedSessionInputReceipt(command, runner, error);
+  }
+
   try {
-    const turnId = await runner.sendInput(String(command.text || ''), {
+    await runner.sendInput(String(command.text || ''), {
       clientRequestId: command.clientRequestId || null,
       inputItems: Array.isArray(command.inputItems) ? command.inputItems : [],
       attachments: Array.isArray(command.attachments) ? command.attachments : [],
@@ -2786,15 +2933,20 @@ async function executeSessionInputCommand(command, runner) {
       apiConfig: normalizeApiConfig(command.apiConfig),
       apiBinding: command.apiBinding || null,
     });
+    const runnerRuntime = currentRunnerActiveRuntime(runner);
     return [buildSessionInputRuntimeEvent(command, runner, {
-      activeTurnId: turnId || runner.activeTurnId || null,
-      busy: Boolean(turnId || runner.activeTurnId),
-      phase: runner.runtime?.phase || (turnId ? 'thinking' : 'idle'),
-      currentTurnStatus: runner.runtime?.currentTurnStatus || (turnId ? 'inProgress' : 'completed'),
+      activeTurnId: runnerRuntime.activeTurnId,
+      busy: runnerRuntime.busy,
+      phase: runnerRuntime.activeTurnId ? runnerRuntime.phase || 'thinking' : 'idle',
+      currentTurnStatus: runnerRuntime.activeTurnId
+        ? runnerRuntime.currentTurnStatus || 'inProgress'
+        : 'completed',
       queuedCommandId: null,
       pendingClientRequestId: null,
       queuedInputAt: null,
-      pendingInputSummary: turnId ? runner.runtime?.pendingInputSummary || String(command.text || '').slice(0, 240) : null,
+      pendingInputSummary: runnerRuntime.activeTurnId
+        ? runner.runtime?.pendingInputSummary || String(command.text || '').slice(0, 240)
+        : null,
       lastError: null,
       lastCodexError: null,
     }, nowIso(), { inputOutcome: 'accepted' })];
@@ -2805,16 +2957,26 @@ async function executeSessionInputCommand(command, runner) {
       failure.code = 'session_input_cancelled_by_stop';
     }
     if (failure.code === 'session_input_acceptance_unknown') {
-      const acceptedTurnId = runner.activeTurnId || runner.runtime?.activeTurnId || null;
+      const runnerRuntime = currentRunnerActiveRuntime(runner);
+      const submissionPending = !runnerRuntime.activeTurnId
+        && runner?.activeClientRequestId === command.clientRequestId
+        && runner?.runtime?.busy === true
+        && runner?.runtime?.phase === 'submitting-turn';
       return [buildSessionInputRuntimeEvent(command, runner, {
-        activeTurnId: acceptedTurnId,
-        busy: true,
-        phase: acceptedTurnId ? runner.runtime?.phase || 'thinking' : 'submitting-turn',
-        currentTurnStatus: acceptedTurnId ? 'inProgress' : 'submitting',
+        activeTurnId: runnerRuntime.activeTurnId,
+        busy: runnerRuntime.busy || submissionPending,
+        phase: runnerRuntime.activeTurnId
+          ? runnerRuntime.phase || 'thinking'
+          : submissionPending ? 'submitting-turn' : 'idle',
+        currentTurnStatus: runnerRuntime.activeTurnId
+          ? runnerRuntime.currentTurnStatus || 'inProgress'
+          : submissionPending ? 'submitting' : 'idle',
         queuedCommandId: null,
         pendingClientRequestId: command.clientRequestId || null,
         queuedInputAt: null,
-        pendingInputSummary: runner.runtime?.pendingInputSummary || String(command.text || '').slice(0, 240),
+        pendingInputSummary: (runnerRuntime.activeTurnId || submissionPending)
+          ? runner.runtime?.pendingInputSummary || String(command.text || '').slice(0, 240)
+          : null,
         lastError: null,
         lastCodexError: null,
       }, nowIso(), { inputOutcome: 'acceptance_unknown' })];
@@ -3084,7 +3246,18 @@ async function startManagedSession(command) {
       bridgeSessionId,
       runId,
     }, error)) {
-      throw error;
+      await postSessionCommandFailure(command, error, 'start', runner, {
+        bestEffort: false,
+        retryCommand: true,
+      });
+      await failManagedSession(
+        bridgeSessionId,
+        cwd,
+        `failed to spawn managed session: ${error.message}`,
+        error.failureState || 'failed:spawn-error',
+        runId
+      );
+      return bridgeSessionId;
     }
     if (error?.retryCommand) throw error;
     if (runner) {
@@ -3613,9 +3786,9 @@ async function handleCommand(command) {
         const startedRunner = await pendingRunner;
         if (startedRunner) {
           try {
-            await enqueueRunnerCommandEffect(startedRunner, () => stopRunnerOnce(startedRunner, {
+            await stopRunnerOnce(startedRunner, {
               suppressTerminalEvent: command.suppressTerminalEvent === true,
-            }));
+            });
           } catch (cause) {
             const stopError = cause instanceof Error
               ? cause
@@ -3771,11 +3944,11 @@ async function handleCommand(command) {
   if (command.type === 'session.interrupt') {
     if (typeof runner.interruptTurn === 'function') {
       try {
-        const result = await enqueueRunnerCommandEffect(runner, () => runner.interruptTurn({
+        const result = await runner.interruptTurn({
           interruptRequestId: command.interruptRequestId || null,
           expectedTurnId: command.expectedTurnId || null,
           expectedClientRequestId: command.expectedClientRequestId || null,
-        }));
+        });
         await deliverSessionInterruptResult(command, runner, result);
       } catch (error) {
         await deliverSessionInterruptResult(command, runner, {
@@ -3970,9 +4143,9 @@ async function handleCommand(command) {
 
   if (command.type === 'session.stop') {
     try {
-      await enqueueRunnerCommandEffect(runner, () => stopRunnerOnce(runner, {
+      await stopRunnerOnce(runner, {
         suppressTerminalEvent: command.suppressTerminalEvent === true,
-      }));
+      });
     } catch (cause) {
       const stopError = cause instanceof Error
         ? cause

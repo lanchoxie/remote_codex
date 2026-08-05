@@ -7,6 +7,7 @@ const path = require('path');
 const {
   recoverMissingFileFromBackup,
   replaceFileWithBackup,
+  replaceFileWithBackupAsync,
 } = require('./atomic-file-replace');
 const {
   agentLogCommand,
@@ -256,6 +257,22 @@ const CHUNKED_FILE_CACHE_MAX_BYTES = Number(process.env.RELAY_CHUNKED_FILE_CACHE
 const RECEIVED_FILE_TTL_MS = Number(process.env.RELAY_RECEIVED_FILE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const SESSION_LOG_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_LOG_ENTRY_LIMIT || 1000);
 const SESSION_DIAGNOSTIC_ENTRY_LIMIT = Number(process.env.RELAY_SESSION_DIAGNOSTIC_ENTRY_LIMIT || 10000);
+const SESSION_LOG_KEY_LIMIT = Math.max(
+  1,
+  Math.min(100_000, Number(process.env.RELAY_SESSION_LOG_KEY_LIMIT || 2048) || 2048)
+);
+const SESSION_DIAGNOSTIC_KEY_LIMIT = Math.max(
+  1,
+  Math.min(100_000, Number(process.env.RELAY_SESSION_DIAGNOSTIC_KEY_LIMIT || 2048) || 2048)
+);
+const SESSION_LOG_TOTAL_BYTES = Math.max(
+  1024 * 1024,
+  Math.min(1024 * 1024 * 1024, Number(process.env.RELAY_SESSION_LOG_TOTAL_BYTES || 64 * 1024 * 1024) || 64 * 1024 * 1024)
+);
+const SESSION_DIAGNOSTIC_TOTAL_BYTES = Math.max(
+  1024 * 1024,
+  Math.min(1024 * 1024 * 1024, Number(process.env.RELAY_SESSION_DIAGNOSTIC_TOTAL_BYTES || 64 * 1024 * 1024) || 64 * 1024 * 1024)
+);
 const SESSION_DETAIL_DIAGNOSTIC_LIMIT = Number(process.env.RELAY_SESSION_DETAIL_DIAGNOSTIC_LIMIT || 400);
 const PERSIST_DEBOUNCE_MS = Number(process.env.RELAY_PERSIST_DEBOUNCE_MS || 500);
 const SESSION_LIST_PREVIEW_LIMIT = Number(process.env.RELAY_SESSION_LIST_PREVIEW_LIMIT || 3);
@@ -271,9 +288,6 @@ const MISSING_MANAGED_DISCOVERY_CONFIRMATION_MS = Math.max(
 );
 const TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS = truthyEnv(process.env.RELAY_TEST_CONTROL_ENABLED)
   ? Math.max(0, Number(process.env.RELAY_TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS || 0) || 0)
-  : 0;
-const TEST_INPUT_PREPARE_DELAY_MS = truthyEnv(process.env.RELAY_TEST_CONTROL_ENABLED)
-  ? Math.max(0, Number(process.env.RELAY_TEST_INPUT_PREPARE_DELAY_MS || 0) || 0)
   : 0;
 const SESSION_STOP_FALLBACK_MS = Number(process.env.RELAY_SESSION_STOP_FALLBACK_MS || 15000);
 const INPUT_REQUEST_DEDUPE_TTL_MS = Number(process.env.RELAY_INPUT_REQUEST_DEDUPE_TTL_MS || 2 * 60 * 1000);
@@ -400,6 +414,7 @@ let relayStopping = false;
 let relayOwnerMarkerWritten = false;
 const relayBackgroundTasks = new Set();
 const stopFallbackTimers = new Set();
+const pendingSessionStopFences = new Map();
 
 function truthyEnv(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
@@ -1642,6 +1657,9 @@ function isInternalTranscriptText(value) {
   if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
     return true;
   }
+  if (/^# AGENTS\.md instructions for [^\r\n]+\s*<INSTRUCTIONS>(?:[\s\S]*)$/i.test(text)) {
+    return true;
+  }
   if (/^The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b/i.test(text)) {
     return true;
   }
@@ -1679,7 +1697,14 @@ function compactTranscriptEntries(entries) {
 }
 
 function mergeAdjacentTranscriptDuplicate(previous, entry) {
-  const identified = (entry?.assistantMessageId || entry?.clientRequestId) ? entry : previous;
+  const previousAssistantId = String(previous?.assistantMessageId || '').trim();
+  const entryAssistantId = String(entry?.assistantMessageId || '').trim();
+  const conflictingAssistantIds = previousAssistantId
+    && entryAssistantId
+    && previousAssistantId !== entryAssistantId;
+  const identified = conflictingAssistantIds
+    ? previous
+    : (entry?.assistantMessageId || entry?.clientRequestId) ? entry : previous;
   const other = identified === entry ? previous : entry;
   return normalizeStoredTranscriptEntry({
     ...other,
@@ -1693,10 +1718,32 @@ function isAdjacentTranscriptDuplicate(previous, entry) {
   if (!previous || !entry || previous.speaker !== entry.speaker) {
     return false;
   }
+  const previousFiles = (previous.files || []).map((file) => file.path || file.name || '').join(',');
+  const entryFiles = (entry.files || []).map((file) => file.path || file.name || '').join(',');
+  const previousText = canonicalTranscriptText(previous.text);
+  const entryText = canonicalTranscriptText(entry.text);
+  const exactContentMatch = Boolean(
+    previousFiles === entryFiles
+    && previousText
+    && entryText
+    && previousText === entryText
+  );
+  const previousTime = Date.parse(previous.timestamp || '');
+  const entryTime = Date.parse(entry.timestamp || '');
+  const timeDeltaMs = Number.isFinite(previousTime) && Number.isFinite(entryTime)
+    ? Math.abs(entryTime - previousTime)
+    : Number.POSITIVE_INFINITY;
   const previousRequestId = String(previous.clientRequestId || '').trim();
   const entryRequestId = String(entry.clientRequestId || '').trim();
   if (previousRequestId && entryRequestId) {
     return previousRequestId === entryRequestId;
+  }
+  if (previousRequestId || entryRequestId) {
+    return Boolean(
+      String(previous.speaker || '').toLowerCase() === 'user'
+      && exactContentMatch
+      && timeDeltaMs <= 30_000
+    );
   }
   const previousAssistantId = String(previous.assistantMessageId || '').trim();
   const entryAssistantId = String(entry.assistantMessageId || '').trim();
@@ -1709,41 +1756,24 @@ function isAdjacentTranscriptDuplicate(previous, entry) {
       return true;
     }
     if (previousAssistantId && entryAssistantId) {
-      return false;
+      return Boolean(
+        exactContentMatch
+        && previous.source === 'codex-jsonl'
+        && entry.source === 'codex-jsonl'
+        && timeDeltaMs <= 250
+      );
     }
-    const previousText = canonicalTranscriptText(previous.text);
-    const entryText = canonicalTranscriptText(entry.text);
-    const previousTime = Date.parse(previous.timestamp || '');
-    const entryTime = Date.parse(entry.timestamp || '');
-    const near = Number.isFinite(previousTime)
-      && Number.isFinite(entryTime)
-      && Math.abs(entryTime - previousTime) <= 5000;
     return Boolean(
-      near
+      timeDeltaMs <= 5000
       && ['agent', 'assistant'].includes(String(previous.speaker || '').toLowerCase())
-      && previousText
-      && previousText === entryText
+      && exactContentMatch
     );
   }
-  const previousFiles = (previous.files || []).map((file) => file.path || file.name || '').join(',');
-  const entryFiles = (entry.files || []).map((file) => file.path || file.name || '').join(',');
-
-  const previousText = canonicalTranscriptText(previous.text);
-  const entryText = canonicalTranscriptText(entry.text);
-  if (
-    previousFiles === entryFiles
-    && previousText
-    && entryText
-    && previousText === entryText
-    && !(previousRequestId || entryRequestId)
-  ) {
+  if (exactContentMatch) {
     return true;
   }
 
-  const previousTime = Date.parse(previous.timestamp || '');
-  const entryTime = Date.parse(entry.timestamp || '');
-  const near = Number.isFinite(previousTime) && Number.isFinite(entryTime) && Math.abs(entryTime - previousTime) <= 30000;
-  if (!near) {
+  if (timeDeltaMs > 30_000) {
     return false;
   }
   if (previousFiles !== entryFiles) {
@@ -1822,7 +1852,6 @@ function loadSessionLogs() {
     const parsed = JSON.parse(raw);
     const rawLogs = parsed && typeof parsed.logs === 'object' ? parsed.logs : {};
     const logs = new Map();
-    const persistedLogs = {};
     let changed = false;
     for (const [key, entries] of Object.entries(rawLogs)) {
       const rawEntries = Array.isArray(entries) ? entries : [];
@@ -1833,18 +1862,13 @@ function loadSessionLogs() {
         .slice(-SESSION_LOG_ENTRY_LIMIT);
       if (compacted.length) {
         logs.set(key, compacted);
-        persistedLogs[key] = compacted;
       }
       if (JSON.stringify(rawEntries) !== JSON.stringify(compacted)) {
         changed = true;
       }
     }
     if (changed) {
-      fs.mkdirSync(path.dirname(SESSION_LOGS_PATH), { recursive: true });
-      fs.writeFileSync(SESSION_LOGS_PATH, JSON.stringify({
-        savedAt: nowIso(),
-        logs: persistedLogs,
-      }, null, 2), 'utf8');
+      sessionLogsNeedsNormalization = true;
     }
     return logs;
   } catch {
@@ -1852,7 +1876,70 @@ function loadSessionLogs() {
   }
 }
 
-function saveSessionLogs() {
+function sessionArtifactEntryBytes(entries) {
+  try {
+    return Buffer.byteLength(JSON.stringify(entries), 'utf8');
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function sessionArtifactUpdatedAt(key, entries) {
+  const sessionUpdatedAt = Date.parse(state.sessions.get(key)?.lastUpdatedAt || '');
+  const entryUpdatedAt = Date.parse(entries?.[entries.length - 1]?.timestamp || '');
+  return Math.max(
+    Number.isFinite(sessionUpdatedAt) ? sessionUpdatedAt : 0,
+    Number.isFinite(entryUpdatedAt) ? entryUpdatedAt : 0
+  );
+}
+
+function sessionArtifactKeyIsProtected(key) {
+  const session = state.sessions.get(key) || null;
+  if (session?.live === true) return true;
+  const canonicalKey = session
+    ? resolveCanonicalConversationKey(session.hostId, session)
+    : key;
+  return state.sessionEventStream.has(canonicalKey) || state.sessionEventStream.has(key);
+}
+
+function pruneSessionArtifactMap(map, options = {}) {
+  const keyLimit = Math.max(1, Number(options.keyLimit) || 1);
+  const byteLimit = Math.max(1, Number(options.byteLimit) || 1);
+  const entries = Array.from(map.entries()).map(([key, value]) => ({
+    key,
+    bytes: sessionArtifactEntryBytes(value),
+    updatedAt: sessionArtifactUpdatedAt(key, value),
+  }));
+  let totalBytes = entries.reduce((total, entry) => total + entry.bytes, 0);
+  let retainedKeys = entries.length;
+  if (retainedKeys <= keyLimit && totalBytes <= byteLimit) return false;
+
+  entries.sort((left, right) => (
+    left.updatedAt - right.updatedAt || left.key.localeCompare(right.key)
+  ));
+  let changed = false;
+  for (const entry of entries) {
+    if (retainedKeys <= keyLimit && totalBytes <= byteLimit) break;
+    if (sessionArtifactKeyIsProtected(entry.key)) continue;
+    if (!map.delete(entry.key)) continue;
+    retainedKeys -= 1;
+    totalBytes = Math.max(0, totalBytes - entry.bytes);
+    changed = true;
+  }
+  return changed;
+}
+
+function restoreEvictedSessionArtifacts(map, beforePrune) {
+  for (const [key, entries] of beforePrune.entries()) {
+    if (!map.has(key)) map.set(key, entries);
+  }
+}
+
+function buildSessionLogsSnapshot() {
+  pruneSessionArtifactMap(state.sessionLogs, {
+    keyLimit: SESSION_LOG_KEY_LIMIT,
+    byteLimit: SESSION_LOG_TOTAL_BYTES,
+  });
   const logs = {};
   for (const [key, entries] of state.sessionLogs.entries()) {
     const normalized = (Array.isArray(entries) ? entries : [])
@@ -1864,7 +1951,12 @@ function saveSessionLogs() {
       logs[key] = compacted;
     }
   }
-  fs.mkdirSync(path.dirname(SESSION_LOGS_PATH), { recursive: true });
+  return logs;
+}
+
+async function saveSessionLogs() {
+  const beforePrune = new Map(state.sessionLogs);
+  const logs = buildSessionLogsSnapshot();
   const serialized = `${JSON.stringify({
     savedAt: nowIso(),
     logs,
@@ -1872,17 +1964,21 @@ function saveSessionLogs() {
   const tempPath = `${SESSION_LOGS_PATH}.${process.pid}.${makeId()}.tmp`;
   let descriptor = null;
   try {
-    descriptor = fs.openSync(tempPath, 'wx');
-    fs.writeFileSync(descriptor, serialized, 'utf8');
-    fs.fsyncSync(descriptor);
-    fs.closeSync(descriptor);
+    await fs.promises.mkdir(path.dirname(SESSION_LOGS_PATH), { recursive: true });
+    descriptor = await fs.promises.open(tempPath, 'wx');
+    await descriptor.writeFile(serialized, 'utf8');
+    await descriptor.sync();
+    await descriptor.close();
     descriptor = null;
-    replaceFileWithBackup(tempPath, SESSION_LOGS_PATH);
+    await replaceFileWithBackupAsync(tempPath, SESSION_LOGS_PATH);
     checkpointPersistedInputTranscriptProjections();
+  } catch (error) {
+    restoreEvictedSessionArtifacts(state.sessionLogs, beforePrune);
+    throw error;
   } finally {
-    if (descriptor != null) fs.closeSync(descriptor);
+    if (descriptor != null) await descriptor.close();
     try {
-      fs.unlinkSync(tempPath);
+      await fs.promises.unlink(tempPath);
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
@@ -2263,6 +2359,10 @@ function loadSessionDiagnostics() {
 }
 
 function buildSessionDiagnosticsSnapshot() {
+  pruneSessionArtifactMap(state.sessionDiagnostics, {
+    keyLimit: SESSION_DIAGNOSTIC_KEY_LIMIT,
+    byteLimit: SESSION_DIAGNOSTIC_TOTAL_BYTES,
+  });
   const diagnostics = {};
   for (const [key, entries] of state.sessionDiagnostics.entries()) {
     const compacted = compactSessionDiagnostics((Array.isArray(entries) ? entries : [])
@@ -2284,12 +2384,20 @@ async function writeSessionDiagnosticsSnapshot(diagnostics) {
 }
 
 async function saveSessionDiagnostics() {
-  await writeSessionDiagnosticsSnapshot(buildSessionDiagnosticsSnapshot());
+  const beforePrune = new Map(state.sessionDiagnostics);
+  try {
+    await writeSessionDiagnosticsSnapshot(buildSessionDiagnosticsSnapshot());
+  } catch (error) {
+    restoreEvictedSessionArtifacts(state.sessionDiagnostics, beforePrune);
+    throw error;
+  }
 }
 
 let sessionLogsSaveTimer = null;
+let sessionLogsSaveInFlight = null;
 let sessionLogsSavePending = false;
 let sessionLogsSaveError = null;
+let sessionLogsNeedsNormalization = false;
 let sessionDiagnosticsSaveTimer = null;
 let sessionDiagnosticsSaveInFlight = null;
 let sessionDiagnosticsSavePending = false;
@@ -2303,37 +2411,45 @@ function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
   }
   sessionLogsSaveTimer = setTimeout(() => {
     sessionLogsSaveTimer = null;
-    try {
-      saveSessionLogs();
-      sessionLogsSavePending = false;
-      sessionLogsSaveError = null;
-    } catch (error) {
-      sessionLogsSaveError = error;
+    void flushSessionLogsSave().catch((error) => {
       console.warn(`[relay] failed to save session logs: ${error.message}`);
-    }
+    });
   }, Math.max(0, Number(delayMs) || 0));
   if (typeof sessionLogsSaveTimer.unref === 'function') {
     sessionLogsSaveTimer.unref();
   }
 }
 
-function flushSessionLogsSave() {
-  if (!sessionLogsSavePending) {
-    return null;
-  }
-  if (sessionLogsSaveTimer) {
-    clearTimeout(sessionLogsSaveTimer);
-    sessionLogsSaveTimer = null;
-  }
-  try {
-    saveSessionLogs();
+async function flushSessionLogsSave() {
+  while (sessionLogsSaveInFlight || sessionLogsSavePending) {
+    if (sessionLogsSaveInFlight) {
+      await sessionLogsSaveInFlight;
+      continue;
+    }
+    if (sessionLogsSaveTimer) {
+      clearTimeout(sessionLogsSaveTimer);
+      sessionLogsSaveTimer = null;
+    }
     sessionLogsSavePending = false;
-    sessionLogsSaveError = null;
-    return null;
-  } catch (error) {
-    sessionLogsSaveError = error;
-    throw error;
+    const savePromise = saveSessionLogs()
+      .then(() => {
+        sessionLogsSaveError = null;
+        sessionLogsNeedsNormalization = false;
+      })
+      .catch((error) => {
+        sessionLogsSaveError = error;
+        throw error;
+      });
+    sessionLogsSaveInFlight = savePromise;
+    try {
+      await savePromise;
+    } finally {
+      if (sessionLogsSaveInFlight === savePromise) {
+        sessionLogsSaveInFlight = null;
+      }
+    }
   }
+  return null;
 }
 
 function scheduleSessionDiagnosticsSave(delayMs = PERSIST_DEBOUNCE_MS) {
@@ -2396,7 +2512,7 @@ async function flushSessionDiagnosticsSave() {
 }
 
 async function flushAgentEventBatchPersistence() {
-  flushSessionLogsSave();
+  await flushSessionLogsSave();
   await flushSessionDiagnosticsSave();
   if (sessionDiagnosticsSaveError) {
     throw sessionDiagnosticsSaveError;
@@ -2456,8 +2572,6 @@ const state = {
   sessionDiscoveryRequests: new Map(),
   missingManagedDiscoveryRuns: new Map(),
   inputRequestCache: new Map(),
-  inputRequestReservations: new Map(),
-  inputRequestsInFlight: new Map(),
   pendingInputProjectionCheckpoints: new Map(),
   inputCommandOutbox,
   agentEventLedger,
@@ -2957,33 +3071,12 @@ function inputRequestCacheKey(hostId, sessionId, clientRequestId, runId = '') {
   return requestId ? `${hostId}::${sessionId}::${requestId}` : '';
 }
 
-let inputSubmissionReservationOrdinal = 0;
-
-function nextInputSubmissionReservationOrdinal() {
-  inputSubmissionReservationOrdinal += 1;
-  return inputSubmissionReservationOrdinal;
-}
-
 function inputRequestConflictError(message = '') {
   return new SessionContractError(
     'input_request_id_conflict',
     message || 'The same clientRequestId was reused with different prompt content.',
     { statusCode: 409 }
   );
-}
-
-function inputReservationConflictError() {
-  return new SessionContractError(
-    'session_input_identity_conflict',
-    'The Session identity changed while multiple prompts were being prepared. The conflicting prompt was not queued.',
-    { statusCode: 409 }
-  );
-}
-
-function earlierInputReservation(left, right) {
-  const leftOrdinal = Number(left?.ordinal || Number.MAX_SAFE_INTEGER);
-  const rightOrdinal = Number(right?.ordinal || Number.MAX_SAFE_INTEGER);
-  return leftOrdinal <= rightOrdinal ? left : right;
 }
 
 function pruneInputRequestCache() {
@@ -3065,69 +3158,6 @@ function inputRequestFingerprint(body = {}) {
   })).digest('hex');
 }
 
-function reserveInputRequest(cacheKey, fingerprint, identity = {}) {
-  const ordinal = nextInputSubmissionReservationOrdinal();
-  if (!cacheKey) {
-    return {
-      owner: true,
-      cacheKey: '',
-      fingerprint,
-      promise: null,
-      ordinal,
-      hostId: String(identity.hostId || '').trim(),
-      scopeKey: String(identity.scopeKey || '').trim(),
-      clientRequestId: null,
-      keys: new Set(),
-    };
-  }
-  const existing = state.inputRequestsInFlight.get(cacheKey);
-  if (existing) {
-    if (existing.cancelledError) throw existing.cancelledError;
-    if (existing.fingerprint !== fingerprint) {
-      throw inputRequestConflictError();
-    }
-    return { ...existing, owner: false };
-  }
-  let resolveRequest;
-  let rejectRequest;
-  const promise = new Promise((resolve, reject) => {
-    resolveRequest = resolve;
-    rejectRequest = reject;
-  });
-  promise.catch(() => {});
-  const reservation = {
-    owner: true,
-    cacheKey,
-    fingerprint,
-    promise,
-    resolveRequest,
-    rejectRequest,
-    createdAtMs: Date.now(),
-    ordinal,
-    hostId: String(identity.hostId || '').trim(),
-    scopeKey: String(identity.scopeKey || '').trim(),
-    clientRequestId: normalizeClientRequestId(identity.clientRequestId) || null,
-    keys: new Set([cacheKey]),
-    cancelledError: null,
-    settled: false,
-  };
-  state.inputRequestsInFlight.set(cacheKey, reservation);
-  return reservation;
-}
-
-function settleInputRequest(reservation, error, payload = null) {
-  if (!reservation?.cacheKey) return;
-  if (reservation.settled) return;
-  reservation.settled = true;
-  for (const key of reservation.keys || [reservation.cacheKey]) {
-    if (state.inputRequestsInFlight.get(key) === reservation) {
-      state.inputRequestsInFlight.delete(key);
-    }
-  }
-  if (error) reservation.rejectRequest(error);
-  else reservation.resolveRequest(payload);
-}
-
 function inputRequestPayloadCommandId(entry) {
   const id = Number(entry?.payload?.command?.id || 0);
   return Number.isSafeInteger(id) && id > 0 ? id : null;
@@ -3182,90 +3212,6 @@ function migrateInputRequestCacheScope(loserKey, winnerKey) {
   }
 }
 
-function migrateInputRequestsInFlightScope(loserKey, winnerKey) {
-  const reservations = [...new Set(state.inputRequestsInFlight.values())];
-  for (const reservation of reservations) {
-    if (
-      !reservation
-      || reservation.scopeKey !== loserKey
-      || !reservation.hostId
-      || !reservation.clientRequestId
-    ) {
-      continue;
-    }
-    const previousKey = reservation.cacheKey;
-    const nextKey = inputRequestCacheKey(
-      reservation.hostId,
-      winnerKey,
-      reservation.clientRequestId
-    );
-    if (!nextKey || nextKey === previousKey) {
-      reservation.scopeKey = winnerKey;
-      continue;
-    }
-    const existing = state.inputRequestsInFlight.get(nextKey);
-    if (!existing || existing === reservation) {
-      if (state.inputRequestsInFlight.get(previousKey) === reservation) {
-        state.inputRequestsInFlight.delete(previousKey);
-      }
-      reservation.cacheKey = nextKey;
-      reservation.scopeKey = winnerKey;
-      reservation.keys?.add(nextKey);
-      state.inputRequestsInFlight.set(nextKey, reservation);
-      continue;
-    }
-
-    const primary = earlierInputReservation(reservation, existing);
-    const secondary = primary === reservation ? existing : reservation;
-    const conflict = reservation.fingerprint === existing.fingerprint
-      ? inputReservationConflictError()
-      : inputRequestConflictError();
-    secondary.cancelledError ||= conflict;
-    if (state.inputRequestsInFlight.get(previousKey) === reservation) {
-      state.inputRequestsInFlight.delete(previousKey);
-    }
-    for (const key of secondary.keys || []) {
-      if (state.inputRequestsInFlight.get(key) === secondary) {
-        state.inputRequestsInFlight.delete(key);
-      }
-    }
-    primary.cacheKey = nextKey;
-    primary.scopeKey = winnerKey;
-    primary.keys?.add(nextKey);
-    state.inputRequestsInFlight.set(nextKey, primary);
-  }
-}
-
-function migrateSessionInputReservationScope(loserKey, winnerKey) {
-  const reservation = state.inputRequestReservations.get(loserKey);
-  if (!reservation) return;
-  const existing = state.inputRequestReservations.get(winnerKey);
-  if (!existing || existing === reservation) {
-    if (state.inputRequestReservations.get(loserKey) === reservation) {
-      state.inputRequestReservations.delete(loserKey);
-    }
-    reservation.key = winnerKey;
-    reservation.keys?.add(winnerKey);
-    state.inputRequestReservations.set(winnerKey, reservation);
-    return;
-  }
-
-  const primary = earlierInputReservation(reservation, existing);
-  const secondary = primary === reservation ? existing : reservation;
-  secondary.cancelledError ||= inputReservationConflictError();
-  if (state.inputRequestReservations.get(loserKey) === reservation) {
-    state.inputRequestReservations.delete(loserKey);
-  }
-  for (const key of secondary.keys || []) {
-    if (state.inputRequestReservations.get(key) === secondary) {
-      state.inputRequestReservations.delete(key);
-    }
-  }
-  primary.key = winnerKey;
-  primary.keys?.add(winnerKey);
-  state.inputRequestReservations.set(winnerKey, primary);
-}
-
 function migrateInputRequestScope(loserKey, winnerKey) {
   const loser = String(loserKey || '').trim();
   const winner = String(winnerKey || '').trim();
@@ -3278,8 +3224,6 @@ function migrateInputRequestScope(loserKey, winnerKey) {
     state.inputCommandOutbox.migrateScope(hostId, loser, winner);
   }
   migrateInputRequestCacheScope(loser, winner);
-  migrateInputRequestsInFlightScope(loser, winner);
-  migrateSessionInputReservationScope(loser, winner);
 }
 
 function inputSessionScopeKey(hostId, sessionId) {
@@ -3288,106 +3232,9 @@ function inputSessionScopeKey(hostId, sessionId) {
     || sessionKey(hostId, sessionId);
 }
 
-function reserveSessionInput(hostId, sessionId, runId, clientRequestId, scopeKey = '', ordinal = 0) {
-  const key = scopeKey || inputSessionScopeKey(hostId, sessionId);
-  const existing = state.inputRequestReservations.get(key);
-  if (existing) {
-    return {
-      ok: false,
-      code: 'session_input_preparing',
-      error: 'A prompt for this Session is already being prepared. Wait for it to be queued before trying again.',
-      clientRequestId: existing.clientRequestId || null,
-    };
-  }
-
-  const runtimeKey = resolveSessionKey(hostId, sessionId);
-  const runtime = state.sessionRuntime.get(runtimeKey)
-    || state.sessionRuntime.get(key)
-    || {};
-  const phase = String(runtime.phase || '').trim().toLowerCase();
-  if (phase === 'stop-failed') {
-    return {
-      ok: false,
-      code: 'session_stop_failed',
-      error: 'The previous Stop failed and this runtime cannot accept new prompts. Retry Stop, then Resume the Session.',
-      phase,
-    };
-  }
-  const terminalPhase = ['idle', 'completed', 'error', 'interrupted', 'closed', 'stop-failed'].includes(phase);
-  const pending = Boolean(
-    runtime.busy === true
-    || runtime.activeTurnId
-    || runtime.waitingOnApproval === true
-    || runtime.waitingOnUserInput === true
-    || (runtime.queuedCommandId && !terminalPhase)
-  );
-  if (pending) {
-    return {
-      ok: false,
-      code: 'session_turn_active',
-      error: 'Codex is still working on the previous turn. Wait for it to finish or interrupt it before sending another prompt.',
-      queuedCommandId: runtime.queuedCommandId || null,
-      phase: runtime.phase || null,
-      activeTurnId: runtime.activeTurnId || null,
-      busy: runtime.busy === true,
-    };
-  }
-
-  const reservation = {
-    ok: true,
-    key,
-    keys: new Set([key]),
-    token: makeId(),
-    ordinal: Number(ordinal || 0) || nextInputSubmissionReservationOrdinal(),
-    hostId: String(hostId || '').trim(),
-    sessionId: String(sessionId || '').trim(),
-    runId: String(runId || '').trim() || null,
-    runtimeKey,
-    runtimeRevision: normalizedRuntimeRevision(runtime),
-    runtimeRunId: String(runtime.runId || '').trim() || null,
-    clientRequestId: normalizeClientRequestId(clientRequestId) || null,
-    cancelledError: null,
-  };
-  state.inputRequestReservations.set(key, reservation);
-  return reservation;
-}
-
-function releaseSessionInputReservation(reservation) {
-  if (!reservation?.ok || !reservation.key) return false;
-  let released = false;
-  for (const key of reservation.keys || [reservation.key]) {
-    const current = state.inputRequestReservations.get(key);
-    if (current?.token !== reservation.token) continue;
-    state.inputRequestReservations.delete(key);
-    released = true;
-  }
-  return released;
-}
-
-function assertInputSubmissionOwnership(hostId, sessionId, requestReservation, inputReservation) {
-  const currentScopeKey = inputSessionScopeKey(hostId, sessionId);
-  if (currentScopeKey && currentScopeKey !== inputReservation.key) {
-    migrateInputRequestScope(inputReservation.key, currentScopeKey);
-  }
-  if (requestReservation?.cancelledError) throw requestReservation.cancelledError;
-  if (
-    requestReservation?.cacheKey
-    && state.inputRequestsInFlight.get(requestReservation.cacheKey) !== requestReservation
-  ) {
-    throw inputReservationConflictError();
-  }
-  if (inputReservation?.cancelledError) throw inputReservation.cancelledError;
-  const current = state.inputRequestReservations.get(inputReservation.key);
-  if (!current || current.token !== inputReservation.token) {
-    throw inputReservationConflictError();
-  }
-  return true;
-}
-
-function assertInputRuntimeStillAvailable(hostId, sessionId, expectedRunId, inputReservation) {
-  const runtimeKey = resolveSessionKey(hostId, sessionId);
-  const runtime = state.sessionRuntime.get(runtimeKey)
-    || state.sessionRuntime.get(inputReservation?.key)
+function assertSessionInputAvailable(hostId, sessionId) {
+  const runtime = state.sessionRuntime.get(resolveSessionKey(hostId, sessionId))
+    || state.sessionRuntime.get(inputSessionScopeKey(hostId, sessionId))
     || {};
   const phase = String(runtime.phase || '').trim().toLowerCase();
   if (phase === 'stop-failed') {
@@ -3408,36 +3255,13 @@ function assertInputRuntimeStillAvailable(hostId, sessionId, expectedRunId, inpu
   if (pending) {
     throw new SessionContractError(
       'session_turn_active',
-      'Codex started another turn while this prompt was being prepared. Wait for it to finish or interrupt it before retrying.',
+      'Codex is still working on the previous turn. Wait for it to finish or interrupt it before sending another prompt.',
       {
         statusCode: 409,
         queuedCommandId: runtime.queuedCommandId || null,
         phase: runtime.phase || null,
         activeTurnId: runtime.activeTurnId || null,
         busy: runtime.busy === true,
-      }
-    );
-  }
-
-  const expected = String(expectedRunId || '').trim();
-  const capturedRunId = String(inputReservation?.runtimeRunId || '').trim();
-  const currentRunId = String(runtime.runId || '').trim();
-  const capturedRevision = Number(inputReservation?.runtimeRevision || 0);
-  const currentRevision = normalizedRuntimeRevision(runtime);
-  if (
-    capturedRunId !== currentRunId
-    || capturedRevision !== currentRevision
-  ) {
-    throw new SessionContractError(
-      'session_runtime_changed',
-      'The Session runtime changed while this prompt was being prepared. Review the current state and retry.',
-      {
-        statusCode: 409,
-        expectedRunId: expected || null,
-        capturedRuntimeRunId: capturedRunId || null,
-        currentRunId: currentRunId || null,
-        expectedRuntimeRevision: capturedRevision || null,
-        currentRuntimeRevision: currentRevision || null,
       }
     );
   }
@@ -5566,8 +5390,45 @@ function normalizeSessionWatchRevision(value) {
   return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
 }
 
+function sessionWatchIdentityBinding(hostId, requestedSessionId, session = {}) {
+  const identity = {
+    hostId,
+    sessionId: requestedSessionId,
+    bridgeSessionId: session.bridgeSessionId || null,
+    nativeThreadId: session.nativeThreadId || null,
+  };
+  const record = state.provenance?.getSessionRecord(identity) || null;
+  const canonicalKey = state.sessionRecordStore?.resolveCanonicalKey(identity) || '';
+  const hostPrefix = `${hostId}::`;
+  const canonicalSessionId = canonicalKey.startsWith(hostPrefix)
+    ? canonicalKey.slice(hostPrefix.length)
+    : null;
+  const rolloutSessionIds = [...new Set([
+    record?.rolloutSessionId,
+    ...(Array.isArray(record?.rolloutSessionIds) ? record.rolloutSessionIds : []),
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+  const identityCandidates = [...new Set([
+    ...rolloutSessionIds,
+    canonicalSessionId,
+    requestedSessionId,
+    session.sessionId,
+    session.nativeThreadId,
+    session.bridgeSessionId,
+    record?.nativeThreadId,
+    record?.bridgeSessionId,
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+  return {
+    canonicalSessionId,
+    rolloutSessionId: rolloutSessionIds[0] || null,
+    rolloutSessionIds,
+    identityCandidates,
+    runId: session.runId || record?.activeRunId || null,
+  };
+}
+
 function enqueueSessionWatch(hostId, sessionId, body = {}) {
   const session = getSession(hostId, sessionId) || {};
+  const binding = sessionWatchIdentityBinding(hostId, sessionId, session);
   return enqueueCommand(hostId, {
     type: 'session.watch',
     sessionId,
@@ -5575,16 +5436,15 @@ function enqueueSessionWatch(hostId, sessionId, body = {}) {
     clientId: body.clientId || null,
     viewId: body.viewId || null,
     watchRevision: normalizeSessionWatchRevision(body.watchRevision),
-    nativeThreadId: body.nativeThreadId || session.nativeThreadId || null,
-    bridgeSessionId: body.bridgeSessionId || session.bridgeSessionId || null,
-    originSessionId: body.originSessionId || session.originSessionId || null,
-    sourceSessionId: body.sourceSessionId || session.sourceSessionId || null,
-    conversationKey: body.conversationKey || session.conversationKey || null,
+    nativeThreadId: session.nativeThreadId || null,
+    bridgeSessionId: session.bridgeSessionId || null,
+    ...binding,
   });
 }
 
 function enqueueSessionUnwatch(hostId, sessionId, body = {}) {
   const session = getSession(hostId, sessionId) || {};
+  const binding = sessionWatchIdentityBinding(hostId, sessionId, session);
   return enqueueCommand(hostId, {
     type: 'session.unwatch',
     sessionId,
@@ -5592,11 +5452,9 @@ function enqueueSessionUnwatch(hostId, sessionId, body = {}) {
     clientId: body.clientId || null,
     viewId: body.viewId || null,
     watchRevision: normalizeSessionWatchRevision(body.watchRevision),
-    nativeThreadId: body.nativeThreadId || session.nativeThreadId || null,
-    bridgeSessionId: body.bridgeSessionId || session.bridgeSessionId || null,
-    originSessionId: body.originSessionId || session.originSessionId || null,
-    sourceSessionId: body.sourceSessionId || session.sourceSessionId || null,
-    conversationKey: body.conversationKey || session.conversationKey || null,
+    nativeThreadId: session.nativeThreadId || null,
+    bridgeSessionId: session.bridgeSessionId || null,
+    ...binding,
   });
 }
 
@@ -8929,13 +8787,17 @@ function setSessionLog(hostId, sessionId, entries, options = {}) {
   const normalized = (Array.isArray(entries) ? entries : [])
     .map(normalizeStoredTranscriptEntry)
     .filter(Boolean);
-  const existing = options.merge ? state.sessionLogs.get(key) || [] : [];
-  state.sessionLogs.set(
-    key,
-    compactTranscriptEntries(mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT))
-      .slice(-SESSION_LOG_ENTRY_LIMIT)
-  );
+  const current = state.sessionLogs.get(key) || [];
+  const existing = options.merge ? current : [];
+  const next = compactTranscriptEntries(
+    mergeByFingerprint([...existing, ...normalized], transcriptFingerprint, SESSION_LOG_ENTRY_LIMIT)
+  ).slice(-SESSION_LOG_ENTRY_LIMIT);
+  if (JSON.stringify(current) === JSON.stringify(next)) {
+    return false;
+  }
+  state.sessionLogs.set(key, next);
   scheduleSessionLogsSave();
+  return true;
 }
 
 function setSessionDiagnostics(hostId, sessionId, entries, options = {}) {
@@ -9007,8 +8869,164 @@ function setSessionRuntime(hostId, sessionId, runtime) {
     ...runtime,
     updatedAt: runtime.updatedAt || nowIso(),
   };
+  const incomingPhase = String(runtime.phase || '').trim().toLowerCase();
+  if (
+    ['idle', 'error', 'interrupted', 'closed', 'quota-exhausted'].includes(incomingPhase)
+    && runtime.activeTurnId == null
+    && runtime.busy === false
+  ) {
+    next.queuedCommandId = null;
+    next.pendingClientRequestId = null;
+    next.queuedInputAt = null;
+    next.pendingInputSummary = null;
+    next.preparingClientRequestId = null;
+    next.preparingInputAt = null;
+    next.inputPreparationExpiresAt = null;
+  }
   state.sessionRuntime.set(key, next);
   return next;
+}
+
+function projectManagedStartFailure(hostId, sessionId, runId, failedRecord, details = {}) {
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const fallbackRunId = String(failedRecord?.activeRunId || '').trim();
+  const fallbackRun = fallbackRunId ? failedRecord?.runs?.[fallbackRunId] || null : null;
+  if (!fallbackRunId || fallbackRunId === runId || fallbackRun?.status !== 'live') {
+    return projectTerminalManagedStartFailure(hostId, effectiveSessionId, runId, details);
+  }
+
+  const timestamp = details.timestamp || nowIso();
+  const code = String(details.code || 'session_command_failed').trim() || 'session_command_failed';
+  const message = String(details.message || 'Session start failed.');
+  const currentSession = getSession(hostId, effectiveSessionId) || getSession(hostId, sessionId);
+  const stopFence = pendingSessionStopFences.get(
+    resolveSessionKey(hostId, effectiveSessionId)
+  ) || null;
+  const parentStopPending = Boolean(
+    stopFence
+    && (!stopFence.runId || String(stopFence.runId) === fallbackRunId)
+  );
+  const fallbackBinding = publicBinding(fallbackRun.apiBinding);
+  const fallbackProfile = fallbackBinding?.kind === 'profile' ? {
+    profileId: fallbackBinding.profileId || null,
+    label: fallbackBinding.label || fallbackBinding.provider || 'API profile',
+    provider: fallbackBinding.provider || null,
+    baseUrl: fallbackBinding.normalizedBaseUrl || null,
+  } : null;
+  const projected = projectSessionRuntimeState(hostId, effectiveSessionId, {
+    sessionId: currentSession?.sessionId || effectiveSessionId,
+    state: parentStopPending ? 'ending' : 'running',
+    live: true,
+    runId: fallbackRunId,
+    nativeThreadId: failedRecord?.nativeThreadId || currentSession?.nativeThreadId || null,
+    launchMode: fallbackRun.launchMode || currentSession?.launchMode || null,
+    apiBinding: fallbackBinding,
+    apiProfile: fallbackProfile,
+    activeRunId: fallbackRunId,
+    latestSuccessfulRunId: failedRecord?.latestSuccessfulRunId || fallbackRunId,
+    requestedSelection: fallbackRun.requestedSelection || null,
+    effectiveSelection: fallbackRun.effectiveSelection || null,
+    resumeError: {
+      code,
+      error: message,
+      stage: details.stage || 'start',
+      canRebind: Boolean(details.canRebind),
+      canTranscriptFallback: sessionCanTranscriptFallback(hostId, effectiveSessionId),
+    },
+    lastUpdatedAt: timestamp,
+  }, {
+    runtimeRevision: null,
+    connection: parentStopPending ? 'closing' : 'ready',
+    phase: parentStopPending ? 'ending' : 'idle',
+    busy: false,
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+    activeTurnId: null,
+    currentTurnStatus: parentStopPending ? 'stopping' : 'idle',
+    queuedCommandId: null,
+    pendingClientRequestId: null,
+    queuedInputAt: null,
+    pendingInputSummary: null,
+    preparingClientRequestId: null,
+    preparingInputAt: null,
+    inputPreparationExpiresAt: null,
+    nativeResumeReady: fallbackRun.nativeResumeReady === true,
+    runId: fallbackRunId,
+    lastError: message,
+    updatedAt: timestamp,
+  }, { preserveManagedLive: false });
+  broadcastSessionRuntimePatch(hostId, projected.session.sessionId, projected.runtime, {
+    runId: fallbackRunId,
+    timestamp,
+  });
+  broadcastSessionEvent(
+    hostId,
+    projected.session.sessionId,
+    'session.state_changed',
+    projected.session
+  );
+  broadcastSessionEvent(
+    hostId,
+    projected.session.sessionId,
+    'session.snapshot',
+    projected.session
+  );
+  return projected.session;
+}
+
+function projectTerminalManagedStartFailure(hostId, sessionId, runId, details = {}) {
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const timestamp = details.timestamp || nowIso();
+  const code = String(details.code || 'session_command_failed').trim() || 'session_command_failed';
+  const message = String(details.message || 'Session start failed.');
+  const terminalRuntimePatch = {
+    connection: 'closed',
+    phase: 'closed',
+    busy: false,
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+    activeTurnId: null,
+    currentTurnStatus: 'closed',
+    queuedCommandId: null,
+    pendingClientRequestId: null,
+    pendingInputSummary: null,
+    runId,
+    updatedAt: timestamp,
+  };
+  const runtime = setSessionRuntime(hostId, effectiveSessionId, terminalRuntimePatch);
+  const currentSession = getSession(hostId, effectiveSessionId) || getSession(hostId, sessionId);
+  const failedSession = upsertSession(hostId, {
+    sessionId: currentSession?.sessionId || effectiveSessionId,
+    state: `failed:${code}`,
+    live: false,
+    runId,
+    runtime,
+    resumeError: {
+      code,
+      error: message,
+      stage: 'start',
+      canRebind: Boolean(details.canRebind),
+      canTranscriptFallback: sessionCanTranscriptFallback(hostId, effectiveSessionId),
+    },
+    lastUpdatedAt: timestamp,
+  }, { preserveManagedLive: false });
+  broadcastSessionRuntimePatch(hostId, failedSession.sessionId, terminalRuntimePatch, {
+    runId,
+    timestamp,
+  });
+  broadcastSessionEvent(hostId, failedSession.sessionId, 'session.state_changed', failedSession);
+  broadcastSessionEvent(hostId, failedSession.sessionId, 'session.snapshot', failedSession);
+  return failedSession;
+}
+
+function projectSessionRuntimeState(hostId, sessionId, sessionPatch, runtimePatch, options = {}) {
+  const runtime = setSessionRuntime(hostId, sessionId, runtimePatch);
+  const session = upsertSession(hostId, {
+    ...(sessionPatch || {}),
+    sessionId,
+    runtime,
+  }, options);
+  return { session, runtime };
 }
 
 function appendSessionDiagnostic(hostId, sessionId, entry) {
@@ -9054,6 +9072,19 @@ function emitSessionDiagnostic(hostId, sessionId, entry) {
   return payload;
 }
 
+function broadcastSessionRuntimePatch(hostId, sessionId, patch = {}, options = {}) {
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const timestamp = options.timestamp || patch.updatedAt || nowIso();
+  const runId = options.runId || patch.runId || null;
+  return broadcastSessionEvent(hostId, effectiveSessionId, 'session.runtime_updated', {
+    hostId,
+    sessionId: effectiveSessionId,
+    ...(runId ? { runId } : {}),
+    patch,
+    timestamp,
+  });
+}
+
 function emitSessionRuntimePatch(hostId, sessionId, patch = {}) {
   const effectiveSessionId = resolveSessionId(hostId, sessionId);
   const existing = state.sessionRuntime.get(resolveSessionKey(hostId, effectiveSessionId)) || {};
@@ -9070,12 +9101,7 @@ function emitSessionRuntimePatch(hostId, sessionId, patch = {}) {
     runtime,
     lastUpdatedAt: timestamp,
   });
-  broadcastSessionEvent(hostId, effectiveSessionId, 'session.runtime_updated', {
-    hostId,
-    sessionId: effectiveSessionId,
-    patch,
-    timestamp,
-  });
+  broadcastSessionRuntimePatch(hostId, effectiveSessionId, patch, { timestamp });
   return runtime;
 }
 
@@ -9667,7 +9693,7 @@ function reconcileRecoveredInputTranscriptProjections(projectionWork = []) {
     }
     queueInputTranscriptProjectionCheckpoint(entry);
   }
-  if (projectionWork.length) saveSessionLogs();
+  if (projectionWork.length) scheduleSessionLogsSave(0);
   return changed;
 }
 
@@ -11001,13 +11027,26 @@ function connectorPrefersKeyboardInteractive(connector) {
   ].some((method) => ['keyboard_interactive', 'otp', 'manual_captcha'].includes(method));
 }
 
+function connectorAllowsTargetPublicKey(connector) {
+  const targetMethod = connector.auth?.method || 'ssh_key';
+  return Boolean(connector.auth?.keyPath)
+    || targetMethod === 'ssh_key'
+    || targetMethod === 'ssh_agent';
+}
+
 function connectorPreferredAuthentications(connector, secret) {
   if (!connectorUsesAskpass(connector, secret)) {
     return undefined;
   }
-  return connectorPrefersKeyboardInteractive(connector)
-    ? 'publickey,keyboard-interactive,password'
-    : 'publickey,password,keyboard-interactive';
+  const allowPublicKey = connectorAllowsTargetPublicKey(connector);
+  if (connectorPrefersKeyboardInteractive(connector)) {
+    return allowPublicKey
+      ? 'publickey,keyboard-interactive,password'
+      : 'keyboard-interactive,password';
+  }
+  return allowPublicKey
+    ? 'publickey,password,keyboard-interactive'
+    : 'password,keyboard-interactive';
 }
 
 function connectorNeedsManualAuth(connector, secret) {
@@ -11071,6 +11110,7 @@ function ensureAskpassHelper() {
     '  }',
     '  exit 1',
     '}',
+    'Try-BrokerPrompt | Out-Null',
     '$index = 1',
     'if ($env:RC_ASKPASS_STATE_FILE -and (Test-Path -LiteralPath $env:RC_ASKPASS_STATE_FILE)) { try { $index = [int](Get-Content -LiteralPath $env:RC_ASKPASS_STATE_FILE -TotalCount 1) } catch { $index = 1 } }',
     'if ($index -lt 1) { $index = 1 }',
@@ -11085,15 +11125,15 @@ function ensureAskpassHelper() {
     '  $b64 = $env:RC_ASKPASS_PASSWORD_PROMPT_B64',
     '}',
     '$answer = Decode-B64 $b64',
-    'if (-not [string]::IsNullOrWhiteSpace($answer)) { [Console]::Out.Write($answer); exit 0 }',
-    'Try-BrokerPrompt | Out-Null',
-    'exit 1',
+    'if ([string]::IsNullOrWhiteSpace($answer)) { exit 1 }',
+    '[Console]::Out.Write($answer)',
   ].join('\r\n');
   const script = [
     '@echo off',
     'setlocal EnableExtensions',
     'set "RC_ASKPASS_PROMPT=%*"',
     `powershell -NoProfile -ExecutionPolicy Bypass -File "${helperScriptPath.replace(/"/g, '""')}"`,
+    'exit /b %ERRORLEVEL%',
   ].join('\r\n');
   fs.mkdirSync(path.dirname(helperPath), { recursive: true });
   fs.writeFileSync(helperScriptPath, psScript, 'utf8');
@@ -11207,6 +11247,29 @@ function sshRunText(run) {
   ].filter(Boolean).join('\n');
 }
 
+function classifyConnectorSshAuthenticationFailure(run) {
+  const text = sshRunText(run);
+  if (/too many authentication failures/i.test(text)) {
+    return {
+      status: 'ssh_authentication_attempts_exhausted',
+      message: 'SSH exhausted the remote authentication-attempt limit before login completed.',
+    };
+  }
+  if (/permission denied \((?:keyboard-interactive(?:,password)?|password,keyboard-interactive)\)/i.test(text)) {
+    return {
+      status: 'keyboard_interactive_denied',
+      message: 'SSH keyboard-interactive authentication was rejected. Enter a current password or OTP in the browser prompt.',
+    };
+  }
+  if (/host key verification failed/i.test(text)) {
+    return {
+      status: 'ssh_host_key_failed',
+      message: 'SSH host-key verification failed before the remote runtime probe could run.',
+    };
+  }
+  return null;
+}
+
 function buildScpCommandParts(connector, localSources, remoteDirectory, options = {}) {
   if (!connector.targetHost) {
     return null;
@@ -11228,6 +11291,12 @@ function buildScpCommandParts(connector, localSources, remoteDirectory, options 
   if (options.preferredAuthentications) {
     args.push('-o', `PreferredAuthentications=${options.preferredAuthentications}`);
   }
+  if (options.pubkeyAuthentication) {
+    args.push('-o', `PubkeyAuthentication=${options.pubkeyAuthentication}`);
+  }
+  if (options.identityAgent) {
+    args.push('-o', `IdentityAgent=${options.identityAgent}`);
+  }
   if (options.controlMaster) {
     args.push('-o', `ControlMaster=${options.controlMaster}`);
   }
@@ -11241,7 +11310,7 @@ function buildScpCommandParts(connector, localSources, remoteDirectory, options 
     args.push('-o', `StreamLocalBindUnlink=${options.streamLocalBindUnlink}`);
   }
   if (connector.auth?.keyPath) {
-    args.push('-i', connector.auth.keyPath);
+    args.push('-o', `IdentityFile=${connector.auth.keyPath}`);
     args.push('-o', 'IdentitiesOnly=yes');
     args.push('-o', 'IdentityAgent=none');
   }
@@ -11613,7 +11682,11 @@ function buildSshActionOptions(connector, action, secret) {
 
   if (useAskpass) {
     options.preferredAuthentications = connectorPreferredAuthentications(connector, secret);
-    options.numberOfPasswordPrompts = 6;
+    options.numberOfPasswordPrompts = 1;
+    if (!connectorAllowsTargetPublicKey(connector)) {
+      options.pubkeyAuthentication = 'no';
+      options.identityAgent = 'none';
+    }
   } else {
     options.batchMode = true;
   }
@@ -11655,12 +11728,16 @@ async function probeConnectorBootstrapRuntime(connector, secret) {
   const match = String(run.stdout || '').match(/CODEX_REMOTE_ARCH=([^\s]+)/);
   const architecture = normalizeLinuxArchitecture(match?.[1]);
   if (run.exitCode !== 0 || !architecture) {
+    const authenticationFailure = run.exitCode !== 0
+      ? classifyConnectorSshAuthenticationFailure(run)
+      : null;
     return {
       ok: false,
-      status: run.exitCode === 0 ? 'remote_architecture_unsupported' : 'remote_probe_failed',
-      message: run.exitCode === 0
+      status: authenticationFailure?.status
+        || (run.exitCode === 0 ? 'remote_architecture_unsupported' : 'remote_probe_failed'),
+      message: authenticationFailure?.message || (run.exitCode === 0
         ? `Unsupported remote Linux architecture: ${match?.[1] || 'unknown'}.`
-        : 'Unable to probe the remote Linux architecture before bootstrap.',
+        : 'Unable to probe the remote Linux architecture before bootstrap.'),
       step: { name: 'remote_runtime_probe', ...run },
     };
   }
@@ -12031,6 +12108,10 @@ function classifyOneShotBootstrapFailure(action, step) {
   }
   if (step?.error) {
     return { status: 'error', message: step.error };
+  }
+  const authenticationFailure = classifyConnectorSshAuthenticationFailure(step);
+  if (authenticationFailure) {
+    return authenticationFailure;
   }
   if (/CODEX_REMOTE_CHECK_AGENT=missing|CODEX_REMOTE_CHECK_SHARED=missing/.test(text)) {
     return { status: 'verify_failed', message: 'Remote bundle uploaded, but the host-agent files did not verify.' };
@@ -13947,9 +14028,17 @@ function resolveSessionCreatedAt(existing, patch) {
 function upsertSession(hostId, patch, options = {}) {
   const ownershipIdentities = sessionOwnershipIdentityValues(patch);
   const preserveManagedLive = options.preserveManagedLive !== false;
-  const managedLiveMatch = preserveManagedLive && patch.source !== 'managed' && patch.live !== true
+  // A managed live record is authoritative for every alternate identity it
+  // announces. Keep same-ID managed lifecycle updates free to advance state.
+  const managedLiveCandidate = preserveManagedLive
     ? findManagedLiveSessionByIdentities(hostId, ownershipIdentities)
     : null;
+  const patchExplicitlyNonManaged = Object.prototype.hasOwnProperty.call(patch || {}, 'source')
+    && patch.source !== 'managed';
+  const managedLiveMatch = managedLiveCandidate && (
+    managedLiveCandidate.sessionId !== patch.sessionId
+    || patchExplicitlyNonManaged
+  ) ? managedLiveCandidate : null;
   const canonicalSessionId = managedLiveMatch?.sessionId || resolveSessionId(hostId, patch.sessionId) || patch.sessionId;
   if (managedLiveMatch && patch.sessionId !== canonicalSessionId) {
     rememberSessionAlias(hostId, patch.sessionId, canonicalSessionId);
@@ -14064,14 +14153,9 @@ function commandPriority(command) {
 }
 
 function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
+  pendingSessionStopFences.delete(resolveSessionKey(hostId, sessionId));
   const existing = getSession(hostId, sessionId);
-  const next = upsertSession(hostId, {
-    sessionId,
-    state: stateName,
-    live: false,
-    runId: existing?.runId || null,
-    lastUpdatedAt: nowIso(),
-  }, { preserveManagedLive: false });
+  const timestamp = nowIso();
   const runtime = setSessionRuntime(hostId, sessionId, {
     phase: 'closed',
     connection: 'closed',
@@ -14081,14 +14165,17 @@ function markSessionClosed(hostId, sessionId, stateName = 'history-only') {
     waitingOnApproval: false,
     waitingOnUserInput: false,
     runId: existing?.runId || null,
-    updatedAt: nowIso(),
+    updatedAt: timestamp,
   });
-  broadcastSessionEvent(hostId, sessionId, 'session.runtime_updated', {
-    hostId,
+  const next = upsertSession(hostId, {
     sessionId,
-    patch: runtime,
-    timestamp: nowIso(),
-  });
+    state: stateName,
+    live: false,
+    runId: existing?.runId || null,
+    runtime,
+    lastUpdatedAt: timestamp,
+  }, { preserveManagedLive: false });
+  broadcastSessionRuntimePatch(hostId, sessionId, runtime, { timestamp });
   broadcastSessionEvent(hostId, sessionId, 'session.snapshot', next);
   return next;
 }
@@ -14114,8 +14201,25 @@ function isStaleSessionRunEvent(event, effectiveSessionId) {
   if (!event?.runId) {
     return false;
   }
+  const eventRunId = String(event.runId).trim();
+  const record = state.provenance?.getSessionRecord({
+    hostId: event.hostId,
+    sessionId: effectiveSessionId,
+  });
+  const activeRunId = String(record?.activeRunId || '').trim();
+  const activeRun = activeRunId ? record?.runs?.[activeRunId] || null : null;
+  if (
+    eventRunId === activeRunId
+    && ['pending', 'live'].includes(activeRun?.status)
+  ) {
+    return false;
+  }
+  const publishedLive = publishedLiveSessionRun(event.hostId, effectiveSessionId, record);
+  if (eventRunId === publishedLive?.runId) {
+    return false;
+  }
   const currentRunId = getCurrentSessionRunId(event.hostId, effectiveSessionId);
-  return Boolean(currentRunId && currentRunId !== event.runId);
+  return Boolean(currentRunId && currentRunId !== eventRunId);
 }
 
 function isDuplicateManagedStartFailureError(event, effectiveSessionId, message) {
@@ -14168,8 +14272,8 @@ function eventTargetsPublishedParentRun(event, effectiveSessionId) {
   );
 }
 
-function sessionAgeMs(session) {
-  const timestamp = Date.parse(session?.lastUpdatedAt || session?.createdAt || '');
+function sessionAgeMs(session, run = null) {
+  const timestamp = Date.parse(run?.createdAt || session?.lastUpdatedAt || session?.createdAt || '');
   return Number.isFinite(timestamp) ? Date.now() - timestamp : Infinity;
 }
 
@@ -14392,12 +14496,20 @@ async function closeManagedSessionsMissingFromDiscovery(hostId, managedRunPresen
   const evaluation = { decisions: new Map(), seen: new Set() };
   const discoveryId = String(options.discoveryId || '').trim();
   for (const session of Array.from(state.sessions.values())) {
-    if (session.hostId !== hostId || session.source !== 'managed' || !session.live) {
+    if (session.hostId !== hostId || session.source !== 'managed') {
       continue;
     }
     const record = state.provenance?.getSessionRecord({ hostId, sessionId: session.sessionId });
     const runId = String(session.runId || record?.activeRunId || '').trim();
     const run = runId ? record?.runs?.[runId] || null : null;
+    const stalePendingStart = Boolean(
+      !session.live
+      && session.state === 'starting'
+      && run?.status === 'pending'
+    );
+    if (!session.live && !stalePendingStart) {
+      continue;
+    }
     const missingKey = managedDiscoveryRunKey(hostId, session.sessionId, runId);
     if (managedDiscoveryReportsRun(
       managedRunPresence,
@@ -14407,12 +14519,54 @@ async function closeManagedSessionsMissingFromDiscovery(hostId, managedRunPresen
       noteManagedRunPresent(evaluation, missingKey);
       continue;
     }
-    if (session.state === 'starting' && sessionAgeMs(session) < STALE_MANAGED_SESSION_GRACE_MS) {
+    if (session.state === 'starting' && sessionAgeMs(session, run) < STALE_MANAGED_SESSION_GRACE_MS) {
       noteManagedRunPresent(evaluation, missingKey);
       continue;
     }
     const closeToken = confirmManagedRunMissing(evaluation, missingKey, discoveryId);
     if (!closeToken) {
+      continue;
+    }
+    if (stalePendingStart) {
+      const failed = await applyConfirmedManagedDiscoveryClose(closeToken, async () => {
+        if (!claimManagedDiscoveryCloseToken(closeToken)) {
+          return false;
+        }
+        const currentRecord = state.provenance?.getSessionRecord({ hostId, sessionId: session.sessionId });
+        const currentRun = currentRecord?.runs?.[runId] || null;
+        const projected = getSession(hostId, session.sessionId);
+        if (
+          currentRecord?.activeRunId !== runId
+          || currentRun?.status !== 'pending'
+          || projected?.runId !== runId
+          || projected?.state !== 'starting'
+          || projected?.live
+        ) {
+          return false;
+        }
+        const code = 'session_start_missing_from_host';
+        const message = 'The Host no longer reports the pending Session start.';
+        const failedRun = await failPlannedRun(hostId, session.sessionId, runId, { code, message });
+        if (failedRun?.transitioned !== true) {
+          return false;
+        }
+        projectManagedStartFailure(hostId, session.sessionId, runId, failedRun.record, {
+          code,
+          message,
+          canRebind: true,
+          timestamp: nowIso(),
+        });
+        emitSessionAlert(hostId, session.sessionId, {
+          severity: 'error',
+          source: 'runtime',
+          message,
+          timestamp: nowIso(),
+        });
+        return true;
+      });
+      if (failed) {
+        closedCount += 1;
+      }
       continue;
     }
     if (run?.status === 'live') {
@@ -14537,14 +14691,14 @@ function scheduleStopFallback(hostId, sessionId, options = {}) {
         return;
       }
 
-      const delayed = upsertSession(hostId, {
-        sessionId: session?.sessionId || sessionId,
+      const delayedSessionId = session?.sessionId || sessionId;
+      const timestamp = nowIso();
+      const projected = projectSessionRuntimeState(hostId, delayedSessionId, {
         state: 'ending',
         live: true,
         runId: expectedRunId,
-        lastUpdatedAt: nowIso(),
-      });
-      const delayedRuntime = setSessionRuntime(hostId, delayed.sessionId, {
+        lastUpdatedAt: timestamp,
+      }, {
         ...(runtime || {}),
         phase: 'ending',
         connection: 'closing',
@@ -14556,22 +14710,19 @@ function scheduleStopFallback(hostId, sessionId, options = {}) {
         pendingInputSummary: null,
         queuedCommandId: null,
         stopDelayed: true,
-        stopDelayedAt: nowIso(),
+        stopDelayedAt: timestamp,
         runId: expectedRunId || runtime?.runId || null,
-        updatedAt: nowIso(),
+        updatedAt: timestamp,
       });
-      broadcastSessionEvent(hostId, delayed.sessionId, 'session.runtime_updated', {
-        hostId,
-        sessionId: delayed.sessionId,
-        patch: delayedRuntime,
-        timestamp: nowIso(),
-      });
+      const delayed = projected.session;
+      const delayedRuntime = projected.runtime;
+      broadcastSessionRuntimePatch(hostId, delayed.sessionId, delayedRuntime, { timestamp });
       broadcastSessionEvent(hostId, delayed.sessionId, 'session.snapshot', delayed);
       emitSessionAlert(hostId, delayed.sessionId, {
         severity: 'warning',
         source: 'relay',
         message: 'Stop is taking longer than expected. The Session remains unavailable for new prompts until the Host confirms success or failure.',
-        timestamp: nowIso(),
+        timestamp,
       });
     })()).catch((error) => {
       console.error(`[relay] failed to reconcile unconfirmed Stop for ${hostId}/${sessionId}: ${error.message || error}`);
@@ -14588,23 +14739,21 @@ function projectStopFailedSession(hostId, sessionId, options = {}) {
   const timestamp = options.timestamp || nowIso();
   const currentSession = getSession(hostId, sessionId);
   const effectiveSessionId = currentSession?.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+  pendingSessionStopFences.delete(resolveSessionKey(hostId, effectiveSessionId));
   const runId = String(options.runId || currentSession?.runId || '').trim() || null;
   const message = String(
     options.message
       || 'The Host could not confirm that this Session stopped. Retry Stop, then Resume the Session.'
   );
-  const failedSession = upsertSession(hostId, {
-    sessionId: effectiveSessionId,
+  const previousRuntime = state.sessionRuntime.get(resolveSessionKey(hostId, effectiveSessionId))
+    || state.sessionRuntime.get(sessionKey(hostId, effectiveSessionId))
+    || {};
+  const projected = projectSessionRuntimeState(hostId, effectiveSessionId, {
     state: 'stop-failed',
     live: true,
     runId,
     lastUpdatedAt: timestamp,
-  }, { preserveManagedLive: false });
-  const runtimeKey = resolveSessionKey(hostId, failedSession.sessionId);
-  const previousRuntime = state.sessionRuntime.get(runtimeKey)
-    || state.sessionRuntime.get(sessionKey(hostId, failedSession.sessionId))
-    || {};
-  const failedRuntime = setSessionRuntime(hostId, failedSession.sessionId, {
+  }, {
     ...previousRuntime,
     phase: 'stop-failed',
     connection: options.connection || 'unknown',
@@ -14620,14 +14769,11 @@ function projectStopFailedSession(hostId, sessionId, options = {}) {
     lastError: message,
     runId,
     updatedAt: timestamp,
-  });
+  }, { preserveManagedLive: false });
+  const failedSession = projected.session;
+  const failedRuntime = projected.runtime;
   if (options.broadcast !== false) {
-    broadcastSessionEvent(hostId, failedSession.sessionId, 'session.runtime_updated', {
-      hostId,
-      sessionId: failedSession.sessionId,
-      patch: failedRuntime,
-      timestamp,
-    });
+    broadcastSessionRuntimePatch(hostId, failedSession.sessionId, failedRuntime, { timestamp });
     broadcastSessionEvent(hostId, failedSession.sessionId, 'session.snapshot', failedSession);
   }
   if (options.alert !== false) {
@@ -14650,6 +14796,7 @@ function runtimePatchWithPendingStopPriority(hostId, sessionId, eventRunId, patc
     || state.sessionRuntime.get(sessionKey(hostId, sessionId))
     || null;
   const hostUsesDurableRunBinding = state.hosts.get(hostId)?.capabilities?.runApiBinding === true;
+  const pendingStopFence = pendingSessionStopFences.get(resolveSessionKey(hostId, sessionId)) || null;
   const failedStopProjection = (
     String(session?.state || '').toLowerCase() === 'stop-failed'
     || String(runtime?.phase || '').toLowerCase() === 'stop-failed'
@@ -14679,6 +14826,7 @@ function runtimePatchWithPendingStopPriority(hostId, sessionId, eventRunId, patc
   );
   const pendingStop = Boolean(
     activeRun?.stopRequestId
+    || pendingStopFence
     || legacyStopProjection
   );
   if (!pendingStop) {
@@ -14687,7 +14835,7 @@ function runtimePatchWithPendingStopPriority(hostId, sessionId, eventRunId, patc
   const pendingStopRunId = String(
     activeRun?.stopRequestId
       ? activeRunId
-      : session?.runId || runtime?.runId || activeRunId || ''
+      : pendingStopFence?.runId || session?.runId || runtime?.runId || activeRunId || ''
   ).trim();
   const normalizedEventRunId = String(eventRunId || patch.runId || '').trim();
   if (normalizedEventRunId && pendingStopRunId && normalizedEventRunId !== pendingStopRunId) {
@@ -14711,17 +14859,20 @@ function beginSessionStop(hostId, sessionId, options = {}) {
   const session = getSession(hostId, sessionId);
   const effectiveSessionId = session?.sessionId || sessionId;
   const targetRunId = String(options.runId || session?.runId || '').trim() || null;
+  pendingSessionStopFences.set(resolveSessionKey(hostId, effectiveSessionId), {
+    runId: targetRunId,
+    stopRequestId: String(options.stopRequestId || '').trim() || null,
+  });
   const previousRuntime = state.sessionRuntime.get(sessionKey(hostId, effectiveSessionId)) || null;
   const previousState = session?.state || null;
   if (session) {
-    const next = upsertSession(hostId, {
-      sessionId: effectiveSessionId,
+    const timestamp = nowIso();
+    const projected = projectSessionRuntimeState(hostId, effectiveSessionId, {
       state: 'ending',
       live: true,
       runId: targetRunId,
-      lastUpdatedAt: nowIso(),
-    });
-    setSessionRuntime(hostId, effectiveSessionId, {
+      lastUpdatedAt: timestamp,
+    }, {
       phase: 'ending',
       connection: 'closing',
       busy: false,
@@ -14732,25 +14883,12 @@ function beginSessionStop(hostId, sessionId, options = {}) {
       pendingInputSummary: null,
       queuedCommandId: null,
       runId: targetRunId,
-      updatedAt: nowIso(),
+      updatedAt: timestamp,
     });
+    const next = projected.session;
+    const nextRuntime = projected.runtime;
     broadcastSessionEvent(hostId, effectiveSessionId, 'session.snapshot', next);
-    broadcastSessionEvent(hostId, effectiveSessionId, 'session.runtime_updated', {
-      hostId,
-      sessionId: effectiveSessionId,
-      patch: {
-        phase: 'ending',
-        connection: 'closing',
-        busy: false,
-        activeTurnId: null,
-        currentTurnStatus: 'stopping',
-        waitingOnApproval: false,
-        waitingOnUserInput: false,
-        pendingInputSummary: null,
-        queuedCommandId: null,
-      },
-      timestamp: nowIso(),
-    });
+    broadcastSessionRuntimePatch(hostId, effectiveSessionId, nextRuntime, { timestamp });
   }
 
   const command = enqueueCommand(hostId, {
@@ -15220,6 +15358,30 @@ function boundedSessionResetAssistantProjection(projection) {
   };
 }
 
+function boundedSessionResetRuntime(runtime) {
+  if (!runtime || typeof runtime !== 'object') return null;
+  const text = (value, max = 256) => boundedSessionResetText(value, max) || null;
+  return {
+    runId: text(runtime.runId),
+    runtimeRevision: Math.max(0, Number(runtime.runtimeRevision || 0)),
+    phase: text(runtime.phase, 64),
+    connection: text(runtime.connection, 64),
+    busy: runtime.busy === true,
+    activeTurnId: text(runtime.activeTurnId),
+    currentTurnStatus: text(runtime.currentTurnStatus, 64),
+    waitingOnApproval: runtime.waitingOnApproval === true,
+    waitingOnUserInput: runtime.waitingOnUserInput === true,
+    clientRequestId: text(runtime.clientRequestId),
+    pendingClientRequestId: text(runtime.pendingClientRequestId),
+    queuedCommandId: runtime.queuedCommandId ?? null,
+    queuedInputAt: text(runtime.queuedInputAt, 128),
+    pendingInputSummary: text(runtime.pendingInputSummary, 256),
+    lastError: text(runtime.lastError, 512),
+    lastCodexError: text(runtime.lastCodexError, 512),
+    updatedAt: text(runtime.updatedAt, 128),
+  };
+}
+
 function boundedSessionResetRecord(session) {
   if (!session || typeof session !== 'object') return null;
   return {
@@ -15244,6 +15406,7 @@ function boundedSessionResetRecord(session) {
     runId: boundedSessionResetText(session.runId, 256) || null,
     bridgeSessionId: boundedSessionResetText(session.bridgeSessionId, 256) || null,
     nativeThreadId: boundedSessionResetText(session.nativeThreadId, 256) || null,
+    runtime: boundedSessionResetRuntime(session.runtime),
   };
 }
 
@@ -15460,6 +15623,14 @@ function sendSessionContractError(res, error, fallbackStage = 'session-launch') 
     currentRunStatus: error?.currentRunStatus || null,
     currentBindingFingerprint: error?.currentBindingFingerprint || null,
     canRebind: Boolean(error?.canRebind),
+    clientRequestId: normalizeClientRequestId(error?.clientRequestId) || null,
+    preparingClientRequestId: normalizeClientRequestId(error?.preparingClientRequestId) || null,
+    preparingSince: error?.preparingSince || null,
+    leaseExpiresAt: error?.leaseExpiresAt || null,
+    retryAfterMs: Number.isFinite(Number(error?.retryAfterMs))
+      ? Math.max(0, Number(error.retryAfterMs))
+      : null,
+    safeToRetry: error?.safeToRetry === true,
   });
 }
 
@@ -15610,6 +15781,9 @@ function assertRebindRunExpectation(record, body = {}) {
 
 function sessionAcceptsLiveControl(hostId, session) {
   if (isSubagentSession(session) || session?.readOnly === true) {
+    return false;
+  }
+  if (pendingSessionStopFences.has(resolveSessionKey(hostId, session?.sessionId))) {
     return false;
   }
   const { run, runId } = sessionRunRecord(hostId, session?.sessionId, { includePending: true });
@@ -15777,7 +15951,7 @@ async function recordLiveRequestedSelection(hostId, sessionId, runId, body = {})
   });
 }
 
-async function validateLiveRequestedSelection(hostId, sessionId, liveRun, body = {}) {
+function validateLiveRequestedSelection(hostId, sessionId, liveRun, body = {}) {
   const selection = {
     model: String(body.model || '').trim() || null,
     effort: String(body.effort || '').trim() || null,
@@ -15827,6 +16001,19 @@ async function resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitReb
     );
   }
   return requestHostBindingPreflight(hostId, inheritedBinding?.kind === 'host_environment' ? inheritedBinding : null);
+}
+
+function acceptedManagedLaunchReplayBinding(hostId, targetSessionId, runId, clientRequestId) {
+  if (!clientRequestId || !runId) {
+    return null;
+  }
+  const record = state.provenance?.getSessionRecord({ hostId, sessionId: targetSessionId });
+  const run = record?.runs?.[runId] || null;
+  if (run?.clientRequestId !== clientRequestId) {
+    return null;
+  }
+  const binding = publicBinding(run.apiBinding);
+  return binding?.bindingFingerprint ? binding : null;
 }
 
 async function failPlannedRun(hostId, sessionId, runId, error) {
@@ -15951,7 +16138,12 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
 
   let submittedBinding;
   try {
-    submittedBinding = await resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind);
+    submittedBinding = acceptedManagedLaunchReplayBinding(
+      hostId,
+      targetSessionId,
+      runId,
+      clientRequestId
+    ) || await resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind);
   } catch (error) {
     throw stageSessionError(error, 'resolve-binding');
   }
@@ -16061,6 +16253,7 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     idempotentReplay: planned.idempotentReplay === true,
   };
   if (planResult.idempotentReplay) {
+    assertManagedLaunchReplayStillExists(planResult);
     return { ...planResult, catalog: null };
   }
 
@@ -16459,6 +16652,28 @@ function queuedManagedLaunchCommand(hostId, runId) {
     command?.type === 'session.start'
     && String(command.runId || '') === String(runId || '')
   )) || null;
+}
+
+function assertManagedLaunchReplayStillExists(plan) {
+  const run = plan?.planned?.run || null;
+  if (run?.status !== 'pending') {
+    return;
+  }
+  const queued = queuedManagedLaunchCommand(plan.hostId, plan.runId);
+  const session = getSession(plan.hostId, plan.targetSessionId);
+  const runtime = state.sessionRuntime.get(resolveSessionKey(plan.hostId, plan.targetSessionId)) || null;
+  const launchHasStarted = String(session?.runId || '') === String(plan.runId || '')
+    && (session.live === true || session.state === 'starting');
+  const runtimeHasStarted = String(runtime?.runId || '') === String(plan.runId || '')
+    && ['starting', 'running', 'busy', 'awaiting-input', 'awaiting-approval'].includes(runtime.phase);
+  if (queued || launchHasStarted || runtimeHasStarted) {
+    return;
+  }
+  throw new SessionContractError(
+    'session_request_replay_unavailable',
+    'The original Session creation request is no longer queued or starting and cannot be replayed. Start a new Session instead.',
+    { statusCode: 409, currentRunId: plan.runId, currentRunStatus: run.status }
+  );
 }
 
 async function handleRequest(req, res) {
@@ -18659,7 +18874,8 @@ async function handleRequest(req, res) {
     for (const canonicalKey of removedCanonicalKeys) {
       state.activitySnapshots.deleteConversation(canonicalKey);
     }
-    saveSessionLogs();
+    scheduleSessionLogsSave(0);
+    await flushSessionLogsSave();
     scheduleSessionDiagnosticsSave(0);
     sendJson(res, 200, { ok: true, hostId });
     return;
@@ -19430,75 +19646,24 @@ async function handleRequest(req, res) {
       sendJson(res, 409, { error: 'this host agent needs to be restarted before it can use Codex turn controls' });
       return;
     }
-    let requestReservation;
-    try {
-      requestReservation = reserveInputRequest(inputCacheKey, inputFingerprint, {
-        hostId,
-        scopeKey: inputScopeKey,
-        clientRequestId: normalizedInputRequestId,
-      });
-    } catch (error) {
-      sendSessionContractError(res, error, 'reserve-input-request');
-      return;
-    }
-    if (!requestReservation.owner) {
-      try {
-        sendJson(res, 200, await requestReservation.promise);
-      } catch (error) {
-        sendSessionContractError(res, error, 'replay-input-request');
-      }
-      return;
-    }
     try {
       assertHostLaunchAllowed(hostId);
     } catch (error) {
-      settleInputRequest(requestReservation, error);
       sendSessionContractError(res, error, 'validate-host-maintenance');
-      return;
-    }
-    const inputReservation = reserveSessionInput(
-      hostId,
-      effectiveSessionId,
-      liveRun.runId,
-      normalizedInputRequestId,
-      inputScopeKey,
-      requestReservation.ordinal
-    );
-    if (!inputReservation.ok) {
-      const error = new SessionContractError(
-        inputReservation.code || 'session_input_rejected',
-        inputReservation.error || 'The Session cannot accept another prompt yet.',
-        { statusCode: 409, ...inputReservation }
-      );
-      settleInputRequest(requestReservation, error);
-      sendSessionContractError(res, error, 'reserve-session-input');
       return;
     }
     let acceptedResponsePayload = null;
     try {
-      if (TEST_INPUT_PREPARE_DELAY_MS > 0) {
-        await new Promise((resolve) => setTimeout(resolve, TEST_INPUT_PREPARE_DELAY_MS));
-      }
       if (!liveRun.compatibilityRuntime) {
-        await validateLiveRequestedSelection(hostId, effectiveSessionId, liveRun, body);
-        await recordLiveRequestedSelection(hostId, effectiveSessionId, liveRun.runId, body);
+        validateLiveRequestedSelection(hostId, effectiveSessionId, liveRun, body);
       }
-      assertInputSubmissionOwnership(
-        hostId,
-        effectiveSessionId,
-        requestReservation,
-        inputReservation
-      );
-      assertInputRuntimeStillAvailable(
-        hostId,
-        effectiveSessionId,
-        liveRun.runId,
-        inputReservation
-      );
       const inlineImageFiles = cacheInlineImageInputFiles(hostId, sessionId, inputItems);
       const inlineTextFiles = cacheInlineTextFiles(hostId, sessionId, body.inlineFiles || body.inlineFileRefs || []);
       const transcriptFiles = normalizeFileTransferRefs([...uploadedFiles, ...inlineImageFiles, ...inlineTextFiles]);
       const transcriptTimestamp = nowIso();
+      // No await is allowed between this check and enqueueCommand. The Relay's
+      // event loop makes the check and durable enqueue one atomic operation.
+      assertSessionInputAvailable(hostId, effectiveSessionId);
       const command = enqueueCommand(hostId, {
       type: 'session.input',
       clientRequestId: normalizedInputRequestId,
@@ -19525,7 +19690,7 @@ async function handleRequest(req, res) {
       serviceTier: String(body.serviceTier || '').trim() || null,
       personality: String(body.personality || '').trim() || null,
       }, {
-        inputScopeKey: requestReservation.scopeKey || inputReservation.key,
+        inputScopeKey,
         inputFingerprint,
         transcriptProjection: {
           sessionId: effectiveSessionId,
@@ -19541,9 +19706,9 @@ async function handleRequest(req, res) {
         clientRequestId: command.clientRequestId || null,
         command,
       };
-      rememberInputRequest(requestReservation.cacheKey, inputFingerprint, acceptedResponsePayload, {
+      rememberInputRequest(inputCacheKey, inputFingerprint, acceptedResponsePayload, {
         hostId,
-        scopeKey: requestReservation.scopeKey || inputReservation.key,
+        scopeKey: inputScopeKey,
         clientRequestId: normalizedInputRequestId,
       });
       recordPendingUserTranscriptEcho(hostId, effectiveSessionId, {
@@ -19617,22 +19782,39 @@ async function handleRequest(req, res) {
           inputTypes: inputItems.map((item) => item.type),
         },
       });
-      settleInputRequest(requestReservation, null, acceptedResponsePayload);
       sendJson(res, 200, acceptedResponsePayload);
+      if (!liveRun.compatibilityRuntime) {
+        setImmediate(() => {
+          recordLiveRequestedSelection(
+            hostId,
+            effectiveSessionId,
+            liveRun.runId,
+            body
+          ).catch((error) => {
+            emitSessionDiagnostic(hostId, effectiveSessionId, {
+              severity: 'warning',
+              source: 'relay',
+              kind: 'control',
+              method: 'session.input/requested-selection-persist-failed',
+              message: `The prompt was queued, but its requested model selection could not be persisted: ${error.message || error}`,
+              data: {
+                runId: liveRun.runId,
+                clientRequestId: normalizedInputRequestId,
+              },
+            });
+          });
+        });
+      }
       return;
     } catch (error) {
       if (acceptedResponsePayload) {
         console.error(
           `[relay] input command ${acceptedResponsePayload.command?.id || '(unknown)'} was durably queued but its UI projection failed: ${error.message || error}`
         );
-        settleInputRequest(requestReservation, null, acceptedResponsePayload);
         sendJson(res, 200, acceptedResponsePayload);
         return;
       }
-      settleInputRequest(requestReservation, error);
       sendSessionContractError(res, error, 'queue-input-request');
-    } finally {
-      releaseSessionInputReservation(inputReservation);
     }
     return;
   }
@@ -20183,9 +20365,15 @@ async function handleRequest(req, res) {
       cursor,
       makeReset: (currentCanonicalKey) => {
         const currentSession = getSession(hostId, sessionId);
+        const currentRuntime = state.sessionRuntime.get(resolveSessionKey(hostId, sessionId))
+          || currentSession?.runtime
+          || null;
         const activitySummary = state.activitySnapshots.summary(currentCanonicalKey);
         return {
-          session: boundedSessionResetRecord(currentSession),
+          session: boundedSessionResetRecord(currentSession ? {
+            ...currentSession,
+            runtime: currentRuntime,
+          } : null),
           assistantProjection: boundedSessionResetAssistantProjection(
             currentSession?.assistantProjection
           ),
@@ -20577,6 +20765,17 @@ function sessionDiscoveryNeedsCommit(record, input = {}) {
       return true;
     }
   }
+  const knownRolloutIds = new Set([
+    record.rolloutSessionId,
+    ...(Array.isArray(record.rolloutSessionIds) ? record.rolloutSessionIds : []),
+  ].map((value) => String(value || '').trim()).filter(Boolean));
+  const incomingRolloutIds = [
+    input.rolloutSessionId,
+    ...(Array.isArray(input.rolloutSessionIds) ? input.rolloutSessionIds : []),
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+  if (incomingRolloutIds.some((value) => !knownRolloutIds.has(value))) {
+    return true;
+  }
   const sourceRank = { managed: 100, manual: 90, metadata: 70, imported: 50, rollout: 40, vscode: 30 };
   const incomingRank = sourceRank[input.source] || 0;
   const existingRank = sourceRank[record.source] || 0;
@@ -20595,6 +20794,38 @@ function sessionDiscoveryNeedsCommit(record, input = {}) {
     }
   }
   return false;
+}
+
+function discoveryListProjectionFingerprint(session) {
+  if (!session) return '';
+  const projected = { ...publicSessionListRecord(session) };
+  delete projected.assistantProjection;
+  delete projected.runtime;
+  return JSON.stringify(projected);
+}
+
+function repairRuntimeFromManagedDiscovery(hostId, session, current) {
+  if (session?.source !== 'managed' || session.live !== true || !session.runtime) {
+    return { runtime: current?.runtime || null, changed: false };
+  }
+  const key = resolveSessionKey(hostId, current?.sessionId || session.sessionId);
+  const existing = state.sessionRuntime.get(key) || current?.runtime || null;
+  const incomingRunId = String(session.runId || session.runtime.runId || '').trim();
+  const existingRunId = String(current?.runId || existing?.runId || '').trim();
+  if (existingRunId && (!incomingRunId || incomingRunId !== existingRunId)) {
+    return { runtime: existing, changed: false };
+  }
+  const incomingRevision = normalizedRuntimeRevision(session.runtime);
+  const existingRevision = normalizedRuntimeRevision(existing);
+  if (existing && (!incomingRevision || incomingRevision <= existingRevision)) {
+    return { runtime: existing, changed: false };
+  }
+  const runtime = setSessionRuntime(hostId, current?.sessionId || session.sessionId, {
+    ...session.runtime,
+    runId: incomingRunId || null,
+    updatedAt: session.runtime.updatedAt || session.updatedAt || nowIso(),
+  });
+  return { runtime, changed: true };
 }
 
 function managedDiscoveryTargetsStaleRun(host, session, current, record) {
@@ -20659,6 +20890,13 @@ async function applyAgentEvent(event) {
   }
 
   if (event.type === 'session.activity_snapshot') {
+    const effectiveSessionId = resolveSessionId(
+      event.hostId,
+      event.sessionId || event.nativeThreadId
+    );
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
     const activityIdentity = sessionIdentity(event.hostId, event);
     const canonicalKey = resolveCanonicalConversationKey(event.hostId, activityIdentity);
     const activityRevision = Number(event.activityRevision);
@@ -20738,6 +20976,11 @@ async function applyAgentEvent(event) {
       }
       const existing = getSession(event.hostId, session.sessionId);
       const subagent = isSubagentSession(session);
+      const authoritativeManagedLive = session.source === 'managed' && session.live === true;
+      // A managed live report supersedes historical rollout classification. In
+      // particular, it must clear a stale child/read-only marker before the
+      // list and control guards inspect the record again.
+      const retainedDiscovery = authoritativeManagedLive ? null : existing;
       const discoverySource = subagent
         ? 'subagent'
         : session.source === 'managed'
@@ -20748,28 +20991,32 @@ async function applyAgentEvent(event) {
       const discoveryInput = {
         hostId: event.hostId,
         sessionId: session.sessionId,
-        bridgeSessionId: session.bridgeSessionId || existing?.bridgeSessionId || null,
-        nativeThreadId: session.nativeThreadId || existing?.nativeThreadId || session.sessionId,
-        conversationKey: session.conversationKey || existing?.conversationKey || session.sessionId,
-        originSessionId: session.originSessionId || existing?.originSessionId || null,
-        sourceSessionId: session.sourceSessionId || existing?.sourceSessionId || null,
+        bridgeSessionId: session.bridgeSessionId || retainedDiscovery?.bridgeSessionId || null,
+        nativeThreadId: session.nativeThreadId || retainedDiscovery?.nativeThreadId || session.sessionId,
+        ...(['rollout', 'vscode', 'subagent'].includes(discoverySource) ? {
+          rolloutSessionId: session.nativeThreadId || session.sessionId,
+          rolloutSessionIds: [session.nativeThreadId || session.sessionId],
+        } : {}),
+        conversationKey: session.conversationKey || retainedDiscovery?.conversationKey || session.sessionId,
+        originSessionId: session.originSessionId || retainedDiscovery?.originSessionId || null,
+        sourceSessionId: session.sourceSessionId || retainedDiscovery?.sourceSessionId || null,
         source: discoverySource,
-        title: session.title || existing?.title || session.sessionId,
-        cwd: session.cwd || existing?.cwd || null,
-        createdAt: session.createdAt || existing?.createdAt || null,
-        apiProfile: session.apiProfile || existing?.apiProfile || null,
-        selection: session.codexOptions || existing?.codexOptions || null,
+        title: session.title || retainedDiscovery?.title || session.sessionId,
+        cwd: session.cwd || retainedDiscovery?.cwd || null,
+        createdAt: session.createdAt || retainedDiscovery?.createdAt || null,
+        apiProfile: session.apiProfile || retainedDiscovery?.apiProfile || null,
+        selection: session.codexOptions || retainedDiscovery?.codexOptions || null,
         modelProviderHint: session.modelProvider || session.modelProviderHint || null,
-        subagent: subagent || existing?.subagent === true,
-        readOnly: subagent || existing?.readOnly === true,
-        threadSource: session.threadSource || existing?.threadSource || null,
-        parentThreadId: session.parentThreadId || existing?.parentThreadId || null,
-        forkedFromId: session.forkedFromId || existing?.forkedFromId || null,
-        agentPath: session.agentPath || existing?.agentPath || null,
-        agentNickname: session.agentNickname || existing?.agentNickname || null,
-        agentRole: session.agentRole || existing?.agentRole || null,
-        multiAgentVersion: session.multiAgentVersion || existing?.multiAgentVersion || null,
-        subagentSource: session.subagentSource || existing?.subagentSource || null,
+        subagent: subagent || retainedDiscovery?.subagent === true,
+        readOnly: subagent || retainedDiscovery?.readOnly === true,
+        threadSource: session.threadSource || retainedDiscovery?.threadSource || null,
+        parentThreadId: session.parentThreadId || retainedDiscovery?.parentThreadId || null,
+        forkedFromId: session.forkedFromId || retainedDiscovery?.forkedFromId || null,
+        agentPath: session.agentPath || retainedDiscovery?.agentPath || null,
+        agentNickname: session.agentNickname || retainedDiscovery?.agentNickname || null,
+        agentRole: session.agentRole || retainedDiscovery?.agentRole || null,
+        multiAgentVersion: session.multiAgentVersion || retainedDiscovery?.multiAgentVersion || null,
+        subagentSource: session.subagentSource || retainedDiscovery?.subagentSource || null,
       };
       const storedDiscovery = state.provenance.getSessionRecord({
         hostId: event.hostId,
@@ -20832,14 +21079,25 @@ async function applyAgentEvent(event) {
       const publishDiscoveredLive = discoveryPublishesLive(session, mergedDiscovery.record);
       const isCurrentlyLive = publishDiscoveredLive
         && sessionOwnershipIdentityValues(session).some((identity) => publishedLiveSessionIds.has(identity));
+      const currentActiveRunId = String(mergedDiscovery.record?.activeRunId || '').trim();
+      const currentActiveRun = currentActiveRunId
+        ? mergedDiscovery.record?.runs?.[currentActiveRunId] || null
+        : null;
       const preserveManagedState = !subagent && current
         && current.source === 'managed'
         && (current.live || current.state === 'starting')
         && (
           isCurrentlyLive
           || !publishDiscoveredLive
-          || (current.state === 'starting' && sessionAgeMs(current) < STALE_MANAGED_SESSION_GRACE_MS)
+          || (
+            current.state === 'starting'
+            && sessionAgeMs(current, currentActiveRun) < STALE_MANAGED_SESSION_GRACE_MS
+          )
         );
+      const previousProjectionFingerprint = discoveryListProjectionFingerprint(current);
+      const runtimeRepair = !suppressStaleRunSideEffects
+        ? repairRuntimeFromManagedDiscovery(event.hostId, session, current)
+        : { runtime: current?.runtime || null, changed: false };
       const discoveredCreatedAt = session.createdAt || null;
       const discoveredConversationKey = session.conversationKey && session.conversationKey !== session.sessionId
         ? session.conversationKey
@@ -20853,16 +21111,16 @@ async function applyAgentEvent(event) {
         source: preserveManagedState ? current.source : discoverySource,
         state: subagent ? 'subagent' : (preserveManagedState ? current.state : (publishDiscoveredLive ? 'running' : 'imported')),
         live: subagent ? false : (preserveManagedState ? current.live : publishDiscoveredLive),
-        subagent: subagent || existing?.subagent === true,
-        readOnly: subagent || existing?.readOnly === true,
-        threadSource: session.threadSource || existing?.threadSource || null,
-        parentThreadId: session.parentThreadId || existing?.parentThreadId || null,
-        forkedFromId: session.forkedFromId || existing?.forkedFromId || null,
-        agentPath: session.agentPath || existing?.agentPath || null,
-        agentNickname: session.agentNickname || existing?.agentNickname || null,
-        agentRole: session.agentRole || existing?.agentRole || null,
-        multiAgentVersion: session.multiAgentVersion || existing?.multiAgentVersion || null,
-        subagentSource: session.subagentSource || existing?.subagentSource || null,
+        subagent: subagent || retainedDiscovery?.subagent === true,
+        readOnly: subagent || retainedDiscovery?.readOnly === true,
+        threadSource: session.threadSource || retainedDiscovery?.threadSource || null,
+        parentThreadId: session.parentThreadId || retainedDiscovery?.parentThreadId || null,
+        forkedFromId: session.forkedFromId || retainedDiscovery?.forkedFromId || null,
+        agentPath: session.agentPath || retainedDiscovery?.agentPath || null,
+        agentNickname: session.agentNickname || retainedDiscovery?.agentNickname || null,
+        agentRole: session.agentRole || retainedDiscovery?.agentRole || null,
+        multiAgentVersion: session.multiAgentVersion || retainedDiscovery?.multiAgentVersion || null,
+        subagentSource: session.subagentSource || retainedDiscovery?.subagentSource || null,
         createdAt: preserveManagedState ? current.createdAt || discoveredCreatedAt : discoveredCreatedAt,
         lastUpdatedAt: preserveManagedState ? current.lastUpdatedAt || nowIso() : session.updatedAt || nowIso(),
         messageCount: Math.max(Number(current?.messageCount || 0), Number(session.messageCount || 0), Array.isArray(session.transcriptPreview) ? session.transcriptPreview.length : 0),
@@ -20898,7 +21156,8 @@ async function applyAgentEvent(event) {
         launchMode: preserveManagedState
           ? current.launchMode || null
           : session.launchMode || null,
-        runtime: preserveManagedState ? current.runtime || null : session.runtime || current?.runtime || null,
+        runtime: runtimeRepair.runtime
+          || (preserveManagedState ? current.runtime || null : session.runtime || current?.runtime || null),
         runId: preserveManagedState
           ? current.runId || null
           : session.runId || session.runtime?.runId || current?.runId || null,
@@ -20912,7 +21171,14 @@ async function applyAgentEvent(event) {
       if (!preserveManagedState && !next.live && Array.isArray(session.transcriptPreview)) {
         setSessionLog(event.hostId, next.sessionId, session.transcriptPreview, { merge: true });
       }
-      broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
+      if (runtimeRepair.changed) {
+        broadcastSessionRuntimePatch(event.hostId, next.sessionId, runtimeRepair.runtime, {
+          timestamp: runtimeRepair.runtime.updatedAt || event.discoveredAt || nowIso(),
+        });
+      }
+      if (previousProjectionFingerprint !== discoveryListProjectionFingerprint(next)) {
+        broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
+      }
     }
     await closeManagedSessionsMissingFromDiscovery(event.hostId, managedRunPresence, {
       discoveryId: event.discoveryId || null,
@@ -21222,9 +21488,7 @@ async function applyAgentEvent(event) {
         runtime,
         lastUpdatedAt: event.timestamp || nowIso(),
       });
-      broadcastSessionEvent(event.hostId, event.sessionId, 'session.runtime_updated', {
-        sessionId: event.sessionId,
-        runtime,
+      broadcastSessionRuntimePatch(event.hostId, event.sessionId, runtime, {
         timestamp: event.timestamp || nowIso(),
       });
     }
@@ -21416,22 +21680,19 @@ async function applyAgentEvent(event) {
       if (eventHost?.capabilities?.runApiBinding === true && failedRun?.transitioned !== true) {
         return;
       }
-      const failedSession = upsertSession(event.hostId, {
-        sessionId: currentSession?.sessionId || effectiveSessionId,
-        state: `failed:${code}`,
-        live: false,
-        runId: event.runId,
-        resumeError: {
+      projectManagedStartFailure(
+        event.hostId,
+        effectiveSessionId,
+        event.runId,
+        failedRun?.record,
+        {
           code,
-          error: message,
+          message,
           stage: event.operation || 'start',
           canRebind: Boolean(event.canRebind),
-          canTranscriptFallback: sessionCanTranscriptFallback(event.hostId, effectiveSessionId),
-        },
-        lastUpdatedAt: event.timestamp || nowIso(),
-      }, { preserveManagedLive: false });
-      broadcastSessionEvent(event.hostId, failedSession.sessionId, 'session.state_changed', failedSession);
-      broadcastSessionEvent(event.hostId, failedSession.sessionId, 'session.snapshot', failedSession);
+          timestamp: event.timestamp || nowIso(),
+        }
+      );
     }
     if (event.operation === 'stop') {
       const record = state.provenance?.getSessionRecord({
@@ -21858,12 +22119,6 @@ async function applyAgentEvent(event) {
           stream: event.stream || 'stdout',
           timestamp: event.timestamp || nowIso(),
         });
-        broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.output', {
-          ...event,
-          sessionId: effectiveSessionId,
-          hostId: event.hostId,
-          timestamp: event.timestamp || nowIso(),
-        });
       }
       return;
     }
@@ -21921,12 +22176,6 @@ async function applyAgentEvent(event) {
         stream: event.stream || 'stdout',
         timestamp: event.timestamp || nowIso(),
       });
-      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.output', {
-        ...event,
-        sessionId: effectiveSessionId,
-        hostId: event.hostId,
-        timestamp: event.timestamp || nowIso(),
-      });
       broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.snapshot', snapshot);
       return;
     }
@@ -21938,6 +22187,19 @@ async function applyAgentEvent(event) {
   if (event.type === 'session.transcript') {
     const effectiveSessionId = resolveSessionId(event.hostId, event.sessionId || event.nativeThreadId || sessionId);
     if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    const liveSession = getSession(event.hostId, effectiveSessionId);
+    const liveRuntime = state.sessionRuntime.get(sessionKey(event.hostId, effectiveSessionId))
+      || liveSession?.runtime
+      || null;
+    const runtimeKind = String(liveRuntime?.adapterId || liveRuntime?.kind || '').trim();
+    if (
+      event.source === 'codex-jsonl'
+      && liveSession?.live === true
+      && liveSession?.source === 'managed'
+      && runtimeKind === 'codex-app-server'
+    ) {
       return;
     }
     let normalizedTranscript = normalizeStoredTranscriptEntry({
@@ -22046,6 +22308,15 @@ async function applyAgentEvent(event) {
           },
           runId: event.runId,
         });
+        pendingSessionStopFences.delete(resolveSessionKey(event.hostId, effectiveSessionId));
+        const replacement = upsertSession(event.hostId, {
+          sessionId: effectiveSessionId,
+          state: 'starting',
+          live: false,
+          runId: replacementRecord.activeRunId,
+          lastUpdatedAt: event.timestamp || nowIso(),
+        }, { preserveManagedLive: false });
+        broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.snapshot', replacement);
         emitSessionDiagnostic(event.hostId, effectiveSessionId, {
           severity: 'info',
           source: 'relay',
@@ -22110,7 +22381,7 @@ async function applyAgentEvent(event) {
       }
     }
     const wasEnding = existingSession?.state === 'ending' || existingRuntime?.phase === 'ending';
-    const next = upsertSession(event.hostId, {
+    let next = upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
       state: event.state || 'unknown',
       live: typeof event.live === 'boolean' ? event.live : true,
@@ -22119,6 +22390,7 @@ async function applyAgentEvent(event) {
     }, { preserveManagedLive: event.live !== false });
 
     if (event.live === false) {
+      pendingSessionStopFences.delete(resolveSessionKey(event.hostId, effectiveSessionId));
       const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
         phase: 'closed',
         connection: 'closed',
@@ -22130,10 +22402,11 @@ async function applyAgentEvent(event) {
         runId: event.runId || existingRunId || null,
         updatedAt: event.timestamp || nowIso(),
       });
-      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.runtime_updated', {
-        hostId: event.hostId,
+      next = upsertSession(event.hostId, {
         sessionId: effectiveSessionId,
-        patch: runtime,
+        runtime,
+      }, { preserveManagedLive: false });
+      broadcastSessionRuntimePatch(event.hostId, effectiveSessionId, runtime, {
         timestamp: event.timestamp || nowIso(),
       });
     }
@@ -22186,9 +22459,47 @@ async function applyAgentEvent(event) {
       && existing?.live === true
       && existing?.source === 'managed'
     ) {
-      // The app-server runner owns live control state. Rollout tail state is
-      // retained for history/recovery only and must not revive or hide a live
-      // error, Stop, or completed turn on legacy Hosts.
+      const observed = event.patch?.externalActivity;
+      if (
+        !observed
+        || typeof observed !== 'object'
+        || observed.owner !== 'external-terminal'
+        || typeof observed.active !== 'boolean'
+      ) {
+        // The app-server runner owns live control state. Rollout tail state is
+        // retained for history/recovery only and must not revive or hide a
+        // live error, Stop, or completed managed turn.
+        return;
+      }
+      const externalActivity = {
+        owner: 'external-terminal',
+        active: observed.active,
+        turnId: String(observed.turnId || '').trim() || null,
+        phase: String(observed.phase || '').trim() || (observed.active ? 'thinking' : 'idle'),
+        status: String(observed.status || '').trim() || (observed.active ? 'inProgress' : 'completed'),
+        updatedAt: observed.updatedAt || event.timestamp || nowIso(),
+      };
+      const existingRuntime = state.sessionRuntime.get(resolveSessionKey(event.hostId, effectiveSessionId))
+        || existing.runtime
+        || {};
+      const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
+        externalActivity,
+        updatedAt: existingRuntime.updatedAt || event.timestamp || nowIso(),
+      });
+      upsertSession(event.hostId, {
+        sessionId: effectiveSessionId,
+        title: existing.title || effectiveSessionId,
+        source: existing.source,
+        state: existing.state || 'running',
+        live: true,
+        runId: existing.runId || null,
+        runtime,
+        lastUpdatedAt: event.timestamp || nowIso(),
+        nativeThreadId: existing.nativeThreadId || event.nativeThreadId || effectiveSessionId,
+      });
+      broadcastSessionRuntimePatch(event.hostId, effectiveSessionId, { externalActivity }, {
+        timestamp: event.timestamp || externalActivity.updatedAt,
+      });
       return;
     }
     const runtimePatch = runtimePatchWithPendingStopPriority(
@@ -22206,6 +22517,7 @@ async function applyAgentEvent(event) {
     if (runtimePatchHasStaleRevision(existingRuntime, incomingRuntime)) {
       return;
     }
+    const runtime = setSessionRuntime(event.hostId, effectiveSessionId, incomingRuntime);
     upsertSession(event.hostId, {
       sessionId: effectiveSessionId,
       title: existing?.title || effectiveSessionId,
@@ -22213,10 +22525,10 @@ async function applyAgentEvent(event) {
       state: existing?.state || (event.patch?.phase || 'imported'),
       live: Boolean(existing?.live),
       runId: event.runId || existing?.runId || event.patch?.runId || null,
+      runtime,
       lastUpdatedAt: event.timestamp || nowIso(),
       nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
     });
-    const runtime = setSessionRuntime(event.hostId, effectiveSessionId, incomingRuntime);
     const runtimeClientRequestId = normalizeClientRequestId(
       runtime?.clientRequestId
       || runtime?.pendingClientRequestId
@@ -22240,10 +22552,9 @@ async function applyAgentEvent(event) {
         message: `Request closed because the session runtime is ${phase}.`,
       });
     }
-    broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.runtime', {
-      ...(runtime || {}),
-      hostId: event.hostId,
-      sessionId: effectiveSessionId,
+    broadcastSessionRuntimePatch(event.hostId, effectiveSessionId, runtime || {}, {
+      runId: event.runId,
+      timestamp: event.timestamp || runtime?.updatedAt || nowIso(),
     });
     return;
   }
@@ -22555,7 +22866,7 @@ async function reconcilePendingSessionRunsAfterRestart() {
   for (const [canonicalKey, record] of Object.entries(snapshot?.records || {})) {
     const runId = record?.activeRunId || null;
     const run = runId ? record.runs?.[runId] || null : null;
-    if (!run || run.status !== 'pending') {
+    if (!run || run.status !== 'pending' || run.stopRequestId) {
       continue;
     }
     const prefix = `${record.hostId}::`;
@@ -22587,25 +22898,15 @@ async function reconcileStopRequestsAfterRestart() {
       const sessionId = canonicalKey.startsWith(prefix)
         ? canonicalKey.slice(prefix.length)
         : record.bridgeSessionId || record.nativeThreadId;
-      const result = await state.provenance.cancelStopRun({
-        identity: { hostId: record.hostId, sessionId },
+      beginSessionStop(record.hostId, sessionId, {
         runId,
         stopRequestId: run.stopRequestId,
       });
-      if (result.transitioned) {
-        projectStopFailedSession(record.hostId, sessionId, {
-          runId,
-          message: 'Relay restarted before the Host confirmed this Stop. The Session remains blocked to avoid sending into an unknown runtime; retry Stop, then Resume it.',
-          connection: 'unknown',
-          broadcast: false,
-          source: 'relay',
-        });
-        reconciled += 1;
-      }
+      reconciled += 1;
     }
   }
   if (reconciled > 0) {
-    console.warn(`[relay] marked ${reconciled} unconfirmed Session Stop request(s) as stop-failed after restart`);
+    console.warn(`[relay] restored ${reconciled} unconfirmed Session Stop request(s) after restart`);
   }
 }
 
@@ -22644,6 +22945,7 @@ async function startRelay() {
       store: state.sessionRecordStore,
       now: nowIso,
     });
+    hydrateSessionMetadataCacheFromStore();
     await reconcileStopRequestsAfterRestart();
     await reconcilePendingSessionRunsAfterRestart();
     state.modelCatalog = new ModelCatalogService({
@@ -22670,14 +22972,15 @@ async function startRelay() {
       dispatchRollout: (request) => createSkillDeployment(request),
       audit: (type, data, options) => recordSkillAudit(type, data, options),
     });
-    hydrateSessionMetadataCacheFromStore();
-
     if (LOCAL_AGENT_WATCHDOG_ENABLED) {
       localAgentWatchdogTimer = setInterval(localAgentWatchdogTick, LOCAL_AGENT_WATCHDOG_INTERVAL_MS);
       localAgentWatchdogTimer.unref?.();
     }
     relayReady = true;
     state.skillAutomation.start();
+    if (sessionLogsNeedsNormalization) {
+      scheduleSessionLogsSave(0);
+    }
     if (sessionDiagnosticsNeedsNormalization) {
       scheduleSessionDiagnosticsSave(0);
     }
@@ -22797,7 +23100,8 @@ async function flushRelayPersistence() {
     sessionLogsSaveTimer = null;
   }
   try {
-    saveSessionLogs();
+    sessionLogsSavePending = true;
+    await flushSessionLogsSave();
   } catch (error) {
     errors.push(error);
   }

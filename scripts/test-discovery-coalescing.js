@@ -127,6 +127,105 @@ async function main() {
     });
     assert.strictEqual(registered.statusCode, 200, JSON.stringify(registered.body));
 
+    const sessionLogsPath = path.join(tempRoot, 'session-logs.json');
+    await postDiscovery(port, [{
+      sessionId: 'empty-history-preview',
+      nativeThreadId: 'empty-history-preview',
+      title: 'Empty history preview',
+      cwd: ROOT,
+      source: 'rollout',
+      live: false,
+      transcriptPreview: [],
+    }], 'empty-history-preview');
+    assert.strictEqual(
+      fs.existsSync(sessionLogsPath),
+      false,
+      'an empty discovery preview must not dirty the global transcript snapshot'
+    );
+
+    const stablePreview = [{
+      speaker: 'agent',
+      text: 'stable preview',
+      timestamp: '2026-07-01T00:00:00.000Z',
+    }];
+    const stableHistory = {
+      sessionId: 'stable-history-preview',
+      nativeThreadId: 'stable-history-preview',
+      title: 'Stable history preview',
+      cwd: ROOT,
+      source: 'rollout',
+      live: false,
+      transcriptPreview: stablePreview,
+    };
+    await postDiscovery(port, [stableHistory], 'stable-history-preview-1');
+    const firstLogsWrite = fs.statSync(sessionLogsPath).mtimeMs;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await postDiscovery(port, [stableHistory], 'stable-history-preview-2');
+    assert.strictEqual(
+      fs.statSync(sessionLogsPath).mtimeMs,
+      firstLogsWrite,
+      'an identical discovery preview must not rewrite the global transcript snapshot'
+    );
+
+    await postDiscovery(port, [{
+      ...liveSession(),
+      runId: 'runtime-repair-run',
+      runtime: {
+        runId: 'runtime-repair-run',
+        runtimeRevision: 10,
+        phase: 'thinking',
+        busy: true,
+        activeTurnId: 'runtime-repair-turn',
+      },
+    }], 'runtime-repair-active');
+    await postDiscovery(port, [{
+      ...liveSession(),
+      runId: 'runtime-repair-run',
+      runtime: {
+        runId: 'runtime-repair-run',
+        runtimeRevision: 11,
+        phase: 'idle',
+        busy: false,
+        activeTurnId: null,
+        currentTurnStatus: 'completed',
+      },
+    }], 'runtime-repair-idle');
+    const repairedDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${encodeURIComponent(SESSION_ID)}/detail?hostId=${encodeURIComponent(HOST_ID)}`
+    );
+    assert.strictEqual(repairedDetail.statusCode, 200, JSON.stringify(repairedDetail.body));
+    assert.strictEqual(
+      repairedDetail.body?.runtime?.phase,
+      'idle',
+      'same-run discovery with a newer runtime revision must repair a missed terminal event'
+    );
+    assert.strictEqual(repairedDetail.body?.runtime?.activeTurnId, null);
+    for (const [batchId, runId, runtimeRevision] of [
+      ['runtime-repair-stale-revision', 'runtime-repair-run', 10],
+      ['runtime-repair-stale-run', 'different-runtime-run', 99],
+    ]) {
+      await postDiscovery(port, [{
+        ...liveSession(),
+        runId,
+        runtime: {
+          runId,
+          runtimeRevision,
+          phase: 'thinking',
+          busy: true,
+          activeTurnId: 'stale-runtime-turn',
+        },
+      }], batchId);
+    }
+    const afterStaleRepair = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${encodeURIComponent(SESSION_ID)}/detail?hostId=${encodeURIComponent(HOST_ID)}`
+    );
+    assert.strictEqual(afterStaleRepair.body?.runtime?.phase, 'idle');
+    assert.strictEqual(afterStaleRepair.body?.runtime?.activeTurnId, null);
+
     await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions?refresh=1`);
     await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions?refresh=1`);
     const commands = await requestJson(port, 'GET', `/api/agent/commands?hostId=${HOST_ID}&after=0&ack=0`);
@@ -152,6 +251,78 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 5));
     await postDiscovery(port, [], 'discovery-missing-after-reset');
     assert.strictEqual((await readSession(port)).live, true, 'a present snapshot must reset missing confirmation');
+
+    await postDiscovery(port, [{
+      sessionId: 'ordinary-fork',
+      nativeThreadId: 'ordinary-fork',
+      title: 'Ordinary fork',
+      cwd: ROOT,
+      source: 'rollout',
+      forkedFromId: SESSION_ID,
+      live: false,
+      transcriptPreview: [],
+    }], 'ordinary-fork-discovery');
+    const ordinaryForks = await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions`);
+    const ordinaryFork = (ordinaryForks.body.sessions || []).find((session) => session.sessionId === 'ordinary-fork');
+    assert(ordinaryFork, 'a normal fork lineage must remain a visible Session');
+    assert.strictEqual(ordinaryFork.readOnly, false, 'a normal fork must remain writable');
+
+    await postDiscovery(port, [{
+      sessionId: 'stale-child',
+      nativeThreadId: 'stale-child',
+      title: 'Stale child discovery',
+      cwd: ROOT,
+      source: 'rollout',
+      threadSource: 'subagent',
+      parentThreadId: SESSION_ID,
+      live: false,
+      transcriptPreview: [],
+    }], 'stale-child-discovery');
+    const hiddenChild = await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions`);
+    assert.strictEqual(
+      (hiddenChild.body.sessions || []).some((session) => session.sessionId === 'stale-child'),
+      false,
+      'an explicit subagent discovery must remain hidden from the independent Session list'
+    );
+    await postDiscovery(port, [{
+      sessionId: 'stale-child',
+      nativeThreadId: 'stale-child',
+      title: 'Authoritative managed replacement',
+      cwd: ROOT,
+      source: 'managed',
+      live: true,
+      transcriptPreview: [],
+    }], 'managed-replacement-discovery');
+    const managedReplacement = await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions`);
+    const clearedManagedReplacement = (managedReplacement.body.sessions || []).find((session) => session.sessionId === 'stale-child');
+    assert(clearedManagedReplacement, 'authoritative managed-live discovery must clear stale child classification');
+    assert.strictEqual(clearedManagedReplacement.readOnly, false);
+
+    await postDiscovery(port, [{
+      sessionId: 'bridge-managed',
+      nativeThreadId: 'bridge-managed',
+      title: 'Bridge managed Session',
+      cwd: ROOT,
+      source: 'managed',
+      live: true,
+      transcriptPreview: [],
+    }], 'bridge-managed-discovery');
+    await postDiscovery(port, [{
+      sessionId: 'native-managed',
+      bridgeSessionId: 'bridge-managed',
+      nativeThreadId: 'native-managed',
+      title: 'Native managed Session',
+      cwd: ROOT,
+      source: 'managed',
+      live: true,
+      transcriptPreview: [],
+    }], 'native-managed-discovery');
+    const managedAliases = await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions`);
+    const managedAliasSessions = (managedAliases.body.sessions || []).filter((session) => (
+      session.sessionId === 'bridge-managed' || session.sessionId === 'native-managed'
+    ));
+    assert.strictEqual(managedAliasSessions.length, 1, 'bridge/native discovery must not create a shadow managed Session');
+    assert.strictEqual(managedAliasSessions[0].nativeThreadId, 'native-managed');
 
     const concurrentSessions = Array.from({ length: 120 }, (_, index) => ({
       sessionId: `concurrent-discovery-${index}`,

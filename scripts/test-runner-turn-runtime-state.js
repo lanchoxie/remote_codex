@@ -23,6 +23,27 @@ function extractBlock(startNeedle, endNeedle, fromIndex = 0) {
 
 const notificationHandlerStart = runner.indexOf('async handleNotification(message)');
 assert(notificationHandlerStart >= 0, 'runner should define handleNotification');
+const releaseClientRequestIdStart = runner.indexOf('releaseClientRequestIdForTurn(turnId)');
+const releaseClientRequestIdEnd = runner.indexOf('async applyPendingInterruptIntent', releaseClientRequestIdStart);
+const releaseClientRequestIdBlock = runner.slice(releaseClientRequestIdStart, releaseClientRequestIdEnd);
+assert(
+  !releaseClientRequestIdBlock.includes('pendingInterruptIntent'),
+  'releasing a client-request mapping must not silently discard an unsettled interrupt'
+);
+assertContains(
+  runner,
+  'async settlePendingInterrupt(intent, result = {})',
+  'terminal paths must use a single interrupt settlement entry point'
+);
+const settlePendingInterruptBlock = extractBlock(
+  'async settlePendingInterrupt(intent, result = {})',
+  'async settlePendingInterruptForSubmissionFailure'
+);
+assertContains(
+  settlePendingInterruptBlock,
+  'intent.settled = false;',
+  'a failed terminal-result delivery must remain retryable instead of losing the interrupt outcome'
+);
 const reasoningBlock = extractBlock(
   "if (method === 'item/reasoning/summaryTextDelta')",
   "if (method === 'item/plan/delta' || method === 'turn/plan/updated')",
@@ -30,13 +51,13 @@ const reasoningBlock = extractBlock(
 );
 assertContains(
   reasoningBlock,
-  'const isActiveTurn = turnId && turnId === this.activeTurnId;',
-  'late reasoning deltas for a completed turn must not resurrect active runtime state'
+  'emitActiveTurnRecoveryIfNeeded',
+  'reasoning recovery must remain behind the runner terminal-state guard'
 );
 assertContains(
   reasoningBlock,
-  'if (isActiveTurn) {',
-  'runner should only emit busy thinking runtime for the currently active turn'
+  'this.appendThinkingDelta',
+  'reasoning deltas must be represented by the activity stream'
 );
 
 const planBlock = extractBlock(
@@ -46,13 +67,13 @@ const planBlock = extractBlock(
 );
 assertContains(
   planBlock,
-  'const isActiveTurn = turnId && turnId === this.activeTurnId;',
-  'late plan deltas for a completed turn must not resurrect active runtime state'
+  'emitActiveTurnRecoveryIfNeeded',
+  'plan recovery must remain behind the runner terminal-state guard'
 );
 assertContains(
   planBlock,
-  'if (isActiveTurn) {',
-  'runner should only emit busy planning runtime for the currently active turn'
+  'this.appendActivityDelta',
+  'plan deltas must be represented by the activity stream'
 );
 
 const resolveRequestBlock = extractBlock(
@@ -197,6 +218,15 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
     assert.strictEqual(runner.runtime.lastError, null, 'same-turn assistant progress must clear a retry error');
     assert.strictEqual(runner.runtime.lastCodexError, null, 'same-turn assistant progress must clear retry metadata');
 
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: { turn: { id: 'turn-retry', status: { type: 'completed' } } },
+    });
+    await runner.flushPendingTurnCompletion('turn-retry');
+    runner.activeClientRequestId = 'turn-phase-request';
+    runner.runtime.phase = 'submitting-turn';
+    runner.runtime.busy = true;
+
     const projectedOutputStart = events.length;
     await runner.handleNotification({
       method: 'turn/started',
@@ -204,6 +234,7 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
         turn: { id: 'turn-phase-projection', status: { type: 'inProgress' } },
       },
     });
+    assert.strictEqual(runner.activeTurnId, 'turn-phase-projection');
     await runner.handleNotification({
       method: 'item/started',
       params: {
@@ -242,6 +273,11 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
         delta: 'final answer only',
       },
     });
+    assert.strictEqual(
+      runner.turnBuffers.get('turn-phase-projection'),
+      'final answer only',
+      'the final assistant delta must remain buffered until turn completion'
+    );
     await runner.handleNotification({
       method: 'turn/completed',
       params: {
@@ -255,11 +291,11 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
     );
     await runner.flushPendingTurnCompletion('turn-phase-projection');
     const projectedOutputs = events.slice(projectedOutputStart)
-      .filter((event) => event.type === 'session.output');
+      .filter((event) => event.type === 'session.transcript');
     assert.deepStrictEqual(
-      projectedOutputs.map((event) => event.chunk),
+      projectedOutputs.map((event) => event.text),
       ['final answer only'],
-      'a delta must inherit item/started phase so commentary cannot be concatenated into final output'
+      'a delta must inherit item/started phase so commentary cannot be concatenated into the final transcript'
     );
 
     setActiveTurn('turn-terminal-error');
@@ -336,7 +372,6 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
       'systemError must finalize and release Thinking activities for the failed turn'
     );
     assert.strictEqual(runner.turnBuffers.has('turn-system-error'), false);
-    assert.strictEqual(runner.reasoningBuffers.has('turn-system-error'), false);
     assert(systemErrorEvents.some((event) => (
       event.type === 'session.activity_snapshot'
       && event.turnId === 'turn-system-error'
@@ -492,8 +527,93 @@ async function verifyPendingAcceptanceInterruptAndRuntimeRevision() {
   }
 }
 
+async function verifyTerminalTurnMonotonicity() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-terminal-turn-'));
+  fs.writeFileSync(path.join(baseHome, 'auth.json'), '{}\n', 'utf8');
+  fs.writeFileSync(path.join(baseHome, 'config.toml'), '', 'utf8');
+  const events = [];
+  let resolveStart;
+  const runner = new CodexAppServerRunner({
+    hostId: 'runner-terminal-turn-host',
+    sessionId: 'runner-terminal-turn-session',
+    bridgeSessionId: 'runner-terminal-turn-session',
+    runId: 'runner-terminal-turn-run',
+    title: 'Runner terminal turn monotonicity',
+    cwd: process.cwd(),
+    launchMode: 'fresh',
+    codexHome: baseHome,
+    postEvent: async (event) => events.push(event),
+  });
+  runner.threadId = 'runner-terminal-turn-thread';
+  runner.sessionId = runner.threadId;
+  runner.nativeThreadId = runner.threadId;
+  runner.rpc = {
+    request: (method) => {
+      if (method === 'turn/start') {
+        return new Promise((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      throw new Error(`Unexpected RPC: ${method}`);
+    },
+  };
+
+  try {
+    const startPromise = runner.sendInput('terminal response must stay terminal', {
+      clientRequestId: 'terminal-response-request',
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(typeof resolveStart, 'function', 'the test must hold an unresolved turn/start response');
+
+    await runner.handleNotification({
+      method: 'turn/completed',
+      params: { turn: { id: 'terminal-before-response', status: { type: 'completed' } } },
+    });
+    resolveStart({ turn: { id: 'terminal-before-response' } });
+    assert.strictEqual(await startPromise, 'terminal-before-response');
+    assert.strictEqual(runner.isTerminalTurnId('terminal-before-response'), true);
+    assert.strictEqual(runner.activeTurnId, null, 'a late turn/start response must not resurrect a terminal turn');
+    assert.strictEqual(runner.runtime.activeTurnId, null);
+    assert.strictEqual(runner.runtime.busy, false);
+
+    const eventCountBeforeLateStart = events.length;
+    await runner.handleNotification({
+      method: 'turn/started',
+      params: { turn: { id: 'terminal-before-response', status: { type: 'inProgress' } } },
+    });
+    assert.strictEqual(runner.activeTurnId, null, 'a late turn/started notification must not resurrect a terminal turn');
+    assert.strictEqual(runner.runtime.busy, false);
+    assert.strictEqual(
+      events.slice(eventCountBeforeLateStart).some((event) => (
+        event.type === 'session.runtime_updated' && event.patch?.busy === true
+      )),
+      false,
+      'late terminal notifications must not publish an active runtime projection'
+    );
+
+    runner.activeClientRequestId = 'exit-interrupt-request';
+    runner.activeTurnId = 'exit-interrupt-turn';
+    runner.clientRequestIdsByTurn.set('exit-interrupt-turn', 'exit-interrupt-request');
+    runner.pendingInterruptIntent = {
+      interruptRequestId: 'exit-interrupt',
+      expectedClientRequestId: 'exit-interrupt-request',
+    };
+    await runner.finalizeExit(1, null);
+    const exitInterruptResults = events.filter((event) => (
+      event.type === 'session.interrupt_result' && event.interruptRequestId === 'exit-interrupt'
+    ));
+    assert.strictEqual(exitInterruptResults.length, 1, 'process exit must settle a pending interrupt exactly once');
+    assert.strictEqual(exitInterruptResults[0].reason, 'turn_already_exited');
+    assert.strictEqual(runner.pendingInterruptIntent, null);
+  } finally {
+    runner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
 verifyRetryRecoveryAndTerminalErrorState()
   .then(verifyPendingAcceptanceInterruptAndRuntimeRevision)
+  .then(verifyTerminalTurnMonotonicity)
   .then(() => console.log('runner turn runtime state assertions passed'))
   .catch((error) => {
     console.error(error);

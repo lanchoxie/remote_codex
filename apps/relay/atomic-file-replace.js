@@ -25,6 +25,17 @@ function nextBackupPath(targetPath, tempPath, fileSystem) {
   return candidate;
 }
 
+async function nextBackupPathAsync(targetPath, tempPath, fileSystem) {
+  const basePath = `${targetPath}.${path.basename(tempPath)}.bak`;
+  let candidate = basePath;
+  let suffix = 0;
+  while (await pathExists(candidate, fileSystem)) {
+    suffix += 1;
+    candidate = `${basePath}.${suffix}`;
+  }
+  return candidate;
+}
+
 function cleanupBackup(backupPath, fileSystem) {
   try {
     fileSystem.unlinkSync(backupPath);
@@ -226,7 +237,7 @@ async function replaceFileWithBackupAsync(tempPath, targetPath, options = {}) {
     }
   }
 
-  const backupPath = nextBackupPath(targetPath, tempPath, fileSystem);
+  const backupPath = await nextBackupPathAsync(targetPath, tempPath, fileSystem);
   try {
     await renameWithRetry(targetPath, backupPath, { ...options, fileSystem });
   } catch (error) {

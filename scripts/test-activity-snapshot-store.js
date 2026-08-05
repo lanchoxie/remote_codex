@@ -45,6 +45,8 @@ const structured = store.accept('epoch-a', 'h::structured', {
   itemType: 'commandExecution',
   method: 'item/completed',
   status: 'completed',
+  startedAt: '2026-07-16T00:00:01.000Z',
+  timestamp: '2026-07-16T00:00:05.000Z',
   text: 'command completed',
   command: 'npm test',
   cwd: 'D:/workspace',
@@ -66,6 +68,8 @@ assert.deepStrictEqual(
     requestId: structured.requestId,
     itemType: structured.itemType,
     status: structured.status,
+    startedAt: structured.startedAt,
+    timestamp: structured.timestamp,
     command: structured.command,
     cwd: structured.cwd,
     output: structured.output,
@@ -85,6 +89,8 @@ assert.deepStrictEqual(
     requestId: 'request-structured',
     itemType: 'commandExecution',
     status: 'completed',
+    startedAt: '2026-07-16T00:00:01.000Z',
+    timestamp: '2026-07-16T00:00:05.000Z',
     command: 'npm test',
     cwd: 'D:/workspace',
     output: 'all tests passed',
@@ -108,6 +114,39 @@ assert.strictEqual(
 assert.strictEqual(
   store.accept('epoch-a', 'h::c', { ...base, activityRevision: 1, text: 'old' }),
   null
+);
+
+const legacyTimingStore = new ActivitySnapshotStore();
+legacyTimingStore.accept('epoch-timing', 'h::timing', {
+  ...base,
+  activityRevision: 1,
+  startedAt: '2026-07-16T00:00:01.000Z',
+  timestamp: '2026-07-16T00:00:02.000Z',
+  text: 'started',
+});
+const legacyTimingUpdate = legacyTimingStore.accept('epoch-timing', 'h::timing', {
+  ...base,
+  activityRevision: 2,
+  timestamp: '2026-07-16T00:00:05.000Z',
+  text: 'completed',
+});
+assert.strictEqual(
+  legacyTimingUpdate.startedAt,
+  '2026-07-16T00:00:01.000Z',
+  'a legacy revision without startedAt must not move an activity into a later turn'
+);
+assert.strictEqual(legacyTimingUpdate.timestamp, '2026-07-16T00:00:05.000Z');
+const conflictingTimingUpdate = legacyTimingStore.accept('epoch-timing', 'h::timing', {
+  ...base,
+  activityRevision: 3,
+  startedAt: '2026-07-16T00:00:04.000Z',
+  timestamp: '2026-07-16T00:00:06.000Z',
+  text: 'conflicting start time',
+});
+assert.strictEqual(
+  conflictingTimingUpdate.startedAt,
+  '2026-07-16T00:00:01.000Z',
+  'a later revision must not rewrite an established activity start time'
 );
 
 const relayRetentionStore = new ActivitySnapshotStore();

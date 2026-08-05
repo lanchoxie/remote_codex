@@ -1022,6 +1022,34 @@ async function main() {
   assert.strictEqual(stoppedReplay.idempotentReplay, true);
   assert.strictEqual(stoppedReplay.run.status, 'stopped', 'a retry must not recreate an accepted stopped run');
 
+  await service.planRun({
+    identity: { hostId: 'host-idempotent-failed', sessionId: 'failed-target' },
+    runId: 'failed-run',
+    launchMode: 'fresh',
+    clientRequestId: 'failed-create-intent',
+    requestFingerprint: 'failed-payload-fingerprint',
+    submittedBinding: asxs,
+  });
+  await service.failRun({
+    identity: { hostId: 'host-idempotent-failed', sessionId: 'failed-target' },
+    runId: 'failed-run',
+    code: 'session_spawn_failed',
+  });
+  await assert.rejects(
+    service.planRun({
+      identity: { hostId: 'host-idempotent-failed', sessionId: 'failed-target' },
+      runId: 'failed-run',
+      launchMode: 'fresh',
+      clientRequestId: 'failed-create-intent',
+      requestFingerprint: 'failed-payload-fingerprint',
+      submittedBinding: asxs,
+    }),
+    (error) => error instanceof SessionContractError
+      && error.code === 'session_request_replay_unavailable'
+      && error.statusCode === 409,
+    'a failed Session creation request must not be replayed as an idempotent success'
+  );
+
   await service.failRun({
     identity: { hostId: 'host-superseded', sessionId: 'superseded' },
     runId: 'run-old-pending',

@@ -35,6 +35,19 @@ renderer.render(output, '```js\nconst answer = 42;\n```');
 assert.strictEqual(output.querySelectorAll('.markdown-code-card').length, 1);
 assert.strictEqual(output.querySelector('.markdown-copy-code').dataset.copyText, 'const answer = 42;\n');
 
+renderer.render(output, [
+  '| Name | Metric A | Metric B | Metric C | Metric D | Metric E |',
+  '| --- | ---: | ---: | ---: | ---: | ---: |',
+  '| deliberately-wide-row | 123 | 456 | 789 | 1011 | 1213 |',
+].join('\n'));
+const tableWrapper = output.querySelector('.markdown-table-wrap');
+assert(tableWrapper, 'Markdown tables must have a local horizontal scroll container');
+assert.strictEqual(tableWrapper.parentElement, output);
+assert.strictEqual(tableWrapper.querySelector(':scope > table'), output.querySelector('table'));
+assert.strictEqual(tableWrapper.getAttribute('role'), 'region');
+assert.strictEqual(tableWrapper.getAttribute('aria-label'), 'Scrollable table');
+assert.strictEqual(tableWrapper.tabIndex, 0);
+
 const displayMath = String.raw`\[
 \Delta E_{\rm L\rightarrow RS}
 E(\text{completely mixed rocksalt})

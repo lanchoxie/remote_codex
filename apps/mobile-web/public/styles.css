@@ -310,6 +310,11 @@ textarea {
   color: var(--muted);
 }
 
+#new-session-status.error {
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
 .session-meta-path {
   display: inline-block;
   max-width: min(960px, 72vw);
@@ -3877,6 +3882,7 @@ select:disabled {
 .message {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   max-width: min(82%, 720px);
   gap: 6px;
 }
@@ -3936,6 +3942,8 @@ select:disabled {
 }
 
 .bubble {
+  min-width: 0;
+  max-width: 100%;
   border: 1px solid var(--border);
   border-radius: 18px;
   padding: 14px 16px;
@@ -3945,6 +3953,8 @@ select:disabled {
 }
 
 .markdown-body {
+  min-width: 0;
+  max-width: 100%;
   white-space: normal;
 }
 
@@ -3992,15 +4002,26 @@ select:disabled {
 }
 
 .markdown-table-wrap {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   margin: 10px 0;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
   border: 1px solid rgba(134, 167, 255, 0.18);
   border-radius: 14px;
 }
 
+.markdown-table-wrap:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .markdown-body table {
-  width: 100%;
-  min-width: 420px;
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 0.94em;
 }
@@ -4011,6 +4032,8 @@ select:disabled {
   border-bottom: 1px solid rgba(134, 167, 255, 0.14);
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 .markdown-body th {
@@ -4381,10 +4404,12 @@ button.message-file-preview-button {
 
 .thinking-history-list {
   display: grid;
+  min-width: 0;
   gap: 8px;
 }
 
 .thinking-history-item {
+  min-width: 0;
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 8px;
   padding: 10px 12px;
@@ -4603,6 +4628,8 @@ button.message-file-preview-button {
 }
 
 .thinking-history-text {
+  min-width: 0;
+  max-width: 100%;
   margin-top: 8px;
   white-space: pre-wrap;
   word-break: break-word;

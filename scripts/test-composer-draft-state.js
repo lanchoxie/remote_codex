@@ -36,6 +36,16 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+const internalTranscriptContext = vm.createContext({});
+vm.runInContext(extractFunction('isInternalTranscriptText'), internalTranscriptContext);
+assert.strictEqual(
+  internalTranscriptContext.isInternalTranscriptText(
+    '# AGENTS.md instructions for C:\\work\\project\n\n<INSTRUCTIONS>\nKeep state isolated.\n</INSTRUCTIONS>\n\n<environment_context>\n  <cwd>C:\\work\\project</cwd>\n</environment_context>'
+  ),
+  true,
+  'browser transcript cleanup must hide injected AGENTS.md context from existing histories'
+);
+
 const dom = new JSDOM(`<!doctype html><body>
   <form id="input-form">
     <textarea id="input-text"></textarea>
@@ -56,6 +66,8 @@ const state = {
   sessionRebindFailures: new Map(),
   codexControls: {
     attachments: [],
+    steerQueue: [],
+    queueAutoSendTimersBySession: new Map(),
     composerDraftsBySession: new Map(),
     composerSessionKeyAliases: new Map(),
     mountedComposerSessionKey: '',
@@ -159,6 +171,7 @@ function resetComposer(session = sessionA) {
     state.codexControls.recentSubmissions,
     state.codexControls.sessionOptionsByKey,
     state.codexControls.apiSwitchNoticesBySession,
+    state.codexControls.queueAutoSendTimersBySession,
     state.sessionRebindFailures,
   ]) map.clear();
   for (const set of [
@@ -168,6 +181,7 @@ function resetComposer(session = sessionA) {
     state.codexControls.interruptBusyKeys,
   ]) set.clear();
   state.codexControls.attachments = [];
+  state.codexControls.steerQueue = [];
   state.codexControls.mountedComposerSessionKey = '';
   state.codexControls.mountingComposerDraft = false;
   context.selectedSession = session;
@@ -231,6 +245,8 @@ async function run() {
   state.sessionApiRebindBusyKeys.add(keyA);
   state.sessionTranscriptFallbackBusyKeys.add(keyA);
   state.sessionRebindFailures.set(keyA, { code: 'previous-failure' });
+  state.codexControls.steerQueue.push({ id: 'queued-a', sessionKey: keyA });
+  state.codexControls.queueAutoSendTimersBySession.set(keyA, 42);
   assert.strictEqual(context.moveComposerDraftSessionKey(keyA, canonicalKey), true);
   assert.strictEqual(context.resolveComposerSessionKey(keyA), canonicalKey);
   assert.strictEqual(inFlight.sessionKey, canonicalKey, 'canonical migration must update the live submission object');
@@ -250,6 +266,8 @@ async function run() {
   assert(state.sessionApiRebindBusyKeys.has(canonicalKey));
   assert(state.sessionTranscriptFallbackBusyKeys.has(canonicalKey));
   assert.strictEqual(state.sessionRebindFailures.get(canonicalKey).code, 'previous-failure');
+  assert.strictEqual(state.codexControls.steerQueue[0].sessionKey, canonicalKey);
+  assert.strictEqual(state.codexControls.queueAutoSendTimersBySession.has(keyA), false);
   const canonicalSession = { ...sessionA, sessionId: 'canonical-a' };
   state.sessions.push(canonicalSession);
   assert.strictEqual(
@@ -303,9 +321,9 @@ async function run() {
   assert.strictEqual(state.codexControls.composerDraftsBySession.get(keyB).text, 'keep beta', 'accepted A send must not clear B');
   assert.strictEqual(state.codexControls.activeDraftsBySession.get(keyA).attachments[0].fileObject, sendFile);
   assert.strictEqual(
-    state.codexControls.composerSubmissionsBySession.get(keyA)?.stage,
-    'queued',
-    'an accepted direct send must remain locked until the Host acknowledges the turn'
+    state.codexControls.composerSubmissionsBySession.has(keyA),
+    false,
+    'an accepted HTTP response must release the Composer submission lock immediately'
   );
   assert.strictEqual(
     context.recoverComposerSubmissionForSession(sessionA, { clientRequestId: 'different-request' }),
@@ -597,31 +615,115 @@ async function run() {
   );
 
   const postedBodies = [];
-  let postAttempt = 0;
-  const retryContext = vm.createContext({
+  const deliveryContext = vm.createContext({
     getActiveTurnBlocker: () => null,
     openStatusForActiveTurnBlocker: () => {},
     assertModelSelectionIsSelectable: () => {},
     assertEffortSelectionIsValid: () => {},
-    delay: async () => {},
     fetchJson: async (_url, options) => {
       postedBodies.push(options.body);
-      postAttempt += 1;
-      if (postAttempt === 1) {
-        const error = new Error('timed out');
-        error.code = 'request_timeout';
-        throw error;
-      }
-      return { ok: true };
+      const error = new Error('timed out');
+      error.code = 'request_timeout';
+      throw error;
     },
   });
-  vm.runInContext(extractFunction('sendInputToSession'), retryContext);
-  await retryContext.sendInputToSession(sessionA, 'retry exactly once', {
-    clientRequestId: 'stable-request-id',
+  vm.runInContext(extractFunction('sendInputToSession'), deliveryContext);
+  await assert.rejects(
+    deliveryContext.sendInputToSession(sessionA, 'send exactly once', {
+      clientRequestId: 'stable-request-id',
+    }),
+    (error) => error?.inputAcceptanceUnknown === true
+  );
+  assert.strictEqual(postedBodies.length, 1, 'an ambiguous POST must not be retried by the browser');
+  assert.strictEqual(JSON.parse(postedBodies[0]).clientRequestId, 'stable-request-id');
+
+  deliveryContext.fetchJson = async () => {
+    const error = new Error('relay rejected input');
+    error.status = 503;
+    error.body = { error: 'not accepted' };
+    throw error;
+  };
+  await assert.rejects(
+    deliveryContext.sendInputToSession(sessionA, 'definitive rejection', {}),
+    (error) => error?.status === 503 && error?.inputAcceptanceUnknown !== true
+  );
+
+  const queuedFollowups = [];
+  const retainedDraftContext = vm.createContext({
+    state: {
+      codexControls: {
+        activeDraftsBySession: new Map([[keyA, { clientRequestId: 'accepted-request' }]]),
+        steerNotice: null,
+      },
+    },
+    resolveComposerSessionKey: (session) => `${session.hostId}::${session.sessionId}`,
+    getRuntimeForSession: () => ({ phase: 'idle', busy: false }),
+    getExternalTerminalActivityForSession: () => ({ active: false }),
+    runtimeIsActive: () => false,
+    addSteerQueueItem: (_session, payload) => queuedFollowups.push(payload),
+    renderComposerTurnNotice: () => {},
+    sendInput: async () => {
+      throw new Error('a retained draft must prevent direct send');
+    },
   });
-  assert.strictEqual(postedBodies.length, 2, 'an ambiguous POST should be retried once');
-  assert.strictEqual(postedBodies[0], postedBodies[1], 'the retry must reuse the exact request body and clientRequestId');
-  assert.strictEqual(JSON.parse(postedBodies[1]).clientRequestId, 'stable-request-id');
+  vm.runInContext(extractFunction('submitComposerPayload'), retainedDraftContext);
+  const queuedFollowup = await retainedDraftContext.submitComposerPayload(sessionA, {
+    clientRequestId: 'next-request',
+    text: 'send after current turn',
+    displayText: 'send after current turn',
+    inputItems: [],
+    uploadedFiles: [],
+    inlineFiles: [],
+  });
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(queuedFollowup)),
+    { accepted: true, trackActiveDraft: false },
+    'a second prompt must queue while the first accepted request still awaits Host acknowledgement'
+  );
+  assert.strictEqual(queuedFollowups.length, 1);
+  assert.strictEqual(
+    retainedDraftContext.state.codexControls.activeDraftsBySession.get(keyA).clientRequestId,
+    'accepted-request',
+    'queueing a follow-up must preserve the first request draft'
+  );
+
+  const racedQueue = [];
+  const racedSendContext = vm.createContext({
+    state: {
+      codexControls: {
+        activeDraftsBySession: new Map(),
+        steerNotice: null,
+      },
+    },
+    resolveComposerSessionKey: (session) => `${session.hostId}::${session.sessionId}`,
+    getRuntimeForSession: () => ({ phase: 'idle', busy: false }),
+    getExternalTerminalActivityForSession: () => ({ active: false }),
+    runtimeIsActive: () => false,
+    addSteerQueueItem: (_session, payload) => racedQueue.push(payload),
+    renderComposerTurnNotice: () => {},
+    sendInput: async () => {
+      const error = new Error('Codex is still working on the previous turn.');
+      error.code = 'session_turn_active';
+      error.status = 409;
+      throw error;
+    },
+  });
+  vm.runInContext(extractFunction('submitComposerPayload'), racedSendContext);
+  const racedQueueResult = await racedSendContext.submitComposerPayload(sessionA, {
+    clientRequestId: 'race-request',
+    text: 'preserve this race-losing prompt',
+    displayText: 'preserve this race-losing prompt',
+    inputItems: [],
+    uploadedFiles: [],
+    inlineFiles: [],
+  });
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(racedQueueResult)),
+    { accepted: true, trackActiveDraft: false },
+    'a Relay active-turn race must move the prompt into the existing Queue instead of surfacing an error'
+  );
+  assert.strictEqual(racedQueue.length, 1);
+  assert.strictEqual(racedQueue[0].clientRequestId, 'race-request');
 
   const transcriptContext = vm.createContext({
     state: {
@@ -644,6 +746,7 @@ async function run() {
       : `${sessionOrKey.hostId}::${sessionOrKey.sessionId}`,
     runtimeIsActive: (runtime) => Boolean(runtime?.activeTurnId || runtime?.busy || runtime?.phase === 'queued-turn'),
     dedupeTranscript: (entries) => entries.map((entry) => ({ ...entry })),
+    rememberSessionCacheValue: () => {},
   });
   for (const name of [
     'pruneTranscriptTombstones',

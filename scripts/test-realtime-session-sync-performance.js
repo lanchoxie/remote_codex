@@ -9,7 +9,7 @@ const { spawn } = require('child_process');
 const ROOT = path.resolve(__dirname, '..');
 const EXISTING_DIAGNOSTICS = Number(process.env.SYNC_PERF_EXISTING_DIAGNOSTICS || 4000);
 const INCOMING_DIAGNOSTICS = Number(process.env.SYNC_PERF_INCOMING_DIAGNOSTICS || 120);
-const MAX_BATCH_INGEST_MS = Number(process.env.SYNC_PERF_MAX_BATCH_MS || 750);
+const MAX_SINGLETON_INGEST_MS = Number(process.env.SYNC_PERF_MAX_SINGLETON_MS || 2500);
 const DIAGNOSTIC_LIMIT = 10000;
 const HOST_ID = 'sync-performance-host';
 const SESSION_ID = 'sync-performance-session';
@@ -113,6 +113,11 @@ async function stopChild(child) {
 }
 
 async function main() {
+  const agentSource = fs.readFileSync(path.join(ROOT, 'apps', 'host-agent', 'agent.js'), 'utf8');
+  assert(
+    /event\?\.type === 'session\.diagnostic'\s*\? ''/.test(agentSource),
+    'Host diagnostic events must bypass durable batch checkpoints so high-frequency output cannot wait on full snapshots'
+  );
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'realtime-sync-performance-'));
   const diagnosticsPath = path.join(tempRoot, 'session-diagnostics.json');
   const existing = Array.from({ length: EXISTING_DIAGNOSTICS }, (_, index) => makeDiagnostic(index));
@@ -150,7 +155,7 @@ async function main() {
   });
   relay.stdout.on('data', (chunk) => relayOutput.push(chunk.toString('utf8')));
   relay.stderr.on('data', (chunk) => relayOutput.push(chunk.toString('utf8')));
-  let measuredBatchIngestMs = null;
+  let measuredSingletonIngestMs = null;
 
   try {
     await waitForRelay(port, relay);
@@ -162,18 +167,17 @@ async function main() {
     }));
 
     const startedAt = Date.now();
-    const response = await requestJson(port, 'POST', '/api/agent/events', {
-      batchId: 'performance-diagnostics-batch',
-      events,
-    });
+    for (const event of events) {
+      const response = await requestJson(port, 'POST', '/api/agent/events', { event });
+      assert.strictEqual(response.statusCode, 200, `relay diagnostic failed: ${JSON.stringify(response.body)}`);
+      assert.strictEqual(response.body?.count, 1, 'relay must ingest each singleton diagnostic');
+    }
     const elapsedMs = Date.now() - startedAt;
-    measuredBatchIngestMs = elapsedMs;
+    measuredSingletonIngestMs = elapsedMs;
 
-    assert.strictEqual(response.statusCode, 200, `relay batch failed: ${JSON.stringify(response.body)}`);
-    assert.strictEqual(response.body?.count, INCOMING_DIAGNOSTICS, 'relay must ingest every diagnostic in the batch');
     assert(
-      elapsedMs < MAX_BATCH_INGEST_MS,
-      `relay must append diagnostics incrementally; ${INCOMING_DIAGNOSTICS} events over ${EXISTING_DIAGNOSTICS} stored entries took ${elapsedMs}ms`
+      elapsedMs < MAX_SINGLETON_INGEST_MS,
+      `singleton diagnostics must not rewrite the full snapshot before each ACK; ${INCOMING_DIAGNOSTICS} events over ${EXISTING_DIAGNOSTICS} stored entries took ${elapsedMs}ms`
     );
 
     const detail = await requestJson(
@@ -266,6 +270,64 @@ async function main() {
       'newer-runtime',
       'an ambiguous-response retry must not let an older runtime patch overwrite newer state'
     );
+
+    await requestJson(port, 'POST', '/api/agent/events', {
+      events: [{
+        type: 'session.runtime_updated',
+        hostId: HOST_ID,
+        sessionId: SESSION_ID,
+        runId: 'sync-current-run',
+        timestamp: '2026-07-11T12:00:02.000Z',
+        patch: {
+          runId: 'sync-current-run',
+          runtimeRevision: 2,
+          phase: 'idle',
+          busy: false,
+          activeTurnId: null,
+        },
+      }],
+    });
+    await requestJson(port, 'POST', '/api/agent/events', {
+      events: [{
+        type: 'session.activity_snapshot',
+        hostId: HOST_ID,
+        sessionId: SESSION_ID,
+        runId: 'sync-old-run',
+        turnId: 'stale-turn',
+        itemId: 'stale-item',
+        kind: 'reasoning',
+        text: 'stale activity',
+        activityRevision: 1,
+        timestamp: '2026-07-11T12:00:03.000Z',
+      }],
+    });
+    const staleActivities = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${encodeURIComponent(SESSION_ID)}/activities?hostId=${encodeURIComponent(HOST_ID)}`
+    );
+    assert.strictEqual(staleActivities.body?.activities?.length, 0, 'activity from a completed run must not enter the current Session');
+
+    await requestJson(port, 'POST', '/api/agent/events', {
+      events: [{
+        type: 'session.activity_snapshot',
+        hostId: HOST_ID,
+        sessionId: SESSION_ID,
+        runId: 'sync-current-run',
+        turnId: 'current-turn',
+        itemId: 'current-item',
+        kind: 'reasoning',
+        text: 'current activity',
+        activityRevision: 1,
+        timestamp: '2026-07-11T12:00:04.000Z',
+      }],
+    });
+    const currentActivities = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${encodeURIComponent(SESSION_ID)}/activities?hostId=${encodeURIComponent(HOST_ID)}`
+    );
+    assert.strictEqual(currentActivities.body?.activities?.length, 1, 'activity from the current run must remain observable');
   } catch (error) {
     if (relayOutput.length) {
       error.message += `\nRelay output:\n${relayOutput.join('').slice(-4000)}`;
@@ -276,7 +338,7 @@ async function main() {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 
-  console.log(`realtime session sync performance assertions passed (${measuredBatchIngestMs}ms for ${INCOMING_DIAGNOSTICS} diagnostics over ${EXISTING_DIAGNOSTICS} stored entries)`);
+  console.log(`realtime session sync performance assertions passed (${measuredSingletonIngestMs}ms for ${INCOMING_DIAGNOSTICS} singleton diagnostics over ${EXISTING_DIAGNOSTICS} stored entries)`);
 }
 
 main().catch((error) => {

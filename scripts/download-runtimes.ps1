@@ -1,6 +1,6 @@
 param(
   [string]$Repo = "lanchoxie/remote_codex",
-  [string]$Tag = "v2.4.8",
+  [string]$Tag = "v2.4.9",
   [string]$OutDir = "",
   [switch]$Force,
   [switch]$DryRun

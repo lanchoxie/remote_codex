@@ -51,11 +51,31 @@ function identityValues(input = {}, options = {}) {
     input.sessionId,
     input.bridgeSessionId,
     input.nativeThreadId,
+    input.rolloutSessionId,
+    ...(Array.isArray(input.rolloutSessionIds) ? input.rolloutSessionIds : []),
   ];
   if (options.includeLineage) {
     values.push(input.originSessionId, input.sourceSessionId);
   }
   return values.map((value) => String(value || '').trim()).filter(Boolean);
+}
+
+function normalizedIdentityList(values = []) {
+  return [...new Set(values
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))];
+}
+
+function discoveredRolloutSessionIds(input = {}) {
+  const explicit = [
+    input.rolloutSessionId,
+    ...(Array.isArray(input.rolloutSessionIds) ? input.rolloutSessionIds : []),
+  ];
+  const source = String(input.source || '').trim().toLowerCase();
+  if (['rollout', 'vscode', 'subagent'].includes(source)) {
+    explicit.push(input.nativeThreadId, input.sessionId);
+  }
+  return normalizedIdentityList(explicit);
 }
 
 function cloneSelection(selection, fallbackSource = 'inherit') {
@@ -269,6 +289,12 @@ function mergeRecords(winner, loser, context = {}) {
   const winnerIsStronger = sourceStrength(winner.source) >= sourceStrength(loser.source);
   const stronger = winnerIsStronger ? winner : loser;
   const weaker = winnerIsStronger ? loser : winner;
+  const rolloutSessionIds = normalizedIdentityList([
+    stronger.rolloutSessionId,
+    ...(Array.isArray(stronger.rolloutSessionIds) ? stronger.rolloutSessionIds : []),
+    weaker.rolloutSessionId,
+    ...(Array.isArray(weaker.rolloutSessionIds) ? weaker.rolloutSessionIds : []),
+  ]);
   const merged = {
     ...weaker,
     ...stronger,
@@ -276,6 +302,8 @@ function mergeRecords(winner, loser, context = {}) {
     conversationKey: stronger.conversationKey || weaker.conversationKey,
     bridgeSessionId: stronger.bridgeSessionId || weaker.bridgeSessionId || null,
     nativeThreadId: stronger.nativeThreadId || weaker.nativeThreadId || null,
+    rolloutSessionId: stronger.rolloutSessionId || weaker.rolloutSessionId || rolloutSessionIds[0] || null,
+    rolloutSessionIds,
     originSessionId: stronger.originSessionId || weaker.originSessionId || null,
     sourceSessionId: stronger.sourceSessionId || weaker.sourceSessionId || null,
     cwd: stronger.cwd || weaker.cwd || null,
@@ -338,6 +366,13 @@ class SessionProvenanceService {
         const replaysAcceptedRequest = acceptedRunId === runId
           && acceptedRun.requestFingerprint === requestFingerprint;
         if (replaysAcceptedRequest) {
+          if (acceptedRun.status === 'failed') {
+            throw new SessionContractError(
+              'session_request_replay_unavailable',
+              'The original Session creation request failed and cannot be replayed. Start a new Session instead.',
+              { statusCode: 409, currentRunId: acceptedRunId, currentRunStatus: acceptedRun.status }
+            );
+          }
           return {
             canonicalKey: targetKey,
             run: structuredClone(acceptedRun),
@@ -1020,6 +1055,20 @@ class SessionProvenanceService {
       ) {
         record.conversationKey = input.conversationKey;
       }
+      const rolloutSessionIds = discoveredRolloutSessionIds(input);
+      if (rolloutSessionIds.length) {
+        record.rolloutSessionId = rolloutSessionIds[0];
+        record.rolloutSessionIds = normalizedIdentityList([
+          ...rolloutSessionIds,
+          ...(Array.isArray(record.rolloutSessionIds) ? record.rolloutSessionIds : []),
+          record.rolloutSessionId,
+        ]);
+      } else {
+        record.rolloutSessionIds = normalizedIdentityList([
+          record.rolloutSessionId,
+          ...(Array.isArray(record.rolloutSessionIds) ? record.rolloutSessionIds : []),
+        ]);
+      }
       record.nativeThreadId ||= input.nativeThreadId || input.sessionId || null;
       record.bridgeSessionId ||= input.bridgeSessionId || null;
       record.originSessionId ||= input.originSessionId || null;
@@ -1067,6 +1116,8 @@ class SessionProvenanceService {
       identity.sessionId,
       identity.bridgeSessionId,
       identity.nativeThreadId,
+      identity.rolloutSessionId,
+      ...(Array.isArray(identity.rolloutSessionIds) ? identity.rolloutSessionIds : []),
       ...(options.includeLineage ? [identity.originSessionId, identity.sourceSessionId] : []),
     ].map((value) => String(value || '').trim()).filter(Boolean);
     const concreteAliases = [...new Set(concreteValues)].map((value) => `${hostId}::${value}`);

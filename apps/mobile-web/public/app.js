@@ -7,6 +7,8 @@ const state = {
   stats: null,
   refreshRequestId: 0,
   refreshPromise: null,
+  sessionDetailRequests: new Map(),
+  sessionRuntimeConfigRequests: new Map(),
   auth: {
     ready: false,
     required: false,
@@ -44,6 +46,7 @@ const state = {
   runtimeApplyGenerations: new Map(),
   runtimeStreamGenerations: new Map(),
   diagnostics: new Map(),
+  externalActivityKeys: new Set(),
   requests: new Map(),
   receivedFiles: new Map(),
   receivedFilesLoadingKeys: new Set(),
@@ -93,6 +96,9 @@ const state = {
   transcriptVisibleLimits: new Map(),
   fullTranscriptLoaded: new Set(),
   historyLoading: new Set(),
+  sessionCacheAccess: new Map(),
+  sessionCacheWeights: new Map(),
+  sessionCachePruneTimer: null,
   shownSessionKey: null,
   sessionWatchController: null,
   sessionWatchCatchUpRequired: false,
@@ -218,6 +224,7 @@ const state = {
   hostCodexUpdateBusyId: null,
   hostCodexUpdates: new Map(),
   sessionLaunchBusy: new Map(),
+  newSessionLaunchError: null,
   sessionApiRebindBusyKeys: new Set(),
   sessionRebindFailures: new Map(),
   sessionTranscriptFallbackBusyKeys: new Set(),
@@ -299,7 +306,7 @@ const state = {
     attachments: [],
     modelsLoading: false,
     steerQueue: [],
-    queueAutoSendScheduled: false,
+    queueAutoSendTimersBySession: new Map(),
     composerDraftsBySession: new Map(),
     composerSessionKeyAliases: new Map(),
     mountedComposerSessionKey: '',
@@ -336,6 +343,7 @@ const state = {
 
 const STREAM_HEALTH_CHECK_MS = 15_000;
 const STREAM_STALE_RECONNECT_MS = 65_000;
+const FULL_REFRESH_INTERVAL_MS = 60_000;
 const SESSION_WATCH_RENEW_MS = 10_000;
 const ACTIVITY_SNAPSHOT_RECOVERY_DEBOUNCE_MS = 250;
 const ACTIVITY_SNAPSHOT_RECOVERY_MAX_WAIT_MS = 2_000;
@@ -365,7 +373,12 @@ const TRANSCRIPT_RENDER_MIN_WINDOW = 32;
 const TRANSCRIPT_RENDER_CHAR_BUDGET = 90_000;
 const TRANSCRIPT_RENDER_LINE_BUDGET = 3_000;
 const TRANSCRIPT_RENDER_CODE_FENCE_BUDGET = 180;
+const SESSION_CACHE_HISTORY_LIMIT = 12;
+const SESSION_CACHE_APPROX_BYTE_LIMIT = 32 * 1024 * 1024;
+const SESSION_CACHE_PRUNE_DEBOUNCE_MS = 500;
 const CLIENT_DIAGNOSTIC_ENTRY_LIMIT = 10000;
+const CLIENT_DIAGNOSTIC_APPROX_BYTE_LIMIT = 8 * 1024 * 1024;
+const CLIENT_DIAGNOSTIC_TRIM_TARGET_BYTES = 6 * 1024 * 1024;
 const CLIENT_DIAGNOSTIC_RECENT_DEDUPE_WINDOW = 200;
 const LIVE_THINKING_DIAGNOSTIC_WINDOW = 240;
 const LIVE_THINKING_ACTIVITY_ENTRY_LIMIT = 160;
@@ -1746,29 +1759,46 @@ function translateStaticText(value) {
   return translated ? text.replace(trimmed, translated) : text;
 }
 
-function shouldSkipLocalizationNode(node) {
-  const parent = node?.parentElement || node;
-  if (!parent || !(parent instanceof Element)) {
-    return false;
-  }
-  return Boolean(parent.closest('#session-log, .markdown-body, pre, code, script, style'));
+function shouldPruneLocalizationElement(node) {
+  return Boolean(
+    node?.nodeType === 1
+    && node.matches?.('#session-log, .markdown-body, pre, code, script, style')
+  );
 }
 
 function applyStaticLocalization(root = document.body) {
   if (!root) {
     return;
   }
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+  const walker = document.createTreeWalker(
+    root,
+    NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+    {
     acceptNode(node) {
-      if (!node.nodeValue?.trim() || shouldSkipLocalizationNode(node)) {
-        return NodeFilter.FILTER_REJECT;
+      if (node.nodeType === 1) {
+        if (shouldPruneLocalizationElement(node)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return node.hasAttribute('placeholder')
+          || node.hasAttribute('aria-label')
+          || node.hasAttribute('title')
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_SKIP;
       }
-      return NodeFilter.FILTER_ACCEPT;
+      return node.nodeValue?.trim()
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT;
     },
-  });
+    }
+  );
   const textNodes = [];
+  const attributeElements = [];
   while (walker.nextNode()) {
-    textNodes.push(walker.currentNode);
+    if (walker.currentNode.nodeType === 3) {
+      textNodes.push(walker.currentNode);
+    } else {
+      attributeElements.push(walker.currentNode);
+    }
   }
   for (const node of textNodes) {
     const translated = translateStaticText(node.nodeValue);
@@ -1777,10 +1807,7 @@ function applyStaticLocalization(root = document.body) {
     }
   }
 
-  for (const element of root.querySelectorAll('[placeholder], [aria-label], [title]')) {
-    if (shouldSkipLocalizationNode(element)) {
-      continue;
-    }
+  for (const element of attributeElements) {
     for (const attribute of ['placeholder', 'aria-label', 'title']) {
       if (element.hasAttribute(attribute)) {
         const current = element.getAttribute(attribute);
@@ -2622,6 +2649,53 @@ async function fetchJson(url, options = {}) {
   return body;
 }
 
+function waitForSharedRequestWithSignal(request, signal) {
+  if (!signal) return request;
+  if (signal.aborted) {
+    const error = new Error('The request was aborted.');
+    error.name = 'AbortError';
+    return Promise.reject(error);
+  }
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      const error = new Error('The request was aborted.');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    request.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      }
+    );
+  });
+}
+
+function fetchSharedSessionDetail(session, detailParams, options = {}) {
+  const sessionKey = getSessionKey(session);
+  const query = String(detailParams || '');
+  if (!sessionKey) return Promise.reject(new Error('Session detail requires a Session key.'));
+  const requestKey = `${sessionKey}?${query}`;
+  let request = state.sessionDetailRequests.get(requestKey);
+  if (!request) {
+    request = fetchJson(
+      `/api/sessions/${encodeURIComponent(session.sessionId)}/detail?${query}`
+    ).finally(() => {
+      if (state.sessionDetailRequests.get(requestKey) === request) {
+        state.sessionDetailRequests.delete(requestKey);
+      }
+    });
+    state.sessionDetailRequests.set(requestKey, request);
+    void request.catch(() => {});
+  }
+  return waitForSharedRequestWithSignal(request, options.signal);
+}
+
 function authAllowsRequests() {
   return !state.auth.required || state.auth.authenticated;
 }
@@ -2800,6 +2874,227 @@ function makeSessionKey(hostId, sessionId) {
 
 function getSessionKey(session) {
   return session ? makeSessionKey(session.hostId, session.sessionId) : null;
+}
+
+function estimateSessionCacheValueBytes(value, seen = new WeakSet(), depth = 0) {
+  if (value == null) return 0;
+  if (typeof value === 'string') return value.length * 2;
+  if (typeof value === 'number' || typeof value === 'bigint') return 8;
+  if (typeof value === 'boolean') return 4;
+  if (typeof value !== 'object' || depth >= 8) return 32;
+  if (seen.has(value)) return 0;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return 24 + value.reduce((total, item) => (
+      total + estimateSessionCacheValueBytes(item, seen, depth + 1)
+    ), 0);
+  }
+  let total = 32;
+  for (const [key, item] of Object.entries(value)) {
+    total += key.length * 2 + estimateSessionCacheValueBytes(item, seen, depth + 1);
+  }
+  return total;
+}
+
+function touchSessionCacheKey(sessionKey, accessedAt = Date.now()) {
+  const key = String(sessionKey || '').trim();
+  if (!key) return;
+  state.sessionCacheAccess.delete(key);
+  state.sessionCacheAccess.set(key, Number(accessedAt) || Date.now());
+}
+
+function setSessionCacheWeightBytes(sessionKey, component, bytes) {
+  const key = String(sessionKey || '').trim();
+  const field = String(component || '').trim();
+  if (!key || !field) return 0;
+  const current = state.sessionCacheWeights.get(key) || {};
+  const next = {
+    ...current,
+    [field]: Math.max(0, Number(bytes) || 0),
+  };
+  next.total = Object.entries(next)
+    .filter(([name]) => name !== 'total')
+    .reduce((total, [, weight]) => total + Math.max(0, Number(weight || 0)), 0);
+  state.sessionCacheWeights.set(key, next);
+  return next.total;
+}
+
+function setSessionCacheWeightComponent(sessionKey, component, value) {
+  return setSessionCacheWeightBytes(
+    sessionKey,
+    component,
+    estimateSessionCacheValueBytes(value)
+  );
+}
+
+function sessionCacheProtectedKeys() {
+  const protectedKeys = new Set();
+  const selectedKey = state.selectedHostId && state.selectedSessionId
+    ? makeSessionKey(state.selectedHostId, state.selectedSessionId)
+    : '';
+  if (selectedKey) protectedKeys.add(selectedKey);
+  if (state.eventSourceKey) protectedKeys.add(state.eventSourceKey);
+  for (const key of state.historyLoading || []) protectedKeys.add(key);
+  for (const session of state.sessions || []) {
+    const key = getSessionKey(session);
+    if (key && (session.live || runtimeIsActive(state.runtime.get(key) || session.runtime || {}))) {
+      protectedKeys.add(key);
+    }
+  }
+  for (const [key, requests] of state.requests || []) {
+    if ((requests || []).some((request) => ['pending', 'responding'].includes(String(request?.status || '')))) {
+      protectedKeys.add(key);
+    }
+  }
+  for (const map of [
+    state.codexControls?.activeDraftsBySession,
+    state.codexControls?.composerSubmissionsBySession,
+    state.codexControls?.interruptOperationsBySession,
+  ]) {
+    for (const key of map?.keys?.() || []) protectedKeys.add(key);
+  }
+  for (const item of state.codexControls?.steerQueue || []) {
+    const key = String(item?.sessionKey || '').trim();
+    if (key) protectedKeys.add(key);
+  }
+  return protectedKeys;
+}
+
+function evictSessionCacheKey(sessionKey) {
+  const key = String(sessionKey || '').trim();
+  if (!key) return false;
+  let removed = false;
+  for (const map of [
+    state.transcripts,
+    state.diagnostics,
+    state.receivedFiles,
+    state.alerts,
+    state.dismissedAlerts,
+    state.runtime,
+    state.runtimeApplyGenerations,
+    state.runtimeStreamGenerations,
+    state.requests,
+    state.streamStatus,
+    state.transcriptTombstones,
+    state.transcriptVisibleLimits,
+    state.transcriptEntryCounts,
+    state.messageReadGates,
+    state.transcriptNotificationRenderVersions,
+    state.transcriptNotificationRenderedAssistantSeq,
+    state.thinkingPanels,
+    state.thinkingScrollPositions,
+    state.thinkingEntryCounts,
+    state.thinkingEntryVersions,
+    state.codexControls?.skillOptionsBySession,
+    state.codexControls?.skillOptionsRetryAfterBySession,
+    state.codexControls?.sessionOptionsByKey,
+    state.codexControls?.apiSwitchNoticesBySession,
+  ]) {
+    removed = map?.delete?.(key) || removed;
+  }
+  for (const set of [
+    state.transcriptUnread,
+    state.transcriptUserDetached,
+    state.fullTranscriptLoaded,
+    state.historyLoading,
+    state.messageReadRenderReady,
+    state.thinkingUnread,
+    state.codexControls?.persistedSessionOptionKeys,
+  ]) {
+    removed = set?.delete?.(key) || removed;
+  }
+  state.sessionCacheAccess.delete(key);
+  state.sessionCacheWeights.delete(key);
+  return removed;
+}
+
+function pruneSessionCaches(options = {}) {
+  const maxHistoryEntries = Object.prototype.hasOwnProperty.call(options, 'maxHistoryEntries')
+    ? Math.max(0, Number(options.maxHistoryEntries) || 0)
+    : SESSION_CACHE_HISTORY_LIMIT;
+  const maxApproxBytes = options.maxApproxBytes === Infinity
+    ? Infinity
+    : Object.prototype.hasOwnProperty.call(options, 'maxApproxBytes')
+      ? Math.max(0, Number(options.maxApproxBytes) || 0)
+      : SESSION_CACHE_APPROX_BYTE_LIMIT;
+  const protectedKeys = sessionCacheProtectedKeys();
+  const cachedKeys = new Set([
+    ...state.transcripts.keys(),
+    ...state.diagnostics.keys(),
+    ...state.receivedFiles.keys(),
+    ...state.alerts.keys(),
+    ...state.runtime.keys(),
+    ...state.runtimeApplyGenerations.keys(),
+    ...state.runtimeStreamGenerations.keys(),
+    ...state.requests.keys(),
+    ...state.streamStatus.keys(),
+    ...state.transcriptTombstones.keys(),
+    ...state.messageReadGates.keys(),
+    ...state.transcriptNotificationRenderVersions.keys(),
+    ...state.transcriptNotificationRenderedAssistantSeq.keys(),
+    ...state.codexControls.skillOptionsBySession.keys(),
+    ...state.codexControls.sessionOptionsByKey.keys(),
+    ...state.sessionCacheWeights.keys(),
+  ]);
+  let totalApproxBytes = 0;
+  for (const key of cachedKeys) {
+    let weight = Number(state.sessionCacheWeights.get(key)?.total || 0);
+    if (!weight) {
+      weight = setSessionCacheWeightComponent(key, 'transcript', state.transcripts.get(key) || []);
+      weight = setSessionCacheWeightComponent(key, 'diagnostics', state.diagnostics.get(key) || []);
+    }
+    totalApproxBytes += Math.max(0, weight);
+  }
+  const candidates = [...cachedKeys]
+    .filter((key) => !protectedKeys.has(key))
+    .sort((left, right) => (
+      Number(state.sessionCacheAccess.get(left) || 0) - Number(state.sessionCacheAccess.get(right) || 0)
+      || left.localeCompare(right)
+    ));
+  let historyEntries = candidates.length;
+  let persistedComposerOptionsChanged = false;
+  for (const key of candidates) {
+    if (historyEntries <= maxHistoryEntries && totalApproxBytes <= maxApproxBytes) break;
+    const weight = Number(state.sessionCacheWeights.get(key)?.total || 0);
+    persistedComposerOptionsChanged ||= state.codexControls.persistedSessionOptionKeys.has(key);
+    evictSessionCacheKey(key);
+    historyEntries -= 1;
+    totalApproxBytes = Math.max(0, totalApproxBytes - weight);
+  }
+  if (persistedComposerOptionsChanged && typeof persistComposerSessionOptions === 'function') {
+    persistComposerSessionOptions();
+  }
+  return { historyEntries, totalApproxBytes };
+}
+
+function scheduleSessionCachePrune() {
+  if (state.sessionCachePruneTimer) return;
+  state.sessionCachePruneTimer = window.setTimeout(() => {
+    state.sessionCachePruneTimer = null;
+    pruneSessionCaches();
+  }, SESSION_CACHE_PRUNE_DEBOUNCE_MS);
+}
+
+function rememberSessionCacheValue(sessionKey, component, value) {
+  touchSessionCacheKey(sessionKey);
+  setSessionCacheWeightComponent(sessionKey, component, value);
+  scheduleSessionCachePrune();
+}
+
+function rememberSessionCacheDelta(sessionKey, component, addedValue, removedValue = null) {
+  const key = String(sessionKey || '').trim();
+  const currentWeight = Number(state.sessionCacheWeights.get(key)?.[component]);
+  if (!Number.isFinite(currentWeight)) {
+    return false;
+  }
+  const addedBytes = estimateSessionCacheValueBytes(addedValue);
+  const removedBytes = Array.isArray(removedValue)
+    ? removedValue.reduce((total, item) => total + estimateSessionCacheValueBytes(item), 0)
+    : estimateSessionCacheValueBytes(removedValue);
+  touchSessionCacheKey(key);
+  setSessionCacheWeightBytes(key, component, currentWeight + addedBytes - removedBytes);
+  scheduleSessionCachePrune();
+  return true;
 }
 
 function forgetActivityCanonicalConversation(canonicalKey) {
@@ -3084,6 +3379,23 @@ function clearSessionLaunchBusy(id) {
   renderAll();
 }
 
+function setNewSessionLaunchError(error = null) {
+  if (!error) {
+    state.newSessionLaunchError = null;
+    renderNewSessionLaunchState();
+    return null;
+  }
+  const structured = structuredSessionError(error);
+  const message = structured.code === 'session_history_unavailable'
+    ? 'The new Session was not created because startup produced no saved history. Retry New Session.'
+    : structured.stage === 'resolve-binding' && /binding preflight|waiting for host-agent/i.test(structured.error)
+      ? 'The Host did not answer the API binding check. No existing Session history was changed. Retry New Session.'
+      : structured.error;
+  state.newSessionLaunchError = { ...structured, error: message };
+  renderNewSessionLaunchState();
+  return state.newSessionLaunchError;
+}
+
 function renderNewSessionLaunchState() {
   const cwdInput = el('new-session-cwd');
   const labelInput = el('new-session-label');
@@ -3111,8 +3423,9 @@ function renderNewSessionLaunchState() {
   if (status) {
     status.textContent = disabled
       ? 'A Session is already being created for this Host and path. Please wait.'
-      : '';
-    status.classList.toggle('hidden', !disabled);
+      : state.newSessionLaunchError?.error || '';
+    status.classList.toggle('error', Boolean(!disabled && state.newSessionLaunchError));
+    status.classList.toggle('hidden', !disabled && !state.newSessionLaunchError);
   }
 }
 
@@ -3277,6 +3590,63 @@ function bootstrapModeLabel(value) {
   }[value] || 'Bootstrap';
 }
 
+function isExternalTerminalDiagnostic(entry) {
+  return entry?.data?.activityOwner === 'external-terminal'
+    || entry?.activityOwner === 'external-terminal';
+}
+
+function resolveExternalTerminalActivity(runtime = {}, diagnostics = []) {
+  const projected = runtime?.externalActivity?.owner === 'external-terminal'
+    ? runtime.externalActivity
+    : null;
+  let result = {
+    owner: 'external-terminal',
+    active: projected?.active === true,
+    turnId: String(projected?.turnId || '').trim() || null,
+    phase: String(projected?.phase || '').trim() || (projected?.active === true ? 'thinking' : 'idle'),
+    status: String(projected?.status || '').trim() || (projected?.active === true ? 'inProgress' : 'completed'),
+    updatedAt: projected?.updatedAt || null,
+  };
+  let updatedAtMs = Date.parse(result.updatedAt || '');
+  const externalDiagnostics = (Array.isArray(diagnostics) ? diagnostics : [])
+    .filter(isExternalTerminalDiagnostic);
+
+  for (const entry of externalDiagnostics) {
+    const timestampMs = Date.parse(entry?.timestamp || '');
+    if (Number.isFinite(updatedAtMs) && Number.isFinite(timestampMs) && timestampMs < updatedAtMs) {
+      continue;
+    }
+    const method = String(entry?.method || '').toLowerCase();
+    const terminal = method.endsWith('/task_complete') || method.endsWith('/turn_aborted');
+    const started = method.endsWith('/task_started');
+    if (!terminal && !started && !isThinkingActivityDiagnostic(entry)) {
+      continue;
+    }
+    result = {
+      ...result,
+      active: !terminal,
+      turnId: String(entry.turnId || entry.data?.turnId || result.turnId || '').trim() || null,
+      phase: terminal ? (method.endsWith('/turn_aborted') ? 'interrupted' : 'idle') : 'thinking',
+      status: terminal ? (method.endsWith('/turn_aborted') ? 'interrupted' : 'completed') : 'inProgress',
+      updatedAt: entry.timestamp || result.updatedAt,
+    };
+    updatedAtMs = timestampMs;
+  }
+  return result;
+}
+
+function getExternalTerminalActivityForSession(session, runtime = null) {
+  if (!session) {
+    return resolveExternalTerminalActivity();
+  }
+  return resolveExternalTerminalActivity(
+    runtime || getRuntimeForSession(session) || session.runtime || {},
+    state.externalActivityKeys?.has?.(getSessionKey(session))
+      ? getDiagnosticsForSession(session)
+      : []
+  );
+}
+
 function describeRuntimeStatus(runtime, stream, session) {
   const connection = stream?.connection || runtime?.connection || (session?.live ? 'connecting' : 'history only');
   const phase = prettyStatusLabel(runtime?.phase || session?.state || 'unknown');
@@ -3425,6 +3795,7 @@ function normalizeThinkingMessage(entry) {
 
   const candidates = [
     entry.data?.text,
+    entry.text,
     entry.data?.content,
     entry.data?.summary,
     entry.data?.plan,
@@ -3606,6 +3977,12 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
   const normalizedSubagentStatus = subagent
     ? String(subagentKind || 'running').trim()
     : firstThinkingField(entry, 'status');
+  const startedAt = firstThinkingField(entry, 'startedAt', 'createdAt')
+    || entry.timestamp
+    || null;
+  const updatedAt = firstThinkingField(entry, 'updatedAt', 'completedAt')
+    || entry.timestamp
+    || startedAt;
   const normalized = {
     activityKey: firstThinkingField(entry, 'activityKey'),
     activityRevision: firstThinkingField(entry, 'activityRevision', 'revision'),
@@ -3666,8 +4043,9 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
       || (subagent && /item\/completed$/i.test(method))
       || /(?:completed|failed|cancelled|canceled|interrupted)$/.test(String(normalizedSubagentStatus || '').toLowerCase()),
     success: firstThinkingField(entry, 'success'),
-    timestamp: entry.timestamp || firstThinkingField(entry, 'createdAt', 'startedAt') || null,
-    updatedAt: firstThinkingField(entry, 'updatedAt', 'completedAt') || entry.timestamp || null,
+    startedAt,
+    timestamp: startedAt,
+    updatedAt,
     source: entry.source || null,
   };
   return window.RemoteCodexThinkingEntryModel?.normalizeThinkingActivityEntry
@@ -3821,6 +4199,33 @@ function buildThinkingEntriesForSession(session, options = {}) {
     : getThinkingDiagnosticsForSession(session);
   const projectedActivities = getProjectedThinkingActivities(session);
 
+  const timestampedDiagnostics = thinkingDiagnostics
+    .map((entry) => ({ entry, timestamp: Date.parse(entry?.timestamp || '') }))
+    .filter((item) => Number.isFinite(item.timestamp))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const timestampedActivities = projectedActivities
+    .map((entry) => ({ entry, timestamp: Date.parse(entry?.timestamp || '') }))
+    .filter((item) => Number.isFinite(item.timestamp))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  function lowerBoundTimestamp(items, target) {
+    let low = 0;
+    let high = items.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (items[middle].timestamp < target) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+  function entriesBetween(items, startTime, endTime, limit = 0) {
+    const startIndex = lowerBoundTimestamp(items, startTime);
+    const endIndex = Number.isFinite(endTime)
+      ? lowerBoundTimestamp(items, endTime + 1)
+      : items.length;
+    const limitedStart = limit > 0 ? Math.max(startIndex, endIndex - limit) : startIndex;
+    return items.slice(limitedStart, endIndex).map((item) => item.entry);
+  }
+
   const transcriptTimes = transcript.map((entry) => Date.parse(entry.timestamp || '')).map((value) => (Number.isFinite(value) ? value : null));
   const segments = [];
   const startGraceMs = 5000;
@@ -3855,18 +4260,18 @@ function buildThinkingEntriesForSession(session, options = {}) {
       }
     }
 
-    const windowEntries = thinkingDiagnostics
-      .filter((diag) => {
-        const diagTime = Date.parse(diag.timestamp || '');
-        return Number.isFinite(diagTime) && diagTime >= startTime - startGraceMs && diagTime <= replyTime;
-      })
-      .sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
-
-    const windowActivities = projectedActivities.filter((activity) => {
-      const activityTime = Date.parse(activity.timestamp || '');
-      return Number.isFinite(activityTime) && activityTime >= startTime - startGraceMs && activityTime <= replyTime;
-    });
-    const merged = mergeProjectedThinkingEntries(windowEntries.slice(-80), windowActivities);
+    const windowEntries = entriesBetween(
+      timestampedDiagnostics,
+      startTime - startGraceMs,
+      replyTime,
+      80
+    );
+    const windowActivities = entriesBetween(
+      timestampedActivities,
+      startTime - startGraceMs,
+      replyTime
+    );
+    const merged = mergeProjectedThinkingEntries(windowEntries, windowActivities);
 
     if (merged.length) {
       segments.push({
@@ -5774,33 +6179,63 @@ async function loadSessionRuntimeConfigForSession(session, options = {}) {
   if (!requestSessionKey || !session?.hostId || !session?.sessionId) {
     return null;
   }
-  try {
-    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
-    const updated = applySessionRuntimeConfig(requestSessionKey, response, expectedRunId, options);
-    if (updated && getSessionKey(getSelectedSession()) === requestSessionKey) {
-      renderSessionDetails();
-      renderSessionApiControls(updated);
-    }
-    return updated;
-  } catch (error) {
-    const target = state.sessions.find((candidate) => getSessionKey(candidate) === requestSessionKey) || null;
-    const requestStillCurrent = target
-      && (!expectedRunId || sessionRuntimeProjectionRunId(target) === expectedRunId);
-    if (requestStillCurrent) {
-      mergeSession({ ...target, runtimeConfigError: structuredSessionError(error) });
-    }
-    if (requestStillCurrent && getSessionKey(getSelectedSession()) === requestSessionKey) {
-      renderSessionApiControls(target);
-    }
-    throw error;
+  const inFlightKey = `${requestSessionKey}::${expectedRunId || 'canonical'}`;
+  const existingRequest = state.sessionRuntimeConfigRequests.get(inFlightKey);
+  if (existingRequest) {
+    return existingRequest;
   }
+
+  let trackedRequest;
+  trackedRequest = (async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
+        const updated = applySessionRuntimeConfig(requestSessionKey, response, expectedRunId, options);
+        if (updated && getSessionKey(getSelectedSession()) === requestSessionKey) {
+          renderSessionDetails();
+          renderSessionApiControls(updated);
+        }
+        return updated;
+      } catch (error) {
+        const target = state.sessions.find((candidate) => getSessionKey(candidate) === requestSessionKey) || null;
+        const requestStillCurrent = target
+          && (!expectedRunId || sessionRuntimeProjectionRunId(target) === expectedRunId);
+        const transientFreshFailure = requestStillCurrent
+          && isTransientFreshRuntimeConfigFailure(target, error);
+        if (transientFreshFailure && attempt < 2) {
+          await delay(200 * (attempt + 1));
+          continue;
+        }
+        if (transientFreshFailure) {
+          mergeSession({ ...target, runtimeConfigError: null });
+          return target;
+        }
+        if (requestStillCurrent) {
+          mergeSession({ ...target, runtimeConfigError: structuredSessionError(error) });
+        }
+        if (requestStillCurrent && getSessionKey(getSelectedSession()) === requestSessionKey) {
+          renderSessionApiControls(target);
+        }
+        throw error;
+      }
+    }
+    return null;
+  })().finally(() => {
+    if (state.sessionRuntimeConfigRequests.get(inFlightKey) === trackedRequest) {
+      state.sessionRuntimeConfigRequests.delete(inFlightKey);
+    }
+  });
+  state.sessionRuntimeConfigRequests.set(inFlightKey, trackedRequest);
+  return trackedRequest;
 }
 
 function setTranscriptForSession(hostId, sessionId, transcript) {
   const key = makeSessionKey(hostId, sessionId);
-  state.transcripts.set(key, dedupeTranscript(transcript).filter((entry) => (
+  const next = dedupeTranscript(transcript).filter((entry) => (
     !transcriptEntryIsTombstoned(key, entry)
-  )));
+  ));
+  state.transcripts.set(key, next);
+  rememberSessionCacheValue(key, 'transcript', next);
 }
 
 function appendTranscriptEntry(hostId, sessionId, entry) {
@@ -5809,7 +6244,9 @@ function appendTranscriptEntry(hostId, sessionId, entry) {
     return false;
   }
   const existing = state.transcripts.get(key) || [];
-  state.transcripts.set(key, dedupeTranscript([...existing, entry]));
+  const next = dedupeTranscript([...existing, entry]);
+  state.transcripts.set(key, next);
+  rememberSessionCacheValue(key, 'transcript', next);
   return true;
 }
 
@@ -5853,6 +6290,7 @@ function removeTranscriptEntry(hostId, sessionId, identity = {}) {
     && String(entry?.clientRequestId || '').trim() === clientRequestId
   ));
   state.transcripts.set(key, next);
+  rememberSessionCacheValue(key, 'transcript', next);
   return next.length !== existing.length;
 }
 
@@ -6841,13 +7279,17 @@ function dedupeAlerts(entries) {
 function setAlertsForSession(hostId, sessionId, alerts) {
   const key = makeSessionKey(hostId, sessionId);
   const retainedAssistantAlerts = (state.alerts.get(key) || []).filter((alert) => alert.alertId);
-  state.alerts.set(key, dedupeAlerts([...(alerts || []), ...retainedAssistantAlerts]));
+  const next = dedupeAlerts([...(alerts || []), ...retainedAssistantAlerts]);
+  state.alerts.set(key, next);
+  rememberSessionCacheValue(key, 'alerts', next);
 }
 
 function appendAlertForSession(hostId, sessionId, alert) {
   const key = makeSessionKey(hostId, sessionId);
   const existing = state.alerts.get(key) || [];
-  state.alerts.set(key, dedupeAlerts([...existing, alert]));
+  const next = dedupeAlerts([...existing, alert]);
+  state.alerts.set(key, next);
+  rememberSessionCacheValue(key, 'alerts', next);
 }
 
 function alertFingerprint(entry) {
@@ -6963,6 +7405,7 @@ function clearAlertsForSelectedSession() {
 
 function getTranscriptForSession(session) {
   const key = getSessionKey(session);
+  if (key && state.transcripts.has(key)) touchSessionCacheKey(key);
   return key ? state.transcripts.get(key) || [] : [];
 }
 
@@ -7525,6 +7968,9 @@ function isInternalTranscriptText(value) {
   if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
     return true;
   }
+  if (/^# AGENTS\.md instructions for [^\r\n]+\s*<INSTRUCTIONS>(?:[\s\S]*)$/i.test(text)) {
+    return true;
+  }
   if (/^The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b/i.test(text)) {
     return true;
   }
@@ -7735,6 +8181,23 @@ function diagnosticEntryKey(entry) {
   return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.turnId || ''}|${entry.itemId || entry.callId || entry.requestId || ''}`;
 }
 
+function trimDiagnosticsForClient(entries) {
+  const limited = (Array.isArray(entries) ? entries : []).slice(-CLIENT_DIAGNOSTIC_ENTRY_LIMIT);
+  let approximateBytes = estimateSessionCacheValueBytes(limited);
+  if (approximateBytes <= CLIENT_DIAGNOSTIC_APPROX_BYTE_LIMIT) {
+    return limited;
+  }
+  let removeCount = 0;
+  while (
+    removeCount < limited.length - 1
+    && approximateBytes > CLIENT_DIAGNOSTIC_TRIM_TARGET_BYTES
+  ) {
+    approximateBytes -= estimateSessionCacheValueBytes(limited[removeCount]);
+    removeCount += 1;
+  }
+  return removeCount ? limited.slice(removeCount) : limited;
+}
+
 function dedupeDiagnostics(entries) {
   const seen = new Set();
   const deduped = [];
@@ -7752,7 +8215,7 @@ function dedupeDiagnostics(entries) {
     deduped.push(normalized);
   }
 
-  return deduped
+  return trimDiagnosticsForClient(deduped
     .sort((a, b) => {
       const left = Date.parse(a.timestamp || '');
       const right = Date.parse(b.timestamp || '');
@@ -7764,18 +8227,25 @@ function dedupeDiagnostics(entries) {
       }
       return 0;
     })
-    .slice(-CLIENT_DIAGNOSTIC_ENTRY_LIMIT);
+    .slice(-CLIENT_DIAGNOSTIC_ENTRY_LIMIT));
 }
 
 function setDiagnosticsForSession(hostId, sessionId, diagnostics) {
   const key = makeSessionKey(hostId, sessionId);
-  state.diagnostics.set(key, dedupeDiagnostics(diagnostics));
+  const next = dedupeDiagnostics(diagnostics);
+  state.diagnostics.set(key, next);
+  if (next.some(isExternalTerminalDiagnostic)) state.externalActivityKeys.add(key);
+  else state.externalActivityKeys.delete(key);
+  rememberSessionCacheValue(key, 'diagnostics', next);
 }
 
 function mergeDiagnosticsForSession(hostId, sessionId, diagnostics) {
   const key = makeSessionKey(hostId, sessionId);
   const existing = state.diagnostics.get(key) || [];
-  state.diagnostics.set(key, dedupeDiagnostics([...existing, ...(Array.isArray(diagnostics) ? diagnostics : [])]));
+  const next = dedupeDiagnostics([...existing, ...(Array.isArray(diagnostics) ? diagnostics : [])]);
+  state.diagnostics.set(key, next);
+  if (next.some(isExternalTerminalDiagnostic)) state.externalActivityKeys.add(key);
+  rememberSessionCacheValue(key, 'diagnostics', next);
 }
 
 function appendDiagnosticForSession(hostId, sessionId, entry) {
@@ -7792,15 +8262,39 @@ function appendDiagnosticForSession(hostId, sessionId, entry) {
       return;
     }
   }
+  const previousWeight = Number(state.sessionCacheWeights.get(key)?.diagnostics);
   existing.push(normalized);
+  let removed = [];
   if (existing.length > CLIENT_DIAGNOSTIC_ENTRY_LIMIT) {
-    existing.splice(0, existing.length - CLIENT_DIAGNOSTIC_ENTRY_LIMIT);
+    removed = existing.splice(0, existing.length - CLIENT_DIAGNOSTIC_ENTRY_LIMIT);
+  }
+  let nextWeight = Number.isFinite(previousWeight)
+    ? previousWeight
+      + estimateSessionCacheValueBytes(normalized)
+      - removed.reduce((total, item) => total + estimateSessionCacheValueBytes(item), 0)
+    : NaN;
+  if (Number.isFinite(nextWeight) && nextWeight > CLIENT_DIAGNOSTIC_APPROX_BYTE_LIMIT) {
+    let removeCount = 0;
+    while (removeCount < existing.length - 1 && nextWeight > CLIENT_DIAGNOSTIC_TRIM_TARGET_BYTES) {
+      nextWeight -= estimateSessionCacheValueBytes(existing[removeCount]);
+      removeCount += 1;
+    }
+    if (removeCount) removed.push(...existing.splice(0, removeCount));
   }
   state.diagnostics.set(key, existing);
+  if (isExternalTerminalDiagnostic(normalized)) state.externalActivityKeys.add(key);
+  if (Number.isFinite(nextWeight)) {
+    touchSessionCacheKey(key);
+    setSessionCacheWeightBytes(key, 'diagnostics', nextWeight);
+    scheduleSessionCachePrune();
+  } else if (!rememberSessionCacheDelta(key, 'diagnostics', normalized, removed)) {
+    rememberSessionCacheValue(key, 'diagnostics', existing);
+  }
 }
 
 function getDiagnosticsForSession(session) {
   const key = getSessionKey(session);
+  if (key && state.diagnostics.has(key)) touchSessionCacheKey(key);
   return key ? state.diagnostics.get(key) || [] : [];
 }
 
@@ -7862,11 +8356,14 @@ function getRequestsForSession(session) {
 
 function setReceivedFilesForSession(hostId, sessionId, files) {
   const key = makeSessionKey(hostId, sessionId);
-  state.receivedFiles.set(key, Array.isArray(files) ? files : []);
+  const next = Array.isArray(files) ? files : [];
+  state.receivedFiles.set(key, next);
+  rememberSessionCacheValue(key, 'receivedFiles', next);
 }
 
 function getReceivedFilesForSession(session) {
   const key = getSessionKey(session);
+  if (key && state.receivedFiles.has(key)) touchSessionCacheKey(key);
   return key ? state.receivedFiles.get(key) || [] : [];
 }
 
@@ -12005,6 +12502,16 @@ function moveComposerDraftSessionKey(previousKeyValue, nextKeyValue) {
     submission.sessionKey = nextKey;
     state.codexControls.composerSubmissionsBySession.set(nextKey, submission);
   }
+  for (const item of state.codexControls.steerQueue) {
+    if ([rawPreviousKey, previousKey].includes(String(item?.sessionKey || ''))) {
+      item.sessionKey = nextKey;
+    }
+  }
+  const queueTimers = state.codexControls.queueAutoSendTimersBySession;
+  const previousQueueTimer = queueTimers.get(previousKey) || queueTimers.get(rawPreviousKey) || null;
+  queueTimers.delete(rawPreviousKey);
+  queueTimers.delete(previousKey);
+  if (previousQueueTimer) window.clearTimeout(previousQueueTimer);
   for (const [signature, recent] of Array.from(state.codexControls.recentSubmissions.entries())) {
     let parsed = null;
     try {
@@ -13641,7 +14148,7 @@ function renderSessionDetails() {
         apiSummary.label,
       ].filter(Boolean).join(' | ');
       headerMeta.innerHTML = [
-        `<span class="session-meta-line">${escapeHtml(metaLine)} <button type="button" class="session-id-copy-button" data-copy-session-id="${escapeHtml(session.sessionId)}" title="Copy full session ID">Copy ID</button></span>`,
+        `<span class="session-meta-line">${escapeHtml(metaLine)} <button type="button" class="session-id-copy-button" data-copy-session-id="${escapeHtml(session.sessionId)}" title="Copy full session ID">Copy ID</button>${session.cwd ? ` <button type="button" class="session-id-copy-button" data-copy-session-dir="${escapeHtml(session.cwd)}" title="Copy full session directory">Copy Dir</button>` : ''}</span>`,
         session.cwd ? `<span class="session-meta-path">${escapeHtml(session.cwd)}</span>` : '',
       ].filter(Boolean).join('<br>');
       headerMeta.title = [metaLine, session.cwd || ''].filter(Boolean).join('\n');
@@ -13829,7 +14336,6 @@ function renderSessionDetails() {
 
   renderApprovalPopup();
   renderStatusWindow();
-  renderLocaleLabels();
 }
 
 function createRuntimeChip(container, label, value, tone = 'info') {
@@ -13910,6 +14416,8 @@ function renderRuntimePanel() {
 
   const runtimeState = describeRuntimeStatus(runtime, stream, session);
   const runtimeActive = runtimeIsActive(runtime);
+  const externalActivity = getExternalTerminalActivityForSession(session, runtime);
+  const displayActive = runtimeActive || externalActivity.active;
   const runtimeIssue = runtimeIssuePresentation(runtime);
   const launchBusy = getSessionLaunchBusyForSession(session);
   const connectionSince = formatElapsedSince(getStreamElapsedAnchor(stream) || runtime.runtimeConnectionStartedAt);
@@ -13932,7 +14440,9 @@ function renderRuntimePanel() {
 
   if (session.live) {
     titleEl.textContent = `${session.title || session.sessionId} is live`;
-    subtitleEl.textContent = runtime.busy
+    subtitleEl.textContent = externalActivity.active && !runtimeActive
+      ? `External terminal activity for ${formatElapsedSince(externalActivity.updatedAt) || '0s'} | ${prettyStatusLabel(runtimeState.connection)}`
+      : runtime.busy
       ? `${runtimeState.phase} for ${phaseSince || '0s'} | ${prettyStatusLabel(runtimeState.connection)}${connectionSince ? ` for ${connectionSince}` : ''}`
       : `${prettyStatusLabel(runtimeState.connection)}${connectionSince ? ` for ${connectionSince}` : ''} | ${runtimeState.phase}`;
   } else if (launchBusy) {
@@ -13967,10 +14477,12 @@ function renderRuntimePanel() {
   );
   appendRuntimeChip(
     'Turn',
-    runtime.activeTurnId
+    externalActivity.active && !runtimeActive
+      ? `${externalActivity.turnId ? `${shortId(externalActivity.turnId)} | ` : ''}External terminal`
+      : runtime.activeTurnId
       ? `${shortId(runtime.activeTurnId)} | ${runtimeState.turn}`
       : runtimeState.turn,
-    runtimeActive ? 'active' : 'info'
+    displayActive ? 'active' : 'info'
   );
   appendRuntimeChip(
     'Requests',
@@ -13979,10 +14491,12 @@ function renderRuntimePanel() {
   );
   appendRuntimeChip(
     'Processing',
-    runtime.busy
+    externalActivity.active && !runtimeActive
+      ? `Terminal active | update ${formatElapsedSince(externalActivity.updatedAt) || 'just now'} ago`
+      : runtime.busy
       ? `Running for ${formatElapsedSince(runtime.busyStartedAt || runtime.phaseStartedAt || runtime.updatedAt) || '0s'}`
       : `Last update ${formatElapsedSince(runtime.updatedAt) || 'just now'} ago`,
-    runtime.busy ? 'active' : 'info'
+    displayActive ? 'active' : 'info'
   );
   const contextWindowText = formatContextWindow(runtime, { empty: '' });
   if (contextWindowText) {
@@ -14031,7 +14545,11 @@ function renderThinkingPanel() {
 
   const runtime = getRuntimeForSession(session) || {};
   const stream = getStreamStatusForSession(session) || {};
-  const showLivePlaceholder = Boolean(session.live && runtimeIsActive(runtime));
+  const externalActivity = getExternalTerminalActivityForSession(session, runtime);
+  const showLivePlaceholder = Boolean(
+    session.live
+    && (runtimeIsActive(runtime) || externalActivity.active)
+  );
   const log = el('session-log');
   if (!showLivePlaceholder) {
     const stalePlaceholders = Array.from(
@@ -16496,6 +17014,7 @@ function renderStatusWindow() {
   syncModalBodyState();
 
   const runtime = getRuntimeForSession(session) || {};
+  const externalActivity = getExternalTerminalActivityForSession(session, runtime);
   const activeTurn = Boolean(session.live && runtimeIsActive(runtime));
   const runtimeIssue = runtimeIssuePresentation(runtime);
   const host = getHost(session.hostId);
@@ -16532,7 +17051,9 @@ function renderStatusWindow() {
     summaryGrid,
     'Phase',
     prettyStatusLabel(runtime.phase || session.state || 'unknown'),
-    runtime.busy
+    externalActivity.active && !runtimeIsActive(runtime)
+      ? `External terminal active for ${formatElapsedSince(externalActivity.updatedAt) || '0s'}`
+      : runtime.busy
       ? `Busy for ${phaseSince || '0s'}`
       : phaseSince
         ? `Updated ${phaseSince} ago`
@@ -16542,8 +17063,12 @@ function renderStatusWindow() {
   renderStatusSummaryCard(
     summaryGrid,
     'Turn',
-    runtime.activeTurnId ? shortId(runtime.activeTurnId) : (activeTurn ? prettyStatusLabel(runtime.currentTurnStatus || runtime.phase || 'active') : 'none'),
-    activeTurn
+    externalActivity.active && !runtimeIsActive(runtime)
+      ? `${externalActivity.turnId ? `${shortId(externalActivity.turnId)} | ` : ''}External terminal`
+      : runtime.activeTurnId ? shortId(runtime.activeTurnId) : (activeTurn ? prettyStatusLabel(runtime.currentTurnStatus || runtime.phase || 'active') : 'none'),
+    externalActivity.active && !runtimeIsActive(runtime)
+      ? 'Observed from the native Codex rollout; Remote Runner controls remain idle.'
+      : activeTurn
       ? `${prettyStatusLabel(runtime.currentTurnStatus || runtime.phase || 'inProgress')} | ${formatElapsedSince(runtime.turnStartedAt || runtime.updatedAt) || '0s'}`
       : prettyStatusLabel(runtime.currentTurnStatus || 'idle')
   );
@@ -17575,7 +18100,9 @@ function renderMarkdown(container, text) {
     container.classList.add('markdown-plain-fallback');
     container.textContent = String(text == null ? '' : text);
   }
-  scheduleMathTypeset(container);
+  if (container.querySelector?.('.markdown-math-inline, .markdown-math-block')) {
+    scheduleMathTypeset(container);
+  }
 }
 
 async function copyTextToClipboard(text) {
@@ -17945,7 +18472,10 @@ function createThinkingOperationEntry(entry, index, stateKey, session) {
     showWhenTruncated: true,
   });
 
-  const commandFallbackOutput = category === 'command' && !entry.output && !entry.stdout
+  const commandFallbackOutput = category === 'command'
+    && !entry.output
+    && !entry.stdout
+    && overview !== String(entry.command || '').trim()
     ? overview
     : '';
   appendField('Output', entry.output || entry.stdout || commandFallbackOutput, {
@@ -17999,9 +18529,9 @@ function createThinkingNarrativeEntry(entry, index, stateKey, session) {
   timestamp.textContent = formatTime(entry.updatedAt || entry.timestamp);
   top.append(kind, timestamp);
   const text = document.createElement('div');
-  text.className = 'thinking-history-text';
+  text.className = 'thinking-history-text markdown-body';
   const narrativeText = String(entry.text == null ? '' : entry.text);
-  text.textContent = narrativeText;
+  renderMarkdown(text, narrativeText);
   item.append(top, text);
   bindThinkingTextExpansion(item, text, narrativeText, {
     stateKey,
@@ -18671,7 +19201,7 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   const hiddenTranscriptCount = renderWindow.hiddenTranscriptCount;
   const renderedTranscript = renderWindow.renderedTranscript;
   const thinkingSegments = buildThinkingEntriesForSession(session, {
-    transcriptEntries: visibleTranscript,
+    transcriptEntries: renderedTranscript,
   });
   const renderedEntryCount = visibleTranscript.length
     + thinkingSegments.reduce((total, segment) => total + (Array.isArray(segment.entries) ? segment.entries.length : 0), 0);
@@ -18700,7 +19230,11 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       : 'No transcript preview was captured for this imported session.';
     log.appendChild(empty);
     const liveSegment = buildLiveActivitySegment(session, null);
-    const showLiveActivity = liveSegment || (session.live && runtimeIsActive(runtime));
+    const externalActivity = getExternalTerminalActivityForSession(session, runtime);
+    const showLiveActivity = liveSegment || (
+      session.live
+      && (runtimeIsActive(runtime) || externalActivity.active)
+    );
     if (showLiveActivity) {
       const displayedSegment = liveSegment || {
         userTimestamp: 'live',
@@ -18798,7 +19332,10 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
       const shouldShowLivePlaceholder = Boolean(
         isLatestUser
         && session.live
-        && runtimeIsActive(runtime)
+        && (
+          runtimeIsActive(runtime)
+          || getExternalTerminalActivityForSession(session, runtime).active
+        )
       );
 
       if (segment || shouldShowLivePlaceholder) {
@@ -22249,20 +22786,8 @@ async function runSkillsManagerAction(action) {
 function renderAll() {
   ensureTranscriptScrollControlsMounted();
   renderAuthGate();
-  const shell = document.querySelector('.shell');
-  shell?.classList.toggle('navigator-collapsed', state.navigatorCollapsed);
-  const sidebar = document.querySelector('.sidebar');
-  sidebar?.classList.toggle('overview-collapsed', state.overviewCollapsed);
-  el('overview-body')?.classList.toggle('hidden', state.overviewCollapsed);
-  el('new-session-body')?.classList.toggle('hidden', state.newSessionCollapsed);
-  const overviewButton = el('toggle-overview-button');
-  const newSessionButton = el('toggle-new-session-button');
-  if (overviewButton) {
-    overviewButton.textContent = state.overviewCollapsed ? 'Show' : 'Hide';
-  }
-  if (newSessionButton) {
-    newSessionButton.textContent = state.newSessionCollapsed ? 'Show New' : 'Hide New';
-  }
+  renderNavigatorLayout();
+  renderSidebarSections();
   renderNewSessionLaunchState();
   renderOverview();
   renderHostNav();
@@ -22280,7 +22805,52 @@ function renderAll() {
   renderSettingsDialog();
   renderSkillsManager();
   renderImagePreview();
-  renderLocaleLabels();
+}
+
+function renderNavigatorLayout() {
+  const shell = document.querySelector('.shell');
+  shell?.classList.toggle('navigator-collapsed', state.navigatorCollapsed);
+  const navigatorButton = el('toggle-navigator-button');
+  if (navigatorButton) {
+    navigatorButton.textContent = state.navigatorCollapsed ? t('nav.open') : t('nav.close');
+    navigatorButton.setAttribute('aria-expanded', state.navigatorCollapsed ? 'false' : 'true');
+  }
+}
+
+function renderSidebarSections() {
+  const sidebar = document.querySelector('.sidebar');
+  sidebar?.classList.toggle('overview-collapsed', state.overviewCollapsed);
+  el('overview-body')?.classList.toggle('hidden', state.overviewCollapsed);
+  el('new-session-body')?.classList.toggle('hidden', state.newSessionCollapsed);
+  const overviewButton = el('toggle-overview-button');
+  const newSessionButton = el('toggle-new-session-button');
+  if (overviewButton) {
+    overviewButton.textContent = state.overviewCollapsed ? 'Show' : 'Hide';
+  }
+  if (newSessionButton) {
+    newSessionButton.textContent = state.newSessionCollapsed ? 'Show New' : 'Hide New';
+  }
+}
+
+function renderRefreshViews() {
+  renderAuthGate();
+  renderNavigatorLayout();
+  renderSidebarSections();
+  renderNewSessionLaunchState();
+  renderOverview();
+  renderHostNav();
+  renderConversationNav();
+  renderSessionDetails();
+  renderRuntimePanel();
+  renderThinkingPanel();
+  renderMessageNotificationBell();
+  renderAlertsWindow();
+  renderDirectoryPicker();
+  if (state.settingsOpen) renderSettingsDialog();
+  if (state.skillsManager.open) renderSkillsManager();
+  if (state.sessionActionDialog?.open) renderSessionActionDialog();
+  if (state.exportDialog?.open) renderExportDialog();
+  if (state.imagePreview?.open) renderImagePreview();
 }
 
 const queuedUiRenders = {
@@ -22445,12 +23015,29 @@ function closeStream() {
   }
 }
 
+function selectedSessionRealtimeIsHealthy(session) {
+  const key = getSessionKey(session);
+  if (!key || state.eventSourceKey !== key || !state.eventSource) return false;
+  const stream = getStreamStatusForSession(session) || {};
+  if (!['connected', 'ready'].includes(String(stream.connection || '').toLowerCase())) return false;
+  const lastPingAt = parseStreamTimestamp(stream.lastPingAt);
+  return !lastPingAt || Date.now() - lastPingAt < STREAM_STALE_RECONNECT_MS;
+}
+
 async function resumeSelectedSessionRealtime(options = {}) {
   if (state.streamRecoveryInFlight) {
     return;
   }
   const selected = getSelectedSession();
   if (!selected?.hostId || !selected?.sessionId) {
+    return;
+  }
+  if (
+    options.force !== true
+    && options.forceDetail !== true
+    && !state.sessionWatchCatchUpRequired
+    && selectedSessionRealtimeIsHealthy(selected)
+  ) {
     return;
   }
   state.streamRecoveryInFlight = true;
@@ -22972,6 +23559,13 @@ function applySessionStreamReset(session, event, payload) {
   }
   if (payload.session) {
     mergeSession(payload.session);
+    if (payload.session.runtime) {
+      setRuntimeForSession(
+        payload.session.hostId || session.hostId,
+        payload.session.sessionId || session.sessionId,
+        payload.session?.runtime, { source: 'stream', allowStale: true }
+      );
+    }
   }
   state.activityProjection?.applyReset(canonicalKey, {
     streamEpoch: payload.streamEpoch,
@@ -22993,6 +23587,14 @@ function sessionStreamResetNeedsRecovery(reason) {
     || reason === 'epoch_mismatch'
     || reason === 'cursor_invalid'
     || reason === 'canonical_key_changed';
+}
+
+function sessionStreamResetNeedsDetailRecovery(session) {
+  const key = getSessionKey(session);
+  return Boolean(
+    key
+    && (session?.live === true || !state.fullTranscriptLoaded.has(key))
+  );
 }
 
 function subscribeSession(session) {
@@ -23067,7 +23669,6 @@ function subscribeSession(session) {
     'session.transcript',
     'session.transcript_removed',
     'session.alert',
-    'session.runtime',
     'session.runtime_updated',
     'session.diagnostic',
     'session.request',
@@ -23092,9 +23693,12 @@ function subscribeSession(session) {
     const payload = JSON.parse(event.data);
     applySessionStreamReset(session, event, payload);
     if (
-      sessionStreamResetNeedsRecovery(payload.reason)
-      || payload.detailRecoveryRequired
-      || payload.activitiesTruncated
+      sessionStreamResetNeedsDetailRecovery(session)
+      && (
+        sessionStreamResetNeedsRecovery(payload.reason)
+        || payload.detailRecoveryRequired
+        || payload.activitiesTruncated
+      )
     ) {
       reconcileSelectedSessionAfterStreamReset(session, {
         activities: payload.activitiesTruncated === true,
@@ -23150,7 +23754,7 @@ function subscribeSession(session) {
     if (payload.bridgeSessionId && state.selectedSessionId === payload.bridgeSessionId) {
       state.selectedSessionId = payload.sessionId;
     }
-    scheduleRenderAll();
+    scheduleSelectedViewsRender();
   });
 
   state.eventSource.addEventListener('session.state_changed', (event) => {
@@ -23164,7 +23768,7 @@ function subscribeSession(session) {
       payload.sessionId || session.sessionId,
       changed?.assistantProjection || payload.assistantProjection
     );
-    scheduleRenderAll();
+    scheduleSelectedViewsRender();
   });
 
   state.eventSource.addEventListener('session.transcript', (event) => {
@@ -23243,6 +23847,13 @@ function subscribeSession(session) {
       sessionId: runtimePayload.sessionId || session.sessionId,
     }) || {};
     const runtimeWasActive = runtimeIsActive(previousRuntime);
+    const hasExternalObservation = runtimePayload.externalActivity?.owner === 'external-terminal';
+    const externalActivityWasActive = hasExternalObservation
+      ? getExternalTerminalActivityForSession({
+        hostId: runtimePayload.hostId || session.hostId,
+        sessionId: runtimePayload.sessionId || session.sessionId,
+      }, previousRuntime).active
+      : false;
     const mergedRuntime = patchRuntimeForSession(
       runtimePayload.hostId || session.hostId,
       runtimePayload.sessionId || session.sessionId,
@@ -23250,6 +23861,12 @@ function subscribeSession(session) {
       { source: 'stream' }
     );
     const runtimeStopped = !runtimeIsActive(mergedRuntime || runtimePayload);
+    const externalActivityIsActive = hasExternalObservation
+      ? getExternalTerminalActivityForSession({
+        hostId: runtimePayload.hostId || session.hostId,
+        sessionId: runtimePayload.sessionId || session.sessionId,
+      }, mergedRuntime || runtimePayload).active
+      : externalActivityWasActive;
     const runtimeSession = {
       hostId: runtimePayload.hostId || session.hostId,
       sessionId: runtimePayload.sessionId || session.sessionId,
@@ -23299,7 +23916,11 @@ function subscribeSession(session) {
     }
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === makeSessionKey(runtimePayload.hostId || session.hostId, runtimePayload.sessionId || session.sessionId)) {
-      if (!runtimeWasActive && runtimeIsActive(mergedRuntime || runtimePayload)) {
+      if (
+        (!runtimeWasActive && runtimeIsActive(mergedRuntime || runtimePayload))
+        || (runtimeWasActive && runtimeStopped)
+        || externalActivityWasActive !== externalActivityIsActive
+      ) {
         scheduleTranscriptRender({ preserveScroll: true });
       }
       maybeScheduleQueuedPromptSend(selected);
@@ -23307,10 +23928,6 @@ function subscribeSession(session) {
     }
     scheduleRuntimeStatusRender();
   };
-
-  state.eventSource.addEventListener('session.runtime', (event) => {
-    handleRuntimePayload(JSON.parse(event.data));
-  });
 
   state.eventSource.addEventListener('session.runtime_updated', (event) => {
     handleRuntimePayload(JSON.parse(event.data));
@@ -23341,12 +23958,30 @@ function subscribeSession(session) {
 
   state.eventSource.addEventListener('session.diagnostic', (event) => {
     const payload = JSON.parse(event.data);
-    appendDiagnosticForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
+    const diagnosticSession = {
+      hostId: payload.hostId || session.hostId,
+      sessionId: payload.sessionId || session.sessionId,
+    };
+    const externalObservation = isExternalTerminalDiagnostic(payload);
+    const externalActivityWasActive = externalObservation
+      ? getExternalTerminalActivityForSession(diagnosticSession).active
+      : false;
+    appendDiagnosticForSession(diagnosticSession.hostId, diagnosticSession.sessionId, payload);
+    const externalActivityIsActive = externalObservation
+      ? getExternalTerminalActivityForSession(diagnosticSession).active
+      : false;
     const selected = getSelectedSession();
-    if (selected && getSessionKey(selected) === makeSessionKey(payload.hostId || session.hostId, payload.sessionId || session.sessionId)) {
+    if (selected && getSessionKey(selected) === makeSessionKey(diagnosticSession.hostId, diagnosticSession.sessionId)) {
       refreshInferredComposerOptionsForSession(selected);
       queuedUiRenders.sessionDetails = true;
       queuedUiRenders.thinkingPanel = true;
+      if (
+        payload.method === 'turn/completed'
+        || payload.final === true
+        || externalActivityWasActive !== externalActivityIsActive
+      ) {
+        scheduleTranscriptRender({ preserveScroll: true });
+      }
     }
     queuedUiRenders.statusWindow = true;
     scheduleQueuedUiFlush();
@@ -23414,12 +24049,15 @@ async function showSession(session = getSelectedSession(), options = {}) {
   }
 
   const sessionKey = getSessionKey(session);
+  touchSessionCacheKey(sessionKey);
   if (sessionKey && state.shownSessionKey !== sessionKey) {
     state.fullTranscriptLoaded.delete(sessionKey);
     state.shownSessionKey = sessionKey;
   }
 
-  void loadSessionRuntimeConfigForSession(session).catch(() => {});
+  if (shouldLoadSessionRuntimeConfigOnOpen(session)) {
+    void loadSessionRuntimeConfigForSession(session).catch(() => {});
+  }
 
   setHistoryLoading(session, true);
   const initialTranscriptRenderOptions = {
@@ -23429,9 +24067,14 @@ async function showSession(session = getSelectedSession(), options = {}) {
   };
   renderTranscript(session, initialTranscriptRenderOptions);
   subscribeSession(session);
+  const sessionKeyAtWatchStart = getSessionKey(session);
+  void watchSelectedSession(session).catch((error) => {
+    if (getSessionKey(getSelectedSession()) === sessionKeyAtWatchStart) {
+      reportError(error);
+    }
+  });
 
   try {
-    await watchSelectedSession(session);
     if (getSessionKey(session) !== getSessionKey(getSelectedSession())) {
       setHistoryLoading(session, false);
       return;
@@ -23461,10 +24104,9 @@ async function showSession(session = getSelectedSession(), options = {}) {
     if (options.fullDiagnostics) {
       detailParams.set('fullDiagnostics', '1');
     }
-    const detail = await fetchJson(
-      `/api/sessions/${encodeURIComponent(session.sessionId)}/detail?${detailParams.toString()}`,
-      { signal: options.signal }
-    );
+    const detail = await fetchSharedSessionDetail(session, detailParams, {
+      signal: options.signal,
+    });
     const detailSession = mergeSession(detail.session) || session;
     const detailHostId = detailSession.hostId || session.hostId;
     const detailSessionId = detailSession.sessionId || session.sessionId;
@@ -24054,6 +24696,12 @@ function renderExportDialog() {
     return;
   }
   const dialog = state.exportDialog;
+  overlay.classList.toggle('hidden', !dialog.open);
+  overlay.setAttribute('aria-hidden', dialog.open ? 'false' : 'true');
+  if (!dialog.open) {
+    syncModalBodyState();
+    return;
+  }
   const session = getSelectedSession();
   const entries = getExportTranscriptEntries(session);
   const files = collectExportFiles(session);
@@ -24098,8 +24746,6 @@ function renderExportDialog() {
     return true;
   });
 
-  overlay.classList.toggle('hidden', !dialog.open);
-  overlay.setAttribute('aria-hidden', dialog.open ? 'false' : 'true');
   const rangeMessageCount = getExportRangeMessageCount(timeline, dialog, rangedEntries.length);
   el('export-dialog-summary').textContent = session
     ? `${sessionDisplayTitle(session)} | ${rangeMessageCount} message(s), ${exportDateRangeLabel(dialog)}, ${imageCount} image(s), ${otherCount} file(s), ${formatBytes(totalBytes) || 'unknown size'} selected.`
@@ -24746,6 +25392,7 @@ function applySelectedHost(hostId) {
   state.selectedConversationKey = null;
   state.selectedSessionId = null;
   ensureSelections();
+  pruneSessionCaches();
   renderAll();
   if (state.directoryPicker.open) {
     fetchDirectoryListing(null, hostId).catch(reportDirectoryPickerError);
@@ -25299,7 +25946,7 @@ async function performRefresh(requestId, baselineSessions) {
   }
 
   ensureSelections();
-  renderAll();
+  renderRefreshViews();
   scheduleAssistantProjectionSync(state.sessions);
 
   if (state.directoryPicker.open && !getHost(state.selectedHostId || '')) {
@@ -25328,8 +25975,6 @@ async function performRefresh(requestId, baselineSessions) {
   const streamMismatch = state.eventSourceKey !== nextKey;
   if (nextKey !== previousKey || !state.transcripts.has(nextKey) || streamMismatch) {
     await showSession(selected);
-  } else {
-    renderTranscript(selected);
   }
 }
 
@@ -25530,6 +26175,24 @@ function isFreshLiveManagedSessionWithoutHistory(session) {
   return Math.max(messageCount, previewCount, transcriptCount) === 0;
 }
 
+function shouldLoadSessionRuntimeConfigOnOpen(session) {
+  return Boolean(
+    session
+    && !isManagedSessionStarting(session)
+    && !isEmptyManagedSessionShell(session)
+  );
+}
+
+function isTransientFreshRuntimeConfigFailure(session, error) {
+  const status = Number(error?.status || error?.body?.statusCode || 0);
+  if (!session || ![404, 409].includes(status)) {
+    return false;
+  }
+  return isManagedSessionStarting(session)
+    || isEmptyManagedSessionShell(session)
+    || isFreshLiveManagedSessionWithoutHistory(session);
+}
+
 function shouldFetchSessionDetailOnOpen(session, options = {}) {
   if (!session) {
     return false;
@@ -25681,6 +26344,7 @@ async function deleteHost(hostId) {
   for (const key of Array.from(state.diagnostics.keys())) {
     if (key.startsWith(`${hostId}::`)) {
       state.diagnostics.delete(key);
+      state.externalActivityKeys.delete(key);
     }
   }
 
@@ -26834,9 +27498,10 @@ async function forkNewBranch(options = {}) {
 }
 
 async function createFreshSession() {
+  setNewSessionLaunchError(null);
   const hostId = state.selectedHostId;
   if (!hostId) {
-    reportError(new Error('Select a host before creating a new session.'));
+    setNewSessionLaunchError(new Error('Select a host before creating a new session.'));
     return null;
   }
 
@@ -26846,7 +27511,7 @@ async function createFreshSession() {
   const label = labelInput.value.trim();
 
   if (!cwd) {
-    reportError(new Error('Enter a directory path on the selected host.'));
+    setNewSessionLaunchError(new Error('Enter a directory path on the selected host.'));
     return null;
   }
 
@@ -27018,39 +27683,27 @@ async function sendInputToSession(session, text, options = {}) {
   };
   const requestUrl = `/api/sessions/${encodeURIComponent(session.sessionId)}/input`;
   const requestBody = JSON.stringify(body);
-  let lastError = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await fetchJson(requestUrl, {
-        method: 'POST',
-        body: requestBody,
-        timeoutMs: 30_000,
-      });
-    } catch (error) {
-      lastError = error;
-      const status = Number(error?.status || 0);
-      const acceptanceUnknown = error?.code === 'request_timeout'
-        || (!status && !error?.body)
-        || status >= 500;
-      if (acceptanceUnknown && attempt === 0) {
-        await delay(250);
-        continue;
-      }
-      if (acceptanceUnknown) {
-        error.inputAcceptanceUnknown = true;
-      }
-      if (/still working on the previous turn/i.test(error.message || '')) {
-        openStatusForActiveTurnBlocker();
-        const activeTurnError = new Error('Codex is still working on the previous turn. Open Status to approve, decline, steer, or interrupt the active turn before sending another prompt.');
-        activeTurnError.code = error.code || 'session_turn_active';
-        activeTurnError.status = error.status || 409;
-        activeTurnError.body = error.body || null;
-        throw activeTurnError;
-      }
-      throw error;
+  try {
+    return await fetchJson(requestUrl, {
+      method: 'POST',
+      body: requestBody,
+      timeoutMs: 30_000,
+    });
+  } catch (error) {
+    const status = Number(error?.status || 0);
+    if (error?.code === 'request_timeout' || (!status && !error?.body)) {
+      error.inputAcceptanceUnknown = true;
     }
+    if (/still working on the previous turn/i.test(error.message || '')) {
+      openStatusForActiveTurnBlocker();
+      const activeTurnError = new Error('Codex is still working on the previous turn. Open Status to approve, decline, steer, or interrupt the active turn before sending another prompt.');
+      activeTurnError.code = error.code || 'session_turn_active';
+      activeTurnError.status = error.status || 409;
+      activeTurnError.body = error.body || null;
+      throw activeTurnError;
+    }
+    throw error;
   }
-  throw lastError || new Error('Prompt delivery could not be confirmed.');
 }
 
 async function sendInput(session, text, options = {}) {
@@ -27082,11 +27735,26 @@ async function submitComposerPayload(session, payload) {
     return { accepted: false, trackActiveDraft: false };
   }
 
-  if (session.live && runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
+  const sessionKey = resolveComposerSessionKey(session);
+  const activeDraft = sessionKey
+    ? state.codexControls.activeDraftsBySession.get(sessionKey) || null
+    : null;
+  const previousInputStillPending = Boolean(
+    activeDraft?.clientRequestId
+    && activeDraft.clientRequestId !== payload.clientRequestId
+  );
+  const externalActivity = getExternalTerminalActivityForSession(session);
+  if (session.live && (
+    runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})
+    || externalActivity.active
+    || previousInputStillPending
+  )) {
     const queuedText = String(payload.displayText || payload.composerDraft?.text || payload.text || '').trim();
     const hasInputs = Boolean(payload.inputItems?.length || payload.uploadedFiles?.length || payload.inlineFiles?.length);
     if (!queuedText && !hasInputs) {
-      throw new Error('Codex is already working. Add text or files to queue, or interrupt it first.');
+      throw new Error(externalActivity.active
+        ? 'A prompt is running in an external terminal. Add text to queue it until that turn finishes.'
+        : 'Codex is already working. Add text or files to queue, or interrupt it first.');
     }
     addSteerQueueItem(session, payload, queuedText || payload.displayText || 'Please inspect the attached file(s).');
     state.codexControls.steerNotice = null;
@@ -27095,7 +27763,23 @@ async function submitComposerPayload(session, payload) {
   }
 
   const wasLive = Boolean(session.live);
-  const accepted = await sendInput(session, payload.text, payload);
+  let accepted;
+  try {
+    accepted = await sendInput(session, payload.text, payload);
+  } catch (error) {
+    if (error?.code === 'session_turn_active') {
+      const queuedText = String(payload.displayText || payload.composerDraft?.text || payload.text || '').trim();
+      addSteerQueueItem(
+        session,
+        payload,
+        queuedText || payload.displayText || 'Please inspect the attached file(s).'
+      );
+      state.codexControls.steerNotice = null;
+      renderComposerTurnNotice();
+      return { accepted: true, trackActiveDraft: false };
+    }
+    throw error;
+  }
   if (!accepted) return { accepted: false, trackActiveDraft: false };
   state.codexControls.steerNotice = null;
   renderComposerTurnNotice();
@@ -27139,7 +27823,12 @@ async function submitComposerInput(input = el('input-text')) {
       return;
     }
     payload.submissionSignature = submission.signature;
-    setActiveDraftForSessionKey(submission.sessionKey, payload);
+    const existingActiveDraft = state.codexControls.activeDraftsBySession.get(
+      resolveComposerSessionKey(submission.sessionKey)
+    ) || null;
+    if (!existingActiveDraft || existingActiveDraft.clientRequestId === submission.id) {
+      setActiveDraftForSessionKey(submission.sessionKey, payload);
+    }
     submission.stage = 'submitting';
     setComposerSubmission(submission, submission.sessionKey);
     clearComposerDraftIfMatching(submission.sessionKey, submission.draft);
@@ -27152,8 +27841,7 @@ async function submitComposerInput(input = el('input-text')) {
     if (result.trackActiveDraft) {
       const resolvedSubmissionKey = resolveComposerSessionKey(submission.sessionKey);
       acknowledgeComposerSubmissionForSession(resolvedSubmissionKey, submission.id, { stage: 'queued' });
-      const activeSubmission = state.codexControls.composerSubmissionsBySession.get(resolvedSubmissionKey) || null;
-      retainSubmissionUntilHostAck = activeSubmission?.id === submission.id;
+      completeComposerSubmissionForSession(resolvedSubmissionKey, submission.id);
     } else {
       clearActiveDraftForSessionRequest(submission.sessionKey, submission.id);
       clearSentDraftSnapshotForSessionRequest(submission.sessionKey, submission.id, { force: true });
@@ -27228,6 +27916,7 @@ async function sendQueuedPrompt(itemId) {
     renderComposerTurnNotice();
     return;
   }
+  if (item.sending || item.forceSending) return;
 
   const session = getSelectedSession();
   if (!session || getSessionKey(session) !== item.sessionKey) {
@@ -27243,9 +27932,16 @@ async function sendQueuedPrompt(itemId) {
     return;
   }
 
-  if (runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
+  if (
+    runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})
+    || getExternalTerminalActivityForSession(session).active
+  ) {
     return;
   }
+  const activeDraft = state.codexControls.activeDraftsBySession.get(
+    resolveComposerSessionKey(session)
+  ) || null;
+  if (activeDraft?.clientRequestId) return;
 
   setSteerQueueItemText(item, text || item.payload.displayText || 'Please inspect the attached file(s).');
   item.sending = true;
@@ -27287,26 +27983,33 @@ async function sendQueuedPrompt(itemId) {
 }
 
 function maybeScheduleQueuedPromptSend(session = getSelectedSession()) {
-  if (!session?.live || state.codexControls.queueAutoSendScheduled) {
+  const sessionKey = getSessionKey(session);
+  const queueTimers = state.codexControls.queueAutoSendTimersBySession;
+  if (!session?.live || !sessionKey || queueTimers.has(sessionKey)) {
     return;
   }
   const runtime = getRuntimeForSession(session) || session.runtime || {};
-  if (runtimeIsActive(runtime)) {
+  if (runtimeIsActive(runtime) || getExternalTerminalActivityForSession(session, runtime).active) {
     return;
   }
   const next = getFirstQueuedPrompt(session);
   if (!next) {
     return;
   }
-  state.codexControls.queueAutoSendScheduled = true;
-  window.setTimeout(() => {
-    state.codexControls.queueAutoSendScheduled = false;
-    const current = getSelectedSession();
-    if (!current || getSessionKey(current) !== next.sessionKey) {
+  const timer = window.setTimeout(() => {
+    queueTimers.delete(sessionKey);
+    const queued = findSteerQueueItem(next.id);
+    if (!queued || queued.sessionKey !== sessionKey) {
       return;
     }
-    sendQueuedPrompt(next.id).catch(reportError);
+    const current = getSelectedSession();
+    if (!current || getSessionKey(current) !== sessionKey) {
+      maybeScheduleQueuedPromptSend(current);
+      return;
+    }
+    sendQueuedPrompt(queued.id).catch(reportError);
   }, 350);
+  queueTimers.set(sessionKey, timer);
 }
 
 async function guideQueuedPrompt(itemId) {
@@ -27316,6 +28019,7 @@ async function guideQueuedPrompt(itemId) {
     renderComposerTurnNotice();
     return;
   }
+  if (item.sending || item.forceSending) return;
 
   const session = getSelectedSession();
   if (!session || getSessionKey(session) !== item.sessionKey) {
@@ -27363,6 +28067,7 @@ async function interruptAndSendQueuedPrompt(itemId) {
     renderComposerTurnNotice();
     return;
   }
+  if (item.sending || item.forceSending) return;
 
   const session = getSelectedSession();
   if (!session || getSessionKey(session) !== item.sessionKey) {
@@ -27787,6 +28492,7 @@ el('logout-button').addEventListener('click', async () => {
 el('toggle-language-button').addEventListener('click', () => {
   state.ui.locale = currentLocale() === 'zh-CN' ? 'en' : 'zh-CN';
   persistUiSettings();
+  renderLocaleLabels();
   renderAll();
 });
 
@@ -28036,6 +28742,7 @@ el('settings-form').addEventListener('submit', (event) => {
   persistUiSettings();
   const optimizeSpeedModeChanged = beforeOptimizeSpeedMode !== isOptimizeSpeedMode();
   closeSettingsDialog();
+  renderLocaleLabels();
   renderAll();
   if (optimizeSpeedModeChanged) {
     refresh().catch(reportError);
@@ -28518,23 +29225,23 @@ el('session-details-button').addEventListener('click', () => {
 });
 
 el('session-meta')?.addEventListener('click', (event) => {
-  const copySessionButton = event.target.closest('[data-copy-session-id]');
+  const copySessionButton = event.target.closest('[data-copy-session-id], [data-copy-session-dir]');
   if (!copySessionButton) {
     return;
   }
   event.preventDefault();
   event.stopPropagation();
-  copyTextToClipboard(copySessionButton.dataset.copySessionId || '')
+  copyTextToClipboard(copySessionButton.dataset.copySessionId || copySessionButton.dataset.copySessionDir || '')
     .then(() => flashCopyButton(copySessionButton))
     .catch(reportError);
 });
 
 el('session-detail-panel').addEventListener('click', (event) => {
-  const copySessionButton = event.target.closest('[data-copy-session-id]');
+  const copySessionButton = event.target.closest('[data-copy-session-id], [data-copy-session-dir]');
   if (copySessionButton) {
     event.preventDefault();
     event.stopPropagation();
-    copyTextToClipboard(copySessionButton.dataset.copySessionId || '')
+    copyTextToClipboard(copySessionButton.dataset.copySessionId || copySessionButton.dataset.copySessionDir || '')
       .then(() => flashCopyButton(copySessionButton))
       .catch(reportError);
     return;
@@ -28792,25 +29499,25 @@ el('new-session-form').addEventListener('submit', async (event) => {
   try {
     await createFreshSession();
   } catch (error) {
-    reportError(error);
+    setNewSessionLaunchError(error);
   }
 });
 
 el('toggle-overview-button')?.addEventListener('click', () => {
   state.overviewCollapsed = !state.overviewCollapsed;
-  renderAll();
+  renderSidebarSections();
 });
 
 el('toggle-new-session-button').addEventListener('click', () => {
   state.newSessionCollapsed = !state.newSessionCollapsed;
-  renderAll();
+  renderSidebarSections();
 });
 
 el('toggle-navigator-button').addEventListener('click', () => {
   closeMobileSelectMenus();
   state.navigatorCollapsed = !state.navigatorCollapsed;
   writeLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, state.navigatorCollapsed);
-  renderAll();
+  renderNavigatorLayout();
 });
 
 el('message-notification-button')?.addEventListener('click', (event) => {
@@ -29163,7 +29870,7 @@ el('close-sidebar-navigator-button')?.addEventListener('click', () => {
   closeMobileSelectMenus();
   state.navigatorCollapsed = true;
   writeLocalStorageJson(NAVIGATOR_COLLAPSED_STORAGE_KEY, state.navigatorCollapsed);
-  renderAll();
+  renderNavigatorLayout();
 });
 
 el('session-search-form').addEventListener('submit', (event) => {
@@ -29829,6 +30536,7 @@ async function boot() {
 
 initializePersistentUiState();
 applyUiTheme();
+renderLocaleLabels();
 boot();
 
 window.addEventListener('resize', () => {
@@ -29839,10 +30547,13 @@ setInterval(() => {
   if (!authAllowsRequests()) {
     return;
   }
+  if (document.visibilityState === 'hidden' || !getSelectedSession()) {
+    return;
+  }
   renderRuntimePanel();
-  renderThinkingPanel();
-  renderApprovalPopup();
-  renderStatusWindow();
+  if (state.sessionDetailsOpen) {
+    renderStatusWindow();
+  }
 }, 1000);
 
 setInterval(() => {
@@ -29853,5 +30564,8 @@ setInterval(() => {
   if (!authAllowsRequests()) {
     return;
   }
+  if (document.visibilityState === 'hidden') {
+    return;
+  }
   refresh().catch(reportError);
-}, 8000);
+}, FULL_REFRESH_INTERVAL_MS);

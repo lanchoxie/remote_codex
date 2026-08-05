@@ -422,8 +422,19 @@
     const error = errorValue && typeof errorValue === 'object'
       ? plainText(errorValue.message || errorValue.detail || errorValue)
       : plainText(errorValue);
-    const timestamp = identifier(firstDefined(sources, ['timestamp', 'createdAt', 'created_at']));
-    const updatedAt = identifier(firstDefined(sources, ['updatedAt', 'updated_at', 'completedAt', 'completed_at'])) || timestamp;
+    const snapshotTimestamp = identifier(firstDefined(sources, ['timestamp']));
+    const timestamp = identifier(firstDefined(sources, [
+      'startedAt',
+      'started_at',
+      'createdAt',
+      'created_at',
+    ])) || snapshotTimestamp;
+    const updatedAt = identifier(firstDefined(sources, [
+      'updatedAt',
+      'updated_at',
+      'completedAt',
+      'completed_at',
+    ])) || snapshotTimestamp || timestamp;
     const completedAtValue = firstDefined(sources, ['completedAt', 'completed_at', 'finishedAt', 'finished_at']);
     const durationValue = firstDefined(sources, ['durationMs', 'duration_ms', 'elapsedMs', 'elapsed_ms']);
     const hasDuration = durationValue !== undefined

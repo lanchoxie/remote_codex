@@ -83,6 +83,7 @@ const DISCOVERY_EXACT_PRESENCE_SESSION_ID = 'discovery-exact-presence-session';
 const DISCOVERY_DIFFERENT_RUN_SESSION_ID = 'discovery-different-run-session';
 const DISCOVERY_RUNLESS_PRESENCE_SESSION_ID = 'discovery-runless-presence-session';
 const OWNERSHIP_COLLISION_SESSION_ID = 'ownership-collision-session';
+const RUNTIME_REVISION_CLAIM_SESSION_ID = 'runtime-revision-claim-session';
 const DISCOVERY_CLOSE_SESSION_ID = 'discovery-close-session';
 const FORK_ALIAS_SOURCE_SESSION_ID = 'fork-alias-source-session';
 const FALLBACK_ALIAS_SOURCE_SESSION_ID = 'fallback-alias-source-session';
@@ -101,10 +102,6 @@ const INPUT_SCOPE_MIGRATION_CASES = Object.freeze({
     loser: 'input-scope-response-loser',
     winner: 'input-scope-response-winner',
   }),
-  withoutRequestId: Object.freeze({
-    loser: 'input-scope-clientless-loser',
-    winner: 'input-scope-clientless-winner',
-  }),
 });
 const HISTORICAL_DIAGNOSTIC_SECRET = 'historical-diagnostic-secret-123456';
 const LIVE_DIAGNOSTIC_SECRET = 'live-diagnostic-secret-123456';
@@ -121,6 +118,24 @@ assert(
 assert(
   relaySource.includes("entry.speaker !== 'user' || entry.deliveryStatus === 'pending'"),
   'Session title inference must exclude provisional user prompts'
+);
+const managedDiscoveryCloseSource = relaySource.slice(
+  relaySource.indexOf('async function closeManagedSessionsMissingFromDiscovery('),
+  relaySource.indexOf('function managedDiscoveryListProjectionFingerprint(')
+);
+assert(
+  managedDiscoveryCloseSource.includes("session.state === 'starting'")
+    && managedDiscoveryCloseSource.includes("run?.status === 'pending'"),
+  'authoritative Host discovery must reconcile stale pending starts that were never live'
+);
+assert(
+  managedDiscoveryCloseSource.includes('sessionAgeMs(session, run)'),
+  'stale pending-start recovery must age the durable run instead of discovery-refreshed Session metadata'
+);
+assert(
+  !managedDiscoveryCloseSource.includes("parentRun?.status !== 'live'")
+    && managedDiscoveryCloseSource.includes('projectManagedStartFailure('),
+  'missing pending replacements must fail only the child and restore any durable live parent'
 );
 
 function getOpenPort() {
@@ -237,7 +252,6 @@ function relayEnv(port, tempRoot) {
     RELAY_MISSING_MANAGED_DISCOVERY_CONFIRMATION_MS: '1',
     RELAY_TEST_CONTROL_ENABLED: 'true',
     RELAY_TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS: '150',
-    RELAY_TEST_INPUT_PREPARE_DELAY_MS: '250',
     RELAY_SESSION_STOP_FALLBACK_MS: '500',
   };
 }
@@ -580,6 +594,22 @@ class FakeHost {
       if (this.failNextStartCode) {
         const code = this.failNextStartCode;
         this.failNextStartCode = null;
+        await this.postEvent({
+          type: 'session.runtime_updated',
+          hostId: HOST_ID,
+          sessionId: command.sessionId,
+          runId: command.runId,
+          patch: {
+            connection: 'connecting',
+            phase: 'initializing',
+            busy: true,
+            activeTurnId: 'stale-startup-turn',
+            currentTurnStatus: 'inProgress',
+            queuedCommandId: command.id,
+            pendingClientRequestId: command.clientRequestId || 'stale-start-request',
+            pendingInputSummary: 'stale startup work',
+          },
+        });
         await this.postEvent({
           type: 'session.command_failed',
           hostId: HOST_ID,
@@ -1181,38 +1211,6 @@ async function main() {
       'a cached input response must follow the canonical Session key without requeueing'
     );
 
-    const clientlessPair = INPUT_SCOPE_MIGRATION_CASES.withoutRequestId;
-    await publishInputScopeMigrationSession(clientlessPair);
-    const clientlessPrompt = 'clientless prompt protected only by the Session reservation';
-    const clientlessCommandsBefore = fakeHost.commands.filter((command) => (
-      command.type === 'session.input' && command.text === clientlessPrompt
-    )).length;
-    const clientlessBeforeMerge = requestJson(
-      port,
-      'POST',
-      `/api/sessions/${clientlessPair.loser}/input`,
-      { hostId: HOST_ID, text: clientlessPrompt }
-    );
-    await delay(20);
-    await publishInputScopeMigrationSession(clientlessPair, true);
-    const duplicateClientlessInput = await requestJson(
-      port,
-      'POST',
-      `/api/sessions/${clientlessPair.winner}/input`,
-      { hostId: HOST_ID, text: clientlessPrompt }
-    );
-    assertContractError(duplicateClientlessInput, 409, 'session_input_preparing');
-    const acceptedClientlessInput = await clientlessBeforeMerge;
-    assert.strictEqual(acceptedClientlessInput.statusCode, 200, JSON.stringify(acceptedClientlessInput.body));
-    await waitForCommand(fakeHost, (command) => command.id === acceptedClientlessInput.body?.command?.id);
-    assert.strictEqual(
-      fakeHost.commands.filter((command) => (
-        command.type === 'session.input' && command.text === clientlessPrompt
-      )).length,
-      clientlessCommandsBefore + 1,
-      'Session reservation migration must protect prompts without a clientRequestId'
-    );
-
     const legacyCanonicalRuntime = await requestJson(
       port,
       'GET',
@@ -1397,6 +1395,7 @@ async function main() {
       source: 'codex-jsonl',
       hostId: HOST_ID,
       sessionId: legacyLiveSessionId,
+      runId: 'legacy',
       patch: {
         connection: 'tailing',
         phase: 'thinking',
@@ -1415,6 +1414,66 @@ async function main() {
       legacyAfterTailRuntime.body?.runtime?.activeTurnId,
       null,
       'rollout tail runtime must not override managed app-server control state on legacy Hosts'
+    );
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      patch: {
+        externalActivity: {
+          owner: 'external-terminal',
+          active: true,
+          turnId: 'external-terminal-turn',
+          phase: 'thinking',
+          status: 'inProgress',
+          updatedAt: '2026-07-30T06:00:00.000Z',
+        },
+      },
+      timestamp: '2026-07-30T06:00:00.000Z',
+    });
+    const legacyWithExternalActivity = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(legacyWithExternalActivity.body?.runtime?.phase, 'idle');
+    assert.strictEqual(legacyWithExternalActivity.body?.runtime?.busy, false);
+    assert.strictEqual(legacyWithExternalActivity.body?.runtime?.activeTurnId, null);
+    assert.deepStrictEqual(legacyWithExternalActivity.body?.runtime?.externalActivity, {
+      owner: 'external-terminal',
+      active: true,
+      turnId: 'external-terminal-turn',
+      phase: 'thinking',
+      status: 'inProgress',
+      updatedAt: '2026-07-30T06:00:00.000Z',
+    });
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'stale-external-run',
+      patch: {
+        externalActivity: {
+          owner: 'external-terminal',
+          active: true,
+          turnId: 'stale-external-turn',
+          phase: 'thinking',
+          status: 'inProgress',
+        },
+      },
+      timestamp: '2026-07-30T06:00:01.000Z',
+    });
+    const legacyAfterStaleExternal = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      legacyAfterStaleExternal.body?.runtime?.externalActivity?.turnId,
+      'external-terminal-turn',
+      'a stale external tail runtime must not replace the current observed turn'
     );
 
     const concurrentRequestId = 'legacy-concurrent-input-intent';
@@ -1480,18 +1539,7 @@ async function main() {
       legacyLiveSessionId,
       (body) => body?.runtime?.phase === 'idle' && body?.runtime?.busy === false
     );
-    const racedRequestId = 'runtime-advanced-during-input-prepare';
-    const racedInput = requestJson(
-      port,
-      'POST',
-      `/api/sessions/${legacyLiveSessionId}/input`,
-      {
-        hostId: HOST_ID,
-        clientRequestId: racedRequestId,
-        text: 'must not queue after another turn becomes active',
-      }
-    );
-    await delay(20);
+    const activeTurnRequestId = 'input-rejected-while-turn-active';
     await fakeHost.postEvent({
       type: 'session.runtime_updated',
       hostId: HOST_ID,
@@ -1507,26 +1555,35 @@ async function main() {
         currentTurnStatus: 'inProgress',
       },
     });
-    const rejectedRacedInput = await racedInput;
-    assertContractError(rejectedRacedInput, 409, 'session_turn_active');
+    const rejectedActiveInput = await requestJson(
+      port,
+      'POST',
+      `/api/sessions/${legacyLiveSessionId}/input`,
+      {
+        hostId: HOST_ID,
+        clientRequestId: activeTurnRequestId,
+        text: 'must not queue while another turn is active',
+      }
+    );
+    assertContractError(rejectedActiveInput, 409, 'session_turn_active');
     assert.strictEqual(
       fakeHost.commands.some((command) => (
-        command.type === 'session.input' && command.clientRequestId === racedRequestId
+        command.type === 'session.input' && command.clientRequestId === activeTurnRequestId
       )),
       false,
-      'a prompt must not enter the durable queue after Host runtime becomes active during preparation'
+      'an active runtime must reject the prompt before durable queueing'
     );
-    const racedRuntimeDetail = await requestJson(
+    const activeRuntimeDetail = await requestJson(
       port,
       'GET',
       `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
     );
-    assert.strictEqual(racedRuntimeDetail.body?.runtime?.phase, 'thinking');
-    assert.strictEqual(racedRuntimeDetail.body?.runtime?.runtimeRevision, 500);
+    assert.strictEqual(activeRuntimeDetail.body?.runtime?.phase, 'thinking');
+    assert.strictEqual(activeRuntimeDetail.body?.runtime?.runtimeRevision, 500);
     assert.strictEqual(
-      racedRuntimeDetail.body?.transcript?.some((entry) => entry.clientRequestId === racedRequestId),
+      activeRuntimeDetail.body?.transcript?.some((entry) => entry.clientRequestId === activeTurnRequestId),
       false,
-      'a rejected prepare race must not leave a provisional transcript echo'
+      'an active-turn rejection must not leave a provisional transcript echo'
     );
     await fakeHost.postEvent({
       type: 'session.runtime_updated',
@@ -2612,6 +2669,49 @@ async function main() {
       'a stopped create replay must not recreate the accepted Session'
     );
 
+    const hostEnvironmentCreateBody = {
+      clientRequestId: 'create-host-environment-intent-1',
+      cwd: ROOT,
+      label: 'Idempotent Host Environment Create',
+    };
+    fakeHost.holdNextStart = true;
+    const hostEnvironmentCreated = await requestJson(
+      port,
+      'POST',
+      `/api/hosts/${HOST_ID}/sessions/start`,
+      hostEnvironmentCreateBody
+    );
+    assert.strictEqual(hostEnvironmentCreated.statusCode, 200, JSON.stringify(hostEnvironmentCreated.body));
+    const heldHostEnvironmentStart = await waitForHeldStart(fakeHost, hostEnvironmentCreated.body?.runId);
+    const bindingPreflightsAfterHostEnvironmentCreate = fakeHost.commands.filter(
+      (command) => command.type === 'host.binding_preflight'
+    ).length;
+    const hostEnvironmentCatalogsAfterCreate = fakeHost.commands.filter(
+      (command) => command.type === 'session.model_list' || command.type === 'host.api_catalog'
+    ).length;
+    const hostEnvironmentReplay = await requestJson(
+      port,
+      'POST',
+      `/api/hosts/${HOST_ID}/sessions/start`,
+      hostEnvironmentCreateBody
+    );
+    assert.strictEqual(hostEnvironmentReplay.statusCode, 200, JSON.stringify(hostEnvironmentReplay.body));
+    assert.strictEqual(hostEnvironmentReplay.body?.idempotentReplay, true);
+    assert.strictEqual(hostEnvironmentReplay.body?.runId, hostEnvironmentCreated.body?.runId);
+    assert.strictEqual(
+      fakeHost.commands.filter((command) => command.type === 'host.binding_preflight').length,
+      bindingPreflightsAfterHostEnvironmentCreate,
+      'an accepted Host-environment create replay must reuse its durable binding without another Host preflight'
+    );
+    assert.strictEqual(
+      fakeHost.commands.filter(
+        (command) => command.type === 'session.model_list' || command.type === 'host.api_catalog'
+      ).length,
+      hostEnvironmentCatalogsAfterCreate,
+      'an accepted Host-environment create replay must not load its model catalog again'
+    );
+    await fakeHost.releaseHeldStart(heldHostEnvironmentStart.runId);
+
     const emptyStarted = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/sessions/start`, {
       sessionId: EMPTY_REBIND_SESSION_ID,
       cwd: ROOT,
@@ -2824,6 +2924,22 @@ async function main() {
       ))
     );
     assert.strictEqual(duplicateFailureDetail.body?.session?.resumeError?.code, 'session_native_resume_failed');
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.connection, 'closed');
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.phase, 'closed');
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.busy, false);
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.activeTurnId, null);
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.currentTurnStatus, 'closed');
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.queuedCommandId, null);
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.pendingClientRequestId, null);
+    assert.strictEqual(duplicateFailureDetail.body?.runtime?.pendingInputSummary, null);
+    const duplicateFailureRuntime = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${duplicateFailureSessionId}/runtime-config?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(duplicateFailureRuntime.statusCode, 200, JSON.stringify(duplicateFailureRuntime.body));
+    assert.strictEqual(duplicateFailureRuntime.body?.activeRunId, null);
+    assert.strictEqual(duplicateFailureRuntime.body?.pendingRun, null);
     assert.strictEqual(
       duplicateFailureDetail.body?.alerts?.filter((alert) => (
         String(alert?.message || '').includes(structuredFailureMessage)
@@ -2831,6 +2947,74 @@ async function main() {
       1,
       'one managed start failure must produce one visible alert even when Host also posts session.error'
     );
+
+    const transcriptCountBeforeStaleResume = duplicateFailureDetail.body?.transcript?.length || 0;
+    fakeHost.holdNextStart = true;
+    const staleResume = await requestJson(
+      port,
+      'POST',
+      `/api/hosts/${HOST_ID}/sessions/start`,
+      {
+        launchMode: 'resume',
+        sourceSessionId: duplicateFailureSessionId,
+        apiConfig: PROFILE_A,
+      }
+    );
+    assert.strictEqual(staleResume.statusCode, 200, JSON.stringify(staleResume.body));
+    const staleResumeCommand = await waitForHeldStart(fakeHost, staleResume.body?.runId);
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: staleResumeCommand.sessionId,
+      runId: staleResumeCommand.runId,
+      patch: {
+        connection: 'connecting',
+        phase: 'initializing',
+        busy: true,
+        activeTurnId: 'stale-resume-turn',
+        currentTurnStatus: 'inProgress',
+      },
+    });
+    const discoverySource = await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions?full=1`);
+    assert.strictEqual(discoverySource.statusCode, 200, JSON.stringify(discoverySource.body));
+    const discoverySessions = (discoverySource.body?.sessions || []).filter((session) => (
+      session.source === 'managed'
+      && session.live === true
+      && session.sessionId !== duplicateFailureSessionId
+    ));
+    await fakeHost.postEvent({
+      type: 'session.discovery',
+      hostId: HOST_ID,
+      discoveryId: 'stale-resume-missing-1',
+      sessions: discoverySessions,
+    });
+    await delay(5);
+    await fakeHost.postEvent({
+      type: 'session.discovery',
+      hostId: HOST_ID,
+      discoveryId: 'stale-resume-missing-2',
+      sessions: discoverySessions,
+    });
+    const recoveredStaleResume = await waitForSessionDetail(
+      port,
+      duplicateFailureSessionId,
+      (body) => body?.session?.state === 'failed:session_start_missing_from_host'
+        && body?.runtime?.phase === 'closed'
+        && body?.runtime?.busy === false
+    );
+    assert.strictEqual(
+      recoveredStaleResume.body?.transcript?.length,
+      transcriptCountBeforeStaleResume,
+      'stale pending Resume recovery must preserve the existing Session transcript'
+    );
+    const recoveredStaleResumeRuntime = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${duplicateFailureSessionId}/runtime-config?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(recoveredStaleResumeRuntime.statusCode, 200, JSON.stringify(recoveredStaleResumeRuntime.body));
+    assert.strictEqual(recoveredStaleResumeRuntime.body?.activeRunId, null);
+    assert.strictEqual(recoveredStaleResumeRuntime.body?.pendingRun, null);
 
     const lateReadyStarted = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/sessions/start`, {
       sessionId: LATE_READY_REBIND_SESSION_ID,
@@ -3347,6 +3531,139 @@ async function main() {
         && body?.runtime?.queuedCommandId == null
         && body?.runtime?.pendingInputSummary == null
     );
+
+    const runtimeClaimStarted = await requestJson(
+      port,
+      'POST',
+      `/api/hosts/${HOST_ID}/sessions/start`,
+      {
+        sessionId: RUNTIME_REVISION_CLAIM_SESSION_ID,
+        cwd: ROOT,
+        label: 'Runtime revision claim acceptance',
+        apiConfig: PROFILE_A,
+      }
+    );
+    assert.strictEqual(runtimeClaimStarted.statusCode, 200, JSON.stringify(runtimeClaimStarted.body));
+    await waitForSessionDetail(
+      port,
+      RUNTIME_REVISION_CLAIM_SESSION_ID,
+      (body) => body?.session?.live === true
+        && (body?.runtime?.phase || body?.session?.runtime?.phase) === 'idle'
+    );
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: RUNTIME_REVISION_CLAIM_SESSION_ID,
+      runId: runtimeClaimStarted.body?.runId,
+      patch: {
+        runtimeRevision: 700,
+        runId: runtimeClaimStarted.body?.runId,
+        phase: 'idle',
+        connection: 'ready',
+        busy: false,
+        activeTurnId: null,
+        currentTurnStatus: 'idle',
+      },
+    });
+
+    fakeHost.holdNextInput = true;
+    const runtimeClaimRequestId = 'runtime-revision-claim-input';
+    const runtimeClaimInput = await requestJson(
+      port,
+      'POST',
+      `/api/sessions/${RUNTIME_REVISION_CLAIM_SESSION_ID}/input`,
+      {
+        hostId: HOST_ID,
+        clientRequestId: runtimeClaimRequestId,
+        text: 'Host terminal runtime must replace the optimistic queued Session snapshot.',
+      }
+    );
+    assert.strictEqual(runtimeClaimInput.statusCode, 200, JSON.stringify(runtimeClaimInput.body));
+    const runtimeClaimCommand = await waitForCommand(
+      fakeHost,
+      (command) => command.id === runtimeClaimInput.body?.command?.id
+    );
+    fakeHost.heldInputs.delete(runtimeClaimCommand.id);
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: RUNTIME_REVISION_CLAIM_SESSION_ID,
+      runId: runtimeClaimStarted.body?.runId,
+      commandId: runtimeClaimCommand.id,
+      commandClientRequestId: runtimeClaimRequestId,
+      clientRequestId: runtimeClaimRequestId,
+      inputOutcome: 'accepted',
+      patch: {
+        runtimeRevision: 701,
+        runId: runtimeClaimStarted.body?.runId,
+        clientRequestId: runtimeClaimRequestId,
+        pendingClientRequestId: runtimeClaimRequestId,
+        phase: 'thinking',
+        connection: 'ready',
+        busy: true,
+        activeTurnId: 'runtime-revision-claim-turn',
+        currentTurnStatus: 'inProgress',
+        queuedCommandId: null,
+      },
+    });
+    await waitForSessionDetail(
+      port,
+      RUNTIME_REVISION_CLAIM_SESSION_ID,
+      (body) => body?.runtime?.phase === 'thinking'
+        && body?.runtime?.activeTurnId === 'runtime-revision-claim-turn'
+    );
+
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: RUNTIME_REVISION_CLAIM_SESSION_ID,
+      runId: runtimeClaimStarted.body?.runId,
+      patch: {
+        runtimeRevision: 702,
+        runId: runtimeClaimStarted.body?.runId,
+        clientRequestId: runtimeClaimRequestId,
+        pendingClientRequestId: null,
+        phase: 'error',
+        connection: 'ready',
+        busy: false,
+        activeTurnId: null,
+        currentTurnStatus: 'failed',
+        queuedCommandId: null,
+        pendingInputSummary: null,
+        lastError: 'synthetic terminal runtime',
+      },
+    });
+    const terminalRuntimeProjection = await waitForSessionDetail(
+      port,
+      RUNTIME_REVISION_CLAIM_SESSION_ID,
+      (body) => body?.runtime?.phase === 'error' && body?.runtime?.busy === false
+    );
+    assert.strictEqual(terminalRuntimeProjection.body?.session?.runtime?.phase, 'error');
+    assert.strictEqual(terminalRuntimeProjection.body?.session?.runtime?.busy, false);
+    assert.strictEqual(terminalRuntimeProjection.body?.session?.runtime?.activeTurnId, null);
+    assert.strictEqual(terminalRuntimeProjection.body?.session?.runtime?.pendingClientRequestId, null);
+    assert.strictEqual(terminalRuntimeProjection.body?.session?.runtime?.runtimeRevision, 702);
+    assert.strictEqual(
+      terminalRuntimeProjection.body?.session?.runtime?.lastError,
+      'synthetic terminal runtime'
+    );
+    for (const query of ['?full=1', '']) {
+      const runtimeSessionList = await requestJson(
+        port,
+        'GET',
+        `/api/hosts/${HOST_ID}/sessions${query}`
+      );
+      assert.strictEqual(runtimeSessionList.statusCode, 200, JSON.stringify(runtimeSessionList.body));
+      const runtimeSessionProjection = runtimeSessionList.body?.sessions?.find(
+        (session) => session.sessionId === RUNTIME_REVISION_CLAIM_SESSION_ID
+      );
+      assert(runtimeSessionProjection, `runtime Session must remain visible for query ${query || '(optimized)'}`);
+      assert.strictEqual(runtimeSessionProjection.runtime?.phase, 'error');
+      assert.strictEqual(runtimeSessionProjection.runtime?.busy, false);
+      assert.strictEqual(runtimeSessionProjection.runtime?.pendingClientRequestId, null);
+      assert.strictEqual(runtimeSessionProjection.runtime?.queuedCommandId, null);
+      assert.strictEqual(runtimeSessionProjection.runtime?.runtimeRevision, 702);
+    }
 
     await fakeHost.postEvent({
       type: 'session.runtime_updated',
@@ -5134,6 +5451,36 @@ async function main() {
 
     relay = spawnRelay(port, tempRoot, output);
     await waitForRelay(port, relay);
+    const recoveredStopBeforeHost = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${RESTART_MISSING_LIVE_SESSION_ID}/runtime-config?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(recoveredStopBeforeHost.statusCode, 200, JSON.stringify(recoveredStopBeforeHost.body));
+    assert.strictEqual(
+      recoveredStopBeforeHost.body?.runStatus,
+      'stopping',
+      'Relay restart must preserve an unconfirmed durable Stop until the Host reports its outcome'
+    );
+    const recoveredStopDetailBeforeHost = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${RESTART_MISSING_LIVE_SESSION_ID}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(recoveredStopDetailBeforeHost.body?.session?.state, 'ending');
+    assert.strictEqual(recoveredStopDetailBeforeHost.body?.session?.runtime?.phase, 'ending');
+    assert.strictEqual(recoveredStopDetailBeforeHost.body?.runtime?.phase, 'ending');
+    assert.strictEqual(recoveredStopDetailBeforeHost.body?.runtime?.busy, false);
+    assert.strictEqual(recoveredStopDetailBeforeHost.body?.runtime?.activeTurnId, null);
+    assert.strictEqual(recoveredStopDetailBeforeHost.body?.runtime?.pendingInputSummary, null);
+    assert.strictEqual(recoveredStopDetailBeforeHost.body?.runtime?.queuedCommandId, null);
+    assert.strictEqual(
+      recoveredStopDetailBeforeHost.body?.alerts?.some((alert) => (
+        /Relay restarted before the Host confirmed this Stop/i.test(alert.message || '')
+      )),
+      false,
+      'Relay restart must not emit a false Stop failure before the Host reports an outcome'
+    );
     const recoveredPendingProjection = await requestJson(
       port,
       'GET',
@@ -5168,6 +5515,15 @@ async function main() {
     await registerHost(port);
     fakeHost = new FakeHost(port);
     fakeHost.start();
+    const recoveredStopCommand = await waitForCommand(fakeHost, (command) => (
+      command.type === 'session.stop'
+      && command.runId === restartMissingLiveRuntime.body?.runId
+    ));
+    assert.strictEqual(
+      recoveredStopCommand.stopRequestId,
+      interruptedStop.body?.command?.stopRequestId,
+      'Relay restart must recover the original durable Stop identity'
+    );
     const recoveredDurableInputCommand = await waitForCommand(
       fakeHost,
       (command) => command.id === durableInputCommandId
@@ -5206,16 +5562,17 @@ async function main() {
     assert.strictEqual(recovered.statusCode, 200, JSON.stringify(recovered.body));
     assert.strictEqual(recovered.body?.sessionBinding?.profileId, PROFILE_B.profileId);
     assert.strictEqual(recovered.body?.effectiveSelection?.model, MODEL_B);
-    const recoveredInterruptedStop = await requestJson(
+    const recoveredInterruptedStop = await waitForRuntime(
       port,
-      'GET',
-      `/api/sessions/${RESTART_MISSING_LIVE_SESSION_ID}/runtime-config?hostId=${HOST_ID}`
+      (body) => body?.runStatus === 'stopped' && body?.activeRunId === null,
+      5000,
+      RESTART_MISSING_LIVE_SESSION_ID
     );
     assert.strictEqual(recoveredInterruptedStop.statusCode, 200, JSON.stringify(recoveredInterruptedStop.body));
     assert.strictEqual(
       recoveredInterruptedStop.body?.runStatus,
-      'live',
-      'an unconfirmed Stop must retain its durable live run so the user can retry Stop'
+      'stopped',
+      'Host terminal confirmation must close a Stop recovered after Relay restart'
     );
     const recoveredInterruptedStopDetail = await requestJson(
       port,
@@ -5224,24 +5581,23 @@ async function main() {
     );
     assert.strictEqual(
       recoveredInterruptedStopDetail.body?.session?.state,
-      'stop-failed',
-      'Relay restart must not reopen an unconfirmed Stop as a writable live Session'
+      'history-only',
+      'Host terminal confirmation must close the recovered Session projection'
     );
-    assert.strictEqual(recoveredInterruptedStopDetail.body?.runtime?.phase, 'stop-failed');
+    assert.strictEqual(recoveredInterruptedStopDetail.body?.session?.live, false);
+    assert.strictEqual(recoveredInterruptedStopDetail.body?.session?.runtime?.phase, 'closed');
+    assert.strictEqual(recoveredInterruptedStopDetail.body?.runtime?.phase, 'closed');
     assert.strictEqual(recoveredInterruptedStopDetail.body?.runtime?.busy, false);
     assert.strictEqual(recoveredInterruptedStopDetail.body?.runtime?.activeTurnId, null);
     assert.strictEqual(recoveredInterruptedStopDetail.body?.runtime?.pendingInputSummary, null);
     assert.strictEqual(recoveredInterruptedStopDetail.body?.runtime?.queuedCommandId, null);
-    const inputAfterInterruptedStopRestart = await requestJson(
-      port,
-      'POST',
-      `/api/sessions/${RESTART_MISSING_LIVE_SESSION_ID}/input`,
-      {
-        hostId: HOST_ID,
-        text: 'must remain blocked until Stop is retried',
-      }
+    assert.strictEqual(
+      recoveredInterruptedStopDetail.body?.alerts?.some((alert) => (
+        /Relay restarted before the Host confirmed this Stop/i.test(alert.message || '')
+      )),
+      false,
+      'a recovered Stop must not leave a transient restart failure alert behind'
     );
-    assertContractError(inputAfterInterruptedStopRestart, 409, 'session_stop_failed');
     const hydratedLiveReplacement = await requestJson(
       port,
       'GET',
@@ -5347,10 +5703,10 @@ async function main() {
       'GET',
       `/api/sessions/${RESTART_MISSING_LIVE_SESSION_ID}/runtime-config?hostId=${HOST_ID}`
     );
-    assert.notStrictEqual(
+    assert.strictEqual(
       durableRunAfterFirstMissing.body?.activeRunId,
       null,
-      'one missing discovery snapshot must preserve a durable live run'
+      'discovery must not revive a Stop already confirmed after Relay restart'
     );
     await delay(5);
     const confirmedEmptyDiscovery = await requestJson(port, 'POST', '/api/agent/events', {
@@ -5373,7 +5729,7 @@ async function main() {
     assert.strictEqual(
       closedMissingDurableRun.body?.activeRunId,
       null,
-      'authoritative discovery must close a durable live run even after its in-memory projection was rehydrated as history-only'
+      'authoritative discovery must preserve the recovered Stop terminal state'
     );
     assert.strictEqual(closedMissingDurableRun.body?.runStatus, 'stopped');
 
@@ -5554,6 +5910,10 @@ async function main() {
         activeTurnId: null,
         busy: false,
         currentTurnStatus: 'completed',
+        queuedCommandId: 'stale-terminal-command',
+        pendingClientRequestId: 'stale-terminal-request',
+        queuedInputAt: '2026-07-30T00:00:00.000Z',
+        pendingInputSummary: 'stale terminal summary',
       },
     });
     const rejectedEchoDetail = await waitForSessionDetail(
@@ -5562,6 +5922,10 @@ async function main() {
       (body) => !body?.transcript?.some((entry) => entry.clientRequestId === rejectedRequestId)
     );
     assert(rejectedEchoDetail.body?.transcript?.some((entry) => entry.clientRequestId === survivingRequestId));
+    assert.strictEqual(rejectedEchoDetail.body?.runtime?.queuedCommandId, null);
+    assert.strictEqual(rejectedEchoDetail.body?.runtime?.pendingClientRequestId, null);
+    assert.strictEqual(rejectedEchoDetail.body?.runtime?.queuedInputAt, null);
+    assert.strictEqual(rejectedEchoDetail.body?.runtime?.pendingInputSummary, null);
     await fakeHost.postEvent({
       type: 'session.transcript',
       hostId: HOST_ID,
@@ -5596,6 +5960,205 @@ async function main() {
     );
     assert.strictEqual(afterLateRejectedEvents.body?.runtime?.runtimeRevision, 20);
     assert.strictEqual(afterLateRejectedEvents.body?.runtime?.phase, 'idle');
+
+    const optimisticMirrorText = 'one Relay optimistic echo and one native history echo';
+    await fakeHost.postEvent({
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      speaker: 'user',
+      clientRequestId: 'optimistic-mirror-request',
+      text: optimisticMirrorText,
+      timestamp: '2099-01-01T00:00:00.000Z',
+    });
+    await fakeHost.postEvent({
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      source: 'codex-jsonl',
+      speaker: 'user',
+      text: optimisticMirrorText,
+      timestamp: '2099-01-01T00:00:13.000Z',
+    });
+    const optimisticMirrorDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${rejectedEchoSessionId}/detail?hostId=${HOST_ID}`
+    );
+    const optimisticMirrorEntries = optimisticMirrorDetail.body?.transcript?.filter((entry) => (
+      entry.text === optimisticMirrorText
+    )) || [];
+    assert.strictEqual(
+      optimisticMirrorEntries.length,
+      1,
+      'a nearby unidentified native echo must merge into the identified Relay optimistic echo'
+    );
+    assert.strictEqual(optimisticMirrorEntries[0].clientRequestId, 'optimistic-mirror-request');
+
+    const failedReplacementSessionId = 'failed-replacement-restores-live-parent';
+    const failedReplacementParent = await requestJson(
+      port,
+      'POST',
+      `/api/hosts/${HOST_ID}/sessions/start`,
+      {
+        sessionId: failedReplacementSessionId,
+        cwd: ROOT,
+        label: 'Failed replacement restores live parent',
+        apiConfig: PROFILE_A,
+      }
+    );
+    assert.strictEqual(
+      failedReplacementParent.statusCode,
+      200,
+      JSON.stringify(failedReplacementParent.body)
+    );
+    const failedReplacementParentRuntime = await waitForRuntime(
+      port,
+      (body) => body?.runId === failedReplacementParent.body?.runId && body?.runStatus === 'live',
+      5000,
+      failedReplacementSessionId
+    );
+    fakeHost.holdNextStart = true;
+    fakeHost.holdNextStop = true;
+    const failedReplacement = await requestJson(
+      port,
+      'POST',
+      `/api/sessions/${failedReplacementSessionId}/rebind`,
+      {
+        hostId: HOST_ID,
+        apiConfig: PROFILE_B,
+        model: MODEL_B,
+        expectedRunId: failedReplacementParentRuntime.body?.runId,
+        expectedRunStatus: failedReplacementParentRuntime.body?.runStatus,
+        expectedBindingFingerprint:
+          failedReplacementParentRuntime.body?.sessionBinding?.bindingFingerprint,
+      }
+    );
+    assert.strictEqual(failedReplacement.statusCode, 200, JSON.stringify(failedReplacement.body));
+    assert.notStrictEqual(failedReplacement.body?.runId, failedReplacementParent.body?.runId);
+    const failedReplacementStartCommand = await waitForHeldStart(
+      fakeHost,
+      failedReplacement.body?.runId
+    );
+    assert.strictEqual(failedReplacementStartCommand.launchMode, 'fresh_rebind');
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: failedReplacementSessionId,
+      runId: failedReplacement.body?.runId,
+      patch: {
+        runtimeRevision: 81,
+        connection: 'connecting',
+        phase: 'initializing',
+        busy: true,
+        activeTurnId: 'failed-replacement-child-start',
+        currentTurnStatus: 'inProgress',
+        queuedCommandId: failedReplacementStartCommand.id,
+        pendingClientRequestId: 'failed-replacement-child-request',
+        pendingInputSummary: 'stale failed replacement startup',
+      },
+    });
+    await fakeHost.postEvent({
+      type: 'session.command_failed',
+      hostId: HOST_ID,
+      sessionId: failedReplacementSessionId,
+      runId: failedReplacement.body?.runId,
+      operation: 'start',
+      code: 'session_replacement_spawn_failed',
+      error: 'fake session_replacement_spawn_failed',
+      canRebind: true,
+    });
+    fakeHost.heldStarts.delete(failedReplacement.body?.runId);
+    const failedReplacementDetail = await waitForSessionDetail(
+      port,
+      failedReplacementSessionId,
+      (body) => body?.session?.runId === failedReplacementParent.body?.runId
+        && body?.session?.resumeError?.code === 'session_replacement_spawn_failed'
+    );
+    assert.strictEqual(
+      failedReplacementDetail.body?.session?.state,
+      'ending',
+      'the failed child must restore the parent Stop projection'
+    );
+    assert.strictEqual(failedReplacementDetail.body?.session?.live, true);
+    assert.strictEqual(
+      failedReplacementDetail.body?.session?.apiBinding?.profileId,
+      PROFILE_A.profileId,
+      'the failed child binding must not remain projected over the live parent'
+    );
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.runId, failedReplacementParent.body?.runId);
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.connection, 'closing');
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.phase, 'ending');
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.busy, false);
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.activeTurnId, null);
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.queuedCommandId, null);
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.pendingClientRequestId, null);
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.pendingInputSummary, null);
+    assert.strictEqual(failedReplacementDetail.body?.runtime?.runtimeRevision, null);
+    const failedReplacementRuntime = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${failedReplacementSessionId}/runtime-config?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(failedReplacementRuntime.statusCode, 200, JSON.stringify(failedReplacementRuntime.body));
+    assert.strictEqual(failedReplacementRuntime.body?.activeRunId, failedReplacementParent.body?.runId);
+    assert.strictEqual(failedReplacementRuntime.body?.runId, failedReplacementParent.body?.runId);
+    assert.strictEqual(failedReplacementRuntime.body?.runStatus, 'live');
+    assert.strictEqual(failedReplacementRuntime.body?.pendingRun, null);
+
+    const heldReplacementParentStop = [...fakeHost.commands].reverse().find((command) => (
+      command.type === 'session.stop'
+      && command.runId === failedReplacementParent.body?.runId
+      && command.requestedSessionId === failedReplacementSessionId
+    ));
+    assert(heldReplacementParentStop, 'Rebind must have queued the live parent Stop before child Start');
+    await fakeHost.postEvent({
+      type: 'session.command_failed',
+      hostId: HOST_ID,
+      sessionId: failedReplacementSessionId,
+      runId: failedReplacementParent.body?.runId,
+      operation: 'stop',
+      code: 'session_stop_incomplete',
+      error: 'fake parent Stop remained unconfirmed after child Start failed',
+    });
+    const failedReplacementStopDetail = await waitForSessionDetail(
+      port,
+      failedReplacementSessionId,
+      (body) => body?.session?.state === 'stop-failed'
+    );
+    assert.strictEqual(failedReplacementStopDetail.body?.session?.live, true);
+    assert.strictEqual(
+      failedReplacementStopDetail.body?.session?.runId,
+      failedReplacementParent.body?.runId
+    );
+    assert.strictEqual(failedReplacementStopDetail.body?.runtime?.phase, 'stop-failed');
+    assert.strictEqual(failedReplacementStopDetail.body?.runtime?.busy, false);
+
+    const cleanupFailedReplacement = await requestJson(
+      port,
+      'POST',
+      `/api/sessions/${failedReplacementSessionId}/stop`,
+      {
+        hostId: HOST_ID,
+        expectedRunId: failedReplacementRuntime.body?.runId,
+        expectedRunStatus: failedReplacementRuntime.body?.runStatus,
+        expectedBindingFingerprint:
+          failedReplacementRuntime.body?.sessionBinding?.bindingFingerprint,
+      }
+    );
+    assert.strictEqual(
+      cleanupFailedReplacement.statusCode,
+      200,
+      JSON.stringify(cleanupFailedReplacement.body)
+    );
+    await waitForRuntime(
+      port,
+      (body) => body?.runId === failedReplacementParent.body?.runId && body?.runStatus === 'stopped',
+      5000,
+      failedReplacementSessionId
+    );
 
     const generatedIdSession = await requestJson(
       port,

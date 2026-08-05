@@ -394,6 +394,54 @@ async function main() {
     );
     assert.strictEqual(transitionalEntries[0].assistantMessageId, identifiedTransition.assistantMessageId);
 
+    const fallbackMirrorText = 'one fallback JSONL answer mirrored thirteen milliseconds later';
+    const fallbackMirrorDigest = 'a'.repeat(64);
+    const fallbackMirrorA = {
+      ...observation('assistant-fallback-mirror-a', '2099-01-01T00:01:30.000Z', fallbackMirrorText),
+      sourceIdentity: {
+        nativeThreadId: 'native-1',
+        streamId: 'rollout:native-1:test.jsonl',
+        protocolTurnId: '',
+        protocolItemId: '',
+        contentPartId: '',
+        sourceOffset: 100,
+        sourceOrdinal: null,
+        role: 'assistant',
+        sourceTimestamp: '2099-01-01T00:01:30.000Z',
+        finalContentDigest: fallbackMirrorDigest,
+      },
+    };
+    const fallbackMirrorB = {
+      ...observation('assistant-fallback-mirror-b', '2099-01-01T00:01:30.013Z', fallbackMirrorText),
+      sourceIdentity: {
+        ...fallbackMirrorA.sourceIdentity,
+        sourceOffset: 200,
+        sourceOrdinal: 2,
+        sourceTimestamp: '2099-01-01T00:01:30.013Z',
+      },
+    };
+    await postEvents(port, [fallbackMirrorA, fallbackMirrorB].map((item) => ({
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: 'native-1',
+      nativeThreadId: 'native-1',
+      source: 'codex-jsonl',
+      speaker: 'assistant',
+      text: fallbackMirrorText,
+      timestamp: item.assistantAt,
+      assistantObservation: item,
+    })), 'fallback-jsonl-mirror');
+    updatedDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/native-1/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      updatedDetail.body.transcript.filter((entry) => entry.text === fallbackMirrorText).length,
+      1,
+      'nearby fallback JSONL mirrors with the same finalized content must render once'
+    );
+
     const repeatedText = 'two legitimate messages may have exactly the same text';
     const repeatedA = observation('assistant-repeat-a', '2099-01-01T00:02:00.000Z', repeatedText);
     const repeatedB = observation('assistant-repeat-b', '2099-01-01T00:02:01.000Z', repeatedText);

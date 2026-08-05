@@ -175,9 +175,38 @@ async function testInterruptedReplacementRecovery() {
   await recovered.close();
 }
 
+async function testCommitUsesRecordLevelCopyOnWrite() {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-record-cow-'));
+  const defaultStore = new SessionRecordStore({ rootDir });
+  assert.strictEqual(defaultStore.snapshotEvery, 250, 'large Stores should not rewrite a full snapshot every 25 mutations');
+
+  const store = await SessionRecordStore.open({ rootDir, snapshotEvery: 1000 });
+  await store.transact('test.cow.seed', (tx) => {
+    for (const sessionId of ['session-a', 'session-b']) {
+      const key = tx.resolveCanonicalKey({ hostId: 'host-cow', sessionId });
+      const record = tx.ensureRecord(key, { hostId: 'host-cow', conversationKey: sessionId });
+      record.title = sessionId;
+      tx.markDirty(key);
+    }
+  });
+  const untouchedRecord = store.projection.records['host-cow::session-a'];
+  await store.transact('test.cow.update', (tx) => {
+    const record = tx.getRecord('host-cow::session-b');
+    record.title = 'updated';
+    tx.markDirty('host-cow::session-b');
+  });
+  assert.strictEqual(
+    store.projection.records['host-cow::session-a'],
+    untouchedRecord,
+    'an unrelated commit must preserve immutable record objects instead of cloning the complete Store'
+  );
+  await store.close();
+}
+
 async function main() {
   await testEqualRevisionSnapshotForkFailsClosed();
   await testInterruptedReplacementRecovery();
+  await testCommitUsesRecordLevelCopyOnWrite();
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-record-store-'));
   const legacyMetadataPath = path.join(rootDir, 'legacy-session-metadata.json');
   fs.writeFileSync(legacyMetadataPath, JSON.stringify({

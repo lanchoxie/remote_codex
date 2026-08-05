@@ -183,6 +183,11 @@ assertContains(
 );
 assertContains(
   app,
+  "payload.session?.runtime, { source: 'stream', allowStale: true }",
+  'stream reset must authoritatively replace stale browser runtime state'
+);
+assertContains(
+  app,
   "reason === 'cursor_expired'",
   'a released event ring should recover missed selected-session detail'
 );
@@ -190,6 +195,16 @@ assertContains(
   app,
   "reason === 'cursor_missing'",
   'a first EventSource connection must recover events emitted before subscription became active'
+);
+assertContains(
+  app,
+  'function sessionStreamResetNeedsDetailRecovery(session)',
+  'stream reset detail recovery should distinguish live sessions from loaded history sessions'
+);
+assertContains(
+  app,
+  'sessionStreamResetNeedsDetailRecovery(session)',
+  'loaded history sessions should not repeat live detail recovery after every cursor reset'
 );
 assertContains(
   app,
@@ -315,6 +330,34 @@ assertContains(
   app,
   'withStreamRecoveryTimeout',
   'hung detail and activity requests should not block all later reset recovery'
+);
+assertContains(
+  app,
+  'sessionDetailRequests: new Map()',
+  'initial detail and stream-reset recovery should share one in-flight Session detail request'
+);
+assertContains(
+  app,
+  'fetchSharedSessionDetail(session, detailParams, {',
+  'showSession should coalesce equivalent full-detail requests'
+);
+const sharedDetailStart = app.indexOf('function fetchSharedSessionDetail(');
+const sharedDetailEnd = app.indexOf('\nfunction authAllowsRequests', sharedDetailStart);
+assert(sharedDetailStart >= 0 && sharedDetailEnd > sharedDetailStart, 'shared Session detail helper is missing');
+const sharedDetailSource = app.slice(sharedDetailStart, sharedDetailEnd);
+assertContains(
+  sharedDetailSource,
+  'state.sessionDetailRequests.get(requestKey)',
+  'equivalent Session detail callers should reuse the active request'
+);
+assertContains(
+  sharedDetailSource,
+  'waitForSharedRequestWithSignal(request, options.signal)',
+  'a recovery timeout should cancel only its wait on the shared request'
+);
+assert(
+  !sharedDetailSource.includes('fetchJson(\n      `/api/sessions/${encodeURIComponent(session.sessionId)}/detail?${query}`,\n      { signal:'),
+  'the recovery AbortSignal must not abort the shared underlying detail request'
 );
 assertContains(
   app,

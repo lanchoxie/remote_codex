@@ -23,11 +23,31 @@ function discoverCodexSessions(options = {}) {
   const metaReadLimit = Math.max(0, Number(
     Object.prototype.hasOwnProperty.call(options, 'metaReadLimit') ? options.metaReadLimit : 250
   ) || 0);
+  const cache = options.cache && typeof options.cache === 'object' ? options.cache : null;
+  const fileCache = cache?.files instanceof Map ? cache.files : null;
+  const cacheStats = options.cacheStats && typeof options.cacheStats === 'object'
+    ? options.cacheStats
+    : {};
+  cacheStats.parsedFiles = 0;
+  cacheStats.reusedFiles = 0;
+  cacheStats.removedFiles = 0;
   const discovered = new Map();
   const internalSessionIds = new Set();
 
   const indexPath = path.join(codexHome, 'session_index.jsonl');
-  for (const row of readJsonLines(indexPath, 5000)) {
+  const indexStats = safeStat(indexPath);
+  const indexSignature = fileStatSignature(indexStats, 'session-index');
+  let indexRows = null;
+  if (cache && cache.indexSignature === indexSignature && Array.isArray(cache.indexRows)) {
+    indexRows = cache.indexRows;
+  } else {
+    indexRows = readJsonLines(indexPath, 5000);
+    if (cache) {
+      cache.indexSignature = indexSignature;
+      cache.indexRows = indexRows;
+    }
+  }
+  for (const row of indexRows) {
     if (!row || !row.id) {
       continue;
     }
@@ -50,63 +70,111 @@ function discoverCodexSessions(options = {}) {
   }
 
   const sessionsRoot = path.join(codexHome, 'sessions');
+  const seenFiles = new Set();
   walkFiles(sessionsRoot, (filePath) => {
     if (!filePath.endsWith('.jsonl')) {
       return;
     }
-
-    const rows = metaReadLimit > 0 ? readJsonLines(filePath, metaReadLimit) : [];
-    const meta = getSessionMeta(filePath, rows);
-    if (!meta || !meta.id) {
-      return;
-    }
-    if (isInternalApprovalReviewSession(meta)) {
-      internalSessionIds.add(meta.id);
-      discovered.delete(meta.id);
-      return;
-    }
-    if (internalSessionIds.has(meta.id)) {
-      return;
-    }
-
-    const preview = includePreview ? extractSessionPreview(filePath) : emptySessionPreview();
     const stats = safeStat(filePath);
-    const existing = discovered.get(meta.id) || {};
-    const lineage = subagentMetadata(meta);
-    discovered.set(meta.id, {
+    const normalizedPath = normalizedDiscoveryPath(filePath);
+    const signature = fileStatSignature(
+      stats,
+      `${includePreview ? 'preview' : 'metadata'}:${metaReadLimit}`
+    );
+    seenFiles.add(normalizedPath);
+    const cached = fileCache?.get(normalizedPath) || null;
+    const cacheHit = cached?.signature === signature;
+    let fileRecord = cacheHit ? cached.record : null;
+    if (cacheHit) {
+      cacheStats.reusedFiles += 1;
+    } else {
+      const rows = metaReadLimit > 0 ? readJsonLines(filePath, metaReadLimit) : [];
+      const meta = getSessionMeta(filePath, rows);
+      if (!meta || !meta.id) {
+        fileCache?.set(normalizedPath, { signature, record: null });
+        cacheStats.parsedFiles += 1;
+        return;
+      }
+      if (isInternalApprovalReviewSession(meta)) {
+        fileRecord = { internal: true, sessionId: meta.id };
+      } else {
+        const preview = includePreview ? extractSessionPreview(filePath) : emptySessionPreview();
+        const lineage = subagentMetadata(meta);
+        fileRecord = {
+          internal: false,
+          sessionId: meta.id,
+          nativeThreadId: meta.id,
+          title: meta.thread_name || meta.id,
+          cwd: meta.cwd || preview.cwd || null,
+          createdAt: earliestTimestamp(
+            meta.timestamp,
+            preview.firstTimestamp,
+            parseTimestampFromFilePath(filePath)
+          ),
+          updatedAt: latestTimestamp(
+            preview.lastTimestamp,
+            stats?.mtime?.toISOString(),
+            meta.timestamp
+          ),
+          messageCount: preview.messageCount || 0,
+          source: lineage ? 'subagent' : (meta.source || 'rollout'),
+          ...(lineage || {}),
+          subagent: Boolean(lineage),
+          readOnly: Boolean(lineage),
+          originator: meta.originator || null,
+          cliVersion: meta.cli_version || null,
+          imported: true,
+          live: false,
+          summary: pick(meta, ['cwd', 'timestamp', 'originator', 'cli_version', 'source']),
+          latestUserMessage: preview.latestUserMessage || null,
+          latestAgentMessage: preview.latestAgentMessage || null,
+          transcriptPreview: preview.transcriptPreview || [],
+          rolloutPath: filePath,
+        };
+      }
+      fileCache?.set(normalizedPath, { signature, record: fileRecord });
+      cacheStats.parsedFiles += 1;
+    }
+    if (!fileRecord) {
+      return;
+    }
+    if (fileRecord.internal) {
+      internalSessionIds.add(fileRecord.sessionId);
+      discovered.delete(fileRecord.sessionId);
+      return;
+    }
+    if (internalSessionIds.has(fileRecord.sessionId)) {
+      return;
+    }
+
+    const existing = discovered.get(fileRecord.sessionId) || {};
+    discovered.set(fileRecord.sessionId, {
       ...existing,
-      sessionId: meta.id,
-      nativeThreadId: existing.nativeThreadId || meta.id,
-      title: existing.title || meta.thread_name || meta.id,
-      cwd: meta.cwd || existing.cwd || preview.cwd || null,
-      createdAt: earliestTimestamp(
-        existing.createdAt,
-        meta.timestamp,
-        preview.firstTimestamp,
-        parseTimestampFromFilePath(filePath)
-      ),
-      updatedAt: latestTimestamp(
-        preview.lastTimestamp,
-        stats?.mtime?.toISOString(),
-        existing.updatedAt,
-        meta.timestamp
-      ),
-      messageCount: Math.max(Number(existing.messageCount || 0), preview.messageCount || 0),
-      source: lineage ? 'subagent' : (meta.source || existing.source || 'rollout'),
-      ...(lineage || {}),
-      subagent: Boolean(lineage),
-      readOnly: Boolean(lineage),
-      originator: meta.originator || existing.originator || null,
-      cliVersion: meta.cli_version || existing.cliVersion || null,
-      imported: true,
+      ...fileRecord,
+      nativeThreadId: existing.nativeThreadId || fileRecord.nativeThreadId,
+      title: existing.title || fileRecord.title,
+      cwd: fileRecord.cwd || existing.cwd || null,
+      createdAt: earliestTimestamp(existing.createdAt, fileRecord.createdAt),
+      updatedAt: latestTimestamp(fileRecord.updatedAt, existing.updatedAt),
+      messageCount: Math.max(Number(existing.messageCount || 0), Number(fileRecord.messageCount || 0)),
+      source: fileRecord.source || existing.source || 'rollout',
+      originator: fileRecord.originator || existing.originator || null,
+      cliVersion: fileRecord.cliVersion || existing.cliVersion || null,
       live: existing.live || false,
-      summary: pick(meta, ['cwd', 'timestamp', 'originator', 'cli_version', 'source']),
-      latestUserMessage: preview.latestUserMessage || existing.latestUserMessage || null,
-      latestAgentMessage: preview.latestAgentMessage || existing.latestAgentMessage || null,
-      transcriptPreview: preview.transcriptPreview || existing.transcriptPreview || [],
-      rolloutPath: filePath,
+      latestUserMessage: fileRecord.latestUserMessage || existing.latestUserMessage || null,
+      latestAgentMessage: fileRecord.latestAgentMessage || existing.latestAgentMessage || null,
+      transcriptPreview: fileRecord.transcriptPreview || existing.transcriptPreview || [],
     });
   });
+
+  if (fileCache) {
+    for (const filePath of Array.from(fileCache.keys())) {
+      if (!seenFiles.has(filePath)) {
+        fileCache.delete(filePath);
+        cacheStats.removedFiles += 1;
+      }
+    }
+  }
 
   return Array.from(discovered.values())
     .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
@@ -115,6 +183,152 @@ function discoverCodexSessions(options = {}) {
       nativeThreadId: session.nativeThreadId || session.sessionId,
       cwdLabel: session.cwd ? path.basename(session.cwd) || session.cwd : '(unknown)',
     }));
+}
+
+function normalizedDiscoveryPath(filePath) {
+  const resolved = path.resolve(String(filePath || ''));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function fileStatSignature(stats, variant = '') {
+  if (!stats) {
+    return `missing:${variant}`;
+  }
+  return [
+    Number(stats.size || 0),
+    Number(stats.mtimeMs || 0),
+    Number(stats.birthtimeMs || 0),
+    variant,
+  ].join(':');
+}
+
+function discoverySessionFingerprint(session = {}) {
+  const preview = Array.isArray(session.transcriptPreview) ? session.transcriptPreview : [];
+  const lastPreview = preview[preview.length - 1] || null;
+  return JSON.stringify([
+    session.sessionId,
+    session.nativeThreadId,
+    session.title,
+    session.cwd,
+    session.createdAt,
+    session.updatedAt,
+    session.messageCount,
+    session.source,
+    session.subagent === true,
+    session.readOnly === true,
+    session.threadSource,
+    session.parentThreadId,
+    session.forkedFromId,
+    session.agentPath,
+    session.agentNickname,
+    session.agentRole,
+    session.multiAgentVersion,
+    session.rolloutPath,
+    session.latestUserMessage,
+    session.latestAgentMessage,
+    preview.length,
+    lastPreview?.assistantMessageId || null,
+    lastPreview?.clientRequestId || null,
+    lastPreview?.timestamp || null,
+    lastPreview?.text || null,
+  ]);
+}
+
+class CodexSessionDiscoveryIndex {
+  constructor(options = {}) {
+    this.options = {
+      codexHome: options.codexHome || getDefaultCodexHome(),
+      preview: options.preview !== false,
+      metaReadLimit: Object.prototype.hasOwnProperty.call(options, 'metaReadLimit')
+        ? options.metaReadLimit
+        : 250,
+    };
+    this.cache = { files: new Map(), indexSignature: null, indexRows: null };
+    this.sessions = [];
+    this.sessionsByIdentity = new Map();
+    this.fingerprints = new Map();
+    this.pendingChanges = new Map();
+    this.pendingRemovals = new Map();
+    this.initialized = false;
+  }
+
+  scan(options = {}) {
+    const cacheStats = {};
+    const initial = !this.initialized;
+    const sessions = discoverCodexSessions({
+      ...this.options,
+      ...options,
+      cache: this.cache,
+      cacheStats,
+    });
+    const nextFingerprints = new Map();
+    const nextByIdentity = new Map();
+    for (const session of sessions) {
+      const sessionId = String(session.sessionId || '').trim();
+      if (!sessionId) continue;
+      const fingerprint = discoverySessionFingerprint(session);
+      nextFingerprints.set(sessionId, fingerprint);
+      if (initial || this.fingerprints.get(sessionId) !== fingerprint) {
+        this.pendingChanges.set(sessionId, fingerprint);
+      }
+      this.pendingRemovals.delete(sessionId);
+      for (const value of [session.sessionId, session.nativeThreadId]) {
+        const identity = String(value || '').trim();
+        if (identity) nextByIdentity.set(identity, session);
+      }
+    }
+    for (const sessionId of this.fingerprints.keys()) {
+      if (!nextFingerprints.has(sessionId)) {
+        this.pendingChanges.delete(sessionId);
+        this.pendingRemovals.set(sessionId, this.fingerprints.get(sessionId));
+      }
+    }
+
+    this.sessions = sessions;
+    this.sessionsByIdentity = nextByIdentity;
+    this.fingerprints = nextFingerprints;
+    this.initialized = true;
+
+    const changedSessions = sessions.filter((session) => (
+      this.pendingChanges.has(String(session.sessionId || '').trim())
+    ));
+    const removedSessionIds = Array.from(this.pendingRemovals.keys()).sort();
+    return {
+      initial,
+      sessions,
+      changedSessions,
+      removedSessionIds,
+      cacheStats,
+      changeTokens: new Map(changedSessions.map((session) => {
+        const sessionId = String(session.sessionId || '').trim();
+        return [sessionId, this.pendingChanges.get(sessionId)];
+      })),
+      removalTokens: new Map(this.pendingRemovals),
+    };
+  }
+
+  acknowledge(result = {}) {
+    for (const [sessionId, token] of result.changeTokens || []) {
+      if (this.pendingChanges.get(sessionId) === token) {
+        this.pendingChanges.delete(sessionId);
+      }
+    }
+    for (const [sessionId, token] of result.removalTokens || []) {
+      if (this.pendingRemovals.get(sessionId) === token) {
+        this.pendingRemovals.delete(sessionId);
+      }
+    }
+  }
+
+  find(candidates = []) {
+    for (const value of Array.isArray(candidates) ? candidates : [candidates]) {
+      const identity = String(value || '').trim();
+      if (identity && this.sessionsByIdentity.has(identity)) {
+        return this.sessionsByIdentity.get(identity);
+      }
+    }
+    return null;
+  }
 }
 
 function emptySessionPreview() {
@@ -372,6 +586,9 @@ function isInternalApprovalReviewSession(input) {
 
 function subagentMetadata(input = {}) {
   const source = input && typeof input.source === 'object' ? input.source : null;
+  const sourceName = typeof input?.source === 'string'
+    ? input.source.trim().toLowerCase()
+    : '';
   const subagent = source && typeof source.subagent === 'object' ? source.subagent : null;
   const threadSpawn = subagent && typeof subagent.thread_spawn === 'object'
     ? subagent.thread_spawn
@@ -385,9 +602,11 @@ function subagentMetadata(input = {}) {
       || ''
   ).trim() || null;
   const forkedFromId = String(input.forked_from_id || input.forkedFromId || '').trim() || null;
+  // A fork records lineage, not an instruction to hide the resulting Session.
+  // Only an explicit subagent marker makes a rollout read-only.
   const isSubagent = threadSource === 'subagent'
-    || Boolean(parentThreadId)
-    || Boolean(forkedFromId)
+    || sourceName === 'subagent'
+    || input.subagent === true
     || Boolean(threadSpawn)
     || Boolean(subagent && Object.keys(subagent).length);
   if (!isSubagent) {
@@ -1209,6 +1428,9 @@ function isInternalTranscriptText(value) {
   if (/^<environment_context>[\s\S]*<\/environment_context>$/i.test(text)) {
     return true;
   }
+  if (/^# AGENTS\.md instructions for [^\r\n]+\s*<INSTRUCTIONS>(?:[\s\S]*)$/i.test(text)) {
+    return true;
+  }
   if (/^The following is the Codex agent history (?:whose request action you are assessing|added since your last approval assessment)\b/i.test(text)) {
     return true;
   }
@@ -1316,6 +1538,7 @@ function walkFiles(rootDir, visit) {
 }
 
 module.exports = {
+  CodexSessionDiscoveryIndex,
   discoverCodexSessions,
   extractSessionDiagnostics,
   extractSessionTranscript,

@@ -831,7 +831,11 @@ const normalized = normalizeThinkingActivityEntry({
   turnId: 'turn-normalized',
   itemId: 'item-normalized',
   text: '<em>plain text</em>',
+  startedAt: '2026-07-27T10:00:02.000Z',
+  timestamp: '2026-07-27T10:00:12.000Z',
 });
 assert.strictEqual(normalized.text, '<em>plain text</em>');
+assert.strictEqual(normalized.timestamp, '2026-07-27T10:00:02.000Z');
+assert.strictEqual(normalized.updatedAt, '2026-07-27T10:00:12.000Z');
 
 console.log('thinking entry model assertions passed');

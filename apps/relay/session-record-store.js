@@ -122,6 +122,8 @@ function defaultRecord(seed = {}) {
     conversationKey: String(seed.conversationKey || '').trim(),
     bridgeSessionId: seed.bridgeSessionId || null,
     nativeThreadId: seed.nativeThreadId || null,
+    rolloutSessionId: seed.rolloutSessionId || null,
+    rolloutSessionIds: Array.isArray(seed.rolloutSessionIds) ? [...seed.rolloutSessionIds] : [],
     originSessionId: seed.originSessionId || null,
     sourceSessionId: seed.sourceSessionId || null,
     source: seed.source || 'metadata',
@@ -410,7 +412,7 @@ class SessionRecordStore {
     this.legacyMetadataPath = options.legacyMetadataPath
       ? path.resolve(options.legacyMetadataPath)
       : null;
-    this.snapshotEvery = Math.max(1, Number(options.snapshotEvery || 25));
+    this.snapshotEvery = Math.max(1, Number(options.snapshotEvery || 250));
     this.now = options.now || (() => new Date().toISOString());
     this.currentSnapshotPath = path.join(this.rootDir, 'snapshot-current.json');
     this.previousSnapshotPath = path.join(this.rootDir, 'snapshot-previous.json');
@@ -756,7 +758,14 @@ class SessionRecordStore {
       checksum: checksum(payload),
       payload,
     };
-    const nextProjection = clone(this.projection);
+    // Records are cloned before a Transaction mutates them, so a shallow
+    // projection copy is sufficient here. Deep-cloning the complete Store on
+    // every mutation made prompt admission compete with unrelated history.
+    const nextProjection = {
+      ...this.projection,
+      records: { ...this.projection.records },
+      aliases: { ...this.projection.aliases },
+    };
     applyPayload(nextProjection, payload);
     try {
       await this.appendWal(envelope);

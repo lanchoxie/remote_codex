@@ -187,6 +187,20 @@ async function main() {
         conversationKey: SESSION_ID,
         title: 'SSE Session',
       }],
+    }, {
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: SESSION_ID,
+      runId: 'sse-runtime-run',
+      timestamp: '2099-02-01T00:00:00.000Z',
+      patch: {
+        runId: 'sse-runtime-run',
+        runtimeRevision: 7,
+        phase: 'idle',
+        busy: false,
+        activeTurnId: null,
+        currentTurnStatus: 'completed',
+      },
     }]);
 
     initial = openSse(port, `/api/sessions/${SESSION_ID}/events?hostId=${HOST_ID}`);
@@ -197,7 +211,53 @@ async function main() {
     assert.strictEqual(reset.data.reason, 'cursor_missing');
     assert.strictEqual(reset.data.canonicalConversationKey, `${HOST_ID}::${SESSION_ID}`);
     assert.strictEqual(reset.data.assistantProjection.latestAssistantSeq, 0);
+    assert.strictEqual(reset.data.session.runtime.phase, 'idle');
+    assert.strictEqual(reset.data.session.runtime.runtimeRevision, 7);
+    assert.strictEqual(reset.data.session.runtime.activeTurnId, null);
     assert.strictEqual(ready.data.canonicalConversationKey, `${HOST_ID}::${SESSION_ID}`);
+
+    await postEvents(port, [{
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: SESSION_ID,
+      runId: 'sse-runtime-run',
+      timestamp: '2099-02-01T00:00:02.000Z',
+      patch: {
+        runId: 'sse-runtime-run',
+        runtimeRevision: 8,
+        phase: 'thinking',
+        busy: true,
+        activeTurnId: 'turn-sse',
+      },
+    }]);
+    const liveRuntime = await waitForFrame(
+      initial,
+      (frame) => frame.event === 'session.runtime_updated' && frame.data.patch?.runtimeRevision === 8,
+      'missing canonical live runtime update'
+    );
+    assert.strictEqual(liveRuntime.data.patch.phase, 'thinking');
+    assert.strictEqual(initial.frames.some((frame) => frame.event === 'session.runtime'), false);
+
+    await postEvents(port, [{
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: SESSION_ID,
+      runId: 'sse-runtime-run',
+      timestamp: '2099-02-01T00:00:03.000Z',
+      patch: {
+        runId: 'sse-runtime-run',
+        runtimeRevision: 9,
+        phase: 'idle',
+        busy: false,
+        activeTurnId: null,
+        currentTurnStatus: 'completed',
+      },
+    }]);
+    await waitForFrame(
+      initial,
+      (frame) => frame.event === 'session.runtime_updated' && frame.data.patch?.runtimeRevision === 9,
+      'missing canonical terminal runtime update'
+    );
 
     const observation = assistantObservation();
     await postEvents(port, [{

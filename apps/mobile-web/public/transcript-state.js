@@ -241,8 +241,11 @@
         fileChanges: event.fileChanges == null ? null : clone(event.fileChanges),
         fileChangesTruncated: event.fileChangesTruncated === true,
         final: event.final === true,
-        timestamp: event.timestamp || event.updatedAt
-          ? String(event.timestamp || event.updatedAt)
+        startedAt: event.startedAt || event.createdAt || event.timestamp || event.updatedAt
+          ? String(event.startedAt || event.createdAt || event.timestamp || event.updatedAt)
+          : null,
+        timestamp: event.timestamp || event.updatedAt || event.startedAt || event.createdAt
+          ? String(event.timestamp || event.updatedAt || event.startedAt || event.createdAt)
           : null,
       };
       let metadataBytes = utf8Bytes(JSON.stringify(normalized));
@@ -339,6 +342,9 @@
         if (record.epoch && record.epoch !== streamEpoch) return false;
         const current = record.activities.get(normalized.activityKey);
         if (current && current.activityRevision >= normalized.activityRevision) return false;
+        if (current?.startedAt) {
+          normalized.startedAt = current.startedAt;
+        }
         record.epoch = streamEpoch;
         setActivity(record, normalized);
         touch(key, record);

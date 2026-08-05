@@ -53,6 +53,8 @@ class CodexSessionTailer {
         lastStatSize: stats.size,
         lastMtimeMs: Number(stats.mtimeMs),
         pendingAssistantMirror: null,
+        rolloutActivityOwner: null,
+        rolloutActivityTurnId: null,
         primed: true,
       });
     }
@@ -67,9 +69,10 @@ class CodexSessionTailer {
         continue;
       }
       next.set(normalized.rolloutPath, normalized);
-      if (!this.files.has(normalized.rolloutPath)) {
+      const existing = this.files.get(normalized.rolloutPath);
+      if (!existing) {
         const stats = safeStat(normalized.rolloutPath);
-        this.files.set(normalized.rolloutPath, {
+        const state = {
           session: normalized,
           offset: stats?.size || 0,
           partialBytes: Buffer.alloc(0),
@@ -80,8 +83,19 @@ class CodexSessionTailer {
           lastStatSize: stats?.size || 0,
           lastMtimeMs: stats ? Number(stats.mtimeMs) : null,
           pendingAssistantMirror: null,
+          rolloutActivityOwner: null,
+          rolloutActivityTurnId: null,
           primed: true,
-        });
+        };
+        this.files.set(normalized.rolloutPath, state);
+        this.seedWatchedActivity(state, normalized);
+      } else {
+        const wasLiveManaged = existing.session?.live === true
+          && existing.session?.transcriptOwner === 'managed-runner';
+        existing.session = { ...existing.session, ...normalized };
+        if (!wasLiveManaged && normalized.live === true && normalized.transcriptOwner === 'managed-runner') {
+          this.seedWatchedActivity(existing, normalized);
+        }
       }
     }
     this.watchedSessions = next;
@@ -92,6 +106,22 @@ class CodexSessionTailer {
       }
     }
     return this.watchedSessions.size;
+  }
+
+  seedWatchedActivity(state, session) {
+    if (session?.live !== true || session?.transcriptOwner !== 'managed-runner') return;
+    const activity = seedRolloutActivity(session.rolloutPath, session);
+    if (!activity) return;
+    state.rolloutActivityOwner = activity.owner;
+    state.rolloutActivityTurnId = activity.turnId;
+    if (activity.owner !== 'external-terminal') return;
+    const seedKey = `${activity.turnId || ''}:${activity.row?.timestamp || ''}`;
+    if (state.rolloutActivitySeedKey === seedKey) return;
+    state.rolloutActivitySeedKey = seedKey;
+    for (const event of makeCodexRowEvents(activity.row)) {
+      const payload = this.makeSessionEvent(session, event, activity.row, activity);
+      if (payload) this.pendingEvents.push(payload);
+    }
   }
 
   async poll() {
@@ -121,6 +151,8 @@ class CodexSessionTailer {
           lastStatSize: stats?.size || 0,
           lastMtimeMs: stats ? Number(stats.mtimeMs) : null,
           pendingAssistantMirror: null,
+          rolloutActivityOwner: null,
+          rolloutActivityTurnId: null,
           primed: true,
         };
         this.files.set(session.rolloutPath, state);
@@ -153,7 +185,7 @@ class CodexSessionTailer {
         && Number(stats.mtimeMs) !== Number(state.lastMtimeMs)
       );
       const fileEvents = [];
-      const appendRowEvents = (row, events) => {
+      const appendRowEvents = (row, events, ownership = null) => {
         for (const event of events || []) {
           if (event.type === 'session.transcript' && event.entry?.assistantObservation) {
             this.assistantCursorIndex?.recordObservation(
@@ -161,7 +193,7 @@ class CodexSessionTailer {
               event.entry.assistantObservation
             );
           }
-          const payload = this.makeSessionEvent(session, event, row);
+          const payload = this.makeSessionEvent(session, event, row, ownership);
           if (!payload) continue;
           fileEvents.push(payload);
           emittedEvents += 1;
@@ -171,7 +203,7 @@ class CodexSessionTailer {
         const pending = state.pendingAssistantMirror;
         if (!pending) return false;
         state.pendingAssistantMirror = null;
-        appendRowEvents(pending.row, pending.events);
+        appendRowEvents(pending.row, pending.events, pending.ownership);
         return true;
       };
       if (identityChanged || sameSizeRewrite || fileTruncated) {
@@ -215,6 +247,7 @@ class CodexSessionTailer {
             flushPendingAssistantMirror();
           }
         }
+        const ownership = observeRolloutRowOwnership(state, session, row);
         const events = makeCodexRowEvents(row, {
           nativeThreadId: session.nativeThreadId || session.sessionId,
           rolloutPath: session.rolloutPath,
@@ -226,11 +259,14 @@ class CodexSessionTailer {
           state.pendingAssistantMirror = {
             row,
             events,
+            ownership,
             queuedAtMs: this.nowMs(),
           };
+          finishRolloutRowOwnership(state, ownership);
           continue;
         }
-        appendRowEvents(row, events);
+        appendRowEvents(row, events, ownership);
+        finishRolloutRowOwnership(state, ownership);
       }
       state.offset = readResult.nextOffset;
       state.lastStatSize = stats.size;
@@ -289,19 +325,56 @@ class CodexSessionTailer {
     return sessions;
   }
 
-  makeSessionEvent(session, event, row) {
+  makeSessionEvent(session, event, row, ownership = null) {
     const base = {
       hostId: this.hostId,
       sessionId: session.sessionId,
       nativeThreadId: session.nativeThreadId || session.sessionId,
       source: 'codex-jsonl',
+      ...(session.runId ? { runId: session.runId } : {}),
       rolloutPath: session.rolloutPath,
       timestamp: row.timestamp || new Date().toISOString(),
     };
 
+    const externalTerminalActivity = ownership?.owner === 'external-terminal';
+    if (session.live === true && event.type === 'session.runtime_updated') {
+      if (!externalTerminalActivity) {
+        return null;
+      }
+      const phase = String(event.patch?.phase || '').trim() || null;
+      const hasActivitySignal = Object.prototype.hasOwnProperty.call(event.patch || {}, 'busy')
+        || Object.prototype.hasOwnProperty.call(event.patch || {}, 'activeTurnId')
+        || ['thinking', 'planning', 'reviewing', 'waiting-approval', 'waiting-user-input', 'interrupting', 'retrying', 'reconnecting', 'running-shell-command', 'compacting', 'idle', 'interrupted', 'error', 'closed', 'completed']
+          .includes(String(phase || '').toLowerCase());
+      if (!hasActivitySignal) {
+        return null;
+      }
+      const active = event.patch?.busy !== false
+        && !['idle', 'interrupted', 'error', 'closed', 'completed'].includes(String(phase || '').toLowerCase());
+      return {
+        ...base,
+        type: 'session.runtime_updated',
+        patch: {
+          externalActivity: {
+            owner: 'external-terminal',
+            active,
+            turnId: ownership.turnId || event.patch?.activeTurnId || null,
+            phase,
+            status: event.patch?.currentTurnStatus || (active ? 'inProgress' : 'completed'),
+            updatedAt: base.timestamp,
+          },
+        },
+      };
+    }
+
+    if (session.live === true && event.type === 'session.diagnostic' && !externalTerminalActivity) {
+      return null;
+    }
+
     if (
-      session.live === true
-      && (event.type === 'session.runtime_updated' || event.type === 'session.diagnostic')
+      event.type === 'session.transcript'
+      && session.transcriptOwner === 'managed-runner'
+      && !externalTerminalActivity
     ) {
       return null;
     }
@@ -323,10 +396,18 @@ class CodexSessionTailer {
     }
 
     if (event.type === 'session.diagnostic') {
+      const entry = event.entry || {};
       return {
         ...base,
         type: 'session.diagnostic',
-        ...(event.entry || {}),
+        ...entry,
+        ...(externalTerminalActivity ? {
+          activityOwner: 'external-terminal',
+          data: {
+            ...(entry.data && typeof entry.data === 'object' && !Array.isArray(entry.data) ? entry.data : {}),
+            activityOwner: 'external-terminal',
+          },
+        } : {}),
       };
     }
     return null;
@@ -401,7 +482,98 @@ function normalizeTailSession(session) {
     sessionId,
     nativeThreadId: session.nativeThreadId || sessionId,
     rolloutPath: session.rolloutPath,
+    transcriptOwner: String(session.transcriptOwner || '').trim() || null,
   };
+}
+
+function rolloutRowLifecycle(row) {
+  const payload = row?.payload && typeof row.payload === 'object' ? row.payload : {};
+  const type = row?.type === 'event_msg' ? String(payload.type || '').trim() : '';
+  return {
+    turnId: String(payload.turn_id || payload.turnId || '').trim() || null,
+    started: type === 'task_started',
+    terminal: type === 'task_complete' || type === 'turn_aborted',
+  };
+}
+
+function seedRolloutActivity(filePath, session, maxBytes = DEFAULT_MAX_BYTES_PER_POLL) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  const stats = safeStat(filePath);
+  if (!stats || stats.size <= 0) return null;
+  const length = Math.min(Number(maxBytes) || DEFAULT_MAX_BYTES_PER_POLL, stats.size);
+  const fd = fs.openSync(filePath, 'r');
+  let text = '';
+  try {
+    const buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, stats.size - length);
+    text = buffer.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+  const lines = text.split(/\r?\n/);
+  if (stats.size > length) lines.shift();
+  let active = null;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch (_) { continue; }
+    const lifecycle = rolloutRowLifecycle(row);
+    if (lifecycle.started) active = { row, turnId: lifecycle.turnId };
+    else if (lifecycle.terminal && (!lifecycle.turnId || !active?.turnId || lifecycle.turnId === active.turnId)) active = null;
+  }
+  if (!active?.turnId) return null;
+  return {
+    ...active,
+    owner: managedRunnerOwnsTurn(session, active.turnId) ? 'managed-runner' : 'external-terminal',
+  };
+}
+
+function managedRunnerOwnsTurn(session, turnId) {
+  if (!turnId || typeof session?.managedTurnOwner !== 'function') {
+    return false;
+  }
+  try {
+    return session.managedTurnOwner(turnId) === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function observeRolloutRowOwnership(state, session, row) {
+  if (session?.live !== true || session?.transcriptOwner !== 'managed-runner') {
+    return null;
+  }
+  const lifecycle = rolloutRowLifecycle(row);
+  let owner = state.rolloutActivityOwner || null;
+  let turnId = lifecycle.turnId || state.rolloutActivityTurnId || null;
+
+  if (lifecycle.started || (lifecycle.turnId && managedRunnerOwnsTurn(session, lifecycle.turnId))) {
+    owner = managedRunnerOwnsTurn(session, lifecycle.turnId)
+      ? 'managed-runner'
+      : 'external-terminal';
+    turnId = lifecycle.turnId || null;
+    state.rolloutActivityOwner = owner;
+    state.rolloutActivityTurnId = turnId;
+  } else if (!owner) {
+    // Without an explicit task_started row there is no safe evidence that a
+    // live managed rollout belongs to another terminal. Keep it managed until
+    // a turn-specific external start is observed.
+    owner = 'managed-runner';
+    state.rolloutActivityOwner = owner;
+    state.rolloutActivityTurnId = turnId;
+  }
+
+  return {
+    owner,
+    turnId,
+    terminal: lifecycle.terminal,
+  };
+}
+
+function finishRolloutRowOwnership(state, ownership) {
+  if (!ownership?.terminal) return;
+  state.rolloutActivityOwner = null;
+  state.rolloutActivityTurnId = null;
 }
 
 function readFileDelta(filePath, offset, byteLength) {
@@ -439,6 +611,8 @@ function resetTailState(state, fileIdentity) {
   state.lastStatSize = 0;
   state.lastMtimeMs = null;
   state.pendingAssistantMirror = null;
+  state.rolloutActivityOwner = null;
+  state.rolloutActivityTurnId = null;
 }
 
 function decodeCompleteLine(buffer) {

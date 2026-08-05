@@ -2173,24 +2173,6 @@ function normalizeThinkingText(value, depth = 0) {
   return String(value).trim();
 }
 
-function mergeThinkingBuffer(previous, chunk) {
-  const left = String(previous || '').trim();
-  const right = String(chunk || '').trim();
-  if (!right) {
-    return left;
-  }
-  if (!left) {
-    return right;
-  }
-  if (left === right || left.includes(right)) {
-    return left;
-  }
-  if (right.includes(left)) {
-    return right;
-  }
-  return `${left}\n${right}`.trim();
-}
-
 function persistedReasoningSummaryText(value) {
   if (typeof value === 'string') {
     return value;
@@ -2742,19 +2724,19 @@ class CodexAppServerRunner {
       this.activeTurnId = null;
       this.activeClientRequestId = null;
       this.clientRequestIdsByTurn = new Map();
+      this.subagentParentTurns = new Map();
       this.pendingInterruptIntent = null;
       this.runtimeRevision = 0;
       this.inputSubmissionInFlight = false;
       this.turnBuffers = new Map();
       this.turnAssistantTranscriptEmitted = new Set();
+      this.terminalTurnIds = new Set();
       this.pendingTurnCompletions = new Map();
       this.turnCompletionFallbackGraceMs = TURN_COMPLETION_FALLBACK_GRACE_MS;
       this.turnBufferTruncated = new Set();
       this.itemPhases = new Map();
       this.maxTurnBufferBytes = TURN_BUFFER_MAX_BYTES;
       this.turnModes = new Map();
-      this.planBuffers = new Map();
-      this.reasoningBuffers = new Map();
       this.initializeNotificationQueue();
       this.initializeThinkingActivity();
       this.pendingRequests = new Map();
@@ -4212,8 +4194,12 @@ class CodexAppServerRunner {
       if (!turnId) this.activeClientRequestId = null;
       return turnId;
     } catch (error) {
+      const failedClientRequestId = this.activeClientRequestId;
       if (error?.code !== 'session_input_acceptance_unknown') {
-        this.activeClientRequestId = null;
+        await this.settlePendingInterruptForSubmissionFailure(failedClientRequestId, error);
+        if (this.activeClientRequestId === failedClientRequestId) {
+          this.activeClientRequestId = null;
+        }
       }
       throw error;
     } finally {
@@ -4247,7 +4233,13 @@ class CodexAppServerRunner {
     if (!this.resumePreludeUsed && this.resumePrelude) {
       prompt = `${this.resumePrelude}\n\nNew user request:\n${prompt}`;
       this.resumePreludeUsed = true;
-      await this.emitOutput('[codex] continuing from imported history context', 'stderr');
+      await this.emitDiagnostic({
+        severity: 'info',
+        source: 'codex',
+        kind: 'lifecycle',
+        method: 'thread/resume-prelude',
+        message: 'Continuing from imported history context.',
+      });
     }
 
     let collaborationMode = normalizeOfficialCollaborationMode(options.collaborationMode);
@@ -4330,31 +4322,36 @@ class CodexAppServerRunner {
 
     const turnId = turn?.turn?.id || null;
     const becameNativeResumeReady = this.runtime.nativeResumeReady !== true;
-    if (turnId) {
+    const turnAlreadyTerminal = this.isTerminalTurnId(turnId);
+    let pendingInterruptApplied = false;
+    if (turnId && !turnAlreadyTerminal) {
       this.activeTurnId = turnId;
       if (this.activeClientRequestId) {
         this.clientRequestIdsByTurn.set(turnId, this.activeClientRequestId);
       }
       this.resetTurnBuffer(turnId);
       this.turnModes.set(turnId, collaborationMode?.mode || mode || 'default');
-      this.emitRuntime({
-        ...(becameNativeResumeReady ? { nativeResumeReady: true } : {}),
-        activeTurnId: turnId,
-        busy: true,
-        phase: (collaborationMode?.mode === 'plan' || mode === 'plan') ? 'planning' : 'thinking',
-        currentTurnStatus: 'inProgress',
-        lastError: null,
-        lastCodexError: null,
-        model: params.model || null,
-        effort: params.effort || null,
-        summary: params.summary || null,
-        collaborationMode: params.collaborationMode || null,
-        approvalPolicy: params.approvalPolicy || null,
-        approvalsReviewer: params.approvalsReviewer || null,
-        sandboxPolicy: params.sandboxPolicy || null,
-        reasoningSummary: null,
-        planSummary: null,
-      }).catch(() => {});
+      pendingInterruptApplied = await this.applyPendingInterruptIntent(turnId);
+      if (!pendingInterruptApplied) {
+        this.emitRuntime({
+          ...(becameNativeResumeReady ? { nativeResumeReady: true } : {}),
+          activeTurnId: turnId,
+          busy: true,
+          phase: (collaborationMode?.mode === 'plan' || mode === 'plan') ? 'planning' : 'thinking',
+          currentTurnStatus: 'inProgress',
+          lastError: null,
+          lastCodexError: null,
+          model: params.model || null,
+          effort: params.effort || null,
+          summary: params.summary || null,
+          collaborationMode: params.collaborationMode || null,
+          approvalPolicy: params.approvalPolicy || null,
+          approvalsReviewer: params.approvalsReviewer || null,
+          sandboxPolicy: params.sandboxPolicy || null,
+          reasoningSummary: null,
+          planSummary: null,
+        }).catch(() => {});
+      }
     } else if (becameNativeResumeReady) {
       this.emitRuntime({ nativeResumeReady: true }).catch(() => {});
     }
@@ -4685,6 +4682,13 @@ class CodexAppServerRunner {
     const finishStop = () => {
       throwTerminalErrors(terminalErrors, 'Codex runner stop did not complete cleanly.');
     };
+    try {
+      const stoppingTurnId = String(this.activeTurnId || '').trim();
+      if (stoppingTurnId) this.rememberTerminalTurnId(stoppingTurnId);
+      await this.resolvePendingInterruptForTerminalTurn(stoppingTurnId, 'stopped');
+    } catch (error) {
+      captureTerminalError(error);
+    }
     const child = this.child;
     if (!child) {
       if (!this.terminationPromise) {
@@ -5200,11 +5204,78 @@ class CodexAppServerRunner {
 
   adoptPendingTurnIdentity(turnId) {
     const normalizedTurnId = String(turnId || '').trim();
-    if (!normalizedTurnId || this.activeTurnId || !this.activeClientRequestId) return false;
+    if (
+      !normalizedTurnId
+      || this.isTerminalTurnId(normalizedTurnId)
+      || this.activeTurnId
+      || !this.activeClientRequestId
+    ) return false;
     this.activeTurnId = normalizedTurnId;
     this.bindClientRequestIdToTurn(normalizedTurnId);
     if (!this.turnBuffers.has(normalizedTurnId)) this.resetTurnBuffer(normalizedTurnId);
     return true;
+  }
+
+  rememberTerminalTurnId(turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    if (!normalizedTurnId) return false;
+    if (!(this.terminalTurnIds instanceof Set)) this.terminalTurnIds = new Set();
+    this.terminalTurnIds.delete(normalizedTurnId);
+    this.terminalTurnIds.add(normalizedTurnId);
+    while (this.terminalTurnIds.size > 128) {
+      const oldestTurnId = this.terminalTurnIds.values().next().value;
+      this.terminalTurnIds.delete(oldestTurnId);
+      this.turnAssistantTranscriptEmitted?.delete?.(oldestTurnId);
+    }
+    return true;
+  }
+
+  isTerminalTurnId(turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    return Boolean(normalizedTurnId && this.terminalTurnIds?.has?.(normalizedTurnId));
+  }
+
+  async settlePendingInterrupt(intent, result = {}) {
+    if (!intent || intent.settled || this.pendingInterruptIntent !== intent) return false;
+    intent.settled = true;
+    try {
+      await this.postEvent({
+        type: 'session.interrupt_result',
+        hostId: this.hostId,
+        sessionId: this.currentSessionId(),
+        runId: this.runId,
+        interruptRequestId: intent.interruptRequestId || null,
+        ...result,
+        timestamp: nowIso(),
+      });
+      if (this.pendingInterruptIntent === intent) {
+        this.pendingInterruptIntent = null;
+      }
+      return true;
+    } catch (error) {
+      intent.settled = false;
+      throw error;
+    }
+  }
+
+  async settlePendingInterruptForSubmissionFailure(clientRequestId, error) {
+    const intent = this.pendingInterruptIntent;
+    const normalizedClientRequestId = String(clientRequestId || '').trim();
+    if (!intent) return false;
+    if (
+      intent.expectedClientRequestId
+      && normalizedClientRequestId
+      && intent.expectedClientRequestId !== normalizedClientRequestId
+    ) {
+      return false;
+    }
+    return this.settlePendingInterrupt(intent, {
+      status: 'no_active',
+      reason: this.stopRequested ? 'session_stopped' : 'turn_start_failed',
+      error: error?.message || null,
+      turnId: null,
+      clientRequestId: normalizedClientRequestId || null,
+    });
   }
 
   async resolvePendingInterruptForTerminalTurn(turnId, status = 'completed') {
@@ -5218,20 +5289,12 @@ class CodexAppServerRunner {
     ) {
       return false;
     }
-    this.pendingInterruptIntent = null;
-    await this.postEvent({
-      type: 'session.interrupt_result',
-      hostId: this.hostId,
-      sessionId: this.currentSessionId(),
-      runId: this.runId,
-      interruptRequestId: intent.interruptRequestId || null,
+    return this.settlePendingInterrupt(intent, {
       status: 'no_active',
       reason: `turn_already_${String(status || 'completed')}`,
       turnId: turnId || null,
       clientRequestId: clientRequestId || null,
-      timestamp: nowIso(),
     });
-    return true;
   }
 
   releaseClientRequestIdForTurn(turnId) {
@@ -5245,12 +5308,6 @@ class CodexAppServerRunner {
     ) {
       this.activeClientRequestId = null;
     }
-    if (
-      clientRequestId
-      && this.pendingInterruptIntent?.expectedClientRequestId === clientRequestId
-    ) {
-      this.pendingInterruptIntent = null;
-    }
     return clientRequestId;
   }
 
@@ -5262,33 +5319,18 @@ class CodexAppServerRunner {
       intent.expectedClientRequestId
       && intent.expectedClientRequestId !== clientRequestId
     ) {
-      this.pendingInterruptIntent = null;
-      await this.postEvent({
-        type: 'session.interrupt_result',
-        hostId: this.hostId,
-        sessionId: this.currentSessionId(),
-        runId: this.runId,
-        interruptRequestId: intent.interruptRequestId || null,
+      await this.settlePendingInterrupt(intent, {
         status: 'no_active',
         reason: 'active_turn_changed',
         turnId: turnId || null,
         clientRequestId: clientRequestId || null,
-        timestamp: nowIso(),
       });
       return false;
     }
 
-    this.pendingInterruptIntent = null;
     try {
       const result = await this.interruptActiveTurn(intent);
-      await this.postEvent({
-        type: 'session.interrupt_result',
-        hostId: this.hostId,
-        sessionId: this.currentSessionId(),
-        runId: this.runId,
-        ...result,
-        timestamp: nowIso(),
-      });
+      await this.settlePendingInterrupt(intent, result);
       return result.status === 'accepted';
     } catch (error) {
       await this.emitRuntime({
@@ -5298,17 +5340,11 @@ class CodexAppServerRunner {
         phase: turnId ? 'thinking' : 'idle',
         currentTurnStatus: turnId ? 'inProgress' : 'idle',
       }).catch(() => {});
-      await this.postEvent({
-        type: 'session.interrupt_result',
-        hostId: this.hostId,
-        sessionId: this.currentSessionId(),
-        runId: this.runId,
-        interruptRequestId: intent.interruptRequestId || null,
+      await this.settlePendingInterrupt(intent, {
         status: 'failed',
         error: error?.message || String(error),
         turnId: turnId || null,
         clientRequestId: clientRequestId || null,
-        timestamp: nowIso(),
       });
       return false;
     }
@@ -5326,9 +5362,107 @@ class CodexAppServerRunner {
     return true;
   }
 
+  foreignNotificationSource(method, params = {}) {
+    const ownerThreadId = String(this.threadId || this.nativeThreadId || '').trim();
+    if (!ownerThreadId) return null;
+    const turnId = String(params.turnId || params.turn?.id || '').trim();
+    const ownsTurn = turnId === String(this.activeTurnId || '').trim()
+      || this.clientRequestIdsByTurn?.has?.(turnId)
+      || this.turnBuffers?.has?.(turnId)
+      || this.turnModes?.has?.(turnId)
+      || this.pendingTurnCompletions?.has?.(turnId);
+    if (turnId && ownsTurn) return null;
+    const notificationThreadId = String(
+      params.threadId
+      || params.thread?.id
+      || ''
+    ).trim();
+    if (notificationThreadId) {
+      return notificationThreadId === ownerThreadId ? null : notificationThreadId;
+    }
+
+    if (!turnId) return null;
+    const pendingTurnMayBelongToRunner = !this.activeTurnId
+      && Boolean(this.activeClientRequestId)
+      && ['turn/started', 'turn/completed', 'error'].includes(method);
+    return ownsTurn || pendingTurnMayBelongToRunner ? null : `turn:${turnId}`;
+  }
+
+  rememberSubagentParentTurn(activity) {
+    const identity = activity?.identity || {};
+    const parentTurnId = String(identity.turnId || '').trim();
+    if (!parentTurnId) return false;
+    const threadIds = [
+      identity.agentThreadId,
+      ...(Array.isArray(identity.receiverThreadIds) ? identity.receiverThreadIds : []),
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    if (!threadIds.length) return false;
+    if (!(this.subagentParentTurns instanceof Map)) this.subagentParentTurns = new Map();
+    for (const threadId of threadIds) {
+      this.subagentParentTurns.delete(threadId);
+      this.subagentParentTurns.set(threadId, parentTurnId);
+    }
+    while (this.subagentParentTurns.size > 128) {
+      this.subagentParentTurns.delete(this.subagentParentTurns.keys().next().value);
+    }
+    return true;
+  }
+
+  async handleForeignThreadNotification(method, params, sourceThreadId) {
+    if (method === 'item/completed' && isAppServerAssistantMessageItem(params.item)) {
+      const text = appServerAssistantMessageText(params.item);
+      const parentTurnId = this.subagentParentTurns?.get?.(sourceThreadId)
+        || String(this.activeTurnId || '').trim();
+      const nativeItemId = String(params.item?.id || params.itemId || '').trim();
+      if (text && parentTurnId && nativeItemId) {
+        const itemId = `subagent-message:${sourceThreadId}:${nativeItemId}`;
+        this.replaceActivitySnapshot({
+          turnId: parentTurnId,
+          itemId,
+          summaryIndex: 0,
+          kind: 'collaboration',
+          itemType: 'subAgentMessage',
+          method,
+          callId: nativeItemId,
+          status: 'completed',
+          agentThreadId: sourceThreadId,
+          parentThreadId: this.threadId || this.nativeThreadId || null,
+          senderThreadId: sourceThreadId,
+          receiverThreadIds: [this.threadId || this.nativeThreadId].filter(Boolean),
+          tool: 'Sub-agent response',
+        }, text, {
+          force: true,
+          maxTextBytes: ACTIVITY_PROGRESS_MAX_BYTES,
+        });
+        await this.finalizeThinkingActivities({ turnId: parentTurnId, itemId });
+      }
+    } else if (method === 'error' || method === 'warning') {
+      await this.emitDiagnostic({
+        severity: method === 'error' ? 'warning' : 'info',
+        source: 'codex',
+        kind: 'collaboration',
+        method: `foreign-thread/${method}`,
+        message: limitText(
+          params.error?.message || params.message || `${method} from sub-agent thread`,
+          300
+        ),
+        data: {
+          threadId: sourceThreadId,
+          turnId: params.turnId || params.turn?.id || null,
+        },
+      });
+    }
+    return true;
+  }
+
   async handleNotification(message) {
     const method = message.method;
     const params = message.params || {};
+    const foreignThread = this.foreignNotificationSource(method, params);
+    if (foreignThread) {
+      await this.handleForeignThreadNotification(method, params, foreignThread);
+      return;
+    }
     if (method === 'item/started' || method === 'item/completed') {
       this.rememberNotificationItemPhase(params);
     }
@@ -5360,6 +5494,7 @@ class CodexAppServerRunner {
       const type = status?.type || 'unknown';
       if (type === 'systemError') {
         const turnId = params.turnId || this.activeTurnId;
+        this.rememberTerminalTurnId(turnId);
         const clientRequestId = this.clientRequestIdForTurn(turnId);
         const errorText = String(
           params.error?.message
@@ -5375,6 +5510,7 @@ class CodexAppServerRunner {
         } catch (error) {
           activityFlushError = error;
         }
+        await this.resolvePendingInterruptForTerminalTurn(turnId, 'failed');
         this.activeTurnId = null;
         await this.resolvePendingRequestsForClosedTurn(
           'failed',
@@ -5420,8 +5556,6 @@ class CodexAppServerRunner {
         if (turnId) {
           this.releaseTurnBuffer(turnId);
           this.turnModes.delete(turnId);
-          this.planBuffers.delete(turnId);
-          this.reasoningBuffers.delete(turnId);
         }
         if (activityFlushError) throw activityFlushError;
         return;
@@ -5488,7 +5622,23 @@ class CodexAppServerRunner {
     }
 
     if (method === 'turn/started') {
-      this.activeTurnId = params.turn?.id || params.turnId || this.activeTurnId;
+      const startedTurnId = params.turn?.id || params.turnId || this.activeTurnId;
+      if (this.isTerminalTurnId(startedTurnId)) {
+        await this.resolvePendingInterruptForTerminalTurn(
+          startedTurnId,
+          params.turn?.status?.type || 'completed'
+        );
+        await this.emitDiagnostic({
+          severity: 'info',
+          source: 'codex',
+          kind: 'turn',
+          method,
+          message: `Ignored late start for terminal turn ${startedTurnId || '(unknown)'}.`,
+          data: params.turn || null,
+        });
+        return;
+      }
+      this.activeTurnId = startedTurnId;
       this.bindClientRequestIdToTurn(this.activeTurnId);
       if (this.activeTurnId && !this.turnBuffers.has(this.activeTurnId)) {
         this.resetTurnBuffer(this.activeTurnId);
@@ -5529,6 +5679,7 @@ class CodexAppServerRunner {
     if (method === 'item/started') {
       const activity = normalizeAppServerActivityItem(params.item, params, 'started');
       if (activity) {
+        this.rememberSubagentParentTurn(activity);
         await this.emitActiveTurnRecoveryIfNeeded(activity.identity.turnId);
         this.replaceActivitySnapshot(activity.identity, activity.text, {
           force: true,
@@ -5560,20 +5711,14 @@ class CodexAppServerRunner {
       }
       if (this.resolvedNotificationPhase(params) === 'commentary') {
         if (text) {
-          await this.emitDiagnostic({
-            severity: 'info',
-            source: 'codex',
-            kind: 'commentary',
-            method,
-            message: limitText(text, 300),
+          this.appendActivityDelta({
             turnId,
-            data: {
-              itemId: params.itemId || null,
-              turnId,
-              text,
-              phase: 'commentary',
-            },
-          });
+            itemId: params.itemId || null,
+            kind: 'commentary',
+            itemType: 'agentMessage',
+            method,
+            status: 'inProgress',
+          }, text, { maxTextBytes: ACTIVITY_PROGRESS_MAX_BYTES });
         }
         return;
       }
@@ -5618,24 +5763,6 @@ class CodexAppServerRunner {
           );
         }
       }
-      await this.emitDiagnostic({
-        severity: 'info',
-        source: 'codex',
-        kind: 'command-output',
-        method,
-        message: limitText(outputDelta, 220),
-        turnId,
-        data: {
-          itemId: params.itemId || null,
-          callId: params.callId || params.itemId || null,
-          requestId: params.requestId || null,
-          turnId: turnId || null,
-          processId: params.processId || null,
-          processHandle: params.processHandle || null,
-          stream: params.stream || null,
-          capReached: typeof params.capReached === 'boolean' ? params.capReached : null,
-        },
-      });
       return;
     }
 
@@ -5661,22 +5788,6 @@ class CodexAppServerRunner {
         fileChanges,
         changes: fileChanges,
       }, message, { force: true, maxTextBytes: ACTIVITY_PROGRESS_MAX_BYTES });
-      await this.emitDiagnostic({
-        severity: 'info',
-        source: 'codex',
-        kind: 'file-change',
-        method,
-        message,
-        turnId,
-        data: {
-          turnId: turnId || null,
-          itemId: itemId || null,
-          callId: params.callId || itemId || null,
-          requestId: params.requestId || null,
-          fileChanges,
-          changes: fileChanges,
-        },
-      });
       return;
     }
 
@@ -5704,93 +5815,47 @@ class CodexAppServerRunner {
           separator: '\n',
         });
       }
-      await this.emitDiagnostic({
-        severity: 'info',
-        source: 'codex',
-        kind: 'mcp-tool',
-        method,
-        message: limitText(progress || 'MCP tool progress', 300),
-        turnId,
-        data: {
-          turnId: turnId || null,
-          itemId: itemId || null,
-          callId: params.callId || itemId || null,
-          requestId: params.requestId || null,
-          progress,
-        },
-      });
       return;
     }
 
     if (method === 'item/reasoning/summaryTextDelta') {
       const turnId = params.turnId || this.activeTurnId;
       const reasoningChunk = String(params.delta ?? '');
-      const isActiveTurn = turnId && turnId === this.activeTurnId;
+      if (this.runtime.lastError || this.runtime.lastCodexError) {
+        await this.emitActiveTurnRecoveryIfNeeded(turnId, { phase: 'thinking' });
+      }
       this.appendThinkingDelta({
         turnId,
         itemId: params.itemId,
         summaryIndex: params.summaryIndex ?? 0,
       }, reasoningChunk);
-      if (turnId) {
-        const previous = this.reasoningBuffers.get(turnId) || '';
-        this.reasoningBuffers.set(
-          turnId,
-          truncateActivityText(`${previous}${reasoningChunk}`, 256 * 1024).text
-        );
-      }
-      if (isActiveTurn) {
-        await this.emitRuntime(this.activeTurnRecoveryPatch(turnId, {
-          phase: 'thinking',
-          reasoningSummary: limitText(this.reasoningBuffers.get(turnId), 1200),
-        }));
-      }
-      await this.emitDiagnostic({
-        severity: 'info',
-        source: 'codex',
-        kind: 'reasoning',
-        method,
-        message: limitText(reasoningChunk, 200),
-        turnId,
-        data: {
-          itemId: params.itemId || null,
-          summaryIndex: params.summaryIndex ?? null,
-          turnId: turnId || null,
-        },
-      });
       return;
     }
 
     if (method === 'item/plan/delta' || method === 'turn/plan/updated') {
       const turnId = params.turnId || this.activeTurnId;
       const planChunk = normalizeThinkingText(params.delta || params.plan || '');
-      const isActiveTurn = turnId && turnId === this.activeTurnId;
-      if (turnId) {
-        const previous = this.planBuffers.get(turnId) || '';
-        const next = truncateActivityText(
-          mergeThinkingBuffer(previous, planChunk),
-          256 * 1024
-        ).text;
-        this.planBuffers.set(turnId, next);
+      if (this.runtime.lastError || this.runtime.lastCodexError) {
+        await this.emitActiveTurnRecoveryIfNeeded(turnId, { phase: 'planning' });
       }
-      if (isActiveTurn) {
-        await this.emitRuntime(this.activeTurnRecoveryPatch(turnId, {
-          phase: 'planning',
-          planSummary: limitText(this.planBuffers.get(turnId), 1200),
-        }));
-      }
-      await this.emitDiagnostic({
-        severity: 'info',
-        source: 'codex',
-        kind: 'plan',
-        method,
-        message: limitText(planChunk, 200),
+      const identity = {
         turnId,
-        data: {
-          itemId: params.itemId || null,
-          turnId: turnId || null,
-          rawPlan: params.plan || null,
-        },
-      });
+        itemId: params.itemId
+          || (method === 'turn/plan/updated' && turnId ? `turn-plan:${turnId}` : null),
+        kind: 'plan',
+        itemType: 'plan',
+        method,
+        status: 'inProgress',
+      };
+      if (method === 'turn/plan/updated') {
+        this.replaceActivitySnapshot(identity, planChunk, {
+          maxTextBytes: ACTIVITY_PROGRESS_MAX_BYTES,
+        });
+      } else {
+        this.appendActivityDelta(identity, planChunk, {
+          maxTextBytes: ACTIVITY_PROGRESS_MAX_BYTES,
+        });
+      }
       return;
     }
 
@@ -5851,39 +5916,12 @@ class CodexAppServerRunner {
           turnId ? this.turnBuffers.get(turnId) : ''
         );
         if (phase !== 'commentary' && text && itemId) {
-          const timestamp = nowIso();
-          const assistantObservation = normalizeAssistantObservation({
-            nativeThreadId: this.nativeThreadId || this.threadId || this.currentSessionId(),
-            protocolTurnId: turnId,
-            protocolItemId: itemId,
-            role: 'assistant',
+          await this.emitAssistantTranscript(text, {
+            turnId,
+            itemId,
             phase: phase || 'final',
-            text,
-            finalized: true,
-            sourceTimestamp: params.item?.timestamp || timestamp,
-            observedAt: timestamp,
+            sourceTimestamp: params.item?.timestamp,
           });
-          if (assistantObservation) {
-            await this.postEvent({
-              type: 'session.transcript',
-              hostId: this.hostId,
-              sessionId: this.currentSessionId(),
-              nativeThreadId: this.nativeThreadId || this.threadId || this.currentSessionId(),
-              runId: this.runId,
-              clientRequestId: this.clientRequestIdForTurn(turnId),
-              source: 'codex-app-server',
-              speaker: 'agent',
-              text,
-              assistantObservation,
-              timestamp,
-            });
-            if (turnId) {
-              if (!(this.turnAssistantTranscriptEmitted instanceof Set)) {
-                this.turnAssistantTranscriptEmitted = new Set();
-              }
-              this.turnAssistantTranscriptEmitted.add(turnId);
-            }
-          }
         }
         await this.flushPendingTurnCompletion(turnId);
         return;
@@ -5906,6 +5944,7 @@ class CodexAppServerRunner {
       }
       const activity = normalizeAppServerActivityItem(params.item, { ...params, turnId }, 'completed');
       if (activity) {
+        this.rememberSubagentParentTurn(activity);
         await this.emitActiveTurnRecoveryIfNeeded(turnId);
         this.replaceActivitySnapshot(activity.identity, activity.text, {
           force: true,
@@ -5931,7 +5970,8 @@ class CodexAppServerRunner {
 
     if (method === 'turn/completed') {
       const turnId = params.turn?.id || params.turnId || this.activeTurnId;
-      this.adoptPendingTurnIdentity(turnId);
+      this.bindClientRequestIdToTurn(turnId);
+      this.rememberTerminalTurnId(turnId);
       await this.resolvePendingInterruptForTerminalTurn(turnId, params.turn?.status?.type || 'completed');
       const text = turnId ? (this.turnBuffers.get(turnId) || '').trim() : '';
       if (text && !this.turnAssistantTranscriptEmitted?.has(turnId)) {
@@ -5961,8 +6001,9 @@ class CodexAppServerRunner {
 
     if (method === 'error') {
       const turnId = params.turnId || this.activeTurnId;
-      this.adoptPendingTurnIdentity(turnId);
+      this.bindClientRequestIdToTurn(turnId);
       if (!params.willRetry) {
+        this.rememberTerminalTurnId(turnId);
         await this.resolvePendingInterruptForTerminalTurn(turnId, 'failed');
       }
       const affectsActiveTurn = Boolean(
@@ -5982,8 +6023,6 @@ class CodexAppServerRunner {
         this.releaseTurnBuffer(turnId);
         this.releaseTurnItemPhases(turnId);
         this.turnModes.delete(turnId);
-        this.planBuffers.delete(turnId);
-        this.reasoningBuffers.delete(turnId);
         this.releaseClientRequestIdForTurn(turnId);
         await this.emitDiagnostic({
           severity: 'info',
@@ -6062,8 +6101,6 @@ class CodexAppServerRunner {
         this.turnAssistantTranscriptEmitted?.delete(turnId);
         this.releaseTurnBuffer(turnId);
         this.turnModes.delete(turnId);
-        this.planBuffers.delete(turnId);
-        this.reasoningBuffers.delete(turnId);
       }
       if (activityFlushError) throw activityFlushError;
       return;
@@ -6081,11 +6118,19 @@ class CodexAppServerRunner {
 
   async finalizeTurnCompletion(params, turnId) {
     const normalizedTurnId = String(turnId || '').trim();
+    this.rememberTerminalTurnId(normalizedTurnId);
+    const completedClientRequestId = this.clientRequestIdForTurn(normalizedTurnId);
     const completesActiveTurn = Boolean(
       normalizedTurnId
-      && normalizedTurnId === String(this.activeTurnId || '').trim()
+      && (
+        normalizedTurnId === String(this.activeTurnId || '').trim()
+        || (
+          !this.activeTurnId
+          && completedClientRequestId
+          && completedClientRequestId === this.activeClientRequestId
+        )
+      )
     );
-    const completedClientRequestId = this.clientRequestIdForTurn(normalizedTurnId);
     let activityFlushError = null;
     try {
       await this.finalizeThinkingActivities({ turnId });
@@ -6094,17 +6139,15 @@ class CodexAppServerRunner {
     }
     const text = turnId ? (this.turnBuffers.get(turnId) || '').trim() : '';
     if (text && !this.turnAssistantTranscriptEmitted?.has(turnId)) {
-      await this.emitOutput(text, 'stdout', {
-        clientRequestId: this.clientRequestIdForTurn(turnId),
+      await this.emitAssistantTranscript(text, {
+        turnId,
+        itemId: `fallback:${normalizedTurnId || 'unknown'}`,
       });
     }
     if (turnId) {
-      this.turnAssistantTranscriptEmitted?.delete(turnId);
       this.releaseTurnBuffer(turnId);
       this.releaseTurnItemPhases(turnId);
       this.turnModes.delete(turnId);
-      this.planBuffers.delete(turnId);
-      this.reasoningBuffers.delete(turnId);
     }
     if (completesActiveTurn) {
       this.activeTurnId = null;
@@ -6354,14 +6397,22 @@ class CodexAppServerRunner {
       // Ownership metadata is advisory once the child has confirmed exit.
       // Cleanup still verifies the original owner token before removal.
     }
+    const exitingTurnId = String(this.activeTurnId || '').trim();
+    if (exitingTurnId) this.rememberTerminalTurnId(exitingTurnId);
+    try {
+      await this.resolvePendingInterruptForTerminalTurn(
+        exitingTurnId,
+        this.stopRequested ? 'stopped' : 'exited'
+      );
+    } catch (error) {
+      terminalErrors.push(retryableTerminalDeliveryError(error));
+    }
     this.activeTurnId = null;
     this.activeClientRequestId = null;
     this.clientRequestIdsByTurn?.clear?.();
     this.pendingInterruptIntent = null;
     this.clearTurnBuffers();
     this.turnModes.clear();
-    this.planBuffers.clear();
-    this.reasoningBuffers.clear();
     try {
       await this.resolvePendingRequestsForClosedTurn(
         'cancelled',
@@ -6417,6 +6468,16 @@ class CodexAppServerRunner {
 
   async finalizePreSpawnCancellation() {
     const terminalErrors = [];
+    try {
+      await this.settlePendingInterrupt(this.pendingInterruptIntent, {
+        status: 'no_active',
+        reason: 'session_stopped',
+        turnId: null,
+        clientRequestId: this.activeClientRequestId || null,
+      });
+    } catch (error) {
+      terminalErrors.push(retryableTerminalDeliveryError(error));
+    }
     if (typeof this.onTerminated === 'function') {
       try {
         this.onTerminated(null, null);
@@ -6443,17 +6504,49 @@ class CodexAppServerRunner {
     throwTerminalErrors(terminalErrors, 'Codex startup cancellation did not complete cleanly.');
   }
 
-  async emitOutput(text, stream, options = {}) {
+  async emitAssistantTranscript(text, options = {}) {
+    const value = String(text || '').trim();
+    const turnId = String(options.turnId || '').trim();
+    if (!value || (turnId && this.turnAssistantTranscriptEmitted?.has?.(turnId))) {
+      return false;
+    }
+    const timestamp = nowIso();
+    const nativeThreadId = this.nativeThreadId || this.threadId || this.currentSessionId();
+    const assistantObservation = normalizeAssistantObservation({
+      representation: 'live',
+      nativeThreadId,
+      protocolTurnId: turnId,
+      protocolItemId: options.itemId || null,
+      role: 'assistant',
+      phase: options.phase || 'final',
+      text: value,
+      finalized: true,
+      sourceTimestamp: options.sourceTimestamp || timestamp,
+      observedAt: timestamp,
+    });
+    if (!assistantObservation) {
+      return false;
+    }
     await this.postEvent({
-      type: 'session.output',
+      type: 'session.transcript',
       hostId: this.hostId,
       sessionId: this.currentSessionId(),
+      nativeThreadId,
       runId: this.runId,
-      clientRequestId: options.clientRequestId || null,
-      stream,
-      chunk: text,
-      timestamp: nowIso(),
+      clientRequestId: this.clientRequestIdForTurn(turnId),
+      source: 'codex-app-server',
+      speaker: 'agent',
+      text: value,
+      assistantObservation,
+      timestamp,
     });
+    if (turnId) {
+      if (!(this.turnAssistantTranscriptEmitted instanceof Set)) {
+        this.turnAssistantTranscriptEmitted = new Set();
+      }
+      this.turnAssistantTranscriptEmitted.add(turnId);
+    }
+    return true;
   }
 
   currentSessionId() {

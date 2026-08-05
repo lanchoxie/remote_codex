@@ -41,6 +41,28 @@ function row(type, message, timestamp) {
   };
 }
 
+function taskRow(type, turnId, timestamp) {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: {
+      type,
+      turn_id: turnId,
+    },
+  };
+}
+
+function reasoningRow(message, timestamp) {
+  return {
+    timestamp,
+    type: 'response_item',
+    payload: {
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: message }],
+    },
+  };
+}
+
 function deferred() {
   let resolve;
   const promise = new Promise((resolvePromise) => {
@@ -84,6 +106,26 @@ async function main() {
     tailer.makeSessionEvent({ sessionId: sessionB, rolloutPath: fileB, live: false, selected: true }, diagnostic, diagnosticRow),
     'a selected non-live history Session must still receive JSONL diagnostics'
   );
+
+  const externalRuntime = tailer.makeSessionEvent(
+    { sessionId: sessionA, rolloutPath: fileA, live: true },
+    {
+      type: 'session.runtime_updated',
+      patch: { phase: 'thinking', busy: true, activeTurnId: 'external-turn' },
+    },
+    { timestamp: '2026-06-27T00:00:00.000Z' },
+    { owner: 'external-terminal', turnId: 'external-turn' }
+  );
+  assert.strictEqual(externalRuntime.patch.phase, undefined);
+  assert.strictEqual(externalRuntime.patch.busy, undefined);
+  assert.deepStrictEqual(externalRuntime.patch.externalActivity, {
+    owner: 'external-terminal',
+    active: true,
+    turnId: 'external-turn',
+    phase: 'thinking',
+    status: 'inProgress',
+    updatedAt: '2026-06-27T00:00:00.000Z',
+  });
 
   const primeResult = tailer.prime();
   assert.strictEqual(primeResult.sessionCount, 0, 'prime() should not scan every jsonl when no sessions are watched');
@@ -141,6 +183,108 @@ async function main() {
   ]);
   const dedupedResult = await tailer.poll();
   assert.strictEqual(dedupedResult.activeSessionCount, 1, 'selected=live must deduplicate by rollout path');
+
+  const ownershipHome = path.join(root, '.codex-ownership');
+  const ownershipFile = path.join(
+    ownershipHome,
+    'sessions',
+    '2026',
+    '06',
+    '27',
+    `rollout-ownership-${sessionA}.jsonl`
+  );
+  writeJsonl(ownershipFile, []);
+  const ownershipEvents = [];
+  const managedTurnIds = new Set(['managed-turn']);
+  const ownershipTailer = new CodexSessionTailer({
+    codexHome: ownershipHome,
+    hostId: 'ownership-host',
+    postEvents: async (batch) => ownershipEvents.push(...batch),
+  });
+  ownershipTailer.setWatchedSessions([{
+    sessionId: sessionA,
+    nativeThreadId: sessionA,
+    rolloutPath: ownershipFile,
+    live: true,
+    transcriptOwner: 'managed-runner',
+    managedRuntimeActive: true,
+    managedTurnOwner: (turnId) => managedTurnIds.has(turnId),
+  }]);
+  appendJsonl(ownershipFile, taskRow('task_started', 'managed-turn', '2026-06-27T00:02:00.000Z'));
+  appendJsonl(ownershipFile, reasoningRow('managed reasoning must remain app-server owned', '2026-06-27T00:02:01.000Z'));
+  appendJsonl(ownershipFile, taskRow('task_complete', 'managed-turn', '2026-06-27T00:02:02.000Z'));
+  const managedOwnershipResult = await ownershipTailer.poll();
+  assert.strictEqual(managedOwnershipResult.emittedEvents, 0);
+  assert.strictEqual(ownershipEvents.length, 0, 'a completed managed turn must not be replayed as external activity');
+
+  appendJsonl(ownershipFile, reasoningRow('late-attached managed reasoning', '2026-06-27T00:02:03.000Z'));
+  appendJsonl(ownershipFile, taskRow('task_complete', 'managed-turn', '2026-06-27T00:02:04.000Z'));
+  const lateAttachResult = await ownershipTailer.poll();
+  assert.strictEqual(lateAttachResult.emittedEvents, 0, 'late tail attachment must not turn managed reasoning into external activity');
+
+  appendJsonl(ownershipFile, taskRow('task_started', 'external-turn', '2026-06-27T00:03:00.000Z'));
+  appendJsonl(ownershipFile, reasoningRow('external terminal reasoning', '2026-06-27T00:03:01.000Z'));
+  appendJsonl(ownershipFile, taskRow('task_complete', 'external-turn', '2026-06-27T00:03:02.000Z'));
+  const externalOwnershipResult = await ownershipTailer.poll();
+  assert.strictEqual(externalOwnershipResult.emittedEvents, 5);
+  assert.strictEqual(ownershipEvents.length, 5);
+  const externalRuntimeEvents = ownershipEvents.filter((event) => event.type === 'session.runtime_updated');
+  const externalDiagnostics = ownershipEvents.filter((event) => event.type === 'session.diagnostic');
+  assert.deepStrictEqual(
+    externalRuntimeEvents.map((event) => event.patch.externalActivity.active),
+    [true, false],
+    'external task lifecycle must be projected without replacing managed runtime fields'
+  );
+  assert(
+    externalRuntimeEvents.every((event) => !Object.prototype.hasOwnProperty.call(event.patch, 'busy')),
+    'external observations must not publish canonical busy state'
+  );
+  assert(
+    externalDiagnostics.every((event) => event.data?.activityOwner === 'external-terminal'),
+    'external diagnostics must carry an explicit ownership marker for the Relay and browser'
+  );
+
+  const lateExternalHome = path.join(root, '.codex-late-external');
+  const lateExternalFile = path.join(
+    lateExternalHome,
+    'sessions',
+    '2026',
+    '06',
+    '27',
+    `rollout-late-external-${sessionB}.jsonl`
+  );
+  writeJsonl(lateExternalFile, [
+    taskRow('task_started', 'late-external-turn', '2026-06-27T00:04:00.000Z'),
+    reasoningRow('already running before the watch was attached', '2026-06-27T00:04:01.000Z'),
+  ]);
+  const lateExternalEvents = [];
+  const lateExternalTailer = new CodexSessionTailer({
+    codexHome: lateExternalHome,
+    hostId: 'late-external-host',
+    postEvents: async (batch) => lateExternalEvents.push(...batch),
+  });
+  lateExternalTailer.setWatchedSessions([{
+    sessionId: sessionB,
+    nativeThreadId: sessionB,
+    rolloutPath: lateExternalFile,
+    live: true,
+    transcriptOwner: 'managed-runner',
+    managedTurnOwner: () => false,
+  }]);
+  await lateExternalTailer.poll();
+  assert.deepStrictEqual(
+    lateExternalEvents.filter((event) => event.type === 'session.runtime_updated')
+      .map((event) => event.patch.externalActivity?.active),
+    [true],
+    'attaching during an external turn must immediately project Thinking activity'
+  );
+  appendJsonl(lateExternalFile, row('agent_message', 'external answer after late watch', '2026-06-27T00:04:02.000Z'));
+  const lateExternalTranscriptResult = await lateExternalTailer.poll();
+  assert.strictEqual(lateExternalTranscriptResult.emittedEvents, 1);
+  assert(
+    lateExternalEvents.some((event) => event.type === 'session.transcript' && event.speaker === 'agent'),
+    'assistant output from an external rollout must remain visible in the managed Session'
+  );
 
   const raceHome = path.join(root, '.codex-race');
   const raceFileA = path.join(raceHome, 'sessions', '2026', '06', '27', `rollout-a-${sessionA}.jsonl`);

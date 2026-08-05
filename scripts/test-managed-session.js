@@ -90,7 +90,7 @@ async function main() {
 
     const matched = await waitForTranscriptLine(
       transcript,
-      (entry) => entry.type === 'session.output' && String(entry.data.chunk || '').includes(prompt),
+      (entry) => entry.type === 'session.transcript' && String(entry.data.text || '').includes(prompt),
       15000
     );
 
@@ -470,6 +470,34 @@ function verifyCodexDiscoveryFormats() {
     throw new Error('environment_context should not become a user transcript entry');
   }
 
+  const agentsInstructionEvents = makeCodexRowEvents({
+    timestamp: '2026-05-27T04:31:31.500Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{
+        type: 'input_text',
+        text: '# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nKeep runtime state isolated.\n</INSTRUCTIONS>\n\n<environment_context>\n  <cwd>/tmp/project</cwd>\n</environment_context>',
+      }],
+    },
+  });
+  if (agentsInstructionEvents.find((event) => event.type === 'session.transcript')) {
+    throw new Error('AGENTS.md instruction context should not become a user transcript entry');
+  }
+  const truncatedAgentsInstructionEvents = makeCodexRowEvents({
+    timestamp: '2026-05-27T04:31:31.750Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: '# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nTruncated internal context' }],
+    },
+  });
+  if (truncatedAgentsInstructionEvents.find((event) => event.type === 'session.transcript')) {
+    throw new Error('truncated AGENTS.md instruction context should not become a user transcript entry');
+  }
+
   const approvalPromptEvents = makeCodexRowEvents({
     timestamp: '2026-05-27T04:31:32.000Z',
     type: 'response_item',
@@ -739,6 +767,14 @@ async function verifySessionTitleInferenceAndRename() {
         }, {
           speaker: 'user',
           timestamp: '2026-05-27T04:40:01.000Z',
+          text: 'Check current directory papers and folders',
+        }, {
+          speaker: 'user',
+          timestamp: '2026-05-27T04:40:01.500Z',
+          text: '# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nKeep runtime state isolated.\n</INSTRUCTIONS>',
+        }, {
+          speaker: 'user',
+          timestamp: '2026-05-27T04:40:01.750Z',
           text: 'Check current directory papers and folders',
         }, {
           speaker: 'agent',

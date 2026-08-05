@@ -224,24 +224,35 @@ function describeRolloutAssistantRow(row) {
   return null;
 }
 
-function isRolloutAssistantMirrorPair(eventRow, responseRow, options = {}) {
-  const event = describeRolloutAssistantRow(eventRow);
-  const response = describeRolloutAssistantRow(responseRow);
-  if (
-    event?.kind !== 'event'
-    || response?.kind !== 'response'
-    || !response.protocolItemId
-    || event.phase !== response.phase
-    || event.text !== response.text
-  ) {
+function isRolloutAssistantMirrorPair(leftRow, rightRow, options = {}) {
+  const left = describeRolloutAssistantRow(leftRow);
+  const right = describeRolloutAssistantRow(rightRow);
+  if (!left || !right || left.text !== right.text) {
     return false;
   }
-  const eventMs = Date.parse(event.timestamp);
-  const responseMs = Date.parse(response.timestamp);
+  const identifiedMirror = left.kind === 'event'
+    && right.kind === 'response'
+    && Boolean(right.protocolItemId);
+  const fallbackMirror = left.kind === 'event'
+    && right.kind === 'event'
+    && !left.protocolItemId
+    && !right.protocolItemId;
+  if (!identifiedMirror && !fallbackMirror) {
+    return false;
+  }
+  const phasesMatch = left.phase === right.phase;
+  const responseSuppliesMissingEventPhase = identifiedMirror
+    && !left.phase
+    && Boolean(right.phase);
+  if (!phasesMatch && !responseSuppliesMissingEventPhase) {
+    return false;
+  }
+  const leftMs = Date.parse(left.timestamp);
+  const rightMs = Date.parse(right.timestamp);
   const maxDeltaMs = Math.max(0, Number(options.maxDeltaMs ?? 1000) || 0);
-  return !Number.isFinite(eventMs)
-    || !Number.isFinite(responseMs)
-    || Math.abs(responseMs - eventMs) <= maxDeltaMs;
+  return !Number.isFinite(leftMs)
+    || !Number.isFinite(rightMs)
+    || Math.abs(rightMs - leftMs) <= maxDeltaMs;
 }
 
 function coalesceRolloutAssistantMirrorRows(rows, options = {}) {

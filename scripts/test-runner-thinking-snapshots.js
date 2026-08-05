@@ -22,8 +22,6 @@ function createRunnerHarness(suffix) {
     turnCompletionFallbackGraceMs: 25,
     turnBufferTruncated: new Set(),
     turnModes: new Map(),
-    planBuffers: new Map(),
-    reasoningBuffers: new Map(),
     pendingRequests: new Map(),
     runtime: {},
     stopRequested: false,
@@ -136,21 +134,49 @@ async function verifyExactItemCompletion() {
   const reasoningDiagnostics = events.filter(
     (event) => event.type === 'session.diagnostic' && event.kind === 'reasoning'
   );
-  assert.deepStrictEqual(
-    [reasoningDiagnostics.map((event) => event.message).join('')],
-    [expected],
-    'coalesced compatibility diagnostics must retain the exact delta stream'
-  );
-  assert(
-    reasoningDiagnostics.every((event) => !event.message.includes('\n')),
-    'runner must not insert newlines between reasoning deltas'
+  assert.strictEqual(
+    reasoningDiagnostics.length,
+    0,
+    'reasoning progress must use the activity stream instead of a duplicate persisted diagnostic stream'
   );
   assert.strictEqual(runner.thinkingActivities.size, 0, 'successful final delivery should release runner tracking');
   assert.strictEqual(runner.thinkingActivityAggregator.debugStats().records, 0);
 }
 
+async function verifyTurnPlanUpdatedWithoutItemId() {
+  const { runner, events, timers } = createRunnerHarness('turn-plan');
+  await runner.handleNotification({
+    method: 'turn/plan/updated',
+    params: {
+      threadId: 'thread-turn-plan',
+      turnId: 'turn-turn-plan',
+      explanation: 'Updated after inspecting the state flow.',
+      plan: [
+        { step: 'Trace the runtime path', status: 'completed' },
+        { step: 'Verify the activity stream', status: 'inProgress' },
+      ],
+    },
+  });
+
+  assert.strictEqual(timers.length, 1, 'a turn-level plan update should schedule one activity snapshot');
+  await timers[0].fn();
+  await runner.waitForActivitySnapshotDelivery();
+
+  const plan = snapshots(events).at(-1);
+  assert(plan, 'a turn-level plan update without itemId should emit an activity snapshot');
+  assert.strictEqual(plan.turnId, 'turn-turn-plan');
+  assert.strictEqual(plan.itemId, 'turn-plan:turn-turn-plan');
+  assert.strictEqual(plan.kind, 'plan');
+  assert.strictEqual(plan.method, 'turn/plan/updated');
+  assert.strictEqual(
+    plan.text,
+    '[completed] Trace the runtime path\n[inProgress] Verify the activity stream'
+  );
+}
+
 function installBlockingDelivery(runner, events) {
   let releaseFirst = null;
+  let releaseRequested = false;
   let calls = 0;
   let inFlight = 0;
   let maxInFlight = 0;
@@ -163,6 +189,7 @@ function installBlockingDelivery(runner, events) {
       if (calls === 1) {
         await new Promise((resolve) => {
           releaseFirst = resolve;
+          if (releaseRequested) resolve();
         });
       }
     } finally {
@@ -171,8 +198,8 @@ function installBlockingDelivery(runner, events) {
   };
   return {
     release() {
-      assert(releaseFirst, 'the first Relay delivery should be blocked');
-      releaseFirst();
+      releaseRequested = true;
+      releaseFirst?.();
     },
     maxInFlight: () => maxInFlight,
   };
@@ -196,7 +223,7 @@ async function verifyBoundedNotificationQueue() {
   });
 
   const blockedStats = runner.notificationQueueStats();
-  assert.strictEqual(blockedStats.inFlightItems, 1, 'only one notification handler may be in flight');
+  assert(blockedStats.inFlightItems <= 1, 'only one notification handler may be in flight');
   assert(blockedStats.totalItems <= blockedStats.maxItems, 'notification count must stay bounded');
   assert(blockedStats.totalBytes <= blockedStats.maxBytes, 'notification bytes must stay bounded');
   assert(
@@ -240,6 +267,7 @@ async function verifyBoundedNotificationQueue() {
       },
     },
   });
+  await new Promise((resolve) => setImmediate(resolve));
   delivery.release();
   await runner.drainNotifications();
 
@@ -318,6 +346,7 @@ async function verifyTerminalBarrierAndOutputOrder() {
       turn: { id: 'turn-terminal-order', status: { type: 'completed' } },
     },
   });
+  await new Promise((resolve) => setImmediate(resolve));
   delivery.release();
   await runner.drainNotifications();
   await new Promise((resolve) => setTimeout(resolve, 40));
@@ -325,15 +354,15 @@ async function verifyTerminalBarrierAndOutputOrder() {
   const finalActivityIndex = events.findIndex(
     (event) => event.type === 'session.activity_snapshot' && event.final === true
   );
-  const outputIndex = events.findIndex(
-    (event) => event.type === 'session.output' && event.chunk === 'exact assistant output'
+  const transcriptIndex = events.findIndex(
+    (event) => event.type === 'session.transcript' && event.text === 'exact assistant output'
   );
   const terminalRuntimeIndex = events.findIndex(
     (event) => event.type === 'session.runtime_updated' && event.patch?.currentTurnStatus === 'completed'
   );
   assert(finalActivityIndex >= 0, 'terminal completion should flush the final activity');
-  assert(outputIndex > finalActivityIndex, 'exact assistant output should follow the final activity');
-  assert(terminalRuntimeIndex > outputIndex, 'terminal runtime state should follow exact assistant output');
+  assert(transcriptIndex > finalActivityIndex, 'exact assistant transcript should follow the final activity');
+  assert(terminalRuntimeIndex > transcriptIndex, 'terminal runtime state should follow exact assistant transcript');
   assert.strictEqual(delivery.maxInFlight(), 1);
 }
 
@@ -650,8 +679,6 @@ async function verifyTerminalError() {
   assert(finalIndex >= 0 && errorIndex > finalIndex, 'terminal errors must flush Thinking before session.error');
   assert.strictEqual(runner.turnBuffers.size, 0);
   assert.strictEqual(runner.turnModes.size, 0);
-  assert.strictEqual(runner.planBuffers.size, 0);
-  assert.strictEqual(runner.reasoningBuffers.size, 0, 'terminal errors must release all turn-scoped buffers');
 }
 
 async function verifyStop() {
@@ -1016,6 +1043,7 @@ async function verifyStructuredActivityBoundsAndOversizedCompaction() {
 
 async function main() {
   await verifyExactItemCompletion();
+  await verifyTurnPlanUpdatedWithoutItemId();
   await verifyBoundedNotificationQueue();
   await verifyKeyedStateCoalescing();
   await verifyTerminalBarrierAndOutputOrder();

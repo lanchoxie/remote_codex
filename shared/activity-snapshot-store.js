@@ -227,6 +227,9 @@ class ActivitySnapshotStore {
     if (current && normalized.activityRevision <= current.activityRevision) {
       return null;
     }
+    if (current?.startedAt) {
+      normalized.startedAt = current.startedAt;
+    }
 
     this.deleteRecord(conversation, normalized.activityKey);
     const bytes = recordBytes(normalized);
@@ -444,7 +447,14 @@ class ActivitySnapshotStore {
       fileChangesTruncated: snapshot.fileChangesTruncated === true || boundedFileChanges.truncated,
       activityRevision,
       final: snapshot.final === true,
-      timestamp: boundedText(snapshot.timestamp || snapshot.updatedAt, 128) || null,
+      startedAt: boundedText(
+        snapshot.startedAt || snapshot.createdAt || snapshot.timestamp || snapshot.updatedAt,
+        128
+      ) || null,
+      timestamp: boundedText(
+        snapshot.timestamp || snapshot.updatedAt || snapshot.startedAt || snapshot.createdAt,
+        128
+      ) || null,
     };
     if (recordBytes(normalized) > this.maxRecordBytes) {
       const compactOutput = truncateUtf8(normalized.output, 16 * 1024);

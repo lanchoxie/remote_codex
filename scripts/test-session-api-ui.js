@@ -121,6 +121,7 @@ assert(!app.includes('const FALLBACK_REASONING_EFFORTS'), 'hard-coded reasoning 
 const launchBody = functionSource('startManagedSession');
 const launchRetryBody = functionSource('fetchManagedLaunchWithRetry');
 const newSessionLaunchStateBody = functionSource('renderNewSessionLaunchState');
+const newSessionErrorBody = functionSource('setNewSessionLaunchError');
 const inputBody = functionSource('sendInputToSession');
 const compactBody = functionSource('compactCurrentThread');
 const interruptBody = functionSource('interruptActiveTurn');
@@ -133,9 +134,17 @@ const modelLoadBody = functionSource('loadModelOptionsForSession');
 const currentModelRefreshBody = functionSource('refreshCurrentModelOptionsForSelectedSession');
 const visibleModelRefreshBody = functionSource('refreshVisibleModelOptionsForSelectedSession');
 const runtimeLoadBody = functionSource('loadSessionRuntimeConfigForSession');
+const runtimeLoadOnOpenBody = functionSource('shouldLoadSessionRuntimeConfigOnOpen');
+const showSessionBody = functionSource('showSession');
 const fetchBody = functionSource('fetchJson');
 const rebindBody = functionSource('rebindSessionApi');
 const composerApiSwitchBody = functionSource('switchSessionApiFromComposer');
+const queueScheduleBody = functionSource('maybeScheduleQueuedPromptSend');
+const moveComposerSessionBody = functionSource('moveComposerDraftSessionKey');
+const submitComposerPayloadBody = functionSource('submitComposerPayload');
+const sendQueuedPromptBody = functionSource('sendQueuedPrompt');
+const guideQueuedPromptBody = functionSource('guideQueuedPrompt');
+const forceQueuedPromptBody = functionSource('interruptAndSendQueuedPrompt');
 const fallbackBody = functionSource('startTranscriptFallback');
 const controlsBody = functionSource('renderSessionApiControls');
 const stateChangedHandler = app.slice(
@@ -152,6 +161,9 @@ assert(launchRetryBody.includes('JSON.stringify(body)'), 'launch retry must rese
 assert(launchRetryBody.includes('managedLaunchFailureMayHaveLostAcceptedResponse'), 'only an ambiguous transport or server failure may retry creation');
 assert(newSessionLaunchStateBody.includes('submitButton.disabled = disabled'), 'New Session submit must disable immediately while its intent is busy');
 assert(newSessionLaunchStateBody.includes('Creating Session...'), 'New Session submit must expose an explicit creating state');
+assert(newSessionLaunchStateBody.includes('state.newSessionLaunchError'), 'New Session launch failures must remain scoped to the creation form');
+assert(newSessionErrorBody.includes('No existing Session history was changed'), 'binding preflight failures must explain that existing history was not modified');
+assert(/newSessionLaunchError:\s*null/.test(app), 'New Session launch error state must not be stored on a selected Session');
 assert(/sessionLaunchBusy:\s*new Map\(\)/.test(app), 'concurrent launch locks must stay isolated by intent');
 assert(!launchBody.includes('explicitProfileId'), 'ordinary launch must never perform an explicit API rebind');
 assert(!launchBody.includes('if (!sessionApiBinding(currentSource))'), 'resume must fail closed when canonical runtime config cannot be loaded');
@@ -160,6 +172,33 @@ assert(!inputBody.includes('getApiRequestConfig'), 'live input must not resolve 
 assert(!inputBody.includes('body.apiConfig'), 'live input must not submit apiConfig');
 assert(!inputBody.includes('verifyHostAvailable'), 'live input must not wait for an active Host probe before Relay queueing');
 assert(inputBody.includes('timeoutMs: 30_000'), 'live input transport must have a bounded browser wait');
+assert(/queueAutoSendTimersBySession:\s*new Map\(\)/.test(app), 'queued prompt timers must be isolated by Session');
+assert(queueScheduleBody.includes('queueTimers.has(sessionKey)'), 'queue scheduling must deduplicate only within the same Session');
+assert(moveComposerSessionBody.includes('item.sessionKey = nextKey'), 'canonical Session migration must retain queued prompts');
+assert(moveComposerSessionBody.includes('queueAutoSendTimersBySession'), 'canonical Session migration must retain queued prompt scheduling');
+assert(moveComposerSessionBody.includes('window.clearTimeout(previousQueueTimer)'), 'canonical Session migration must cancel a timer whose closure contains the old key');
+assert(
+  /activeDraft\?\.clientRequestId\s*&&\s*activeDraft\.clientRequestId !== payload\.clientRequestId/.test(submitComposerPayloadBody),
+  'a retained direct-send draft must queue the next prompt instead of being overwritten'
+);
+assert(
+  submitComposerPayloadBody.includes("error?.code === 'session_turn_active'"),
+  'an authoritative active-turn rejection must fall back to the visible Queue instead of losing the prompt'
+);
+for (const [name, source] of [
+  ['auto send', sendQueuedPromptBody],
+  ['Guide', guideQueuedPromptBody],
+  ['Interrupt & Send', forceQueuedPromptBody],
+]) {
+  assert(
+    source.includes('item.sending || item.forceSending'),
+    `${name} must share the Queue item in-flight guard`
+  );
+}
+assert(
+  queueScheduleBody.includes('maybeScheduleQueuedPromptSend(current)'),
+  'a Queue timer that observes a Session switch must schedule the newly selected Session'
+);
 assert(!compactBody.includes('getApiRequestConfig'), 'compact must not resolve the Host default API');
 assert(!compactBody.includes('body.apiConfig'), 'compact must not submit apiConfig');
 assert(
@@ -178,6 +217,11 @@ assert(app.includes("state.eventSource.addEventListener('session.transcript_remo
 assert(app.includes("'session.transcript_removed',"), 'transcript removals must participate in SSE cursor replay');
 assert(runtimeLoadBody.includes('/runtime-config?'), 'selection must load Session runtime config');
 assert(runtimeLoadBody.includes('requestSessionKey'), 'runtime config responses must retain the request Session key');
+assert(runtimeLoadBody.includes('sessionRuntimeConfigRequests'), 'runtime config reads must share one in-flight request per Session run');
+assert(runtimeLoadBody.includes('isTransientFreshRuntimeConfigFailure'), 'fresh runtime config races must retry without becoming saved-history errors');
+assert(showSessionBody.includes('shouldLoadSessionRuntimeConfigOnOpen(session)'), 'opening a starting Session must defer runtime config until startup is confirmed');
+assert(runtimeLoadOnOpenBody.includes('!isManagedSessionStarting(session)'));
+assert(/sessionRuntimeConfigRequests:\s*new Map\(\)/.test(app), 'runtime config request deduplication must be isolated in state');
 assert(
   stateChangedHandler.includes('loadSessionRuntimeConfigForSession'),
   'terminal Session state changes must proactively reload canonical runtime config'
@@ -518,6 +562,13 @@ assert.strictEqual(hostEnvironmentSummary.source, 'binding');
 
 assert(!app.includes('Restart sessions using changed API settings?'), 'saving a new-Session Host default must not offer to restart existing Sessions');
 assert(!app.includes('getApiChangedLiveSessions'), 'Host-default settings must not drive existing Session lifecycle');
+assert(app.includes('data-copy-session-dir="${escapeHtml(session.cwd)}"'), 'the Session header must expose the full working directory for Copy Dir');
+assert.strictEqual(
+  (app.match(/\[data-copy-session-id\], \[data-copy-session-dir\]/g) || []).length,
+  2,
+  'both Session metadata click surfaces must accept Copy ID and Copy Dir'
+);
+assert(app.includes('copySessionButton.dataset.copySessionDir'), 'Copy Dir must copy the Session cwd rather than the visible truncated path');
 assert(!/'settings\.apiCopy': '.*starting or restarting Codex app-server sessions\.'/i.test(app), 'API profile copy must not imply Host defaults change resumed Sessions');
 assert(!/'settings\.apiRestartTip': 'After changing an API key or Base URL/i.test(app), 'provider changes must use explicit Session rebind, not a generic restart');
 assert(html.includes('Host mappings are defaults for new Sessions only.'), 'API settings must explain fresh-Session-only Host defaults');
@@ -1444,6 +1495,13 @@ assert(!/<option value="(?:minimal|low|medium|high|xhigh|max|ultra)"/.test(effor
 assert(!html.includes('New Session default (this browser)'), 'the duplicated Host default summary must be removed');
 assert(html.includes('id="new-session-submit-button"'), 'New Session submit must be addressable for busy state rendering');
 assert(html.includes('id="new-session-status"'), 'New Session form must expose an aria-live creation status');
+assert(css.includes('#new-session-status.error'), 'New Session launch failures must have a visible local error state');
+const newSessionSubmitStart = app.indexOf("el('new-session-form').addEventListener('submit'");
+const newSessionSubmitEnd = app.indexOf("el('toggle-overview-button')", newSessionSubmitStart);
+assert(newSessionSubmitStart >= 0 && newSessionSubmitEnd > newSessionSubmitStart, 'New Session submit handler missing');
+const newSessionSubmitHandler = app.slice(newSessionSubmitStart, newSessionSubmitEnd);
+assert(newSessionSubmitHandler.includes('setNewSessionLaunchError(error)'), 'New Session submit failures must stay on the creation form');
+assert(!newSessionSubmitHandler.includes('reportError(error)'), 'New Session submit failures must not be appended to the selected Session');
 for (const id of [
   'session-api-binding-label',
   'session-catalog-label',
@@ -1977,7 +2035,9 @@ async function verifyEmptyManagedSessionCannotResume() {
   let confirmations = 0;
   const helpers = loadHelpers([
     'sessionNativeResumeReadiness',
+    'isManagedSessionStarting',
     'isEmptyManagedSessionShell',
+    'shouldLoadSessionRuntimeConfigOnOpen',
     'resumeFromHistory',
   ], {
     state,
@@ -2009,6 +2069,29 @@ async function verifyEmptyManagedSessionCannotResume() {
     'an empty stopped managed Session with unknown readiness must be treated as non-resumable'
   );
   assert.strictEqual(
+    helpers.shouldLoadSessionRuntimeConfigOnOpen({
+      ...emptyStopped,
+      state: 'starting',
+    }),
+    false,
+    'a starting fresh Session must not request saved runtime history before startup is confirmed'
+  );
+  assert.strictEqual(
+    helpers.shouldLoadSessionRuntimeConfigOnOpen(emptyStopped),
+    false,
+    'an empty stopped shell must not request runtime history that does not exist'
+  );
+  assert.strictEqual(
+    helpers.shouldLoadSessionRuntimeConfigOnOpen({
+      ...emptyStopped,
+      sessionId: 'saved-history',
+      state: 'history-only',
+      messageCount: 1,
+    }),
+    true,
+    'a real history Session must still load its canonical runtime configuration'
+  );
+  assert.strictEqual(
     helpers.isEmptyManagedSessionShell({ ...emptyStopped, rolloutPath: 'C:/codex/sessions/thread.jsonl' }),
     false,
     'a discovered rollout is resume evidence when an older Host did not report native readiness'
@@ -2019,6 +2102,107 @@ async function verifyEmptyManagedSessionCannotResume() {
   );
   assert.strictEqual(confirmations, 0, 'empty-shell Resume must fail before unrelated Rebind confirmation');
   assert.strictEqual(resumeStarts, 0, 'empty-shell Resume must never submit a native resume request');
+}
+
+async function verifyFreshRuntimeConfigRaceIsTransientAndDeduplicated() {
+  const session = {
+    hostId: 'host-a',
+    sessionId: 'fresh-live',
+    source: 'managed',
+    state: 'running',
+    live: true,
+    runId: 'fresh-run',
+    messageCount: 0,
+    transcriptPreview: [],
+    runtimeConfigError: null,
+  };
+  const state = {
+    sessions: [session],
+    transcripts: new Map(),
+    sessionRuntimeConfigRequests: new Map(),
+  };
+  let fetches = 0;
+  let controlRenders = 0;
+  const helpers = loadHelpers([
+    'isTransientFreshRuntimeConfigFailure',
+    'loadSessionRuntimeConfigForSession',
+  ], {
+    state,
+    getSessionKey: (candidate) => candidate ? `${candidate.hostId}::${candidate.sessionId}` : null,
+    sessionRuntimeProjectionRunId: (candidate) => candidate?.runId || null,
+    fetchJson: async () => {
+      fetches += 1;
+      if (fetches < 3) {
+        throw Object.assign(new Error('Saved Session history is unavailable.'), {
+          status: 404,
+          code: 'session_history_unavailable',
+        });
+      }
+      return {
+        runId: 'fresh-run',
+        apiBinding: { kind: 'host_environment', bindingFingerprint: 'fresh-binding' },
+      };
+    },
+    applySessionRuntimeConfig: (requestKey, response) => {
+      state.sessions[0] = {
+        ...state.sessions[0],
+        runtimeConfig: response,
+        runtimeConfigError: null,
+        apiBinding: response.apiBinding,
+      };
+      return state.sessions[0];
+    },
+    getSelectedSession: () => state.sessions[0],
+    renderSessionDetails: () => {},
+    renderSessionApiControls: () => { controlRenders += 1; },
+    mergeSession: (patch) => {
+      state.sessions[0] = { ...state.sessions[0], ...patch };
+      return state.sessions[0];
+    },
+    structuredSessionError: (error) => ({ code: error.code, error: error.message }),
+    isManagedSessionStarting: () => false,
+    isEmptyManagedSessionShell: () => false,
+    isFreshLiveManagedSessionWithoutHistory: () => true,
+    delay: async () => {},
+  });
+
+  const [first, duplicate] = await Promise.all([
+    helpers.loadSessionRuntimeConfigForSession(session),
+    helpers.loadSessionRuntimeConfigForSession(session),
+  ]);
+  assert.strictEqual(fetches, 3, 'concurrent fresh runtime reads must share one bounded retry sequence');
+  assert.strictEqual(first.runtimeConfig.apiBinding.bindingFingerprint, 'fresh-binding');
+  assert.strictEqual(duplicate.runtimeConfig.apiBinding.bindingFingerprint, 'fresh-binding');
+  assert.strictEqual(state.sessions[0].runtimeConfigError, null, 'a recovered fresh race must not leave a history error');
+  assert.strictEqual(state.sessionRuntimeConfigRequests.size, 0, 'the shared runtime request must be released after settlement');
+  assert.strictEqual(controlRenders, 1, 'deduplicated callers must not render duplicate API control updates');
+}
+
+function verifyNewSessionErrorsStayOnCreationForm() {
+  const state = { newSessionLaunchError: null };
+  let renders = 0;
+  const helpers = loadHelpers(['setNewSessionLaunchError'], {
+    state,
+    structuredSessionError: (error) => ({
+      code: error.code || 'session_spawn_failed',
+      error: error.message,
+      stage: error.stage || null,
+    }),
+    renderNewSessionLaunchState: () => { renders += 1; },
+  });
+  helpers.setNewSessionLaunchError(Object.assign(
+    new Error('Host API binding preflight timed out while waiting for host-agent'),
+    { stage: 'resolve-binding' }
+  ));
+  assert.match(state.newSessionLaunchError.error, /No existing Session history was changed/);
+  helpers.setNewSessionLaunchError(Object.assign(
+    new Error('Saved Session history is unavailable.'),
+    { code: 'session_history_unavailable' }
+  ));
+  assert.match(state.newSessionLaunchError.error, /new Session was not created/i);
+  helpers.setNewSessionLaunchError(null);
+  assert.strictEqual(state.newSessionLaunchError, null);
+  assert.strictEqual(renders, 3);
 }
 
 async function verifyUnknownApiHistoryUsesExplicitRebind() {
@@ -3137,6 +3321,8 @@ function verifyPreferredApiSwitchModel() {
 Promise.resolve()
   .then(verifyBatchApplyReusesPreflightCatalog)
   .then(verifyEmptyManagedSessionCannotResume)
+  .then(verifyFreshRuntimeConfigRaceIsTransientAndDeduplicated)
+  .then(verifyNewSessionErrorsStayOnCreationForm)
   .then(verifyUnknownApiHistoryUsesExplicitRebind)
   .then(verifyApiProfileModelPagination)
   .then(verifyValidatedV1Suggestion)

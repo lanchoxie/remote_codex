@@ -720,7 +720,7 @@ assert(agentSource.includes('findRunnerForCommand(liveSessions, command)'), 'all
 assert(agentSource.includes('abortUnconfirmedRunner(runner)'), 'a runner rejected during start confirmation must be stopped');
 assert(
   agentSource.includes('retainRunnerForStartRetry(liveSessions, runner'),
-  'an unconfirmed startup child must remain indexed before its start command is retried'
+  'an unconfirmed startup child must remain indexed for later Stop and cleanup'
 );
 assert(agentSource.includes('await replayManagedSessionStart('), 'start command replay must resend its attested confirmation');
 assert(agentSource.includes('shouldPublishMissingRunnerStop(command)'), 'missing-runner stop must honor terminal suppression');
@@ -743,6 +743,10 @@ for (const preparationStep of [
 assert(
   /catch \(error\)[\s\S]*postSessionCommandFailure\(command, error, 'start'\)[\s\S]*failManagedSession\(/.test(managedStartSource),
   'every managed-start preparation failure must report command_failed and a failed terminal state'
+);
+assert(
+  /if \(retainRunnerForStartRetry\([\s\S]*?\)\) \{[\s\S]*?postSessionCommandFailure\(command, error, 'start', runner, \{[\s\S]*?bestEffort: false[\s\S]*?\}\)[\s\S]*?failManagedSession\([\s\S]*?return bridgeSessionId;[\s\S]*?\}/.test(managedStartSource),
+  'an unconfirmed startup child must publish a reliable terminal start failure instead of replaying the start command forever'
 );
 assert(
   /catch \(error\) \{[\s\S]*if \(error\?\.retryCommand\) throw error;[\s\S]*abortUnconfirmedRunner\(runner\)/.test(managedStartSource),
@@ -3483,9 +3487,28 @@ async function verifyTurnCompletionOutOfOrderFallback() {
     await new Promise((resolve) => setTimeout(resolve, 75));
     assert.strictEqual(runner.pendingTurnCompletions.has(fallbackTurnId), false);
     assert.strictEqual(
-      events.filter((event) => event.type === 'session.output' && event.chunk === 'legacy fallback answer').length,
+      events.filter((event) => event.type === 'session.transcript' && event.text === 'legacy fallback answer').length,
       1,
-      'older app-server streams without item/completed must still emit one bounded fallback answer'
+      'older app-server streams without item/completed must still emit one bounded fallback transcript'
+    );
+    await runner.handleNotification({
+      method: 'item/completed',
+      params: {
+        threadId: runner.threadId,
+        turnId: fallbackTurnId,
+        item: {
+          id: 'late-identified-fallback-answer',
+          type: 'agentMessage',
+          role: 'assistant',
+          phase: 'final',
+          content: [{ type: 'output_text', text: 'legacy fallback answer' }],
+        },
+      },
+    });
+    assert.strictEqual(
+      events.filter((event) => event.type === 'session.transcript' && event.text === 'legacy fallback answer').length,
+      1,
+      'a late identified assistant item must not duplicate an already published fallback transcript'
     );
     assert.strictEqual(runner.runtime.currentTurnStatus, 'completed');
   } finally {

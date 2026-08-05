@@ -130,10 +130,6 @@ async function verifyTailProjection(root) {
     [],
     'the shared cursor index must dedupe an observation already published by tailing'
   );
-  assert(
-    discoveryAfterTail.allObservedIds.includes(transcript.assistantObservation.assistantMessageId),
-    'tail and discovery must converge on one assistant identity'
-  );
 
   posted.length = 0;
   fs.appendFileSync(rolloutPath, `${taskCompleteRow('尾部中文答案')}\n`, 'utf8');
@@ -169,7 +165,6 @@ async function main() {
     assert(first.cursorUnknown, 'an initial byte-bounded rebuild must stay unknown until it reaches a row boundary at EOF');
     assert(first.bytesRead <= 73);
     const complete = finishBackfill(index, session, first);
-    assert.deepStrictEqual(complete.allObservedIds.length, 2);
     assert.deepStrictEqual(complete.observations.map((item) => item.previewText), ['one', '二号回答']);
     assert(complete.observations.every((item) => item.sourceIdentity.sourceOffset >= 0));
     assert.strictEqual(new Set(complete.observations.map((item) => item.assistantMessageId)).size, 2);
@@ -212,16 +207,35 @@ async function main() {
     assert.deepStrictEqual(taskComplete.observations, [], 'task_complete must not create a cursor message');
 
     const otherComplete = finishBackfill(index, otherSession);
-    assert.strictEqual(otherComplete.allObservedIds.length, 1);
     index.acknowledge(otherComplete);
     const otherRevision = otherComplete.projectionRevision;
+
+    const retryPath = path.join(root, 'rollout-retry-backpressure.jsonl');
+    const retryRowOne = assistantRow(31, 'retry one');
+    const retryRowTwo = assistantRow(32, 'retry two');
+    fs.writeFileSync(retryPath, `${retryRowOne}\n${retryRowTwo}\n`, 'utf8');
+    const retryIndex = new CodexAssistantCursorIndex({
+      maxBytesPerScan: Buffer.byteLength(`${retryRowOne}\n`),
+    });
+    const retrySession = { nativeThreadId: 'retry-backpressure', rolloutPath: retryPath };
+    const unacknowledged = retryIndex.scan(retrySession, { stopAtPending: true });
+    assert.strictEqual(unacknowledged.observations.length, 1);
+    assert.strictEqual(unacknowledged.cursorUnknown, true);
+    const exactRetry = retryIndex.scan(retrySession, { stopAtPending: true });
+    assert.strictEqual(exactRetry.bytesRead, 0, 'an unacknowledged cursor batch must stop reading new rows');
+    assert.deepStrictEqual(
+      exactRetry.observations.map((item) => item.assistantMessageId),
+      unacknowledged.observations.map((item) => item.assistantMessageId)
+    );
+    retryIndex.acknowledge(exactRetry);
+    assert.strictEqual(finishBackfill(retryIndex, retrySession).observations.length, 1);
 
     fs.writeFileSync(rolloutPath, `${assistantRow(4, 'replacement')}\n`, 'utf8');
     const replacement = index.scan(session);
     assert(replacement.replaced || replacement.truncated, 'truncation or replacement must reset only the changed rollout');
     assert(replacement.bytesRead <= 73);
     const rebuilt = finishBackfill(index, session, replacement);
-    assert(rebuilt.allObservedIds.some((id) => id === rebuilt.observations[0]?.assistantMessageId));
+    assert.strictEqual(rebuilt.observations.length, 1);
     const untouchedOther = index.scan(otherSession);
     assert.strictEqual(untouchedOther.bytesRead, 0);
     assert.strictEqual(untouchedOther.projectionRevision, otherRevision, 'resetting one rollout must not reset another cursor');
@@ -320,11 +334,21 @@ async function main() {
     );
     assert(budgetBatch.some((item) => item.cursorUnknown));
 
+    const bounded = new CodexAssistantCursorIndex({ maxObservedIdsPerFile: 64 });
+    for (let number = 0; number < 500; number += 1) {
+      bounded.recordObservation(session, { assistantMessageId: `tail-observation-${number}` });
+    }
+    assert(
+      bounded.getMetrics().retainedObservationIds <= 64,
+      'tail/discovery overlap identities must stay bounded per rollout file'
+    );
+
     const source = fs.readFileSync(path.join(__dirname, '..', 'shared', 'codex-assistant-cursor.js'), 'utf8');
     assert(!source.includes('readFileSync('), 'the cursor must never load a complete rollout file');
+    assert(!source.includes('allObservedIds: Array.from'), 'cursor projection must not clone every historical assistant id');
     const agentSource = fs.readFileSync(path.join(__dirname, '..', 'apps', 'host-agent', 'agent.js'), 'utf8');
     assert(agentSource.includes('assistantCursor: {'));
-    assert(agentSource.includes('assistantCursorIndex.acknowledgeMany(cursorResults)'));
+    assert(agentSource.includes('assistantCursorIndex.acknowledgeMany(publishedCursorResults)'));
     assert(agentSource.includes('assistantCursorIndex,'), 'tail and discovery must share the same cursor index');
 
     await verifyTailProjection(root);

@@ -50,6 +50,7 @@ async function main() {
   assert.strictEqual(emitted[0].activityRevision, 1);
   assert.strictEqual(emitted[0].final, false);
   assert.strictEqual(emitted[0].timestamp, '2026-07-16T00:00:00.000Z');
+  assert.strictEqual(emitted[0].startedAt, '2026-07-16T00:00:00.000Z');
 
   await aggregator.flush(item);
   assert.strictEqual(emitted.length, 1, 'an unchanged non-final snapshot should be idempotent');
@@ -90,6 +91,44 @@ async function main() {
   assert.strictEqual(metadataSnapshots[1].status, 'completed');
   assert.strictEqual(metadataSnapshots[1].exitCode, 0);
   assert.strictEqual(metadataSnapshots[1].activityRevision, 2);
+
+  const clock = [
+    '2026-07-16T00:01:00.000Z',
+    '2026-07-16T00:01:01.000Z',
+    '2026-07-16T00:01:05.000Z',
+  ];
+  const timedSnapshots = [];
+  const timed = new ThinkingActivityAggregator({
+    canonicalConversationKey: 'host-a::conversation-timed',
+    runId: 'run-timed',
+    emitSnapshot: async (snapshot) => timedSnapshots.push(snapshot),
+    setTimer: () => ({ timed: true }),
+    clearTimer: () => {},
+    now: () => clock.shift(),
+  });
+  const timedItem = {
+    turnId: 'turn-timed',
+    itemId: 'commentary-timed',
+    kind: 'commentary',
+  };
+  timed.appendDelta(timedItem, 'Inspecting');
+  await timed.flush(timedItem);
+  timed.appendDelta(timedItem, ' state');
+  await timed.flush(timedItem, { final: true });
+  assert.deepStrictEqual(
+    timedSnapshots.map((snapshot) => ({
+      startedAt: snapshot.startedAt,
+      timestamp: snapshot.timestamp,
+    })),
+    [{
+      startedAt: '2026-07-16T00:01:00.000Z',
+      timestamp: '2026-07-16T00:01:01.000Z',
+    }, {
+      startedAt: '2026-07-16T00:01:00.000Z',
+      timestamp: '2026-07-16T00:01:05.000Z',
+    }],
+    'an activity must retain its first-observed time while later revisions update independently'
+  );
 
   const boundedEmitted = [];
   const evicted = [];

@@ -123,7 +123,6 @@ async function main() {
       RELAY_LOCAL_HOST_STUB: 'false',
       RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
       RELAY_TEST_CONTROL_ENABLED: 'true',
-      RELAY_TEST_INPUT_PREPARE_DELAY_MS: '500',
       SESSION_RECORD_STORE_ROOT: path.join(tempRoot, 'session-record-store'),
     },
     stdio: ['ignore', 'pipe', 'pipe'],

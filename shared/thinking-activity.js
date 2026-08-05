@@ -130,6 +130,7 @@ class ThinkingActivityAggregator {
       this.records.set(key, {
         ...normalized,
         activityKey: key,
+        startedAt: this.now(),
         text: '',
         textBytes: 0,
         textTruncated: false,
@@ -145,6 +146,7 @@ class ThinkingActivityAggregator {
     if (record) {
       let metadataChanged = false;
       for (const [field, value] of Object.entries(normalized)) {
+        if (field === 'startedAt' || field === 'updatedAt' || field === 'timestamp') continue;
         if (!Object.is(record[field], value)) {
           record[field] = value;
           metadataChanged = true;
@@ -206,6 +208,7 @@ class ThinkingActivityAggregator {
     record.activityRevision += 1;
     record.emittedText = record.text;
     record.emittedContentRevision = record.contentRevision;
+    const updatedAt = this.now();
     const snapshot = {
       ...record,
       textBytes: undefined,
@@ -214,7 +217,7 @@ class ThinkingActivityAggregator {
       contentRevision: undefined,
       emittedContentRevision: undefined,
       final,
-      timestamp: this.now(),
+      timestamp: updatedAt,
     };
     await this.emit(snapshot);
     return snapshot;

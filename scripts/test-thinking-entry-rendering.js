@@ -2,7 +2,10 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const MarkdownIt = require('markdown-it');
+const createDOMPurify = require('dompurify');
 const { JSDOM } = require('jsdom');
+const { createMarkdownRenderer } = require('../apps/mobile-web/public/markdown-renderer');
 
 const appPath = path.join(__dirname, '..', 'apps', 'mobile-web', 'public', 'app.js');
 const source = fs.readFileSync(appPath, 'utf8');
@@ -18,6 +21,14 @@ function extractFunction(name) {
 }
 
 const dom = new JSDOM('<!doctype html><body></body>');
+dom.window.RemoteCodexMarkdownRenderer = createMarkdownRenderer({
+  markdownIt: MarkdownIt,
+  sanitizer: createDOMPurify(dom.window),
+  document: dom.window.document,
+});
+dom.window.MathJax = {
+  typesetPromise: () => Promise.resolve(),
+};
 const context = {
   window: dom.window,
   document: dom.window.document,
@@ -28,6 +39,10 @@ const context = {
   THINKING_EXPANDABLE_CODE_CHAR_LIMIT: 720,
   THINKING_EXPANDABLE_CODE_LINE_LIMIT: 12,
   normalizeFileChanges: () => [],
+  getTranscriptForSession: () => [],
+  getThinkingDiagnosticsForSession: () => [],
+  getProjectedThinkingActivities: () => context.projectedActivities || [],
+  mergeProjectedThinkingEntries: (diagnostics, activities) => [...diagnostics, ...activities],
   prettyStatusLabel: (value) => String(value || '').replace(/-/g, ' '),
   limitText: (value, maximum) => String(value || '').slice(0, maximum),
   formatTime: (value) => String(value || ''),
@@ -48,6 +63,7 @@ for (const name of [
   'isFileChangeDiagnostic',
   'isUserSuitableThinkingText',
   'normalizeThinkingActivityForModel',
+  'buildThinkingEntriesForSession',
   'thinkingDisclosureStateKey',
   'bindThinkingDisclosure',
   'thinkingEntryViewportKey',
@@ -62,6 +78,8 @@ for (const name of [
   'thinkingTextNeedsExpansion',
   'thinkingSourceWasTruncated',
   'thinkingStructuredValueWasTruncated',
+  'scheduleMathTypeset',
+  'renderMarkdown',
   'bindThinkingTextExpansion',
   'appendThinkingOperationField',
   'thinkingOperationTitle',
@@ -110,6 +128,91 @@ assert.strictEqual(
   'Thinking must prefer the complete structured text over the diagnostic preview'
 );
 
+const delayedCommentary = context.normalizeThinkingActivityForModel({
+  activityKey: 'commentary-delayed-final',
+  activityRevision: 2,
+  turnId: 'turn-one',
+  itemId: 'message-one',
+  kind: 'commentary',
+  text: 'Checking the first turn',
+  startedAt: '2026-07-27T10:00:02.000Z',
+  timestamp: '2026-07-27T10:00:12.000Z',
+  final: true,
+}, 0);
+assert.strictEqual(
+  delayedCommentary.timestamp,
+  '2026-07-27T10:00:02.000Z',
+  'Thinking turn assignment must use the immutable activity start time'
+);
+assert.strictEqual(delayedCommentary.updatedAt, '2026-07-27T10:00:12.000Z');
+
+context.projectedActivities = [
+  delayedCommentary,
+  context.normalizeThinkingActivityForModel({
+    activityKey: 'tool-first-turn',
+    activityRevision: 1,
+    turnId: 'turn-one',
+    itemId: 'tool-one',
+    kind: 'command',
+    command: 'node first.js',
+    text: 'Ran first command',
+    startedAt: '2026-07-27T10:00:04.000Z',
+    updatedAt: '2026-07-27T10:00:05.000Z',
+    timestamp: '2026-07-27T10:00:05.000Z',
+  }, 1),
+  context.normalizeThinkingActivityForModel({
+    activityKey: 'commentary-second-turn',
+    activityRevision: 2,
+    turnId: 'turn-two',
+    itemId: 'message-two',
+    kind: 'commentary',
+    text: 'Checking the second turn',
+    startedAt: '2026-07-27T10:01:02.000Z',
+    updatedAt: '2026-07-27T10:01:13.000Z',
+    timestamp: '2026-07-27T10:01:13.000Z',
+    final: true,
+  }, 2),
+  context.normalizeThinkingActivityForModel({
+    activityKey: 'tool-second-turn',
+    activityRevision: 1,
+    turnId: 'turn-two',
+    itemId: 'tool-two',
+    kind: 'command',
+    command: 'node second.js',
+    text: 'Ran second command',
+    startedAt: '2026-07-27T10:01:04.000Z',
+    updatedAt: '2026-07-27T10:01:05.000Z',
+    timestamp: '2026-07-27T10:01:05.000Z',
+  }, 3),
+];
+const turnSegments = context.buildThinkingEntriesForSession({ sessionId: 'two-turns' }, {
+  transcriptEntries: [{
+    speaker: 'user',
+    text: 'first',
+    timestamp: '2026-07-27T10:00:00.000Z',
+  }, {
+    speaker: 'assistant',
+    text: 'first reply',
+    timestamp: '2026-07-27T10:00:10.000Z',
+  }, {
+    speaker: 'user',
+    text: 'second',
+    timestamp: '2026-07-27T10:01:00.000Z',
+  }, {
+    speaker: 'assistant',
+    text: 'second reply',
+    timestamp: '2026-07-27T10:01:10.000Z',
+  }],
+  diagnostics: [],
+});
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(turnSegments.map((segment) => (
+    segment.entries.map((entry) => entry.itemId)
+  )))),
+  [['message-one', 'tool-one'], ['message-two', 'tool-two']],
+  'late final snapshots must retain commentary and tools in their own consecutive turns'
+);
+
 const baseEntry = {
   groupKey: 'command:stable',
   activityKeys: ['activity-start', 'activity-output'],
@@ -134,6 +237,29 @@ assert.strictEqual(
   first.querySelector('[data-thinking-field-key="Output"]')?.dataset.thinkingFieldKey,
   'Output',
   'structured operation fields need stable keys for narrow live patches'
+);
+
+const startedCommand = context.normalizeThinkingActivityForModel({
+  activityKey: 'command-started-no-output',
+  activityRevision: 1,
+  turnId: 'turn-command-started',
+  itemId: 'command-started',
+  kind: 'command',
+  command: 'node started.js',
+  text: 'node started.js',
+  startedAt: '2026-07-27T10:02:00.000Z',
+  timestamp: '2026-07-27T10:02:01.000Z',
+}, 4);
+const renderedStartedCommand = context.createThinkingOperationEntry(
+  startedCommand,
+  4,
+  'session::started-command',
+  {}
+);
+assert.strictEqual(
+  renderedStartedCommand.querySelector('[data-thinking-field-key="Output"]'),
+  null,
+  'a projected command summary must not be duplicated as command output'
 );
 
 dom.window.document.body.appendChild(first);
@@ -286,8 +412,33 @@ const narrative = context.createThinkingNarrativeEntry({
   textTruncated: false,
   timestamp: '2026-07-27T10:00:00.000Z',
 }, 0, 'session::narrative', {});
-assert.strictEqual(narrative.querySelector('.thinking-history-text').textContent, longNarrativeText);
+assert.strictEqual(narrative.querySelector('.thinking-history-text').textContent.trim(), longNarrativeText);
 assert(narrative.querySelector('.thinking-expand-toggle'), 'long Commentary should expose an expand control');
+
+const mathNarrativeText = String.raw`The pooled result is:
+
+\[
+\Delta P_{\mathrm{pooled}}
+\]`;
+const mathNarrative = context.createThinkingNarrativeEntry({
+  groupKey: 'commentary:math',
+  kind: 'commentary',
+  text: mathNarrativeText,
+  timestamp: '2026-07-27T10:01:00.000Z',
+}, 0, 'session::math-narrative', {});
+const mathNarrativeBody = mathNarrative.querySelector('.thinking-history-text');
+assert(mathNarrativeBody.classList.contains('markdown-body'));
+assert.strictEqual(
+  mathNarrativeBody.querySelectorAll('.markdown-math-block').length,
+  1,
+  'Thinking commentary must pass display math through the Markdown renderer'
+);
+assert.strictEqual(
+  mathNarrativeBody.querySelector('.markdown-math-block').textContent,
+  String.raw`\[
+\Delta P_{\mathrm{pooled}}
+\]`
+);
 
 const changedTextKey = context.thinkingEntryViewportKey({
   ...baseEntry,

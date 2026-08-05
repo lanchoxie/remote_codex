@@ -56,6 +56,8 @@ assert.strictEqual(projection.applyActivity(structuredKey, {
   kind: 'command-output',
   itemType: 'commandExecution',
   status: 'completed',
+  startedAt: '2026-07-16T00:00:01.000Z',
+  timestamp: '2026-07-16T00:00:05.000Z',
   text: 'done',
   command: 'npm test',
   cwd: 'D:/workspace',
@@ -83,6 +85,8 @@ for (const [field, expected] of Object.entries({
   requestId: 'request-structured',
   itemType: 'commandExecution',
   status: 'completed',
+  startedAt: '2026-07-16T00:00:01.000Z',
+  timestamp: '2026-07-16T00:00:05.000Z',
   command: 'npm test',
   cwd: 'D:/workspace',
   output: '<literal output>',
@@ -104,8 +108,48 @@ assert.strictEqual(projectedStructured.resultTruncated, true);
 assert.strictEqual(projectedStructured.fileChangesTruncated, true);
 assert.strictEqual(projectedStructured.success, false);
 
+const timingKey = 'host-a::timing';
+projection.applyReset(timingKey, { streamEpoch: 'epoch-timing', activities: [] });
+projection.applyActivity(timingKey, {
+  streamEpoch: 'epoch-timing',
+  activityKey: 'timing-activity',
+  activityRevision: 1,
+  turnId: 'turn-timing',
+  itemId: 'item-timing',
+  startedAt: '2026-07-16T00:00:01.000Z',
+  timestamp: '2026-07-16T00:00:02.000Z',
+  text: 'started',
+});
+projection.applyActivity(timingKey, {
+  streamEpoch: 'epoch-timing',
+  activityKey: 'timing-activity',
+  activityRevision: 2,
+  turnId: 'turn-timing',
+  itemId: 'item-timing',
+  timestamp: '2026-07-16T00:00:05.000Z',
+  text: 'completed',
+});
+const legacyTimingProjection = projection.activitiesFor(timingKey)[0];
+assert.strictEqual(legacyTimingProjection.startedAt, '2026-07-16T00:00:01.000Z');
+assert.strictEqual(legacyTimingProjection.timestamp, '2026-07-16T00:00:05.000Z');
+projection.applyActivity(timingKey, {
+  streamEpoch: 'epoch-timing',
+  activityKey: 'timing-activity',
+  activityRevision: 3,
+  turnId: 'turn-timing',
+  itemId: 'item-timing',
+  startedAt: '2026-07-16T00:00:04.000Z',
+  timestamp: '2026-07-16T00:00:06.000Z',
+  text: 'conflicting start time',
+});
+assert.strictEqual(
+  projection.activitiesFor(timingKey)[0].startedAt,
+  '2026-07-16T00:00:01.000Z',
+  'browser projection must keep the first accepted activity start time'
+);
+
 const metadataBounded = createTranscriptActivityProjection({
-  maxRecordBytes: 1024,
+  maxRecordBytes: 2048,
   maxTotalBytes: 4096,
 });
 const metadataBoundedKey = 'host-a::metadata-bounded';

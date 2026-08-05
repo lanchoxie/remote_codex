@@ -27,6 +27,7 @@ function assertBridgeRuntimeMigrationKeepsNativeIdleState() {
     sessionRuntime: new Map(),
     sessionDiagnostics: new Map(),
     sessionRequests: new Map(),
+    pendingUserTranscriptEchoes: new Map(),
     subscribers: new Map(),
   };
   const sessionKey = (hostId, sessionId) => `${hostId}::${sessionId}`;

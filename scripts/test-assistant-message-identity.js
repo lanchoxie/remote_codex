@@ -41,6 +41,23 @@ assert.deepStrictEqual(
   [mirroredResponseRow],
   'strict adjacent mirrors must retain only the protocol-identified response row'
 );
+const duplicatedFallbackEventRow = {
+  ...mirroredEventRow,
+  timestamp: '2026-07-16T09:00:00.013Z',
+};
+assert.deepStrictEqual(
+  coalesceRolloutAssistantMirrorRows([mirroredEventRow, duplicatedFallbackEventRow]),
+  [duplicatedFallbackEventRow],
+  'adjacent identical fallback agent_message rows must collapse before identity assignment'
+);
+assert.deepStrictEqual(
+  coalesceRolloutAssistantMirrorRows([
+    mirroredEventRow,
+    { ...duplicatedFallbackEventRow, timestamp: '2026-07-16T09:00:02.000Z' },
+  ]).length,
+  2,
+  'identical fallback messages outside the mirror window must remain distinct'
+);
 for (const mismatchedResponse of [
   { ...mirroredResponseRow, payload: { ...mirroredResponseRow.payload, phase: 'commentary' } },
   { ...mirroredResponseRow, payload: { ...mirroredResponseRow.payload, content: [{ type: 'output_text', text: 'different' }] } },

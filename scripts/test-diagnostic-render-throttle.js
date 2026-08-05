@@ -34,12 +34,32 @@ const diagnosticHandler = sliceBetween(
   'session.diagnostic handler'
 );
 assert(
-  !diagnosticHandler.includes('scheduleTranscriptRender('),
-  'diagnostic/thinking events should not trigger full transcript rerender'
+  diagnosticHandler.includes("payload.method === 'turn/completed'")
+    && diagnosticHandler.includes('scheduleTranscriptRender({ preserveScroll: true })'),
+  'terminal diagnostics must rebuild the final transcript once after the live Thinking card is removed'
+);
+assert(
+  !diagnosticHandler.includes('!runtimeIsActive(runtime)'),
+  'ordinary diagnostics received while idle must not rebuild the full transcript'
 );
 assert(
   diagnosticHandler.includes('queuedUiRenders.thinkingPanel = true'),
   'diagnostic events should refresh the lightweight live thinking panel'
+);
+assert(
+  diagnosticHandler.includes('externalActivityWasActive !== externalActivityIsActive')
+    && diagnosticHandler.includes('scheduleTranscriptRender({ preserveScroll: true })'),
+  'external terminal lifecycle transitions must create or settle the inline Thinking card'
+);
+assert(
+  diagnosticHandler.includes('const externalObservation = isExternalTerminalDiagnostic(payload)')
+    && diagnosticHandler.includes('externalObservation\n      ? getExternalTerminalActivityForSession'),
+  'ordinary managed diagnostics must not rescan the full external activity history'
+);
+assert(
+  diagnosticHandler.indexOf('scheduleTranscriptRender({ preserveScroll: true })')
+    > diagnosticHandler.indexOf("payload.method === 'turn/completed'"),
+  'active diagnostic deltas must stay on the lightweight Thinking patch path'
 );
 assert(
   diagnosticHandler.includes('queuedUiRenders.statusWindow = true'),
@@ -70,6 +90,28 @@ assert(
 assert(
   thinkingPanel.includes('runtimeIsActive(runtime)'),
   'renderThinkingPanel must keep retrying, reconnecting, and activeTurnId-only turns visible'
+);
+assert(
+  thinkingPanel.includes('externalActivity.active'),
+  'renderThinkingPanel must stay visible while a separately running terminal owns the native turn'
+);
+const composerSubmission = sliceBetween(
+  'async function submitComposerPayload',
+  'async function submitComposerInput',
+  'composer submission'
+);
+assert(
+  composerSubmission.includes('|| externalActivity.active'),
+  'Remote prompts must queue behind an observed external terminal turn'
+);
+const queuedPrompt = sliceBetween(
+  'async function sendQueuedPrompt',
+  'function maybeScheduleQueuedPromptSend',
+  'queued prompt sender'
+);
+assert(
+  queuedPrompt.includes('getExternalTerminalActivityForSession(session).active'),
+  'queued prompts must not send while the external terminal turn is still active'
 );
 assert(
   !thinkingPanel.includes('hasRecentDiagnostic'),
@@ -105,6 +147,55 @@ const runtimeIsActive = sliceBetween(
 );
 const runtimeSemantics = vm.createContext({});
 vm.runInContext(`${runtimeIssuePresentation}\n${runtimeIsActive}`, runtimeSemantics);
+
+const externalActivityHelpers = sliceBetween(
+  'function isExternalTerminalDiagnostic',
+  'function describeRuntimeStatus',
+  'external terminal activity helpers'
+);
+const externalActivitySemantics = vm.createContext({
+  isThinkingActivityDiagnostic: (entry) => ['reasoning', 'command-output'].includes(entry?.kind),
+});
+vm.runInContext(externalActivityHelpers, externalActivitySemantics);
+const externalDiagnostics = [
+  {
+    timestamp: '2026-07-30T06:00:00.000Z',
+    kind: 'turn',
+    method: 'event_msg/task_started',
+    turnId: 'external-turn',
+    data: { activityOwner: 'external-terminal' },
+  },
+  {
+    timestamp: '2026-07-30T06:00:01.000Z',
+    kind: 'reasoning',
+    method: 'response_item/reasoning',
+    data: { activityOwner: 'external-terminal' },
+  },
+];
+const externalActive = externalActivitySemantics.resolveExternalTerminalActivity({}, externalDiagnostics);
+assert.strictEqual(externalActive.active, true);
+assert.strictEqual(externalActive.turnId, 'external-turn');
+const externalCompleted = externalActivitySemantics.resolveExternalTerminalActivity({}, [
+  ...externalDiagnostics,
+  {
+    timestamp: '2026-07-30T06:00:02.000Z',
+    kind: 'turn',
+    method: 'event_msg/task_complete',
+    turnId: 'external-turn',
+    data: { activityOwner: 'external-terminal' },
+  },
+]);
+assert.strictEqual(externalCompleted.active, false);
+const projectedExternalActive = externalActivitySemantics.resolveExternalTerminalActivity({
+  externalActivity: {
+    owner: 'external-terminal',
+    active: true,
+    turnId: 'projected-turn',
+    updatedAt: '2026-07-30T06:01:00.000Z',
+  },
+}, []);
+assert.strictEqual(projectedExternalActive.active, true);
+assert.strictEqual(projectedExternalActive.turnId, 'projected-turn');
 
 for (const runtime of [
   { activeTurnId: 'turn-active' },
@@ -190,12 +281,64 @@ const transcript = sliceBetween(
   'renderTranscript'
 );
 assert(
-  transcript.includes('&& runtimeIsActive(runtime)'),
+  transcript.includes('runtimeIsActive(runtime)')
+    && transcript.includes('getExternalTerminalActivityForSession(session, runtime).active'),
   'the latest-turn thinking placeholder must use the shared active-runtime predicate'
 );
 assert(
   !transcript.includes("runtime.busy || runtime.phase === 'thinking'"),
   'the transcript must not maintain a narrower duplicate list of active phases'
+);
+
+const periodicRefresh = sliceBetween(
+  'async function performRefresh(',
+  'function addSessionIdentityValue(',
+  'periodic refresh'
+);
+assert(
+  !periodicRefresh.includes('renderTranscript(selected)'),
+  'periodic metadata refresh must not rebuild an unchanged transcript DOM'
+);
+assert(
+  app.includes("if (document.visibilityState === 'hidden')")
+    && app.includes('refresh().catch(reportError);'),
+  'background tabs must skip periodic metadata refresh work'
+);
+assert(
+  app.includes('const FULL_REFRESH_INTERVAL_MS = 60_000;')
+    && app.includes('}, FULL_REFRESH_INTERVAL_MS);'),
+  'the full Host, Session, and collection fallback refresh must run no more than once per minute'
+);
+const periodicStatusTickStart = app.indexOf('setInterval(() => {', app.indexOf("window.addEventListener('resize'"));
+const periodicStatusTickEnd = app.indexOf('setInterval(() => {', periodicStatusTickStart + 1);
+assert(periodicStatusTickStart >= 0 && periodicStatusTickEnd > periodicStatusTickStart, 'one-second status tick was not found');
+const periodicStatusTick = app.slice(periodicStatusTickStart, periodicStatusTickEnd);
+assert(
+  periodicStatusTick.includes("document.visibilityState === 'hidden'")
+    && periodicStatusTick.includes('!getSelectedSession()'),
+  'the one-second status tick must stop when the page is hidden or no Session is selected'
+);
+assert(
+  !periodicStatusTick.includes('renderThinkingPanel()'),
+  'the one-second timer must not rebuild Thinking DOM without a new runtime event'
+);
+assert(
+  !periodicStatusTick.includes('renderApprovalPopup()'),
+  'approval UI must be event-driven instead of rebuilt every second'
+);
+assert(
+  periodicStatusTick.includes('if (state.sessionDetailsOpen)')
+    && periodicStatusTick.includes('renderStatusWindow()'),
+  'the expensive Status view should refresh once per second only while it is open'
+);
+const realtimeResume = sliceBetween(
+  'async function resumeSelectedSessionRealtime(',
+  'async function withStreamRecoveryTimeout(',
+  'selected Session realtime resume'
+);
+assert(
+  realtimeResume.includes('selectedSessionRealtimeIsHealthy(selected)'),
+  'focus/pageshow must reuse a healthy selected Session stream instead of fetching full detail again'
 );
 
 const runtimeStore = sliceBetween(
@@ -302,7 +445,7 @@ assert.strictEqual(blockedEqualRevisionRollback.phase, 'closed');
 
 const runtimeEventHandler = sliceBetween(
   'const handleRuntimePayload = (payload) => {',
-  "state.eventSource.addEventListener('session.runtime'",
+  "state.eventSource.addEventListener('session.runtime_updated'",
   'runtime event handler'
 );
 assert(
@@ -326,8 +469,25 @@ assert(
   'the first active runtime projection must create the transcript Thinking placeholder even if transcript SSE is late'
 );
 assert(
+  runtimeEventHandler.includes('runtimeWasActive && runtimeStopped'),
+  'a terminal runtime projection must remove a stale live Thinking placeholder even if no final diagnostic arrives'
+);
+assert(
   runtimeEventHandler.includes('scheduleTranscriptRender({ preserveScroll: true })'),
   'active runtime transition must request a full transcript render without moving the reader'
+);
+assert(
+  !app.includes("addEventListener('session.runtime',"),
+  'the browser must consume one canonical runtime SSE event instead of maintaining two equivalent handlers'
+);
+const lifecycleHandlers = sliceBetween(
+  "state.eventSource.addEventListener('session.started'",
+  "state.eventSource.addEventListener('session.transcript'",
+  'lifecycle event handlers'
+);
+assert(
+  !lifecycleHandlers.includes('scheduleRenderAll()'),
+  'Session lifecycle updates must not redraw unrelated application chrome'
 );
 assert(
   app.includes('getRuntimeStreamGeneration(detailHostId, detailSessionId) === detailRuntimeStreamGeneration'),

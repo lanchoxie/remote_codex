@@ -239,6 +239,38 @@ async function main() {
       'commentary mirrors must produce one Thinking diagnostic'
     );
 
+    const unphasedCommentaryEvent = {
+      timestamp: '2026-07-11T12:00:01.100Z',
+      type: 'event_msg',
+      payload: { type: 'agent_message', message: 'checking the archive layout' },
+    };
+    const phasedCommentaryResponse = {
+      timestamp: '2026-07-11T12:00:01.120Z',
+      type: 'response_item',
+      payload: {
+        id: 'msg-mirror-commentary-unphased-event',
+        type: 'message',
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: 'checking the archive layout' }],
+      },
+    };
+    fs.appendFileSync(
+      mirrorPath,
+      `${JSON.stringify(unphasedCommentaryEvent)}\n${JSON.stringify(phasedCommentaryResponse)}\n`
+    );
+    await mirrorTailer.poll();
+    assert.strictEqual(
+      mirrorPosted.filter((event) => event.type === 'session.transcript' && event.text === 'checking the archive layout').length,
+      0,
+      'an unphased event mirror must not leak commentary outside Thinking'
+    );
+    assert.strictEqual(
+      mirrorPosted.filter((event) => event.type === 'session.diagnostic' && event.message === 'checking the archive layout').length,
+      1,
+      'the phased response mirror must retain unphased event commentary in Thinking'
+    );
+
     const legacyEvent = {
       timestamp: '2026-07-11T12:00:02.000Z',
       type: 'event_msg',

@@ -9,6 +9,7 @@ const {
 
 const DEFAULT_MAX_BYTES_PER_SCAN = 256 * 1024;
 const DEFAULT_ASSISTANT_MIRROR_GRACE_MS = 250;
+const DEFAULT_MAX_OBSERVED_IDS_PER_FILE = 512;
 
 function positiveInteger(value, fallback) {
   const number = Math.trunc(Number(value));
@@ -42,7 +43,7 @@ function decodeCompleteLine(buffer) {
   return decoder.write(buffer) + decoder.end();
 }
 
-function createCursor(fileKey, fileIdentity, previous = null) {
+function createCursor(fileKey, fileIdentity, previous = null, maxObservedIds = DEFAULT_MAX_OBSERVED_IDS_PER_FILE) {
   return {
     fileKey,
     fileIdentity,
@@ -51,6 +52,7 @@ function createCursor(fileKey, fileIdentity, previous = null) {
     partialStartOffset: 0,
     sourceOrdinal: 0,
     observedIds: new Set(),
+    maxObservedIds,
     pendingObservations: previous?.pendingObservations || new Map(),
     pendingAssistantMirror: null,
     projectionRevision: Math.max(0, Number(previous?.projectionRevision || 0)) + 1,
@@ -61,16 +63,31 @@ function createCursor(fileKey, fileIdentity, previous = null) {
   };
 }
 
+function rememberObservedId(cursor, assistantMessageId) {
+  if (!assistantMessageId || cursor.observedIds.has(assistantMessageId)) {
+    return false;
+  }
+  cursor.observedIds.add(assistantMessageId);
+  while (cursor.observedIds.size > cursor.maxObservedIds) {
+    cursor.observedIds.delete(cursor.observedIds.values().next().value);
+  }
+  return true;
+}
+
 function observationTimeMs(value) {
   const parsed = Date.parse(String(value || ''));
   return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
 function retainObservation(cursor, observation) {
-  if (!observation || cursor.observedIds.has(observation.assistantMessageId)) {
+  if (
+    !observation
+    || cursor.observedIds.has(observation.assistantMessageId)
+    || cursor.pendingObservations.has(observation.assistantMessageId)
+  ) {
     return false;
   }
-  cursor.observedIds.add(observation.assistantMessageId);
+  rememberObservedId(cursor, observation.assistantMessageId);
   cursor.pendingObservations.set(observation.assistantMessageId, observation);
   return true;
 }
@@ -102,7 +119,7 @@ function projectCursor(cursor, session, options = {}) {
     truncated: options.truncated === true,
     projectionRevision: Math.max(0, Number(cursor?.projectionRevision || 0)),
     bytesRead: Math.max(0, Number(options.bytesRead || 0)),
-    allObservedIds: Array.from(cursor?.observedIds || []),
+    observedIdCount: cursor?.observedIds?.size || 0,
   };
 }
 
@@ -123,6 +140,10 @@ class CodexAssistantCursorIndex {
     this.assistantMirrorGraceMs = Math.max(
       0,
       Number(options.assistantMirrorGraceMs ?? DEFAULT_ASSISTANT_MIRROR_GRACE_MS) || 0
+    );
+    this.maxObservedIdsPerFile = positiveInteger(
+      options.maxObservedIdsPerFile,
+      DEFAULT_MAX_OBSERVED_IDS_PER_FILE
     );
     this.files = new Map();
     this.scanManyStart = 0;
@@ -169,10 +190,21 @@ class CodexAssistantCursorIndex {
     const replaced = identityChanged || sameSizeRewrite;
 
     if (!cursor || replaced || truncated) {
-      cursor = createCursor(fileKey, identity, cursor);
+      cursor = createCursor(fileKey, identity, cursor, this.maxObservedIdsPerFile);
       this.files.set(fileKey, cursor);
     }
     cursor.unavailable = false;
+
+    if (options.stopAtPending === true && cursor.pendingObservations.size > 0) {
+      return projectCursor(cursor, session, {
+        replaced,
+        truncated,
+        cursorUnknown: stat.size !== cursor.offset
+          || cursor.partialBytes.length > 0
+          || cursor.parseError
+          || Boolean(cursor.pendingAssistantMirror),
+      });
+    }
 
     if (stat.size === cursor.offset) {
       const pendingAgeMs = cursor.pendingAssistantMirror
@@ -341,7 +373,12 @@ class CodexAssistantCursorIndex {
     const values = (Array.isArray(sessions) ? sessions : [])
       .filter((session) => session?.rolloutPath);
     if (!values.length) {
+      this.files.clear();
       return [];
+    }
+    const activeFileKeys = new Set(values.map((session) => normalizedFileKey(session.rolloutPath)));
+    for (const fileKey of this.files.keys()) {
+      if (!activeFileKeys.has(fileKey)) this.files.delete(fileKey);
     }
     const start = this.scanManyStart % values.length;
     const ordered = values.slice(start).concat(values.slice(0, start));
@@ -351,6 +388,7 @@ class CodexAssistantCursorIndex {
     for (let index = 0; index < ordered.length; index += 1) {
       const result = this.scan(ordered[index], {
         maxBytes: Math.min(this.maxBytesPerScan, remaining),
+        stopAtPending: true,
       });
       resultsBySession.set(ordered[index], result);
       remaining = Math.max(0, remaining - result.bytesRead);
@@ -375,14 +413,16 @@ class CodexAssistantCursorIndex {
       const stat = safeStat(this.fs, fileKey);
       cursor = createCursor(
         fileKey,
-        stat && stat.isFile() ? statFileIdentity(fileKey, stat) : null
+        stat && stat.isFile() ? statFileIdentity(fileKey, stat) : null,
+        null,
+        this.maxObservedIdsPerFile
       );
       this.files.set(fileKey, cursor);
     }
-    if (cursor.observedIds.has(assistantMessageId)) {
+    if (cursor.observedIds.has(assistantMessageId) || cursor.pendingObservations.has(assistantMessageId)) {
       return false;
     }
-    cursor.observedIds.add(assistantMessageId);
+    rememberObservedId(cursor, assistantMessageId);
     cursor.projectionRevision += 1;
     return true;
   }
@@ -411,7 +451,13 @@ class CodexAssistantCursorIndex {
   }
 
   getMetrics() {
-    return { ...this.metrics };
+    return {
+      ...this.metrics,
+      retainedObservationIds: Array.from(this.files.values())
+        .reduce((count, cursor) => count + cursor.observedIds.size, 0),
+      pendingObservations: Array.from(this.files.values())
+        .reduce((count, cursor) => count + cursor.pendingObservations.size, 0),
+    };
   }
 }
 

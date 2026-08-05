@@ -18,6 +18,8 @@ assertContains(relay, "'host.file_download_info'", 'file download info should be
 assertContains(relay, "'host.file_download_chunk'", 'file download chunks should be high priority');
 
 assertContains(relay, "type: 'session.watch'", 'relay should enqueue session.watch when the UI opens a conversation');
+assertContains(relay, 'sessionWatchIdentityBinding', 'Relay watch commands should bind the logical Session to physical rollout identities');
+assertContains(relay, 'rolloutSessionIds', 'Relay watch commands should carry all durable rollout aliases');
 assertContains(relay, "type: 'session.unwatch'", 'relay should enqueue session.unwatch when a conversation is no longer open');
 assertContains(relay, "event.type === 'watch.performance'", 'relay should turn slow watch telemetry into a visible session warning');
 assertContains(
@@ -42,6 +44,8 @@ assertContains(
 );
 
 assertContains(agent, "command.type === 'session.watch'", 'host-agent should handle session.watch commands');
+assertContains(agent, 'input.rolloutSessionIds', 'Host Agent should prefer the physical rollout aliases supplied by Relay');
+assertContains(agent, 'managedTailSession(found, runner)', 'watched rollout aliases should retain managed ownership metadata');
 assertContains(agent, "command.type === 'session.unwatch'", 'host-agent should handle session.unwatch commands');
 assertContains(agent, 'upsertSessionWatch(watchedHistorySessions', 'host-agent should atomically replace each browser view lease');
 assertContains(agent, 'ownerRevisions: watchedSessionRevisions', 'host-agent should reject stale watch revisions');

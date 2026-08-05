@@ -136,6 +136,7 @@ function activity(sessionId, revision, text) {
     text,
     activityRevision: revision,
     final: false,
+    startedAt: '2099-03-01T00:00:00.500Z',
     timestamp: `2099-03-01T00:00:0${Math.min(revision, 9)}.000Z`,
   };
 }
@@ -206,6 +207,8 @@ async function main() {
       'missing first activity'
     );
     assert.strictEqual(first.data.text, firstText);
+    assert.strictEqual(first.data.startedAt, '2099-03-01T00:00:00.500Z');
+    assert.strictEqual(first.data.timestamp, '2099-03-01T00:00:01.000Z');
     assert.strictEqual(first.data.canonicalConversationKey, `${HOST_ID}::${BRIDGE_ID}`);
     assert.strictEqual(
       first.data.activityKey,

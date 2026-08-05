@@ -217,6 +217,20 @@
       }
     }
 
+    function decorateTables(container) {
+      if (!documentValue) return;
+      for (const table of [...container.querySelectorAll('table')]) {
+        if (table.parentElement?.classList.contains('markdown-table-wrap')) continue;
+        const wrapper = documentValue.createElement('div');
+        wrapper.className = 'markdown-table-wrap';
+        wrapper.tabIndex = 0;
+        wrapper.setAttribute('role', 'region');
+        wrapper.setAttribute('aria-label', 'Scrollable table');
+        table.replaceWith(wrapper);
+        wrapper.appendChild(table);
+      }
+    }
+
     function decorateCodeBlocks(container) {
       if (!documentValue) return;
       for (const pre of [...container.querySelectorAll('pre')]) {
@@ -260,6 +274,7 @@
       container.classList?.remove('markdown-plain-fallback');
       container.innerHTML = clean;
       decorateLinks(container);
+      decorateTables(container);
       decorateCodeBlocks(container);
       return { rendered: true, fallback: false };
     }

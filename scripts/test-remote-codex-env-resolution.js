@@ -4,6 +4,7 @@ const {
   agentLogCommand,
   buildAgentLaunchCommand,
   buildRemoteStatusCommand,
+  buildSshCommandParts,
   connectorControlFileName,
   connectorTmuxSessionName,
   normalizeConnectorInput,
@@ -42,6 +43,34 @@ assert.strictEqual(
   '/srv/remote-codex',
   'loaded connector profiles must repair a previously persisted deployment path'
 );
+
+const explicitIdentitySsh = buildSshCommandParts({
+  targetHost: '10.25.1.240',
+  targetPort: 22112,
+  username: 'remote-user',
+  auth: { keyPath: 'C:/Users/test/.ssh/id_ed25519' },
+}, { batchMode: true });
+assert(!explicitIdentitySsh.args.includes('-i'), 'SSH must not append the configured key to default identities');
+assert(
+  explicitIdentitySsh.args.includes('IdentityFile=C:/Users/test/.ssh/id_ed25519'),
+  'SSH must replace the default identity list with the configured key'
+);
+assert(explicitIdentitySsh.args.includes('IdentitiesOnly=yes'));
+assert(explicitIdentitySsh.args.includes('IdentityAgent=none'));
+
+const passwordOnlySsh = buildSshCommandParts({
+  targetHost: '10.25.1.240',
+  targetPort: 22112,
+  username: 'remote-user',
+  auth: { method: 'keyboard_interactive' },
+}, {
+  preferredAuthentications: 'keyboard-interactive,password',
+  pubkeyAuthentication: 'no',
+  identityAgent: 'none',
+});
+assert(passwordOnlySsh.args.includes('PreferredAuthentications=keyboard-interactive,password'));
+assert(passwordOnlySsh.args.includes('PubkeyAuthentication=no'));
+assert(passwordOnlySsh.args.includes('IdentityAgent=none'));
 
 assertContains(
   connectors,
@@ -157,8 +186,13 @@ assertContains(
 const savedAnswerIndex = relay.indexOf('if (-not [string]::IsNullOrWhiteSpace($answer))');
 const brokerPromptIndex = relay.indexOf('Try-BrokerPrompt | Out-Null');
 assert(
-  savedAnswerIndex >= 0 && brokerPromptIndex > savedAnswerIndex,
-  'saved connector credentials must be answered before waiting on the interactive askpass broker'
+  brokerPromptIndex >= 0 && savedAnswerIndex === -1,
+  'interactive Connector actions must ask the browser before using saved connector credentials'
+);
+assertContains(
+  relay,
+  'if ([string]::IsNullOrWhiteSpace($answer)) { exit 1 }',
+  'non-interactive Connector actions should still fail closed when no saved credential is available'
 );
 assertContains(
   relay,
@@ -174,6 +208,51 @@ assertContains(
   relay,
   'probeConnectorBootstrapRuntime(baseConnector, secret)',
   'bootstrap must probe the remote architecture before building its payload'
+);
+assertContains(
+  relay,
+  "status: 'ssh_authentication_attempts_exhausted'",
+  'remote probe failures should identify exhausted SSH authentication attempts'
+);
+assertContains(
+  relay,
+  "status: 'keyboard_interactive_denied'",
+  'remote probe failures should identify rejected keyboard-interactive authentication'
+);
+const targetPublicKeyGuard = relay.match(/function connectorAllowsTargetPublicKey\(connector\) \{[\s\S]*?\n\}/)?.[0] || '';
+assert(
+  targetPublicKeyGuard.includes('Boolean(connector.auth?.keyPath)'),
+  'an explicit key path must preserve public-key as the first factor for keyboard-interactive MFA'
+);
+assertContains(
+  relay,
+  'options.numberOfPasswordPrompts = 1;',
+  'automatic Connector actions must not replay a failed credential until SSH exhausts MaxAuthTries'
+);
+assertContains(
+  relay,
+  "options.pubkeyAuthentication = 'no'",
+  'password and OTP Connectors without an explicit key must not exhaust SSH attempts on local Agent identities'
+);
+assertContains(
+  relay,
+  "options.identityAgent = 'none'",
+  'password and OTP Connectors without an explicit key must disable the local SSH Agent'
+);
+assertContains(
+  connectors,
+  '`PubkeyAuthentication=${options.pubkeyAuthentication}`',
+  'generated SSH commands must support explicitly disabling public-key authentication'
+);
+assertContains(
+  connectors,
+  '`IdentityAgent=${options.identityAgent}`',
+  'generated SSH commands must support explicitly disabling the local SSH Agent'
+);
+assertContains(
+  relay,
+  'exit /b %ERRORLEVEL%',
+  'the Windows AskPass wrapper must propagate the PowerShell helper result to OpenSSH'
 );
 assertContains(
   relay,
@@ -314,6 +393,11 @@ assert(
 assert(
   !relay.includes('actionMultiplexFallback'),
   'disabled SSH multiplexing must not leave connector action fallback state'
+);
+assertContains(
+  relay,
+  'args.push(\'-o\', `IdentityFile=${connector.auth.keyPath}`);',
+  'SCP uploads must replace the default identity list with the configured key'
 );
 
 assert.strictEqual(

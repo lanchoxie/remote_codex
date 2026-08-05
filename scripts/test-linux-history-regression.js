@@ -26,16 +26,16 @@ assertIncludes(
 
 assertIncludes(
   app,
-  'await watchSelectedSession(session);',
-  'Opening history should enqueue its watch before requesting the detail snapshot.'
+  'void watchSelectedSession(session).catch((error) => {',
+  'Opening history should enqueue its watch without blocking the detail snapshot.'
 );
 const showSessionStart = app.indexOf('async function showSession(');
 const showSessionEnd = app.indexOf('\nfunction buildSessionExportUrl', showSessionStart);
 const showSessionSource = app.slice(showSessionStart, showSessionEnd);
 assert(
-  showSessionSource.indexOf('await watchSelectedSession(session);')
-    < showSessionSource.indexOf('/detail?${detailParams.toString()}'),
-  'watch registration must form a barrier before the full history snapshot to avoid an EOF handoff gap'
+  showSessionSource.indexOf('void watchSelectedSession(session).catch((error) => {')
+    < showSessionSource.indexOf('fetchSharedSessionDetail(session, detailParams, {'),
+  'watch registration must be issued before the full history snapshot without making the detail request wait'
 );
 assertIncludes(
   showSessionSource,

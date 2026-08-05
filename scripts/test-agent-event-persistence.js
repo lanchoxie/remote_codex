@@ -94,6 +94,7 @@ async function stopChild(child) {
 async function withRelay(label, faultOptions, task) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `relay-persistence-${label}-`));
   const port = await openPort();
+  const logsPath = path.join(root, 'session-logs.json');
   const diagnosticsPath = path.join(root, 'session-diagnostics.json');
   const dismissedHostsPath = path.join(root, 'dismissed-hosts.json');
   const output = [];
@@ -122,7 +123,7 @@ async function withRelay(label, faultOptions, task) {
   relay.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')));
   try {
     await waitForRelay(port, relay);
-    await task({ port, root, diagnosticsPath, dismissedHostsPath, relay });
+    await task({ port, root, logsPath, diagnosticsPath, dismissedHostsPath, relay });
   } catch (error) {
     error.message += `\nRelay output:\n${output.join('')}`;
     throw error;
@@ -173,6 +174,28 @@ async function testDiagnosticsFailOnceRecovery() {
     const persisted = JSON.parse(fs.readFileSync(diagnosticsPath, 'utf8'));
     const entries = persisted.diagnostics?.[`${hostId}::${sessionId}`] || [];
     assert.strictEqual(entries.filter((entry) => entry.message === 'fail-once diagnostic').length, 1);
+  });
+}
+
+async function testTranscriptCheckpointPersistsAtomically() {
+  await withRelay('transcript-checkpoint', {}, async ({ port, logsPath }) => {
+    const hostId = 'persistence-transcript-host';
+    const sessionId = 'persistence-transcript-session';
+    await registerHost(port, hostId);
+    const response = await requestJson(port, 'POST', '/api/agent/events', {
+      batchId: 'persistence-transcript-batch',
+      events: [{
+        type: 'session.transcript',
+        hostId,
+        sessionId,
+        speaker: 'agent',
+        text: 'durable transcript checkpoint',
+      }],
+    });
+    assert.strictEqual(response.statusCode, 200, JSON.stringify(response.body));
+    const persisted = JSON.parse(fs.readFileSync(logsPath, 'utf8'));
+    const entries = persisted.logs?.[`${hostId}::${sessionId}`] || [];
+    assert.strictEqual(entries.filter((entry) => entry.text === 'durable transcript checkpoint').length, 1);
   });
 }
 
@@ -259,6 +282,7 @@ async function testDismissedRestoreWriteRetry() {
 }
 
 testDiagnosticsFailOnceRecovery()
+  .then(testTranscriptCheckpointPersistsAtomically)
   .then(testConcurrentPartialCheckpoint)
   .then(testDismissedRestoreWriteRetry)
   .then(() => console.log('Agent event persistence assertions passed'))
