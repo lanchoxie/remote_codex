@@ -177,6 +177,24 @@ async function testDiagnosticsFailOnceRecovery() {
   });
 }
 
+async function testDiagnosticsTransientBusyRecovery() {
+  await withRelay('transient-busy', {
+    RELAY_TEST_DIAGNOSTICS_BUSY_ATTEMPTS: '2',
+  }, async ({ port, diagnosticsPath }) => {
+    const hostId = 'persistence-transient-busy-host';
+    const sessionId = 'persistence-transient-busy-session';
+    await registerHost(port, hostId);
+    const response = await requestJson(port, 'POST', '/api/agent/events', {
+      batchId: 'persistence-transient-busy-batch',
+      events: [diagnosticEvent(hostId, sessionId, 'transient busy diagnostic')],
+    });
+    assert.strictEqual(response.statusCode, 200, JSON.stringify(response.body));
+    const persisted = JSON.parse(fs.readFileSync(diagnosticsPath, 'utf8'));
+    const entries = persisted.diagnostics?.[`${hostId}::${sessionId}`] || [];
+    assert.strictEqual(entries.filter((entry) => entry.message === 'transient busy diagnostic').length, 1);
+  });
+}
+
 async function testTranscriptCheckpointPersistsAtomically() {
   await withRelay('transcript-checkpoint', {}, async ({ port, logsPath }) => {
     const hostId = 'persistence-transcript-host';
@@ -282,6 +300,7 @@ async function testDismissedRestoreWriteRetry() {
 }
 
 testDiagnosticsFailOnceRecovery()
+  .then(testDiagnosticsTransientBusyRecovery)
   .then(testTranscriptCheckpointPersistsAtomically)
   .then(testConcurrentPartialCheckpoint)
   .then(testDismissedRestoreWriteRetry)

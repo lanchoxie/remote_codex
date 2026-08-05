@@ -501,6 +501,77 @@ async function main() {
   assert.strictEqual(walFailureStore.readHealth().writable, false);
   await walFailureStore.close();
 
+  const transientWalRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-wal-transient-'));
+  const transientWalStore = await SessionRecordStore.open({
+    rootDir: transientWalRoot,
+    snapshotEvery: 100,
+    fileReplaceOptions: { maxRetries: 2, sleep: async () => {} },
+  });
+  const openTransientWalHandle = transientWalStore.openWalHandle.bind(transientWalStore);
+  let transientWalOpenAttempts = 0;
+  transientWalStore.openWalHandle = async () => {
+    transientWalOpenAttempts += 1;
+    if (transientWalOpenAttempts < 3) {
+      const error = new Error('simulated transient WAL scanner lock');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return openTransientWalHandle();
+  };
+  await transientWalStore.transact('test.wal.transient', () => null);
+  assert.strictEqual(transientWalOpenAttempts, 3, 'transient WAL open locks must be retried');
+  assert.strictEqual(transientWalStore.readHealth().status, 'ok');
+
+  transientWalStore.openWalHandle = async () => {
+    const error = new Error('simulated persistent WAL scanner lock');
+    error.code = 'EBUSY';
+    throw error;
+  };
+  await assert.rejects(
+    transientWalStore.transact('test.wal.persistent-lock', () => null),
+    (error) => error instanceof StoreRecoveryError
+      && error.code === 'session_store_wal_write_failed'
+      && error.retryableWithoutMutation === true
+  );
+  assert.strictEqual(
+    transientWalStore.readHealth().writable,
+    true,
+    'an exhausted WAL open lock must leave the Store retryable because no bytes were written'
+  );
+  transientWalStore.openWalHandle = openTransientWalHandle;
+  await transientWalStore.transact('test.wal.after-lock', () => null);
+  assert.strictEqual(transientWalStore.readSnapshot().storeRevision, 2);
+  await transientWalStore.close();
+
+  const transientSentinelRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-sentinel-transient-'));
+  const transientSentinelStore = await SessionRecordStore.open({
+    rootDir: transientSentinelRoot,
+    snapshotEvery: 100,
+  });
+  const writeTransientSentinel = transientSentinelStore.writeSentinelHighWater.bind(transientSentinelStore);
+  let transientSentinelAttempts = 0;
+  transientSentinelStore.writeSentinelHighWater = async (...args) => {
+    transientSentinelAttempts += 1;
+    if (transientSentinelAttempts === 1) {
+      const error = new Error('simulated transient sentinel scanner lock');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return writeTransientSentinel(...args);
+  };
+  await transientSentinelStore.transact('test.sentinel.transient', () => null);
+  assert.strictEqual(
+    transientSentinelStore.readSnapshot().storeRevision,
+    1,
+    'a durable WAL commit must advance the projection while its sentinel is temporarily locked'
+  );
+  assert.strictEqual(transientSentinelStore.readHealth().status, 'degraded');
+  assert.strictEqual(transientSentinelStore.readHealth().writable, true);
+  await transientSentinelStore.transact('test.sentinel.after-lock', () => null);
+  assert.strictEqual(transientSentinelStore.readSnapshot().storeRevision, 2);
+  assert.strictEqual(transientSentinelStore.readHealth().status, 'ok');
+  await transientSentinelStore.close();
+
   const sentinelRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-sentinel-'));
   const sentinelPath = path.join(
     path.dirname(sentinelRoot),

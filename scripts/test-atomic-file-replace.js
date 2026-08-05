@@ -64,6 +64,7 @@ async function main() {
       const { targetPath, tempPath } = writeFixture(root, 'restored-failure', 'old', 'new');
       let replaceAttempts = 0;
       assert.throws(() => replaceFileWithBackup(tempPath, targetPath, {
+        maxRetries: 0,
         fileSystem: makeFileSystem((from, to) => {
           if (from === tempPath && to === targetPath && replaceAttempts++ < 2) {
             throw injectedError('EPERM', 'simulated replacement failure');
@@ -79,6 +80,7 @@ async function main() {
       let replaceAttempts = 0;
       let backupPath = '';
       assert.throws(() => replaceFileWithBackup(tempPath, targetPath, {
+        maxRetries: 0,
         fileSystem: makeFileSystem((from, to) => {
           if (from === tempPath && to === targetPath && replaceAttempts++ < 2) {
             throw injectedError('EPERM', 'simulated replacement failure');
@@ -111,6 +113,28 @@ async function main() {
       assert.strictEqual(recovered.recovered, true, 'collision-suffixed backups must also recover a missing canonical state');
       assert.strictEqual(recovered.backupPath, collisionBackupPath);
       assert.strictEqual(fs.readFileSync(targetPath, 'utf8'), 'old-collision-state');
+    }
+
+    {
+      const { targetPath, tempPath } = writeFixture(root, 'sync-transient-lock', 'old', 'new');
+      let directAttempts = 0;
+      let backupAttempts = 0;
+      const result = replaceFileWithBackup(tempPath, targetPath, {
+        fileSystem: makeFileSystem((from, to) => {
+          if (from === tempPath && to === targetPath && directAttempts++ === 0) {
+            throw injectedError('EPERM', 'simulated Windows replacement conflict');
+          }
+          if (from === targetPath && to.endsWith('.bak') && backupAttempts++ < 2) {
+            throw injectedError('EBUSY', 'simulated synchronous scanner lock');
+          }
+          return fs.renameSync(from, to);
+        }),
+        maxRetries: 3,
+        sleepSync: () => {},
+      });
+      assert.strictEqual(result.usedBackup, true);
+      assert.strictEqual(backupAttempts, 3);
+      assert.strictEqual(fs.readFileSync(targetPath, 'utf8'), 'new');
     }
 
     {

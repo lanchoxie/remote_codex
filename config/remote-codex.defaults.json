@@ -1,6 +1,6 @@
 {
   "runtimeReleaseRepo": "lanchoxie/remote_codex",
-  "runtimeReleaseTag": "v2.4.9",
+  "runtimeReleaseTag": "v2.4.10",
   "localCodexHome": "~/.codex",
   "remoteCodexHome": "~/.codex",
   "remoteCodexBinHints": [

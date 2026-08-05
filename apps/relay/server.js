@@ -8,6 +8,7 @@ const {
   recoverMissingFileFromBackup,
   replaceFileWithBackup,
   replaceFileWithBackupAsync,
+  retryTransientFileOperation,
 } = require('./atomic-file-replace');
 const {
   agentLogCommand,
@@ -2377,10 +2378,14 @@ function buildSessionDiagnosticsSnapshot() {
 
 async function writeSessionDiagnosticsSnapshot(diagnostics) {
   await fs.promises.mkdir(path.dirname(SESSION_DIAGNOSTICS_PATH), { recursive: true });
-  await fs.promises.writeFile(SESSION_DIAGNOSTICS_PATH, JSON.stringify({
+  const snapshot = JSON.stringify({
     savedAt: nowIso(),
     diagnostics,
-  }, null, 2), 'utf8');
+  }, null, 2);
+  await retryTransientFileOperation(
+    () => fs.promises.writeFile(SESSION_DIAGNOSTICS_PATH, snapshot, 'utf8'),
+    { maxRetries: 12, retryDelayMs: 25, maxRetryDelayMs: 500 }
+  );
 }
 
 async function saveSessionDiagnostics() {
@@ -2403,6 +2408,23 @@ let sessionDiagnosticsSaveInFlight = null;
 let sessionDiagnosticsSavePending = false;
 let sessionDiagnosticsSaveError = null;
 let sessionDiagnosticsNeedsNormalization = false;
+let sessionDiagnosticsSaveRetryDelayMs = 1000;
+let sessionDiagnosticsSaveLastWarningAt = 0;
+let sessionDiagnosticsSaveSuppressedWarnings = 0;
+
+function warnSessionDiagnosticsSaveFailure(error) {
+  const timestamp = Date.now();
+  if (timestamp - sessionDiagnosticsSaveLastWarningAt < 30_000) {
+    sessionDiagnosticsSaveSuppressedWarnings += 1;
+    return;
+  }
+  const suppressed = sessionDiagnosticsSaveSuppressedWarnings > 0
+    ? ` (${sessionDiagnosticsSaveSuppressedWarnings} repeated failures suppressed)`
+    : '';
+  console.warn(`[relay] failed to save session diagnostics: ${error.message}${suppressed}`);
+  sessionDiagnosticsSaveLastWarningAt = timestamp;
+  sessionDiagnosticsSaveSuppressedWarnings = 0;
+}
 
 function scheduleSessionLogsSave(delayMs = PERSIST_DEBOUNCE_MS) {
   sessionLogsSavePending = true;
@@ -2487,12 +2509,20 @@ async function flushSessionDiagnosticsSave() {
       .then(() => {
         sessionDiagnosticsSaveError = null;
         sessionDiagnosticsNeedsNormalization = false;
+        sessionDiagnosticsSaveRetryDelayMs = 1000;
+        sessionDiagnosticsSaveLastWarningAt = 0;
+        sessionDiagnosticsSaveSuppressedWarnings = 0;
       })
       .catch((error) => {
         sessionDiagnosticsSaveError = error;
         sessionDiagnosticsSavePending = true;
         saveFailed = true;
-        console.warn(`[relay] failed to save session diagnostics: ${error.message}`);
+        warnSessionDiagnosticsSaveFailure(error);
+        scheduleSessionDiagnosticsSave(sessionDiagnosticsSaveRetryDelayMs);
+        sessionDiagnosticsSaveRetryDelayMs = Math.min(
+          15_000,
+          sessionDiagnosticsSaveRetryDelayMs * 2
+        );
       });
     sessionDiagnosticsSaveInFlight = savePromise;
     try {

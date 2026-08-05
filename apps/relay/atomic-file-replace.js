@@ -10,6 +10,52 @@ const REPLACE_CONFLICT_CODES = new Set([
 ]);
 const TRANSIENT_RENAME_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
 
+function isTransientFileLockError(error) {
+  return TRANSIENT_RENAME_CODES.has(error?.code);
+}
+
+function retryTransientFileOperationSync(operation, options = {}) {
+  const maxRetries = Math.max(0, Number(options.maxRetries ?? 12));
+  const retryDelayMs = Math.max(0, Number(options.retryDelayMs ?? 20));
+  const maxRetryDelayMs = Math.max(retryDelayMs, Number(options.maxRetryDelayMs ?? 500));
+  const sleep = options.sleepSync || ((delayMs) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+  });
+  let attempt = 0;
+  while (true) {
+    try {
+      return operation();
+    } catch (error) {
+      if (!isTransientFileLockError(error) || attempt >= maxRetries) {
+        throw error;
+      }
+      const delayMs = Math.min(maxRetryDelayMs, retryDelayMs * (2 ** attempt));
+      attempt += 1;
+      sleep(delayMs);
+    }
+  }
+}
+
+async function retryTransientFileOperation(operation, options = {}) {
+  const maxRetries = Math.max(0, Number(options.maxRetries ?? 8));
+  const retryDelayMs = Math.max(0, Number(options.retryDelayMs ?? 20));
+  const maxRetryDelayMs = Math.max(retryDelayMs, Number(options.maxRetryDelayMs ?? 500));
+  const sleep = options.sleep || ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+  let attempt = 0;
+  while (true) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isTransientFileLockError(error) || attempt >= maxRetries) {
+        throw error;
+      }
+      const delayMs = Math.min(maxRetryDelayMs, retryDelayMs * (2 ** attempt));
+      attempt += 1;
+      await sleep(delayMs);
+    }
+  }
+}
+
 function isReplaceConflict(error) {
   return REPLACE_CONFLICT_CODES.has(error?.code);
 }
@@ -68,46 +114,18 @@ async function pathExists(filePath, fileSystem) {
 
 async function renameWithRetry(fromPath, toPath, options = {}) {
   const fileSystem = options.fileSystem || fs;
-  const maxRetries = Math.max(0, Number(options.maxRetries ?? 8));
-  const retryDelayMs = Math.max(0, Number(options.retryDelayMs ?? 20));
-  const maxRetryDelayMs = Math.max(retryDelayMs, Number(options.maxRetryDelayMs ?? 500));
-  const sleep = options.sleep || ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
-  let attempt = 0;
-  while (true) {
-    try {
-      await fileSystem.promises.rename(fromPath, toPath);
-      return;
-    } catch (error) {
-      if (!TRANSIENT_RENAME_CODES.has(error?.code) || attempt >= maxRetries) {
-        throw error;
-      }
-      const delayMs = Math.min(maxRetryDelayMs, retryDelayMs * (2 ** attempt));
-      attempt += 1;
-      await sleep(delayMs);
-    }
-  }
+  await retryTransientFileOperation(
+    () => fileSystem.promises.rename(fromPath, toPath),
+    options
+  );
 }
 
 async function unlinkWithRetry(filePath, options = {}) {
   const fileSystem = options.fileSystem || fs;
-  const maxRetries = Math.max(0, Number(options.maxRetries ?? 8));
-  const retryDelayMs = Math.max(0, Number(options.retryDelayMs ?? 20));
-  const maxRetryDelayMs = Math.max(retryDelayMs, Number(options.maxRetryDelayMs ?? 500));
-  const sleep = options.sleep || ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
-  let attempt = 0;
-  while (true) {
-    try {
-      await fileSystem.promises.unlink(filePath);
-      return;
-    } catch (error) {
-      if (!TRANSIENT_RENAME_CODES.has(error?.code) || attempt >= maxRetries) {
-        throw error;
-      }
-      const delayMs = Math.min(maxRetryDelayMs, retryDelayMs * (2 ** attempt));
-      attempt += 1;
-      await sleep(delayMs);
-    }
-  }
+  await retryTransientFileOperation(
+    () => fileSystem.promises.unlink(filePath),
+    options
+  );
 }
 
 function backupCandidates(targetPath, fileSystem) {
@@ -150,7 +168,10 @@ function recoverMissingFileFromBackup(targetPath, options = {}) {
     return { recovered: false, backupPath: null };
   }
   try {
-    fileSystem.renameSync(backup.candidate, targetPath);
+    retryTransientFileOperationSync(
+      () => fileSystem.renameSync(backup.candidate, targetPath),
+      options
+    );
     return { recovered: true, backupPath: backup.candidate };
   } catch (error) {
     if (fileSystem.existsSync(targetPath)) {
@@ -199,21 +220,33 @@ function replaceFileWithBackup(tempPath, targetPath, options = {}) {
 
   const backupPath = nextBackupPath(targetPath, tempPath, fileSystem);
   try {
-    fileSystem.renameSync(targetPath, backupPath);
+    retryTransientFileOperationSync(
+      () => fileSystem.renameSync(targetPath, backupPath),
+      options
+    );
   } catch (error) {
     // A concurrent remover may have made the initial replace conflict stale.
     if (error?.code === 'ENOENT') {
-      fileSystem.renameSync(tempPath, targetPath);
+      retryTransientFileOperationSync(
+        () => fileSystem.renameSync(tempPath, targetPath),
+        options
+      );
       return { usedBackup: false, backupPath: null };
     }
     throw error;
   }
 
   try {
-    fileSystem.renameSync(tempPath, targetPath);
+    retryTransientFileOperationSync(
+      () => fileSystem.renameSync(tempPath, targetPath),
+      options
+    );
   } catch (error) {
     try {
-      fileSystem.renameSync(backupPath, targetPath);
+      retryTransientFileOperationSync(
+        () => fileSystem.renameSync(backupPath, targetPath),
+        options
+      );
     } catch (restoreError) {
       error.recoveryPath = backupPath;
       error.restoreError = restoreError;
@@ -267,8 +300,11 @@ async function replaceFileWithBackupAsync(tempPath, targetPath, options = {}) {
 }
 
 module.exports = {
+  isTransientFileLockError,
   recoverMissingFileFromBackup,
   recoverMissingFileFromBackupAsync,
   replaceFileWithBackup,
   replaceFileWithBackupAsync,
+  retryTransientFileOperation,
+  retryTransientFileOperationSync,
 };

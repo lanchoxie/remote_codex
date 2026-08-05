@@ -8,6 +8,7 @@ const {
 const {
   recoverMissingFileFromBackupAsync,
   replaceFileWithBackupAsync,
+  retryTransientFileOperation,
 } = require('./atomic-file-replace');
 
 const SCHEMA_VERSION = 1;
@@ -31,6 +32,12 @@ function snapshotFailureRequiresReadOnly(error) {
     || code === 'session_store_checksum_gap'
     || code === 'session_store_revision_gap'
   );
+}
+
+function sentinelWriteCanRetryWithoutClosing(error) {
+  return ['EACCES', 'EBUSY', 'EPERM'].includes(error?.code)
+    && !error?.recoveryPath
+    && !error?.restoreError;
 }
 
 class StoreRecoveryError extends Error {
@@ -428,6 +435,7 @@ class SessionRecordStore {
     this.queue = Promise.resolve();
     this.mutationsClosed = null;
     this.lastSnapshotError = null;
+    this.lastSentinelError = null;
     this.sentinelEstablished = false;
     this.needsSecretRewrite = false;
     this.fileReplaceOptions = options.fileReplaceOptions || {};
@@ -770,6 +778,7 @@ class SessionRecordStore {
     try {
       await this.appendWal(envelope);
     } catch (error) {
+      const retryableWithoutMutation = error?.retryableWithoutMutation === true;
       const wrapped = error instanceof StoreRecoveryError
         && error.code === 'session_store_wal_write_failed'
         ? error
@@ -777,11 +786,19 @@ class SessionRecordStore {
           'session_store_wal_write_failed',
           `Unable to append the Session store WAL: ${redactSecretText(error.message || String(error))}`
         );
-      this.mutationsClosed = wrapped.message;
+      wrapped.retryableWithoutMutation = retryableWithoutMutation;
+      if (!retryableWithoutMutation) {
+        this.mutationsClosed = wrapped.message;
+      }
       throw wrapped;
     }
+    // The WAL entry is durable at this point. The sentinel is only a
+    // high-water recovery hint, so a transient Windows lock must not leave
+    // the in-memory projection behind the WAL or close future mutations.
+    this.projection = nextProjection;
     try {
       await this.writeSentinelHighWater(nextProjection, { hasStoreState: true });
+      this.lastSentinelError = null;
     } catch (error) {
       const wrapped = error instanceof StoreRecoveryError
         ? error
@@ -789,10 +806,13 @@ class SessionRecordStore {
           'session_store_sentinel_write_failed',
           `Unable to advance Session store sentinel: ${redactSecretText(error.message || String(error))}`
         );
-      this.mutationsClosed = wrapped.message;
-      throw wrapped;
+      if (sentinelWriteCanRetryWithoutClosing(error)) {
+        this.lastSentinelError = wrapped;
+      } else {
+        this.mutationsClosed = wrapped.message;
+        throw wrapped;
+      }
     }
-    this.projection = nextProjection;
     if (revision % this.snapshotEvery === 0) {
       try {
         await this.writeSnapshot();
@@ -814,13 +834,33 @@ class SessionRecordStore {
   }
 
   async appendWal(envelope) {
-    const handle = await fs.promises.open(this.walPath, 'a');
+    let handle;
+    try {
+      handle = await retryTransientFileOperation(
+        () => this.openWalHandle(),
+        {
+          maxRetries: 12,
+          retryDelayMs: 25,
+          maxRetryDelayMs: 500,
+          ...this.fileReplaceOptions,
+        }
+      );
+    } catch (error) {
+      if (['EACCES', 'EBUSY', 'EPERM'].includes(error?.code)) {
+        error.retryableWithoutMutation = true;
+      }
+      throw error;
+    }
     try {
       await handle.writeFile(`${JSON.stringify(envelope)}\n`, 'utf8');
       await handle.sync();
     } finally {
       await handle.close();
     }
+  }
+
+  openWalHandle() {
+    return fs.promises.open(this.walPath, 'a');
   }
 
   readSnapshot() {
@@ -831,20 +871,25 @@ class SessionRecordStore {
     const snapshotError = this.lastSnapshotError?.message
       ? redactSecretText(this.lastSnapshotError.message)
       : null;
+    const sentinelError = this.lastSentinelError?.message
+      ? redactSecretText(this.lastSentinelError.message)
+      : null;
     if (this.mutationsClosed) {
       return {
         status: 'failed',
         writable: false,
         revision: Number(this.projection.storeRevision || 0),
         snapshotError,
+        sentinelError,
         error: redactSecretText(this.mutationsClosed),
       };
     }
     return {
-      status: snapshotError ? 'degraded' : 'ok',
+      status: snapshotError || sentinelError ? 'degraded' : 'ok',
       writable: true,
       revision: Number(this.projection.storeRevision || 0),
       snapshotError,
+      sentinelError,
       error: null,
     };
   }

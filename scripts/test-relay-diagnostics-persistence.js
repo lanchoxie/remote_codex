@@ -32,5 +32,14 @@ assert(
   /fs\.promises\.writeFile\s*\(\s*SESSION_DIAGNOSTICS_PATH/.test(relay),
   'relay should persist session diagnostics with fs.promises.writeFile'
 );
+assert(
+  /retryTransientFileOperation[\s\S]*fs\.promises\.writeFile\s*\(\s*SESSION_DIAGNOSTICS_PATH/.test(relay),
+  'relay should retry transient Windows locks while persisting diagnostics'
+);
+assert(
+  /sessionDiagnosticsSaveRetryDelayMs/.test(relay)
+    && /sessionDiagnosticsSaveSuppressedWarnings/.test(relay),
+  'relay should back off failed diagnostics saves and suppress repeated warnings'
+);
 
 console.log('relay diagnostics persistence assertions passed');

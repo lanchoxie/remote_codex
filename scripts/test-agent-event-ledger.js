@@ -54,6 +54,28 @@ function main() {
     }
     const bounded = new AgentEventLedger({ filePath, limit: 4, now: () => ++clock });
     assert(bounded.applied.size <= 4, 'ledger replay must remain bounded');
+
+    const lockFixturePath = path.join(root, 'scanner-lock-ledger.jsonl');
+    fs.writeFileSync(lockFixturePath, '{"version":1,"op":"partial"', 'utf8');
+    const locked = new AgentEventLedger({
+      filePath: lockFixturePath,
+      limit: 4,
+      now: () => ++clock,
+      autoLoad: false,
+    });
+    const compactAfterLock = locked.compact.bind(locked);
+    locked.compact = () => {
+      const error = new Error('simulated startup scanner lock');
+      error.code = 'EBUSY';
+      throw error;
+    };
+    assert.doesNotThrow(() => locked.load(), 'a locked startup compaction must not abort Relay startup');
+    assert.strictEqual(locked.compactionRequired, true);
+    locked.compact = compactAfterLock;
+    assert.strictEqual(locked.recordApplied('host-lock|batch-lock', 'digest-lock'), true);
+    assert.strictEqual(locked.compactionRequired, false);
+    const recoveredLocked = new AgentEventLedger({ filePath: lockFixturePath, limit: 4 });
+    assert.strictEqual(recoveredLocked.applied.get('host-lock|batch-lock')?.digest, 'digest-lock');
     console.log('agent event ledger assertions passed');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

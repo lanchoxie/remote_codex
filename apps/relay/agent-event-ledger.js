@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
+  isTransientFileLockError,
   recoverMissingFileFromBackup,
   replaceFileWithBackup,
 } = require('./atomic-file-replace');
@@ -26,6 +27,7 @@ class AgentEventLedger {
     this.applied = new Map();
     this.partial = new Map();
     this.operationCount = 0;
+    this.compactionRequired = false;
     if (options.autoLoad !== false) {
       this.load();
     }
@@ -126,7 +128,12 @@ class AgentEventLedger {
     }
     const pruned = this.enforceBounds();
     if (truncatedTail || pruned || this.operationCount > this.limit * 2) {
-      this.compact();
+      try {
+        this.compact();
+      } catch (error) {
+        if (!isTransientFileLockError(error)) throw error;
+        this.compactionRequired = true;
+      }
     }
   }
 
@@ -144,6 +151,9 @@ class AgentEventLedger {
   }
 
   append(record) {
+    if (this.compactionRequired) {
+      this.compact();
+    }
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     const fd = fs.openSync(this.filePath, 'a');
     try {
@@ -214,7 +224,12 @@ class AgentEventLedger {
   compactIfNeeded() {
     this.enforceBounds();
     if (this.operationCount > this.limit * 2) {
-      this.compact();
+      try {
+        this.compact();
+      } catch (error) {
+        if (!isTransientFileLockError(error)) throw error;
+        this.compactionRequired = true;
+      }
     }
   }
 
@@ -247,6 +262,7 @@ class AgentEventLedger {
       fd = null;
       replaceFileWithBackup(tempPath, this.filePath);
       this.operationCount = records.length;
+      this.compactionRequired = false;
     } finally {
       if (fd != null) fs.closeSync(fd);
       try {

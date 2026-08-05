@@ -8,6 +8,10 @@ const diagnosticsDelayMs = Math.max(
   Number(process.env.RELAY_TEST_DIAGNOSTICS_DELAY_MS || 0) || 0
 );
 const diagnosticsFailOnce = process.env.RELAY_TEST_DIAGNOSTICS_FAIL_ONCE === '1';
+const diagnosticsBusyAttempts = Math.max(
+  0,
+  Number(process.env.RELAY_TEST_DIAGNOSTICS_BUSY_ATTEMPTS || 0) || 0
+);
 const dismissedHostsPath = String(process.env.RELAY_TEST_DISMISSED_HOSTS_PATH || '').trim();
 const dismissedFailureTrigger = String(process.env.RELAY_TEST_DISMISSED_FAILURE_TRIGGER || '').trim();
 
@@ -29,6 +33,11 @@ fs.promises.writeFile = async function injectedPromisesWriteFile(filePath, ...ar
     if (diagnosticsFailOnce && diagnosticsAttempts === 1) {
       const error = new Error('injected diagnostics write failure');
       error.code = 'EIO';
+      throw error;
+    }
+    if (diagnosticsAttempts <= diagnosticsBusyAttempts) {
+      const error = new Error('injected diagnostics scanner lock');
+      error.code = 'EBUSY';
       throw error;
     }
     if (diagnosticsDelayMs > 0 && diagnosticsAttempts === 1) {
