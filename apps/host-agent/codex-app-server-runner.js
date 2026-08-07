@@ -2731,6 +2731,7 @@ class CodexAppServerRunner {
       this.turnBuffers = new Map();
       this.turnAssistantTranscriptEmitted = new Set();
       this.terminalTurnIds = new Set();
+      this.systemErrorsByTurn = new Map();
       this.pendingTurnCompletions = new Map();
       this.turnCompletionFallbackGraceMs = TURN_COMPLETION_FALLBACK_GRACE_MS;
       this.turnBufferTruncated = new Set();
@@ -5235,6 +5236,27 @@ class CodexAppServerRunner {
     return Boolean(normalizedTurnId && this.terminalTurnIds?.has?.(normalizedTurnId));
   }
 
+  rememberSystemErrorTurn(turnId, metadata = {}) {
+    const normalizedTurnId = String(turnId || '').trim();
+    if (!normalizedTurnId) return false;
+    if (!(this.systemErrorsByTurn instanceof Map)) this.systemErrorsByTurn = new Map();
+    this.systemErrorsByTurn.delete(normalizedTurnId);
+    this.systemErrorsByTurn.set(normalizedTurnId, { ...metadata });
+    while (this.systemErrorsByTurn.size > 128) {
+      this.systemErrorsByTurn.delete(this.systemErrorsByTurn.keys().next().value);
+    }
+    return true;
+  }
+
+  takeSystemErrorTurn(turnId) {
+    const normalizedTurnId = String(turnId || '').trim();
+    const metadata = normalizedTurnId
+      ? this.systemErrorsByTurn?.get?.(normalizedTurnId) || null
+      : null;
+    if (metadata) this.systemErrorsByTurn.delete(normalizedTurnId);
+    return metadata;
+  }
+
   async settlePendingInterrupt(intent, result = {}) {
     if (!intent || intent.settled || this.pendingInterruptIntent !== intent) return false;
     intent.settled = true;
@@ -5370,7 +5392,8 @@ class CodexAppServerRunner {
       || this.clientRequestIdsByTurn?.has?.(turnId)
       || this.turnBuffers?.has?.(turnId)
       || this.turnModes?.has?.(turnId)
-      || this.pendingTurnCompletions?.has?.(turnId);
+      || this.pendingTurnCompletions?.has?.(turnId)
+      || this.systemErrorsByTurn?.has?.(turnId);
     if (turnId && ownsTurn) return null;
     const notificationThreadId = String(
       params.threadId
@@ -5493,6 +5516,24 @@ class CodexAppServerRunner {
       const status = params.status || null;
       const type = status?.type || 'unknown';
       if (type === 'systemError') {
+        const concreteTerminalErrorAlreadyPublished = Boolean(
+          !this.activeTurnId
+          && this.runtime.lastCodexError
+          && this.runtime.lastCodexError !== 'systemError'
+          && ['error', 'quota-exhausted'].includes(String(this.runtime.phase || '').toLowerCase())
+          && ['failed', 'error'].includes(String(this.runtime.currentTurnStatus || '').toLowerCase())
+        );
+        if (concreteTerminalErrorAlreadyPublished) {
+          await this.emitDiagnostic({
+            severity: 'info',
+            source: 'codex',
+            kind: 'thread-status',
+            method,
+            message: 'Ignored late systemError status after a concrete terminal Codex error.',
+            data: status,
+          });
+          return;
+        }
         const turnId = params.turnId || this.activeTurnId;
         this.rememberTerminalTurnId(turnId);
         const clientRequestId = this.clientRequestIdForTurn(turnId);
@@ -5504,6 +5545,7 @@ class CodexAppServerRunner {
         const codexError = describeCodexError(
           params.error?.codexErrorInfo || status?.codexErrorInfo || null
         ) || 'systemError';
+        this.rememberSystemErrorTurn(turnId, { clientRequestId });
         let activityFlushError = null;
         try {
           await this.finalizeThinkingActivities({ turnId });
@@ -5541,6 +5583,8 @@ class CodexAppServerRunner {
           turnId: turnId || null,
           clientRequestId,
           message: errorText,
+          codexError,
+          provisionalSystemError: true,
           timestamp: nowIso(),
         });
         await this.emitDiagnostic({
@@ -6017,8 +6061,65 @@ class CodexAppServerRunner {
       }
       const text = pieces.filter(Boolean).join('\n');
       const codexError = describeCodexError(params.error?.codexErrorInfo || null);
+      const pendingSystemError = !params.willRetry
+        ? this.takeSystemErrorTurn(turnId)
+        : null;
+      const refinesCurrentSystemError = Boolean(
+        pendingSystemError
+        && !this.activeTurnId
+        && this.runtime.lastCodexError === 'systemError'
+        && (
+          !this.activeClientRequestId
+          || this.activeClientRequestId === pendingSystemError.clientRequestId
+        )
+      );
       let activityFlushError = null;
       if (!affectsActiveTurn) {
+        if (refinesCurrentSystemError) {
+          await this.emitRuntime({
+            clientRequestId: pendingSystemError.clientRequestId || null,
+            phase: codexError === 'usageLimitExceeded' || codexError === 'contextWindowExceeded'
+              ? 'quota-exhausted'
+              : 'error',
+            activeTurnId: null,
+            busy: false,
+            waitingOnApproval: false,
+            waitingOnUserInput: false,
+            currentTurnStatus: 'failed',
+            pendingInputSummary: null,
+            pendingClientRequestId: null,
+            queuedCommandId: null,
+            queuedInputAt: null,
+            lastError: text,
+            lastCodexError: codexError,
+          });
+          await this.postEvent({
+            type: 'session.error',
+            hostId: this.hostId,
+            sessionId: this.currentSessionId(),
+            runId: this.runId,
+            turnId: turnId || null,
+            clientRequestId: pendingSystemError.clientRequestId || null,
+            message: text,
+            codexError,
+            supersedesProvisionalError: true,
+            timestamp: nowIso(),
+          });
+          await this.emitDiagnostic({
+            severity: 'error',
+            source: 'codex',
+            kind: 'error',
+            method,
+            message: text,
+            detail: codexError || null,
+            data: params.error || null,
+            turnId: turnId || null,
+          });
+          this.releaseTurnBuffer(turnId);
+          this.releaseTurnItemPhases(turnId);
+          this.turnModes.delete(turnId);
+          return;
+        }
         await this.finalizeThinkingActivities({ turnId }).catch(() => {});
         this.releaseTurnBuffer(turnId);
         this.releaseTurnItemPhases(turnId);
@@ -6410,6 +6511,7 @@ class CodexAppServerRunner {
     this.activeTurnId = null;
     this.activeClientRequestId = null;
     this.clientRequestIdsByTurn?.clear?.();
+    this.systemErrorsByTurn?.clear?.();
     this.pendingInterruptIntent = null;
     this.clearTurnBuffers();
     this.turnModes.clear();

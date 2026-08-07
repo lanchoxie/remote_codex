@@ -8883,7 +8883,7 @@ function runtimePatchHasStaleRevision(existing, incoming) {
   );
 }
 
-function setSessionRuntime(hostId, sessionId, runtime) {
+function setSessionRuntime(hostId, sessionId, runtime, options = {}) {
   const key = resolveSessionKey(hostId, sessionId);
   if (!runtime || typeof runtime !== 'object') {
     state.sessionRuntime.delete(key);
@@ -8891,11 +8891,11 @@ function setSessionRuntime(hostId, sessionId, runtime) {
   }
 
   const existing = state.sessionRuntime.get(key) || {};
-  if (runtimePatchHasStaleRevision(existing, runtime)) {
+  if (options.allowStaleRevision !== true && runtimePatchHasStaleRevision(existing, runtime)) {
     return existing;
   }
   const next = {
-    ...existing,
+    ...(options.replace === true ? {} : existing),
     ...runtime,
     updatedAt: runtime.updatedAt || nowIso(),
   };
@@ -9453,14 +9453,24 @@ function appendSessionLog(hostId, sessionId, entry) {
 
 function appendSessionAlert(hostId, sessionId, entry) {
   const key = sessionKey(hostId, sessionId);
-  const existing = state.sessionAlerts.get(key) || [];
+  let existing = state.sessionAlerts.get(key) || [];
+  const turnId = String(entry.turnId || '').trim();
+  if (entry.supersedesProvisionalError === true && turnId) {
+    existing = existing.filter((item) => !(
+      item?.provisionalSystemError === true
+      && String(item.turnId || '').trim() === turnId
+    ));
+  }
   const nextEntry = {
     timestamp: entry.timestamp || nowIso(),
     severity: entry.severity || 'warning',
     source: entry.source || 'runtime',
     message: entry.message || '',
     transient: entry.transient === true,
-    turnId: entry.turnId || null,
+    turnId: turnId || null,
+    codexError: entry.codexError || null,
+    provisionalSystemError: entry.provisionalSystemError === true,
+    supersedesProvisionalError: entry.supersedesProvisionalError === true,
   };
   existing.push(nextEntry);
   state.sessionAlerts.set(
@@ -22057,7 +22067,33 @@ async function applyAgentEvent(event) {
       || inheritedSourceSessionId
       || event.bridgeSessionId
       || effectiveSessionId;
-    const next = event.bridgeSessionId && event.bridgeSessionId !== effectiveSessionId
+    const announcedRuntime = event.runtime && typeof event.runtime === 'object'
+      ? event.runtime
+      : {};
+    const startedRuntimeActive = Boolean(
+      announcedRuntime.busy === true
+      || announcedRuntime.activeTurnId
+      || announcedRuntime.waitingOnApproval === true
+      || announcedRuntime.waitingOnUserInput === true
+    );
+    const startedTimestamp = announcedRuntime.updatedAt || event.timestamp || nowIso();
+    const startedRuntime = {
+      ...announcedRuntime,
+      runId,
+      connection: announcedRuntime.connection || 'ready',
+      phase: announcedRuntime.phase || (startedRuntimeActive ? 'thinking' : 'idle'),
+      busy: announcedRuntime.busy === true,
+      activeTurnId: announcedRuntime.activeTurnId || null,
+      currentTurnStatus: announcedRuntime.currentTurnStatus
+        || (startedRuntimeActive ? 'inProgress' : 'idle'),
+      waitingOnApproval: announcedRuntime.waitingOnApproval === true,
+      waitingOnUserInput: announcedRuntime.waitingOnUserInput === true,
+      queuedCommandId: announcedRuntime.queuedCommandId || null,
+      pendingClientRequestId: announcedRuntime.pendingClientRequestId || null,
+      pendingInputSummary: announcedRuntime.pendingInputSummary || null,
+      updatedAt: startedTimestamp,
+    };
+    let next = event.bridgeSessionId && event.bridgeSessionId !== effectiveSessionId
       ? migrateSessionIdentity(event.hostId, event.bridgeSessionId, effectiveSessionId, {
         title: event.title || effectiveSessionId,
         cwd: event.cwd || null,
@@ -22066,7 +22102,7 @@ async function applyAgentEvent(event) {
         live: true,
         createdAt: event.createdAt || bridgeSession?.createdAt || currentSession?.createdAt || nowIso(),
         messageCount: bridgeSession?.messageCount || currentSession?.messageCount || 0,
-        runtime: event.runtime || null,
+        runtime: startedRuntime,
         runId,
         originSessionId: inheritedOriginSessionId,
         sourceSessionId: inheritedSourceSessionId,
@@ -22089,7 +22125,7 @@ async function applyAgentEvent(event) {
         live: true,
         createdAt: event.createdAt || currentSession?.createdAt || nowIso(),
         messageCount: currentSession?.messageCount || 0,
-        runtime: event.runtime || null,
+        runtime: startedRuntime,
         runId,
         originSessionId: inheritedOriginSessionId,
         sourceSessionId: inheritedSourceSessionId,
@@ -22105,7 +22141,21 @@ async function applyAgentEvent(event) {
         effectiveSelection: confirmedRun?.effectiveSelection || null,
         lastUpdatedAt: nowIso(),
       });
+    const runtime = setSessionRuntime(event.hostId, next.sessionId, startedRuntime, {
+      allowStaleRevision: true,
+      replace: true,
+    });
+    next = upsertSession(event.hostId, {
+      sessionId: next.sessionId,
+      runId,
+      runtime,
+      lastUpdatedAt: startedTimestamp,
+    });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.started', next);
+    broadcastSessionRuntimePatch(event.hostId, effectiveSessionId, runtime, {
+      runId,
+      timestamp: startedTimestamp,
+    });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.snapshot', next);
     return;
   }
@@ -22738,6 +22788,10 @@ async function applyAgentEvent(event) {
       severity: 'error',
       source: 'runtime',
       message,
+      turnId: event.turnId || null,
+      codexError: event.codexError || null,
+      provisionalSystemError: event.provisionalSystemError === true,
+      supersedesProvisionalError: event.supersedesProvisionalError === true,
       timestamp: event.timestamp || nowIso(),
     });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.error', {

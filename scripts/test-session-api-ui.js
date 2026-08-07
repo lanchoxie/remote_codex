@@ -152,6 +152,37 @@ const stateChangedHandler = app.slice(
   app.indexOf("state.eventSource.addEventListener('session.transcript'")
 );
 
+const alertState = { alerts: new Map() };
+const alertHelpers = loadHelpers(['dedupeAlerts', 'appendAlertForSession'], {
+  state: alertState,
+  makeSessionKey: (hostId, sessionId) => `${hostId}::${sessionId}`,
+  rememberSessionCacheValue: () => {},
+});
+alertHelpers.appendAlertForSession('host', 'session', {
+  severity: 'error',
+  message: 'Codex thread entered a system error state.',
+  turnId: 'turn-system-error',
+  provisionalSystemError: true,
+});
+alertHelpers.appendAlertForSession('host', 'session', {
+  severity: 'error',
+  message: 'Selected model is at capacity. Please try a different model.',
+  turnId: 'turn-system-error',
+  codexError: 'serverOverloaded',
+  supersedesProvisionalError: true,
+});
+assert.strictEqual(alertState.alerts.get('host::session')?.length, 1, 'UI must replace a provisional systemError alert');
+assert.strictEqual(
+  alertState.alerts.get('host::session')?.[0]?.codexError,
+  'serverOverloaded',
+  'UI must retain the concrete Codex error code'
+);
+assert(
+  app.includes('!state.fullDiagnosticsLoaded.has(key)')
+  && app.includes('fullDiagnostics: true'),
+  'Load older must fetch the full persisted Thinking history once before expanding the transcript window'
+);
+
 assert(launchBody.includes('resolveLaunchApiConfig'), 'managed launch must resolve fresh versus inherited API ownership');
 assert(launchBody.includes('sessionLaunchIntentKey'), 'managed launch must lock by Host, workspace, mode, and source intent');
 assert(launchBody.includes('getSessionLaunchBusyForIntent'), 'duplicate UI launches must reuse the existing busy intent');

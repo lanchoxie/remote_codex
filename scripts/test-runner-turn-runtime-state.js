@@ -330,6 +330,8 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
     )), 'terminal error runtime must publish a complete inactive turn projection');
 
     setActiveTurn('turn-system-error');
+    runner.activeClientRequestId = 'system-error-client-request';
+    runner.clientRequestIdsByTurn.set('turn-system-error', 'system-error-client-request');
     runner.runtime.waitingOnApproval = true;
     runner.runtime.waitingOnUserInput = true;
     runner.runtime.pendingInputSummary = 'input pending before system error';
@@ -347,9 +349,9 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
     await runner.handleNotification({
       method: 'thread/status/changed',
       params: {
+        threadId: runner.threadId,
         status: {
           type: 'systemError',
-          message: 'thread runtime failed',
         },
       },
     });
@@ -363,7 +365,7 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
     assert.strictEqual(runner.runtime.queuedCommandId, null);
     assert.strictEqual(runner.runtime.currentTurnStatus, 'failed');
     assert.strictEqual(runner.runtime.phase, 'error');
-    assert.strictEqual(runner.runtime.lastError, 'thread runtime failed');
+    assert.strictEqual(runner.runtime.lastError, 'Codex thread entered a system error state.');
     assert.strictEqual(runner.runtime.lastCodexError, 'systemError');
     assert.strictEqual(runner.pendingRequests.size, 0, 'systemError must resolve pending Codex requests');
     assert.strictEqual(
@@ -384,8 +386,110 @@ async function verifyRetryRecoveryAndTerminalErrorState() {
     )), 'systemError must publish failed resolution for pending requests');
     assert(systemErrorEvents.some((event) => (
       event.type === 'session.error'
-      && event.message === 'thread runtime failed'
+      && event.message === 'Codex thread entered a system error state.'
+      && event.provisionalSystemError === true
     )), 'systemError must publish a terminal session.error event');
+
+    const concreteErrorEventStart = events.length;
+    await runner.handleNotification({
+      method: 'error',
+      params: {
+        turnId: 'turn-system-error',
+        willRetry: false,
+        error: {
+          message: 'Selected model is at capacity. Please try a different model.',
+          codexErrorInfo: 'serverOverloaded',
+        },
+      },
+    });
+    const concreteErrorEvents = events.slice(concreteErrorEventStart);
+    assert.strictEqual(runner.runtime.lastError, 'Selected model is at capacity. Please try a different model.');
+    assert.strictEqual(runner.runtime.lastCodexError, 'serverOverloaded');
+    assert(concreteErrorEvents.some((event) => (
+      event.type === 'session.error'
+      && event.supersedesProvisionalError === true
+      && event.codexError === 'serverOverloaded'
+      && event.clientRequestId === 'system-error-client-request'
+    )), 'a concrete late Codex error must supersede the provisional systemError event');
+    assert(!concreteErrorEvents.some((event) => (
+      event.type === 'session.diagnostic'
+      && /Ignored late error for inactive turn/.test(event.message || '')
+    )), 'a concrete error that refines systemError must not be discarded as an inactive-turn error');
+
+    setActiveTurn('turn-system-error-fenced');
+    runner.activeClientRequestId = 'old-system-error-client';
+    runner.clientRequestIdsByTurn.set('turn-system-error-fenced', 'old-system-error-client');
+    await runner.handleNotification({
+      method: 'thread/status/changed',
+      params: {
+        threadId: runner.threadId,
+        status: { type: 'systemError' },
+      },
+    });
+    runner.activeClientRequestId = 'new-turn-client';
+    Object.assign(runner.runtime, {
+      clientRequestId: 'new-turn-client',
+      phase: 'submitting-turn',
+      currentTurnStatus: 'submitting',
+      lastError: null,
+      lastCodexError: null,
+    });
+    const fencedErrorEventStart = events.length;
+    await runner.handleNotification({
+      method: 'error',
+      params: {
+        turnId: 'turn-system-error-fenced',
+        willRetry: false,
+        error: {
+          message: 'late old-turn capacity error',
+          codexErrorInfo: 'serverOverloaded',
+        },
+      },
+    });
+    const fencedErrorEvents = events.slice(fencedErrorEventStart);
+    assert.strictEqual(runner.runtime.clientRequestId, 'new-turn-client');
+    assert.strictEqual(runner.runtime.phase, 'submitting-turn');
+    assert.strictEqual(runner.runtime.lastError, null);
+    assert(!fencedErrorEvents.some((event) => (
+      event.type === 'session.error'
+      && event.message === 'late old-turn capacity error'
+    )), 'a late old-turn error must not replace the runtime or alert for a newer submission');
+    assert(fencedErrorEvents.some((event) => (
+      event.type === 'session.diagnostic'
+      && /Ignored late error for inactive turn/.test(event.message || '')
+    )), 'a fenced old-turn error should retain the inactive-turn diagnostic');
+
+    setActiveTurn('turn-concrete-error-first');
+    await runner.handleNotification({
+      method: 'error',
+      params: {
+        turnId: 'turn-concrete-error-first',
+        willRetry: false,
+        error: {
+          message: 'specific provider failure arrived first',
+          codexErrorInfo: 'serverOverloaded',
+        },
+      },
+    });
+    const lateSystemStatusEventStart = events.length;
+    await runner.handleNotification({
+      method: 'thread/status/changed',
+      params: {
+        threadId: runner.threadId,
+        status: { type: 'systemError' },
+      },
+    });
+    const lateSystemStatusEvents = events.slice(lateSystemStatusEventStart);
+    assert.strictEqual(runner.runtime.lastError, 'specific provider failure arrived first');
+    assert.strictEqual(runner.runtime.lastCodexError, 'serverOverloaded');
+    assert(!lateSystemStatusEvents.some((event) => (
+      event.type === 'session.error'
+      && event.provisionalSystemError === true
+    )), 'a late bare systemError status must not downgrade a concrete terminal error');
+    assert(lateSystemStatusEvents.some((event) => (
+      event.type === 'session.diagnostic'
+      && /Ignored late systemError status/.test(event.message || '')
+    )), 'the ignored reverse-order systemError should remain observable in diagnostics');
 
     setActiveTurn('turn-process-exit');
     runner.runtime.pendingInputSummary = 'stale queued input';

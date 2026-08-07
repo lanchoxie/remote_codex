@@ -284,6 +284,7 @@ const cacheSandbox = {
     thinkingEntryVersions: new Map(),
     thinkingUnread: new Set(),
     fullTranscriptLoaded: new Set(),
+    fullDiagnosticsLoaded: new Set(),
     historyLoading: new Set(),
     messageReadRenderReady: new Set(),
     sessionCacheAccess: new Map(),
@@ -328,6 +329,7 @@ for (const [index, key] of cacheKeys.entries()) {
   cacheSandbox.state.alerts.set(key, [{ message: `${key} alert` }]);
   cacheSandbox.state.transcriptVisibleLimits.set(key, 160);
   cacheSandbox.state.fullTranscriptLoaded.add(key);
+  cacheSandbox.state.fullDiagnosticsLoaded.add(key);
   cacheSandbox.touchSessionCacheKey(key, index + 1);
   cacheSandbox.setSessionCacheWeightComponent(key, 'transcript', cacheSandbox.state.transcripts.get(key));
   cacheSandbox.setSessionCacheWeightComponent(key, 'diagnostics', cacheSandbox.state.diagnostics.get(key));
@@ -342,6 +344,10 @@ assert(!cacheSandbox.state.alerts.has('host::history-0'), 'history cache evictio
 assert(
   !cacheSandbox.state.fullTranscriptLoaded.has('host::history-0'),
   'an evicted history Session must fetch detail again when reopened'
+);
+assert(
+  !cacheSandbox.state.fullDiagnosticsLoaded.has('host::history-0'),
+  'an evicted history Session must fetch full Thinking diagnostics again when older messages are requested'
 );
 assert.strictEqual(
   [...cacheSandbox.state.transcripts.keys()].filter((key) => key.includes('history-')).length,

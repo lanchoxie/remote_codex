@@ -735,7 +735,6 @@ class FakeHost {
           phase: 'idle',
           busy: false,
           activeTurnId: null,
-          currentTurnStatus: 'idle',
         },
       });
   }
@@ -1364,6 +1363,41 @@ async function main() {
     );
     assert.strictEqual(propagatedTransientAlert?.transient, true, 'Relay must preserve transient alert metadata');
     assert.strictEqual(propagatedTransientAlert?.turnId, 'legacy-retry-turn', 'Relay must preserve alert turn identity');
+    const systemErrorTurnId = 'legacy-system-error-turn';
+    await fakeHost.postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      turnId: systemErrorTurnId,
+      message: 'Codex thread entered a system error state.',
+      codexError: 'systemError',
+      provisionalSystemError: true,
+    });
+    await fakeHost.postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      turnId: systemErrorTurnId,
+      message: 'Selected model is at capacity. Please try a different model.',
+      codexError: 'serverOverloaded',
+      supersedesProvisionalError: true,
+    });
+    const refinedSystemErrorDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    const refinedSystemErrorAlerts = refinedSystemErrorDetail.body?.alerts?.filter(
+      (alert) => alert?.turnId === systemErrorTurnId
+    ) || [];
+    assert.strictEqual(refinedSystemErrorAlerts.length, 1, 'specific Codex error must replace the provisional systemError alert');
+    assert.strictEqual(
+      refinedSystemErrorAlerts[0]?.message,
+      'Selected model is at capacity. Please try a different model.'
+    );
+    assert.strictEqual(refinedSystemErrorAlerts[0]?.codexError, 'serverOverloaded');
     const legacyInput = await requestJson(port, 'POST', `/api/sessions/${legacyLiveSessionId}/input`, {
       hostId: HOST_ID,
       text: 'grandfathered live input',
@@ -2832,6 +2866,19 @@ async function main() {
     assert.strictEqual(emptyRuntimeByNewAlias.statusCode, 200, JSON.stringify(emptyRuntimeByNewAlias.body));
     assert.strictEqual(emptyRuntimeByNewAlias.body?.runId, emptyRebound.body?.runId);
     assert.strictEqual(emptyRuntimeByNewAlias.body?.provenance?.conversationKey, emptyFirstStart.conversationKey);
+    const emptyReboundDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${EMPTY_REBIND_SESSION_ID}-native/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(emptyReboundDetail.statusCode, 200, JSON.stringify(emptyReboundDetail.body));
+    assert.strictEqual(emptyReboundDetail.body?.runtime?.runId, emptyRebound.body?.runId);
+    assert.strictEqual(emptyReboundDetail.body?.runtime?.phase, 'idle');
+    assert.strictEqual(
+      emptyReboundDetail.body?.runtime?.currentTurnStatus,
+      'idle',
+      'a live replacement Run must not inherit the parent Run stopping status'
+    );
 
     const duplicateFailureSessionId = 'duplicate-start-failure-alert-session';
     const duplicateFailureStarted = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/sessions/start`, {

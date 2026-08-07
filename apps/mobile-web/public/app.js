@@ -95,6 +95,7 @@ const state = {
   transcriptScrollMachines: new WeakMap(),
   transcriptVisibleLimits: new Map(),
   fullTranscriptLoaded: new Set(),
+  fullDiagnosticsLoaded: new Set(),
   historyLoading: new Set(),
   sessionCacheAccess: new Map(),
   sessionCacheWeights: new Map(),
@@ -2996,6 +2997,7 @@ function evictSessionCacheKey(sessionKey) {
     state.transcriptUnread,
     state.transcriptUserDetached,
     state.fullTranscriptLoaded,
+    state.fullDiagnosticsLoaded,
     state.historyLoading,
     state.messageReadRenderReady,
     state.thinkingUnread,
@@ -7263,6 +7265,9 @@ function dedupeAlerts(entries) {
       hostId: entry.hostId || null,
       transient: entry.transient === true,
       turnId: entry.turnId || null,
+      codexError: entry.codexError || null,
+      provisionalSystemError: entry.provisionalSystemError === true,
+      supersedesProvisionalError: entry.supersedesProvisionalError === true,
     };
     const key = normalized.alertId
       || `${normalized.severity}|${normalized.timestamp || ''}|${normalized.message}`;
@@ -7286,7 +7291,14 @@ function setAlertsForSession(hostId, sessionId, alerts) {
 
 function appendAlertForSession(hostId, sessionId, alert) {
   const key = makeSessionKey(hostId, sessionId);
-  const existing = state.alerts.get(key) || [];
+  let existing = state.alerts.get(key) || [];
+  const turnId = String(alert?.turnId || '').trim();
+  if (alert?.supersedesProvisionalError === true && turnId) {
+    existing = existing.filter((entry) => !(
+      entry?.provisionalSystemError === true
+      && String(entry.turnId || '').trim() === turnId
+    ));
+  }
   const next = dedupeAlerts([...existing, alert]);
   state.alerts.set(key, next);
   rememberSessionCacheValue(key, 'alerts', next);
@@ -24153,6 +24165,9 @@ async function showSession(session = getSelectedSession(), options = {}) {
     }
     mergeDiagnosticsForSession(detailHostId, detailSessionId, getDiagnosticsForSession(session));
     mergeDiagnosticsForSession(detailHostId, detailSessionId, detail.diagnostics || []);
+    if (options.fullDiagnostics) {
+      state.fullDiagnosticsLoaded.add(detailSessionKey);
+    }
     setRequestsForSession(detailHostId, detailSessionId, detail.requests || []);
     setHistoryLoading(session, false);
     setHistoryLoading(detailSession, false);
@@ -29287,6 +29302,24 @@ el('session-log').addEventListener('click', async (event) => {
   const loadOlder = event.target.closest('[data-load-older-transcript]');
   if (loadOlder) {
     const key = loadOlder.dataset.loadOlderTranscript || getSessionKey(getSelectedSession()) || '';
+    const selected = getSelectedSession();
+    if (selected && key && !state.fullDiagnosticsLoaded.has(key)) {
+      loadOlder.disabled = true;
+      const previousText = loadOlder.textContent;
+      loadOlder.textContent = 'Loading older messages and Thinking...';
+      try {
+        await showSession(selected, {
+          fullDiagnostics: true,
+          preserveScroll: true,
+          throwOnError: true,
+        });
+      } catch (error) {
+        reportError(error);
+      } finally {
+        loadOlder.disabled = false;
+        loadOlder.textContent = previousText;
+      }
+    }
     const current = Number(state.transcriptVisibleLimits.get(key) || TRANSCRIPT_RENDER_WINDOW);
     state.transcriptVisibleLimits.set(key, current + TRANSCRIPT_RENDER_INCREMENT);
     renderTranscript(getSelectedSession(), { preserveScroll: true });
