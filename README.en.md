@@ -1,5 +1,14 @@
 # Mobile Codex Remote
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+<p align="center">
+  <img src="docs/assets/readme/mobile-conversation.jpg" alt="Remote Codex running on a phone" width="29%" />
+  <img src="docs/assets/readme/windows-desktop-session.png" alt="Remote Codex running on a PC" width="68%" />
+</p>
+
+The same Remote Codex control plane runs across phone, desktop, Linux, and HPC hosts.
+
 Chinese landing page: [README.md](README.md)
 Detailed Chinese guide: [README.zh-CN.md](README.zh-CN.md)
 Release/update report: [docs/update-report-2026-06-15.md](docs/update-report-2026-06-15.md)

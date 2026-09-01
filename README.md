@@ -1,5 +1,14 @@
 # Remote Codex：手机也能控制 Codex 长任务
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+<p align="center">
+  <img src="docs/assets/readme/mobile-conversation.jpg" alt="手机端实际运行的 Remote Codex 会话" width="29%" />
+  <img src="docs/assets/readme/windows-desktop-session.png" alt="PC 端实际运行的 Remote Codex 会话" width="68%" />
+</p>
+
+手机和 PC/HPC 运行画面：同一个 Remote Codex 控制台可跨设备查看和接管 Codex 长任务。
+
 把 Codex 变成一个可以在手机、Windows、Linux、远程服务器和 HPC 集群之间接力使用的 AI 工作台。
 不用一直守在电脑前：你可以在手机上看进度、接管对话、上传文件、导入历史上下文，并在上下文丢失时一键把当前会话重新附加回 prompt。
 
