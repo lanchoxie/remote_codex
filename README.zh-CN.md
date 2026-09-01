@@ -1,5 +1,14 @@
 # Mobile Codex Remote 中文使用指南
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+<p align="center">
+  <img src="docs/assets/readme/mobile-conversation.jpg" alt="手机端实际运行的 Remote Codex 会话" width="29%" />
+  <img src="docs/assets/readme/windows-desktop-session.png" alt="PC 端实际运行的 Remote Codex 会话" width="68%" />
+</p>
+
+同一个 Remote Codex 控制台可以跨手机、桌面、Linux 和 HPC 主机运行。
+
 中文产品首页：[README.md](README.md)
 English guide: [README.en.md](README.en.md)
 
