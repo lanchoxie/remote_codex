@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const {
   redactSecretText,
   stripSecrets,
@@ -49,12 +50,51 @@ class StoreRecoveryError extends Error {
   }
 }
 
+function isWalCheckpointFailure(error) {
+  const code = String(error?.code || '');
+  return code.startsWith('session_store_wal_')
+    || code === 'session_store_checksum_gap'
+    || code === 'session_store_revision_gap';
+}
+
+function wrapCheckpointFailure(error) {
+  const walFailure = isWalCheckpointFailure(error);
+  if (
+    error instanceof StoreRecoveryError
+    && (walFailure || error.code === 'session_store_snapshot_failed')
+  ) {
+    return { walFailure, error };
+  }
+  return {
+    walFailure,
+    error: new StoreRecoveryError(
+      walFailure ? 'session_store_wal_compaction_failed' : 'session_store_snapshot_failed',
+      walFailure
+        ? `Unable to compact the Session store WAL: ${redactSecretText(error.message || String(error))}`
+        : `Unable to persist Session store snapshot: ${redactSecretText(error.message || String(error))}`
+    ),
+  };
+}
+
 function checksum(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
 function clone(value) {
   return value == null ? value : structuredClone(value);
+}
+
+async function writeFileHandleFully(handle, contents) {
+  const buffer = Buffer.isBuffer(contents) ? contents : Buffer.from(String(contents), 'utf8');
+  let offset = 0;
+  while (offset < buffer.length) {
+    const remaining = buffer.length - offset;
+    const { bytesWritten } = await handle.write(buffer, offset, remaining, null);
+    if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0 || bytesWritten > remaining) {
+      throw new Error('Unable to write complete Session store WAL compaction output.');
+    }
+    offset += bytesWritten;
+  }
 }
 
 function projectionStateChecksum(projection) {
@@ -139,6 +179,9 @@ function defaultRecord(seed = {}) {
     activeRunId: seed.activeRunId || null,
     latestSuccessfulRunId: seed.latestSuccessfulRunId || null,
     runs: clone(seed.runs) || {},
+    // Physical runner cleanup intents survive Relay restarts independently
+    // from the logical run status. Older records simply have no intents.
+    runnerRetirements: clone(seed.runnerRetirements) || {},
     catalog: clone(seed.catalog) || {},
     notification: clone(seed.notification) || {},
     updatedAt: seed.updatedAt || null,
@@ -421,6 +464,10 @@ class SessionRecordStore {
       : null;
     this.snapshotEvery = Math.max(1, Number(options.snapshotEvery || 250));
     this.now = options.now || (() => new Date().toISOString());
+    const configuredWalReadHighWaterMark = Number(options.walReadHighWaterMark);
+    this.walReadHighWaterMark = Number.isFinite(configuredWalReadHighWaterMark)
+      ? Math.max(1, Math.floor(configuredWalReadHighWaterMark))
+      : 64 * 1024;
     this.currentSnapshotPath = path.join(this.rootDir, 'snapshot-current.json');
     this.previousSnapshotPath = path.join(this.rootDir, 'snapshot-previous.json');
     this.nextSnapshotPath = path.join(this.rootDir, 'snapshot-next.json');
@@ -435,6 +482,7 @@ class SessionRecordStore {
     this.queue = Promise.resolve();
     this.mutationsClosed = null;
     this.lastSnapshotError = null;
+    this.lastWalError = null;
     this.lastSentinelError = null;
     this.sentinelEstablished = false;
     this.needsSecretRewrite = false;
@@ -635,61 +683,111 @@ class SessionRecordStore {
     }
   }
 
-  async readWalEntries() {
-    let text;
+  async *iterateWalEntries() {
+    let handle;
     try {
-      text = await fs.promises.readFile(this.walPath, 'utf8');
+      handle = await fs.promises.open(this.walPath, 'r');
     } catch (error) {
       if (error.code === 'ENOENT') {
-        return [];
+        return;
       }
-      throw new StoreRecoveryError('session_store_wal_read_failed', error.message);
+      throw new StoreRecoveryError(
+        'session_store_wal_read_failed',
+        redactSecretText(error.message || String(error))
+      );
     }
-    const entries = [];
-    for (const [index, line] of text.split(/\r?\n/).entries()) {
-      if (!line.trim()) {
-        continue;
+
+    const input = handle.createReadStream({
+      encoding: 'utf8',
+      highWaterMark: this.walReadHighWaterMark,
+      autoClose: false,
+    });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    let lineNumber = 0;
+    let previousWalRevision = null;
+    let iterationError = null;
+    try {
+      for await (const line of lines) {
+        lineNumber += 1;
+        if (!line.trim()) {
+          continue;
+        }
+        let entry;
+        try {
+          entry = JSON.parse(line);
+        } catch (error) {
+          throw new StoreRecoveryError(
+            'session_store_wal_invalid',
+            `Invalid WAL JSON at line ${lineNumber}: ${redactSecretText(error.message)}`
+          );
+        }
+        const revision = Number(entry.revision);
+        if (!entry.payload || !Number.isSafeInteger(revision) || revision !== Number(entry.payload.revision)) {
+          throw new StoreRecoveryError(
+            'session_store_wal_invalid',
+            `Invalid WAL envelope at line ${lineNumber}`
+          );
+        }
+        if (checksum(entry.payload) !== entry.checksum) {
+          throw new StoreRecoveryError(
+            'session_store_checksum_gap',
+            `Invalid WAL checksum at revision ${entry.revision}`
+          );
+        }
+        if (previousWalRevision !== null && revision !== previousWalRevision + 1) {
+          throw new StoreRecoveryError(
+            'session_store_revision_gap',
+            `WAL revision gap between ${previousWalRevision} and ${revision}`
+          );
+        }
+        previousWalRevision = revision;
+        const safePayload = sanitizePayload(entry.payload);
+        if (JSON.stringify(safePayload) !== JSON.stringify(entry.payload)) {
+          this.needsSecretRewrite = true;
+        }
+        yield {
+          ...entry,
+          checksum: checksum(safePayload),
+          payload: safePayload,
+        };
       }
-      let entry;
+    } catch (error) {
+      iterationError = error instanceof StoreRecoveryError
+        ? error
+        : new StoreRecoveryError(
+          'session_store_wal_read_failed',
+          redactSecretText(error.message || String(error))
+        );
+      throw iterationError;
+    } finally {
+      let cleanupError = null;
       try {
-        entry = JSON.parse(line);
+        lines.close();
       } catch (error) {
+        cleanupError = error;
+      }
+      try {
+        input.destroy();
+      } catch (error) {
+        cleanupError ||= error;
+      }
+      try {
+        await handle.close();
+      } catch (error) {
+        cleanupError ||= error;
+      }
+      if (!iterationError && cleanupError) {
         throw new StoreRecoveryError(
-          'session_store_wal_invalid',
-          `Invalid WAL JSON at line ${index + 1}: ${error.message}`
+          'session_store_wal_read_failed',
+          redactSecretText(cleanupError.message || String(cleanupError))
         );
       }
-      if (!entry.payload || Number(entry.revision) !== Number(entry.payload.revision)) {
-        throw new StoreRecoveryError('session_store_wal_invalid', `Invalid WAL envelope at line ${index + 1}`);
-      }
-      if (checksum(entry.payload) !== entry.checksum) {
-        throw new StoreRecoveryError('session_store_checksum_gap', `Invalid WAL checksum at revision ${entry.revision}`);
-      }
-      const safePayload = sanitizePayload(entry.payload);
-      if (JSON.stringify(safePayload) !== JSON.stringify(entry.payload)) {
-        this.needsSecretRewrite = true;
-      }
-      entries.push({
-        ...entry,
-        checksum: checksum(safePayload),
-        payload: safePayload,
-      });
     }
-    return entries;
   }
 
   async replayWal() {
-    const entries = await this.readWalEntries();
-    let previousWalRevision = null;
-    for (const entry of entries) {
+    for await (const entry of this.iterateWalEntries()) {
       const revision = Number(entry.revision);
-      if (previousWalRevision !== null && revision !== previousWalRevision + 1) {
-        throw new StoreRecoveryError(
-          'session_store_revision_gap',
-          `WAL revision gap between ${previousWalRevision} and ${revision}`
-        );
-      }
-      previousWalRevision = revision;
       if (revision <= Number(this.projection.storeRevision || 0)) {
         continue;
       }
@@ -817,12 +915,17 @@ class SessionRecordStore {
       try {
         await this.writeSnapshot();
         this.lastSnapshotError = null;
+        this.lastWalError = null;
       } catch (error) {
-        const wrapped = new StoreRecoveryError(
-          'session_store_snapshot_failed',
-          `Unable to persist Session store snapshot: ${redactSecretText(error.message || String(error))}`
-        );
-        this.lastSnapshotError = wrapped;
+        const checkpointFailure = wrapCheckpointFailure(error);
+        const wrapped = checkpointFailure.error;
+        if (checkpointFailure.walFailure) {
+          this.lastWalError = wrapped;
+          this.lastSnapshotError = null;
+        } else {
+          this.lastSnapshotError = wrapped;
+          this.lastWalError = null;
+        }
         if (snapshotFailureRequiresReadOnly(error)) {
           // The WAL and sentinel already committed this revision. Do not report
           // it as rejected, but stop the next mutation on a broken invariant.
@@ -867,10 +970,97 @@ class SessionRecordStore {
     return clone(this.projection);
   }
 
+  readPendingRunnerRetirementEntries(hostId = '') {
+    const entries = [];
+    const requestedHostId = String(hostId || '').trim();
+    for (const [canonicalKey, record] of Object.entries(this.projection.records)) {
+      if (requestedHostId && String(record?.hostId || '').trim() !== requestedHostId) continue;
+      const retirements = record?.runnerRetirements;
+      if (!retirements) continue;
+      const pending = Object.fromEntries(Object.entries(retirements).filter(([, retirement]) => (
+        retirement && retirement.status !== 'succeeded' && retirement.status !== 'blocked'
+      )));
+      if (!Object.keys(pending).length) continue;
+      entries.push({
+        canonicalKey,
+        hostId: record.hostId,
+        runnerRetirements: clone(pending),
+      });
+    }
+    return entries;
+  }
+
+  readActiveManagedRunEntries(hostId) {
+    const entries = [];
+    for (const [canonicalKey, record] of Object.entries(this.projection.records)) {
+      if (record?.hostId !== hostId || record.source !== 'managed') continue;
+      const runId = String(record.activeRunId || '').trim();
+      const run = runId ? record.runs?.[runId] : null;
+      if (run?.status !== 'live') continue;
+      entries.push({
+        canonicalKey,
+        record: {
+          hostId: record.hostId,
+          source: record.source,
+          activeRunId: runId,
+          bridgeSessionId: record.bridgeSessionId,
+          nativeThreadId: record.nativeThreadId,
+          conversationKey: record.conversationKey,
+          runs: { [runId]: clone(run) },
+        },
+      });
+    }
+    return entries;
+  }
+
+  readDiscoveryIdentityMatches(hostId, identities) {
+    const candidates = new Set((Array.isArray(identities) ? identities : [])
+      .map((value) => String(value || '').trim()).filter(Boolean));
+    if (!hostId || !candidates.size) return [];
+    const prefix = `${hostId}::`;
+    const entries = [];
+    for (const [canonicalKey, record] of Object.entries(this.projection.records)) {
+      if (record?.hostId !== hostId) continue;
+      const recordIdentities = [
+        canonicalKey.startsWith(prefix) ? canonicalKey.slice(prefix.length) : '',
+        record.conversationKey,
+        record.sessionId,
+        record.bridgeSessionId,
+        record.nativeThreadId,
+        record.rolloutSessionId,
+        ...(Array.isArray(record.rolloutSessionIds) ? record.rolloutSessionIds : []),
+      ];
+      if (!recordIdentities.some((value) => candidates.has(String(value || '').trim()))) continue;
+      const activeRunId = String(record.activeRunId || '').trim();
+      const activeRun = activeRunId ? record.runs?.[activeRunId] : null;
+      entries.push({
+        canonicalKey,
+        record: {
+          hostId: record.hostId,
+          source: record.source,
+          conversationKey: record.conversationKey,
+          sessionId: record.sessionId,
+          bridgeSessionId: record.bridgeSessionId,
+          nativeThreadId: record.nativeThreadId,
+          rolloutSessionId: record.rolloutSessionId,
+          rolloutSessionIds: clone(record.rolloutSessionIds),
+          activeRunId,
+          runs: activeRun ? { [activeRunId]: clone(activeRun) } : {},
+          runtime: clone(record.runtime),
+        },
+      });
+    }
+    return entries;
+  }
+
   readHealth() {
     const snapshotError = this.lastSnapshotError?.message
       ? redactSecretText(this.lastSnapshotError.message)
       : null;
+    const walError = this.lastWalError?.message
+      ? redactSecretText(this.lastWalError.message)
+      : null;
+    const walErrorCode = this.lastWalError?.code || null;
     const sentinelError = this.lastSentinelError?.message
       ? redactSecretText(this.lastSentinelError.message)
       : null;
@@ -880,15 +1070,19 @@ class SessionRecordStore {
         writable: false,
         revision: Number(this.projection.storeRevision || 0),
         snapshotError,
+        walError,
+        walErrorCode,
         sentinelError,
         error: redactSecretText(this.mutationsClosed),
       };
     }
     return {
-      status: snapshotError || sentinelError ? 'degraded' : 'ok',
+      status: snapshotError || walError || sentinelError ? 'degraded' : 'ok',
       writable: true,
       revision: Number(this.projection.storeRevision || 0),
       snapshotError,
+      walError,
+      walErrorCode,
       sentinelError,
       error: null,
     };
@@ -935,14 +1129,17 @@ class SessionRecordStore {
       try {
         await this.writeSnapshot();
         this.lastSnapshotError = null;
+        this.lastWalError = null;
       } catch (error) {
-        const wrapped = error instanceof StoreRecoveryError && error.code === 'session_store_snapshot_failed'
-          ? error
-          : new StoreRecoveryError(
-            'session_store_snapshot_failed',
-            `Unable to persist Session store snapshot: ${redactSecretText(error.message || String(error))}`
-        );
-        this.lastSnapshotError = wrapped;
+        const checkpointFailure = wrapCheckpointFailure(error);
+        const wrapped = checkpointFailure.error;
+        if (checkpointFailure.walFailure) {
+          this.lastWalError = wrapped;
+          this.lastSnapshotError = null;
+        } else {
+          this.lastSnapshotError = wrapped;
+          this.lastWalError = null;
+        }
         if (snapshotFailureRequiresReadOnly(error)) {
           this.mutationsClosed = wrapped.message;
         }
@@ -1104,14 +1301,75 @@ class SessionRecordStore {
       return;
     }
     const previousRevision = Number(previous.projection.storeRevision || 0);
-    const entries = await this.readWalEntries();
-    const retained = entries.filter((entry) => Number(entry.revision) > previousRevision);
-    const contents = retained.length
-      ? `${retained.map((entry) => JSON.stringify(entry)).join('\n')}\n`
-      : '';
-    await this.writeSyncedFile(this.nextWalPath, contents);
-    await this.replaceFile(this.nextWalPath, this.walPath);
-    await this.syncDirectory();
+    const currentRevision = Number(this.projection.storeRevision || 0);
+    try {
+      let handle;
+      let writeError = null;
+      let retainedCount = 0;
+      let firstRetainedRevision = null;
+      let lastRetainedRevision = null;
+      try {
+        handle = await fs.promises.open(this.nextWalPath, 'w');
+        for await (const entry of this.iterateWalEntries()) {
+          const revision = Number(entry.revision);
+          if (revision <= previousRevision) {
+            continue;
+          }
+          firstRetainedRevision ??= revision;
+          lastRetainedRevision = revision;
+          retainedCount += 1;
+          await writeFileHandleFully(handle, `${JSON.stringify(entry)}\n`);
+        }
+        const expectedRetainedCount = Math.max(0, currentRevision - previousRevision);
+        if (
+          retainedCount !== expectedRetainedCount
+          || (
+            expectedRetainedCount > 0
+            && (
+              firstRetainedRevision !== previousRevision + 1
+              || lastRetainedRevision !== currentRevision
+            )
+          )
+        ) {
+          throw new StoreRecoveryError(
+            'session_store_revision_gap',
+            `WAL compaction cannot preserve revisions ${previousRevision + 1} through ${currentRevision}.`
+          );
+        }
+        await handle.sync();
+      } catch (error) {
+        writeError = error;
+        throw error;
+      } finally {
+        if (handle) {
+          try {
+            await handle.close();
+          } catch (error) {
+            if (!writeError) {
+              throw error;
+            }
+          }
+        }
+      }
+      await this.replaceFile(this.nextWalPath, this.walPath);
+      await this.syncDirectory();
+    } catch (error) {
+      const wrapped = error instanceof StoreRecoveryError
+        && error.code === 'session_store_wal_compaction_failed'
+        ? error
+        : new StoreRecoveryError(
+          'session_store_wal_compaction_failed',
+          `Unable to compact the Session store WAL: ${redactSecretText(error.message || String(error))}`,
+          { stage: 'compaction', causeCode: error?.code || null }
+        );
+      if (error?.recoveryPath) {
+        wrapped.recoveryPath = error.recoveryPath;
+      }
+      if (error?.restoreError) {
+        wrapped.restoreError = error.restoreError;
+      }
+      throw wrapped;
+    }
   }
 
   async writeSyncedFile(filePath, contents) {

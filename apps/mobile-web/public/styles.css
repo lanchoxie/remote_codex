@@ -1,3 +1,5 @@
+/* Frozen compatibility layer; new presentation lives in ui/*.css. */
+@layer legacy {
 :root {
   color-scheme: dark;
   --bg: #09111f;
@@ -2809,6 +2811,33 @@ select:disabled {
   gap: 10px;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.session-terminal-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.session-terminal-icon {
+  font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.session-terminal-feedback {
+  flex: 1 1 100%;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.session-terminal-feedback[data-status="failed"] {
+  color: var(--danger, #ff8c8c);
 }
 
 .export-thinking-toggle {
@@ -5945,33 +5974,87 @@ button {
     linear-gradient(180deg, rgba(27, 45, 80, 0.72), rgba(14, 25, 48, 0.72));
 }
 
-.conversation-card.live {
+.conversation-card.live-idle,
+.conversation-card.runtime-active {
   border-color: rgba(169, 191, 235, 0.16);
 }
 
-.conversation-live-dot {
+.conversation-runtime-dot {
   position: absolute;
   top: 11px;
   right: 11px;
   width: 9px;
   height: 9px;
   border-radius: 999px;
-  background: #22c55e;
-  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.14), 0 0 16px rgba(34, 197, 94, 0.42);
-  animation: live-session-pulse 1.9s ease-in-out infinite;
   pointer-events: none;
 }
 
-.conversation-card.message-unread::after {
-  content: "";
+.conversation-runtime-dot.history {
+  background: #94a3b8;
+  box-shadow: 0 0 0 4px rgba(148, 163, 184, 0.12);
+}
+
+.conversation-error-badge {
   position: absolute;
-  top: 11px;
-  right: 28px;
+  top: 6px;
+  right: 56px;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #b42318;
+  color: #fff;
+  font: bold 13px/1 system-ui;
+}
+
+.conversation-runtime-dot.live-idle {
+  background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.14), 0 0 16px rgba(34, 197, 94, 0.32);
+}
+
+.conversation-runtime-dot.runtime-active {
+  background: #facc15;
+  box-shadow: 0 0 0 4px rgba(250, 204, 21, 0.14), 0 0 16px rgba(250, 204, 21, 0.42);
+  animation: live-session-pulse 1.35s ease-in-out infinite;
+}
+
+.conversation-unread-button {
+  position: absolute;
+  top: 1px;
+  right: 22px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.conversation-unread-button::before {
+  content: "";
+  display: block;
   width: 9px;
   height: 9px;
   border-radius: 999px;
   background: #ef4444;
   box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.12), 0 0 16px rgba(239, 68, 68, 0.32);
+}
+
+.conversation-unread-button:hover,
+.conversation-unread-button:focus-visible {
+  background: transparent;
+  box-shadow: none;
+}
+
+.conversation-unread-button:focus-visible {
+  outline: 2px solid rgba(239, 68, 68, 0.72);
+  outline-offset: -3px;
 }
 
 @keyframes live-session-pulse {
@@ -5982,6 +6065,12 @@ button {
   50% {
     transform: scale(1.16);
     opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-runtime-dot.runtime-active {
+    animation: none;
   }
 }
 
@@ -6420,6 +6509,10 @@ button {
     padding: 8px 11px;
   }
 
+  .detail-actions .session-terminal-button {
+    min-height: 44px;
+  }
+
   .unified-session-panel {
     padding: 10px;
   }
@@ -6486,10 +6579,22 @@ button {
   background: rgba(130, 247, 208, 0.08);
 }
 
-#toggle-alerts-button:not(.hidden) {
+#toggle-alerts-button.has-current-warning:not(.hidden) {
   border-color: rgba(255, 145, 64, 0.42);
   background: rgba(255, 145, 64, 0.14);
   color: #ff9f43;
+}
+
+#toggle-alerts-button.has-current-error:not(.hidden) {
+  border-color: rgba(255, 131, 148, 0.48);
+  background: rgba(255, 131, 148, 0.14);
+  color: #ff8394;
+}
+
+#toggle-alerts-button.has-current-error::before {
+  content: '!';
+  font-weight: bold;
+  margin-right: 5px;
 }
 
 .message-notification-anchor {
@@ -8023,3 +8128,4 @@ html[data-theme="minimal-light"] .conversation-card.active .conversation-card-ac
     min-height: 44px;
   }
 }
+} /* legacy */

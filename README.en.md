@@ -3,15 +3,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <p align="center">
-  <img src="docs/assets/readme/mobile-conversation.jpg" alt="Remote Codex running on a phone" width="29%" />
-  <img src="docs/assets/readme/windows-desktop-session.png" alt="Remote Codex running on a PC" width="68%" />
+  <img src="docs/assets/readme/workspace-mobile-chat-2026.png" alt="Mobile conversation, reasoning, and composer" width="27%" />
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="Updated desktop workspace and conversation" width="70%" />
 </p>
 
-The same Remote Codex control plane runs across phone, desktop, Linux, and HPC hosts.
+These updated UI screenshots use isolated sample data. The same Remote Codex control plane runs across phone, desktop, Linux, and HPC hosts.
 
 Chinese landing page: [README.md](README.md)
 Detailed Chinese guide: [README.zh-CN.md](README.zh-CN.md)
-Release/update report: [docs/update-report-2026-06-15.md](docs/update-report-2026-06-15.md)
+Release notes: [docs/releases/v2.4.12.md](docs/releases/v2.4.12.md)
 
 Mobile Codex Remote is a browser control plane for Codex sessions running on local computers, remote Linux hosts, and HPC clusters. It gives you one web UI for starting, resuming, forking, steering, interrupting, reviewing, exporting, importing, and monitoring Codex work from a desktop browser or phone.
 
@@ -65,10 +65,10 @@ git clone https://github.com/lanchoxie/remote_codex.git
 cd remote_codex
 ```
 
-The project currently uses built-in Node.js modules only, so there is usually no install step. If dependencies are added later, run:
+Install the locked dependencies before the first start:
 
 ```bash
-npm install
+npm ci
 ```
 
 ## Updating Without Losing Local Data
@@ -128,13 +128,7 @@ Keep the relay and host-agent windows open while using the app.
 The Windows desktop UI is the same browser app used on phones, but the wider layout shows the navigator, transcript, file cards, and settings at the same time. After launching, choose your local Windows host, for example `ILLUIN Windows`, from the left `Current Host` selector.
 
 <p align="center">
-  <img src="docs/assets/readme/windows-desktop-session.png" alt="Windows desktop session, file preview, and control bar" width="48%" />
-  <img src="docs/assets/readme/windows-host-manager.png" alt="Windows host manager and local restart controls" width="30%" />
-</p>
-<p align="center">
-  <img src="docs/assets/readme/windows-api-profiles.png" alt="Windows API profiles and host mapping settings" width="32%" />
-  <img src="docs/assets/readme/windows-export-options.png" alt="Windows conversation export options" width="32%" />
-  <img src="docs/assets/readme/windows-history-attachments.png" alt="Windows history import and export attachments" width="32%" />
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="Updated Windows desktop workspace" width="90%" />
 </p>
 
 Common Windows-side workflows:

@@ -7,8 +7,14 @@ const {
   describeRolloutAssistantRow,
   isRolloutAssistantMirrorPair,
 } = require('./assistant-message-identity');
+const { safeStructuredJson } = require('./structured-text');
 
 const DEFAULT_MAX_BYTES_PER_POLL = 4 * 1024 * 1024;
+// A seed is performed only when a Session first becomes watched (or its
+// ownership revision changes), so it can afford a larger bounded context than
+// the steady-state poll.  Files beyond this bound are treated as having an
+// unknown prefix and are handled fail-closed below.
+const DEFAULT_MAX_BYTES_PER_SEED = 16 * 1024 * 1024;
 const DEFAULT_MAX_EVENTS_PER_BATCH = 64;
 const DEFAULT_ASSISTANT_MIRROR_GRACE_MS = 250;
 
@@ -19,6 +25,10 @@ class CodexSessionTailer {
     this.postEvent = options.postEvent;
     this.postEvents = typeof options.postEvents === 'function' ? options.postEvents : null;
     this.maxBytesPerPoll = Number(options.maxBytesPerPoll || DEFAULT_MAX_BYTES_PER_POLL);
+    this.maxBytesPerSeed = Math.max(
+      1,
+      Number(options.maxBytesPerSeed ?? DEFAULT_MAX_BYTES_PER_SEED)
+    );
     this.maxEventsPerBatch = Math.max(1, Number(options.maxEventsPerBatch || DEFAULT_MAX_EVENTS_PER_BATCH));
     this.assistantCursorIndex = options.assistantCursorIndex || null;
     this.assistantMirrorGraceMs = Math.max(
@@ -53,8 +63,19 @@ class CodexSessionTailer {
         lastStatSize: stats.size,
         lastMtimeMs: Number(stats.mtimeMs),
         pendingAssistantMirror: null,
+        previousRolloutRow: null,
         rolloutActivityOwner: null,
         rolloutActivityTurnId: null,
+        rolloutActivitySeedKey: null,
+        rolloutReviewParentTurnId: null,
+        rolloutReviewParentManaged: false,
+        rolloutReviewChildTurnId: null,
+        rolloutReviewChildTurnIds: [],
+        rolloutReviewContexts: [],
+        rolloutReviewExitObserved: false,
+        rolloutReviewParentTerminalObserved: false,
+        managedTurnOwnershipRevision: session.managedTurnOwnershipRevision || null,
+        watchIdentity: sessionWatchIdentity(session),
         primed: true,
       });
     }
@@ -83,17 +104,51 @@ class CodexSessionTailer {
           lastStatSize: stats?.size || 0,
           lastMtimeMs: stats ? Number(stats.mtimeMs) : null,
           pendingAssistantMirror: null,
+          previousRolloutRow: null,
           rolloutActivityOwner: null,
           rolloutActivityTurnId: null,
+          rolloutActivitySeedKey: null,
+          rolloutReviewParentTurnId: null,
+          rolloutReviewParentManaged: false,
+          rolloutReviewChildTurnId: null,
+          rolloutReviewChildTurnIds: [],
+          rolloutReviewContexts: [],
+          rolloutReviewExitObserved: false,
+          rolloutReviewParentTerminalObserved: false,
+          managedTurnOwnershipRevision: normalized.managedTurnOwnershipRevision || null,
+          watchIdentity: sessionWatchIdentity(normalized),
           primed: true,
         };
         this.files.set(normalized.rolloutPath, state);
         this.seedWatchedActivity(state, normalized);
       } else {
+        const previousSession = existing.session || null;
         const wasLiveManaged = existing.session?.live === true
           && existing.session?.transcriptOwner === 'managed-runner';
+        const previousWatchIdentity = existing.watchIdentity
+          || sessionWatchIdentity(previousSession);
+        const nextWatchIdentity = sessionWatchIdentity(normalized);
+        const watchIdentityChanged = previousWatchIdentity !== nextWatchIdentity;
+        if (watchIdentityChanged) {
+          this.reconcileSessionWatchChange(existing, previousSession, normalized);
+        }
         existing.session = { ...existing.session, ...normalized };
+        const nextOwnershipRevision = normalized.managedTurnOwnershipRevision || null;
+        const ownershipRevisionChanged = existing.managedTurnOwnershipRevision
+          !== nextOwnershipRevision;
+        existing.managedTurnOwnershipRevision = nextOwnershipRevision;
+        existing.watchIdentity = nextWatchIdentity;
         if (!wasLiveManaged && normalized.live === true && normalized.transcriptOwner === 'managed-runner') {
+          this.seedWatchedActivity(existing, normalized);
+        } else if (
+          wasLiveManaged
+          && normalized.live === true
+          && normalized.transcriptOwner === 'managed-runner'
+          && (ownershipRevisionChanged || watchIdentityChanged)
+        ) {
+          // Runner ownership maps are populated and retired asynchronously.
+          // Re-seed only when their explicit revision changes so a new
+          // callback closure does not rescan the rollout every poll.
           this.seedWatchedActivity(existing, normalized);
         }
       }
@@ -108,20 +163,134 @@ class CodexSessionTailer {
     return this.watchedSessions.size;
   }
 
+  reconcileSessionWatchChange(state, previousSession, nextSession) {
+    const previousTurnId = state?.rolloutActivityOwner === 'external-terminal'
+      ? String(state.rolloutActivityTurnId || '').trim()
+      : '';
+    if (previousTurnId && previousSession) {
+      // Close the projection under the old Run identity before replacing the
+      // callback/runner.  Using the old Session metadata prevents a stale
+      // terminal from accidentally clearing a newer Run at the Relay.
+      const terminal = this.makeExternalActivityTerminalEvent(previousSession, {
+        turnId: previousTurnId,
+        terminalPhase: 'idle',
+        row: { timestamp: new Date().toISOString() },
+      });
+      if (terminal) {
+        this.pendingEvents.push(terminal);
+      }
+    }
+    clearRolloutActivityState(state);
+    state.watchIdentity = sessionWatchIdentity(nextSession);
+  }
+
   seedWatchedActivity(state, session) {
-    if (session?.live !== true || session?.transcriptOwner !== 'managed-runner') return;
-    const activity = seedRolloutActivity(session.rolloutPath, session);
-    if (!activity) return;
+    if (session?.live !== true || session?.transcriptOwner !== 'managed-runner') {
+      return;
+    }
+    const activity = seedRolloutActivity(session.rolloutPath, session, this.maxBytesPerSeed);
+    if (!activity) {
+      const previousExternalTurnId = state.rolloutActivityOwner === 'external-terminal'
+        ? String(state.rolloutActivityTurnId || '').trim()
+        : '';
+      if (previousExternalTurnId) {
+        // The refreshed ownership map now proves that the previously seeded
+        // Turn is not an external activity (or that it has already settled).
+        // Retract that exact identity; the Relay performs a second CAS check
+        // before accepting the correction.
+        this.pendingEvents.push(this.makeExternalActivityTerminalEvent(session, {
+          turnId: previousExternalTurnId,
+          terminalPhase: 'idle',
+          row: { timestamp: new Date().toISOString() },
+        }));
+      }
+      clearRolloutActivityState(state);
+      return;
+    }
+    const seedHasUnknownPrefix = activity.contextComplete === false;
+    const reviewContextRecovered = Boolean(activity.reviewParentTurnId);
+    if (activity.terminal === true && activity.owner === 'external-terminal') {
+      if (seedHasUnknownPrefix && !reviewContextRecovered) {
+        // The candidate started before the bounded seed window.  Without its
+        // preceding lifecycle markers we cannot distinguish an external
+        // terminal from a Review child, so do not manufacture a terminal
+        // transition on a live managed Session.
+        return;
+      }
+      const seedKey = `terminal:${activity.turnId || ''}:${activity.row?.timestamp || ''}`;
+      if (state.rolloutActivitySeedKey === seedKey) {
+        return;
+      }
+      state.rolloutActivitySeedKey = seedKey;
+      this.pendingEvents.push(this.makeExternalActivityTerminalEvent(session, activity));
+      clearRolloutActivityState(state, { clearSeed: false });
+      return;
+    }
+    const previousExternalTurnId = state.rolloutActivityOwner === 'external-terminal'
+      ? String(state.rolloutActivityTurnId || '').trim()
+      : '';
+    if (seedHasUnknownPrefix && !reviewContextRecovered) {
+      // Do not retain a newly inferred external owner when the seed starts in
+      // the middle of the rollout.  Otherwise a later task_complete row could
+      // emit a lone `active=false` for an activity for which no `active=true`
+      // event was ever published.
+      if (!previousExternalTurnId) {
+        clearRolloutActivityState(state, { clearSeed: false, clearReview: false });
+      }
+      return;
+    }
+    if (previousExternalTurnId && activity.owner !== 'external-terminal') {
+      // A late ownership update can prove that an activity previously
+      // projected as external was actually managed. Retract only that exact
+      // old identity; Relay-side CAS protects a newer external Turn.
+      this.pendingEvents.push(this.makeExternalActivityTerminalEvent(session, {
+        turnId: previousExternalTurnId,
+        terminalPhase: 'idle',
+        row: activity.row || {},
+      }));
+    }
     state.rolloutActivityOwner = activity.owner;
     state.rolloutActivityTurnId = activity.turnId;
-    if (activity.owner !== 'external-terminal') return;
+    state.rolloutReviewParentTurnId = activity.reviewParentTurnId || null;
+    state.rolloutReviewParentManaged = activity.reviewParentManaged === true;
+    state.rolloutReviewChildTurnId = activity.reviewChildTurnId || null;
+    state.rolloutReviewChildTurnIds = Array.isArray(activity.reviewChildTurnIds)
+      ? activity.reviewChildTurnIds.slice()
+      : (activity.reviewChildTurnId ? [activity.reviewChildTurnId] : []);
+    state.rolloutReviewExitObserved = activity.reviewExitObserved === true;
+    state.rolloutReviewParentTerminalObserved = activity.reviewParentTerminalObserved === true;
+    if (activity.owner !== 'external-terminal') {
+      return;
+    }
     const seedKey = `${activity.turnId || ''}:${activity.row?.timestamp || ''}`;
-    if (state.rolloutActivitySeedKey === seedKey) return;
+    if (state.rolloutActivitySeedKey === seedKey) {
+      return;
+    }
     state.rolloutActivitySeedKey = seedKey;
     for (const event of makeCodexRowEvents(activity.row)) {
       const payload = this.makeSessionEvent(session, event, activity.row, activity);
-      if (payload) this.pendingEvents.push(payload);
+      if (payload) {
+        this.pendingEvents.push(payload);
+      }
     }
+  }
+
+  makeExternalActivityTerminalEvent(session, ownership, row = ownership?.row || {}) {
+    const terminalPhase = ownership?.terminalPhase === 'interrupted' ? 'interrupted' : 'idle';
+    const terminalStatus = terminalPhase === 'interrupted' ? 'interrupted' : 'completed';
+    return this.makeSessionEvent(session, {
+      type: 'session.runtime_updated',
+      patch: {
+        phase: terminalPhase,
+        busy: false,
+        activeTurnId: null,
+        currentTurnStatus: terminalStatus,
+      },
+    }, row, {
+      owner: 'external-terminal',
+      turnId: ownership?.turnId || null,
+      terminal: true,
+    });
   }
 
   async poll() {
@@ -151,18 +320,39 @@ class CodexSessionTailer {
           lastStatSize: stats?.size || 0,
           lastMtimeMs: stats ? Number(stats.mtimeMs) : null,
           pendingAssistantMirror: null,
+          previousRolloutRow: null,
           rolloutActivityOwner: null,
           rolloutActivityTurnId: null,
+          rolloutActivitySeedKey: null,
+          rolloutReviewParentTurnId: null,
+          rolloutReviewParentManaged: false,
+          rolloutReviewChildTurnId: null,
+          rolloutReviewChildTurnIds: [],
+          rolloutReviewContexts: [],
+          rolloutReviewExitObserved: false,
+          rolloutReviewParentTerminalObserved: false,
+          managedTurnOwnershipRevision: session.managedTurnOwnershipRevision || null,
+          watchIdentity: sessionWatchIdentity(session),
           primed: true,
         };
         this.files.set(session.rolloutPath, state);
         newSessionCount += 1;
         continue;
       } else {
+        const previousSession = state.session || null;
+        const nextWatchIdentity = sessionWatchIdentity(session);
+        const watchIdentityChanged = (state.watchIdentity || sessionWatchIdentity(previousSession)) !== nextWatchIdentity;
+        if (watchIdentityChanged) {
+          this.reconcileSessionWatchChange(state, previousSession, session);
+        }
         state.session = {
           ...state.session,
           ...session,
         };
+        state.watchIdentity = nextWatchIdentity;
+        if (watchIdentityChanged) {
+          this.seedWatchedActivity(state, session);
+        }
       }
 
       const stats = safeStat(session.rolloutPath);
@@ -206,9 +396,16 @@ class CodexSessionTailer {
         appendRowEvents(pending.row, pending.events, pending.ownership);
         return true;
       };
-      if (identityChanged || sameSizeRewrite || fileTruncated) {
+      if (sameSizeRewrite) {
+        // Rollout files are append-only from the tailer's perspective. A
+        // same-length mtime change cannot contain a new append, so rewinding
+        // to byte zero would only rebroadcast history. Full-detail discovery
+        // owns reconciliation when another process rewrites existing bytes.
+        replaced = true;
+      }
+      if (identityChanged || fileTruncated) {
         resetTailState(state, nextFileIdentity);
-        replaced = replaced || identityChanged || sameSizeRewrite;
+        replaced = replaced || identityChanged;
         truncated = truncated || fileTruncated;
       }
       if (stats.size === state.offset) {
@@ -238,6 +435,7 @@ class CodexSessionTailer {
           row = JSON.parse(trimmed);
         } catch (_) {
           flushPendingAssistantMirror();
+          state.previousRolloutRow = null;
           continue;
         }
         if (state.pendingAssistantMirror) {
@@ -248,6 +446,17 @@ class CodexSessionTailer {
           }
         }
         const ownership = observeRolloutRowOwnership(state, session, row);
+        if (ownership?.activityClosure?.turnId) {
+          const terminalPayload = this.makeExternalActivityTerminalEvent(
+            session,
+            ownership.activityClosure,
+            row
+          );
+          if (terminalPayload) {
+            fileEvents.push(terminalPayload);
+            emittedEvents += 1;
+          }
+        }
         const events = makeCodexRowEvents(row, {
           nativeThreadId: session.nativeThreadId || session.sessionId,
           rolloutPath: session.rolloutPath,
@@ -255,7 +464,13 @@ class CodexSessionTailer {
           sourceOrdinal: lineEntry.sourceOrdinal,
           observedAt: new Date().toISOString(),
         });
-        if (describeRolloutAssistantRow(row)?.kind === 'event') {
+        const assistantRow = describeRolloutAssistantRow(row);
+        const reverseAssistantMirror = Boolean(
+          assistantRow?.kind === 'event'
+          && state.previousRolloutRow
+          && isRolloutAssistantMirrorPair(row, state.previousRolloutRow)
+        );
+        if (assistantRow?.kind === 'event' && !reverseAssistantMirror) {
           state.pendingAssistantMirror = {
             row,
             events,
@@ -263,10 +478,14 @@ class CodexSessionTailer {
             queuedAtMs: this.nowMs(),
           };
           finishRolloutRowOwnership(state, ownership);
+          state.previousRolloutRow = row;
           continue;
         }
-        appendRowEvents(row, events, ownership);
+        if (!reverseAssistantMirror) {
+          appendRowEvents(row, events, ownership);
+        }
         finishRolloutRowOwnership(state, ownership);
+        state.previousRolloutRow = row;
       }
       state.offset = readResult.nextOffset;
       state.lastStatSize = stats.size;
@@ -338,7 +557,7 @@ class CodexSessionTailer {
 
     const externalTerminalActivity = ownership?.owner === 'external-terminal';
     if (session.live === true && event.type === 'session.runtime_updated') {
-      if (!externalTerminalActivity) {
+      if (!externalTerminalActivity || ownership?.suppressRuntime === true) {
         return null;
       }
       const phase = String(event.patch?.phase || '').trim() || null;
@@ -384,6 +603,10 @@ class CodexSessionTailer {
         ...base,
         type: 'session.transcript',
         ...(event.entry || {}),
+        ...(externalTerminalActivity ? {
+          activityOwner: 'external-terminal',
+          turnId: ownership.turnId || event.entry?.turnId || null,
+        } : {}),
       };
     }
 
@@ -486,74 +709,549 @@ function normalizeTailSession(session) {
   };
 }
 
+function identityValue(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  if (typeof value === 'object') {
+    return safeStructuredJson(value) || null;
+  }
+  return String(value);
+}
+
+function sessionWatchIdentity(session) {
+  if (!session) {
+    return null;
+  }
+  const runner = session?.runner && typeof session.runner === 'object' ? session.runner : {};
+  const ownerCallback = typeof session?.managedTurnOwnership === 'function'
+    ? session.managedTurnOwnership
+    : session?.managedTurnOwner;
+  return JSON.stringify([
+    identityValue(session?.sessionId),
+    identityValue(session?.nativeThreadId),
+    identityValue(session?.rolloutPath),
+    identityValue(session?.runId ?? runner.runId),
+    identityValue(
+      session?.managedRunnerId
+      ?? session?.runnerId
+      ?? session?.runnerInstanceId
+      ?? session?.agentInstanceId
+      ?? session?.ownerInstanceId
+      ?? runner.id
+      ?? runner.runnerId
+      ?? runner.instanceId
+    ),
+    identityValue(
+      session?.managedTurnOwnershipRevision
+      ?? session?.managedTurnOwnerRevision
+      ?? session?.ownershipRevision
+      ?? runner.managedTurnOwnershipRevision
+      ?? runner.ownershipRevision
+      ?? ownerCallback?.ownershipRevision
+      ?? ownerCallback?.revision
+    ),
+    identityValue(
+      session?.lifecycleGeneration
+      ?? session?.managedLifecycleGeneration
+      ?? runner.lifecycleGeneration
+      ?? runner.turnLifecycleGeneration
+    ),
+  ]);
+}
+
+function clearRolloutActivityState(state, options = {}) {
+  if (!state) {
+    return;
+  }
+  state.rolloutActivityOwner = null;
+  state.rolloutActivityTurnId = null;
+  if (options.clearReview !== false) {
+    state.rolloutReviewParentTurnId = null;
+    state.rolloutReviewParentManaged = false;
+    state.rolloutReviewChildTurnId = null;
+    state.rolloutReviewChildTurnIds = [];
+    state.rolloutReviewContexts = [];
+    state.rolloutReviewExitObserved = false;
+    state.rolloutReviewParentTerminalObserved = false;
+  }
+  if (options.clearSeed !== false) {
+    state.rolloutActivitySeedKey = null;
+  }
+}
+
 function rolloutRowLifecycle(row) {
   const payload = row?.payload && typeof row.payload === 'object' ? row.payload : {};
   const type = row?.type === 'event_msg' ? String(payload.type || '').trim() : '';
   return {
+    type,
     turnId: String(payload.turn_id || payload.turnId || '').trim() || null,
     started: type === 'task_started',
     terminal: type === 'task_complete' || type === 'turn_aborted',
+    reviewEntered: type === 'entered_review_mode',
+    reviewExited: type === 'exited_review_mode',
   };
 }
 
-function seedRolloutActivity(filePath, session, maxBytes = DEFAULT_MAX_BYTES_PER_POLL) {
-  if (!filePath || !fs.existsSync(filePath)) return null;
+function ensureReviewState(state) {
+  if (!Array.isArray(state.rolloutReviewContexts)) {
+    state.rolloutReviewContexts = [];
+  }
+  if (!Array.isArray(state.rolloutReviewChildTurnIds)) {
+    state.rolloutReviewChildTurnIds = [];
+  }
+  return state.rolloutReviewContexts;
+}
+
+function reviewParentIdFromRow(row) {
+  const payload = row?.payload && typeof row.payload === 'object' ? row.payload : {};
+  return String(
+    payload.parent_turn_id
+    || payload.parentTurnId
+    || payload.review_parent_turn_id
+    || payload.reviewParentTurnId
+    || payload.source?.parent_turn_id
+    || payload.source?.parentTurnId
+    || ''
+  ).trim() || null;
+}
+
+function activeReviewContext(state, parentTurnId = null) {
+  const contexts = ensureReviewState(state);
+  const requested = String(parentTurnId || '').trim();
+  if (requested) {
+    for (let index = contexts.length - 1; index >= 0; index -= 1) {
+      if (contexts[index].parentTurnId === requested) {
+        return contexts[index];
+      }
+    }
+    return null;
+  }
+  for (let index = contexts.length - 1; index >= 0; index -= 1) {
+    if (!contexts[index].exitObserved || !contexts[index].parentTerminalObserved) {
+      return contexts[index];
+    }
+  }
+  return null;
+}
+
+function reviewContextForChild(state, childTurnId) {
+  const normalized = String(childTurnId || '').trim();
+  if (!normalized) return null;
+  const contexts = ensureReviewState(state);
+  for (let index = contexts.length - 1; index >= 0; index -= 1) {
+    if (contexts[index].childTurnIds.includes(normalized)) {
+      return contexts[index];
+    }
+  }
+  return null;
+}
+
+function syncLegacyReviewState(state, context) {
+  if (!context) {
+    state.rolloutReviewParentTurnId = null;
+    state.rolloutReviewParentManaged = false;
+    state.rolloutReviewChildTurnId = null;
+    state.rolloutReviewChildTurnIds = [];
+    state.rolloutReviewExitObserved = false;
+    state.rolloutReviewParentTerminalObserved = false;
+    return;
+  }
+  state.rolloutReviewParentTurnId = context.parentTurnId || null;
+  state.rolloutReviewParentManaged = context.managed === true;
+  state.rolloutReviewChildTurnIds = context.childTurnIds.slice();
+  state.rolloutReviewChildTurnId = context.childTurnIds.length
+    ? context.childTurnIds[context.childTurnIds.length - 1]
+    : null;
+  state.rolloutReviewExitObserved = context.exitObserved === true;
+  state.rolloutReviewParentTerminalObserved = context.parentTerminalObserved === true;
+}
+
+function openReviewContext(state, parentTurnId, managed = true) {
+  const contexts = ensureReviewState(state);
+  const normalized = String(parentTurnId || '').trim();
+  if (!normalized) return null;
+  let context = activeReviewContext(state, normalized);
+  if (!context) {
+    context = {
+      parentTurnId: normalized,
+      managed: managed !== false,
+      childTurnIds: [],
+      terminalChildTurnIds: [],
+      exitObserved: false,
+      parentTerminalObserved: false,
+    };
+    contexts.push(context);
+  } else {
+    context.managed = context.managed || managed !== false;
+  }
+  syncLegacyReviewState(state, context);
+  return context;
+}
+
+function removeReviewContext(state, context) {
+  const contexts = ensureReviewState(state);
+  const index = contexts.indexOf(context);
+  if (index >= 0) contexts.splice(index, 1);
+  const fallback = activeReviewContext(state);
+  syncLegacyReviewState(state, fallback);
+}
+
+function seedRolloutActivity(filePath, session, maxBytes = DEFAULT_MAX_BYTES_PER_SEED) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return null;
+  }
   const stats = safeStat(filePath);
-  if (!stats || stats.size <= 0) return null;
-  const length = Math.min(Number(maxBytes) || DEFAULT_MAX_BYTES_PER_POLL, stats.size);
+  if (!stats || stats.size <= 0) {
+    return null;
+  }
+  const length = Math.min(Number(maxBytes) || DEFAULT_MAX_BYTES_PER_SEED, stats.size);
+  const contextComplete = stats.size <= length;
   const fd = fs.openSync(filePath, 'r');
-  let text = '';
+  let buffer = Buffer.alloc(0);
+  let startOffset = stats.size - length;
   try {
-    const buffer = Buffer.alloc(length);
-    const bytesRead = fs.readSync(fd, buffer, 0, length, stats.size - length);
-    text = buffer.subarray(0, bytesRead).toString('utf8');
+    buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, startOffset);
+    buffer = buffer.subarray(0, bytesRead);
+
+    // A bounded read may begin halfway through a JSONL record.  Only discard
+    // a prefix when the preceding byte proves that the offset is not already
+    // at a line boundary.  The old unconditional `lines.shift()` dropped a
+    // valid first record whenever the boundary happened to align exactly.
+    if (startOffset > 0) {
+      let atLineBoundary = false;
+      try {
+        const previousByte = Buffer.alloc(1);
+        const previousBytesRead = fs.readSync(fd, previousByte, 0, 1, startOffset - 1);
+        atLineBoundary = previousBytesRead === 1 && previousByte[0] === 0x0a;
+      } catch (_) {
+        atLineBoundary = false;
+      }
+      if (!atLineBoundary) {
+        const firstNewline = buffer.indexOf(0x0a);
+        if (firstNewline < 0) {
+          // There is no complete record in this bounded slice.  Returning an
+          // explicit incomplete result keeps callers fail-closed.
+          buffer = Buffer.alloc(0);
+        } else {
+          buffer = buffer.subarray(firstNewline + 1);
+        }
+      }
+    }
   } finally {
     fs.closeSync(fd);
   }
+  const text = buffer.toString('utf8');
   const lines = text.split(/\r?\n/);
-  if (stats.size > length) lines.shift();
-  let active = null;
+  const state = {
+    rolloutActivityOwner: null,
+    rolloutActivityTurnId: null,
+    rolloutReviewParentTurnId: null,
+    rolloutReviewParentManaged: false,
+    rolloutReviewChildTurnId: null,
+    rolloutReviewChildTurnIds: [],
+    rolloutReviewContexts: [],
+    rolloutReviewExitObserved: false,
+    rolloutReviewParentTerminalObserved: false,
+  };
+  let activeRow = null;
+  let lastSettledExternal = null;
   for (const line of lines) {
     if (!line.trim()) continue;
     let row;
-    try { row = JSON.parse(line); } catch (_) { continue; }
+    try {
+      row = JSON.parse(line);
+    } catch (_) {
+      continue;
+    }
     const lifecycle = rolloutRowLifecycle(row);
-    if (lifecycle.started) active = { row, turnId: lifecycle.turnId };
-    else if (lifecycle.terminal && (!lifecycle.turnId || !active?.turnId || lifecycle.turnId === active.turnId)) active = null;
+    const ownership = observeRolloutRowOwnership(state, session, row);
+    if (
+      lifecycle.started
+      && ownership?.owner === 'external-terminal'
+      && ownership.turnId === lifecycle.turnId
+    ) {
+      activeRow = row;
+      lastSettledExternal = null;
+    }
+    if (ownership?.activityClosure?.turnId) {
+      lastSettledExternal = {
+        row,
+        turnId: ownership.activityClosure.turnId,
+        owner: 'external-terminal',
+        terminal: true,
+        terminalPhase: ownership.activityClosure.terminalPhase || 'idle',
+        contextComplete,
+      };
+    } else if (
+      ownership?.clearActivityTurnId
+      && ownership.owner === 'external-terminal'
+      && ownership.clearActivityTurnId === ownership.turnId
+    ) {
+      lastSettledExternal = {
+        row,
+        turnId: ownership.turnId,
+        owner: 'external-terminal',
+        terminal: true,
+        terminalPhase: lifecycle.type === 'turn_aborted' ? 'interrupted' : 'idle',
+        contextComplete,
+      };
+      activeRow = null;
+    }
+    if (ownership?.activityClosure?.turnId === state.rolloutActivityTurnId) {
+      activeRow = null;
+    }
+    finishRolloutRowOwnership(state, ownership);
   }
-  if (!active?.turnId) return null;
-  return {
-    ...active,
-    owner: managedRunnerOwnsTurn(session, active.turnId) ? 'managed-runner' : 'external-terminal',
-  };
+  if (state.rolloutActivityOwner === 'external-terminal' && state.rolloutActivityTurnId) {
+    return {
+      row: activeRow,
+      owner: state.rolloutActivityOwner,
+      turnId: state.rolloutActivityTurnId,
+      reviewParentTurnId: state.rolloutReviewParentTurnId,
+      reviewParentManaged: state.rolloutReviewParentManaged,
+      reviewChildTurnId: state.rolloutReviewChildTurnId,
+      reviewChildTurnIds: state.rolloutReviewChildTurnIds,
+      reviewContexts: state.rolloutReviewContexts,
+      reviewExitObserved: state.rolloutReviewExitObserved,
+      reviewParentTerminalObserved: state.rolloutReviewParentTerminalObserved,
+      contextComplete,
+    };
+  }
+  if (lastSettledExternal) {
+    return { ...lastSettledExternal, contextComplete };
+  }
+  return null;
+}
+
+function normalizeTurnOwnership(value) {
+  if (value === true) {
+    return 'managed';
+  }
+  // `false` is retained as the legacy external signal.  New callers should
+  // return `unknown` (or an object carrying that status) when a Runner map was
+  // merely retired and external ownership cannot be proven.
+  if (value === false) {
+    return 'external';
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['managed', 'managed-runner', 'runner', 'internal'].includes(normalized)) {
+      return 'managed';
+    }
+    if (['external', 'external-terminal', 'terminal'].includes(normalized)) {
+      return 'external';
+    }
+    if (['unknown', 'unverified', 'indeterminate'].includes(normalized)) {
+      return 'unknown';
+    }
+    return 'unknown';
+  }
+  if (value && typeof value === 'object') {
+    if (value.managed === true || value.owner === 'managed' || value.owner === 'managed-runner') {
+      return 'managed';
+    }
+    if (value.external === true || value.owner === 'external' || value.owner === 'external-terminal') {
+      return 'external';
+    }
+    const status = value.status || value.ownership || value.state;
+    if (status !== undefined) {
+      return normalizeTurnOwnership(status);
+    }
+  }
+  return 'unknown';
+}
+
+function managedRunnerTurnOwnership(session, turnId) {
+  if (!turnId) {
+    return 'unknown';
+  }
+  const callback = typeof session?.managedTurnOwnership === 'function'
+    ? session.managedTurnOwnership
+    : (typeof session?.managedTurnOwner === 'function' ? session.managedTurnOwner : null);
+  if (!callback) {
+    return 'unknown';
+  }
+  try {
+    return normalizeTurnOwnership(callback.call(session, turnId));
+  } catch (_) {
+    return 'unknown';
+  }
 }
 
 function managedRunnerOwnsTurn(session, turnId) {
-  if (!turnId || typeof session?.managedTurnOwner !== 'function') {
-    return false;
-  }
-  try {
-    return session.managedTurnOwner(turnId) === true;
-  } catch (_) {
-    return false;
-  }
+  return managedRunnerTurnOwnership(session, turnId) === 'managed';
 }
 
 function observeRolloutRowOwnership(state, session, row) {
   if (session?.live !== true || session?.transcriptOwner !== 'managed-runner') {
     return null;
   }
+  ensureReviewState(state);
   const lifecycle = rolloutRowLifecycle(row);
-  let owner = state.rolloutActivityOwner || null;
-  let turnId = lifecycle.turnId || state.rolloutActivityTurnId || null;
+  const activeOwner = state.rolloutActivityOwner || null;
+  const activeTurnId = String(state.rolloutActivityTurnId || '').trim() || null;
+  const rowOwnership = lifecycle.turnId
+    ? managedRunnerTurnOwnership(session, lifecycle.turnId)
+    : 'unknown';
+  const rowIsManaged = rowOwnership === 'managed';
+  const rowIsExternal = rowOwnership === 'external';
+  let owner = activeOwner;
+  let turnId = activeTurnId || lifecycle.turnId || null;
+  let activityClosure = null;
+  let clearActivityTurnId = null;
+  let clearReview = false;
+  let reviewContextForCleanup = null;
 
-  if (lifecycle.started || (lifecycle.turnId && managedRunnerOwnsTurn(session, lifecycle.turnId))) {
-    owner = managedRunnerOwnsTurn(session, lifecycle.turnId)
-      ? 'managed-runner'
-      : 'external-terminal';
+  if (lifecycle.reviewEntered && lifecycle.turnId) {
+    // `entered_review_mode` is emitted by the managed parent turn.  The
+    // Runner's in-memory ownership map may already be gone when a Host
+    // attaches after a restart, so the marker itself must remain sufficient
+    // evidence for reconstructing the Review boundary.
+    openReviewContext(state, lifecycle.turnId, true);
+    owner = 'managed-runner';
+    turnId = lifecycle.turnId;
+  } else if (lifecycle.started) {
+    const explicitReviewParentTurnId = reviewParentIdFromRow(row);
+    // A Review child in current Codex JSONL normally carries parent_turn_id,
+    // but older/native rollouts may omit it.  An open Review is not sufficient
+    // provenance: an unrelated terminal can start concurrently in the same
+    // rollout.  Only explicit lineage may enter childTurnIds; otherwise use
+    // the Runner's direct ownership result and fail closed when it is unknown.
+    const reviewContext = explicitReviewParentTurnId
+      ? activeReviewContext(state, explicitReviewParentTurnId)
+      : null;
+    const openReview = activeReviewContext(state);
+    const reviewOpenWithoutLineage = Boolean(
+      lifecycle.turnId
+      && !explicitReviewParentTurnId
+      && openReview
+      && openReview.exitObserved !== true
+    );
+    if (
+      reviewOpenWithoutLineage
+      && activeOwner === 'external-terminal'
+      && activeTurnId
+      && activeTurnId !== lifecycle.turnId
+    ) {
+      // A previously projected Review child and a new unlinked Turn are
+      // indistinguishable in native JSONL. Retract the old projection before
+      // entering the ambiguous Turn; this prevents the parent terminal from
+      // leaving a yellow activity marker behind.
+      activityClosure = {
+        owner: 'external-terminal',
+        turnId: activeTurnId,
+        terminalPhase: 'idle',
+      };
+      clearActivityTurnId = activeTurnId;
+    }
+    const reviewParentTurnId = String(reviewContext?.parentTurnId || '').trim();
+    const isManagedReviewChild = Boolean(
+      lifecycle.turnId
+      && explicitReviewParentTurnId
+      && reviewParentTurnId
+      && lifecycle.turnId !== reviewParentTurnId
+      && reviewContext.exitObserved !== true
+      && reviewContext?.managed === true
+    );
+    if (isManagedReviewChild) {
+      if (!reviewContext.childTurnIds.includes(lifecycle.turnId)) {
+        reviewContext.childTurnIds.push(lifecycle.turnId);
+      }
+      syncLegacyReviewState(state, reviewContext);
+    }
+    owner = isManagedReviewChild
+      ? 'external-terminal'
+      : reviewOpenWithoutLineage
+        ? (activeTurnId === lifecycle.turnId ? activeOwner : 'unknown')
+        : (rowIsManaged ? 'managed-runner' : (rowIsExternal ? 'external-terminal' : 'unknown'));
     turnId = lifecycle.turnId || null;
     state.rolloutActivityOwner = owner;
     state.rolloutActivityTurnId = turnId;
+  } else if (lifecycle.reviewExited && lifecycle.turnId) {
+    const reviewContext = activeReviewContext(state, lifecycle.turnId);
+    const reviewParentManaged = reviewContext?.managed === true;
+    if (reviewParentManaged) {
+      reviewContext.exitObserved = true;
+      syncLegacyReviewState(state, reviewContext);
+      const reviewChildTurnId = String(
+        reviewContext.childTurnIds[reviewContext.childTurnIds.length - 1] || ''
+      ).trim();
+      if (
+        reviewContext.parentTerminalObserved === true
+        && reviewChildTurnId
+        && activeOwner === 'external-terminal'
+        && activeTurnId === reviewChildTurnId
+      ) {
+        activityClosure = {
+          owner: 'external-terminal',
+          turnId: reviewChildTurnId,
+          terminalPhase: 'idle',
+        };
+        clearActivityTurnId = reviewChildTurnId;
+        clearReview = true;
+        reviewContextForCleanup = reviewContext;
+      }
+    }
+    owner = reviewParentManaged ? 'managed-runner' : (activeOwner || 'managed-runner');
+    turnId = reviewParentManaged ? lifecycle.turnId : (activeTurnId || lifecycle.turnId);
+  } else if (lifecycle.terminal && lifecycle.turnId) {
+    const reviewParentContext = activeReviewContext(state, lifecycle.turnId);
+    const reviewChildContext = reviewContextForChild(state, lifecycle.turnId);
+    const reviewParentManaged = reviewParentContext?.managed === true;
+    if (reviewParentManaged) {
+      const reviewChildTurnId = String(
+        reviewParentContext.childTurnIds[reviewParentContext.childTurnIds.length - 1] || ''
+      ).trim();
+      const mayCloseReviewChild = lifecycle.type === 'turn_aborted'
+        || reviewParentContext.exitObserved === true;
+      reviewParentContext.parentTerminalObserved = true;
+      syncLegacyReviewState(state, reviewParentContext);
+      if (
+        mayCloseReviewChild
+        && reviewChildTurnId
+        && activeOwner === 'external-terminal'
+        && activeTurnId === reviewChildTurnId
+      ) {
+        activityClosure = {
+          owner: 'external-terminal',
+          turnId: reviewChildTurnId,
+          terminalPhase: lifecycle.type === 'turn_aborted' ? 'interrupted' : 'idle',
+        };
+        clearActivityTurnId = reviewChildTurnId;
+        reviewContextForCleanup = reviewParentContext;
+      }
+      owner = 'managed-runner';
+      turnId = lifecycle.turnId;
+      clearReview = Boolean(
+        !reviewChildTurnId
+        || activityClosure
+        || activeTurnId !== reviewChildTurnId
+      );
+      if (clearReview) {
+        reviewContextForCleanup = reviewParentContext;
+      }
+    } else if (reviewChildContext && activeTurnId && lifecycle.turnId === activeTurnId) {
+      owner = activeOwner || (rowIsManaged ? 'managed-runner' : (rowIsExternal ? 'external-terminal' : 'unknown'));
+      turnId = activeTurnId;
+      clearActivityTurnId = activeTurnId;
+      reviewChildContext.terminalChildTurnIds = reviewChildContext.terminalChildTurnIds || [];
+      if (!reviewChildContext.terminalChildTurnIds.includes(activeTurnId)) {
+        reviewChildContext.terminalChildTurnIds.push(activeTurnId);
+      }
+      if (reviewChildContext.parentTerminalObserved === true) {
+        clearReview = true;
+        reviewContextForCleanup = reviewChildContext;
+      }
+    } else if (activeTurnId && lifecycle.turnId === activeTurnId) {
+      owner = activeOwner || (rowIsManaged ? 'managed-runner' : (rowIsExternal ? 'external-terminal' : 'unknown'));
+      turnId = activeTurnId;
+      clearActivityTurnId = activeTurnId;
+    } else {
+      owner = rowIsManaged ? 'managed-runner' : (rowIsExternal ? 'external-terminal' : 'unknown');
+      turnId = lifecycle.turnId;
+    }
   } else if (!owner) {
     // Without an explicit task_started row there is no safe evidence that a
     // live managed rollout belongs to another terminal. Keep it managed until
@@ -567,13 +1265,47 @@ function observeRolloutRowOwnership(state, session, row) {
     owner,
     turnId,
     terminal: lifecycle.terminal,
+    activityClosure,
+    clearActivityTurnId,
+    clearReview,
+    reviewContext: reviewContextForCleanup,
+    suppressRuntime: Boolean(lifecycle.terminal && !clearActivityTurnId),
   };
 }
 
 function finishRolloutRowOwnership(state, ownership) {
-  if (!ownership?.terminal) return;
-  state.rolloutActivityOwner = null;
-  state.rolloutActivityTurnId = null;
+  const clearActivityTurnId = String(ownership?.clearActivityTurnId || '').trim();
+  if (
+    clearActivityTurnId
+    && clearActivityTurnId === String(state.rolloutActivityTurnId || '').trim()
+  ) {
+    state.rolloutActivityOwner = null;
+    state.rolloutActivityTurnId = null;
+    const childContext = reviewContextForChild(state, clearActivityTurnId);
+    if (childContext) {
+      childContext.terminalChildTurnIds = childContext.terminalChildTurnIds || [];
+      if (!childContext.terminalChildTurnIds.includes(clearActivityTurnId)) {
+        childContext.terminalChildTurnIds.push(clearActivityTurnId);
+      }
+      childContext.childTurnIds = childContext.childTurnIds.filter((id) => id !== clearActivityTurnId);
+    }
+    if (clearActivityTurnId === state.rolloutReviewChildTurnId) {
+      state.rolloutReviewChildTurnId = null;
+    }
+  }
+  if (ownership?.clearReview) {
+    const contexts = ensureReviewState(state);
+    const explicitContext = ownership.reviewContext;
+    const parentId = String(state.rolloutReviewParentTurnId || '').trim();
+    const context = explicitContext && contexts.includes(explicitContext)
+      ? explicitContext
+      : contexts.find((candidate) => candidate.parentTurnId === parentId);
+    if (context) {
+      removeReviewContext(state, context);
+    } else {
+      syncLegacyReviewState(state, null);
+    }
+  }
 }
 
 function readFileDelta(filePath, offset, byteLength) {
@@ -611,8 +1343,9 @@ function resetTailState(state, fileIdentity) {
   state.lastStatSize = 0;
   state.lastMtimeMs = null;
   state.pendingAssistantMirror = null;
-  state.rolloutActivityOwner = null;
-  state.rolloutActivityTurnId = null;
+  state.previousRolloutRow = null;
+  clearRolloutActivityState(state);
+  state.managedTurnOwnershipRevision = null;
 }
 
 function decodeCompleteLine(buffer) {

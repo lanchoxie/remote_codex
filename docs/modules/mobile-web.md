@@ -10,7 +10,16 @@ The mobile web module is the phone-first control UI. It is currently a static no
 
 - `index.html`: layout and modal structure.
 - `styles.css`: responsive mobile/desktop styling.
-- `app.js`: state, API client, rendering, SSE handling, and user actions.
+- `app.js`: session state, API client, SSE handling, and compatibility/facade
+  wiring. New DOM-owned controls should live in a focused module instead of
+  adding another renderer or event listener here.
+- `image-preview.js`: isolated image preview controller (DOM, modal links,
+  backdrop/close events, and rendering).
+- `directory-picker.js`: isolated directory picker controller (DOM, browsing
+  requests, stale-response protection, and picker events).
+- `relay-api.js`: transport-only JSON request client and normalized Relay
+  errors. It has no Session or DOM state and receives authentication handling
+  as a callback from `app.js`.
 - `markdown-renderer.js`: local CommonMark rendering and HTML sanitization.
 - `message-notification-client.js`: v2 receipts, alias reconciliation, read
   eligibility, deterministic alert outbox, and cross-tab drainer election.
@@ -36,10 +45,22 @@ The mobile web module is the phone-first control UI. It is currently a static no
 
 ## Data flow
 
-1. `refresh()` loads stats, hosts, connectors, and sessions.
-2. Selecting a live session opens an SSE stream through `subscribeSession()`.
-3. SSE events update transcript, alerts, runtime, diagnostics, and requests.
-4. User actions call relay APIs.
+The browser is split into three layers even though it is still served as a
+no-build static bundle:
+
+1. `relay-api.js` performs JSON transport and turns non-2xx responses into
+   structured errors.
+2. Focused UI controllers such as `directory-picker.js` and
+   `image-preview.js` own their DOM and event listeners and receive callbacks
+   for state/API access.
+3. `app.js` owns canonical Session state, SSE reconciliation, and cross-feature
+   orchestration. It exposes compatibility wrappers to the controllers but
+   does not duplicate their listeners.
+
+Within that boundary, `refresh()` loads stats, hosts, connectors, and
+sessions; selecting a live session opens an SSE stream through
+`subscribeSession()`; and SSE events update transcript, alerts, runtime,
+diagnostics, and requests.
 
 Full refreshes are single-flight. The client snapshots Session object identities
 when the request starts and reconciles the returned list instead of clearing the

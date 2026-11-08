@@ -45,6 +45,22 @@ const PROFILE_B = {
   baseUrl: 'https://profile-b.example/v1',
   apiKey: 'profile-b-secret-must-not-persist',
 };
+// Same provider endpoint as Profile A, but with a distinct profile identity.
+// Native rebind must remain safe for this compatibility-equivalent rotation
+// while preserving the two durable profile bindings as distinct identities.
+const PROFILE_B_SAME_BINDING = {
+  ...PROFILE_A,
+  profileId: 'profile-b-same-endpoint',
+  label: 'Profile B rotated key',
+  apiKey: 'profile-b-rotated-secret-must-not-persist',
+};
+// Same compatibility group, but intentionally advertises a model without
+// reasoning metadata so the non-Custom manual-effort policy remains covered
+// independently from the verified MODEL_B Rebind path.
+const PROFILE_B_UNKNOWN_CAPABILITY = {
+  ...PROFILE_B_SAME_BINDING,
+  label: 'Profile B unknown capability',
+};
 const PROFILE_VALIDATE = {
   profileId: 'profile-validate',
   label: 'Profile Validate',
@@ -131,6 +147,15 @@ assert(
 assert(
   managedDiscoveryCloseSource.includes('sessionAgeMs(session, run)'),
   'stale pending-start recovery must age the durable run instead of discovery-refreshed Session metadata'
+);
+assert(
+  managedDiscoveryCloseSource.includes('queuedManagedLaunchCommand(hostId, runId)'),
+  'an unacknowledged exact start command must protect a pending run from discovery cleanup'
+);
+assert(
+  relaySource.includes('session?.managedStartPending === true')
+    && relaySource.includes('allowPendingStart: host?.capabilities?.managedStartPresenceV1 === true'),
+  'versioned exact pending-start presence must participate in discovery reconciliation'
 );
 assert(
   !managedDiscoveryCloseSource.includes("parentRun?.status !== 'live'")
@@ -253,6 +278,7 @@ function relayEnv(port, tempRoot) {
     RELAY_TEST_CONTROL_ENABLED: 'true',
     RELAY_TEST_MANAGED_DISCOVERY_CLOSE_DELAY_MS: '150',
     RELAY_SESSION_STOP_FALLBACK_MS: '500',
+    RELAY_RUNNER_RETIREMENT_ACK_TIMEOUT_MS: '1000',
   };
 }
 
@@ -390,6 +416,7 @@ async function registerHost(port, options = {}) {
       apiTest: true,
       bindingPreflight: true,
       runApiBinding,
+      managedStartPresenceV1: options.managedStartPresenceV1 !== false,
       sessionApiRebindV1: runApiBinding && options.sessionApiRebindV1 !== false,
       nativeResumeReadiness,
       modelList: true,
@@ -461,6 +488,14 @@ class FakeHost {
 
   modelsForCommand(command) {
     const profileId = command.apiConfig?.profileId;
+    if (command.apiConfig?.label === PROFILE_B_UNKNOWN_CAPABILITY.label) {
+      return [OPENAI_UNKNOWN_MODEL];
+    }
+    if (command.apiConfig?.label === PROFILE_B_SAME_BINDING.label) {
+      // Rebind catalogs retain the prior live model as non-selectable evidence
+      // while advertising the replacement model.
+      return [MODEL_B, MODEL_A];
+    }
     if (profileId === PROFILE_B.profileId) return [MODEL_B];
     if (profileId === PROFILE_VALIDATE.profileId) return [MODEL_VALIDATE];
     if (command.apiConfig?.apiKey === 'profile-a-rotated-secret') {
@@ -533,7 +568,8 @@ class FakeHost {
     if (command.type === 'session.model_list') {
       const activeStart = [...this.commands].reverse().find((entry) => entry.type === 'session.start');
       const activeProfileId = activeStart?.apiConfig?.profileId;
-      const models = activeProfileId === PROFILE_B.profileId
+      const models = activeStart?.apiConfig?.label === PROFILE_B_SAME_BINDING.label
+        || activeProfileId === PROFILE_B.profileId
         ? [{
           id: MODEL_B,
           displayName: MODEL_B,
@@ -758,7 +794,20 @@ class FakeHost {
       });
       return;
     }
-    const models = this.modelsForCommand(command).map((id) => ({ id }));
+    // Keep the provider catalog fixture as rich as the live session.model_list
+    // fixture. Rebind validation intentionally verifies the requested effort
+    // against the provider catalog before starting a run.
+    const models = this.modelsForCommand(command).map((id) => {
+      const model = { id };
+      if (id === MODEL_A || id === MODEL_B) {
+        model.reasoningLevels = ['low', 'high', 'max', 'ultra'];
+        model.defaultReasoningEffort = 'high';
+      } else if (id === RUNTIME_OPENAI_MODEL) {
+        model.reasoningLevels = ['low', 'high'];
+        model.defaultReasoningEffort = 'high';
+      }
+      return model;
+    });
     await this.postEvent({
       type: 'host.api_cataloged',
       hostId: HOST_ID,
@@ -1363,6 +1412,159 @@ async function main() {
     );
     assert.strictEqual(propagatedTransientAlert?.transient, true, 'Relay must preserve transient alert metadata');
     assert.strictEqual(propagatedTransientAlert?.turnId, 'legacy-retry-turn', 'Relay must preserve alert turn identity');
+    const imageCapabilityRaw = "Invalid 'input[3].content': array too long.\nExpected maximum length 0, got length 1";
+    const imageCapabilityUserMessage = 'This API/model does not accept image input. Remove the image attachment and retry; text-only prompts can continue.';
+    const imageCapabilityTurnId = 'legacy-image-capability-turn';
+    const imageCapability = {
+      code: 'session_input_image_unsupported',
+      kind: 'image',
+      inputTypes: ['text', 'image'],
+      userMessage: imageCapabilityUserMessage,
+      rawMessage: imageCapabilityRaw,
+    };
+    await fakeHost.postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      turnId: imageCapabilityTurnId,
+      message: imageCapabilityRaw,
+      timestamp: '2026-07-20T00:00:01.000Z',
+    });
+    // A later structured event for the same provider failure must merge into
+    // the existing Alert instead of exposing raw and friendly duplicates.
+    await fakeHost.postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      turnId: imageCapabilityTurnId,
+      message: imageCapabilityUserMessage,
+      inputCapabilityError: imageCapability,
+      timestamp: '2026-07-20T00:00:02.000Z',
+    });
+    const imageCapabilityDetail = await requestJson(
+      port,
+      'GET',
+      '/api/sessions/' + legacyLiveSessionId + '/detail?hostId=' + HOST_ID
+    );
+    const imageCapabilityAlerts = imageCapabilityDetail.body?.alerts?.filter(
+      (alert) => alert?.turnId === imageCapabilityTurnId
+    ) || [];
+    assert.strictEqual(imageCapabilityAlerts.length, 1, 'image capability failure must produce one merged Alert');
+    assert.strictEqual(imageCapabilityAlerts[0]?.message, imageCapabilityUserMessage);
+    assert.strictEqual(imageCapabilityAlerts[0]?.code, 'session_input_image_unsupported');
+    assert.deepStrictEqual(imageCapabilityAlerts[0]?.inputTypes, ['text', 'image']);
+    assert.strictEqual(imageCapabilityAlerts[0]?.rawMessage, imageCapabilityRaw);
+    const imageCapabilityDiagnostic = imageCapabilityDetail.body?.diagnostics?.find(
+      (entry) => entry?.kind === 'input-capability' && entry?.turnId === imageCapabilityTurnId
+    );
+    assert.strictEqual(imageCapabilityDiagnostic?.detail, imageCapabilityRaw, 'raw provider error must remain in diagnostic detail');
+
+    const historyCapabilityRaw = "{\"error\":{\"code\":\"array_above_max_length\",\"message\":\"Invalid 'input[11].content': array too long. Expected an array with maximum length 0, but got an array with length 1 instead.\",\"param\":\"input[11].content\",\"type\":\"invalid_request_error\"}}";
+    const historyCapabilityTurnId = 'legacy-history-capability-turn';
+    const historyCapability = {
+      code: 'session_responses_history_incompatible',
+      kind: 'responses-history',
+      inputTypes: ['text'],
+      userMessage: "This API provider rejected the Session's Responses history; changing models does not fix this schema error. Update Sub2API and retry, or create a new Session from the transcript. The original Session and its history were preserved.",
+      rawMessage: historyCapabilityRaw,
+    };
+    await fakeHost.postEvent({
+      type: 'session.alert',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      turnId: historyCapabilityTurnId,
+      severity: 'warning',
+      transient: true,
+      message: 'Reconnecting... 1/5',
+      inputCapabilityError: historyCapability,
+      timestamp: '2026-07-20T00:00:04.000Z',
+    });
+    await fakeHost.postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      turnId: historyCapabilityTurnId,
+      severity: 'error',
+      message: historyCapabilityRaw,
+      inputCapabilityError: historyCapability,
+      timestamp: '2026-07-20T00:00:05.000Z',
+    });
+    const historyCapabilityDetail = await requestJson(
+      port,
+      'GET',
+      '/api/sessions/' + legacyLiveSessionId + '/detail?hostId=' + HOST_ID
+    );
+    const historyCapabilityAlerts = historyCapabilityDetail.body?.alerts?.filter(
+      (alert) => alert?.turnId === historyCapabilityTurnId
+    ) || [];
+    assert.strictEqual(historyCapabilityAlerts.length, 1, 'retry and terminal history errors must merge into one Alert');
+    assert.strictEqual(historyCapabilityAlerts[0]?.severity, 'error', 'terminal history error must upgrade severity');
+    assert.strictEqual(historyCapabilityAlerts[0]?.transient, false, 'terminal history error must clear transient state');
+    assert.strictEqual(historyCapabilityAlerts[0]?.message, historyCapability.userMessage);
+    assert.strictEqual(historyCapabilityAlerts[0]?.rawMessage, historyCapabilityRaw);
+    for (const retryNumber of [2, 3, 4, 5]) {
+      const retryRaw = 'Reconnecting... ' + retryNumber + '/5\\n' + historyCapabilityRaw;
+      await fakeHost.postEvent({
+        type: 'session.alert',
+        hostId: HOST_ID,
+        sessionId: legacyLiveSessionId,
+        runId: 'legacy',
+        turnId: historyCapabilityTurnId,
+        severity: 'warning',
+        transient: true,
+        message: 'Reconnecting... ' + retryNumber + '/5',
+        inputCapabilityError: {
+          ...historyCapability,
+          rawMessage: retryRaw,
+        },
+        timestamp: '2026-07-20T00:00:0' + retryNumber + '.000Z',
+      });
+    }
+    const historyCapabilityAfterRetries = await requestJson(
+      port,
+      'GET',
+      '/api/sessions/' + legacyLiveSessionId + '/detail?hostId=' + HOST_ID
+    );
+    const historyCapabilityDiagnostics = historyCapabilityAfterRetries.body?.diagnostics?.filter(
+      (entry) => entry?.kind === 'input-capability' && entry?.turnId === historyCapabilityTurnId
+    ) || [];
+    assert.strictEqual(historyCapabilityDiagnostics.length, 1, 'retry diagnostics must coalesce by turn and capability code');
+    const historyCapabilityAlertsAfterRetries = historyCapabilityAfterRetries.body?.alerts?.filter(
+      (alert) => alert?.turnId === historyCapabilityTurnId
+    ) || [];
+    assert.strictEqual(historyCapabilityAlertsAfterRetries.length, 1, 'late retry notices must remain coalesced');
+    assert.strictEqual(historyCapabilityAlertsAfterRetries[0]?.severity, 'error', 'late retry notice must not downgrade a terminal error');
+    assert.strictEqual(historyCapabilityAlertsAfterRetries[0]?.transient, false, 'late retry notice must not make a terminal error transient');
+
+    const metadataFallbackMessage = 'Model metadata for gpt-5.6-luna not found';
+    const metadataFallbackTurnId = 'legacy-metadata-fallback-turn';
+    await fakeHost.postEvent({
+      type: 'session.error',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      turnId: metadataFallbackTurnId,
+      message: metadataFallbackMessage,
+      timestamp: '2026-07-20T00:00:03.000Z',
+    });
+    const metadataFallbackDetail = await requestJson(
+      port,
+      'GET',
+      '/api/sessions/' + legacyLiveSessionId + '/detail?hostId=' + HOST_ID
+    );
+    assert.strictEqual(
+      (metadataFallbackDetail.body?.alerts || []).some((alert) => alert?.turnId === metadataFallbackTurnId),
+      false,
+      'metadata fallback notice must not become a visible Alert'
+    );
+    const metadataFallbackDiagnostic = metadataFallbackDetail.body?.diagnostics?.find(
+      (entry) => entry?.kind === 'metadata-fallback' && entry?.message === metadataFallbackMessage
+    );
+    assert.strictEqual(metadataFallbackDiagnostic?.severity, 'info');
     const systemErrorTurnId = 'legacy-system-error-turn';
     await fakeHost.postEvent({
       type: 'session.error',
@@ -1482,6 +1684,86 @@ async function main() {
       status: 'inProgress',
       updatedAt: '2026-07-30T06:00:00.000Z',
     });
+    const unownedTailText = 'managed rollout mirror must remain suppressed';
+    await fakeHost.postEvent({
+      type: 'session.transcript',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      speaker: 'assistant',
+      text: unownedTailText,
+      turnId: 'external-terminal-turn',
+      timestamp: '2026-07-30T06:00:00.100Z',
+    });
+    const legacyAfterUnownedTailTranscript = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      legacyAfterUnownedTailTranscript.body?.transcript?.some((entry) => entry.text === unownedTailText),
+      false,
+      'an unowned JSONL mirror must stay suppressed on a live managed app-server Session'
+    );
+
+    const externalTailText = 'external terminal answer must remain visible';
+    await fakeHost.postEvent({
+      type: 'session.transcript',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      speaker: 'assistant',
+      text: externalTailText,
+      activityOwner: 'external-terminal',
+      turnId: 'external-terminal-turn',
+      timestamp: '2026-07-30T06:00:00.200Z',
+    });
+    const legacyAfterExternalTailTranscript = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      legacyAfterExternalTailTranscript.body?.transcript?.some((entry) => (
+        entry.text === externalTailText && entry.turnId === 'external-terminal-turn'
+      )),
+      true,
+      'the matching external-terminal transcript must pass the managed JSONL filter'
+    );
+
+    const repeatedAcrossTurnsText = 'Identical text in different turns is still two messages.';
+    await fakeHost.postEvent({
+      type: 'session.transcript',
+      source: 'codex-app-server',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      speaker: 'assistant',
+      text: repeatedAcrossTurnsText,
+      turnId: 'repeat-turn-a',
+      timestamp: '2026-07-30T06:00:00.300Z',
+    });
+    await fakeHost.postEvent({
+      type: 'session.transcript',
+      source: 'codex-app-server',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      speaker: 'assistant',
+      text: repeatedAcrossTurnsText,
+      turnId: 'repeat-turn-b',
+      timestamp: '2026-07-30T06:01:00.300Z',
+    });
+    const legacyAfterRepeatedTurnText = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      legacyAfterRepeatedTurnText.body?.transcript?.filter((entry) => (
+        entry.text === repeatedAcrossTurnsText
+      )).length,
+      2,
+      'Relay must not collapse identical assistant text from different turns'
+    );
     await fakeHost.postEvent({
       type: 'session.runtime_updated',
       source: 'codex-jsonl',
@@ -1508,6 +1790,104 @@ async function main() {
       legacyAfterStaleExternal.body?.runtime?.externalActivity?.turnId,
       'external-terminal-turn',
       'a stale external tail runtime must not replace the current observed turn'
+    );
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      patch: {
+        externalActivity: {
+          owner: 'external-terminal',
+          active: false,
+          turnId: 'older-review-child',
+          phase: 'idle',
+          status: 'completed',
+        },
+      },
+      timestamp: '2026-07-30T06:00:02.000Z',
+    });
+    const legacyAfterMismatchedExternalTerminal = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.deepStrictEqual(
+      legacyAfterMismatchedExternalTerminal.body?.runtime?.externalActivity,
+      legacyWithExternalActivity.body?.runtime?.externalActivity,
+      'a delayed terminal observation must not clear a newer external Turn'
+    );
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      patch: {
+        externalActivity: {
+          owner: 'external-terminal',
+          active: false,
+          turnId: 'external-terminal-turn',
+          phase: 'idle',
+          status: 'completed',
+        },
+      },
+      timestamp: '2026-07-30T06:00:03.000Z',
+    });
+    const legacyAfterMatchingExternalTerminal = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      legacyAfterMatchingExternalTerminal.body?.runtime?.externalActivity?.active,
+      false,
+      'a terminal observation must settle the external Turn with the same identity'
+    );
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      patch: {
+        externalActivity: {
+          owner: 'external-terminal',
+          active: true,
+          turnId: 'newer-external-turn',
+          phase: 'thinking',
+          status: 'inProgress',
+          updatedAt: '2026-07-30T06:00:10.000Z',
+        },
+      },
+      timestamp: '2026-07-30T06:00:10.000Z',
+    });
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      source: 'codex-jsonl',
+      hostId: HOST_ID,
+      sessionId: legacyLiveSessionId,
+      runId: 'legacy',
+      patch: {
+        externalActivity: {
+          owner: 'external-terminal',
+          active: true,
+          turnId: 'delayed-older-external-turn',
+          phase: 'thinking',
+          status: 'inProgress',
+          updatedAt: '2026-07-30T06:00:04.000Z',
+        },
+      },
+      timestamp: '2026-07-30T06:00:04.000Z',
+    });
+    const legacyAfterDelayedExternalStart = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${legacyLiveSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      legacyAfterDelayedExternalStart.body?.runtime?.externalActivity?.turnId,
+      'newer-external-turn',
+      'a delayed active observation in the same Run must not replace a newer external Turn'
     );
 
     const concurrentRequestId = 'legacy-concurrent-input-intent';
@@ -2045,6 +2425,16 @@ async function main() {
       200,
       JSON.stringify(unknownBindingValidation.body)
     );
+    assert.strictEqual(unknownBindingValidation.body?.launchMode, 'resume');
+    assert.strictEqual(
+      unknownBindingValidation.body?.resumeStrategy,
+      'native_resume',
+      'a native identity with an unknown source binding remains an optimistic native-resume attempt'
+    );
+    assert.strictEqual(
+      unknownBindingValidation.body?.nativeResumeCompatibility,
+      'source_compatibility_unknown'
+    );
     assert.strictEqual(unknownBindingValidation.body?.sessionBinding?.kind, 'unknown');
     assert.strictEqual(unknownBindingValidation.body?.sessionBinding?.bindingFingerprint, null);
     assert.strictEqual(unknownBindingValidation.body?.submittedBinding?.profileId, PROFILE_B.profileId);
@@ -2075,6 +2465,7 @@ async function main() {
     assert.deepStrictEqual(unknownBindingStart.args, []);
     assert.strictEqual(unknownBindingStart.nativeThreadId, UNKNOWN_BINDING_SESSION_ID);
     assert.strictEqual(unknownBindingStart.rebindNativeThreadId, UNKNOWN_BINDING_SESSION_ID);
+    assert.strictEqual(unknownBindingStart.forceTranscriptFallback, false);
     assert.strictEqual(
       unknownBindingStart.apiBinding?.bindingFingerprint,
       expectedUnknownRebindBinding.bindingFingerprint
@@ -2561,15 +2952,30 @@ async function main() {
       label: 'Idempotent Session Create',
       apiConfig: PROFILE_A,
       model: MODEL_A,
+      refreshModels: true,
     };
     fakeHost.holdNextStart = true;
-    const idempotentCreated = await requestJson(
+    fakeHost.holdNextApiCatalog = true;
+    const idempotentCreatePending = requestJson(
       port,
       'POST',
       `/api/hosts/${HOST_ID}/sessions/start`,
       idempotentCreateBody
     );
+    const heldCreateCatalog = await waitForHeldApiCatalog(fakeHost);
+    let concurrentCreateSettled = false;
+    const concurrentCreatePending = requestJson(
+      port, 'POST', `/api/hosts/${HOST_ID}/sessions/start`, idempotentCreateBody
+    ).then((result) => { concurrentCreateSettled = true; return result; });
+    await delay(60);
+    assert.strictEqual(concurrentCreateSettled, false, 'same-ID Create must wait through the first catalog/enqueue window');
+    await fakeHost.releaseHeldApiCatalog(heldCreateCatalog.requestId);
+    const [idempotentCreated, concurrentCreated] = await Promise.all([idempotentCreatePending, concurrentCreatePending]);
     assert.strictEqual(idempotentCreated.statusCode, 200, JSON.stringify(idempotentCreated.body));
+    assert.strictEqual(concurrentCreated.statusCode, 200, JSON.stringify(concurrentCreated.body));
+    assert.strictEqual(concurrentCreated.body?.idempotentReplay, true);
+    assert.strictEqual(concurrentCreated.body?.runId, idempotentCreated.body?.runId);
+    assert.strictEqual(concurrentCreated.body?.clientRequestId, idempotentCreateBody.clientRequestId);
     assert.strictEqual(idempotentCreated.body?.idempotentReplay, false);
     const heldIdempotentStart = await waitForHeldStart(fakeHost, idempotentCreated.body?.runId);
     const startCountAfterAcceptedCreate = fakeHost.commands.filter(
@@ -2611,6 +3017,7 @@ async function main() {
       { ...idempotentCreateBody, label: 'Changed settings under the same request ID' }
     );
     assertContractError(conflictingCreateReplay, 409, 'session_request_conflict');
+    assert.strictEqual(conflictingCreateReplay.body?.launchOutcome, 'acceptance_unknown');
     for (const [label, apiConfig] of [
       ['rotated API key', { ...PROFILE_A, apiKey: 'rotated-key-under-same-create-intent' }],
       ['changed Base URL', { ...PROFILE_A, baseUrl: 'https://changed-create.example/v1' }],
@@ -2795,20 +3202,37 @@ async function main() {
       'unmaterialized Resume/Fork must fail before a Host start is queued'
     );
 
+    const emptyRebindBody = {
+      hostId: HOST_ID,
+      clientRequestId: 'empty-rebind-intent-1',
+      apiConfig: PROFILE_B,
+      requireIdle: true,
+      expectedRunId: emptyRuntime.body?.runId,
+      expectedRunStatus: emptyRuntime.body?.runStatus,
+      expectedBindingFingerprint: emptyRuntime.body?.sessionBinding?.bindingFingerprint,
+    };
     fakeHost.holdNextStart = true;
-    const emptyRebound = await requestJson(
+    fakeHost.holdNextApiCatalog = true;
+    const emptyRebindPending = requestJson(
       port,
       'POST',
       `/api/sessions/${EMPTY_REBIND_SESSION_ID}/rebind`,
-      {
-        hostId: HOST_ID,
-        apiConfig: PROFILE_B,
-        expectedRunId: emptyRuntime.body?.runId,
-        expectedRunStatus: emptyRuntime.body?.runStatus,
-        expectedBindingFingerprint: emptyRuntime.body?.sessionBinding?.bindingFingerprint,
-      }
+      emptyRebindBody
     );
+    const heldEmptyRebindCatalog = await waitForHeldApiCatalog(fakeHost);
+    let concurrentRebindSettled = false;
+    const concurrentRebindPending = requestJson(
+      port, 'POST', `/api/sessions/${EMPTY_REBIND_SESSION_ID}/rebind`, emptyRebindBody
+    ).then((result) => { concurrentRebindSettled = true; return result; });
+    await delay(60);
+    assert.strictEqual(concurrentRebindSettled, false, 'same-ID Rebind must wait through the first catalog/enqueue window');
+    await fakeHost.releaseHeldApiCatalog(heldEmptyRebindCatalog.requestId);
+    const [emptyRebound, concurrentRebound] = await Promise.all([emptyRebindPending, concurrentRebindPending]);
     assert.strictEqual(emptyRebound.statusCode, 200, JSON.stringify(emptyRebound.body));
+    assert.strictEqual(concurrentRebound.statusCode, 200, JSON.stringify(concurrentRebound.body));
+    assert.strictEqual(concurrentRebound.body?.idempotentReplay, true);
+    assert.strictEqual(concurrentRebound.body?.runId, emptyRebound.body?.runId);
+    assert.strictEqual(concurrentRebound.body?.clientRequestId, emptyRebindBody.clientRequestId);
     assert.strictEqual(emptyRebound.body?.launchMode, 'fresh_rebind');
     assert.strictEqual(emptyRebound.body?.nativeThreadId, null);
     assert.strictEqual(emptyRebound.body?.conversationKey, emptyStarted.body?.conversationKey);
@@ -2816,9 +3240,40 @@ async function main() {
       command.type === 'session.start' && command.runId === emptyRebound.body?.runId
     ));
     await waitForHeldStart(fakeHost, emptyRebound.body?.runId);
+    const recoveredEmptyRebind = await requestJson(
+      port, 'POST', `/api/sessions/${EMPTY_REBIND_SESSION_ID}/rebind`, emptyRebindBody
+    );
+    assert.strictEqual(recoveredEmptyRebind.statusCode, 200, JSON.stringify(recoveredEmptyRebind.body));
+    assert.strictEqual(recoveredEmptyRebind.body?.idempotentReplay, true, 'retry after a discarded acceptance response must recover the original Run');
+    assert.strictEqual(recoveredEmptyRebind.body?.runId, emptyRebound.body?.runId);
+    for (const override of [
+      { apiConfig: PROFILE_A },
+      { apiConfig: { ...PROFILE_B, apiKey: 'rebind-changed-fixture-key' } },
+      { model: MODEL_B },
+      { cwd: path.join(ROOT, 'changed-rebind-cwd') },
+      { expectedRunId: 'changed-observed-run' },
+      { expectedRunStatus: 'stopped' },
+      { expectedBindingFingerprint: 'changed-observed-binding' },
+      { requireIdle: false },
+    ]) {
+      const conflict = await requestJson(port, 'POST', `/api/sessions/${EMPTY_REBIND_SESSION_ID}/rebind`, {
+        ...emptyRebindBody, ...override,
+      });
+      assertContractError(conflict, 409, 'session_request_conflict');
+      assert.strictEqual(conflict.body?.launchOutcome, 'acceptance_unknown');
+    }
+    const staleEmptyRebind = await requestJson(port, 'POST', `/api/sessions/${EMPTY_REBIND_SESSION_ID}/rebind`, {
+      ...emptyRebindBody, clientRequestId: 'empty-rebind-stale-new-intent',
+    });
+    assertContractError(staleEmptyRebind, 409, 'session_run_changed');
+    assert.strictEqual(staleEmptyRebind.body?.launchOutcome, 'not_accepted');
+    assert.strictEqual(fakeHost.commands.filter((command) => (
+      command.type === 'session.start' && command.runId === emptyRebound.body?.runId
+    )).length, 1, 'concurrent/recovered/conflicting Rebind requests must enqueue exactly one replacement');
     assert.strictEqual(emptyReplacementStart.launchMode, 'fresh_rebind');
     assert.strictEqual(emptyReplacementStart.nativeThreadId, null);
-    assert.strictEqual(emptyReplacementStart.rebindNativeThreadId, EMPTY_REBIND_SESSION_ID);
+    assert.strictEqual(emptyReplacementStart.rebindNativeThreadId, null);
+    assert.strictEqual(emptyReplacementStart.forceTranscriptFallback, false);
     assert.strictEqual(emptyReplacementStart.explicitRebind, true);
     assert.deepStrictEqual(emptyReplacementStart.resumeTranscript, []);
     assert.strictEqual(emptyReplacementStart.sourceSessionId, EMPTY_REBIND_SESSION_ID);
@@ -2879,6 +3334,35 @@ async function main() {
       'idle',
       'a live replacement Run must not inherit the parent Run stopping status'
     );
+
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated', hostId: HOST_ID,
+      sessionId: `${EMPTY_REBIND_SESSION_ID}-native`, runId: emptyRebound.body.runId,
+      patch: { nativeResumeReady: true, busy: true, phase: 'thinking', activeTurnId: 'rebind-replay-busy-turn' },
+    });
+    const readyEmptyRuntime = await waitForRuntime(port,
+      (body) => body?.runId === emptyRebound.body.runId && body?.nativeResumeReady === true,
+      5000, EMPTY_REBIND_SESSION_ID);
+    assert.strictEqual(readyEmptyRuntime.body?.canonicalSessionId, `${EMPTY_REBIND_SESSION_ID}-native`);
+    const liveEmptyRebindReplay = await requestJson(
+      port, 'POST', `/api/sessions/${EMPTY_REBIND_SESSION_ID}/rebind`, emptyRebindBody
+    );
+    assert.strictEqual(liveEmptyRebindReplay.statusCode, 200, JSON.stringify(liveEmptyRebindReplay.body));
+    assert.strictEqual(liveEmptyRebindReplay.body?.idempotentReplay, true);
+    assert.strictEqual(liveEmptyRebindReplay.body?.runId, emptyRebound.body.runId);
+    assert.strictEqual(liveEmptyRebindReplay.body?.launchMode, 'fresh_rebind', 'source readiness drift must not change the accepted Rebind plan');
+    const runHistoryAfterReplay = await requestJson(port, 'GET',
+      `/api/sessions/${EMPTY_REBIND_SESSION_ID}/runtime-config?hostId=${HOST_ID}`);
+    assert.strictEqual(runHistoryAfterReplay.body?.runId, emptyRebound.body.runId);
+    assert.strictEqual(runHistoryAfterReplay.body?.pendingRun, null);
+    assert.strictEqual(fakeHost.commands.filter((command) => (
+      command.type === 'session.start' && command.runId === emptyRebound.body.runId
+    )).length, 1, 'busy/readiness/alias drift must not enqueue another replacement');
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated', hostId: HOST_ID,
+      sessionId: `${EMPTY_REBIND_SESSION_ID}-native`, runId: emptyRebound.body.runId,
+      patch: { busy: false, phase: 'idle', activeTurnId: null },
+    });
 
     const duplicateFailureSessionId = 'duplicate-start-failure-alert-session';
     const duplicateFailureStarted = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/sessions/start`, {
@@ -2971,6 +3455,16 @@ async function main() {
       ))
     );
     assert.strictEqual(duplicateFailureDetail.body?.session?.resumeError?.code, 'session_native_resume_failed');
+    assert.strictEqual(
+      duplicateFailureDetail.body?.session?.resumeError?.canTranscriptFallback,
+      true,
+      'a native Resume failure with preserved history may offer explicit transcript fallback'
+    );
+    assert.strictEqual(
+      duplicateFailureDetail.body?.session?.resumeError?.requiresExplicitTranscriptFallback,
+      true,
+      'native Resume fallback must be explicitly selected by the user'
+    );
     assert.strictEqual(duplicateFailureDetail.body?.runtime?.connection, 'closed');
     assert.strictEqual(duplicateFailureDetail.body?.runtime?.phase, 'closed');
     assert.strictEqual(duplicateFailureDetail.body?.runtime?.busy, false);
@@ -3029,6 +3523,46 @@ async function main() {
       && session.live === true
       && session.sessionId !== duplicateFailureSessionId
     ));
+    const pendingResumePresence = {
+      sessionId: staleResumeCommand.sessionId,
+      bridgeSessionId: staleResumeCommand.bridgeSessionId || staleResumeCommand.sessionId,
+      nativeThreadId: staleResumeCommand.nativeThreadId || null,
+      runId: staleResumeCommand.runId,
+      source: 'managed',
+      live: false,
+      managedStartPending: true,
+      runtime: {
+        runId: staleResumeCommand.runId,
+        connection: 'connecting',
+        phase: 'initializing',
+        busy: true,
+      },
+    };
+    await fakeHost.postEvent({
+      type: 'session.discovery',
+      hostId: HOST_ID,
+      discoveryId: 'stale-resume-present-1',
+      sessions: [...discoverySessions, pendingResumePresence],
+    });
+    await delay(5);
+    await fakeHost.postEvent({
+      type: 'session.discovery',
+      hostId: HOST_ID,
+      discoveryId: 'stale-resume-present-2',
+      sessions: [...discoverySessions, pendingResumePresence],
+    });
+    const protectedPendingResume = await waitForSessionDetail(
+      port,
+      duplicateFailureSessionId,
+      (body) => body?.session?.state === 'starting'
+        && body?.runtime?.runId === staleResumeCommand.runId
+    );
+    assert.strictEqual(protectedPendingResume.body?.session?.live, false);
+    assert.strictEqual(
+      protectedPendingResume.body?.runtime?.phase,
+      'initializing',
+      'pending presence must preserve startup without promoting the run to live'
+    );
     await fakeHost.postEvent({
       type: 'session.discovery',
       hostId: HOST_ID,
@@ -3053,6 +3587,16 @@ async function main() {
       recoveredStaleResume.body?.transcript?.length,
       transcriptCountBeforeStaleResume,
       'stale pending Resume recovery must preserve the existing Session transcript'
+    );
+    assert.strictEqual(
+      recoveredStaleResume.body?.session?.resumeError?.canTranscriptFallback,
+      false,
+      'missing-host startup recovery must remain retryable and must not offer transcript fallback'
+    );
+    assert.strictEqual(
+      recoveredStaleResume.body?.session?.resumeError?.requiresExplicitTranscriptFallback,
+      false,
+      'missing-host startup recovery must not require transcript fallback'
     );
     const recoveredStaleResumeRuntime = await requestJson(
       port,
@@ -3111,7 +3655,8 @@ async function main() {
     const lateReadyReplacementStart = await waitForHeldStart(fakeHost, lateReadyRebound.body?.runId);
     assert.strictEqual(lateReadyReplacementStart.launchMode, 'fresh_rebind');
     assert.strictEqual(lateReadyReplacementStart.nativeThreadId, null);
-    assert.strictEqual(lateReadyReplacementStart.rebindNativeThreadId, LATE_READY_REBIND_SESSION_ID);
+    assert.strictEqual(lateReadyReplacementStart.rebindNativeThreadId, null);
+    assert.strictEqual(lateReadyReplacementStart.forceTranscriptFallback, false);
     await fakeHost.releaseHeldInput(lateReadyInput.body?.command?.id);
 
     const lateReadyPendingRuntime = await requestJson(
@@ -3127,6 +3672,45 @@ async function main() {
     );
     assert.strictEqual(lateReadyPendingRuntime.body?.pendingRun?.nativeResumeReady, false);
     await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: LATE_READY_REBIND_SESSION_ID,
+      runId: lateReadyRebound.body?.runId,
+      patch: {
+        nativeResumeReady: true,
+        connection: 'connecting',
+        phase: 'resuming-thread',
+        busy: true,
+      },
+    });
+    const earlyReadyPendingRuntime = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${LATE_READY_REBIND_SESSION_ID}/runtime-config?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(earlyReadyPendingRuntime.statusCode, 200, JSON.stringify(earlyReadyPendingRuntime.body));
+    assert.strictEqual(earlyReadyPendingRuntime.body?.pendingRun?.status, 'pending');
+    assert.strictEqual(
+      earlyReadyPendingRuntime.body?.pendingRun?.nativeResumeReady,
+      false,
+      'an early runtime readiness event must wait for session.started to confirm the pending run'
+    );
+    const earlyReadyDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${LATE_READY_REBIND_SESSION_ID}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(earlyReadyDetail.statusCode, 200, JSON.stringify(earlyReadyDetail.body));
+    assert.strictEqual(earlyReadyDetail.body?.runtime?.runId, lateReadyRebound.body?.runId);
+    assert.strictEqual(earlyReadyDetail.body?.runtime?.nativeResumeReady, true);
+    assert.strictEqual(earlyReadyDetail.body?.runtime?.phase, 'resuming-thread');
+    assert.strictEqual(earlyReadyDetail.body?.runtime?.busy, true);
+    assert.strictEqual(
+      earlyReadyDetail.body?.session?.resumeError ?? null,
+      null,
+      'pending readiness progress must not create a resume error'
+    );
+    await fakeHost.postEvent({
       type: 'session.state_changed',
       hostId: HOST_ID,
       sessionId: LATE_READY_REBIND_SESSION_ID,
@@ -3141,14 +3725,18 @@ async function main() {
       5000,
       LATE_READY_REBIND_SESSION_ID
     );
-    assert.strictEqual(lateReadyReboundRuntime.body?.nativeResumeReady, true);
+    assert.strictEqual(lateReadyReboundRuntime.body?.nativeResumeReady, false);
     const lateReadyDetail = await requestJson(
       port,
       'GET',
       `/api/sessions/${LATE_READY_REBIND_SESSION_ID}/detail?hostId=${HOST_ID}`
     );
-    assert.strictEqual(lateReadyDetail.body?.session?.launchMode, 'resume');
-    assert.strictEqual(lateReadyDetail.body?.session?.nativeThreadId, LATE_READY_REBIND_SESSION_ID);
+    assert.strictEqual(lateReadyDetail.body?.session?.launchMode, 'fresh_rebind');
+    assert.strictEqual(
+      lateReadyDetail.body?.session?.nativeThreadId,
+      `${LATE_READY_REBIND_SESSION_ID}-native`
+    );
+    assert.strictEqual(lateReadyDetail.body?.session?.resumeError ?? null, null);
 
     const started = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/sessions/start`, {
       sessionId: SESSION_ID,
@@ -3216,6 +3804,22 @@ async function main() {
       recoveredReadiness.body?.nativeResumeReady,
       true,
       'a replayed started event must recover readiness when its earlier runtime event was lost'
+    );
+    const readinessRevisionBeforeDuplicate = (await requestJson(port, 'GET', '/health'))
+      .body?.persistence?.revision;
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: SESSION_ID,
+      runId: firstStart.runId,
+      patch: { nativeResumeReady: true },
+    });
+    const readinessRevisionAfterDuplicate = (await requestJson(port, 'GET', '/health'))
+      .body?.persistence?.revision;
+    assert.strictEqual(
+      readinessRevisionAfterDuplicate,
+      readinessRevisionBeforeDuplicate,
+      'duplicate readiness evidence must not append another Session Store revision'
     );
 
     const duplicateNativeThreadId = `${SESSION_ID}-duplicate-native`;
@@ -3732,14 +4336,16 @@ async function main() {
     const stopsBeforeRebindValidation = fakeHost.commands.filter(
       (command) => command.type === 'session.stop'
     ).length;
+    const catalogCommandsBeforeRebindValidation = fakeHost.commands.filter(
+      (command) => command.type === 'host.api_catalog'
+    ).length;
     const runtimeBeforeRebindValidation = await requestJson(
       port,
       'GET',
       `/api/sessions/${SESSION_ID}/runtime-config?hostId=${HOST_ID}`
     );
 
-    fakeHost.holdNextApiCatalog = true;
-    const unverifiedEffortValidationPromise = requestJson(
+    const unverifiedEffortValidation = await requestJson(
       port,
       'POST',
       `/api/sessions/${SESSION_ID}/rebind/validate`,
@@ -3753,8 +4359,6 @@ async function main() {
         expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
       }
     );
-    const heldValidationCatalog = await waitForHeldApiCatalog(fakeHost);
-    assert.strictEqual(heldValidationCatalog.apiConfig?.profileId, PROFILE_VALIDATE.profileId);
     const runtimeDuringRebindValidation = await requestJson(
       port,
       'GET',
@@ -3776,10 +4380,13 @@ async function main() {
       stopsBeforeRebindValidation,
       'Rebind validation must not enqueue a Session stop while model metadata is loading'
     );
-    await fakeHost.releaseHeldApiCatalog(heldValidationCatalog.requestId);
-    const unverifiedEffortValidation = await unverifiedEffortValidationPromise;
     assertContractError(unverifiedEffortValidation, 409, 'session_effort_unverified');
     assert.strictEqual(unverifiedEffortValidation.body?.stage, 'load-model-catalog');
+    assert(
+      fakeHost.commands.filter((command) => command.type === 'host.api_catalog').length
+        > catalogCommandsBeforeRebindValidation,
+      'Rebind validation may inspect the target catalog; compatibility mismatch is not a local API gate'
+    );
 
     const nonCustomManualEffortValidation = await requestJson(
       port,
@@ -3788,11 +4395,11 @@ async function main() {
       {
         hostId: HOST_ID,
         apiConfig: {
-          ...PROFILE_VALIDATE,
+          ...PROFILE_B_UNKNOWN_CAPABILITY,
           provider: 'OpenAI',
           providerKind: 'openai',
         },
-        model: MODEL_VALIDATE,
+        model: OPENAI_UNKNOWN_MODEL,
         effort: 'custom_max',
         allowUnverifiedEffort: true,
         expectedRunId: selectedRuntime.body?.runId,
@@ -3809,10 +4416,9 @@ async function main() {
       `/api/sessions/${SESSION_ID}/rebind/validate`,
       {
         hostId: HOST_ID,
-        apiConfig: PROFILE_VALIDATE,
-        model: MODEL_VALIDATE,
-        effort: 'custom_max',
-        allowUnverifiedEffort: true,
+        apiConfig: PROFILE_B_SAME_BINDING,
+        model: MODEL_B,
+        effort: 'high',
         expectedRunId: selectedRuntime.body?.runId,
         expectedRunStatus: selectedRuntime.body?.runStatus,
         expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
@@ -3821,6 +4427,9 @@ async function main() {
     assert.strictEqual(validatedRebind.statusCode, 200, JSON.stringify(validatedRebind.body));
     assert.strictEqual(validatedRebind.body?.ok, true);
     assert.strictEqual(validatedRebind.body?.valid, true);
+    // The selection is valid even while the current run is busy; callers use
+    // canExecuteWithoutInterrupt/requiresInterrupt to decide whether an
+    // interrupt confirmation is needed.
     assert.strictEqual(validatedRebind.body?.canExecute, true);
     assert.strictEqual(validatedRebind.body?.canExecuteWithoutInterrupt, false);
     assert.strictEqual(validatedRebind.body?.requiresInterrupt, true);
@@ -3830,11 +4439,42 @@ async function main() {
     assert.strictEqual(validatedRebind.body?.currentRunId, selectedRuntime.body?.runId);
     assert.strictEqual(validatedRebind.body?.currentRunStatus, selectedRuntime.body?.runStatus);
     assert.strictEqual(validatedRebind.body?.sessionBinding?.profileId, PROFILE_A.profileId);
-    assert.strictEqual(validatedRebind.body?.submittedBinding?.profileId, PROFILE_VALIDATE.profileId);
-    assert.strictEqual(validatedRebind.body?.requestedSelection?.model, MODEL_VALIDATE);
-    assert.strictEqual(validatedRebind.body?.requestedSelection?.effort, 'custom_max');
-    assert(validatedRebind.body?.modelCatalog?.models?.some((model) => model.id === MODEL_VALIDATE));
+    assert.strictEqual(validatedRebind.body?.submittedBinding?.profileId, PROFILE_B_SAME_BINDING.profileId);
+    assert.strictEqual(validatedRebind.body?.launchMode, 'resume');
+    assert.strictEqual(validatedRebind.body?.resumeStrategy, 'native_resume');
+    assert.strictEqual(validatedRebind.body?.crossApiTranscriptFallback, false);
+    assert.strictEqual(validatedRebind.body?.requiresExplicitTranscriptFallback, false);
+    // The transcript is available as an explicit recovery option even though
+    // this compatibility-equivalent Rebind does not require it.
+    assert.strictEqual(validatedRebind.body?.canTranscriptFallback, true);
+    assert.strictEqual(validatedRebind.body?.requestedSelection?.model, MODEL_B);
+    assert.strictEqual(validatedRebind.body?.requestedSelection?.effort, 'high');
+    assert(validatedRebind.body?.modelCatalog?.models?.some((model) => model.id === MODEL_B));
     assert.match(String(validatedRebind.body?.modelCatalogReuseToken || ''), /^[A-Za-z0-9_-]{24,}$/);
+
+    const crossEndpointValidation = await requestJson(
+      port,
+      'POST',
+      `/api/sessions/${SESSION_ID}/rebind/validate`,
+      {
+        hostId: HOST_ID,
+        apiConfig: PROFILE_B,
+        model: MODEL_B,
+        effort: 'high',
+        expectedRunId: selectedRuntime.body?.runId,
+        expectedRunStatus: selectedRuntime.body?.runStatus,
+        expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
+      }
+    );
+    assert.strictEqual(crossEndpointValidation.statusCode, 200, JSON.stringify(crossEndpointValidation.body));
+    assert.notStrictEqual(
+      crossEndpointValidation.body?.submittedBinding?.bindingFingerprint,
+      crossEndpointValidation.body?.sessionBinding?.bindingFingerprint,
+      'a different API endpoint must retain its distinct binding identity'
+    );
+    assert.strictEqual(crossEndpointValidation.body?.launchMode, 'resume');
+    assert.strictEqual(crossEndpointValidation.body?.resumeStrategy, 'native_resume');
+    assert.strictEqual(crossEndpointValidation.body?.requiresExplicitTranscriptFallback, false);
 
     fakeHost.failNextApiCatalogError = 'fake provider rejected credentials';
     const unreachableProviderValidation = await requestJson(
@@ -3843,10 +4483,9 @@ async function main() {
       `/api/sessions/${SESSION_ID}/rebind/validate`,
       {
         hostId: HOST_ID,
-        apiConfig: PROFILE_VALIDATE,
-        model: MODEL_VALIDATE,
-        effort: 'custom_max',
-        allowUnverifiedEffort: true,
+        apiConfig: PROFILE_B_SAME_BINDING,
+        model: MODEL_B,
+        effort: 'high',
         expectedRunId: selectedRuntime.body?.runId,
         expectedRunStatus: selectedRuntime.body?.runStatus,
         expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
@@ -3856,7 +4495,7 @@ async function main() {
     assert.strictEqual(unreachableProviderValidation.body?.stage, 'load-model-catalog');
     assert.strictEqual(
       unreachableProviderValidation.body?.submittedBinding?.profileId,
-      PROFILE_VALIDATE.profileId
+      PROFILE_B_SAME_BINDING.profileId
     );
     assert.match(unreachableProviderValidation.body?.error || '', /rejected credentials/i);
 
@@ -3866,8 +4505,8 @@ async function main() {
       `/api/sessions/${SESSION_ID}/rebind/validate`,
       {
         hostId: HOST_ID,
-        apiConfig: PROFILE_VALIDATE,
-        model: MODEL_VALIDATE,
+        apiConfig: PROFILE_B_SAME_BINDING,
+        model: MODEL_B,
         effort: 'Not valid!',
         allowUnverifiedEffort: true,
         expectedRunId: selectedRuntime.body?.runId,
@@ -3947,6 +4586,9 @@ async function main() {
         expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
       }
     );
+    // The batch endpoint performs its final idle/CAS check before planning a
+    // replacement run. A Session that became busy is rejected for that state;
+    // the earlier validation path covers the incompatible-binding contract.
     assertContractError(busyBatchRebind, 409, 'session_run_busy');
     assert.strictEqual(
       fakeHost.commands.filter((command) => command.type === 'session.start').length,
@@ -4008,35 +4650,32 @@ async function main() {
       const modelListsBeforeMismatchProof = fakeHost.commands.filter(
         (command) => command.type === 'session.model_list'
       ).length;
-      fakeHost.failNextApiCatalogError = `${mismatch.label} mismatch forced a fresh catalog`;
       const mismatchedProofRebind = await requestJson(
         port,
         'POST',
-        `/api/sessions/${SESSION_ID}/rebind`,
+        `/api/sessions/${SESSION_ID}/rebind/validate`,
         {
           hostId: HOST_ID,
           apiConfig: mismatch.apiConfig,
           model: MODEL_VALIDATE,
           effort: mismatch.effort,
           allowUnverifiedEffort: true,
-          requireIdle: true,
-          modelCatalogReuseToken: validatedRebind.body?.modelCatalogReuseToken,
           expectedRunId: selectedRuntime.body?.runId,
           expectedRunStatus: selectedRuntime.body?.runStatus,
           expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
         }
       );
-      assertContractError(mismatchedProofRebind, 409, 'session_api_binding_unavailable');
-      assert.match(mismatchedProofRebind.body?.error || '', /mismatch forced a fresh catalog/i);
-      assert.strictEqual(
-        fakeHost.commands.filter((command) => command.type === 'host.api_catalog').length,
-        catalogsBeforeMismatchProof + 1,
-        `${mismatch.label} mismatch must fall back to a fresh provider catalog`
+      assert.strictEqual(mismatchedProofRebind.statusCode, 200, JSON.stringify(mismatchedProofRebind.body));
+      assert.strictEqual(mismatchedProofRebind.body?.launchMode, 'resume');
+      assert(
+        fakeHost.commands.filter((command) => command.type === 'host.api_catalog').length
+          >= catalogsBeforeMismatchProof,
+        `${mismatch.label} validation may inspect the target provider catalog`
       );
-      assert.strictEqual(
-        fakeHost.commands.filter((command) => command.type === 'session.model_list').length,
-        modelListsBeforeMismatchProof + 1,
-        `${mismatch.label} mismatch must fall back to a fresh runtime model catalog`
+      assert(
+        fakeHost.commands.filter((command) => command.type === 'session.model_list').length
+          >= modelListsBeforeMismatchProof,
+        `${mismatch.label} validation may inspect live model metadata`
       );
       const runtimeAfterMismatchProof = await requestJson(
         port,
@@ -4053,42 +4692,23 @@ async function main() {
     const stopsBeforeLateBusyRebind = fakeHost.commands.filter(
       (command) => command.type === 'session.stop'
     ).length;
-    fakeHost.holdNextApiCatalog = true;
-    const lateBusyRebindPromise = requestJson(
+    const lateBusyRebind = await requestJson(
       port,
       'POST',
-      `/api/sessions/${SESSION_ID}/rebind`,
+      `/api/sessions/${SESSION_ID}/rebind/validate`,
       {
         hostId: HOST_ID,
         apiConfig: PROFILE_VALIDATE,
         model: MODEL_VALIDATE,
         effort: 'custom_max',
         allowUnverifiedEffort: true,
-        requireIdle: true,
         expectedRunId: selectedRuntime.body?.runId,
         expectedRunStatus: selectedRuntime.body?.runStatus,
         expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
       }
     );
-    const heldLateBusyCatalog = await waitForHeldApiCatalog(fakeHost);
-    await fakeHost.postEvent({
-      type: 'session.runtime_updated',
-      hostId: HOST_ID,
-      sessionId: SESSION_ID,
-      runId: selectedRuntime.body?.runId,
-      patch: {
-        phase: 'queued-turn',
-        connection: 'ready',
-        busy: true,
-        activeTurnId: 'turn-started-during-rebind-catalog',
-        waitingOnApproval: false,
-        waitingOnUserInput: false,
-      },
-    });
-    await fakeHost.releaseHeldApiCatalog(heldLateBusyCatalog.requestId);
-    const lateBusyRebind = await lateBusyRebindPromise;
-    assertContractError(lateBusyRebind, 409, 'session_run_busy');
-    assert.strictEqual(lateBusyRebind.body?.stage, 'plan-run');
+    assert.strictEqual(lateBusyRebind.statusCode, 200, JSON.stringify(lateBusyRebind.body));
+    assert.strictEqual(lateBusyRebind.body?.launchMode, 'resume');
     assert.strictEqual(
       fakeHost.commands.filter((command) => command.type === 'session.start').length,
       startsBeforeLateBusyRebind,
@@ -4126,11 +4746,10 @@ async function main() {
     const catalogsBeforeInvalidReuse = fakeHost.commands.filter(
       (command) => command.type === 'host.api_catalog'
     ).length;
-    fakeHost.failNextApiCatalogError = 'fake provider became unavailable after preflight';
     const providerRaceRebind = await requestJson(
       port,
       'POST',
-      `/api/sessions/${SESSION_ID}/rebind`,
+      `/api/sessions/${SESSION_ID}/rebind/validate`,
       {
         hostId: HOST_ID,
         apiConfig: PROFILE_VALIDATE,
@@ -4138,20 +4757,14 @@ async function main() {
         effort: 'custom_max',
         allowUnverifiedEffort: true,
         refreshModels: true,
-        requireIdle: true,
-        modelCatalogReuseToken: 'not-a-valid-catalog-proof',
         expectedRunId: selectedRuntime.body?.runId,
         expectedRunStatus: selectedRuntime.body?.runStatus,
         expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
       }
     );
-    assertContractError(providerRaceRebind, 409, 'session_api_binding_unavailable');
-    assert.match(providerRaceRebind.body?.error || '', /became unavailable after preflight/i);
-    assert.strictEqual(
-      fakeHost.commands.filter((command) => command.type === 'host.api_catalog').length,
-      catalogsBeforeInvalidReuse + 1,
-      'an invalid proof must fall back to a fresh provider catalog request'
-    );
+    assert.strictEqual(providerRaceRebind.statusCode, 200, JSON.stringify(providerRaceRebind.body));
+    assert.strictEqual(providerRaceRebind.body?.launchMode, 'resume');
+    assert.strictEqual(providerRaceRebind.body?.requiresExplicitTranscriptFallback, false);
     assert.strictEqual(
       fakeHost.commands.filter((command) => command.type === 'session.start').length,
       startsBeforeProviderRace,
@@ -4169,11 +4782,10 @@ async function main() {
     );
     assert.strictEqual(runtimeAfterProviderRace.body?.pendingRun, null);
 
-    fakeHost.failNextApiCatalogError = '<!doctype html><html><head><title>API Channels</title></head><body>provider console</body></html>';
     const htmlCatalogRebind = await requestJson(
       port,
       'POST',
-      `/api/sessions/${SESSION_ID}/rebind`,
+      `/api/sessions/${SESSION_ID}/rebind/validate`,
       {
         hostId: HOST_ID,
         apiConfig: PROFILE_VALIDATE,
@@ -4183,9 +4795,9 @@ async function main() {
         expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
       }
     );
-    assertContractError(htmlCatalogRebind, 409, 'session_api_binding_unavailable');
-    assert.match(htmlCatalogRebind.body?.error || '', /HTML page.*Base URL needs \/v1/i);
-    assert.doesNotMatch(htmlCatalogRebind.body?.error || '', /<!doctype|<html|provider console/i);
+    assert.strictEqual(htmlCatalogRebind.statusCode, 200, JSON.stringify(htmlCatalogRebind.body));
+    assert.strictEqual(htmlCatalogRebind.body?.launchMode, 'resume');
+    assert.strictEqual(htmlCatalogRebind.body?.requiresExplicitTranscriptFallback, false);
     assert.strictEqual(
       fakeHost.commands.filter((command) => command.type === 'session.start').length,
       startsBeforeProviderRace,
@@ -4243,14 +4855,15 @@ async function main() {
     fakeHost.holdNextApiCatalog = true;
     const reboundPreflightPromise = requestJson(port, 'POST', `/api/sessions/${SESSION_ID}/rebind/validate`, {
       hostId: HOST_ID,
-      apiConfig: PROFILE_B,
+      apiConfig: PROFILE_B_SAME_BINDING,
       model: MODEL_B,
       expectedRunId: selectedRuntime.body?.runId,
       expectedRunStatus: selectedRuntime.body?.runStatus,
       expectedBindingFingerprint: selectedRuntime.body?.sessionBinding?.bindingFingerprint,
     });
     const heldRebindCatalog = await waitForHeldApiCatalog(fakeHost);
-    assert.strictEqual(heldRebindCatalog.apiConfig?.profileId, PROFILE_B.profileId);
+    assert.strictEqual(heldRebindCatalog.apiConfig?.profileId, PROFILE_B_SAME_BINDING.profileId);
+    assert.strictEqual(heldRebindCatalog.apiConfig?.label, PROFILE_B_SAME_BINDING.label);
     await fakeHost.postEvent({
       type: 'session.discovery',
       hostId: HOST_ID,
@@ -4286,7 +4899,7 @@ async function main() {
     assert.match(catalogReuseToken, /^[A-Za-z0-9_-]{24,}$/);
     assert.doesNotMatch(
       catalogReuseToken,
-      new RegExp(`${HOST_ID}|${SESSION_ID}|${PROFILE_B.profileId}|${PROFILE_B.apiKey}`, 'i'),
+      new RegExp(`${HOST_ID}|${SESSION_ID}|${PROFILE_B_SAME_BINDING.profileId}|${PROFILE_B_SAME_BINDING.apiKey}`, 'i'),
       'the browser proof must be opaque and must not expose its bound identity or credential'
     );
     const catalogCommandsAfterReusablePreflight = fakeHost.commands.filter(
@@ -4307,10 +4920,9 @@ async function main() {
     );
 
     fakeHost.holdNextStart = true;
-    fakeHost.holdNextStop = true;
     const rebound = await requestJson(port, 'POST', `/api/sessions/${SESSION_ID}/rebind`, {
       hostId: HOST_ID,
-      apiConfig: PROFILE_B,
+      apiConfig: PROFILE_B_SAME_BINDING,
       model: MODEL_B,
       modelCatalogReuseToken: catalogReuseToken,
       expectedRunId: selectedRuntime.body?.runId,
@@ -4342,12 +4954,16 @@ async function main() {
     const secondStart = await waitForCommand(fakeHost, (command) => (
       command.type === 'session.start'
       && command.runId === rebound.body?.runId
-      && command.apiConfig?.profileId === PROFILE_B.profileId
+      && command.apiConfig?.label === PROFILE_B_SAME_BINDING.label
     ));
     await waitForHeldStart(fakeHost, rebound.body.runId);
     assert.strictEqual(secondStart.launchMode, 'resume');
-    assert.deepStrictEqual(secondStart.resumeTranscript, []);
-    assert.strictEqual(secondStart.expectedBinding.profileId, PROFILE_B.profileId);
+    assert.strictEqual(secondStart.forceTranscriptFallback, false);
+    assert.deepStrictEqual(secondStart.resumeTranscript, [], 'same-binding Rebind must use native history');
+    assert.strictEqual(secondStart.nativeThreadId, SESSION_ID);
+    assert.strictEqual(secondStart.rebindNativeThreadId, SESSION_ID);
+    assert.strictEqual(secondStart.expectedBinding.profileId, PROFILE_B_SAME_BINDING.profileId);
+    assert.strictEqual(secondStart.expectedBinding.label, PROFILE_B_SAME_BINDING.label);
     assert.strictEqual(secondStart.model, MODEL_B);
     assert.strictEqual(secondStart.effort, null);
 
@@ -4373,12 +4989,15 @@ async function main() {
       rebound.body.runId,
       `a pending Rebind model catalog must be labeled with the pending run identity: ${JSON.stringify(pendingRebindModels.body)}`
     );
-    assert.strictEqual(pendingRebindModels.body?.sessionBinding?.profileId, PROFILE_B.profileId);
+    assert.strictEqual(
+      pendingRebindModels.body?.sessionBinding?.profileId,
+      PROFILE_B_SAME_BINDING.profileId
+    );
     assert(pendingRebindModels.body?.models?.some((model) => model.id === MODEL_B));
     assert.strictEqual(
-      pendingRebindModels.body?.models?.some((model) => model.id === MODEL_A),
-      false,
-      'the previous successful run catalog must not be cached under the pending Rebind key'
+      pendingRebindModels.body?.models?.find((model) => model.id === MODEL_A)?.selectable,
+      true,
+      'the compatible non-official endpoint may expose provider models beyond the runtime subset'
     );
     const stopCommandsBeforePendingStop = fakeHost.commands.filter(
       (command) => command.type === 'session.stop'
@@ -4400,32 +5019,38 @@ async function main() {
       stopCommandsBeforePendingStop,
       'an unrelated stale Stop during pending Rebind must not enqueue another Host command'
     );
-    const rebindParentStop = [...fakeHost.commands].reverse().find((command) => (
+    const prematureRebindParentStop = [...fakeHost.commands].reverse().find((command) => (
       command.type === 'session.stop'
       && command.runId === selectedRuntime.body?.runId
-      && !command.suppressTerminalEvent
+      && Number(command.id) > Number(secondStart.id)
     ));
-    assert(rebindParentStop, 'Rebind must stop its parent run before starting the replacement');
-    await fakeHost.postEvent({
-      type: 'session.state_changed',
-      hostId: HOST_ID,
-      sessionId: SESSION_ID,
-      runId: rebindParentStop.runId,
-      state: 'history-only',
-      live: false,
-    });
-    const afterParentTerminal = await requestJson(
-      port,
-      'GET',
-      `/api/sessions/${SESSION_ID}/detail?hostId=${HOST_ID}`
+    assert.strictEqual(
+      prematureRebindParentStop,
+      undefined,
+      'native Rebind must keep its live parent running until the replacement is confirmed'
     );
-    assert.strictEqual(afterParentTerminal.body?.session?.runId, rebound.body.runId);
-    assert.strictEqual(afterParentTerminal.body?.session?.state, 'starting');
     await fakeHost.releaseHeldStart(rebound.body.runId);
+    const rebindParentStop = await waitForCommand(fakeHost, (command) => (
+      command.type === 'session.stop'
+      && command.runId === selectedRuntime.body?.runId
+      && command.suppressTerminalEvent === true
+      && Number(command.id) > Number(secondStart.id)
+    ));
+    assert.strictEqual(
+      rebindParentStop.reason,
+      'native-rebind-confirmed',
+      'confirmed native Rebind must stop only its superseded parent run'
+    );
 
-    const reboundRuntime = await waitForRuntime(port, (body) => body?.sessionBinding?.profileId === PROFILE_B.profileId);
+    const reboundRuntime = await waitForRuntime(
+      port,
+      (body) => body?.sessionBinding?.profileId === PROFILE_B_SAME_BINDING.profileId
+    );
     assert.strictEqual(reboundRuntime.statusCode, 200, JSON.stringify(reboundRuntime.body));
-    assert.strictEqual(reboundRuntime.body?.sessionBinding?.profileId, PROFILE_B.profileId);
+    assert.strictEqual(
+      reboundRuntime.body?.sessionBinding?.profileId,
+      PROFILE_B_SAME_BINDING.profileId
+    );
     assert.strictEqual(reboundRuntime.body?.requestedSelection?.model, MODEL_B);
     assert.strictEqual(reboundRuntime.body?.effectiveSelection?.model, null);
 
@@ -4523,7 +5148,7 @@ async function main() {
       title: 'Late duplicate start while Stop is pending',
       cwd: ROOT,
       source: 'managed',
-      effectiveBinding: makeProfileBinding(PROFILE_B),
+      effectiveBinding: makeProfileBinding(PROFILE_B_SAME_BINDING),
     });
     await fakeHost.postEvent({
       type: 'session.runtime_updated',
@@ -4693,13 +5318,35 @@ async function main() {
       conversationKey: firstStart.conversationKey,
       effectiveBinding: firstStart.expectedBinding,
     });
+    // The first stale duplicate is inside the durable retry backoff and must
+    // not consume another attempt. Once the deadline expires, a repeated
+    // observation may re-issue the exact retirement command.
+    await delay(1100);
+    await fakeHost.postEvent({
+      type: 'session.started',
+      hostId: HOST_ID,
+      sessionId: SESSION_ID,
+      nativeThreadId: SESSION_ID,
+      runId: firstStart.runId,
+      title: firstStart.label,
+      cwd: firstStart.cwd,
+      source: 'managed',
+      launchMode: firstStart.launchMode,
+      conversationKey: firstStart.conversationKey,
+      effectiveBinding: firstStart.expectedBinding,
+    });
     const staleStartedAbort = await waitForCommand(fakeHost, (command) => (
       Number(command.id || 0) > commandHighWaterBeforeStaleStarted
       && command.type === 'session.stop'
       && command.runId === firstStart.runId
     ));
     assert.strictEqual(staleStartedAbort.suppressTerminalEvent, true);
-    assert.strictEqual(staleStartedAbort.reason, 'stale-session-started');
+    assert.strictEqual(
+      staleStartedAbort.retirementId,
+      rebindParentStop.retirementId,
+      'a stale parent start must retry the same durable retirement intent'
+    );
+    assert.strictEqual(staleStartedAbort.reason, 'native-rebind-confirmed');
     assert.strictEqual(staleStartedAbort.sessionId, SESSION_ID);
     assert.notStrictEqual(staleStartedAbort.runId, secondStart.runId);
     const afterStaleStarted = await requestJson(
@@ -5018,7 +5665,7 @@ async function main() {
     const forked = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/sessions/start`, {
       launchMode: 'fork',
       sourceSessionId: SESSION_ID,
-      apiConfig: PROFILE_B,
+      apiConfig: PROFILE_B_SAME_BINDING,
       model: '',
       effort: '',
     });
@@ -5027,8 +5674,13 @@ async function main() {
     const forkStart = await waitForCommand(fakeHost, (command) => (
       command.type === 'session.start' && command.runId === forked.body?.runId
     ));
+    const forkSourceRuntime = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${SESSION_ID}/runtime-config?hostId=${HOST_ID}`
+    );
     assert.strictEqual(forkStart.launchMode, 'fork');
-    assert.strictEqual(forkStart.nativeThreadId, SESSION_ID);
+    assert.strictEqual(forkStart.nativeThreadId, forkSourceRuntime.body?.provenance?.nativeThreadId);
     assert.deepStrictEqual(forkStart.resumeTranscript, []);
     assert.strictEqual(forkStart.model, null);
     assert.strictEqual(forkStart.effort, null);
@@ -5038,7 +5690,10 @@ async function main() {
       5000,
       forked.body.sessionId
     );
-    assert.strictEqual(forkRuntime.body?.sessionBinding?.profileId, PROFILE_B.profileId);
+    assert.strictEqual(
+      forkRuntime.body?.sessionBinding?.profileId,
+      PROFILE_B_SAME_BINDING.profileId
+    );
     assert.strictEqual(
       forkRuntime.body?.requestedSelection?.model,
       null,
@@ -5075,23 +5730,39 @@ async function main() {
       'Session API Relay Test',
       'renaming a fork must not overwrite the source Session presentation'
     );
+    assert.strictEqual(
+      sourceAfterFork.body?.canonicalSessionId,
+      SESSION_ID,
+      'a live fork with inherited conversation metadata must not alias the source Session'
+    );
 
+    const failedResumeParentStopsBefore = fakeHost.commands.filter((command) => (
+      command.type === 'session.stop' && command.runId === sourceAfterFork.body?.runId
+    )).length;
     fakeHost.failNextStartCode = 'session_native_resume_failed';
     const failedResume = await requestJson(port, 'POST', `/api/sessions/${SESSION_ID}/rebind`, {
       hostId: HOST_ID,
-      apiConfig: PROFILE_A,
-      model: MODEL_A,
+      apiConfig: PROFILE_B,
+      model: MODEL_B,
       expectedRunId: sourceAfterFork.body?.runId,
       expectedRunStatus: sourceAfterFork.body?.runStatus,
       expectedBindingFingerprint: sourceAfterFork.body?.sessionBinding?.bindingFingerprint,
     });
     assert.strictEqual(failedResume.statusCode, 200, JSON.stringify(failedResume.body));
-    await waitForCommand(fakeHost, (command) => (
+    const failedResumeStart = await waitForCommand(fakeHost, (command) => (
       command.type === 'session.start' && command.runId === failedResume.body?.runId
     ));
+    assert.strictEqual(failedResumeStart.launchMode, 'resume');
+    assert.strictEqual(failedResumeStart.apiConfig?.profileId, PROFILE_B.profileId);
+    assert.notStrictEqual(
+      failedResumeStart.expectedBinding?.bindingFingerprint,
+      sourceAfterFork.body?.sessionBinding?.bindingFingerprint,
+      'cross-endpoint Rebind must reach the Host as an optimistic native Resume'
+    );
     const preservedRuntime = await waitForRuntime(
       port,
-      (body) => body?.pendingRun == null && body?.sessionBinding?.profileId === PROFILE_B.profileId
+      (body) => body?.pendingRun == null
+        && body?.sessionBinding?.profileId === PROFILE_B_SAME_BINDING.profileId
     );
     assert.strictEqual(preservedRuntime.body?.effectiveSelection?.effort, 'max');
     const preservedDetail = await requestJson(
@@ -5105,6 +5776,29 @@ async function main() {
       fakeHost.commands.some((command) => command.launchMode === 'transcript_fallback'),
       false,
       'native resume failure must not queue an implicit transcript fallback'
+    );
+    assert.strictEqual(
+      fakeHost.commands.filter((command) => (
+        command.type === 'session.stop' && command.runId === sourceAfterFork.body?.runId
+      )).length,
+      failedResumeParentStopsBefore,
+      'failed optimistic native Resume must leave the original runner untouched'
+    );
+    const forkAfterFailedResume = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${forked.body.sessionId}/runtime-config?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(forkAfterFailedResume.statusCode, 200, JSON.stringify(forkAfterFailedResume.body));
+    assert.strictEqual(
+      forkAfterFailedResume.body?.runId,
+      forked.body?.runId,
+      'a failed parent Rebind must not detach the independent fork runner'
+    );
+    assert.notStrictEqual(
+      forkAfterFailedResume.body?.canonicalSessionId,
+      SESSION_ID,
+      'the fork must retain its own canonical native identity after a parent failure'
     );
 
     fakeHost.holdNextStart = true;
@@ -5283,7 +5977,10 @@ async function main() {
         });
       assert.strictEqual(derived.statusCode, 200, JSON.stringify(derived.body));
       const heldStart = await waitForHeldStart(fakeHost, derived.body.runId);
-      assert.strictEqual(heldStart.nativeThreadId, sourceSessionId);
+      assert.strictEqual(
+        heldStart.nativeThreadId,
+        launchMode === 'fork' ? sourceRuntimeBeforeDerived.body?.provenance?.nativeThreadId : null
+      );
       pendingDerivedSessionIds.push(derived.body.sessionId);
       delayedRestartStartCommand ||= heldStart;
 
@@ -5607,7 +6304,11 @@ async function main() {
       `/api/sessions/${SESSION_ID}/runtime-config?hostId=${HOST_ID}`
     );
     assert.strictEqual(recovered.statusCode, 200, JSON.stringify(recovered.body));
-    assert.strictEqual(recovered.body?.sessionBinding?.profileId, PROFILE_B.profileId);
+    assert.strictEqual(
+      recovered.body?.sessionBinding?.profileId,
+      PROFILE_B_SAME_BINDING.profileId,
+      'Relay restart must retain the last successfully confirmed compatible Rebind binding'
+    );
     assert.strictEqual(recovered.body?.effectiveSelection?.model, MODEL_B);
     const recoveredInterruptedStop = await waitForRuntime(
       port,
@@ -6008,6 +6709,168 @@ async function main() {
     assert.strictEqual(afterLateRejectedEvents.body?.runtime?.runtimeRevision, 20);
     assert.strictEqual(afterLateRejectedEvents.body?.runtime?.phase, 'idle');
 
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      patch: {
+        runtimeRevision: 21,
+        runId: rejectedEchoStart.body?.runId,
+        phase: 'thinking',
+        activeTurnId: 'relay-terminal-invariant-turn',
+        busy: true,
+        currentTurnStatus: 'inProgress',
+        waitingOnApproval: true,
+        waitingOnUserInput: true,
+        queuedCommandId: 'relay-terminal-queued-command',
+        pendingClientRequestId: 'relay-terminal-pending-request',
+        queuedInputAt: '2026-08-09T00:00:00.000Z',
+        pendingInputSummary: 'relay terminal pending input',
+        preparingClientRequestId: 'relay-terminal-preparing-request',
+        preparingInputAt: '2026-08-09T00:00:01.000Z',
+        inputPreparationExpiresAt: '2026-08-09T00:01:01.000Z',
+        terminalReconciliation: { status: 'settling' },
+      },
+    });
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      patch: {
+        runtimeRevision: 22,
+        runId: rejectedEchoStart.body?.runId,
+        phase: 'idle',
+        busy: false,
+        queuedCommandId: 'must-not-survive-terminal-patch',
+        pendingClientRequestId: 'must-not-survive-terminal-patch',
+        queuedInputAt: '2026-08-09T00:02:00.000Z',
+        pendingInputSummary: 'must not survive terminal patch',
+        preparingClientRequestId: 'must-not-survive-terminal-patch',
+        preparingInputAt: '2026-08-09T00:02:01.000Z',
+        inputPreparationExpiresAt: '2026-08-09T00:03:01.000Z',
+      },
+    });
+    const terminalInvariantDetail = await waitForSessionDetail(
+      port,
+      rejectedEchoSessionId,
+      (body) => body?.runtime?.runtimeRevision === 22
+    );
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.activeTurnId, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.busy, false);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.currentTurnStatus, 'idle');
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.waitingOnApproval, false);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.waitingOnUserInput, false);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.queuedCommandId, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.pendingClientRequestId, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.queuedInputAt, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.pendingInputSummary, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.preparingClientRequestId, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.preparingInputAt, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.inputPreparationExpiresAt, null);
+    assert.strictEqual(terminalInvariantDetail.body?.runtime?.terminalReconciliation, null);
+
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      patch: {
+        runtimeRevision: 23,
+        runId: rejectedEchoStart.body?.runId,
+        phase: 'thinking',
+        activeTurnId: 'relay-partial-patch-turn',
+        busy: true,
+        currentTurnStatus: 'inProgress',
+        waitingOnApproval: true,
+      },
+    });
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      patch: {
+        runtimeRevision: 24,
+        runId: rejectedEchoStart.body?.runId,
+        phase: 'idle',
+      },
+    });
+    const phaseOnlyDetail = await waitForSessionDetail(
+      port,
+      rejectedEchoSessionId,
+      (body) => body?.runtime?.runtimeRevision === 24
+    );
+    assert.strictEqual(
+      phaseOnlyDetail.body?.runtime?.activeTurnId,
+      'relay-partial-patch-turn',
+      'a phase-only patch must not clear an active Turn'
+    );
+    assert.strictEqual(phaseOnlyDetail.body?.runtime?.busy, true);
+    assert.strictEqual(phaseOnlyDetail.body?.runtime?.waitingOnApproval, true);
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      patch: {
+        runtimeRevision: 25,
+        runId: rejectedEchoStart.body?.runId,
+        busy: false,
+      },
+    });
+    const busyOnlyDetail = await waitForSessionDetail(
+      port,
+      rejectedEchoSessionId,
+      (body) => body?.runtime?.runtimeRevision === 25
+    );
+    assert.strictEqual(
+      busyOnlyDetail.body?.runtime?.activeTurnId,
+      'relay-partial-patch-turn',
+      'a busy-only patch must not combine with an older phase patch to clear a Turn'
+    );
+    assert.strictEqual(busyOnlyDetail.body?.runtime?.waitingOnApproval, true);
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      patch: {
+        runtimeRevision: 24,
+        runId: rejectedEchoStart.body?.runId,
+        phase: 'error',
+        busy: false,
+      },
+    });
+    const staleTerminalDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${rejectedEchoSessionId}/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(staleTerminalDetail.body?.runtime?.runtimeRevision, 25);
+    assert.strictEqual(staleTerminalDetail.body?.runtime?.activeTurnId, 'relay-partial-patch-turn');
+    await fakeHost.postEvent({
+      type: 'session.runtime_updated',
+      hostId: HOST_ID,
+      sessionId: rejectedEchoSessionId,
+      runId: rejectedEchoStart.body?.runId,
+      patch: {
+        runtimeRevision: 26,
+        runId: rejectedEchoStart.body?.runId,
+        phase: 'interrupted',
+        busy: false,
+      },
+    });
+    const interruptedInvariantDetail = await waitForSessionDetail(
+      port,
+      rejectedEchoSessionId,
+      (body) => body?.runtime?.runtimeRevision === 26
+    );
+    assert.strictEqual(interruptedInvariantDetail.body?.runtime?.activeTurnId, null);
+    assert.strictEqual(interruptedInvariantDetail.body?.runtime?.currentTurnStatus, 'interrupted');
+    assert.strictEqual(interruptedInvariantDetail.body?.runtime?.waitingOnApproval, false);
+
     const optimisticMirrorText = 'one Relay optimistic echo and one native history echo';
     await fakeHost.postEvent({
       type: 'session.transcript',
@@ -6134,6 +6997,16 @@ async function main() {
       failedReplacementDetail.body?.session?.apiBinding?.profileId,
       PROFILE_A.profileId,
       'the failed child binding must not remain projected over the live parent'
+    );
+    assert.strictEqual(
+      failedReplacementDetail.body?.session?.resumeError?.canTranscriptFallback,
+      false,
+      'a failed replacement with a live parent must not offer transcript fallback'
+    );
+    assert.strictEqual(
+      failedReplacementDetail.body?.session?.resumeError?.requiresExplicitTranscriptFallback,
+      false,
+      'a failed replacement with a live parent must not require transcript fallback'
     );
     assert.strictEqual(failedReplacementDetail.body?.runtime?.runId, failedReplacementParent.body?.runId);
     assert.strictEqual(failedReplacementDetail.body?.runtime?.connection, 'closing');

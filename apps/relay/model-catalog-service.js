@@ -1,4 +1,5 @@
 const { redactSecretText } = require('../../shared/secret-redaction');
+const { parseReasoningMetadata } = require('../../shared/model-reasoning');
 
 const CATALOG_ERROR_MAX_LENGTH = 400;
 const INVALID_HTML_CATALOG_ERROR = 'The API returned an HTML page instead of a recognizable model catalog. Check whether the Base URL needs /v1.';
@@ -90,35 +91,9 @@ function normalizeReasoningEffort(value, options = {}) {
   return effort;
 }
 
-function reasoningMetadata(raw = {}) {
-  const hasMetadata = typeof raw.reasoningDeclared === 'boolean'
-    ? raw.reasoningDeclared
-    : Object.prototype.hasOwnProperty.call(raw, 'reasoningLevels')
-      || Object.prototype.hasOwnProperty.call(raw, 'supportedReasoningEfforts')
-      || Object.prototype.hasOwnProperty.call(raw, 'supported_reasoning_efforts');
-  const hasDefault = typeof raw.defaultReasoningEffortDeclared === 'boolean'
-    ? raw.defaultReasoningEffortDeclared
-    : Object.prototype.hasOwnProperty.call(raw, 'defaultReasoningEffort')
-      || Object.prototype.hasOwnProperty.call(raw, 'default_reasoning_effort');
-  const values = raw.reasoningLevels
-    || raw.supportedReasoningEfforts
-    || raw.supported_reasoning_efforts
-    || [];
-  const defaultValue = raw.defaultReasoningEffort ?? raw.default_reasoning_effort;
-  return {
-    declared: hasMetadata,
-    levels: uniqueStrings(values
-      .map((value) => value?.reasoningEffort || value?.reasoning_effort || value)
-      .map((value) => normalizeReasoningEffort(value))
-      .filter(Boolean)),
-    defaultDeclared: hasDefault,
-    defaultReasoningEffort: normalizeReasoningEffort(defaultValue),
-  };
-}
-
 function normalizeModel(raw = {}) {
   const id = String(raw.id || raw.model || raw.slug || '').trim();
-  const reasoning = reasoningMetadata(raw);
+  const reasoning = parseReasoningMetadata(raw);
   return {
     id,
     displayName: String(raw.displayName || raw.display_name || raw.name || '').trim() || null,

@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const path = require('path');
+const { structuredText } = require('./structured-text');
 
 const PREVIEW_TEXT_LIMIT = 1000;
 const INTERNAL_ASSISTANT_CHANNELS = new Set([
@@ -11,8 +12,121 @@ const INTERNAL_ASSISTANT_CHANNELS = new Set([
   'internal',
 ]);
 
+const PROTOCOL_ID_KEYS = Object.freeze([
+  'id',
+  'value',
+  'uuid',
+  'threadId',
+  'thread_id',
+  'turnId',
+  'turn_id',
+  'itemId',
+  'item_id',
+  'partId',
+  'part_id',
+  'name',
+  'text',
+]);
+
 function text(value) {
-  return String(value == null ? '' : value).trim();
+  return structuredText(value).trim();
+}
+
+function canonicalProtocolValue(value, seen = new WeakSet(), depth = 0) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'bigint') return String(value);
+  if (typeof value !== 'object') return String(value);
+  if (seen.has(value)) return '[Circular]';
+  if (depth >= 8) return '[Nested value omitted]';
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? '[Invalid Date]' : value.toISOString();
+  }
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.slice(0, 64).map((item) => canonicalProtocolValue(item, seen, depth + 1));
+    }
+    const result = {};
+    let keys = [];
+    try {
+      keys = Object.keys(value).sort();
+    } catch (_) {
+      return '[Unserializable object]';
+    }
+    for (const key of keys.slice(0, 64)) {
+      try {
+        result[key] = canonicalProtocolValue(value[key], seen, depth + 1);
+      } catch (_) {
+        result[key] = '[Unserializable property]';
+      }
+    }
+    if (keys.length > 64) result._truncatedKeys = true;
+    return result;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function canonicalProtocolText(value) {
+  try {
+    const serialized = JSON.stringify(canonicalProtocolValue(value));
+    return serialized && serialized !== 'null' ? serialized : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function protocolScalar(value, preferredKeys = [], seen = new WeakSet()) {
+  if (value === null || value === undefined || value === '') return '';
+  if (typeof value !== 'object') return String(value).trim();
+  if (seen.has(value)) return '';
+  seen.add(value);
+  try {
+    if (Array.isArray(value) && value.length === 1) {
+      return protocolScalar(value[0], preferredKeys, seen);
+    }
+    const keys = Array.from(new Set([...preferredKeys, 'value', 'name', 'text']));
+    for (const key of keys) {
+      let candidate;
+      try {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        candidate = value[key];
+      } catch (_) {
+        continue;
+      }
+      if (candidate === value) continue;
+      const normalized = protocolScalar(candidate, preferredKeys, seen);
+      if (normalized) return normalized;
+    }
+    return canonicalProtocolText(value).trim();
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function protocolIdentity(value) {
+  return protocolScalar(value, PROTOCOL_ID_KEYS);
+}
+
+function protocolToken(value, field) {
+  return protocolScalar(value, [
+    field,
+    'type',
+    'role',
+    'kind',
+    'status',
+    'state',
+    'phase',
+    'channel',
+    'method',
+  ]);
+}
+
+function protocolTimestamp(value) {
+  return protocolScalar(value, ['timestamp', 'time', 'at', 'value', 'text']);
 }
 
 function sha256(value) {
@@ -28,11 +142,11 @@ function coordinate(value) {
 }
 
 function sourceFileIdentity(input = {}) {
-  const explicit = text(input.streamId || input.sourceStreamId);
+  const explicit = protocolIdentity(input.streamId || input.sourceStreamId);
   if (explicit) {
     return explicit;
   }
-  const normalizedPath = text(input.rolloutPath || input.sourcePath)
+  const normalizedPath = protocolIdentity(input.rolloutPath || input.sourcePath)
     .replace(/\\/g, '/')
     .toLowerCase();
   if (!normalizedPath) {
@@ -42,17 +156,17 @@ function sourceFileIdentity(input = {}) {
   if (!basename) {
     return '';
   }
-  const nativeThreadId = text(
+  const nativeThreadId = protocolIdentity(
     input.nativeThreadId || input.threadId || input.protocolThreadId
   );
   return `rollout:${nativeThreadId}:${basename}`;
 }
 
 function assistantMessageIdFor(identity = {}) {
-  const nativeThreadId = text(
+  const nativeThreadId = protocolIdentity(
     identity.nativeThreadId || identity.threadId || identity.protocolThreadId
   );
-  const protocolItemId = text(identity.protocolItemId || identity.itemId);
+  const protocolItemId = protocolIdentity(identity.protocolItemId || identity.itemId);
   if (nativeThreadId && protocolItemId) {
     const protocol = [
       'protocol',
@@ -63,10 +177,10 @@ function assistantMessageIdFor(identity = {}) {
     return `assistant:sha256:${sha256(JSON.stringify(protocol))}`;
   }
 
-  const streamId = text(identity.streamId);
+  const streamId = protocolIdentity(identity.streamId);
   const sourceOffset = coordinate(identity.sourceOffset);
   const sourceOrdinal = coordinate(identity.sourceOrdinal);
-  const sourceTimestamp = text(identity.sourceTimestamp);
+  const sourceTimestamp = protocolTimestamp(identity.sourceTimestamp);
   if (
     !nativeThreadId
     || !streamId
@@ -83,7 +197,7 @@ function assistantMessageIdFor(identity = {}) {
     sourceOffset === null ? sourceOrdinal : null,
     'assistant',
     sourceTimestamp,
-    text(identity.finalContentDigest),
+    protocolIdentity(identity.finalContentDigest),
   ];
   return `assistant:sha256:${sha256(JSON.stringify(source))}`;
 }
@@ -111,7 +225,7 @@ function contentParts(input, payload, item) {
 function protocolFields(input, row, payload, params, item, parts) {
   const firstPart = firstObject(parts[0]);
   return {
-    nativeThreadId: text(
+    nativeThreadId: protocolIdentity(
       input.nativeThreadId
       || input.threadId
       || input.protocolThreadId
@@ -122,7 +236,7 @@ function protocolFields(input, row, payload, params, item, parts) {
       || row?.thread_id
       || row?.threadId
     ),
-    protocolTurnId: text(
+    protocolTurnId: protocolIdentity(
       input.protocolTurnId
       || input.turnId
       || item.turn_id
@@ -132,7 +246,7 @@ function protocolFields(input, row, payload, params, item, parts) {
       || payload.turn_id
       || payload.turnId
     ),
-    protocolItemId: text(
+    protocolItemId: protocolIdentity(
       input.protocolItemId
       || input.itemId
       || item.id
@@ -144,7 +258,7 @@ function protocolFields(input, row, payload, params, item, parts) {
       || payload.message_id
       || payload.messageId
     ),
-    contentPartId: text(
+    contentPartId: protocolIdentity(
       input.contentPartId
       || input.partId
       || firstPart.id
@@ -183,7 +297,7 @@ function extractContentText(content) {
 }
 
 function normalizeRolloutMirrorText(value) {
-  return String(value == null ? '' : value)
+  return text(value)
     .replace(/\r\n?/g, '\n')
     .trim();
 }
@@ -191,23 +305,23 @@ function normalizeRolloutMirrorText(value) {
 function describeRolloutAssistantRow(row) {
   if (!row || typeof row !== 'object') return null;
   const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
-  const rowType = text(row.type).toLowerCase();
-  const payloadType = text(payload.type).toLowerCase();
+  const rowType = protocolToken(row.type, 'type').toLowerCase();
+  const payloadType = protocolToken(payload.type, 'type').toLowerCase();
   if (rowType === 'event_msg' && payloadType === 'agent_message') {
     const value = normalizeRolloutMirrorText(payload.message);
     if (!value) return null;
     return {
       kind: 'event',
       text: value,
-      phase: text(payload.phase || payload.channel).toLowerCase(),
-      timestamp: text(row.timestamp || payload.timestamp),
+      phase: protocolToken(payload.phase || payload.channel, 'phase').toLowerCase(),
+      timestamp: protocolTimestamp(row.timestamp || payload.timestamp),
       protocolItemId: '',
     };
   }
   if (
     rowType === 'response_item'
     && payloadType === 'message'
-    && ['assistant', 'agent'].includes(text(payload.role).toLowerCase())
+    && ['assistant', 'agent'].includes(protocolToken(payload.role, 'role').toLowerCase())
   ) {
     const value = normalizeRolloutMirrorText(
       payload.message || extractContentText(payload.content)
@@ -216,9 +330,9 @@ function describeRolloutAssistantRow(row) {
     return {
       kind: 'response',
       text: value,
-      phase: text(payload.phase || payload.channel).toLowerCase(),
-      timestamp: text(row.timestamp || payload.timestamp),
-      protocolItemId: text(payload.id || payload.item_id || payload.itemId),
+      phase: protocolToken(payload.phase || payload.channel, 'phase').toLowerCase(),
+      timestamp: protocolTimestamp(row.timestamp || payload.timestamp),
+      protocolItemId: protocolIdentity(payload.id || payload.item_id || payload.itemId),
     };
   }
   return null;
@@ -279,7 +393,7 @@ function isTaskComplete(input, row, payload, item) {
     payload.type,
     payload.eventType,
     item.type,
-  ].map((value) => text(value).toLowerCase());
+  ].map((value) => protocolToken(value, 'type').toLowerCase());
   return markers.some((marker) => (
     marker === 'task_complete'
     || marker.endsWith('/task_complete')
@@ -287,14 +401,15 @@ function isTaskComplete(input, row, payload, item) {
 }
 
 function assistantRole(input, row, payload, item) {
-  let role = text(
+  let role = protocolToken(
     input.role
     || input.speaker
     || item.role
     || payload.role
-    || row?.role
+    || row?.role,
+    'role'
   ).toLowerCase();
-  const type = text(item.type || payload.type).toLowerCase();
+  const type = protocolToken(item.type || payload.type, 'type').toLowerCase();
   if (!role && ['agent_message', 'assistant_message'].includes(type)) {
     role = 'assistant';
   }
@@ -302,34 +417,35 @@ function assistantRole(input, row, payload, item) {
 }
 
 function isRetainedRolloutAssistant(input, row, payload) {
-  if (text(input.representation).toLowerCase() !== 'rollout' || !row) {
+  if (protocolToken(input.representation, 'representation').toLowerCase() !== 'rollout' || !row) {
     return true;
   }
-  const rowType = text(row.type).toLowerCase();
-  const payloadType = text(payload.type).toLowerCase();
-  const channel = text(payload.phase || payload.channel || payload.kind).toLowerCase();
+  const rowType = protocolToken(row.type, 'type').toLowerCase();
+  const payloadType = protocolToken(payload.type, 'type').toLowerCase();
+  const channel = protocolToken(payload.phase || payload.channel || payload.kind, 'phase').toLowerCase();
   if (INTERNAL_ASSISTANT_CHANNELS.has(channel)) {
     return false;
   }
   if (rowType === 'response_item') {
-    const role = text(payload.role).toLowerCase();
+    const role = protocolToken(payload.role, 'role').toLowerCase();
     return payloadType === 'message' && (role === 'assistant' || role === 'agent');
   }
   if (rowType === 'event_msg') {
     return payloadType === 'agent_message' && Boolean(text(payload.message));
   }
-  return Boolean(text(input.role || input.speaker));
+  return Boolean(protocolToken(input.role || input.speaker, 'role'));
 }
 
 function isInternalAssistantObservation(input, payload, item) {
-  const channel = text(
+  const channel = protocolToken(
     input.phase
     || input.channel
     || item.phase
     || item.channel
     || payload.phase
     || payload.channel
-    || payload.kind
+    || payload.kind,
+    'phase'
   ).toLowerCase();
   return INTERNAL_ASSISTANT_CHANNELS.has(channel);
 }
@@ -394,7 +510,7 @@ function normalizeAssistantObservation(input = {}) {
     sourceOffset: coordinate(input.sourceOffset ?? row?.sourceOffset),
     sourceOrdinal: coordinate(input.sourceOrdinal ?? row?.sourceOrdinal),
     role: 'assistant',
-    sourceTimestamp: text(
+    sourceTimestamp: protocolTimestamp(
       input.sourceTimestamp
       || item.timestamp
       || payload.timestamp
@@ -409,7 +525,7 @@ function normalizeAssistantObservation(input = {}) {
     return null;
   }
 
-  const observedAt = text(input.observedAt || input.firstObservedAt);
+  const observedAt = protocolTimestamp(input.observedAt || input.firstObservedAt);
   return {
     assistantMessageId,
     assistantAt: sourceIdentity.sourceTimestamp || observedAt,

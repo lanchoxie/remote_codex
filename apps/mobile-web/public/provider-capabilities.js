@@ -1,12 +1,14 @@
 (function init(root, factory) {
-  const api = factory();
+  const api = factory(typeof module === 'object' && module.exports
+    ? require('../../../shared/model-reasoning')
+    : root.RemoteCodexModelReasoning);
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
   } else {
     root.RemoteCodexProviderCapabilities = api;
   }
-}(typeof globalThis !== 'undefined' ? globalThis : this, () => {
-  const REGISTRY_VERSION = '2026-07-19.1';
+}(typeof globalThis !== 'undefined' ? globalThis : this, ({ parseReasoningMetadata }) => {
+  const REGISTRY_VERSION = '2026-09-09.1';
   const PROVIDER_KINDS = Object.freeze(['openai', 'anthropic', 'gemini', 'custom']);
 
   const PROVIDER_OPTIONS = Object.freeze([
@@ -48,7 +50,7 @@
     sourceId: 'openai-official-model-capabilities',
     label: 'OpenAI model capability advisory snapshot',
     registryVersion: REGISTRY_VERSION,
-    checkedAt: '2026-07-19',
+    checkedAt: '2026-09-09',
     authority: 'advisory',
     runtimeAuthoritative: true,
     urls: Object.freeze([
@@ -61,6 +63,18 @@
   // Exact IDs only. Unknown aliases and future snapshots stay unknown until the
   // bundled advisory data is deliberately refreshed.
   const OPENAI_MODEL_RULES = Object.freeze([
+    Object.freeze({
+      // GPT-5.6 is the documented alias for GPT-5.6 Sol.
+      modelIds: Object.freeze(['gpt-5.6']),
+      reasoningLevels: Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max']),
+      defaultReasoningEffort: 'medium',
+    }),
+    Object.freeze({
+      // GPT-6 Astra's documented reasoning levels are low through max.
+      modelIds: Object.freeze(['gpt-6-astra']),
+      reasoningLevels: Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']),
+      defaultReasoningEffort: 'medium',
+    }),
     Object.freeze({
       modelIds: Object.freeze(['gpt-5.6-sol']),
       reasoningLevels: Object.freeze(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']),
@@ -212,45 +226,12 @@
     return String(value == null ? '' : value).trim().toLowerCase();
   }
 
-  function uniqueEfforts(values = []) {
-    const seen = new Set();
-    const efforts = [];
-    for (const entry of Array.isArray(values) ? values : []) {
-      const value = String(
-        entry && typeof entry === 'object'
-          ? entry.reasoningEffort || entry.reasoning_effort || entry.value || ''
-          : entry
-      ).trim();
-      if (!value || seen.has(value)) {
-        continue;
-      }
-      seen.add(value);
-      efforts.push(value);
-    }
-    return efforts;
-  }
-
   function runtimeReasoningDeclaration(raw = {}) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-      return null;
-    }
-    const keys = [
-      'reasoningLevels',
-      'supportedReasoningEfforts',
-      'supported_reasoning_efforts',
-    ];
-    const declaredKey = keys.find((key) => Object.prototype.hasOwnProperty.call(raw, key));
-    if (!declaredKey) {
-      return null;
-    }
-    const levels = uniqueEfforts(raw[declaredKey] || []);
-    const defaultReasoningEffort = String(
-      raw.defaultReasoningEffort || raw.default_reasoning_effort || ''
-    ).trim() || null;
-    return {
-      reasoningLevels: levels,
-      defaultReasoningEffort,
-    };
+    const metadata = parseReasoningMetadata(raw);
+    return metadata.declared ? {
+      reasoningLevels: metadata.levels,
+      defaultReasoningEffort: metadata.defaultReasoningEffort,
+    } : null;
   }
 
   function findOpenAiRule(modelId) {

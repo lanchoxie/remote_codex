@@ -1,0 +1,323 @@
+@media (min-width: 721px) {
+  .composer-next-turn-settings {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
+
+  .composer-next-turn-settings > summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+    padding: 3px 2px;
+    color: var(--ui-text);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 650;
+    list-style: none;
+    user-select: none;
+  }
+
+  .composer-next-turn-settings > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .composer-next-turn-settings > summary::after {
+    width: 7px;
+    height: 7px;
+    margin-left: auto;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    content: "";
+    transform: rotate(45deg) translateY(-2px);
+  }
+
+  .composer-next-turn-settings[open] > summary::after {
+    transform: rotate(225deg) translate(-1px, -1px);
+  }
+
+  #composer-next-turn-settings-status {
+    display: none;
+  }
+
+  .composer-next-turn-settings-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 6px;
+    min-width: 0;
+    max-height: min(48dvh, 400px);
+    padding-top: 8px;
+    overflow: auto;
+  }
+
+  .composer-next-turn-settings-panel > .composer-api-control {
+    grid-column: 1 / -1;
+  }
+
+  .composer-next-turn-settings-panel > .composer-session-control-fields {
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.8fr);
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .composer-next-turn-settings-panel #composer-permissions {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 720px) {
+  .composer {
+    position: fixed;
+    right: max(10px, env(safe-area-inset-right, 0px));
+    bottom: max(8px, env(safe-area-inset-bottom, 0px));
+    left: max(10px, env(safe-area-inset-left, 0px));
+    z-index: 80;
+    box-sizing: border-box;
+    width: calc(100vw - 20px);
+    max-width: calc(100vw - 20px);
+    justify-self: stretch;
+    gap: 6px;
+    padding: 8px;
+    border-radius: 16px;
+  }
+
+  .transcript-panel {
+    padding-bottom: calc(var(--mobile-composer-height, 0px) + env(safe-area-inset-bottom, 0px) + 16px);
+  }
+
+  #alerts-fab:not(.hidden) {
+    bottom: calc(var(--mobile-composer-height, 0px) + env(safe-area-inset-bottom, 0px) + 14px);
+  }
+
+  .composer-attachment-grid {
+    gap: 6px;
+  }
+
+  .composer-attachment-grid .attachment-icon-button {
+    width: 36px;
+    min-width: 36px;
+    min-height: 34px;
+    border-radius: 8px;
+    font-size: 18px;
+  }
+
+  .composer-attachment-grid .attachment-import-button {
+    min-width: 0;
+    min-height: 34px;
+    padding: 0 8px;
+    border-radius: 8px;
+    font-size: 10px;
+  }
+
+  .composer-main-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .composer-main-row textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 56px;
+    height: 56px;
+    max-height: min(32dvh, 192px);
+    padding: 10px 12px;
+    resize: none;
+    overflow-y: hidden;
+  }
+
+  .composer-session-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+    padding: 0;
+  }
+
+  .composer-session-selection-status {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    clip-path: inset(50%);
+  }
+
+  .composer-session-control-fields {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .composer-api-control {
+    grid-column: 1;
+    grid-template-columns: 28px minmax(0, 1fr);
+    align-items: center;
+    gap: 6px;
+  }
+
+  .composer-api-control > span {
+    white-space: normal;
+  }
+
+  .composer-session-select-with-action {
+    grid-template-columns: minmax(0, 1fr) 34px;
+    gap: 4px;
+  }
+
+  .composer-session-control select,
+  .composer-control-icon-button {
+    min-height: 36px;
+  }
+
+  .composer-control-icon-button {
+    width: 34px;
+    min-width: 34px;
+  }
+
+  .composer-next-turn-settings {
+    grid-column: 1;
+    min-width: 0;
+    border-top: 1px solid var(--ui-border);
+  }
+
+  .composer-next-turn-settings > summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 34px;
+    padding: 3px 2px;
+    color: var(--ui-text);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 650;
+    list-style: none;
+    user-select: none;
+  }
+
+  #composer-next-turn-settings-status {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--ui-muted);
+    font-size: 10px;
+    font-weight: 400;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  #composer-next-turn-settings-status.warning {
+    color: var(--ui-warning-text);
+  }
+
+  #composer-next-turn-settings-status.error {
+    color: var(--ui-error-text);
+  }
+
+  #composer-next-turn-settings-status.success {
+    color: var(--ui-success-text, var(--ui-accent));
+  }
+
+  .composer-next-turn-settings > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .composer-next-turn-settings > summary::after {
+    width: 7px;
+    height: 7px;
+    margin-left: auto;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    content: "";
+    transform: rotate(45deg) translateY(-2px);
+  }
+
+  .composer-next-turn-settings[open] > summary::after {
+    transform: rotate(225deg) translate(-1px, -1px);
+  }
+
+  .composer-next-turn-settings-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    max-height: min(42dvh, 320px);
+    padding: 4px 0 2px;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+
+  .composer-next-turn-settings-panel > .composer-session-control-fields {
+    grid-column: 1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .composer-next-turn-settings-panel .composer-session-control {
+    gap: 3px;
+    font-size: 10px;
+  }
+
+  .composer-next-turn-settings-panel .composer-session-control select {
+    min-height: 36px;
+    font-size: 11px;
+  }
+
+  .composer-next-turn-settings-panel .composer-manual-effort-controls,
+  .composer-next-turn-settings-panel #composer-permissions {
+    grid-column: 1;
+  }
+
+  .composer-next-turn-settings-panel .composer-manual-effort-controls {
+    justify-content: stretch;
+  }
+
+  .composer-permissions-menu > summary {
+    min-height: 28px;
+    padding: 3px 0;
+  }
+
+  .composer-permissions-panel {
+    gap: 6px;
+    padding: 8px;
+  }
+
+  .composer-action-stack {
+    display: flex;
+    flex-flow: row nowrap;
+    gap: 4px;
+    width: 100%;
+    padding-bottom: 1px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .composer-action-stack::-webkit-scrollbar {
+    display: none;
+  }
+
+  .composer-action-stack button {
+    flex: 0 0 auto;
+    min-width: max-content;
+    min-height: 36px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    font-size: 11px;
+  }
+
+  #codex-send-button {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 380px) {
+  .composer-next-turn-settings-panel > .composer-session-control-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .composer-action-stack button {
+    padding-inline: 6px;
+    font-size: 10px;
+  }
+}

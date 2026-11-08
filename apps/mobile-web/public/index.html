@@ -3,11 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#0b1020" />
+    <meta name="theme-color" content="#f5f6f4" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>Mobile Codex Remote</title>
     <link rel="manifest" href="/manifest.json" />
-    <link rel="stylesheet" href="/styles.css?v=20260727-thinking-expand-3" />
+    <link rel="stylesheet" href="/styles.css?v=20260914-ui-1" />
+    <link rel="stylesheet" href="/structure-preview.css?v=20260827-structure-1" />
+    <link rel="stylesheet" href="/ui/tokens.css?v=20260914-ui-1" />
+    <link rel="stylesheet" href="/ui/controls.css?v=20260914-ui-1" />
+    <link rel="stylesheet" href="/ui/workbench.css?v=20260914-ui-3" />
+    <link rel="stylesheet" href="/ui/notifications.css?v=20260914-bell-1" />
+    <link rel="stylesheet" href="/ui/composer-permissions.css?v=20260914-permissions-1" />
+    <link rel="stylesheet" href="/ui/confirm-dialog.css?v=20261105-confirm-2" />
+    <link rel="stylesheet" href="/ui/composer-queue.css?v=20260915-queue-ui-3" />
+    <link rel="stylesheet" href="/ui/composer-mobile.css?v=20261106-dock-2" />
+    <script src="/ui/theme.js?v=20260914-ui-1"></script>
     <script>
       window.MathJax = {
         tex: {
@@ -242,7 +252,6 @@
               <input id="settings-api-key" type="password" placeholder="sk-..." autocomplete="off" />
             </label>
           </div>
-          <div id="settings-provider-capability-status" class="settings-warning"></div>
           <div class="settings-inline-actions api-base-url-suggestion-actions">
             <button id="settings-api-apply-suggested-base-url-button" type="button" class="secondary-button hidden" data-i18n-key="settings.useDetectedV1">Use detected /v1</button>
           </div>
@@ -414,7 +423,7 @@
             </div>
             <button id="session-sort-dir-button" type="button" class="secondary-button session-sort-dir-button" aria-label="Toggle sort direction">Desc</button>
           </div>
-          <div id="session-search-summary" class="session-search-summary"></div>
+          <div id="session-search-summary" class="session-search-summary" role="status" aria-live="polite" aria-atomic="true" data-i18n-skip></div>
           <div id="session-list" class="list conversation-list"></div>
         </section>
       </aside>
@@ -432,8 +441,8 @@
             <button id="open-settings-button" type="button" class="secondary-button">Settings</button>
             <button id="open-skills-manager-button" type="button" class="secondary-button">Skills</button>
             <div class="message-notification-anchor">
-              <button id="message-notification-button" type="button" class="secondary-button message-notification-button" aria-expanded="false" aria-controls="message-notification-panel" title="No unread Codex messages">
-                <span class="message-notification-icon" aria-hidden="true">&#128276;</span>
+              <button id="message-notification-button" type="button" class="secondary-button message-notification-button" aria-label="No unread Codex messages" aria-expanded="false" aria-controls="message-notification-panel" title="No unread Codex messages">
+                <span class="message-notification-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z"/><path d="M10 21h4"/></svg></span>
                 <span id="message-notification-count" class="message-notification-count hidden">0</span>
               </button>
               <div id="message-notification-panel" class="message-notification-panel hidden" aria-hidden="true">
@@ -453,9 +462,14 @@
             <button id="end-all-sessions-button" type="button" class="danger-button hidden">Stop All</button>
             <button id="import-selected-host-button" type="button" class="secondary-button hidden" hidden aria-hidden="true">Import Host</button>
             <button id="toggle-alerts-button" type="button" class="secondary-button">Alerts</button>
+            <button id="open-session-terminal-button" type="button" class="secondary-button session-terminal-button hidden" hidden title="Select a Session to open its working directory on the target Host.">
+              <span class="session-terminal-icon" aria-hidden="true">&gt;_</span>
+              <span id="open-session-terminal-label" aria-live="polite">Terminal</span>
+            </button>
             <button id="rename-session-button" type="button" class="secondary-button">Rename</button>
             <button id="export-session-button" type="button" class="secondary-button">Export</button>
             <button id="resume-session-button" type="button" class="secondary-button">Resume From History</button>
+            <span id="open-session-terminal-feedback" class="session-terminal-feedback" role="status" aria-live="polite" hidden></span>
           </div>
         </header>
 
@@ -588,42 +602,53 @@
             </div>
             <div class="composer-main-row">
               <div class="composer-input-wrap">
-                <textarea id="input-text" rows="3" placeholder="Send a follow-up prompt to the live managed session..."></textarea>
+                <textarea id="input-text" rows="2" placeholder="Send a follow-up prompt to the live managed session..."></textarea>
                 <div id="slash-command-menu" class="slash-command-menu hidden" role="listbox" aria-label="Slash commands"></div>
                 <div class="composer-session-toolbar" role="group" aria-label="Session API and next turn settings">
                   <div id="composer-session-selection-status" class="composer-session-selection-status" aria-live="polite">Select a Session to configure its runtime.</div>
                   <div class="composer-session-control-fields">
-                    <label class="composer-session-control composer-api-control">
-                      <span>API</span>
-                      <div class="composer-session-select-with-action">
-                        <select id="session-api-rebind-select" aria-label="Current Session API profile"></select>
-                        <button id="session-api-rebind-button" type="button" class="secondary-button composer-control-icon-button" aria-label="Restart Session with the current API profile" title="Restart Session with the current API profile">&#8635;</button>
+                    <details id="composer-next-turn-settings" class="composer-next-turn-settings" open>
+                      <summary>
+                        <span data-i18n-key="composer.advancedSettings">Run settings</span>
+                        <span id="composer-next-turn-settings-status" aria-hidden="true"></span>
+                      </summary>
+                      <div class="composer-next-turn-settings-panel">
+                        <label class="composer-session-control composer-api-control">
+                          <span>API</span>
+                          <div class="composer-session-select-with-action">
+                            <select id="session-api-rebind-select" aria-label="Current Session API profile"></select>
+                            <button id="session-api-rebind-button" type="button" class="secondary-button composer-control-icon-button" aria-label="Restart Session with the current API profile" title="Restart Session with the current API profile">&#8635;</button>
+                          </div>
+                        </label>
+                        <div class="composer-session-control-fields">
+                          <label class="composer-session-control composer-model-control">
+                            <span>Next model</span>
+                            <input id="codex-model-input" type="hidden" autocomplete="off" />
+                            <datalist id="codex-model-options"></datalist>
+                            <div class="composer-session-select-with-action">
+                              <select id="codex-model-select" aria-label="Model for the next turn">
+                                <option value="">Model: auto/default</option>
+                              </select>
+                              <button id="codex-model-refresh-button" type="button" class="secondary-button composer-control-icon-button" aria-label="Refresh current Session models" title="Refresh current Session models">&#8635;</button>
+                            </div>
+                          </label>
+                          <label class="composer-session-control composer-effort-control">
+                            <span>Next thinking</span>
+                            <select id="codex-effort-select" aria-label="Reasoning effort for the next turn">
+                              <option value="">Auto / model default</option>
+                            </select>
+                          </label>
+                        </div>
+                        <div id="composer-manual-effort-controls" class="composer-manual-effort-controls">
+                          <input id="codex-effort-manual-input" class="hidden" aria-label="Manual reasoning effort" placeholder="Custom effort, e.g. high" autocomplete="off" />
+                          <label id="codex-effort-unverified-row" class="settings-checkbox compact hidden">
+                            <input id="codex-effort-unverified-checkbox" type="checkbox" />
+                            <span>Allow unverified effort</span>
+                          </label>
+                        </div>
+                        <div id="composer-permissions"></div>
                       </div>
-                    </label>
-                    <label class="composer-session-control composer-model-control">
-                      <span>Next model</span>
-                      <input id="codex-model-input" type="hidden" autocomplete="off" />
-                      <datalist id="codex-model-options"></datalist>
-                      <div class="composer-session-select-with-action">
-                        <select id="codex-model-select" aria-label="Model for the next turn">
-                          <option value="">Model: auto/default</option>
-                        </select>
-                        <button id="codex-model-refresh-button" type="button" class="secondary-button composer-control-icon-button" aria-label="Refresh current Session models" title="Refresh current Session models">&#8635;</button>
-                      </div>
-                    </label>
-                    <label class="composer-session-control composer-effort-control">
-                      <span>Next thinking</span>
-                      <select id="codex-effort-select" aria-label="Reasoning effort for the next turn">
-                        <option value="">Auto / model default</option>
-                      </select>
-                    </label>
-                  </div>
-                  <div id="composer-manual-effort-controls" class="composer-manual-effort-controls">
-                    <input id="codex-effort-manual-input" class="hidden" aria-label="Manual reasoning effort" placeholder="Custom effort, e.g. high" autocomplete="off" />
-                    <label id="codex-effort-unverified-row" class="settings-checkbox compact hidden">
-                      <input id="codex-effort-unverified-checkbox" type="checkbox" />
-                      <span>Allow unverified effort</span>
-                    </label>
+                    </details>
                   </div>
                 </div>
               </div>
@@ -1149,13 +1174,35 @@
     <script src="/vendor/markdown-it-14.1.0.min.js"></script>
     <script src="/vendor/dompurify-3.2.6.min.js"></script>
     <script src="/markdown-renderer.js"></script>
+    <script src="/structured-text.js?v=20260830-structured-text-3"></script>
     <script src="/thinking-entry-model.js?v=20260727-thinking-expand-3"></script>
     <script src="/transcript-state.js?v=20260727-thinking-expand-3"></script>
     <script src="/transcript-scroll.js"></script>
-    <script src="/message-notification-client.js"></script>
+    <script src="/message-notification-client.js?v=20260827-notification-indicators-1"></script>
     <script src="/session-watch-controller.js"></script>
-    <script src="/provider-capabilities.js"></script>
+    <script src="/managed-session-launch.js"></script>
+    <script src="/managed-session-launch-intent.js"></script>
+    <script src="/managed-session-launch-storage.js"></script>
+    <script src="/managed-session-launch-coordinator.js"></script>
+    <script src="/model-reasoning.js?v=20261105-effort-metadata-1"></script>
+    <script src="/provider-capabilities.js?v=20261105-effort-metadata-1"></script>
+    <script src="/session-review-guard.js?v=20260828-review-guard-1"></script>
+    <script src="/session-modal-controller.js?v=20260907-modal-state-2"></script>
     <script src="/api-profile-backup.js"></script>
-    <script src="/app.js?v=20260730-thinking-markdown-math-1"></script>
+    <script src="/relay-api.js?v=20260831-ui-split-1"></script>
+    <script src="/image-preview.js?v=20260831-ui-split-1"></script>
+    <script src="/directory-picker.js?v=20260831-ui-split-1"></script>
+    <script src="/structure-preview.js?v=20260827-structure-2"></script>
+    <script src="/session-stream-client.js?v=20260831-session-stream-1"></script>
+    <script src="/session-runtime-state.js?v=20260912-runtime-state-2"></script>
+    <script src="/ui/i18n.js?v=20260914-search-1"></script>
+    <script src="/ui/session-search.js?v=20260914-search-1"></script>
+    <script src="/ui/composer-permissions.js?v=20260914-permissions-1"></script>
+    <script src="/ui/confirm-dialog.js?v=20261009-confirm-1"></script>
+    <script src="/ui/session-steer.js?v=20260915-steer-2"></script>
+    <script src="/ui/composer-queue-store.js?v=20261009-queue-store-1"></script>
+    <script src="/ui/composer-queue.js?v=20260915-queue-ui-3"></script>
+    <script src="/ui/composer-mobile-layout.js?v=20261106-dock-2"></script>
+    <script src="/app.js?v=20261106-compact-composer-1"></script>
   </body>
 </html>

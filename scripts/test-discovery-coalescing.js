@@ -111,6 +111,7 @@ async function main() {
       RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
       RELAY_MISSING_MANAGED_DISCOVERY_CONFIRMATION_MS: '1',
       RELAY_HOST_SESSION_DISCOVERY_REQUEST_COOLDOWN_MS: '60000',
+      RELAY_MAX_AGENT_EVENT_BODY_BYTES: String(1024 * 1024),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -362,6 +363,52 @@ async function main() {
     });
     assert.strictEqual(conflictingBatch.statusCode, 409);
     assert.strictEqual(conflictingBatch.body?.code, 'agent_event_batch_id_conflict');
+
+    await postDiscovery(port, [liveSession(), {
+      sessionId: 'preview-chunk-history',
+      nativeThreadId: 'preview-chunk-history',
+      title: 'Preview chunk history',
+      cwd: ROOT,
+      source: 'rollout',
+      live: false,
+      transcriptPreview: [],
+    }], 'preview-chunk-metadata');
+    const previewChunk = {
+      batchId: 'preview-chunk-1',
+      events: [{
+        type: 'session.discovery.preview',
+        hostId: HOST_ID,
+        discoveryId: 'preview-chunk-metadata',
+        sessions: [{
+          sessionId: 'preview-chunk-history',
+          nativeThreadId: 'preview-chunk-history',
+          title: 'Preview chunk history',
+          cwd: ROOT,
+          source: 'rollout',
+          live: false,
+          transcriptPreview: [{ speaker: 'agent', text: 'preview delivered separately' }],
+        }],
+      }],
+    };
+    const previewResponse = await requestJson(port, 'POST', '/api/agent/events', previewChunk);
+    assert.strictEqual(previewResponse.statusCode, 200, JSON.stringify(previewResponse.body));
+    assert.strictEqual((await readSession(port))?.live, true, 'preview chunks must not close unrelated live Sessions');
+    const previewHistory = await requestJson(port, 'GET', `/api/hosts/${HOST_ID}/sessions?full=1`);
+    const previewSession = (previewHistory.body.sessions || []).find((session) => session.sessionId === 'preview-chunk-history');
+    assert.strictEqual(previewSession?.transcriptPreview?.[0]?.text, 'preview delivered separately');
+    const duplicatePreview = await requestJson(port, 'POST', '/api/agent/events', previewChunk);
+    assert.strictEqual(duplicatePreview.body?.duplicate, true);
+
+    const oversized = await requestJson(port, 'POST', '/api/agent/events', {
+      batchId: 'oversized-discovery',
+      events: [{
+        type: 'session.discovery',
+        hostId: HOST_ID,
+        sessions: [{ sessionId: 'oversized', transcriptPreview: [{ text: 'x'.repeat(1100000) }] }],
+      }],
+    });
+    assert.strictEqual(oversized.statusCode, 413, JSON.stringify(oversized.body));
+    assert.strictEqual(oversized.body?.code, 'request_body_too_large');
   } catch (error) {
     if (output.length) error.message += `\nRelay output:\n${output.join('').slice(-4000)}`;
     throw error;

@@ -1,0 +1,88 @@
+/* Layer order is part of the UI contract. Legacy !important guards stay intact. */
+@layer legacy, tokens, controls, workbench;
+
+@layer tokens {
+  :root {
+    --ui-font: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+    --ui-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+    --ui-radius-sm: 6px;
+    --ui-radius: 10px;
+    --ui-radius-lg: 14px;
+    --ui-space-1: 4px;
+    --ui-space-2: 8px;
+    --ui-space-3: 12px;
+    --ui-space-4: 16px;
+    --ui-space-5: 24px;
+    --ui-space-6: 32px;
+    /* Compatibility aliases let unmigrated components consume the same palette. */
+    --bg: var(--ui-canvas);
+    --panel: var(--ui-surface);
+    --panel-2: var(--ui-raised);
+    --surface: var(--ui-subtle);
+    --surface-strong: var(--ui-hover);
+    --text: var(--ui-text);
+    --muted: var(--ui-muted);
+    --accent: var(--ui-accent);
+    --accent-2: var(--ui-accent);
+    --danger: var(--ui-error-text);
+    --warning: var(--ui-warning-text);
+    --border: var(--ui-border);
+    --border-strong: var(--ui-border-strong);
+    --shadow-soft: var(--ui-shadow);
+    --shadow-card: none;
+    /* Indicators are semantic, not a decorative accent palette. */
+    --ui-idle-dot: #22c55e;
+    --ui-running-dot: #facc15;
+    --ui-history-dot: #94a3b8;
+    --ui-unread-dot: #ef4444;
+    --ui-error-badge: #b42318;
+  }
+  :root, html[data-theme="minimal-light"] {
+    color-scheme: light;
+    --ui-canvas: #f5f6f4;
+    --ui-surface: #ffffff;
+    --ui-raised: #ffffff;
+    --ui-rail: #eef0ed;
+    --ui-subtle: #f3f5f2;
+    --ui-hover: #e8ede8;
+    --ui-text: #202b28;
+    --ui-muted: #596963;
+    --ui-border: #dce2dc;
+    --ui-border-strong: #b6c4bb;
+    --ui-accent: #1c6452;
+    --ui-accent-hover: #144f41;
+    --ui-on-accent: #ffffff;
+    --ui-accent-soft: #e8f1eb;
+    --ui-error-text: #a52b31;
+    --ui-error-bg: #fff0f0;
+    --ui-warning-text: #875300;
+    --ui-warning-bg: #fff6e4;
+    --ui-backdrop: rgba(25, 35, 30, .34);
+    --ui-shadow: 0 14px 48px rgba(28, 42, 34, .12);
+    --ui-code: #f2f4f2;
+  }
+  html[data-theme="dark-tech"] {
+    color-scheme: dark;
+    --ui-canvas: #171b1e;
+    --ui-surface: #1d2326;
+    --ui-raised: #252d30;
+    --ui-rail: #191f22;
+    --ui-subtle: #242c2f;
+    --ui-hover: #2d393a;
+    --ui-text: #e2e9e5;
+    --ui-muted: #a5b5ad;
+    --ui-border: #36423d;
+    --ui-border-strong: #566e60;
+    --ui-accent: #99d6b4;
+    --ui-accent-hover: #b8e6cb;
+    --ui-on-accent: #142a21;
+    --ui-accent-soft: #263c32;
+    --ui-error-text: #ffb0b4;
+    --ui-error-bg: #40272e;
+    --ui-warning-text: #edc17a;
+    --ui-warning-bg: #3c3324;
+    --ui-backdrop: rgba(0, 0, 0, .55);
+    --ui-shadow: 0 14px 48px rgba(0, 0, 0, .32);
+    --ui-code: #181f22;
+  }
+}

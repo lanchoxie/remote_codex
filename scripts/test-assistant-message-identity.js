@@ -175,6 +175,61 @@ assert.notStrictEqual(
   'distinct protocol items must retain distinct identities'
 );
 
+const objectProtocolIdentity = {
+  nativeThreadId: { id: 'thread-1', type: 'thread' },
+  protocolTurnId: { value: 'turn-1', type: 'turn' },
+  protocolItemId: { id: 'item-1', type: 'message' },
+  contentPartId: { value: 'part-0', type: 'content_part' },
+  role: { role: 'assistant' },
+};
+assert.strictEqual(
+  assistantMessageIdFor(objectProtocolIdentity),
+  assistantMessageIdFor(protocolIdentity),
+  'object-wrapped protocol ids must normalize to the same identity as scalar ids'
+);
+assert.notStrictEqual(
+  assistantMessageIdFor(objectProtocolIdentity),
+  assistantMessageIdFor({
+    ...objectProtocolIdentity,
+    protocolItemId: { id: 'item-2', type: 'message' },
+  }),
+  'distinct object-wrapped item ids must not collapse to [object Object]'
+);
+
+const objectProtocolRow = {
+  timestamp: { value: '2026-07-16T09:00:00.000Z' },
+  type: { type: 'response_item' },
+  payload: {
+    type: { type: 'message' },
+    role: { role: 'assistant' },
+    phase: { phase: 'final' },
+    turn_id: { id: 'turn-object' },
+    id: { id: 'item-object' },
+    content: [{ id: { id: 'part-object' }, type: 'output_text', text: 'object protocol answer' }],
+  },
+};
+const objectProtocolObservation = normalizeAssistantObservation({
+  nativeThreadId: { id: 'thread-object' },
+  representation: { value: 'rollout' },
+  row: objectProtocolRow,
+  finalized: true,
+});
+assert(objectProtocolObservation, 'object-valued type and role fields must still identify an assistant message');
+assert.strictEqual(objectProtocolObservation.sourceIdentity.nativeThreadId, 'thread-object');
+assert.strictEqual(objectProtocolObservation.sourceIdentity.protocolItemId, 'item-object');
+assert.strictEqual(objectProtocolObservation.sourceIdentity.protocolTurnId, 'turn-object');
+assert.strictEqual(objectProtocolObservation.sourceIdentity.contentPartId, 'part-object');
+assert(!JSON.stringify(objectProtocolObservation).includes('[object Object]'));
+assert.strictEqual(describeRolloutAssistantRow(objectProtocolRow)?.kind, 'response');
+const cyclicProtocolItemId = { opaque: 'item-cyclic' };
+cyclicProtocolItemId.value = cyclicProtocolItemId;
+const cyclicProtocolMessageId = assistantMessageIdFor({
+  nativeThreadId: { id: 'thread-object' },
+  protocolItemId: cyclicProtocolItemId,
+});
+assert.match(cyclicProtocolMessageId, /^assistant:sha256:/);
+assert(!cyclicProtocolMessageId.includes('[object Object]'));
+
 const partiallyIdentified = normalizeAssistantObservation({
   ...common,
   representation: 'live',

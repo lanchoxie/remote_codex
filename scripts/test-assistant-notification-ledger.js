@@ -134,6 +134,112 @@ async function main() {
     'duplicate streaming updates must not allocate another durable identity'
   );
 
+  const legacyDigest = 'a'.repeat(64);
+  const legacyMirror = ingestAssistantObservation(tx, {
+    canonicalKey: keyA,
+    lineageKey: keyA,
+    source: 'codex-jsonl',
+    observation: observation(
+      'assistant-legacy-source',
+      '2026-07-16T10:03:30.000Z',
+      'legacy fallback reply',
+      {
+        sourceIdentity: {
+          nativeThreadId: 'native-1',
+          streamId: 'rollout:native-1:file',
+          sourceOffset: 80,
+          sourceOrdinal: null,
+          role: 'assistant',
+          sourceTimestamp: '2026-07-16T10:03:30.000Z',
+          finalContentDigest: legacyDigest,
+          protocolTurnId: null,
+          protocolItemId: null,
+        },
+      }
+    ),
+  });
+  delete legacyMirror.entry.source;
+  const legacyMirrorReplay = ingestAssistantObservation(tx, {
+    canonicalKey: keyA,
+    lineageKey: keyA,
+    source: 'codex-jsonl',
+    observation: observation(
+      'assistant-legacy-source-replay',
+      '2026-07-16T10:03:30.500Z',
+      'legacy fallback reply',
+      {
+        sourceIdentity: {
+          nativeThreadId: 'native-1',
+          streamId: 'rollout:native-1:file',
+          sourceOffset: 81,
+          sourceOrdinal: null,
+          role: 'assistant',
+          sourceTimestamp: '2026-07-16T10:03:30.500Z',
+          finalContentDigest: legacyDigest,
+          protocolTurnId: null,
+          protocolItemId: null,
+        },
+      }
+    ),
+  });
+  assert.strictEqual(
+    legacyMirrorReplay.entry.assistantSeq,
+    legacyMirror.entry.assistantSeq,
+    'a pre-source rollout ledger entry must absorb its strict JSONL mirror after upgrade'
+  );
+  assert.strictEqual(
+    legacyMirrorReplay.entry.source,
+    'codex-jsonl',
+    'a matched legacy rollout entry should persist the inferred source on its next observation'
+  );
+
+  const ambiguousLegacy = ingestAssistantObservation(tx, {
+    canonicalKey: keyA,
+    lineageKey: keyA,
+    source: 'codex-app-server',
+    observation: observation(
+      'assistant-ambiguous-legacy',
+      '2026-07-16T10:03:40.000Z',
+      'same text must remain distinct',
+      {
+        sourceIdentity: {
+          nativeThreadId: 'native-1',
+          streamId: 'app-server:native-1',
+          sourceTimestamp: '2026-07-16T10:03:40.000Z',
+          finalContentDigest: legacyDigest,
+          protocolTurnId: null,
+          protocolItemId: null,
+        },
+      }
+    ),
+  });
+  delete ambiguousLegacy.entry.source;
+  const ambiguousReplay = ingestAssistantObservation(tx, {
+    canonicalKey: keyA,
+    lineageKey: keyA,
+    source: 'codex-jsonl',
+    observation: observation(
+      'assistant-ambiguous-legacy-replay',
+      '2026-07-16T10:03:40.500Z',
+      'same text must remain distinct',
+      {
+        sourceIdentity: {
+          nativeThreadId: 'native-1',
+          streamId: 'app-server:native-1',
+          sourceTimestamp: '2026-07-16T10:03:40.500Z',
+          finalContentDigest: legacyDigest,
+          protocolTurnId: null,
+          protocolItemId: null,
+        },
+      }
+    ),
+  });
+  assert.notStrictEqual(
+    ambiguousReplay.entry.assistantSeq,
+    ambiguousLegacy.entry.assistantSeq,
+    'legacy source inference must not classify a non-rollout stream from matching text alone'
+  );
+
   const streaming = ingestAssistantObservation(tx, {
     canonicalKey: keyA,
     lineageKey: keyA,

@@ -187,6 +187,7 @@ function normalizeStoredProfile(profile = {}) {
     providerKind: normalizeProviderKind(profile.providerKind, provider),
     baseUrl: normalizeBaseUrl(profile.baseUrl),
     apiKey: String(profile.apiKey || ''),
+    nativeResumeCompatibilityKey: String(profile.nativeResumeCompatibilityKey || '').trim().slice(0, 160).toLowerCase(),
     rememberApiKey: profile.rememberApiKey !== false || Boolean(profile.apiKey),
     sessionDefaults: normalizeSessionDefaults(profile.sessionDefaults),
   };

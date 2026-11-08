@@ -167,7 +167,12 @@ Important event names:
 
 - Keep relay state changes in `apps/relay/server.js` until a real store is introduced.
 - Keep host-local filesystem/process actions inside `apps/host-agent`.
-- Keep UI state in `apps/mobile-web/public/app.js`.
+- Keep canonical application state and cross-feature orchestration in
+  `apps/mobile-web/public/app.js`, but keep DOM-owned controls in focused
+  browser modules under `apps/mobile-web/public` (for example
+  `directory-picker.js` and `image-preview.js`). Those modules receive state
+  and API callbacks through a small injected controller interface; they must
+  not create a second session store, SSE connection, or global render loop.
 - Put cross-module normalization and small data models in `shared`.
 - Do not store passwords, OTP codes, captcha answers, or private keys in connector profiles.
 - Treat imported Codex history as read-only metadata unless a live runtime owns the process.

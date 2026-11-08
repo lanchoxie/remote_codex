@@ -7,6 +7,22 @@ const { JSDOM } = require('jsdom');
 const appPath = path.join(__dirname, '..', 'apps', 'mobile-web', 'public', 'app.js');
 const app = fs.readFileSync(appPath, 'utf8');
 
+function structuredTestText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(structuredTestText).filter(Boolean).join('\n');
+  if (typeof value === 'object') {
+    for (const key of ['text', 'content', 'message', 'summary', 'type', 'status', 'phase']) {
+      if (value[key] != null) {
+        const text = structuredTestText(value[key]);
+        if (text) return text;
+      }
+    }
+    try { return JSON.stringify(value); } catch (_) { return ''; }
+  }
+  return String(value);
+}
+
 function extractFunctionSource(name) {
   const match = new RegExp(`function\\s+${name}\\s*\\(`).exec(app);
   assert(match, `${name} was not found`);
@@ -43,6 +59,7 @@ const sandbox = {
   TRANSCRIPT_RENDER_CHAR_BUDGET: 90000,
   TRANSCRIPT_RENDER_LINE_BUDGET: 3000,
   TRANSCRIPT_RENDER_CODE_FENCE_BUDGET: 180,
+  structuredThinkingText: structuredTestText,
 };
 vm.createContext(sandbox);
 vm.runInContext([
@@ -129,12 +146,28 @@ const longRunDiagnostics = Array.from({ length: 10_000 }, (_, index) => ({
   message: `diagnostic ${index}`,
 }));
 const longRunContext = vm.createContext({
+  structuredThinkingText: structuredTestText,
+  structuredThinkingScalar: (value, fallback = '') => {
+    if (value == null || value === '') return fallback;
+    if (typeof value !== 'object') return String(value);
+    for (const key of ['type', 'status', 'state', 'phase', 'kind', 'name', 'id']) {
+      if (value[key] != null && value[key] !== '') return String(value[key]);
+    }
+    return structuredTestText(value) || fallback;
+  },
   getTranscriptForSession: () => longRunTranscript,
   getThinkingDiagnosticsForSession: () => longRunDiagnostics,
   getProjectedThinkingActivities: () => [],
   mergeProjectedThinkingEntries: (diagnostics, activities) => [...diagnostics, ...activities].slice(-160),
 });
-vm.runInContext(thinkingPairingSource, longRunContext);
+vm.runInContext([
+  extractFunctionSource('firstThinkingField'),
+  extractFunctionSource('thinkingTurnIdentity'),
+  extractFunctionSource('buildThinkingTurnOwnershipIndex'),
+  extractFunctionSource('thinkingTurnIdentityAliases'),
+  extractFunctionSource('thinkingEntryMatchesUserTurn'),
+  thinkingPairingSource,
+].join('\n'), longRunContext);
 const pairingStartedAt = process.hrtime.bigint();
 let pairedSegments = [];
 for (let iteration = 0; iteration < 20; iteration += 1) {
@@ -266,6 +299,7 @@ const cacheSandbox = {
     alerts: new Map(),
     dismissedAlerts: new Map(),
     requests: new Map(),
+    requestApplyGenerations: new Map(),
     runtime: new Map(),
     runtimeApplyGenerations: new Map(),
     runtimeStreamGenerations: new Map(),
@@ -276,6 +310,7 @@ const cacheSandbox = {
     messageReadGates: new Map(),
     transcriptNotificationRenderVersions: new Map(),
     transcriptNotificationRenderedAssistantSeq: new Map(),
+    transcriptNotificationRenderedAssistantIds: new Map(),
     transcriptUnread: new Set(),
     transcriptUserDetached: new Set(),
     thinkingPanels: new Map(),

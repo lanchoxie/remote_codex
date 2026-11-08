@@ -9,6 +9,19 @@ const { spawn } = require('child_process');
 const ROOT = path.resolve(__dirname, '..');
 const HOST_ID = 'notification-sse-host';
 const SESSION_ID = 'native-sse-1';
+const relaySource = fs.readFileSync(path.join(ROOT, 'apps', 'relay', 'server.js'), 'utf8');
+
+const resetProjectionStart = relaySource.indexOf('const durableAssistantProjection = assistantProjectionForIdentity(');
+assert(resetProjectionStart >= 0, 'SSE reset must rebuild Assistant state from the durable Session Record Store');
+const resetProjectionBlock = relaySource.slice(resetProjectionStart, resetProjectionStart + 900);
+assert(
+  resetProjectionBlock.includes('compactAssistantProjection(durableAssistantProjection)'),
+  'SSE reset must bound the newly rebuilt durable Assistant projection'
+);
+assert(
+  !resetProjectionBlock.includes('currentSession?.assistantProjection'),
+  'SSE reset must not trust the mutable in-memory Session projection cache'
+);
 
 function openPort() {
   return new Promise((resolve, reject) => {
@@ -357,6 +370,38 @@ async function main() {
     assert.strictEqual(expiredReset.data.reason, 'cursor_expired');
     assert.strictEqual(expiredReset.data.assistantProjection.latestAssistantSeq, 1);
     expired.close();
+
+    // Discovery can refresh the in-memory Session with an older compact projection.
+    // Reset recovery must still rebuild Assistant state from the durable ledger.
+    await postEvents(port, [{
+      type: 'session.discovery',
+      hostId: HOST_ID,
+      sessions: [{
+        sessionId: SESSION_ID,
+        nativeThreadId: SESSION_ID,
+        conversationKey: SESSION_ID,
+        assistantProjection: {
+          canonicalConversationKey: `${HOST_ID}::${SESSION_ID}`,
+          latestAssistantSeq: 0,
+          projectionRevision: 0,
+        },
+      }],
+    }]);
+    const durableReset = openSse(
+      port,
+      `/api/sessions/${SESSION_ID}/events?hostId=${HOST_ID}`
+    );
+    const durableResetFrame = await waitForFrame(
+      durableReset,
+      (frame) => frame.event === 'stream.reset',
+      'missing durable projection reset'
+    );
+    assert.strictEqual(
+      durableResetFrame.data.assistantProjection.latestAssistantSeq,
+      1,
+      'SSE reset must rebuild Assistant state from the durable ledger instead of Session cache'
+    );
+    durableReset.close();
 
     const releasedCursor = initial.frames.filter((frame) => frame.id).at(-1).id;
     initial.close();

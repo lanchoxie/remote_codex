@@ -124,6 +124,8 @@ sandbox.document = {
 sandbox.document.body.appendChild = (child) => child;
 sandbox.NodeFilter = { SHOW_TEXT: 4 };
 sandbox.window = {
+  RemoteCodexSessionModal: require('../apps/mobile-web/public/session-modal-controller'),
+  RemoteCodexSessionRuntimeState: require('../apps/mobile-web/public/session-runtime-state'),
   crypto: { randomUUID: () => 'test-uuid' },
   localStorage: {
     getItem: () => null,
@@ -136,7 +138,7 @@ sandbox.window = {
   clearInterval: sandbox.clearInterval,
   requestAnimationFrame: (fn) => fn(),
   addEventListener() {},
-  location: { origin: 'http://127.0.0.1:8797', search: '' },
+  location: { origin: 'http://127.0.0.1:8897', search: '' },
   alert: () => {},
   confirm: () => true,
   prompt: () => '',
@@ -153,6 +155,10 @@ window.__sidebarLiveTest = {
   state,
   getConversationGroups,
   sortConversationGroups,
+  deriveConversationRuntimeIndicator,
+  runtimeIsActive,
+  runtimeIssuePresentation,
+  setRuntimeForSession,
 };
 `;
 
@@ -273,20 +279,179 @@ assert.strictEqual(
 );
 
 assert.ok(
-  source.includes("group.liveCount > 0 ? 'live' : 'history'"),
-  'conversation card class should distinguish live and history groups'
+  source.includes('const runtimeIndicator = deriveConversationRuntimeIndicator(group);'),
+  'conversation cards should derive an explicit runtime indicator'
 );
 assert.ok(
-  styles.includes('.conversation-card.live'),
-  'styles should give live conversation cards a distinct class'
+  styles.includes('.conversation-card.live-idle'),
+  'styles should distinguish idle live conversation cards'
 );
 assert.ok(
-  styles.includes('.conversation-live-dot'),
-  'live conversation card should show a small green live indicator'
+  styles.includes('.conversation-runtime-dot.runtime-active'),
+  'active live conversations should expose a yellow runtime indicator'
 );
 assert.ok(
   styles.includes('live-session-pulse'),
-  'live conversation indicator should pulse subtly'
+  'only active runtime indicators should pulse subtly'
 );
+assert.ok(
+  styles.includes('.conversation-unread-button::before'),
+  'unread replies should remain a separate clickable indicator'
+);
+assert.ok(
+  /\.conversation-unread-button\s*\{[^}]*display:\s*grid;[^}]*place-items:\s*center;/s.test(styles),
+  'the unread indicator button should center a rendered dot'
+);
+assert.ok(
+  /\.conversation-unread-button::before\s*\{[^}]*display:\s*block;[^}]*width:\s*9px;[^}]*height:\s*9px;/s.test(styles),
+  'the unread pseudo-element should occupy visible space'
+);
+assert.ok(
+  styles.includes('@media (prefers-reduced-motion: reduce)'),
+  'the active runtime pulse should respect reduced-motion preferences'
+);
+assert.ok(
+  source.includes("runtimeDot.setAttribute('aria-label', runtimeIndicator.label)"),
+  'runtime indicators should expose their state to assistive technology'
+);
+assert.ok(
+  /queuedUiRenders\.conversationNav = true;\s*scheduleRuntimeStatusRender\(\);/.test(source),
+  'runtime SSE updates should refresh the sidebar indicator in the same render batch'
+);
+
+const historyIndicator = api.deriveConversationRuntimeIndicator({ sessions: [{
+  hostId: 'win', sessionId: 'indicator-history', live: false, state: 'history-only',
+}] });
+assert.deepStrictEqual(
+  { ...historyIndicator },
+  { tone: 'history', label: 'History or offline' }
+);
+
+const idleLive = {
+  hostId: 'win', sessionId: 'indicator-live', live: true, runId: 'run-live', state: 'running',
+};
+api.state.runtime.set('win::indicator-live', {
+  runId: 'run-live', phase: 'idle', busy: false, activeTurnId: null,
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [idleLive] }) },
+  { tone: 'live-idle', label: 'Live session idle' }
+);
+
+api.state.runtime.set('win::indicator-live', {
+  runId: 'run-live', phase: 'thinking', busy: true, activeTurnId: 'turn-live',
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [idleLive] }) },
+  { tone: 'runtime-active', label: 'Session running' }
+);
+
+api.state.runtime.set('win::indicator-live', {
+  runId: 'stale-run', phase: 'thinking', busy: true, activeTurnId: 'stale-turn',
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [idleLive] }) },
+  { tone: 'live-idle', label: 'Live session idle' },
+  'runtime state from a superseded run must not turn the live indicator yellow'
+);
+
+api.state.runtime.set('win::indicator-live', {
+  phase: 'thinking', busy: true, activeTurnId: 'runless-stale-turn',
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [idleLive] }) },
+  { tone: 'live-idle', label: 'Live session idle' },
+  'a runless runtime snapshot must not turn a known live Run yellow'
+);
+
+const runlessLive = {
+  hostId: 'win', sessionId: 'indicator-runless-live', live: true, state: 'running',
+};
+api.state.runtime.set('win::indicator-runless-live', {
+  runId: 'unbound-runtime-run', phase: 'thinking', busy: true, activeTurnId: 'unbound-turn',
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [runlessLive] }) },
+  { tone: 'live-idle', label: 'Live session idle' },
+  'a runtime Run must not claim a live Session whose current Run identity is unknown'
+);
+
+api.state.runtime.set('win::indicator-runless-live', {
+  phase: 'thinking', busy: true, activeTurnId: 'legacy-turn',
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [runlessLive] }) },
+  { tone: 'runtime-active', label: 'Session running' },
+  'legacy runless live/runtime projections should remain compatible when neither side has a Run identity'
+);
+
+const pendingReplacementLive = {
+  hostId: 'win',
+  sessionId: 'indicator-pending-replacement',
+  live: true,
+  runId: 'run-live-parent',
+  activeRunId: 'run-pending-child',
+  runtimeConfig: { runId: 'run-live-parent', activeRunId: 'run-pending-child' },
+};
+api.state.runtime.set('win::indicator-pending-replacement', {
+  runId: 'run-live-parent', phase: 'thinking', busy: true, activeTurnId: 'turn-live-parent',
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [pendingReplacementLive] }) },
+  { tone: 'runtime-active', label: 'Session running' },
+  'a pending child Run must not hide active runtime state from the still-live parent Run'
+);
+api.state.runtime.set('win::indicator-pending-replacement', {
+  phase: 'thinking', busy: true, activeTurnId: 'unscoped-stale-turn',
+});
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [pendingReplacementLive] }) },
+  { tone: 'live-idle', label: 'Live session idle' },
+  'a Session with a known live Run must reject active runtime state that has no Run identity'
+);
+
+assert.deepStrictEqual(
+  { ...api.deriveConversationRuntimeIndicator({ sessions: [{
+    hostId: 'win', sessionId: 'indicator-starting', live: false, state: 'starting',
+  }] }) },
+  { tone: 'history', label: 'History or offline' }
+);
+
+api.state.sessionLaunchBusy.set('pending-start', {
+  hostId: 'win', sessionId: 'indicator-starting', sessionKey: 'win::indicator-starting',
+});
+assert.strictEqual(api.deriveConversationRuntimeIndicator({ sessions: [{
+  hostId: 'win', sessionId: 'indicator-starting', live: false, state: 'starting',
+}] }).tone, 'runtime-active', 'a real launch receipt must remain visible');
+api.state.sessionLaunchBusy.clear();
+
+for (const runtime of [
+  { phase: 'completed', busy: true, activeTurnId: 'stale' },
+  { phase: 'closed', busy: true, activeTurnId: 'stale' },
+  { phase: 'error', currentTurnStatus: 'failed', busy: true, activeTurnId: 'stale' },
+]) {
+  api.state.runtime.set('win::indicator-live', { ...runtime, runId: 'run-live' });
+  assert.strictEqual(api.deriveConversationRuntimeIndicator({ sessions: [idleLive] }).tone, 'live-idle');
+}
+api.state.runtime.set('win::indicator-live', { phase: 'running', currentTurnStatus: 'completed', busy: true, activeTurnId: 'stale', runId: 'run-live' });
+assert.strictEqual(api.deriveConversationRuntimeIndicator({ sessions: [idleLive] }).tone, 'runtime-active');
+for (const phase of ['reviewing', 'compacting', 'running-shell-command', 'submitting-turn', 'terminal-settling', 'runtime-unknown']) {
+  const runtime = { phase, currentTurnStatus: 'completed', busy: true, runId: 'run-live' };
+  api.state.runtime.set('win::indicator-live', runtime);
+  assert.strictEqual(api.deriveConversationRuntimeIndicator({ sessions: [idleLive] }).tone, 'runtime-active', phase);
+}
+api.setRuntimeForSession('win', 'merge-test', {
+  runId: 'merge-run', runtimeRevision: 1, phase: 'thinking', busy: true,
+  activeTurnId: 'turn-1', waitingOnApproval: true,
+});
+const completed = api.setRuntimeForSession('win', 'merge-test', {
+  runId: 'merge-run', runtimeRevision: 2, phase: 'completed', busy: false,
+});
+assert.strictEqual(completed.activeTurnId, null);
+assert.strictEqual(completed.waitingOnApproval, false);
+assert.strictEqual(api.runtimeIsActive(completed), false);
+assert.strictEqual(api.setRuntimeForSession('win', 'merge-test', {
+  runId: 'merge-run', runtimeRevision: 1, phase: 'thinking', busy: true,
+}).runtimeRevision, 2, 'late active patches must not reopen a completed runtime');
 
 console.log('session sidebar live assertions passed');

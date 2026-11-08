@@ -79,6 +79,8 @@ const sandbox = {
   RegExp,
   Buffer,
   Blob,
+  TextEncoder,
+  TextDecoder,
   File: typeof File === 'function' ? File : undefined,
   setTimeout() {
     return 0;
@@ -166,6 +168,13 @@ window.__historyImportTest = {
   state,
   openHistoryImportDialog,
   getHistoryImportCandidateGroups,
+  getHistoryImportSessionForGroup,
+  buildSessionExportUrl,
+  readResponseBytesWithLimit,
+  readResponseTextWithLimit,
+  readResponseBlobWithLimit,
+  normalizeHistoryImportError,
+  historyImportSizeError,
   setHistoryImportSort,
   setHistoryImportSearch,
   toggleHistoryImportCollection,
@@ -202,6 +211,9 @@ api.state.sessionCollections = [
     { hostId: 'win', conversationKey: 'c2', sessionId: 's2' },
     { hostId: 'win', conversationKey: 'c3', sessionId: 's3' },
   ] },
+  { collectionId: 'stale', name: 'Stale references', items: [
+    { hostId: 'win', conversationKey: 'c4', sessionId: 's4', title: 'Saved but not loaded' },
+  ] },
   { collectionId: 'trash', name: 'Trash', items: [
     { hostId: 'win', conversationKey: 'trash1', sessionId: 'trash1' },
   ] },
@@ -232,8 +244,22 @@ assert.deepStrictEqual(plainArray(groups.map((group) => group.conversationKey)),
 
 assert.ok(!api.state.historyImportDialog.selectedCollectionIds.has('trash'));
 
+api.setHistoryImportSearch('');
+api.toggleHistoryImportCollection('stale', true);
+groups = api.getHistoryImportCandidateGroups();
+const staleGroup = groups.find((group) => group.conversationKey === 'c4');
+assert.ok(staleGroup?.collectionOnly, 'stale collection item should remain visible as a collection-only candidate');
+const staleSession = api.getHistoryImportSessionForGroup(staleGroup);
+assert.strictEqual(staleSession?.hostId, 'win', 'collection-only import should recover hostId from collection item');
+assert.strictEqual(staleSession?.sessionId, 's4', 'collection-only import should recover sessionId from collection item');
+assert.ok(
+  api.buildSessionExportUrl(staleSession, 'markdown').includes('hostId=win'),
+  'collection-only import should produce an export URL instead of an empty URL'
+);
+
 const latestSource = fs.readFileSync(appPath, 'utf8');
 const stylesSource = fs.readFileSync(path.join(ROOT, 'apps', 'mobile-web', 'public', 'styles.css'), 'utf8');
+const relaySource = fs.readFileSync(path.join(ROOT, 'apps', 'relay', 'server.js'), 'utf8');
 assert.ok(latestSource.includes('history-import-search-input'), 'dialog should include search input');
 assert.ok(latestSource.includes('history-import-sort-select'), 'dialog should include sort select');
 assert.ok(latestSource.includes('history-import-sort-dir-button'), 'dialog should include sort direction button');
@@ -242,4 +268,85 @@ assert.ok(latestSource.includes('collectionNames'), 'dialog rows should render c
 assert.ok(!latestSource.includes('function getHistoryImportSessions'), 'dialog should not use the old global session candidate builder');
 assert.ok(stylesSource.includes('.history-import-toolbar'), 'dialog should style the filtering toolbar');
 assert.ok(stylesSource.includes('.history-import-meta'), 'dialog should style created/updated/message metadata');
+assert.ok(latestSource.includes('removeHistoryImportBatch'), 'history import should rollback its own attachments on failure');
+assert.ok(latestSource.includes('history_import_memory_error'), 'history import should classify browser memory failures');
+assert.ok(latestSource.includes('QuotaExceededError') || latestSource.includes('quotaexceeded'), 'history import should classify browser quota errors');
+assert.ok(latestSource.includes("response?.body?.cancel?."), 'oversized responses should cancel their body before failing');
+assert.ok(latestSource.includes('payload?.detail'), 'HTTP export failures should preserve the server-side reason');
+assert.ok(relaySource.includes('function getSessionExportAvailabilityError'), 'Relay should expose an explicit export availability check');
+assert.ok(relaySource.includes("code: 'session_history_unavailable'"), 'Relay export failures should use a stable history error code');
 console.log('history import filtering tests passed');
+
+function makeStreamingResponse(chunks, contentLength = null) {
+  let index = 0;
+  const response = {
+    headers: {
+      get(name) {
+        return String(name).toLowerCase() === 'content-length' && contentLength != null
+          ? String(contentLength)
+          : null;
+      },
+    },
+    cancelled: false,
+    cancelReason: '',
+    body: {
+      async cancel(reason) {
+        response.cancelled = true;
+        response.cancelReason = String(reason || '');
+      },
+      getReader() {
+        return {
+          async read() {
+            if (index >= chunks.length) {
+              return { done: true, value: undefined };
+            }
+            return { done: false, value: chunks[index++] };
+          },
+          async cancel(reason) {
+            response.cancelled = true;
+            response.cancelReason = String(reason || '');
+          },
+        };
+      },
+    },
+  };
+  return response;
+}
+
+(async () => {
+  const declaredOversize = makeStreamingResponse([], 5);
+  await assert.rejects(
+    () => api.readResponseBlobWithLimit(declaredOversize, 4),
+    (error) => error?.code === 'history_import_bundle_too_large' && error.maxBytes === 4 && error.actualBytes === 5,
+    'declared oversized bundle should fail before reading the body'
+  );
+  assert.strictEqual(declaredOversize.cancelled, true, 'declared oversized response should be cancelled');
+
+  const streamedOversize = makeStreamingResponse([
+    new Uint8Array([1, 2, 3]),
+    new Uint8Array([4, 5]),
+  ]);
+  await assert.rejects(
+    () => api.readResponseBlobWithLimit(streamedOversize, 4),
+    (error) => error?.code === 'history_import_bundle_too_large' && error.actualBytes === 5,
+    'streamed oversized bundle should be rejected at the first over-limit chunk'
+  );
+  assert.strictEqual(streamedOversize.cancelled, true, 'over-limit stream should be cancelled');
+
+  const markdown = api.readResponseTextWithLimit(
+    makeStreamingResponse([new TextEncoder().encode('# Imported\n')]),
+    64
+  );
+  assert.strictEqual(await markdown, '# Imported\n', 'markdown within the limit should decode normally');
+
+  const memoryError = api.normalizeHistoryImportError(new Error('Invalid string length'));
+  assert.strictEqual(memoryError.code, 'history_import_memory_error');
+  const quotaError = api.normalizeHistoryImportError({ name: 'QuotaExceededError' });
+  assert.strictEqual(quotaError.code, 'history_import_storage_quota');
+  const sizeError = api.historyImportSizeError('zip', 4, 5);
+  assert.strictEqual(sizeError.code, 'history_import_bundle_too_large');
+  console.log('history import size-limit tests passed');
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

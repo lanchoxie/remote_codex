@@ -166,6 +166,19 @@ function buildNodeBinResolutionCommand() {
 
 function buildCodexBinResolutionCommand(connector = {}) {
   const codexHome = shellEnvValue(connector.codexHome || '~/.codex', { allowHome: true });
+  const explicitCodexBin = cleanString(connector.bootstrap?.codexBin);
+  if (explicitCodexBin) {
+    if (!path.posix.isAbsolute(explicitCodexBin) || /[\r\n\0]/.test(explicitCodexBin)) {
+      throw new Error('Configured Codex binary must be an absolute POSIX path.');
+    }
+    return [
+      `CODEX_BIN=${shellEnvValue(explicitCodexBin)}`,
+      'test -x "$CODEX_BIN" || { echo CODEX_REMOTE_CONFIGURED_CODEX_UNAVAILABLE >&2; exit 73; }',
+      'CODEX_BIN_DIR="$(dirname "$CODEX_BIN")"',
+      'PATH="$CODEX_BIN_DIR:$PATH"',
+      'export CODEX_BIN PATH',
+    ].join('\n');
+  }
   return [
     'codex_remote_is_rejected_bin() {',
     '  case "$1" in',
@@ -315,6 +328,7 @@ function normalizeConnectorInput(input = {}, existing = null) {
       tmuxSession: cleanString(nextBootstrap.tmuxSession || input.bootstrapTmuxSession || previousBootstrap.tmuxSession) || 'codex-remote',
       serviceName: cleanString(nextBootstrap.serviceName || input.bootstrapServiceName || previousBootstrap.serviceName) || 'codex-remote',
       launchCommand: cleanText(nextBootstrap.launchCommand || input.bootstrapLaunchCommand || previousBootstrap.launchCommand),
+      codexBin: cleanString(nextBootstrap.codexBin || input.bootstrapCodexBin || previousBootstrap.codexBin),
     },
     createdAt: cleanString(previous.createdAt || input.createdAt) || now,
     updatedAt: now,
@@ -441,7 +455,7 @@ function buildRemoteStatusCommand(connector) {
       `expected_connector_id=${shellEnvValue(expectedConnectorId)};`,
       `expected_host_id=${shellEnvValue(expectedHostId)};`,
       'if cd "$control_dir" 2>/dev/null; then control_dir="$(pwd -P)"; else echo CODEX_REMOTE_AGENT_MISSING; exit 0; fi;',
-      'agent_pid="$(ps -eo pid=,comm=,args= 2>/dev/null | while read -r candidate_pid candidate_comm candidate_args; do case "$candidate_comm" in node|nodejs) ;; *) continue ;; esac; case "$candidate_args" in *apps/host-agent/agent.js*) ;; *) continue ;; esac; candidate_environment="$(tr \'\\000\' \'\\n\' < "/proc/$candidate_pid/environ" 2>/dev/null || true)"; candidate_connector_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^REMOTE_CODEX_CONNECTOR_ID=//p" | head -n 1)"; candidate_host_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^HOST_ID=//p" | head -n 1)"; identity_match=0; if test -n "$expected_connector_id" && test -n "$candidate_connector_id"; then test "$candidate_connector_id" = "$expected_connector_id" && identity_match=1; elif test -n "$expected_host_id" && test -n "$candidate_host_id"; then test "$candidate_host_id" = "$expected_host_id" && identity_match=1; fi; test "$identity_match" = 1 || continue; candidate_cwd="$(readlink -f "/proc/$candidate_pid/cwd" 2>/dev/null || true)"; case "$candidate_cwd" in "$control_dir"|"$control_dir"/*) echo "$candidate_pid"; break ;; esac; done)";',
+      'agent_pid="$(ps -eo pid= -o comm= -o args= 2>/dev/null | while read -r candidate_pid candidate_comm candidate_args; do case "$candidate_comm" in node|nodejs) ;; *) continue ;; esac; case "$candidate_args" in *apps/host-agent/agent.js*) ;; *) continue ;; esac; candidate_environment="$(tr \'\\000\' \'\\n\' < "/proc/$candidate_pid/environ" 2>/dev/null || true)"; candidate_connector_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^REMOTE_CODEX_CONNECTOR_ID=//p" | head -n 1)"; candidate_host_id="$(printf "%s\\n" "$candidate_environment" | sed -n "s/^HOST_ID=//p" | head -n 1)"; identity_match=0; if test -n "$expected_connector_id" && test -n "$candidate_connector_id"; then test "$candidate_connector_id" = "$expected_connector_id" && identity_match=1; elif test -n "$expected_host_id" && test -n "$candidate_host_id"; then test "$candidate_host_id" = "$expected_host_id" && identity_match=1; fi; test "$identity_match" = 1 || continue; candidate_cwd="$(readlink -f "/proc/$candidate_pid/cwd" 2>/dev/null || true)"; case "$candidate_cwd" in "$control_dir"|"$control_dir"/*) echo "$candidate_pid"; break ;; esac; done)";',
       'if test -n "$agent_pid" && kill -0 "$agent_pid" 2>/dev/null; then echo CODEX_REMOTE_AGENT_PROCESS_RUNNING; exit 0; fi;',
       'echo CODEX_REMOTE_AGENT_MISSING',
     ].join(' ');
@@ -769,6 +783,7 @@ function serializeConnector(connector) {
       tmuxSession: connector.bootstrap?.tmuxSession || 'codex-remote',
       serviceName: connector.bootstrap?.serviceName || 'codex-remote',
       launchCommand: connector.bootstrap?.launchCommand || '',
+      codexBin: connector.bootstrap?.codexBin || '',
     },
     createdAt: connector.createdAt || nowIso(),
     updatedAt: connector.updatedAt || nowIso(),

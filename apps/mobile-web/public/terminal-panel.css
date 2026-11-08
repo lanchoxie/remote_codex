@@ -1,0 +1,118 @@
+.remote-terminal-panel {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 72;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(760px, calc(100vw - 36px));
+  height: min(520px, calc(100dvh - 36px));
+  min-width: 420px;
+  min-height: 260px;
+  overflow: hidden;
+  border: 1px solid rgba(169, 191, 235, 0.2);
+  border-radius: 8px;
+  background: #080d18;
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.48);
+  color: var(--text, #ebf1ff);
+  contain: layout paint;
+}
+.remote-terminal-panel-hidden { display: none; }
+.remote-terminal-header {
+  display: flex;
+  min-width: 0;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 6px 5px 12px;
+  border-bottom: 1px solid rgba(169, 191, 235, 0.14);
+  background: #111a2a;
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+}
+.remote-terminal-identity { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.remote-terminal-indicator {
+  width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #95a8cb;
+}
+.remote-terminal-panel[data-terminal-state="connected"] .remote-terminal-indicator {
+  background: #7de7cb; box-shadow: 0 0 0 3px rgba(125, 231, 203, 0.12);
+}
+.remote-terminal-panel[data-terminal-state="error"] .remote-terminal-indicator { background: #ff8394; }
+.remote-terminal-panel[data-terminal-state="connecting"] .remote-terminal-indicator,
+.remote-terminal-panel[data-terminal-state="reconnecting"] .remote-terminal-indicator { background: #ffd37d; }
+.remote-terminal-title,
+.remote-terminal-status {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: 0;
+}
+.remote-terminal-title { font-size: 13px; font-weight: 700; }
+.remote-terminal-status { color: var(--muted, #95a8cb); font-size: 11px; }
+.remote-terminal-controls { display: flex; flex: 0 0 auto; gap: 2px; }
+.remote-terminal-control {
+  display: inline-grid;
+  width: 32px;
+  min-width: 32px;
+  height: 30px;
+  min-height: 30px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #dbe6fb;
+  font: 18px/1 ui-sans-serif, system-ui, sans-serif;
+  cursor: pointer;
+}
+.remote-terminal-control:hover,
+.remote-terminal-control:focus-visible { background: rgba(255, 255, 255, 0.09); outline: none; }
+.remote-terminal-control[data-terminal-action="close"]:hover,
+.remote-terminal-control[data-terminal-action="close"]:focus-visible { background: #c74052; color: #fff; }
+.remote-terminal-viewport,
+.remote-terminal-xterm { min-width: 0; min-height: 0; width: 100%; height: 100%; }
+.remote-terminal-viewport { overflow: hidden; padding: 9px 7px 7px 10px; background: #080d18; }
+.remote-terminal-xterm .xterm { height: 100%; }
+.remote-terminal-resize-handle {
+  position: absolute; right: 0; bottom: 0; width: 18px; height: 18px;
+  cursor: nwse-resize; touch-action: none;
+}
+.remote-terminal-resize-handle::after {
+  content: ""; position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px;
+  border-right: 1px solid rgba(219, 230, 251, 0.56);
+  border-bottom: 1px solid rgba(219, 230, 251, 0.56);
+}
+.remote-terminal-panel-maximized {
+  inset: 10px; width: auto; height: auto; max-width: none; max-height: none;
+}
+.remote-terminal-panel-minimized {
+  grid-template-rows: auto; width: min(520px, calc(100vw - 36px)); height: auto !important; min-height: 0;
+}
+.remote-terminal-panel-minimized .remote-terminal-viewport,
+.remote-terminal-panel-minimized .remote-terminal-resize-handle { display: none; }
+@media (max-width: 720px), (pointer: coarse) {
+  .remote-terminal-panel {
+    inset: auto 0 0;
+    width: 100%;
+    max-width: 100%;
+    height: min(62dvh, 560px);
+    min-width: 0;
+    min-height: 220px;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 8px 8px 0 0;
+  }
+  .remote-terminal-panel-maximized { inset: 0; height: 100dvh; border-radius: 0; }
+  .remote-terminal-panel-minimized { inset: auto 0 0; width: 100%; min-height: 0; }
+  .remote-terminal-header { min-height: 48px; cursor: default; }
+  .remote-terminal-control { width: 42px; min-width: 42px; height: 40px; min-height: 40px; }
+  .remote-terminal-status { display: none; }
+  .remote-terminal-resize-handle { display: none; }
+}
+@media (max-width: 390px) {
+  .remote-terminal-title { max-width: calc(100vw - 170px); }
+  .remote-terminal-viewport { padding-right: 4px; padding-left: 7px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .remote-terminal-panel, .remote-terminal-control { scroll-behavior: auto; transition: none; }
+}

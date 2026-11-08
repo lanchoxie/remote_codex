@@ -552,6 +552,76 @@ function verifyCodexDiscoveryFormats() {
     throw new Error('codex row parser did not emit reasoning diagnostics');
   }
 
+  // Structured protocol values must be rendered recursively.  A direct
+  // String(object) coercion here leaks the literal "[object Object]" into
+  // transcript/thinking output and loses the useful nested payload.
+  const structuredRows = [
+    {
+      timestamp: '2026-05-27T04:32:41.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        message: { content: [{ type: 'text', text: 'nested user payload' }] },
+      },
+    },
+    {
+      timestamp: '2026-05-27T04:32:42.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'agent_message',
+        phase: 'commentary',
+        message: [{ type: 'text', text: 'nested agent payload' }, { type: 'json', value: { ok: true } }],
+      },
+    },
+    {
+      timestamp: '2026-05-27T04:32:43.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call_output',
+        output: [{ type: 'text', text: 'structured command output' }, { type: 'json', value: { exitCode: 0 } }],
+      },
+    },
+    {
+      timestamp: '2026-05-27T04:32:44.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: { content: [{ type: 'text', text: 'nested reasoning payload' }] } }],
+      },
+    },
+  ];
+  for (const row of structuredRows) {
+    const events = makeCodexRowEvents(row);
+    const serialized = JSON.stringify(events);
+    if (serialized.includes('[object Object]')) {
+      throw new Error(`structured codex row leaked object coercion: ${serialized}`);
+    }
+  }
+  const structuredAgentEvents = makeCodexRowEvents(structuredRows[1]);
+  if (!structuredAgentEvents.find((event) => event.type === 'session.diagnostic'
+    && event.entry?.message?.includes('nested agent payload'))) {
+    throw new Error('structured agent message did not preserve nested text');
+  }
+  const structuredOutputEvents = makeCodexRowEvents(structuredRows[2]);
+  if (!structuredOutputEvents.find((event) => event.type === 'session.diagnostic'
+    && event.entry?.message?.includes('structured command output'))) {
+    throw new Error('structured function_call_output did not preserve nested text');
+  }
+  const cyclicMessage = {};
+  cyclicMessage.self = cyclicMessage;
+  const cyclicEvents = makeCodexRowEvents({
+    timestamp: '2026-05-27T04:32:45.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'agent_message',
+      phase: 'commentary',
+      message: cyclicMessage,
+    },
+  });
+  if (JSON.stringify(cyclicEvents).includes('[object Object]')) {
+    throw new Error('cyclic structured message leaked object coercion');
+  }
+
   const commentaryText = 'I am checking the docs directory before downloading papers.';
   const commentaryEvents = makeCodexRowEvents({
     timestamp: '2026-05-27T04:33:00.000Z',

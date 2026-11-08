@@ -150,6 +150,7 @@ assert.deepStrictEqual(normalizeStoredProfile({
   provider: 'Gemini',
   providerKind: 'gemini',
   baseUrl: 'https://gemini.example.invalid/v1',
+  nativeResumeCompatibilityKey: '',
   apiKey: '',
   rememberApiKey: true,
   sessionDefaults: {

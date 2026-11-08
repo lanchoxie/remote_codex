@@ -6,21 +6,33 @@ const path = require('path');
 
 const { repairIsolatedProvenance } = require('./repair-session-provenance');
 
-const rolloutPath = process.env.TARGET_ROLLOUT_PATH
-  || 'C:/Users/xiety/.codex/sessions/2026/07/13/rollout-2026-07-13T03-21-11-019f57c6-ad18-7062-87f7-15a61dad9d06.jsonl';
-assert(fs.existsSync(rolloutPath), `target rollout missing: ${rolloutPath}`);
+const sessionId = '019f57c6-ad18-7062-87f7-15a61dad9d06';
+const bridgeSessionId = 'a87751e9-db8f-4a18-896f-ae1b38364ab8';
+const profileId = 'fixture-profile';
+const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'target-session-rollout-'));
+const rolloutPath = path.join(fixtureRoot, `rollout-2026-01-01T00-00-00-${sessionId}.jsonl`);
+const timestamp = '2026-01-01T00:00:00.000Z';
+const rows = [
+  { timestamp, type: 'session_meta', payload: { id: sessionId, timestamp, cwd: fixtureRoot, thread_name: 'Fixture Session' } },
+  { timestamp, type: 'event_msg', payload: { type: 'user_message', message: 'Check the fixture.' } },
+  { timestamp, type: 'event_msg', payload: { type: 'user_message', message: 'Check the fixture.' } },
+  { timestamp, type: 'event_msg', payload: { type: 'agent_message', message: 'The fixture is consistent.' } },
+  { timestamp, type: 'event_msg', payload: { type: 'agent_message', message: 'The fixture is consistent.' } },
+  { timestamp, type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'The fixture is consistent.' } },
+];
+fs.writeFileSync(rolloutPath, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
 const before = crypto.createHash('sha256').update(fs.readFileSync(rolloutPath)).digest('hex');
 const outputRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'target-session-provenance-'));
 const baseRepairOptions = {
   rolloutPath,
-  hostId: 'illuin',
-  sessionId: '019f57c6-ad18-7062-87f7-15a61dad9d06',
-  bridgeSessionId: 'a87751e9-db8f-4a18-896f-ae1b38364ab8',
+  hostId: 'fixture-host',
+  sessionId,
+  bridgeSessionId,
   apiProfile: {
-    profileId: 'api-1781276986738-5ca8cb31040658',
-    label: 'Asxs',
+    profileId,
+    label: 'Fixture API',
     provider: 'OpenAI',
-    baseUrl: 'https://api.asxs.top/v1',
+    baseUrl: 'https://example.invalid/v1',
   },
   selection: { model: 'gpt-5.6-sol', effort: 'ultra' },
 };
@@ -28,11 +40,11 @@ const baseRepairOptions = {
 repairIsolatedProvenance({ ...baseRepairOptions, outputRoot }).then(async (report) => {
   const after = crypto.createHash('sha256').update(fs.readFileSync(rolloutPath)).digest('hex');
   assert.strictEqual(after, before, 'source rollout must remain byte-identical');
-  assert.strictEqual(report.transcriptCount, 17, 'task_complete metadata must not inflate the raw transcript count');
-  assert.strictEqual(report.deduplicatedTranscriptCount, 12);
-  assert.strictEqual(report.record.bridgeSessionId, 'a87751e9-db8f-4a18-896f-ae1b38364ab8');
-  assert.strictEqual(report.record.nativeThreadId, '019f57c6-ad18-7062-87f7-15a61dad9d06');
-  assert.strictEqual(report.run.apiBinding.profileId, 'api-1781276986738-5ca8cb31040658');
+  assert.strictEqual(report.transcriptCount, 4, 'task_complete metadata must not inflate the raw transcript count');
+  assert.strictEqual(report.deduplicatedTranscriptCount, 2);
+  assert.strictEqual(report.record.bridgeSessionId, bridgeSessionId);
+  assert.strictEqual(report.record.nativeThreadId, sessionId);
+  assert.strictEqual(report.run.apiBinding.profileId, profileId);
   assert.deepStrictEqual(report.run.effectiveSelection, {
     model: 'gpt-5.6-sol',
     effort: 'ultra',
@@ -46,9 +58,9 @@ repairIsolatedProvenance({ ...baseRepairOptions, outputRoot }).then(async (repor
       ...baseRepairOptions,
       outputRoot: secretOutputRoot,
       apiProfile: {
-        profileId: 'api-1781276986738-5ca8cb31040658',
+        profileId,
         provider: 'OpenAI',
-        baseUrl: 'https://api.asxs.top/v1',
+        baseUrl: 'https://example.invalid/v1',
         apiKey: 'must-not-be-accepted',
       },
     }),
@@ -60,9 +72,9 @@ repairIsolatedProvenance({ ...baseRepairOptions, outputRoot }).then(async (repor
       ...baseRepairOptions,
       outputRoot: nestedSecretOutputRoot,
       apiProfile: {
-        profileId: 'api-1781276986738-5ca8cb31040658',
+        profileId,
         provider: 'OpenAI',
-        baseUrl: 'https://api.asxs.top/v1',
+        baseUrl: 'https://example.invalid/v1',
         transport: {
           credentials: {
             clientSecret: 'nested-secret-must-not-be-accepted',

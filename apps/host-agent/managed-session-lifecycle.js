@@ -75,6 +75,82 @@ function commandsShareSessionRun(left = {}, right = {}) {
   return commandIdentityValues(right).some((identity) => leftIdentities.has(identity));
 }
 
+function buildManagedStartDiscoverySession(record, defaults = {}) {
+  const command = record?.command || {};
+  const runner = record?.runner || null;
+  if (!runner) return null;
+
+  const runId = String(runner.runId || command.runId || '').trim();
+  const bridgeSessionId = String(
+    command.bridgeSessionId
+    || command.sessionId
+    || runner.bridgeSessionId
+    || runner.sessionId
+    || ''
+  ).trim();
+  if (!runId || !bridgeSessionId) return null;
+
+  const nativeThreadId = String(
+    runner.nativeThreadId
+    || command.nativeThreadId
+    || command.rebindNativeThreadId
+    || ''
+  ).trim() || null;
+  const runnerRuntime = runner.runtime || {};
+  const runtime = {
+    runId,
+    connection: runnerRuntime.connection || null,
+    phase: runnerRuntime.phase || null,
+    startupStep: runnerRuntime.startupStep || null,
+    busy: runnerRuntime.busy === true,
+    currentTurnStatus: runnerRuntime.currentTurnStatus || null,
+    launchMode: runnerRuntime.launchMode || runner.launchMode || command.launchMode || null,
+    forceTranscriptFallback: runnerRuntime.forceTranscriptFallback === true
+      || command.forceTranscriptFallback === true,
+    nativeThreadId: runnerRuntime.nativeThreadId || nativeThreadId,
+    nativeResumeReady: runnerRuntime.nativeResumeReady === true,
+    resumeStrategy: runnerRuntime.resumeStrategy || null,
+  };
+  const runtimePhase = String(runtime.phase || '').trim();
+  if (![
+    'starting',
+    'initializing',
+    'opening-thread',
+    'starting-thread',
+    'resuming-thread',
+    'forking-thread',
+  ].includes(runtimePhase)) {
+    runtime.phase = 'initializing';
+  }
+  runtime.busy = true;
+  runtime.currentTurnStatus = 'starting';
+  return {
+    sessionId: bridgeSessionId,
+    bridgeSessionId,
+    nativeThreadId,
+    runId,
+    title: runner.title || command.label || command.cwd || bridgeSessionId,
+    cwd: runner.cwd || command.cwd || defaults.cwd || null,
+    source: 'managed',
+    live: false,
+    managedStartPending: true,
+    createdAt: runner.createdAt || command.createdAt || null,
+    updatedAt: defaults.updatedAt || new Date().toISOString(),
+    messageCount: 0,
+    latestUserMessage: null,
+    latestAgentMessage: null,
+    transcriptPreview: [],
+    originSessionId: runner.originSessionId || command.originSessionId || null,
+    sourceSessionId: runner.sourceSessionId || command.sourceSessionId || null,
+    conversationKey: runner.conversationKey
+      || command.conversationKey
+      || command.originSessionId
+      || bridgeSessionId,
+    launchMode: runner.launchMode || command.launchMode || null,
+    runtime,
+  };
+}
+
 function retainRunnerForStartRetry(liveSessions, runner, command = {}, error = null) {
   if (
     !liveSessions
@@ -125,7 +201,11 @@ const runnerStopStates = new WeakMap();
 function mergeRunnerStopOptions(target, patch = {}) {
   for (const [key, value] of Object.entries(patch || {})) {
     if (value === undefined) continue;
-    if (key === 'suppressTerminalEvent' || key === 'deferStartupTerminalEvent') {
+    if (
+      key === 'suppressTerminalEvent'
+      || key === 'deferStartupTerminalEvent'
+      || key === 'stopCommandRequested'
+    ) {
       target[key] = target[key] === true || value === true;
       continue;
     }
@@ -135,6 +215,9 @@ function mergeRunnerStopOptions(target, patch = {}) {
 }
 
 function applyRunnerStopOptions(runner, options = {}) {
+  if (options.stopCommandRequested === true) {
+    runner.stopCommandRequested = true;
+  }
   if (typeof runner?.applyStopOptions === 'function') {
     runner.applyStopOptions(options);
     return;
@@ -142,6 +225,10 @@ function applyRunnerStopOptions(runner, options = {}) {
   if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
     runner.suppressTerminalEvent = true;
   }
+}
+
+function runnerHasSessionStopRequest(runner) {
+  return runner?.stopCommandRequested === true;
 }
 
 function stopRunnerOnce(runner, options = {}) {
@@ -222,6 +309,22 @@ function createManagedSessionStartGate() {
     return null;
   }
 
+  function pendingRunnerWaitTimeoutError(command = {}, timeoutMs = 0) {
+    const identity = String(
+      command.runId
+      || command.requestedSessionId
+      || command.sessionId
+      || 'the requested Session'
+    ).trim();
+    const error = new Error(
+      `Timed out waiting for managed Session ${identity} to finish starting before Stop can be applied.`
+    );
+    error.code = 'session_start_runner_wait_timeout';
+    error.retryCommand = true;
+    error.retryAfterMs = Math.max(0, Number(timeoutMs) || 0);
+    return error;
+  }
+
   return {
     beginStart(command = {}) {
       if (shuttingDown) throw shutdownError();
@@ -262,9 +365,23 @@ function createManagedSessionStartGate() {
         },
       };
     },
-    waitForRunner(command = {}) {
+    waitForRunner(command = {}, options = {}) {
       const record = findActiveStart(command);
-      return record ? record.runnerOrFinished : null;
+      if (!record) return null;
+      const timeoutMs = Math.trunc(Number(options?.timeoutMs || 0));
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        return record.runnerOrFinished;
+      }
+      let timer = null;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(pendingRunnerWaitTimeoutError(command, timeoutMs));
+        }, timeoutMs);
+        timer.unref?.();
+      });
+      return Promise.race([record.runnerOrFinished, timeout]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
     },
     beginShutdown() {
       shuttingDown = true;
@@ -292,6 +409,12 @@ function createManagedSessionStartGate() {
     },
     activeStartCount() {
       return activeStarts.size;
+    },
+    snapshotActiveStarts() {
+      return Array.from(activeStarts, (record) => ({
+        command: { ...record.command },
+        runner: record.runner,
+      }));
     },
     async waitForActiveStarts() {
       const starts = Array.from(activeStarts);
@@ -538,6 +661,7 @@ function shouldPublishMissingRunnerStop(command = {}) {
 
 module.exports = {
   abortUnconfirmedRunner,
+  buildManagedStartDiscoverySession,
   buildManagedSessionStartedEvent,
   createManagedSessionStartGate,
   createManagedSessionShutdown,
@@ -545,6 +669,7 @@ module.exports = {
   findRunnerForCommand,
   retainRunnerForStartRetry,
   replayManagedSessionStart,
+  runnerHasSessionStopRequest,
   runnerMatchesCommandRun,
   shouldPublishMissingRunnerStop,
   stopRunnerOnce,

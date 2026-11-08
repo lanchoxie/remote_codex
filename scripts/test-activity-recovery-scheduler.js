@@ -20,10 +20,17 @@ const context = vm.createContext({
   Number,
   String,
   Promise,
-  selectedSession: { canonicalKey: 'host::a' },
+  selectedSession: {
+    hostId: 'host',
+    sessionId: 'session-a',
+    canonicalKey: 'host::a',
+  },
   state: {
     activitySnapshotRecoveryTasks: new Map(),
     eventCursorByCanonical: new Map(),
+    sessionStreamGeneration: 0,
+    eventSource: null,
+    eventSourceKey: null,
     streamDetailRecoveryInFlight: false,
     streamDetailRecoveryPendingKey: null,
     streamActivityRecoveryPendingKeys: new Set(),
@@ -54,12 +61,14 @@ const context = vm.createContext({
       ? `${session.hostId}::${session.sessionId}`
       : '';
   },
-  rememberSessionStreamEvent(session, event, payload) {
+  sessionStreamEventCanonicalKey(session, event, payload) {
     const canonicalKey = payload?.canonicalConversationKey || session?.canonicalKey || '';
-    if (canonicalKey && event?.lastEventId) {
-      context.state.eventCursorByCanonical.set(canonicalKey, event.lastEventId);
-    }
     return canonicalKey;
+  },
+  commitSessionStreamEvent(session, event, payload, canonicalKey = '') {
+    const key = canonicalKey || payload?.canonicalConversationKey || session?.canonicalKey || '';
+    if (key && event?.lastEventId) context.state.eventCursorByCanonical.set(key, event.lastEventId);
+    return key;
   },
   loadSessionActivitySnapshot: async () => ({}),
   loadSessionActivityRecords: async (_session, requested) => new Map(requested),
@@ -100,8 +109,16 @@ async function runScheduledTask() {
 
 async function main() {
   schedule(1);
-  assert.strictEqual(context.state.eventCursorByCanonical.get('host::a'), 'epoch:1');
-  context.selectedSession = { canonicalKey: 'host::b' };
+  assert.strictEqual(
+    context.state.eventCursorByCanonical.has('host::a'),
+    false,
+    'a compact activity cursor must remain staged until recovery applies'
+  );
+  context.selectedSession = {
+    hostId: 'host',
+    sessionId: 'session-b',
+    canonicalKey: 'host::b',
+  };
   context.discardStaleActivitySnapshotRecoveryTasks();
   assert.strictEqual(context.state.activitySnapshotRecoveryTasks.has('host::a'), false);
   assert.strictEqual(
@@ -110,7 +127,11 @@ async function main() {
     'switching away must invalidate the cursor for an unrecovered compact event'
   );
 
-  context.selectedSession = { canonicalKey: 'host::a' };
+  context.selectedSession = {
+    hostId: 'host',
+    sessionId: 'session-a',
+    canonicalKey: 'host::a',
+  };
   context.loadSessionActivityRecords = async () => {
     throw new Error('temporary activity endpoint outage');
   };
@@ -121,6 +142,11 @@ async function main() {
   assert.strictEqual(failedTask.retryAttempt, 1);
   assert(failedTask.timer, 'a failed recovery must schedule a retry');
   assert.strictEqual(context.reportedErrors.length, 1, 'one outage should report only its first error');
+  assert.strictEqual(
+    context.state.eventCursorByCanonical.has('host::a'),
+    false,
+    'a failed compact recovery must leave its cursor available for replay'
+  );
 
   context.state.activitySnapshotRecoveryTasks.clear();
   timers.clear();
@@ -142,6 +168,11 @@ async function main() {
     context.state.activitySnapshotRecoveryTasks.has('host::a'),
     false,
     'a response covering an in-flight invalidation should avoid a redundant full recovery'
+  );
+  assert.strictEqual(
+    context.state.eventCursorByCanonical.get('host::a'),
+    'epoch:4',
+    'the latest staged compact cursor should commit only after recovery succeeds'
   );
 
   let resolveBoundedRecovery;

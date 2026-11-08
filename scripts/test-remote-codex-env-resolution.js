@@ -3,6 +3,7 @@ const fs = require('fs');
 const {
   agentLogCommand,
   buildAgentLaunchCommand,
+  buildCodexBinResolutionCommand,
   buildRemoteStatusCommand,
   buildSshCommandParts,
   connectorControlFileName,
@@ -13,6 +14,7 @@ const {
 
 const connectors = fs.readFileSync('shared/connectors.js', 'utf8');
 const relay = fs.readFileSync('apps/relay/server.js', 'utf8');
+const askpass = fs.readFileSync('apps/relay/connector-askpass.js', 'utf8');
 const mobileApp = fs.readFileSync('apps/mobile-web/public/app.js', 'utf8');
 const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 
@@ -43,6 +45,24 @@ assert.strictEqual(
   '/srv/remote-codex',
   'loaded connector profiles must repair a previously persisted deployment path'
 );
+
+const hklCodexBin = '/hpc/data/home/spst/xiety/opt/node-v22.23.1-glibc217/bin/codex';
+const explicitConnector = normalizeConnectorInput({
+  hostId: 'hkl_login01',
+  bootstrap: { codexBin: hklCodexBin },
+});
+assert.strictEqual(explicitConnector.bootstrap.codexBin, hklCodexBin);
+assert.strictEqual(normalizeConnectorInput({}, explicitConnector).bootstrap.codexBin, hklCodexBin);
+const explicitResolver = buildCodexBinResolutionCommand(explicitConnector);
+assert(explicitResolver.includes(`CODEX_BIN="${hklCodexBin}"`));
+assert(explicitResolver.includes('CODEX_REMOTE_CONFIGURED_CODEX_UNAVAILABLE'));
+assert(!explicitResolver.includes('command -v codex'), 'configured Codex must never fall back to PATH');
+assert(!explicitResolver.includes('.conda/envs/node_env/bin'), 'configured Codex must not search the older conda runtime');
+assert(buildAgentLaunchCommand(explicitConnector).includes(`CODEX_BIN="${hklCodexBin}"`));
+assert.throws(() => buildCodexBinResolutionCommand({ bootstrap: { codexBin: 'codex' } }),
+  /absolute POSIX path/);
+assert(buildCodexBinResolutionCommand({ bootstrap: {} }).includes('command -v codex'),
+  'other Hosts must retain automatic Codex resolution');
 
 const explicitIdentitySsh = buildSshCommandParts({
   targetHost: '10.25.1.240',
@@ -160,7 +180,7 @@ const remoteStatusCommand = buildRemoteStatusCommand({
 });
 assertContains(
   remoteStatusCommand,
-  'ps -eo pid=,comm=,args=',
+  'ps -eo pid= -o comm= -o args=',
   'remote status should discover a live Host Agent under the Connector root even when its stable PID is stale'
 );
 assertContains(
@@ -183,16 +203,21 @@ assertContains(
   'buildCodexBinResolutionCommand',
   'one-shot bootstrap should reuse the same Codex resolver as generated connector commands'
 );
-const savedAnswerIndex = relay.indexOf('if (-not [string]::IsNullOrWhiteSpace($answer))');
-const brokerPromptIndex = relay.indexOf('Try-BrokerPrompt | Out-Null');
+const savedAnswerIndex = askpass.indexOf('Set-AskpassOutcome "static_answer"');
+const brokerPromptIndex = askpass.indexOf('$answer = Try-BrokerPrompt');
 assert(
-  brokerPromptIndex >= 0 && savedAnswerIndex === -1,
-  'interactive Connector actions must ask the browser before using saved connector credentials'
+  savedAnswerIndex >= 0 && brokerPromptIndex > savedAnswerIndex,
+  'interactive Connector actions must use a matching saved password before opening a browser prompt'
+);
+assertContains(
+  askpass,
+  'Set-AskpassOutcome "askpass_timeout"',
+  'unanswered browser prompts must leave an explicit askpass timeout outcome'
 );
 assertContains(
   relay,
-  'if ([string]::IsNullOrWhiteSpace($answer)) { exit 1 }',
-  'non-interactive Connector actions should still fail closed when no saved credential is available'
+  "status: 'askpass_timeout'",
+  'connector results must distinguish an unanswered browser prompt from architecture probing failures'
 );
 assertContains(
   relay,
@@ -208,6 +233,67 @@ assertContains(
   relay,
   'probeConnectorBootstrapRuntime(baseConnector, secret)',
   'bootstrap must probe the remote architecture before building its payload'
+);
+assertContains(
+  relay,
+  'describeRemoteBootstrapProbeFailure',
+  'remote architecture probe failures should retain an actionable reason'
+);
+assertContains(
+  relay,
+  "reason: 'network_unreachable'",
+  'remote architecture probe should distinguish network reachability failures'
+);
+assertContains(
+  relay,
+  "reason: 'process_start_failed'",
+  'remote architecture probe should distinguish local ssh process failures'
+);
+assertContains(
+  relay,
+  'probeReason:',
+  'remote architecture probe reason should be returned with the step result'
+);
+assertContains(
+  relay,
+  'probeReason: bootstrap.probeReason || bootstrap.step?.probeReason || null',
+  'connector bootstrap responses should preserve the remote probe reason at the top level'
+);
+const stepDiagnosticStart = mobileApp.indexOf('function connectorActionStepLines(');
+const stepDiagnosticEnd = mobileApp.indexOf('function renderConnectorActionResult(', stepDiagnosticStart);
+assert(stepDiagnosticStart >= 0 && stepDiagnosticEnd > stepDiagnosticStart, 'connector step diagnostics helper should exist');
+const connectorActionStepLines = Function(
+  'prettyStatusLabel',
+  `${mobileApp.slice(stepDiagnosticStart, stepDiagnosticEnd)}; return connectorActionStepLines;`
+)((value) => String(value || '').replace(/_/g, ' '));
+const timeoutDiagnostics = connectorActionStepLines({
+  name: 'remote_runtime_probe',
+  exitCode: null,
+  timedOut: true,
+  probeReason: 'network_unreachable',
+  stderr: 'ssh: connect timed out',
+});
+assert.strictEqual(timeoutDiagnostics[0], 'remote_runtime_probe timed out');
+assert(timeoutDiagnostics.includes('Reason: network unreachable'));
+assert(!timeoutDiagnostics.some((line) => line.includes('exit null')), 'null probe exit codes must not be rendered as exit null');
+const signalDiagnostics = connectorActionStepLines({
+  name: 'remote_runtime_probe',
+  exitCode: null,
+  signal: 'SIGTERM',
+});
+assert.strictEqual(signalDiagnostics[0], 'remote_runtime_probe stopped by signal SIGTERM');
+const processErrorDiagnostics = connectorActionStepLines({
+  name: 'remote_runtime_probe',
+  exitCode: null,
+  error: 'spawn ssh ENOENT',
+});
+assert.strictEqual(processErrorDiagnostics[0], 'remote_runtime_probe failed before an exit code was returned');
+assert(processErrorDiagnostics.includes('error:'));
+assert(processErrorDiagnostics.includes('spawn ssh ENOENT'));
+assertContains(
+  mobileApp,
+  'Timed out while waiting for the SSH process.',
+  'connector action results should explain a top-level SSH timeout'
 );
 assertContains(
   relay,
@@ -250,7 +336,7 @@ assertContains(
   'generated SSH commands must support explicitly disabling the local SSH Agent'
 );
 assertContains(
-  relay,
+  askpass,
   'exit /b %ERRORLEVEL%',
   'the Windows AskPass wrapper must propagate the PowerShell helper result to OpenSSH'
 );
@@ -337,6 +423,16 @@ assertContains(
   relay,
   'buildAgentLaunchCommand(connector, { execProcess: true })',
   'the one-shot launcher should make its PID identify the real default Host Agent process'
+);
+assertContains(
+  relay,
+  'ps -eo pid= -o ppid=',
+  'the one-shot launcher must use portable ps columns when locating Agent child processes'
+);
+assertContains(
+  relay,
+  'ps -eo pid= -o comm= -o args=',
+  'the one-shot launcher must use portable ps columns when finding old Agents'
 );
 assertContains(
   relay,

@@ -50,6 +50,7 @@ assert.strictEqual(projection.applyActivity(structuredKey, {
   activityRevision: 1,
   runId: 'run-structured',
   turnId: 'turn-structured',
+  clientRequestId: 'client-request-structured',
   itemId: 'item-structured',
   callId: 'call-structured',
   requestId: 'request-structured',
@@ -83,6 +84,7 @@ const projectedStructured = projection.activitiesFor(structuredKey)[0];
 for (const [field, expected] of Object.entries({
   callId: 'call-structured',
   requestId: 'request-structured',
+  clientRequestId: 'client-request-structured',
   itemType: 'commandExecution',
   status: 'completed',
   startedAt: '2026-07-16T00:00:01.000Z',
@@ -107,6 +109,63 @@ assert.strictEqual(projectedStructured.argumentsTruncated, true);
 assert.strictEqual(projectedStructured.resultTruncated, true);
 assert.strictEqual(projectedStructured.fileChangesTruncated, true);
 assert.strictEqual(projectedStructured.success, false);
+
+// Identity and epoch fields can arrive as structured protocol wrappers. They
+// must be normalized before becoming Map keys or rendered metadata.
+const wrappedIdentityKey = { id: 'host-a::wrapped-identity' };
+assert.strictEqual(projection.applyReset(wrappedIdentityKey, {
+  streamEpoch: { name: 'epoch-wrapped' },
+  activities: [],
+}), true);
+assert.strictEqual(projection.applyActivity(wrappedIdentityKey, {
+  streamEpoch: { name: 'epoch-wrapped' },
+  activityKey: { id: 'wrapped-activity' },
+  activityRevision: 1,
+  timestamp: { value: '2026-07-16T00:00:06.000Z' },
+  text: { content: 'wrapped activity' },
+}), true);
+const wrappedActivity = projection.activitiesFor('host-a::wrapped-identity')[0];
+assert.strictEqual(wrappedActivity.canonicalConversationKey, 'host-a::wrapped-identity');
+assert.strictEqual(wrappedActivity.streamEpoch, 'epoch-wrapped');
+assert.strictEqual(wrappedActivity.activityKey, 'wrapped-activity');
+assert.strictEqual(wrappedActivity.timestamp, '2026-07-16T00:00:06.000Z');
+assert.strictEqual(wrappedActivity.text, 'wrapped activity');
+assert(!JSON.stringify(wrappedActivity).includes('[object Object]'));
+
+const stableOrderKey = 'host-a::stable-order';
+projection.applyReset(stableOrderKey, { streamEpoch: 'epoch-stable-order', activities: [] });
+assert.strictEqual(projection.applyActivity(stableOrderKey, {
+  streamEpoch: 'epoch-stable-order',
+  activityKey: 'activity-a',
+  activityRevision: 1,
+  text: 'first activity before native identity is available',
+}), true);
+assert.strictEqual(projection.applyActivity(stableOrderKey, {
+  streamEpoch: 'epoch-stable-order',
+  activityKey: 'activity-b',
+  activityRevision: 1,
+  turnId: 'turn-stable',
+  itemId: 'item-100',
+  text: 'second activity',
+}), true);
+assert.deepStrictEqual(
+  projection.activitiesFor(stableOrderKey).map((entry) => entry.activityKey),
+  ['activity-a', 'activity-b'],
+  'activities must initially render in first-observed order'
+);
+assert.strictEqual(projection.applyActivity(stableOrderKey, {
+  streamEpoch: 'epoch-stable-order',
+  activityKey: 'activity-a',
+  activityRevision: 2,
+  turnId: 'turn-stable',
+  itemId: 'item-999',
+  text: 'first activity after native identity enrichment',
+}), true);
+assert.deepStrictEqual(
+  projection.activitiesFor(stableOrderKey).map((entry) => entry.activityKey),
+  ['activity-a', 'activity-b'],
+  'identity enrichment must not move an existing activity row'
+);
 
 const timingKey = 'host-a::timing';
 projection.applyReset(timingKey, { streamEpoch: 'epoch-timing', activities: [] });
@@ -203,6 +262,116 @@ assert.strictEqual(projection.applyActivity(canonicalKey, {
   activityRevision: 2,
   text: 'after reset',
 }), true);
+
+const truncatedResetKey = 'host-a::truncated-reset';
+const retainedActivity = {
+  streamEpoch: 'epoch-before-reconnect',
+  activityKey: 'retained-activity',
+  activityRevision: 2,
+  runId: 'run-retained',
+  turnId: 'turn-retained',
+  itemId: 'item-retained',
+  text: 'completed before reconnect',
+  final: true,
+};
+const removedBySnapshotActivity = {
+  streamEpoch: 'epoch-before-reconnect',
+  activityKey: 'removed-by-authoritative-snapshot',
+  activityRevision: 1,
+  runId: 'run-retained',
+  turnId: 'turn-retained',
+  itemId: 'item-removed',
+  text: 'present only in the old projection',
+  final: true,
+};
+projection.applyReset(truncatedResetKey, {
+  streamEpoch: 'epoch-before-reconnect',
+  activities: [retainedActivity, removedBySnapshotActivity],
+});
+assert.strictEqual(projection.applyReset(truncatedResetKey, {
+  streamEpoch: 'epoch-after-reconnect',
+  activities: [],
+  activitiesTruncated: true,
+}), true);
+assert.strictEqual(
+  projection.epochFor(truncatedResetKey),
+  'epoch-after-reconnect',
+  'an incomplete reset must rebase the retained projection to the new stream epoch'
+);
+assert.deepStrictEqual(
+  projection.activitiesFor(truncatedResetKey).map((entry) => [
+    entry.activityKey,
+    entry.streamEpoch,
+    entry.text,
+  ]),
+  [
+    ['retained-activity', 'epoch-after-reconnect', 'completed before reconnect'],
+    [
+      'removed-by-authoritative-snapshot',
+      'epoch-after-reconnect',
+      'present only in the old projection',
+    ],
+  ],
+  'an incomplete reset must not blank previously rendered activities'
+);
+assert.strictEqual(projection.applyActivity(truncatedResetKey, {
+  ...retainedActivity,
+  streamEpoch: 'epoch-after-reconnect',
+  activityRevision: 3,
+  text: 'updated in the rebased epoch',
+}), true, 'the rebased projection must accept incremental events from the new epoch');
+assert.strictEqual(projection.applyActivity(truncatedResetKey, {
+  streamEpoch: 'epoch-after-reconnect',
+  activityKey: 'new-after-reconnect',
+  activityRevision: 1,
+  runId: 'run-retained',
+  turnId: 'turn-retained',
+  itemId: 'item-new',
+  text: 'arrived while recovery was paging',
+}), true);
+assert.deepStrictEqual(
+  projection.activitiesFor(truncatedResetKey).map((entry) => entry.activityKey),
+  ['retained-activity', 'removed-by-authoritative-snapshot', 'new-after-reconnect'],
+  'a failed or abandoned recovery must leave the rebased source projection intact'
+);
+assert.strictEqual(projection.replaceSnapshot(truncatedResetKey, {
+  streamEpoch: 'epoch-after-reconnect',
+  activities: [{
+    ...retainedActivity,
+    streamEpoch: 'ignored-embedded-epoch',
+    activityRevision: 2,
+    text: 'older snapshot copy',
+  }],
+}), true);
+assert.deepStrictEqual(
+  projection.activitiesFor(truncatedResetKey).map((entry) => [
+    entry.activityKey,
+    entry.activityRevision,
+    entry.text,
+  ]),
+  [['retained-activity', 3, 'updated in the rebased epoch']],
+  'a complete snapshot must atomically remove missing records while retaining a newer matching delta'
+);
+
+const completeResetKey = 'host-a::complete-reset';
+projection.applyReset(completeResetKey, {
+  streamEpoch: 'complete-before',
+  activities: [{
+    streamEpoch: 'complete-before',
+    activityKey: 'must-be-removed',
+    activityRevision: 1,
+    text: 'old authoritative content',
+  }],
+});
+projection.applyReset(completeResetKey, {
+  streamEpoch: 'complete-after',
+  activities: [],
+});
+assert.deepStrictEqual(
+  projection.activitiesFor(completeResetKey),
+  [],
+  'a complete reset must retain its destructive authoritative replacement semantics'
+);
 
 const external = projection.activitiesFor(canonicalKey);
 external[0].text = 'mutated';

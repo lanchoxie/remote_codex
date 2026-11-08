@@ -6,6 +6,7 @@ const MarkdownIt = require('markdown-it');
 const createDOMPurify = require('dompurify');
 const { JSDOM } = require('jsdom');
 const { createMarkdownRenderer } = require('../apps/mobile-web/public/markdown-renderer');
+const structuredText = require('../apps/mobile-web/public/structured-text');
 
 const appPath = path.join(__dirname, '..', 'apps', 'mobile-web', 'public', 'app.js');
 const source = fs.readFileSync(appPath, 'utf8');
@@ -26,6 +27,7 @@ dom.window.RemoteCodexMarkdownRenderer = createMarkdownRenderer({
   sanitizer: createDOMPurify(dom.window),
   document: dom.window.document,
 });
+dom.window.RemoteCodexStructuredText = structuredText;
 dom.window.MathJax = {
   typesetPromise: () => Promise.resolve(),
 };
@@ -38,11 +40,15 @@ const context = {
   THINKING_EXPANDABLE_TEXT_LINE_LIMIT: 8,
   THINKING_EXPANDABLE_CODE_CHAR_LIMIT: 720,
   THINKING_EXPANDABLE_CODE_LINE_LIMIT: 12,
+  pendingMathTypesetContainers: new Set(),
+  mathTypesetScheduled: false,
   normalizeFileChanges: () => [],
   getTranscriptForSession: () => [],
   getThinkingDiagnosticsForSession: () => [],
   getProjectedThinkingActivities: () => context.projectedActivities || [],
   mergeProjectedThinkingEntries: (diagnostics, activities) => [...diagnostics, ...activities],
+  isThinkingActivityDiagnostic: () => true,
+  LIVE_THINKING_ACTIVITY_ENTRY_LIMIT: 160,
   prettyStatusLabel: (value) => String(value || '').replace(/-/g, ' '),
   limitText: (value, maximum) => String(value || '').slice(0, maximum),
   formatTime: (value) => String(value || ''),
@@ -52,6 +58,8 @@ const context = {
   restoreViewportElementOffset: () => {},
   renderFileCards: () => {},
   renderFileChangeDetails: () => dom.window.document.createElement('div'),
+  structuredThinkingText: (value, options) => structuredText.toText(value, options),
+  structuredThinkingScalar: (value, fallback) => structuredText.toScalar(value, fallback),
 };
 vm.createContext(context);
 for (const name of [
@@ -63,9 +71,20 @@ for (const name of [
   'isFileChangeDiagnostic',
   'isUserSuitableThinkingText',
   'normalizeThinkingActivityForModel',
+  'aggregateThinkingActivityEntries',
+  'thinkingTurnIdentity',
+  'buildThinkingTurnOwnershipIndex',
+  'thinkingTurnIdentityAliases',
+  'thinkingEntryMatchesUserTurn',
+  'buildLiveActivitySegment',
   'buildThinkingEntriesForSession',
+  'normalizeTranscriptSpeaker',
+  'normalizeTranscriptIdentity',
+  'normalizeTranscriptTimestamp',
+  'transcriptEntryStableTurnKey',
   'thinkingDisclosureStateKey',
   'bindThinkingDisclosure',
+  'thinkingEntryStableIdentityKey',
   'thinkingEntryViewportKey',
   'thinkingEntryKey',
   'thinkingEntryActivityKeys',
@@ -96,6 +115,13 @@ for (const name of [
   'syncThinkingEntryAttributes',
   'captureThinkingEntryInnerState',
   'restoreThinkingEntryInnerState',
+  'syncThinkingPatchAttributes',
+  'patchThinkingSimpleElement',
+  'patchThinkingExpansionAccessories',
+  'patchThinkingOperationField',
+  'thinkingOperationBodyChildKey',
+  'patchThinkingOperationBody',
+  'patchThinkingOperationSummary',
   'patchThinkingHistoryEntry',
   'patchThinkingHistoryList',
 ]) {
@@ -132,6 +158,7 @@ const delayedCommentary = context.normalizeThinkingActivityForModel({
   activityKey: 'commentary-delayed-final',
   activityRevision: 2,
   turnId: 'turn-one',
+  clientRequestId: 'request-one',
   itemId: 'message-one',
   kind: 'commentary',
   text: 'Checking the first turn',
@@ -145,6 +172,38 @@ assert.strictEqual(
   'Thinking turn assignment must use the immutable activity start time'
 );
 assert.strictEqual(delayedCommentary.updatedAt, '2026-07-27T10:00:12.000Z');
+assert.strictEqual(delayedCommentary.clientRequestId, 'request-one');
+
+context.window.RemoteCodexThinkingEntryModel = {
+  normalizeThinkingActivityEntry(value) {
+    const { clientRequestId, ...withoutClientRequestId } = value;
+    return withoutClientRequestId;
+  },
+  aggregateThinkingEntries(entries) {
+    return entries.map(({ clientRequestId, ...withoutClientRequestId }) => withoutClientRequestId);
+  },
+};
+const modelNormalizedCommentary = context.normalizeThinkingActivityForModel({
+  activityKey: 'model-normalized-commentary',
+  activityRevision: 1,
+  turnId: 'turn-one',
+  clientRequestId: 'request-one',
+  itemId: 'model-normalized-commentary',
+  kind: 'commentary',
+  text: 'Model-normalized commentary',
+  timestamp: '2026-07-27T10:00:03.000Z',
+}, 0);
+assert.strictEqual(
+  modelNormalizedCommentary.clientRequestId,
+  'request-one',
+  'the app wrapper must preserve clientRequestId when the rendering model omits it'
+);
+assert.strictEqual(
+  context.aggregateThinkingActivityEntries([modelNormalizedCommentary])[0].clientRequestId,
+  'request-one',
+  'the app wrapper must restore clientRequestId after rendering-model aggregation'
+);
+delete context.window.RemoteCodexThinkingEntryModel;
 
 context.projectedActivities = [
   delayedCommentary,
@@ -152,6 +211,7 @@ context.projectedActivities = [
     activityKey: 'tool-first-turn',
     activityRevision: 1,
     turnId: 'turn-one',
+    clientRequestId: 'request-one',
     itemId: 'tool-one',
     kind: 'command',
     command: 'node first.js',
@@ -164,6 +224,7 @@ context.projectedActivities = [
     activityKey: 'commentary-second-turn',
     activityRevision: 2,
     turnId: 'turn-two',
+    clientRequestId: 'request-two',
     itemId: 'message-two',
     kind: 'commentary',
     text: 'Checking the second turn',
@@ -176,6 +237,7 @@ context.projectedActivities = [
     activityKey: 'tool-second-turn',
     activityRevision: 1,
     turnId: 'turn-two',
+    clientRequestId: 'request-two',
     itemId: 'tool-two',
     kind: 'command',
     command: 'node second.js',
@@ -189,7 +251,8 @@ const turnSegments = context.buildThinkingEntriesForSession({ sessionId: 'two-tu
   transcriptEntries: [{
     speaker: 'user',
     text: 'first',
-    timestamp: '2026-07-27T10:00:00.000Z',
+    timestamp: '2026-07-27T10:00:30.000Z',
+    clientRequestId: 'request-one',
   }, {
     speaker: 'assistant',
     text: 'first reply',
@@ -198,6 +261,7 @@ const turnSegments = context.buildThinkingEntriesForSession({ sessionId: 'two-tu
     speaker: 'user',
     text: 'second',
     timestamp: '2026-07-27T10:01:00.000Z',
+    clientRequestId: 'request-two',
   }, {
     speaker: 'assistant',
     text: 'second reply',
@@ -211,6 +275,115 @@ assert.deepStrictEqual(
   )))),
   [['message-one', 'tool-one'], ['message-two', 'tool-two']],
   'late final snapshots must retain commentary and tools in their own consecutive turns'
+);
+assert.strictEqual(
+  turnSegments[0].userEntryKey,
+  'user|request|request-one',
+  'Thinking card identity must prefer clientRequestId over a reconciled transcript timestamp'
+);
+
+const reconciledTurnSegments = context.buildThinkingEntriesForSession({ sessionId: 'two-turns' }, {
+  transcriptEntries: [{
+    speaker: 'user',
+    text: 'first',
+    timestamp: '2026-07-27T09:59:00.000Z',
+    clientRequestId: 'request-one',
+  }, {
+    speaker: 'assistant',
+    text: 'first reply',
+    timestamp: '2026-07-27T10:00:10.000Z',
+  }, {
+    speaker: 'user',
+    text: 'second',
+    timestamp: '2026-07-27T10:01:00.000Z',
+    clientRequestId: 'request-two',
+  }, {
+    speaker: 'assistant',
+    text: 'second reply',
+    timestamp: '2026-07-27T10:01:10.000Z',
+  }],
+  diagnostics: [{
+    kind: 'commentary',
+    message: 'Late diagnostic for the first turn',
+    timestamp: '2026-07-27T10:01:06.000Z',
+    turnId: 'turn-one',
+    clientRequestId: 'request-one',
+    itemId: 'late-first-diagnostic',
+    final: true,
+  }],
+});
+assert.strictEqual(
+  reconciledTurnSegments[0].userEntryKey,
+  turnSegments[0].userEntryKey,
+  'server timestamp reconciliation must not recreate a completed Thinking card'
+);
+assert(
+  reconciledTurnSegments[0].entries.some((entry) => entry.itemId === 'late-first-diagnostic'),
+  'a late final with explicit identity must remain attached to the original user turn'
+);
+assert(
+  !reconciledTurnSegments[1].entries.some((entry) => entry.itemId === 'late-first-diagnostic'),
+  'a late final must not move into the timestamp window of a later user turn'
+);
+
+const identityOnlySegments = context.buildThinkingEntriesForSession({ sessionId: 'identity-only' }, {
+  transcriptEntries: [{
+    speaker: 'user',
+    text: 'identity only',
+    timestamp: null,
+    clientRequestId: 'request-one',
+  }],
+  diagnostics: [{
+    kind: 'commentary',
+    message: 'Identity survives without a usable timestamp',
+    timestamp: '2026-07-27T11:00:00.000Z',
+    turnId: 'turn-one',
+    clientRequestId: 'request-one',
+    itemId: 'identity-only-diagnostic',
+  }],
+});
+assert.strictEqual(identityOnlySegments.length, 1);
+assert.strictEqual(identityOnlySegments[0].entries[0].itemId, 'identity-only-diagnostic');
+
+context.projectedActivities = [{
+  turnId: 'turn-one',
+  clientRequestId: 'request-one',
+  itemId: 'late-previous-live-activity',
+  timestamp: '2026-07-27T10:01:30.000Z',
+}, {
+  turnId: 'turn-two',
+  clientRequestId: 'request-two',
+  itemId: 'current-live-activity',
+  timestamp: '2026-07-27T10:01:02.000Z',
+}];
+const liveTurnSegment = context.buildLiveActivitySegment(
+  { sessionId: 'two-turns' },
+  {
+    speaker: 'user',
+    text: 'second',
+    timestamp: '2026-07-27T10:01:00.000Z',
+    clientRequestId: 'request-two',
+  },
+  [{
+    kind: 'commentary',
+    message: 'Late previous diagnostic',
+    timestamp: '2026-07-27T10:01:31.000Z',
+    turnId: 'turn-one',
+    clientRequestId: 'request-one',
+    itemId: 'late-previous-live-diagnostic',
+  }, {
+    kind: 'commentary',
+    message: 'Current diagnostic',
+    timestamp: '2026-07-27T10:01:03.000Z',
+    turnId: 'turn-two',
+    clientRequestId: 'request-two',
+    itemId: 'current-live-diagnostic',
+  }]
+);
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(liveTurnSegment.entries.map((entry) => entry.itemId).sort())),
+  ['current-live-activity', 'current-live-diagnostic'].sort(),
+  'live Thinking must reject late activity from a previous explicit user turn regardless of timestamp'
 );
 
 const baseEntry = {
@@ -275,6 +448,7 @@ const history = dom.window.document.createElement('div');
 dom.window.document.body.appendChild(history);
 history.appendChild(first);
 const originalOutput = first.querySelector('[data-thinking-field-key="Output"] pre');
+const originalOutputField = originalOutput.closest('[data-thinking-field-key]');
 originalOutput.scrollTop = 17;
 originalOutput.scrollLeft = 23;
 const originalSummary = first.querySelector(':scope > summary');
@@ -303,6 +477,26 @@ assert.strictEqual(first.open, true, 'an open operation must stay open after liv
 assert(first.textContent.includes('updated output'));
 assert(!first.textContent.includes('<script>literal output</script>'));
 const patchedOutput = first.querySelector('[data-thinking-field-key="Output"] pre');
+assert.strictEqual(
+  first.querySelector(':scope > summary'),
+  originalSummary,
+  'changed Thinking rows must retain their summary DOM'
+);
+assert.strictEqual(
+  first.querySelector('.thinking-operation-body'),
+  originalBody,
+  'changed Thinking rows must retain their body DOM'
+);
+assert.strictEqual(
+  patchedOutput.closest('[data-thinking-field-key]'),
+  originalOutputField,
+  'changed Thinking rows must retain stable field DOM'
+);
+assert.strictEqual(
+  patchedOutput,
+  originalOutput,
+  'changed Thinking rows must update preformatted output in place'
+);
 assert.strictEqual(patchedOutput.scrollTop, 17, 'narrow patches should preserve nested output scrollTop');
 assert.strictEqual(patchedOutput.scrollLeft, 23, 'narrow patches should preserve nested output scrollLeft');
 assert.strictEqual(
@@ -445,6 +639,32 @@ const changedTextKey = context.thinkingEntryViewportKey({
   text: 'a completely different live payload',
 }, 99);
 assert.strictEqual(changedTextKey, 'thinking|command:stable', 'viewport identity must not depend on text or index');
+assert.strictEqual(
+  context.thinkingEntryKey({
+    groupKey: 'generic-group-before-enrichment',
+    callId: 'call-stable',
+    category: 'activity',
+  }, 0),
+  context.thinkingEntryKey({
+    groupKey: 'specific-group-after-enrichment',
+    callId: 'call-stable',
+    turnId: 'turn-late',
+    category: 'tool',
+  }, 0),
+  'late context/category enrichment must not replace an existing entity row'
+);
+assert.strictEqual(
+  context.thinkingEntryKey({
+    activityKey: 'activity-stable',
+    category: 'reasoning',
+  }, 0),
+  context.thinkingEntryKey({
+    activityKey: 'activity-stable',
+    itemId: 'item-arrived-later',
+    category: 'reasoning',
+  }, 0),
+  'a late itemId must not replace an existing activity row'
+);
 assert.notStrictEqual(
   context.thinkingEntriesRenderVersion([{ ...baseEntry, text: 'first revision', activityRevision: 1 }]),
   context.thinkingEntriesRenderVersion([{ ...baseEntry, text: 'second revision', activityRevision: 2 }]),

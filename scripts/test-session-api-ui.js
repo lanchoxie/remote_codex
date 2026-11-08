@@ -8,6 +8,10 @@ const root = path.join(__dirname, '..');
 const app = fs.readFileSync(path.join(root, 'apps/mobile-web/public/app.js'), 'utf8');
 const html = fs.readFileSync(path.join(root, 'apps/mobile-web/public/index.html'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'apps/mobile-web/public/styles.css'), 'utf8');
+const structuredText = require('../apps/mobile-web/public/structured-text');
+const sessionRuntimeState = require('../apps/mobile-web/public/session-runtime-state');
+const relayApiSource = fs.readFileSync(path.join(root, 'apps/mobile-web/public/relay-api.js'), 'utf8');
+const { createRequestError } = require('../apps/mobile-web/public/relay-api');
 
 function functionSource(name) {
   const marker = `function ${name}`;
@@ -101,9 +105,16 @@ function loadHelpers(names, globals = {}) {
     Map,
     Set,
     URL,
+    structuredThinkingText: (value) => structuredText.toText(value),
     ...globals,
+    window: {
+      RemoteCodexStructuredText: structuredText,
+      RemoteCodexSessionRuntimeState: sessionRuntimeState,
+      ...globals.window,
+    },
   });
-  const source = names.map((name) => {
+  const requestedNames = [...new Set(['structuredThinkingScalar', 'normalizeNativeResumeCompatibilityKey', ...names])];
+  const source = requestedNames.map((name) => {
     const extracted = functionSource(name);
     return app.includes(`async function ${name}`) ? `async ${extracted}` : extracted;
   }).join('\n');
@@ -120,6 +131,15 @@ assert(!app.includes('const FALLBACK_REASONING_EFFORTS'), 'hard-coded reasoning 
 
 const launchBody = functionSource('startManagedSession');
 const launchRetryBody = functionSource('fetchManagedLaunchWithRetry');
+const managedLaunchLoadBody = functionSource('loadManagedLaunchObservation');
+const managedLaunchObserveBody = functionSource('observeManagedLaunchOnce');
+const managedLaunchTrackBody = functionSource('trackManagedLaunchReceipt');
+const managedLaunchRecoverBody = functionSource('recoverManagedLaunchReceipts');
+const managedLaunchRecoverOneBody = functionSource('beginManagedLaunchReceiptRecovery');
+const managedLaunchRecheckBody = functionSource('recheckAcceptedManagedLaunch');
+const managedLaunchRestoreBody = functionSource('restoreManagedLaunchReceipts');
+const managedLaunchTerminalBody = functionSource('applyManagedLaunchTerminalProjection');
+const managedLaunchIntentLockBody = functionSource('withManagedLaunchIntentLock');
 const newSessionLaunchStateBody = functionSource('renderNewSessionLaunchState');
 const newSessionErrorBody = functionSource('setNewSessionLaunchError');
 const inputBody = functionSource('sendInputToSession');
@@ -138,7 +158,16 @@ const runtimeLoadOnOpenBody = functionSource('shouldLoadSessionRuntimeConfigOnOp
 const showSessionBody = functionSource('showSession');
 const fetchBody = functionSource('fetchJson');
 const rebindBody = functionSource('rebindSessionApi');
+const rebindSubmitBody = functionSource('submitRebindWithIntentLock');
+const rebindCompletionBody = functionSource('waitForAcceptedRebindCompletion');
 const composerApiSwitchBody = functionSource('switchSessionApiFromComposer');
+const composerConfirmOffset = composerApiSwitchBody.indexOf('requestUiConfirmation(');
+const composerRebindOffset = composerApiSwitchBody.indexOf('await rebindSessionApi(');
+assert(composerConfirmOffset >= 0 && composerConfirmOffset < composerRebindOffset,
+  'API switch must confirm before async Rebind preflight so embedded browsers retain the user gesture');
+const batchRebindBody = functionSource('applyProfileRebindSessionActionDialog');
+const profileRebindCompletionBody = functionSource('waitForProfileRebindCompletion');
+const historyResumeBody = functionSource('resumeFromHistory');
 const queueScheduleBody = functionSource('maybeScheduleQueuedPromptSend');
 const moveComposerSessionBody = functionSource('moveComposerDraftSessionKey');
 const submitComposerPayloadBody = functionSource('submitComposerPayload');
@@ -148,12 +177,12 @@ const forceQueuedPromptBody = functionSource('interruptAndSendQueuedPrompt');
 const fallbackBody = functionSource('startTranscriptFallback');
 const controlsBody = functionSource('renderSessionApiControls');
 const stateChangedHandler = app.slice(
-  app.indexOf("state.eventSource.addEventListener('session.state_changed'"),
-  app.indexOf("state.eventSource.addEventListener('session.transcript'")
+  app.indexOf("streamGate.listen('session.state_changed'"),
+  app.indexOf("streamGate.listen('session.transcript'")
 );
 
 const alertState = { alerts: new Map() };
-const alertHelpers = loadHelpers(['dedupeAlerts', 'appendAlertForSession'], {
+const alertHelpers = loadHelpers(['structuredThinkingText', 'dedupeAlerts', 'appendAlertForSession'], {
   state: alertState,
   makeSessionKey: (hostId, sessionId) => `${hostId}::${sessionId}`,
   rememberSessionCacheValue: () => {},
@@ -177,6 +206,62 @@ assert.strictEqual(
   'serverOverloaded',
   'UI must retain the concrete Codex error code'
 );
+const imageInputError = {
+  code: 'session_input_image_unsupported',
+  kind: 'image',
+  inputTypes: ['text', 'image'],
+  userMessage: 'This API/model does not accept image input. Remove the image attachment and retry; text-only prompts can continue.',
+  rawMessage: "Invalid 'input[3].content': array too long. Expected maximum length 0, got length 1",
+};
+alertHelpers.appendAlertForSession('host', 'image-session', {
+  severity: 'error',
+  message: imageInputError.rawMessage,
+  turnId: 'image-turn',
+  clientRequestId: 'image-request',
+  timestamp: '2026-08-19T00:00:00.000Z',
+});
+alertHelpers.appendAlertForSession('host', 'image-session', {
+  severity: 'error',
+  message: imageInputError.userMessage,
+  inputCapabilityError: imageInputError,
+  turnId: 'image-turn',
+  clientRequestId: 'image-request',
+  timestamp: '2026-08-19T00:00:01.000Z',
+});
+const imageAlerts = alertState.alerts.get('host::image-session') || [];
+assert.strictEqual(imageAlerts.length, 1, 'raw and friendly image capability errors must render as one Alert');
+assert.strictEqual(imageAlerts[0].message, imageInputError.userMessage);
+assert.strictEqual(imageAlerts[0].code, imageInputError.code);
+assert.deepStrictEqual(imageAlerts[0].inputTypes, imageInputError.inputTypes);
+assert.strictEqual(imageAlerts[0].rawMessage, imageInputError.rawMessage);
+const runtimeIssueHelpers = loadHelpers(['runtimeIssuePresentation'], {
+  runtimeIsActive: () => false,
+});
+assert.strictEqual(
+  runtimeIssueHelpers.runtimeIssuePresentation({ phase: 'closed', lastCodexError: 'old error' }),
+  null,
+  'clean terminal state must suppress stale runtime error'
+);
+assert.strictEqual(
+  runtimeIssueHelpers.runtimeIssuePresentation({ phase: 'failed', lastError: 'real error' }).message,
+  'real error',
+  'runtime issue presentation must include lastError'
+);
+assert.strictEqual(
+  runtimeIssueHelpers.runtimeIssuePresentation({
+    phase: 'error',
+    currentTurnStatus: 'failed',
+    userFacingError: imageInputError.userMessage,
+    lastCodexError: imageInputError.code,
+  }).message,
+  imageInputError.userMessage,
+  'runtime status must prefer the friendly capability error over its classification code'
+);
+assert(
+  app.includes('recoverComposerSubmissionForSession(runtimeSession')
+    && app.includes('recoverComposerSubmissionForSession({'),
+  'runtime and command failure paths must reuse per-Session composer recovery'
+);
 assert(
   app.includes('!state.fullDiagnosticsLoaded.has(key)')
   && app.includes('fullDiagnostics: true'),
@@ -190,13 +275,51 @@ assert(launchBody.includes('clientRequestId: launchBusyId'), 'managed launch mus
 assert(launchBody.includes('fetchManagedLaunchWithRetry'), 'managed launch must recover when an accepted HTTP response is lost');
 assert(launchRetryBody.includes('JSON.stringify(body)'), 'launch retry must resend the exact accepted request payload');
 assert(launchRetryBody.includes('managedLaunchFailureMayHaveLostAcceptedResponse'), 'only an ambiguous transport or server failure may retry creation');
-assert(newSessionLaunchStateBody.includes('submitButton.disabled = disabled'), 'New Session submit must disable immediately while its intent is busy');
+assert(newSessionLaunchStateBody.includes('submitButton.disabled = locked && !canRecheck'), 'New Session submit must disable while an accepted intent is actively observed');
 assert(newSessionLaunchStateBody.includes('Creating Session...'), 'New Session submit must expose an explicit creating state');
+assert(newSessionLaunchStateBody.includes('Recheck Accepted Run'), 'an unresolved accepted launch must expose an enabled Recheck action');
+assert(managedLaunchRecheckBody.includes('recheck: true'), 'Recheck must start a fresh observation lease');
+assert(!managedLaunchRecheckBody.includes('fetchJson'), 'Recheck must never submit a second launch request');
 assert(newSessionLaunchStateBody.includes('state.newSessionLaunchError'), 'New Session launch failures must remain scoped to the creation form');
 assert(newSessionErrorBody.includes('No existing Session history was changed'), 'binding preflight failures must explain that existing history was not modified');
 assert(/newSessionLaunchError:\s*null/.test(app), 'New Session launch error state must not be stored on a selected Session');
 assert(/sessionLaunchBusy:\s*new Map\(\)/.test(app), 'concurrent launch locks must stay isolated by intent');
 assert(!launchBody.includes('explicitProfileId'), 'ordinary launch must never perform an explicit API rebind');
+assert(
+  managedLaunchLoadBody.includes('SESSION_LAUNCH_OBSERVATION_REQUEST_TIMEOUT_MS'),
+  'each managed launch observation request must have a bounded transport timeout'
+);
+assert(managedLaunchObserveBody.includes('managedLaunchReceiptRebindTarget'), 'Rebind observations must retain their expected API target');
+assert(managedLaunchObserveBody.includes('rebind-binding-mismatch'), 'automatic and manual Recheck must reject a different live API binding');
+assert(
+  managedLaunchTrackBody.includes('getManagedSessionLaunchCoordinator'),
+  'managed launch polling must be delegated to the extracted coordinator'
+);
+assert(
+  managedLaunchRecoverOneBody.includes('sessionLaunchRecoveryHandlers'),
+  'restored launch terminal handlers must be registered at most once'
+);
+assert(managedLaunchRecoverOneBody.includes('persist: false'), 'cross-tab recovery must not reinsert a terminally removed receipt');
+assert(
+  !app.includes('while (state.sessionLaunchReceipts.has(key))'),
+  'app.js must not retain its former unbounded launch polling loop'
+);
+assert(managedLaunchRestoreBody.includes('getManagedSessionLaunchCoordinator().restore'), 'receipt restoration must use the canonical Coordinator decoder and locked sanitation');
+assert(!app.includes('persistManagedLaunchReceipts'), 'app.js must not perform an unlocked whole-ledger write');
+assert(functionSource('getManagedSessionLaunchCoordinator').includes('mutateLedger:'), 'ledger changes must use atomic browser storage on HTTP');
+assert(managedLaunchIntentLockBody.includes('getManagedLaunchStorage().withIntent'), 'Web Locks and durable HTTP intent coordination must share the launch storage adapter');
+assert(launchBody.includes('claimIntent('), 'network launch must claim its durable shared request ID before submission');
+assert(launchBody.includes('body.clientRequestId = claim.clientRequestId'), 'cross-tab launches must reuse the durable request ID');
+assert(managedLaunchTerminalBody.includes('sessionLaunchTerminalProjections'), 'terminal UI projection must be idempotent per tab');
+assert(managedLaunchTrackBody.includes('applyManagedLaunchTerminalProjection'), 'tracker completion must share one terminal projection path');
+assert(functionSource('requireRelayLogin').includes("pause(null, 'authentication-required')"));
+assert(functionSource('applyAuthConfig').includes("pause(null, 'authentication-required')"));
+assert(app.includes("resume(null, 'document-hidden')"), 'visibility recovery must only clear its own launch-observation pause');
+assert(app.includes("pause(null, 'document-hidden')"), 'hidden documents must pause launch observation with a distinct reason');
+assert(app.includes("resume(null, 'page-hidden')"), 'pageshow must only clear its own launch-observation pause');
+assert(app.includes("pause(null, 'page-hidden')"), 'pagehide must pause launch observation with a distinct reason');
+assert(app.includes("resume(null, 'network-offline')"), 'online recovery must only clear the network pause');
+assert(app.includes("pause(null, 'network-offline')"), 'offline state must pause launch observation with a distinct reason');
 assert(!launchBody.includes('if (!sessionApiBinding(currentSource))'), 'resume must fail closed when canonical runtime config cannot be loaded');
 assert(!launchBody.includes('sourceSession = currentSource'), 'resume must not fall back to a list projection after runtime-config failure');
 assert(!inputBody.includes('getApiRequestConfig'), 'live input must not resolve the Host default API');
@@ -227,8 +350,9 @@ for (const [name, source] of [
   );
 }
 assert(
-  queueScheduleBody.includes('maybeScheduleQueuedPromptSend(current)'),
-  'a Queue timer that observes a Session switch must schedule the newly selected Session'
+  queueScheduleBody.includes('const targetSession = findSessionForResolvedComposerKey(sessionKey)')
+    && !queueScheduleBody.includes('const current = getSelectedSession()'),
+  'a Queue timer must resolve its owning Session by sessionKey instead of following the current selection'
 );
 assert(!compactBody.includes('getApiRequestConfig'), 'compact must not resolve the Host default API');
 assert(!compactBody.includes('body.apiConfig'), 'compact must not submit apiConfig');
@@ -244,7 +368,11 @@ assert(
   restoreSentDraftAfterInterruptBody.includes('await waitForActiveTurnToClear(session)'),
   'draft restoration must wait for terminal turn state'
 );
-assert(app.includes("state.eventSource.addEventListener('session.transcript_removed'"));
+assert(
+  app.includes("'session.transcript_removed'")
+    && app.includes('streamGate.listen'),
+  'transcript removals must participate in the stream cursor replay path'
+);
 assert(app.includes("'session.transcript_removed',"), 'transcript removals must participate in SSE cursor replay');
 assert(runtimeLoadBody.includes('/runtime-config?'), 'selection must load Session runtime config');
 assert(runtimeLoadBody.includes('requestSessionKey'), 'runtime config responses must retain the request Session key');
@@ -276,12 +404,30 @@ assert(
   sessionDetailsBody.includes('|| isSessionApiRebindBusy(session)'),
   'Rebind must disable the composer model and effort controls while the request is pending'
 );
-assert(fetchBody.includes('error.code'), 'fetchJson must preserve structured error codes');
-assert(fetchBody.includes('AbortController'), 'fetchJson must support bounded request cancellation');
-for (const field of ['stage', 'sessionBinding', 'submittedBinding', 'canRebind', 'canTranscriptFallback']) {
-  assert(fetchBody.includes(`error.${field}`), `fetchJson must preserve ${field}`);
+assert(
+  fetchBody.includes('return client.requestJson(url, options)')
+    && relayApiSource.includes('error.code'),
+  'relay API client must preserve structured error codes'
+);
+assert(
+  relayApiSource.includes('AbortController') && relayApiSource.includes('timeoutMs'),
+  'relay API client must support bounded request cancellation'
+);
+for (const field of [
+  'stage',
+  'sessionBinding',
+  'submittedBinding',
+  'canRebind',
+  'canTranscriptFallback',
+  'requiresExplicitTranscriptFallback',
+]) {
+  const value = field.startsWith('can') || field.startsWith('requires') ? true : { sentinel: field };
+  const error = createRequestError({ status: 409 }, { error: 'conflict', [field]: value }, '/fixture');
+  assert.deepStrictEqual(error[field], value, `relay API error handling must preserve ${field}`);
 }
-assert(rebindBody.includes('/rebind'), 'explicit API changes must use the rebind route');
+assert(rebindSubmitBody.includes('/rebind'), 'explicit API changes must use the rebind route');
+assert(rebindSubmitBody.includes('withManagedLaunchIntentLock'), 'Rebind submission must be serialized by its accepted intent');
+assert(rebindSubmitBody.includes('acceptedRebindReceipt'), 'an accepted Rebind must be persisted before completion observation');
 assert(rebindBody.includes('explicitProfileId'), 'rebind must resolve only the explicitly selected local profile');
 assert(
   rebindBody.includes('loadStableCanonicalSessionForRebind'),
@@ -299,6 +445,22 @@ assert(rebindBody.indexOf('loadStableCanonicalSessionForRebind') < rebindBody.in
 assert(rebindBody.includes('formatSessionRebindConfirmation'), 'Rebind confirmation must show the captured transition');
 assert(functionSource('formatSessionRebindConfirmation').includes("formatUiText('session.rebindConfirmEndpoint'"));
 assert(rebindBody.includes('waitForExplicitRebindCompletion'), 'single Rebind must wait for the accepted run to become live');
+assert(rebindCompletionBody.includes('acceptedRebindReceipt'), 'Rebind completion must start from the durable accepted-run receipt');
+assert(rebindCompletionBody.includes('trackManagedLaunchReceipt'), 'Rebind completion must use the Coordinator exact-runtime observer');
+for (const [pathLabel, source] of [
+  ['single Session completion', rebindCompletionBody],
+  ['composer API switch', composerApiSwitchBody],
+  ['batch/live apply', batchRebindBody],
+  ['batch completion', profileRebindCompletionBody],
+  ['history Rebind & Resume', historyResumeBody],
+]) {
+  assert(!source.includes('waitForSession('), `${pathLabel} must not use the legacy fixed-timeout Session List poller`);
+  assert(!source.includes('sessionListQuery('), `${pathLabel} must not inspect a non-authoritative Session List directly`);
+}
+assert(composerApiSwitchBody.includes('rebindSessionApi'), 'the compact composer API switch must use the canonical Rebind path');
+assert(batchRebindBody.includes('rebindSessionApi'), 'batch/live apply must submit through the canonical Rebind path');
+assert(profileRebindCompletionBody.includes('waitForAcceptedRebindCompletion'), 'batch/live apply must observe the accepted run through the Coordinator');
+assert(historyResumeBody.includes('switchSessionApiFromComposer'), 'history Rebind & Resume must share the composer Rebind path');
 assert(rebindBody.includes('reconcileAcceptedRebind'), 'accepted Rebind must reconcile transient completion failures');
 assert(rebindBody.includes('rebindResponseWasAccepted'), 'single Rebind must recover when its accepted HTTP response is lost');
 assert(rebindBody.includes('rebindResponseWithClientSelection'), 'every accepted Rebind response must retain the submitted selection snapshot');
@@ -368,7 +530,7 @@ assert(fallbackClickHandler.includes('isSessionTranscriptFallbackBusy(session)')
 assert(fallbackClickHandler.includes('setSessionTranscriptFallbackBusy(session, true)'), 'transcript fallback busy state must be set before awaiting the request');
 assert(fallbackClickHandler.includes('setSessionTranscriptFallbackBusy(session, false)'), 'transcript fallback busy state must be cleared in finally');
 assert(fallbackBody.includes('canTranscriptFallback'), 'fallback must require server-provided eligibility');
-assert(fallbackBody.includes('window.confirm'), 'transcript fallback must require confirmation');
+assert(fallbackBody.includes('requestUiConfirmation'), 'transcript fallback must require confirmation');
 assert(fallbackBody.includes('/transcript-fallback'), 'fallback must use its explicit route');
 assert(fallbackBody.includes('loadCanonicalSessionForLifecycleMutation'), 'fallback must load canonical source lifecycle state');
 assert(fallbackBody.includes('captureSessionLifecycleExpectation'), 'fallback must capture the canonical source run');
@@ -379,6 +541,18 @@ assert(controlsBody.includes('selectableCatalogModels(catalog).length'), 'catalo
 assert(controlsBody.includes('unavailable hidden'), 'catalog status must explain hidden unavailable references');
 assert(controlsBody.includes('modelOptionsErrorsByKey'), 'catalog failures must remain visible inline');
 assert(controlsBody.includes('sessionApiControlValue(session)'), 'API controls must always render from the actual Session binding');
+assert(
+  controlsBody.includes('session?.resumeError?.requiresExplicitTranscriptFallback')
+    && controlsBody.includes('session_responses_history_incompatible')
+    && controlsBody.includes('Update Sub2API and retry')
+    && controlsBody.includes('create a new Session from the transcript')
+    && controlsBody.includes('original Session is unchanged'),
+  'history-schema failures must offer Sub2API retry and an explicit non-destructive transcript fallback'
+);
+assert(
+  controlsBody.includes('fallbackButton.title = explicitFallbackRequired'),
+  'transcript fallback control must explain its non-destructive behavior'
+);
 assert(controlsBody.includes('runtimeIsActive(runtime)'), 'the API selector must be disabled while a turn is active');
 assert(launchBody.includes('latest?.resumeError || structuredSessionError(error)'), 'launch failure must preserve the server resume error');
 assert(
@@ -430,6 +604,15 @@ assert.strictEqual(migratedClaude.provider, 'Claude', 'providerKind migration mu
 const normalizedDefaultProfile = profileNormalizationHelpers.normalizeApiProfile();
 assert.strictEqual(normalizedDefaultProfile.providerKind, 'openai');
 assert.strictEqual(normalizedDefaultProfile.provider, 'OpenAI');
+assert.strictEqual(
+  profileNormalizationHelpers.normalizeApiProfile({
+    profileId: 'compat',
+    provider: 'Custom',
+    providerKind: 'custom',
+    nativeResumeCompatibilityKey: '  Shared-Gateway-Group  ',
+  }).nativeResumeCompatibilityKey,
+  'shared-gateway-group'
+);
 
 const unsavedProfile = {
   profileId: 'draft',
@@ -459,6 +642,7 @@ assert.strictEqual(unsavedProfile.providerKind, 'custom');
 assert.strictEqual(unsavedProfile.provider, 'After Provider');
 assert.strictEqual(unsavedProfile.baseUrl, 'https://after.example/v1');
 assert.strictEqual(unsavedProfile.apiKey, 'after-key');
+assert.strictEqual(unsavedProfile.nativeResumeCompatibilityKey, '');
 assert.strictEqual(
   JSON.stringify(unsavedProfile.sessionDefaults),
   legacyDefaultsBeforeProfileSave,
@@ -603,6 +787,8 @@ assert(app.includes('copySessionButton.dataset.copySessionDir'), 'Copy Dir must 
 assert(!/'settings\.apiCopy': '.*starting or restarting Codex app-server sessions\.'/i.test(app), 'API profile copy must not imply Host defaults change resumed Sessions');
 assert(!/'settings\.apiRestartTip': 'After changing an API key or Base URL/i.test(app), 'provider changes must use explicit Session rebind, not a generic restart');
 assert(html.includes('Host mappings are defaults for new Sessions only.'), 'API settings must explain fresh-Session-only Host defaults');
+assert(!html.includes('settings-api-native-resume-compatibility-key'), 'internal compatibility hints must not appear as a normal API setting');
+assert(!html.includes('Native resume compatibility group'), 'API settings must not expose a preemptive compatibility-group gate');
 
 const historical = {
   hostId: 'host-a',
@@ -670,6 +856,42 @@ assert.strictEqual(
   }),
   true,
   'an empty OpenAI Base URL must match the canonical official endpoint recorded by the backend'
+);
+assert.strictEqual(
+  bindingHelpers.apiBindingMatchesProfileIdentity({
+    kind: 'profile',
+    profileId: 'compat-profile',
+    provider: 'Custom',
+    providerKind: 'custom',
+    normalizedBaseUrl: 'https://a.example/v1',
+    nativeResumeCompatibilityKey: 'shared-gateway',
+  }, {
+    profileId: 'compat-profile',
+    provider: 'Custom',
+    providerKind: 'custom',
+    baseUrl: 'https://a.example/v1',
+    nativeResumeCompatibilityKey: 'SHARED-GATEWAY',
+  }),
+  true,
+  'compatibility keys must be normalized before comparing a bound Profile'
+);
+assert.strictEqual(
+  bindingHelpers.apiBindingMatchesProfileIdentity({
+    kind: 'profile',
+    profileId: 'compat-profile',
+    provider: 'Custom',
+    providerKind: 'custom',
+    normalizedBaseUrl: 'https://a.example/v1',
+    nativeResumeCompatibilityKey: 'shared-gateway',
+  }, {
+    profileId: 'compat-profile',
+    provider: 'Custom',
+    providerKind: 'custom',
+    baseUrl: 'https://a.example/v1',
+    nativeResumeCompatibilityKey: 'other-gateway',
+  }),
+  false,
+  'changing a compatibility group must require an explicit Rebind'
 );
 const apiValidationHelpers = loadHelpers(['validateApiConfigForRequest'], {
   state: { selectedHostId: 'host-a' },
@@ -1608,6 +1830,7 @@ for (const removedId of [
   assert(!html.includes(`id="${removedId}"`), `${removedId} must be removed with API run defaults`);
 }
 assert(html.indexOf('/provider-capabilities.js') < html.indexOf('/app.js'), 'provider registry must load before app.js');
+assert(html.indexOf('/model-reasoning.js') >= 0 && html.indexOf('/model-reasoning.js') < html.indexOf('/provider-capabilities.js'), 'shared effort parser must load before the provider registry');
 assert(functionSource('readEffortControlValue').includes('allowUnverifiedEffort'));
 assert(functionSource('assertEffortSelectionIsValid').includes('session_effort_unverified'));
 assert(functionSource('assertEffortSelectionIsValid').includes('providerAllowsManualEffortWhenUnknown'));
@@ -1909,14 +2132,16 @@ assert(functionSource('applyProfileRebindSessionActionDialog').includes('rebindS
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('previousValidation?.response?.modelCatalogReuseToken'));
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('modelCatalogReuseToken: latestValidation.response?.modelCatalogReuseToken'));
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('rebindFailureMayHaveLostAcceptedResponse(error)'));
-assert(functionSource('applyProfileRebindSessionActionDialog').includes('rebindAttempted &&'), 'batch recovery must run only after a Rebind request was attempted');
+assert(/rebindAttempted\s*&&/.test(functionSource('applyProfileRebindSessionActionDialog')), 'batch recovery must run only after a Rebind request was attempted');
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('applySessionSelectionToSessionOptions'));
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('requireIdle: true'));
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('waitForProfileRebindCompletion'));
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('latestValidation?.response?.currentRunId'));
 assert(functionSource('rebindResponseWasAccepted').includes('rebindSelectionMatchesRuntime'));
 assert(functionSource('applyProfileRebindSessionActionDialog').includes('latestValidation?.selection'));
-assert(functionSource('waitForProfileRebindCompletion').includes("runtime?.runStatus !== 'live'"));
+assert(functionSource('waitForProfileRebindCompletion').includes('waitForAcceptedRebindCompletion'));
+assert(functionSource('waitForProfileRebindCompletion').includes('rebindTargetSummary'));
+assert(rebindCompletionBody.includes("runtime?.runStatus !== 'live'"));
 assert(!functionSource('applyProfileRebindSessionActionDialog').includes('restartManagedSession'));
 assert(
   !functionSource('restartManagedSession').includes("catch(() => ({"),
@@ -2599,6 +2824,7 @@ async function verifyLostRebindResponseRecovery() {
     'normalizeRebindSelectionSnapshot',
     'rebindResponseWithClientSelection',
     'rebindFailureMayHaveLostAcceptedResponse',
+    'rebindFailureIsLocalCoordinationError',
     'rebindSessionApi',
   ], {
     state: { sessions: [session] },
@@ -2609,7 +2835,7 @@ async function verifyLostRebindResponseRecovery() {
     sessionApiBinding: (candidate) => candidate?.apiBinding || null,
     rebindTargetSummary: (profileId) => ({ kind: 'profile', profileId, label: profileId }),
     verifyHostAvailable: async () => {},
-    fetchJson: async () => { throw new Error('connection closed after request upload'); },
+    submitRebindWithIntentLock: async () => { throw new Error('connection closed after request upload'); },
     applyRebindLaunchResponse: () => { throw new Error('a missing response cannot be applied'); },
     renderAll: () => {},
     rebindResponseWasAccepted: async (candidate, target, previousRunId, expectedSelection) => {
@@ -2672,6 +2898,7 @@ async function verifyDefinitiveRebindConflictDoesNotRecover() {
     'normalizeRebindSelectionSnapshot',
     'rebindResponseWithClientSelection',
     'rebindFailureMayHaveLostAcceptedResponse',
+    'rebindFailureIsLocalCoordinationError',
     'rebindSessionApi',
   ], {
     state: { sessions: [session] },
@@ -2682,7 +2909,7 @@ async function verifyDefinitiveRebindConflictDoesNotRecover() {
     sessionApiBinding: (candidate) => candidate?.apiBinding || null,
     rebindTargetSummary: (profileId) => ({ kind: 'profile', profileId, label: profileId }),
     verifyHostAvailable: async () => {},
-    fetchJson: async () => { throw conflict; },
+    submitRebindWithIntentLock: async () => { throw conflict; },
     applyRebindLaunchResponse: () => { throw new Error('a rejected request cannot be applied'); },
     renderAll: () => {},
     rebindResponseWasAccepted: async () => {
@@ -2733,6 +2960,7 @@ async function verifyCurrentSelectionSnapshotSurvivesMutation() {
     'normalizeRebindSelectionSnapshot',
     'rebindResponseWithClientSelection',
     'rebindFailureMayHaveLostAcceptedResponse',
+    'rebindFailureIsLocalCoordinationError',
     'rebindSessionApi',
   ], {
     state: requestState,
@@ -2744,8 +2972,12 @@ async function verifyCurrentSelectionSnapshotSurvivesMutation() {
     sessionApiBinding: (candidate) => candidate?.apiBinding || null,
     rebindTargetSummary: (profileId) => ({ kind: 'profile', profileId, label: profileId }),
     verifyHostAvailable: async () => {},
-    fetchJson: async (_url, options) => {
-      submittedBody = JSON.parse(options.body);
+    submitRebindWithIntentLock: async (_session, _target, submittedSelection, body) => {
+      submittedBody = { ...body };
+      assert.deepStrictEqual(
+        JSON.parse(JSON.stringify(submittedSelection)),
+        { model: 'submitted-model', effort: 'high', summary: 'concise' }
+      );
       sourceSelection.model = 'changed-while-request-was-pending';
       sourceSelection.effort = 'low';
       return {
@@ -3046,6 +3278,302 @@ async function verifyLostManagedLaunchResponseRecovery() {
   assert.strictEqual(conflictAttempts, 1, 'a definitive server conflict must not retry Session creation');
 }
 
+async function verifyRejectedLaunchIntentRecovery() {
+  const completed = [];
+  const helpers = loadHelpers(['completeDefinitivelyRejectedLaunchIntent'], {
+    getManagedLaunchStorage: () => ({ completeIntent: async (...args) => completed.push(args) }),
+  });
+  const finish = helpers.completeDefinitivelyRejectedLaunchIntent;
+  for (const error of [
+    new Error('connection closed'),
+    { status: 409, body: { code: 'session_request_conflict', clientRequestId: 'request-a', launchOutcome: 'acceptance_unknown' } },
+    { status: 503, body: { code: 'session_request_replay_unavailable', currentRunStatus: 'pending', clientRequestId: 'request-a', launchOutcome: 'acceptance_unknown' } },
+    { status: 400, body: { clientRequestId: 'different-request', launchOutcome: 'not_accepted' } },
+    { status: 422, body: { code: 'validation-failed' } },
+  ]) await finish('intent-a', 'request-a', error);
+  assert.strictEqual(completed.length, 0, 'unknown outcomes and unrelated response IDs must retain the durable submission');
+  for (const launchOutcome of ['not_accepted', 'failed']) {
+    await finish('intent-a', 'request-a', { status: 409, body: { clientRequestId: 'request-a', launchOutcome } });
+  }
+  assert.deepStrictEqual(completed, [['intent-a', 'request-a'], ['intent-a', 'request-a']],
+    'authoritative rejection or persisted failure must let the next explicit action use a new request ID');
+}
+
+function verifyDurableLiveRunMaterializesSessionProjection() {
+  const stale = {
+    hostId: 'host-a',
+    sessionId: 'session-a',
+    runId: null,
+    state: 'imported',
+    live: false,
+    resumeError: { code: 'stale-startup-error' },
+  };
+  const helpers = loadHelpers(['materializeManagedLaunchLiveSession'], {
+    state: { sessions: [stale] },
+    findSessionForManagedLaunch: (_receipt, sessions) => sessions?.[0] || null,
+    mergeSession: (session) => session,
+  });
+  const projected = helpers.materializeManagedLaunchLiveSession({
+    hostId: 'host-a',
+    sessionId: 'session-a',
+    bridgeSessionId: 'session-a',
+    runId: 'run-a',
+    launchMode: 'fresh',
+    cwd: 'D:/workspace',
+  }, {
+    sessions: [stale],
+    runtimeConfig: {
+      hostId: 'host-a',
+      sessionId: 'session-a',
+      runId: 'run-a',
+      activeRunId: 'run-a',
+      runStatus: 'live',
+      sessionBinding: { kind: 'host-default', bindingFingerprint: 'binding-a' },
+      provenance: {
+        nativeThreadId: 'native-a',
+        conversationKey: 'conversation-a',
+      },
+    },
+  });
+  assert.strictEqual(projected.live, true);
+  assert.strictEqual(projected.state, 'live');
+  assert.strictEqual(projected.runId, 'run-a');
+  assert.strictEqual(projected.nativeThreadId, 'native-a');
+  assert.strictEqual(projected.conversationKey, 'conversation-a');
+  assert.strictEqual(projected.resumeError, null);
+  assert.strictEqual(projected.runtimeConfig.runStatus, 'live');
+}
+
+async function verifyTerminalProjectionRunsOncePerTab() {
+  const receipt = { hostId: 'host-a', sessionId: 'session-a', runId: 'run-a' };
+  const busy = { id: 'busy-a', intentKey: 'intent-a' };
+  const state = {
+    sessions: [],
+    sessionLaunchTerminalProjections: new Set(),
+    sessionLaunchReceipts: new Map([['host-a::run-a', receipt]]),
+    sessionLaunchBusy: new Map([['intent-a', busy]]),
+  };
+  let merged = 0;
+  let rendered = 0;
+  const helpers = loadHelpers(['applyManagedLaunchTerminalProjection'], {
+    state,
+    managedLaunchTrackerKey: () => 'host-a::run-a',
+    managedLaunchReceiptKey: () => 'host-a::run-a',
+    managedLaunchBusyForReceipt: () => busy,
+    findSessionForManagedLaunch: (_receipt, sessions) => sessions?.[0] || null,
+    materializeManagedLaunchLiveSession: () => { throw new Error('live projection already exists'); },
+    mergeSession: (session) => {
+      merged += 1;
+      return session;
+    },
+    renderAll: () => { rendered += 1; },
+  });
+  const result = {
+    status: 'live',
+    reason: 'exact-runtime-live',
+    loaded: { sessions: [{ ...receipt, live: true, state: 'live' }] },
+  };
+  await helpers.applyManagedLaunchTerminalProjection(result, { receipt });
+  await helpers.applyManagedLaunchTerminalProjection(result, { receipt });
+  assert.strictEqual(merged, 1, 'a tab must materialize one terminal projection per accepted run');
+  assert.strictEqual(rendered, 1, 'duplicate terminal callbacks must not redraw the same projection');
+  assert.strictEqual(state.sessionLaunchBusy.size, 0);
+  assert.strictEqual(state.sessionLaunchReceipts.size, 0);
+}
+
+async function verifyAcceptedRebindUsesCoordinatorResult() {
+  const session = { hostId: 'host-a', sessionId: 'session-a', cwd: '/workspace' };
+  const response = { sessionId: 'session-a', runId: 'run-b' };
+  const binding = { kind: 'profile', profileId: 'profile-b' };
+  let trackerCalls = 0;
+  const helpers = loadHelpers(['waitForAcceptedRebindCompletion'], {
+    acceptedRebindReceipt: async () => ({ ...response, hostId: 'host-a', version: 1, acceptedAtMs: Date.now() }),
+    trackManagedLaunchReceipt: async () => {
+      trackerCalls += 1;
+      return {
+        ...session,
+        live: true,
+        runId: 'run-b',
+        runtimeConfig: {
+          runId: 'run-b',
+          runStatus: 'live',
+          apiBinding: binding,
+        },
+      };
+    },
+    managedSessionStartTimeoutMs: () => 90_000,
+    getHost: () => ({ platform: 'linux' }),
+    rebindTargetMatchesBinding: (candidate, target) => candidate.profileId === target.profileId,
+    fetchJson: async () => { throw new Error('exact runtime result should be reused'); },
+    sessionContractError: (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra }),
+    shortId: (value) => value,
+  });
+  const completed = await helpers.waitForAcceptedRebindCompletion(
+    session,
+    response,
+    { kind: 'profile', profileId: 'profile-b' }
+  );
+  assert.strictEqual(trackerCalls, 1);
+  assert.strictEqual(completed.live, true);
+  assert.strictEqual(completed.runtimeConfig.runStatus, 'live');
+}
+
+async function verifyProfileRebindCompletionBuildsSafeTarget() {
+  let observedTarget = null;
+  const helpers = loadHelpers([
+    'normalizedBrowserSecretKey',
+    'isBrowserSecretQueryKey',
+    'browserSafeUrl',
+    'browserSafeRebindTarget',
+    'normalizeApiIdentityBaseUrl',
+    'effectiveApiBaseUrl',
+    'apiResponsesEndpoint',
+    'rebindTargetSummary',
+    'waitForProfileRebindCompletion',
+  ], {
+    inferApiProviderKind: (input) => input?.providerKind || 'custom',
+    OPENAI_OFFICIAL_BASE_URL: 'https://api.openai.com/v1',
+    waitForAcceptedRebindCompletion: async (_session, _response, target) => {
+      observedTarget = target;
+      return { live: true };
+    },
+  });
+  await helpers.waitForProfileRebindCompletion(
+    { hostId: 'host-a', sessionId: 'session-a' },
+    {
+      profileId: 'profile-minemine',
+      provider: 'MineMine',
+      providerKind: 'custom',
+      baseUrl: 'https://gateway.example/v1?api_key=secret&region=x#private',
+      apiKey: 'body-secret',
+    },
+    { sessionId: 'session-a', runId: 'run-b' }
+  );
+  assert.strictEqual(observedTarget.kind, 'profile');
+  assert.strictEqual(observedTarget.profileId, 'profile-minemine');
+  assert.strictEqual(observedTarget.provider, 'MineMine');
+  assert.strictEqual(observedTarget.providerKind, 'custom');
+  assert.strictEqual(observedTarget.baseUrl, 'https://gateway.example/v1?region=x');
+  assert(!JSON.stringify(observedTarget).includes('secret'));
+}
+
+async function verifyRebindObservationChecksPersistedBindingTarget() {
+  let runtimeConfig = {
+    runId: 'run-b',
+    runStatus: 'live',
+    apiBinding: { kind: 'profile', profileId: 'profile-c' },
+  };
+  const helpers = loadHelpers([
+    'normalizedBrowserSecretKey',
+    'isBrowserSecretQueryKey',
+    'browserSafeUrl',
+    'browserSafeRebindTarget',
+    'normalizeApiIdentityBaseUrl',
+    'effectiveApiBaseUrl',
+    'apiBindingMatchesProfileIdentity',
+    'rebindTargetMatchesBinding',
+    'managedLaunchReceiptRebindTarget',
+    'observeManagedLaunchOnce',
+  ], {
+    state: { sessionLaunchSoftTimeouts: new Map() },
+    managedSessionLaunchApi: () => ({
+      classifyLaunchObservation: () => ({ status: 'live', reason: 'exact-runtime-live' }),
+    }),
+    shouldPauseManagedLaunchObservation: () => false,
+    managedLaunchTrackerKey: () => 'host-a::run-b',
+    managedSessionStartTimeoutMs: () => 90_000,
+    getHost: () => ({ platform: 'linux' }),
+    loadManagedLaunchObservation: async () => ({ sessions: [], runtimeConfig }),
+    findSessionForManagedLaunch: () => null,
+    inferApiProviderKind: (input) => input?.providerKind || 'custom',
+    OPENAI_OFFICIAL_BASE_URL: 'https://api.openai.com/v1',
+  });
+  const receipt = {
+    hostId: 'host-a',
+    sessionId: 'session-a',
+    runId: 'run-b',
+    rebindTargetKind: 'profile',
+    rebindProfileId: 'profile-b',
+    rebindProvider: 'MineMine',
+    rebindProviderKind: 'custom',
+    rebindBaseUrl: 'https://gateway.example/v1',
+  };
+  const mismatch = await helpers.observeManagedLaunchOnce(receipt);
+  assert.strictEqual(mismatch.status, 'conflict');
+  assert.strictEqual(mismatch.reason, 'rebind-binding-mismatch');
+  assert.strictEqual(mismatch.terminal, true);
+
+  runtimeConfig = { runId: 'run-b', runStatus: 'live' };
+  const unobserved = await helpers.observeManagedLaunchOnce(receipt);
+  assert.strictEqual(unobserved.status, 'indeterminate');
+  assert.strictEqual(unobserved.reason, 'rebind-binding-unobserved');
+  assert.strictEqual(unobserved.terminal, false);
+
+  const reconstructed = helpers.managedLaunchReceiptRebindTarget(receipt);
+  assert.strictEqual(reconstructed.kind, 'profile');
+  assert.strictEqual(reconstructed.provider, 'MineMine');
+  assert.strictEqual(reconstructed.providerKind, 'custom');
+  assert.strictEqual(reconstructed.baseUrl, 'https://gateway.example/v1');
+
+  runtimeConfig = {
+    runId: 'run-b',
+    runStatus: 'live',
+    apiBinding: {
+      kind: 'profile',
+      profileId: 'profile-b',
+      provider: 'OtherProvider',
+      providerKind: 'custom',
+      normalizedBaseUrl: 'https://gateway.example/v1',
+    },
+  };
+  const wrongProvider = await helpers.observeManagedLaunchOnce(receipt);
+  assert.strictEqual(wrongProvider.status, 'conflict', 'restored Rebind must validate provider identity');
+
+  runtimeConfig.apiBinding.provider = 'MineMine';
+  const customProviderLive = await helpers.observeManagedLaunchOnce(receipt);
+  assert.strictEqual(customProviderLive.status, 'live', 'a matching restored custom-provider Rebind must remain live');
+}
+
+async function verifyAcceptedRebindReceiptIsSecretlessAndProviderAware() {
+  let remembered = null;
+  const helpers = loadHelpers([
+    'normalizedBrowserSecretKey',
+    'isBrowserSecretQueryKey',
+    'browserSafeUrl',
+    'browserSafeRebindTarget',
+    'normalizeRebindSelectionSnapshot',
+    'acceptedRebindIntentKey',
+    'acceptedRebindReceipt',
+  ], {
+    state: { sessionLaunchReceipts: new Map() },
+    sessionLaunchIntentKey: () => '["host-a","/workspace","rebind","session-a"]',
+    rememberManagedLaunchReceipt: async (_response, options) => {
+      remembered = { ...options };
+      return remembered;
+    },
+    sessionContractError: (code, message) => Object.assign(new Error(message), { code }),
+  });
+  const receipt = await helpers.acceptedRebindReceipt(
+    { hostId: 'host-a', sessionId: 'session-a', cwd: '/workspace', title: 'Workspace' },
+    { sessionId: 'session-a', runId: 'run-b' },
+    {
+      kind: 'profile',
+      profileId: 'profile-minemine',
+      provider: 'MineMine',
+      providerKind: 'custom',
+      baseUrl: 'https://gateway.example/v1?api_key=top-secret&region=x#private',
+    },
+    { intentKey: '["unsafe","api_key=top-secret"]' }
+  );
+  assert.strictEqual(receipt.rebindTargetKind, 'profile');
+  assert.strictEqual(receipt.rebindProvider, 'MineMine');
+  assert.strictEqual(receipt.rebindProviderKind, 'custom');
+  assert.strictEqual(receipt.rebindBaseUrl, 'https://gateway.example/v1?region=x');
+  assert(!JSON.stringify(remembered).includes('top-secret'));
+  assert(!remembered.intentKey.includes('api_key'));
+  assert(functionSource('rememberManagedLaunchReceipt').includes('rebindProvider: context.rebindProvider'));
+}
+
 async function verifyStopFailureRestoresCompleteRuntimeSnapshot() {
   const session = {
     hostId: 'host-stop',
@@ -3154,6 +3682,7 @@ async function verifyComposerApiSwitchTransaction() {
   let reportedErrors = 0;
   let restoredDraft = null;
   let submittedTargetProfileId = null;
+  let lastModelLoadOptions = null;
   const busyTransitions = [];
   const notices = [];
   const helpers = loadHelpers(['switchSessionApiFromComposer'], {
@@ -3198,19 +3727,29 @@ async function verifyComposerApiSwitchTransaction() {
     },
     captureModelCatalogRequest: () => ({}),
     applyModelCatalogResponse: (_request, catalog) => catalog,
-    loadModelOptionsForSession: async () => {
+    loadModelOptionsForSession: async (_session, options) => {
+      lastModelLoadOptions = options;
       if (catalogFailure) throw catalogFailure;
-      return { models: [{ id: 'model-latest', isDefault: true }] };
+      return {
+        models: [{ id: 'model-latest', isDefault: true }],
+        sources: [{ source: 'live', stale: false, models: [{ id: 'model-latest', isDefault: true }] }],
+      };
     },
-    preferredModelForApiSwitch: (catalog) => catalog.models[0].id,
+    preferredModelForApiSwitch: (catalog, options) => {
+      assert(options.providerCatalog, 'fresh Rebind provider evidence must survive the live refresh');
+      return catalog.models[0].id;
+    },
     applySessionSelectionToSessionOptions: (_session, selection) => { appliedSelection = selection; },
     rebindResponseWithClientSelection: (response, selection) => ({ ...response, clientSelection: selection }),
     rebindTargetSummary: (profileId) => ({ kind: 'profile', profileId, label: profileId }),
+    formatSessionRebindConfirmation: () => 'confirm Rebind',
+    requestUiConfirmation: async () => true,
     apiProfileRequestConfig: (profile) => profile,
     rebindTargetDisplayLabel: (target) => target.label,
     recordSessionRebindFailure: () => {},
     sessionApiBinding: (candidate) => candidate.apiBinding,
     reportError: () => { reportedErrors += 1; },
+    window: { confirm: () => true },
     t: (key) => key,
     formatUiText: (key, values) => `${key}:${values.target}`,
   });
@@ -3254,6 +3793,10 @@ async function verifyComposerApiSwitchTransaction() {
     JSON.parse(JSON.stringify(appliedSelection))
   );
   assert.strictEqual(notices.at(-1)?.tone, 'success');
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(lastModelLoadOptions)),
+    { force: true, refresh: true }
+  );
 
   rebindResult = {
     modelCatalog: {
@@ -3275,6 +3818,8 @@ async function verifyComposerApiSwitchTransaction() {
     { model: '', effort: '', summary: 'concise' },
     'a successful switch must remain on safe Auto settings when the refreshed catalog is unavailable'
   );
+  assert.strictEqual(notices.at(-1)?.tone, 'warning');
+  assert.match(notices.at(-1)?.message || '', /session\.apiSwitchNoVerifiedDefault/);
 
   catalogFailure = null;
   rebindResult = new Error('preflight rejected');
@@ -3319,15 +3864,71 @@ function verifyPreferredApiSwitchModel() {
   assert.strictEqual(
     helpers.preferredModelForApiSwitch({
       ...catalog,
-      sources: [{
-        source: 'provider',
-        authority: 'authoritative',
-        stale: false,
-        models: catalog.sources[0].models,
-      }],
+      sources: [
+        {
+          source: 'provider',
+          authority: 'authoritative',
+          stale: false,
+          models: catalog.sources[0].models,
+        },
+        {
+          source: 'live',
+          authority: 'authoritative',
+          stale: false,
+          models: [{ id: 'latest-available', isDefault: true }, { id: 'old-default' }],
+        },
+      ],
     }, { requireFreshProvider: true }),
     'latest-available',
     'a profile switch must select from the fresh provider catalog returned by Rebind'
+  );
+  assert.strictEqual(
+    helpers.preferredModelForApiSwitch({
+      models: [
+        { id: 'gpt-4o-audio-preview' },
+        { id: 'gpt-5.6-sol', isDefault: true },
+        { id: 'gpt-5.5' },
+      ],
+      sources: [
+        {
+          source: 'provider',
+          stale: false,
+          models: [
+            { id: 'gpt-4o-audio-preview' },
+            { id: 'gpt-5.5' },
+            { id: 'gpt-5.6-sol' },
+          ],
+        },
+        {
+          source: 'live',
+          stale: false,
+          models: [
+            { id: 'gpt-5.6-sol', isDefault: true },
+            { id: 'gpt-5.5' },
+          ],
+        },
+      ],
+    }, { requireFreshProvider: true }),
+    'gpt-5.6-sol',
+    'a profile switch must prefer the app-server default shared with the target API'
+  );
+  assert.strictEqual(
+    helpers.preferredModelForApiSwitch({
+      models: [
+        { id: 'gpt-4o-audio-preview' },
+        { id: 'gpt-image-1' },
+      ],
+      sources: [{
+        source: 'provider',
+        stale: false,
+        models: [
+          { id: 'gpt-4o-audio-preview' },
+          { id: 'gpt-image-1' },
+        ],
+      }],
+    }, { requireFreshProvider: true }),
+    '',
+    'a profile switch must remain Auto when no model is confirmed by the app-server'
   );
   assert.strictEqual(
     helpers.preferredModelForApiSwitch({
@@ -3347,6 +3948,135 @@ function verifyPreferredApiSwitchModel() {
     '',
     'a profile switch must remain Auto when no fresh provider model is available'
   );
+
+  const rebindProviderCatalog = {
+    sources: [{ source: 'provider', stale: false, models: [
+      { id: 'gpt-4o-audio-preview' },
+      { id: 'shared-model' },
+      { id: 'live-default' },
+    ] }],
+  };
+  const postRebindLiveCatalog = {
+    defaultModel: 'live-default',
+    models: [
+      { id: 'gpt-4o-audio-preview' },
+      { id: 'shared-model' },
+      { id: 'live-default', isDefault: true },
+    ],
+    sources: [{ source: 'live', stale: false, models: [
+      { id: 'live-default', isDefault: true },
+      { id: 'shared-model' },
+    ] }],
+  };
+  assert.strictEqual(
+    helpers.preferredModelForApiSwitch(postRebindLiveCatalog, {
+      requireFreshProvider: true,
+      providerCatalog: rebindProviderCatalog,
+    }),
+    'live-default',
+    'fresh provider evidence from Rebind must be intersected with the replacement runtime live catalog'
+  );
+  assert.strictEqual(
+    helpers.preferredModelForApiSwitch({
+      ...postRebindLiveCatalog,
+      sources: [{ ...postRebindLiveCatalog.sources[0], stale: true }],
+    }, {
+      requireFreshProvider: true,
+      providerCatalog: rebindProviderCatalog,
+    }),
+    '',
+    'stale live evidence must not drive automatic selection'
+  );
+}
+
+function verifyProviderOnlyModelLabel() {
+  const helpers = loadHelpers(['modelSelectLabel']);
+  const label = helpers.modelSelectLabel({
+    model: 'gpt-4o-audio-preview',
+    displayName: 'gpt-4o-audio-preview',
+    inputModalities: [],
+    providerAdvertised: true,
+    cliSupported: 'unknown',
+  });
+  assert.match(label, /API only \/ Codex unverified/);
+  assert.match(
+    helpers.modelSelectLabel({
+      model: 'gpt-4o-audio-preview',
+      displayName: 'gpt-4o-audio-preview',
+      inputModalities: [],
+      providerAdvertised: 'unknown',
+      previouslyAdvertised: true,
+      cliSupported: 'unknown',
+    }),
+    /API only \/ Codex unverified/,
+    'the warning label must survive a post-Rebind live refresh using last-known-good provider evidence'
+  );
+}
+
+function verifyManagedLaunchReceiptCleanupHandlesPreAcceptanceFailure() {
+  const helpers = loadHelpers([
+    'managedLaunchReceiptKey',
+    'managedLaunchReceiptIntentKey',
+  ], {
+    sessionLaunchIntentKey: (input) => JSON.stringify([
+      input.hostId || '',
+      input.cwd || '',
+      input.launchMode || '',
+      input.sourceSession?.sessionId || '',
+    ]),
+  });
+
+  assert.doesNotThrow(
+    () => helpers.managedLaunchReceiptKey(null),
+    'a pre-acceptance launch must be able to run finally with a null receipt'
+  );
+  assert.strictEqual(
+    helpers.managedLaunchReceiptKey(null),
+    '',
+    'a null launch receipt must not produce a host/run key'
+  );
+  assert.doesNotThrow(
+    () => helpers.managedLaunchReceiptIntentKey(null),
+    'intent cleanup must also tolerate a null receipt'
+  );
+}
+
+function verifyHistorySessionDoesNotProjectStaleExternalActivity() {
+  const helpers = loadHelpers([
+    'resolveExternalTerminalActivity',
+    'getExternalTerminalActivityForSession',
+  ], {
+    state: { externalActivityKeys: new Set() },
+    getRuntimeForSession: () => ({
+      externalActivity: {
+        owner: 'external-terminal',
+        active: true,
+        turnId: 'stale-terminal-turn',
+        phase: 'thinking',
+        status: 'inProgress',
+        updatedAt: '2026-08-29T00:00:00.000Z',
+      },
+    }),
+    getSessionKey: () => 'history-session',
+    getDiagnosticsForSession: () => [],
+    isExternalTerminalDiagnostic: () => false,
+    isThinkingActivityDiagnostic: () => false,
+  });
+
+  const history = helpers.getExternalTerminalActivityForSession({
+    hostId: 'history-host',
+    sessionId: 'history-session',
+    live: false,
+  });
+  assert.strictEqual(history.active, false, 'history-only sessions must hide a stale external activity projection');
+  assert.strictEqual(history.turnId, null, 'history-only sessions must not retain a stale external turn label');
+
+  const incremental = helpers.getExternalTerminalActivityForSession({
+    hostId: 'history-host',
+    sessionId: 'history-session',
+  });
+  assert.strictEqual(incremental.active, true, 'SSE temporary session objects without live must preserve runtime updates');
+  assert.strictEqual(incremental.turnId, 'stale-terminal-turn');
 }
 
 Promise.resolve()
@@ -3363,9 +4093,19 @@ Promise.resolve()
   .then(verifyCurrentSelectionSnapshotSurvivesMutation)
   .then(verifyApiProfileModelRequestIsolation)
   .then(verifyLostManagedLaunchResponseRecovery)
+  .then(verifyRejectedLaunchIntentRecovery)
+  .then(verifyDurableLiveRunMaterializesSessionProjection)
+  .then(verifyTerminalProjectionRunsOncePerTab)
+  .then(verifyAcceptedRebindUsesCoordinatorResult)
+  .then(verifyProfileRebindCompletionBuildsSafeTarget)
+  .then(verifyRebindObservationChecksPersistedBindingTarget)
+  .then(verifyAcceptedRebindReceiptIsSecretlessAndProviderAware)
   .then(verifyStopFailureRestoresCompleteRuntimeSnapshot)
   .then(verifyComposerApiSwitchTransaction)
   .then(verifyPreferredApiSwitchModel)
+  .then(verifyProviderOnlyModelLabel)
+  .then(verifyManagedLaunchReceiptCleanupHandlesPreAcceptanceFailure)
+  .then(verifyHistorySessionDoesNotProjectStaleExternalActivity)
   .then(() => {
   console.log('session API UI assertions passed');
   }).catch((error) => {

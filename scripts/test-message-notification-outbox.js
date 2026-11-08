@@ -29,6 +29,22 @@ async function main() {
   assert.strictEqual(outbox.enqueue({ ...message, previewText: 'updated' }).alertId, id);
   assert.strictEqual(Object.keys(outbox.all()).length, 1);
 
+  const removedPending = new NotificationOutbox({ load: () => ({}), save: () => {} });
+  const retainedPendingItem = removedPending.enqueue({ ...message, assistantMessageId: 'retained-pending' });
+  const deletedPendingItem = removedPending.enqueue({ ...message, assistantMessageId: 'deleted-pending' });
+  assert.strictEqual(
+    removedPending.removeMessages(message.canonicalConversationKey, ['deleted-pending']),
+    true,
+    'authoritative deletion must cancel a matching pending notification'
+  );
+  assert.strictEqual(removedPending.get(deletedPendingItem.alertId), null);
+  assert(removedPending.get(retainedPendingItem.alertId));
+  assert.strictEqual(
+    removedPending.removeMessages(message.canonicalConversationKey, ['missing-pending']),
+    false,
+    'canceling an already absent notification should be a no-op'
+  );
+
   const beforeInApp = new NotificationOutbox({ load: () => ({}), save: () => {} });
   const beforeInAppItem = beforeInApp.enqueue({ ...message, assistantMessageId: 'before-in-app' });
   let beforeInAppSystemCalls = 0;
@@ -575,11 +591,15 @@ async function main() {
     onQuotaRecovered: () => { reclaimedQuotaRecoveries += 1; },
   });
   reclaimedQuota.enqueue({ ...message, assistantMessageId: 'quota-after-clear' });
-  assert.strictEqual(reclaimedQuotaSaves, 3);
-  assert.strictEqual(reclaimedQuotaClears, 1);
-  assert.strictEqual(reclaimedQuotaRecoveries, 1);
-  assert.strictEqual(reclaimedQuota.isPersistenceDisabled(), false);
-  assert.strictEqual(Object.keys(reclaimedQuotaStorage.items).length, 1);
+  assert.strictEqual(reclaimedQuotaSaves, 2);
+  assert.strictEqual(
+    reclaimedQuotaClears,
+    0,
+    'quota fallback must not clear durable cancellation tombstones before another write'
+  );
+  assert.strictEqual(reclaimedQuotaRecoveries, 0);
+  assert.strictEqual(reclaimedQuota.isPersistenceDisabled(), true);
+  assert.deepStrictEqual(reclaimedQuotaStorage, {});
 
   let persistentQuotaSaves = 0;
   let persistentQuotaErrors = 0;
@@ -598,17 +618,21 @@ async function main() {
   persistentQuota.enqueue({ ...message, assistantMessageId: 'persistent-quota-1' });
   assert.strictEqual(
     persistentQuotaSaves,
-    3,
-    'persistent quota errors must stop after one compacted retry and one post-clear write'
+    2,
+    'persistent quota errors must stop after one compacted retry'
   );
-  assert.strictEqual(persistentQuotaClears, 1, 'persistent quota must remove its oversized durable snapshot');
+  assert.strictEqual(
+    persistentQuotaClears,
+    0,
+    'persistent quota must preserve the existing durable snapshot'
+  );
   assert.strictEqual(persistentQuotaErrors, 0, 'quota exhaustion must not enter the ordinary error retry path');
   assert.strictEqual(persistenceDisabledCalls, 1, 'persistent quota must switch the page to memory storage once');
   assert.strictEqual(persistentQuota.isPersistenceDisabled(), true);
   persistentQuota.enqueue({ ...message, assistantMessageId: 'persistent-quota-2' });
   assert.strictEqual(
     persistentQuotaSaves,
-    3,
+    2,
     'the in-memory fallback must not create a repeated localStorage write storm'
   );
   let unelectedPresentations = 0;
@@ -647,6 +671,111 @@ async function main() {
     Object.keys(reopenedShared.all()).length,
     2,
     'a stale tab enqueue must merge durable outbox items instead of overwriting them'
+  );
+
+  let canceledDurable = {};
+  const canceledOptions = {
+    load: () => JSON.parse(JSON.stringify(canceledDurable)),
+    save: (value) => { canceledDurable = JSON.parse(JSON.stringify(value)); },
+    now: () => '2026-07-16T10:00:00.000Z',
+  };
+  const canceledProducer = new NotificationOutbox(canceledOptions);
+  const canceledItem = canceledProducer.enqueue({
+    ...message,
+    canonicalConversationKey: 'canceled-cross-tab',
+    assistantMessageId: 'deleted-cross-tab',
+  });
+  const staleCanceledTab = new NotificationOutbox(canceledOptions);
+  const cancelingTab = new NotificationOutbox(canceledOptions);
+  assert.strictEqual(
+    cancelingTab.removeMessages('canceled-cross-tab', ['deleted-cross-tab']),
+    true
+  );
+  staleCanceledTab.enqueue({
+    ...message,
+    canonicalConversationKey: 'canceled-cross-tab',
+    assistantMessageId: 'deleted-cross-tab',
+    previewText: 'stale pending revision',
+  });
+  const reopenedCanceled = new NotificationOutbox(canceledOptions);
+  assert.strictEqual(
+    reopenedCanceled.get(canceledItem.alertId),
+    null,
+    'a stale tab must not resurrect a notification canceled by authoritative reconciliation'
+  );
+  assert.strictEqual(
+    reopenedCanceled.all()[canceledItem.alertId].status,
+    'canceled',
+    'cancellation must survive as a durable remove-wins tombstone'
+  );
+
+  let cancellationRetentionStorage = {};
+  const cancellationRetention = new NotificationOutbox({
+    load: () => JSON.parse(JSON.stringify(cancellationRetentionStorage)),
+    save: (value) => { cancellationRetentionStorage = JSON.parse(JSON.stringify(value)); },
+    now: () => '2026-07-16T10:00:00.000Z',
+    presentedLimit: 0,
+    presentedRetentionMs: 0,
+    byteLimit: 1024,
+  });
+  const cancellationIds = [];
+  for (let index = 0; index < 20; index += 1) {
+    const item = cancellationRetention.enqueue({
+      ...message,
+      canonicalConversationKey: 'retained-cancellations',
+      assistantMessageId: `deleted-${index}`,
+      previewText: 'must be removed from a compact tombstone',
+    });
+    cancellationRetention.removeMessages('retained-cancellations', [`deleted-${index}`]);
+    cancellationIds.push(item.alertId);
+  }
+  const reopenedCancellationRetention = new NotificationOutbox({
+    load: () => JSON.parse(JSON.stringify(cancellationRetentionStorage)),
+    save: () => {},
+    now: () => '2026-08-27T10:00:00.000Z',
+    presentedLimit: 0,
+    presentedRetentionMs: 0,
+    byteLimit: 1024,
+  });
+  assert(
+    cancellationIds.every((alertId) => reopenedCancellationRetention.all()[alertId]?.status === 'canceled'),
+    'normal count, age, and byte pruning must never delete cancellation tombstones'
+  );
+  assert.deepStrictEqual(
+    Object.keys(reopenedCancellationRetention.all()[cancellationIds[0]]).sort(),
+    [
+      'alertId',
+      'assistantMessageId',
+      'canonicalConversationKey',
+      'revision',
+      'status',
+      'updatedAt',
+    ],
+    'cancellation tombstones must discard notification payload fields'
+  );
+
+  let quotaProtectedStorage = JSON.parse(JSON.stringify(cancellationRetentionStorage));
+  const quotaProtectedSnapshot = JSON.parse(JSON.stringify(quotaProtectedStorage));
+  let quotaProtectedClears = 0;
+  const quotaProtected = new NotificationOutbox({
+    load: () => JSON.parse(JSON.stringify(quotaProtectedStorage)),
+    save: () => { throw quotaError(); },
+    clear: () => {
+      quotaProtectedClears += 1;
+      quotaProtectedStorage = {};
+    },
+    now: () => '2026-08-27T10:00:00.000Z',
+  });
+  quotaProtected.enqueue({
+    ...message,
+    canonicalConversationKey: 'quota-protected',
+    assistantMessageId: 'new-pending',
+  });
+  assert.strictEqual(quotaProtectedClears, 0, 'quota fallback must never clear durable tombstones');
+  assert.deepStrictEqual(
+    quotaProtectedStorage,
+    quotaProtectedSnapshot,
+    'failed quota recovery must leave the last durable cancellation snapshot intact'
   );
 
   let bulkStorage = {};

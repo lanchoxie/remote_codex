@@ -107,6 +107,8 @@ const BINDING_KEYS = new Set([
   'baseUrl',
   'normalizedBaseUrl',
   'modelProviderHint',
+  'nativeResumeCompatibilityKey',
+  'nativeResumeCompatibilityFingerprint',
   'bindingFingerprint',
 ]);
 const INPUT_ITEM_KEYS = Object.freeze({

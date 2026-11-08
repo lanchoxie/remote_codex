@@ -37,6 +37,7 @@ assert.strictEqual(store.activityByRecoveryToken('h::c', 'missing-token'), null)
 const structured = store.accept('epoch-a', 'h::structured', {
   runId: 'run-structured',
   turnId: 'turn-structured',
+  clientRequestId: 'client-request-structured',
   itemId: 'item-structured',
   callId: 'call-structured',
   requestId: 'request-structured',
@@ -66,6 +67,7 @@ assert.deepStrictEqual(
   {
     callId: structured.callId,
     requestId: structured.requestId,
+    clientRequestId: structured.clientRequestId,
     itemType: structured.itemType,
     status: structured.status,
     startedAt: structured.startedAt,
@@ -87,6 +89,7 @@ assert.deepStrictEqual(
   {
     callId: 'call-structured',
     requestId: 'request-structured',
+    clientRequestId: 'client-request-structured',
     itemType: 'commandExecution',
     status: 'completed',
     startedAt: '2026-07-16T00:00:01.000Z',
@@ -147,6 +150,68 @@ assert.strictEqual(
   conflictingTimingUpdate.startedAt,
   '2026-07-16T00:00:01.000Z',
   'a later revision must not rewrite an established activity start time'
+);
+
+const terminalStore = new ActivitySnapshotStore();
+const terminalActivity = terminalStore.accept('epoch-terminal', 'h::terminal', {
+  ...base,
+  activityRevision: 2,
+  status: 'completed',
+  final: true,
+  text: 'stable completed activity',
+});
+assert.strictEqual(
+  terminalStore.accept('epoch-terminal', 'h::terminal', {
+    ...base,
+    activityRevision: 3,
+    status: 'running',
+    final: false,
+    text: 'late non-terminal diagnostic',
+  }),
+  null,
+  'a completed activity must not regress to a later non-terminal revision'
+);
+assert.strictEqual(terminalStore.snapshot('h::terminal')[0].text, terminalActivity.text);
+assert.strictEqual(
+  terminalStore.accept('epoch-terminal', 'h::terminal', {
+    ...base,
+    activityRevision: 4,
+    status: 'completed',
+    final: true,
+    text: 'refined completed activity',
+  }).text,
+  'refined completed activity',
+  'a newer terminal snapshot for the same activity may refine completed content'
+);
+
+const firstObservedStore = new ActivitySnapshotStore();
+firstObservedStore.accept('epoch-order', 'h::order', {
+  ...base,
+  itemId: 'item-z',
+  activityRevision: 1,
+  text: 'observed first',
+});
+firstObservedStore.accept('epoch-order', 'h::order', {
+  ...base,
+  itemId: 'item-a',
+  activityRevision: 1,
+  text: 'observed second',
+});
+const firstObservedBeforeUpdate = firstObservedStore.snapshot('h::order');
+firstObservedStore.accept('epoch-order', 'h::order', {
+  ...base,
+  itemId: 'item-z',
+  activityRevision: 2,
+  text: 'updated without moving',
+});
+assert.deepStrictEqual(
+  firstObservedStore.snapshot('h::order').map((entry) => entry.text),
+  ['updated without moving', 'observed second'],
+  'revisions must update a row in place without changing first-observed order'
+);
+assert.strictEqual(
+  firstObservedStore.snapshot('h::order')[0].firstObservedOrdinal,
+  firstObservedBeforeUpdate[0].firstObservedOrdinal
 );
 
 const relayRetentionStore = new ActivitySnapshotStore();
@@ -229,8 +294,8 @@ store.reset('epoch-b', 'h::c', [
 const rebuilt = store.snapshot('h::c');
 assert.deepStrictEqual(
   rebuilt.map((snapshot) => snapshot.text),
-  ['rebuilt', 'second summary', 'later turn'],
-  'snapshots should be sorted by turn, item, and summary index'
+  ['later turn', 'second summary', 'rebuilt'],
+  'snapshots should retain their first-observed order instead of reordering by protocol IDs'
 );
 assert.strictEqual(
   store.accept('epoch-b', 'h::c', { ...base, activityRevision: 1, text: 'reset duplicate' }),

@@ -197,7 +197,8 @@ function classifyCodexInstallation(input = {}, options = {}) {
   const packageRoot = verifiedPackage?.root || null;
   const npmPrefix = npmPrefixFromPackageRoot(packageRoot) || inferredPrefix;
   const expectedBinDirectory = platform === 'win32' ? npmPrefix : path.join(npmPrefix, 'bin');
-  const binOwnedByPrefix = path.resolve(path.dirname(binPath)) === path.resolve(expectedBinDirectory);
+  const binOwnedByPrefix = path.resolve(safeRealPath(path.dirname(binPath), fileSystem))
+    === path.resolve(safeRealPath(expectedBinDirectory, fileSystem));
   const realPathMatchesManifest = Boolean(
     verifiedPackage
     && (

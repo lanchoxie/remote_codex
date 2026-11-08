@@ -1,9 +1,11 @@
+const { structuredScalar, structuredText } = require('./structured-text');
+
 function makeActivityKey(value = {}) {
   return JSON.stringify([
-    String(value.canonicalConversationKey || ''),
-    String(value.runId || ''),
-    String(value.turnId || ''),
-    String(value.itemId || ''),
+    structuredScalar(value.canonicalConversationKey, ''),
+    structuredScalar(value.runId, ''),
+    structuredScalar(value.turnId, ''),
+    structuredScalar(value.itemId, ''),
     Number(value.summaryIndex || 0),
   ]);
 }
@@ -17,7 +19,7 @@ function boundedInteger(value, fallback, min, max) {
 }
 
 function truncateActivityText(value, maxBytes) {
-  const text = String(value ?? '');
+  const text = structuredText(value);
   if (Buffer.byteLength(text, 'utf8') <= maxBytes) {
     return { text, truncated: false };
   }
@@ -163,7 +165,7 @@ class ThinkingActivityAggregator {
     if (!record || record.textTruncated) return record;
     const result = this.setRecordText(
       record,
-      `${record.text}${String(delta ?? '')}`,
+      `${record.text}${structuredText(delta)}`,
       options.maxTextBytes
     );
     if (

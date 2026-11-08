@@ -91,6 +91,98 @@ async function main() {
   assert.strictEqual(splitPrefixInstall.npmCliPath, pathNpmCli);
   assert.strictEqual(splitPrefixInstall.nodeBin, pathNodeBin);
 
+  const linuxPrefix = path.join(root, 'canonical-linux-install');
+  const linuxBinDirectory = path.join(linuxPrefix, 'bin');
+  const linuxPackageRoot = path.join(linuxPrefix, 'lib', 'node_modules', '@openai', 'codex');
+  const linuxCodexEntry = path.join(linuxPackageRoot, 'bin', 'codex.js');
+  const linuxNpmCli = path.join(linuxPrefix, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const linuxNpmBin = path.join(linuxBinDirectory, 'npm');
+  const linuxNodeBin = path.join(linuxBinDirectory, 'node');
+  fs.mkdirSync(path.dirname(linuxCodexEntry), { recursive: true });
+  fs.mkdirSync(path.dirname(linuxNpmCli), { recursive: true });
+  fs.mkdirSync(linuxBinDirectory, { recursive: true });
+  fs.writeFileSync(path.join(linuxPackageRoot, 'package.json'), JSON.stringify({
+    name: '@openai/codex', version: '0.164.0', bin: { codex: 'bin/codex.js' },
+  }));
+  fs.writeFileSync(linuxCodexEntry, 'module.exports = {};\n');
+  fs.writeFileSync(path.join(linuxPrefix, 'lib', 'node_modules', 'npm', 'package.json'), JSON.stringify({
+    name: 'npm', version: '11.0.0', bin: { npm: 'bin/npm-cli.js' },
+  }));
+  fs.writeFileSync(linuxNpmCli, 'module.exports = {};\n');
+  fs.writeFileSync(linuxNpmBin, '#!/bin/sh\n');
+  fs.writeFileSync(linuxNodeBin, '');
+  for (const mountAlias of ['dm-data-alias', 'public-hpc-alias']) {
+    const aliasBinDirectory = path.join(root, mountAlias, 'bin');
+    const aliasCodexBin = path.join(aliasBinDirectory, 'codex');
+    const aliasFileSystem = {
+      ...fs,
+      realpathSync(filePath) {
+        if (path.resolve(filePath) === path.resolve(aliasBinDirectory)) return linuxBinDirectory;
+        if (path.resolve(filePath) === path.resolve(aliasCodexBin)) return linuxCodexEntry;
+        if (path.resolve(filePath) === path.resolve(linuxNpmBin)) return linuxNpmCli;
+        return fs.realpathSync(filePath);
+      },
+    };
+    const aliasedInstall = classifyCodexInstallation({
+      binPath: aliasCodexBin,
+      realPath: linuxCodexEntry,
+      explicit: true,
+      platform: 'linux',
+      envPath: linuxBinDirectory,
+      npmBin: linuxNpmBin,
+    }, { fileSystem: aliasFileSystem });
+    assert.strictEqual(aliasedInstall.source, 'npm_global', mountAlias);
+    assert.strictEqual(aliasedInstall.canAutoUpdate, true, mountAlias);
+    assert.strictEqual(aliasedInstall.npmPrefix, linuxPrefix, mountAlias);
+    assert.strictEqual(aliasedInstall.npmCliPath, linuxNpmCli, mountAlias);
+    const aliasedProbe = probeCodexInstallation({
+      codexBin: aliasCodexBin,
+      explicit: true,
+      platform: 'linux',
+      env: { PATH: linuxBinDirectory },
+      npmBin: linuxNpmBin,
+      fileSystem: aliasFileSystem,
+      spawnSync: () => ({ status: 0, stdout: 'codex-cli 0.164.0\n', stderr: '' }),
+    });
+    assert.strictEqual(aliasedProbe.canAutoUpdate, true, mountAlias);
+    let aliasUpdateInvocation = null;
+    const aliasUpdate = await updateCodexInstallation(aliasedProbe, {
+      fileSystem: aliasFileSystem,
+      env: { PATH: linuxBinDirectory },
+      spawnSync: () => ({ status: 0, stdout: 'codex-cli 0.165.0\n', stderr: '' }),
+      runProcess: async (command, args, options) => {
+        aliasUpdateInvocation = { command, args, options };
+        return { exitCode: 0, signal: null, error: null, timedOut: false, stdout: '', stderr: '' };
+      },
+    });
+    assert.strictEqual(aliasUpdateInvocation.command, linuxNodeBin, mountAlias);
+    assert.strictEqual(aliasUpdateInvocation.args[0], linuxNpmCli, mountAlias);
+    assert.strictEqual(aliasUpdateInvocation.options.env.NPM_CONFIG_PREFIX, linuxPrefix, mountAlias);
+    assert.strictEqual(aliasUpdate.installation.binPath, aliasCodexBin, mountAlias);
+    assert.strictEqual(aliasUpdate.version, '0.165.0', mountAlias);
+  }
+
+  const mismatchedAlias = classifyCodexInstallation({
+    binPath: path.join(root, 'different-mount', 'bin', 'codex'),
+    realPath: linuxCodexEntry,
+    explicit: true,
+    platform: 'linux',
+    envPath: linuxBinDirectory,
+    npmBin: linuxNpmBin,
+  }, {
+    fileSystem: {
+      ...fs,
+      realpathSync(filePath) {
+        if (path.resolve(filePath) === path.resolve(path.join(root, 'different-mount', 'bin'))) {
+          return path.join(root, 'different-install', 'bin');
+        }
+        if (path.resolve(filePath) === path.resolve(linuxNpmBin)) return linuxNpmCli;
+        return fs.realpathSync(filePath);
+      },
+    },
+  });
+  assert.strictEqual(mismatchedAlias.canAutoUpdate, false);
+
   const directPackageBinary = classifyCodexInstallation({
     binPath: path.join(codexPackageRoot, 'bin', 'codex.js'),
     realPath: path.join(codexPackageRoot, 'bin', 'codex.js'),

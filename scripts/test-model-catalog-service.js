@@ -25,6 +25,73 @@ const {
   buildApiEnvironment,
   normalizeApiConfig,
 } = require('../apps/host-agent/runtime-utils');
+const providerCapabilities = require('../apps/mobile-web/public/provider-capabilities');
+
+function testOpenAiReasoningCapabilityRegistry() {
+  const expected = {
+    'gpt-5.6': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+    'gpt-6-astra': ['low', 'medium', 'high', 'xhigh', 'max'],
+  };
+
+  for (const [modelId, levels] of Object.entries(expected)) {
+    const capability = providerCapabilities.getAdvisoryModelCapability('openai', modelId);
+    assert.ok(capability, `${modelId} must have an explicit OpenAI advisory capability`);
+    assert.deepStrictEqual(capability.reasoningLevels, levels);
+    assert.strictEqual(capability.capabilityKnown, true);
+    assert.strictEqual(capability.source, 'advisory');
+    assert.strictEqual(capability.defaultReasoningEffort, 'medium');
+  }
+
+  const decorated = providerCapabilities.decorateModels('openai', [
+    { id: 'gpt-6-astra', reasoningLevels: [], reasoningDeclared: false },
+    { id: 'gpt-6', reasoningLevels: [], reasoningDeclared: false },
+    { id: 'future-openai-model', reasoningLevels: [], reasoningDeclared: false },
+  ]);
+  assert.deepStrictEqual(decorated[0].reasoningLevels, expected['gpt-6-astra']);
+  assert.strictEqual(decorated[1].capabilityKnown, false, 'bare gpt-6 remains fail-closed until its provider declares capabilities');
+  assert.deepStrictEqual(decorated[1].reasoningLevels, []);
+  assert.strictEqual(decorated[2].capabilityKnown, false, 'unknown OpenAI IDs remain fail-closed');
+  assert.deepStrictEqual(decorated[2].reasoningLevels, []);
+
+  const middle = providerCapabilities.getAdvisoryModelCapability('openai', 'gpt-6-astra');
+  assert.strictEqual(
+    middle.reasoningLevels.includes('middle'),
+    false,
+    'middle must not be silently treated as the standard medium level'
+  );
+
+  const advisorySource = providerCapabilities.createAdvisoryOverrideSource(
+    'openai',
+    ['gpt-6-astra']
+  );
+  const merged = mergeCatalogSources([
+    source({
+      source: 'live',
+      models: [
+        { id: 'gpt-6-astra', reasoningLevels: [], reasoningDeclared: false },
+        { id: 'gpt-6', reasoningLevels: [], reasoningDeclared: false },
+      ],
+    }),
+    source({
+      source: 'provider',
+      models: [{ id: 'gpt-6-astra' }, { id: 'gpt-6' }],
+    }),
+    advisorySource,
+  ]);
+  assert.deepStrictEqual(merged.lookup('gpt-6-astra').reasoningLevels, expected['gpt-6-astra']);
+  assert.strictEqual(merged.lookup('gpt-6').capabilityKnown, false);
+  assert.throws(
+    () => merged.validate({ model: 'gpt-6', effort: 'high' }),
+    (error) => error.code === 'session_effort_unverified',
+    'bare gpt-6 must remain fail-closed without declared or verified capabilities'
+  );
+  assert.doesNotThrow(() => merged.validate({ model: 'gpt-6-astra', effort: 'xhigh' }));
+  assert.throws(
+    () => merged.validate({ model: 'gpt-6', effort: 'middle' }),
+    (error) => error.code === 'session_effort_unsupported' || error.code === 'session_effort_unverified',
+    'the non-standard middle label must remain rejected until a provider declares it'
+  );
+}
 
 function source(overrides) {
   return {
@@ -222,6 +289,7 @@ async function testApiBaseUrlDiagnostics() {
 
 async function main() {
   await testApiBaseUrlDiagnostics();
+  testOpenAiReasoningCapabilityRegistry();
   assert.strictEqual(
     normalizeCatalogError('  '),
     'The model catalog request failed without a readable error.'

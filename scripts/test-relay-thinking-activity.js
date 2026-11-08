@@ -10,6 +10,8 @@ const ROOT = path.resolve(__dirname, '..');
 const HOST_ID = 'thinking-relay-host';
 const NATIVE_ID = 'native-thinking';
 const BRIDGE_ID = 'bridge-thinking';
+const LATE_NATIVE_ID = 'native-thinking-late-alias';
+const LATE_BRIDGE_ID = 'bridge-thinking-late-alias';
 
 function openPort() {
   return new Promise((resolve, reject) => {
@@ -115,8 +117,11 @@ async function waitForFrame(stream, predicate, message) {
   throw new Error(`${message}; frames=${JSON.stringify(stream.frames)}`);
 }
 
-async function postEvents(port, events) {
-  const response = await requestJson(port, 'POST', '/api/agent/events', { events });
+async function postEvents(port, events, batchId = null) {
+  const response = await requestJson(port, 'POST', '/api/agent/events', {
+    events,
+    ...(batchId ? { batchId } : {}),
+  });
   assert.strictEqual(response.statusCode, 200, JSON.stringify(response.body));
 }
 
@@ -146,7 +151,7 @@ async function main() {
   const port = await openPort();
   assert.notStrictEqual(port, 8797);
   const output = [];
-  const relay = spawn(process.execPath, [path.join(ROOT, 'apps', 'relay', 'server.js')], {
+  let relay = spawn(process.execPath, [path.join(ROOT, 'apps', 'relay', 'server.js')], {
     cwd: ROOT,
     env: {
       ...process.env,
@@ -466,6 +471,93 @@ async function main() {
       'same-message tool diagnostics with different item IDs must both be delivered'
     );
 
+    const requestBoundDiagnosticMessage = 'same text from distinct client requests';
+    await postEvents(port, [{
+      type: 'session.diagnostic',
+      hostId: HOST_ID,
+      sessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+      runId: 'run-thinking',
+      turnId: 'turn-thinking',
+      clientRequestId: 'client-request-a',
+      severity: 'info',
+      source: 'thinking-activity-test',
+      kind: 'reasoning',
+      method: 'item/completed',
+      message: requestBoundDiagnosticMessage,
+      timestamp: '2099-03-01T00:00:07.000Z',
+    }, {
+      type: 'session.diagnostic',
+      hostId: HOST_ID,
+      sessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+      runId: 'run-thinking',
+      turnId: 'turn-thinking',
+      clientRequestId: 'client-request-b',
+      severity: 'info',
+      source: 'thinking-activity-test',
+      kind: 'reasoning',
+      method: 'item/completed',
+      message: requestBoundDiagnosticMessage,
+      timestamp: '2099-03-01T00:00:07.000Z',
+    }], 'diagnostic-client-request-identities');
+    await waitForFrame(
+      largeResetStream,
+      (frame) => frame.event === 'session.diagnostic'
+        && frame.data.clientRequestId === 'client-request-b',
+      'diagnostic clientRequestId was not preserved'
+    );
+    assert.deepStrictEqual(
+      largeResetStream.frames
+        .filter((frame) => frame.event === 'session.diagnostic'
+          && frame.data.message === requestBoundDiagnosticMessage)
+        .map((frame) => frame.data.clientRequestId)
+        .sort(),
+      ['client-request-a', 'client-request-b'],
+      'diagnostics from distinct client requests must not be compacted together'
+    );
+
+    await postEvents(port, [{
+      ...activity(LATE_BRIDGE_ID, 1, 'completed before alias discovery'),
+      runId: 'run-late-alias',
+      turnId: 'turn-late-alias',
+      clientRequestId: 'client-late-alias',
+      itemId: 'item-late-alias',
+      status: 'completed',
+      final: true,
+    }, {
+      type: 'session.discovery',
+      hostId: HOST_ID,
+      sessions: [{
+        sessionId: LATE_NATIVE_ID,
+        bridgeSessionId: LATE_BRIDGE_ID,
+        nativeThreadId: LATE_NATIVE_ID,
+        conversationKey: LATE_NATIVE_ID,
+      }],
+    }]);
+    const lateAliasSnapshot = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${LATE_BRIDGE_ID}/activities?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(lateAliasSnapshot.statusCode, 200);
+    assert.strictEqual(lateAliasSnapshot.body.activities.length, 1);
+    assert.strictEqual(
+      lateAliasSnapshot.body.activities[0].canonicalConversationKey,
+      `${HOST_ID}::${LATE_NATIVE_ID}`,
+      'a terminal activity must follow an alias established later in the same Agent request'
+    );
+
+    await postEvents(port, [{
+      ...activity(BRIDGE_ID, 6, 'completed activity survives Relay restart'),
+      conversationKey: NATIVE_ID,
+      bridgeSessionId: BRIDGE_ID,
+      nativeThreadId: NATIVE_ID,
+      clientRequestId: 'client-terminal-thinking',
+      status: 'completed',
+      final: true,
+    }]);
+
     const activitySnapshot = await requestJson(
       port,
       'GET',
@@ -473,8 +565,68 @@ async function main() {
     );
     assert.strictEqual(activitySnapshot.statusCode, 200);
     assert.strictEqual(activitySnapshot.body.activities.length, 1);
-    assert.strictEqual(activitySnapshot.body.activities[0].activityRevision, 5);
-    assert.strictEqual(activitySnapshot.body.activities[0].text, nearBudgetText);
+    assert.strictEqual(activitySnapshot.body.activities[0].activityRevision, 6);
+    assert.strictEqual(activitySnapshot.body.activities[0].text, 'completed activity survives Relay restart');
+
+    largeResetStream.close();
+    largeResetStream = null;
+    await stopChild(relay);
+    relay = spawn(process.execPath, [path.join(ROOT, 'apps', 'relay', 'server.js')], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        RELAY_STATE_ROOT: tempRoot,
+        RELAY_AUTH_DISABLED: 'true',
+        RELAY_LOCAL_AGENT_WATCHDOG_ENABLED: 'false',
+        SESSION_RESET_SSE_MAX_BYTES: '2048',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    relay.stdout.on('data', (chunk) => output.push(chunk.toString('utf8')));
+    relay.stderr.on('data', (chunk) => output.push(chunk.toString('utf8')));
+    await waitForRelay(port, relay);
+
+    const restoredActivitySnapshot = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${BRIDGE_ID}/activities?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(restoredActivitySnapshot.statusCode, 200);
+    assert.strictEqual(restoredActivitySnapshot.body.activities.length, 1);
+    assert.strictEqual(restoredActivitySnapshot.body.activities[0].activityRevision, 6);
+    assert.strictEqual(
+      restoredActivitySnapshot.body.activities[0].clientRequestId,
+      'client-terminal-thinking'
+    );
+    assert.strictEqual(restoredActivitySnapshot.body.activities[0].final, true);
+
+    const restoredLateAliasSnapshot = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${LATE_BRIDGE_ID}/activities?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(restoredLateAliasSnapshot.statusCode, 200);
+    assert.strictEqual(restoredLateAliasSnapshot.body.activities.length, 1);
+    assert.strictEqual(
+      restoredLateAliasSnapshot.body.activities[0].canonicalConversationKey,
+      `${HOST_ID}::${LATE_NATIVE_ID}`
+    );
+
+    const restoredDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${BRIDGE_ID}/detail?hostId=${HOST_ID}&diagnostics=full`
+    );
+    assert.strictEqual(restoredDetail.statusCode, 200);
+    assert.deepStrictEqual(
+      restoredDetail.body.diagnostics
+        .filter((entry) => entry.message === requestBoundDiagnosticMessage)
+        .map((entry) => entry.clientRequestId)
+        .sort(),
+      ['client-request-a', 'client-request-b'],
+      'diagnostic clientRequestId must survive Relay restart'
+    );
 
     console.log('Relay thinking activity assertions passed');
   } catch (error) {

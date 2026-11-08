@@ -381,6 +381,76 @@ function verifyStructuredOnlyEntriesSurvive() {
   assert.strictEqual(entries[0].reasoningEffort, 'high');
 }
 
+function verifyObjectValuesDoNotLeakObjectStringCoercion() {
+  const objectValue = (value) => ({ value });
+  const textValue = (value) => ({ content: value });
+  const normalized = normalizeThinkingActivityEntry(event({
+    kind: objectValue('tool-call'),
+    method: objectValue('response_item/function_call/read_file'),
+    name: objectValue('read_file'),
+    itemId: objectValue('object-item'),
+    callId: objectValue('object-call'),
+    activityKey: objectValue('object-activity'),
+    text: textValue('object text'),
+    output: textValue('object output'),
+    stdout: textValue('object stdout'),
+    stderr: textValue('object stderr'),
+    command: textValue('cat README.md'),
+    cwd: objectValue('D:/workspace'),
+    arguments: { payload: { path: 'README.md' } },
+    commandActions: [{ action: objectValue('read') }],
+    server: { name: 'workspace' },
+    tool: objectValue('read_file'),
+    namespace: objectValue('workspace'),
+    resourceUri: textValue('file:///workspace/README.md'),
+    senderThreadId: objectValue('parent-thread'),
+    receiverThreadIds: [objectValue('child-thread')],
+    agentThreadId: objectValue('agent-thread'),
+    agentPath: objectValue('/root/child'),
+    agentNickname: objectValue('child'),
+    agentRole: objectValue('worker'),
+    parentThreadId: objectValue('parent-thread'),
+    subagentKind: objectValue('worker'),
+    prompt: textValue('inspect the readme'),
+    agentsStates: { state: objectValue('running') },
+    actionData: { action: objectValue('read') },
+    model: objectValue('gpt-5.2-codex'),
+    reasoningEffort: objectValue('high'),
+    result: textValue('object result'),
+    progress: textValue('object progress'),
+    query: textValue('README.md'),
+    action: objectValue('read'),
+    status: { state: objectValue('completed') },
+    error: { message: textValue('object error') },
+    completedAt: objectValue('2026-07-21T10:00:01.000Z'),
+    fileChanges: [{
+      path: objectValue('src/object.js'),
+      status: objectValue('modified'),
+      diff: textValue('+object change'),
+    }],
+  }));
+
+  assert(!JSON.stringify(normalized).includes('[object Object]'), 'normalized object values must never stringify as [object Object]');
+  assert.strictEqual(normalized.kind, 'tool-call');
+  assert.strictEqual(normalized.method, 'response_item/function_call/read_file');
+  assert.strictEqual(normalized.callId, 'object-call');
+  assert.strictEqual(normalized.text, 'object text');
+  assert.strictEqual(normalized.output, 'object output');
+  assert.strictEqual(normalized.status, 'completed');
+  assert.strictEqual(normalized.error, 'object error');
+  assert.strictEqual(normalized.fileChanges[0].path, 'src/object.js');
+
+  const rendered = aggregateThinkingEntries([event({
+    kind: objectValue('tool-call'),
+    method: objectValue('response_item/function_call/read_file'),
+    callId: objectValue('aggregate-call'),
+    text: textValue('aggregate text'),
+    output: textValue('aggregate output'),
+    status: { state: objectValue('completed') },
+  })]);
+  assert(!JSON.stringify(rendered).includes('[object Object]'), 'aggregated object values must never stringify as [object Object]');
+}
+
 function makeFernetLikeToken() {
   const token = Buffer.alloc(73, 0);
   token[0] = 0x80;
@@ -607,6 +677,115 @@ function verifyStaleTerminalRevisionCannotRegressState() {
   assert.strictEqual(entries[0].error, 'new failure');
 }
 
+function verifyStructuredTerminalSnapshotLocksCompletedContent() {
+  const finalSnapshot = event({
+    kind: 'tool-call',
+    method: 'session.activity',
+    activityKey: 'locked-activity',
+    callId: 'locked-call',
+    source: 'codex-app-server',
+    itemType: 'mcpToolCall',
+    text: 'Authoritative final text',
+    output: 'Authoritative final output',
+    resultText: 'Authoritative final result',
+    status: 'completed',
+    progress: 'done',
+    fileChanges: [{ path: 'src/locked.js', status: 'modified', diff: '+final' }],
+    final: true,
+  });
+  const lateDiagnostic = event({
+    canonicalConversationKey: '',
+    kind: 'tool-call',
+    method: 'session.diagnostic',
+    callId: 'locked-call',
+    source: 'relay-diagnostic',
+    text: 'Late diagnostic text',
+    output: 'Late diagnostic output',
+    resultText: 'Late diagnostic result',
+    status: 'failed',
+    progress: 'retrying',
+    fileChanges: [
+      { path: 'src/locked.js', status: 'deleted', diff: '-wrong' },
+      { path: 'src/diagnostic-only.js', status: 'created', diff: '+wrong' },
+    ],
+  });
+
+  const entries = aggregateThinkingEntries([finalSnapshot, lateDiagnostic]);
+  assert.strictEqual(entries.length, 1, 'structured activity and matching diagnostic must render once');
+  assert.strictEqual(entries[0].text, 'Authoritative final text');
+  assert.strictEqual(entries[0].output, 'Authoritative final output');
+  assert.strictEqual(entries[0].resultText, 'Authoritative final result');
+  assert.strictEqual(entries[0].status, 'completed');
+  assert.strictEqual(entries[0].progress, 'done');
+  assert.deepStrictEqual(entries[0].fileChanges, [{
+    path: 'src/locked.js',
+    status: 'modified',
+    additions: null,
+    deletions: null,
+    diff: '+final',
+    truncated: false,
+  }]);
+  assert.strictEqual(entries[0].terminal, true);
+}
+
+function verifyHigherRevisionStructuredTerminalCanReplaceLockedSnapshot() {
+  const entries = aggregateThinkingEntries([
+    event({
+      kind: 'tool-call',
+      method: 'session.activity',
+      activityKey: 'revised-activity',
+      activityRevision: 2,
+      callId: 'revised-call',
+      text: 'First final text',
+      output: 'First final output',
+      status: 'completed',
+      progress: 'done',
+      fileChanges: [{ path: 'src/revised.js', status: 'modified', diff: '+first' }],
+      final: true,
+    }),
+    event({
+      kind: 'tool-call',
+      method: 'session.diagnostic',
+      callId: 'revised-call',
+      text: 'Diagnostic must not win',
+      status: 'failed',
+      final: true,
+    }),
+    event({
+      kind: 'tool-call',
+      method: 'session.activity',
+      activityKey: 'different-activity',
+      activityRevision: 99,
+      callId: 'revised-call',
+      text: 'Different activity must not replace the lock',
+      status: 'failed',
+      final: true,
+    }),
+    event({
+      kind: 'tool-call',
+      method: 'session.activity',
+      activityKey: 'revised-activity',
+      activityRevision: 3,
+      callId: 'revised-call',
+      text: 'Corrected final text',
+      output: 'Corrected final output',
+      status: 'succeeded',
+      progress: 'corrected',
+      fileChanges: [{ path: 'src/revised.js', status: 'modified', diff: '+corrected' }],
+      final: true,
+    }),
+  ]);
+
+  assert.strictEqual(entries.length, 1);
+  assert.strictEqual(entries[0].text, 'Corrected final text');
+  assert.strictEqual(entries[0].output, 'Corrected final output');
+  assert.strictEqual(entries[0].status, 'succeeded');
+  assert.strictEqual(entries[0].progress, 'corrected');
+  assert.strictEqual(entries[0].fileChanges.length, 1);
+  assert.strictEqual(entries[0].fileChanges[0].diff, '+corrected');
+  assert.strictEqual(entries[0].revision, 3);
+}
+
 function renderedContentCost(entry) {
   return [
     entry.name,
@@ -815,11 +994,14 @@ verifyFileAndSearchGrouping();
 verifyEntryAndTotalBounds();
 verifyNormalizedInputsUseCurrentOrder();
 verifyStructuredOnlyEntriesSurvive();
+verifyObjectValuesDoNotLeakObjectStringCoercion();
 verifyEncryptedCollaborationMessagesAreRedacted();
 verifyGroupKeyIsOrderIndependent();
 verifyProjectedAndUnscopedDiagnosticMerge();
 verifyExplicitScopeAndRuntimeConflictsStaySeparate();
 verifyStaleTerminalRevisionCannotRegressState();
+verifyStructuredTerminalSnapshotLocksCompletedContent();
+verifyHigherRevisionStructuredTerminalCanReplaceLockedSnapshot();
 verifySingleEntryTotalBound();
 verifyStructuredAndExplicitTruncationFlags();
 verifyTruncationFlagsAggregateAcrossLifecycleEvents();

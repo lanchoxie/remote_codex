@@ -11,6 +11,11 @@ const {
   retryTransientFileOperation,
 } = require('./atomic-file-replace');
 const {
+  attachAskpassOutcome,
+  buildWindowsAskpassCommand,
+  buildWindowsAskpassPowerShell,
+} = require('./connector-askpass');
+const {
   agentLogCommand,
   buildAgentLaunchCommand,
   buildDetachedBootstrapCommand,
@@ -55,6 +60,12 @@ const { createSkillArtifactArchive } = require('../../shared/skill-artifact');
 const { normalizePortableSkillId } = require('../../shared/skill-id');
 const { parseSkillMarkdown } = require('../../shared/skill-inventory');
 const { redactSecretText, stripSecrets } = require('../../shared/secret-redaction');
+const { structuredScalar, structuredText } = require('../../shared/structured-text');
+const {
+  classifyCodexInputCompatibilityError,
+  isModelMetadataFallbackNotice,
+  normalizeInputTypes,
+} = require('../../shared/codex-input-errors');
 const {
   ActivitySnapshotStore,
   makeActivityRecoveryToken,
@@ -66,19 +77,26 @@ const {
 } = require('../../shared/physical-path');
 const {
   OFFICIAL_OPENAI_BASE_URL,
+  assessNativeResumeCompatibility,
   bindingFingerprint,
   bindingsEqual,
   makeProfileBinding,
+  nativeResumeCompatibilityFingerprint,
   publicBinding,
 } = require('../../shared/api-binding');
 const { downloadGithubSkill, normalizeGithubSkillSource } = require('./github-skill-source');
 const { AgentEventLedger } = require('./agent-event-ledger');
 const { InputCommandOutbox } = require('./input-command-outbox');
+const { createSessionSteerOperations } = require('./session-steer-operations');
+const { createInputRequestTimer } = require('./input-request-timing');
 const { HostAgentLeaseRegistry } = require('./host-agent-lease');
 const { ModelCatalogError, ModelCatalogService } = require('./model-catalog-service');
 const { RebindCatalogReuseStore } = require('./rebind-catalog-reuse');
 const { normalizeApiConfig: normalizeRuntimeApiConfig } = require('../host-agent/runtime-utils');
 const providerCapabilities = require('../mobile-web/public/provider-capabilities');
+const {
+  assessSessionReviewAvailability,
+} = require('../mobile-web/public/session-review-guard');
 const {
   emptyNotificationState,
   ingestAssistantObservation,
@@ -89,6 +107,10 @@ const { SessionEventStream } = require('./session-event-stream');
 const { writeSseEvent } = require('./sse-writer');
 const { SessionContractError, SessionProvenanceService } = require('./session-provenance-service');
 const { SessionRecordStore } = require('./session-record-store');
+const {
+  ThinkingActivityPersistence,
+  isTerminalActivity,
+} = require('./thinking-activity-persistence');
 const { SkillAuditLog } = require('./skill-audit-log');
 const { SkillAutomationService } = require('./skill-automation-service');
 const { SkillDeploymentService } = require('./skill-deployment-service');
@@ -106,6 +128,9 @@ const SESSION_RESET_SSE_MAX_BYTES = Math.max(
 );
 const SESSION_SSE_PAYLOAD_MAX_BYTES = Math.max(512, SESSION_RESET_SSE_MAX_BYTES - 512);
 const PRIMARY_RELAY_PORT = 8797;
+const INPUT_REQUEST_TIMING_ENABLED = !/^(0|false|no|off)$/i.test(
+  String(process.env.RELAY_INPUT_TIMING_ENABLED ?? 'true').trim()
+);
 function enabledEnvironmentFlag(name, defaultValue) {
   const value = process.env[name];
   if (value == null || String(value).trim() === '') {
@@ -116,8 +141,11 @@ function enabledEnvironmentFlag(name, defaultValue) {
 
 const RUN_ID_REQUIRED_SESSION_EVENT_TYPES = new Set([
   'session.command_failed',
+  'session.command_succeeded',
   'session.interrupt_result',
+  'session.steer_result',
   'session.output',
+  'session.review_started',
   'session.runtime_updated',
   'session.selection_confirmed',
   'session.started',
@@ -194,6 +222,8 @@ const RELAY_AUTH_COOKIE_NAME = PORT === PRIMARY_RELAY_PORT
 const DEFAULT_COLLECTION_ID = 'default';
 const TRASH_COLLECTION_ID = 'trash';
 const ASKPASS_MAX_PROMPTS_PER_ACTION = 8;
+const ASKPASS_BROWSER_TIMEOUT_SECONDS = 90;
+const ASKPASS_PROCESS_TIMEOUT_GRACE_MS = 15_000;
 const MAX_JSON_BODY_BYTES = Number(process.env.RELAY_MAX_JSON_BODY_BYTES || 192 * 1024 * 1024);
 const MAX_AGENT_EVENT_BODY_BYTES = Math.max(
   1024 * 1024,
@@ -365,6 +395,10 @@ const LOCAL_AGENT_FORCE_EXIT_WAIT_MS = Math.max(
 );
 const COMMAND_QUEUE_TTL_MS = Number(process.env.RELAY_COMMAND_QUEUE_TTL_MS || 10 * 60 * 1000);
 const COMMAND_QUEUE_MAX_LENGTH = Number(process.env.RELAY_COMMAND_QUEUE_MAX_LENGTH || 1000);
+const RUNNER_RETIREMENT_ACK_TIMEOUT_MS = Math.max(
+  1000,
+  Number(process.env.RELAY_RUNNER_RETIREMENT_ACK_TIMEOUT_MS || 15_000) || 15_000
+);
 const HOST_CODEX_UPDATE_TIMEOUT_MS = Math.max(
   60_000,
   Number(process.env.HOST_CODEX_UPDATE_TIMEOUT_MS || 12 * 60 * 1000) || 12 * 60 * 1000
@@ -403,6 +437,16 @@ const HIGH_PRIORITY_COMMAND_TYPES = new Set([
   'session.steer',
   'session.request.respond',
 ]);
+// Control commands have their own Agent polling lane.  They must remain
+// separate from ordinary high-priority work (for example file chunks), since
+// a slow normal handler must never prevent Stop/Interrupt/approval delivery.
+const CONTROL_COMMAND_TYPES = new Set([
+  'host.shutdown',
+  'session.interrupt',
+  'session.steer',
+  'session.request.respond',
+  'session.stop',
+]);
 let RELAY_AUTH_TOKEN = '';
 let RELAY_CONTROL_TOKEN = '';
 let relayAuthAccount = null;
@@ -416,6 +460,14 @@ let relayOwnerMarkerWritten = false;
 const relayBackgroundTasks = new Set();
 const stopFallbackTimers = new Set();
 const pendingSessionStopFences = new Map();
+// Reconciliation can be triggered by registration, heartbeat, discovery and
+// restart at the same time.  Serialize each durable retirement intent so two
+// triggers cannot claim the same parent runner concurrently.
+const runnerRetirementEnqueueLocks = new Map();
+// A retirement command ID is reserved before its durable claim completes.
+// Keep a per-Host delivery watermark for that gap so a normal command cannot
+// advance the Host's monotonic cursor past the not-yet-enqueued Stop.
+const runnerRetirementCommandReservations = new Map();
 
 function truthyEnv(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
@@ -482,6 +534,7 @@ function rebindCatalogApiConfigFingerprint(apiConfig) {
     provider: config.provider || null,
     providerKind: config.providerKind || null,
     profileId: config.profileId || null,
+    nativeResumeCompatibilityKey: config.nativeResumeCompatibilityKey || null,
     baseUrl: config.baseUrl || null,
     apiKey: config.apiKey || null,
   })).digest('hex');
@@ -1551,6 +1604,11 @@ function normalizeStoredTranscriptEntry(entry) {
   const deliveryStatus = ['pending', 'accepted'].includes(String(entry.deliveryStatus || '').trim())
     ? String(entry.deliveryStatus).trim()
     : null;
+  const turnId = String(entry.turnId || entry.turn_id || '').trim();
+  const activityOwner = String(entry.activityOwner || entry.activity_owner || '').trim().toLowerCase();
+  const eventId = String(entry.eventId || entry.event_id || '').trim();
+  const sourceOffset = Number(entry.sourceOffset);
+  const sourceOrdinal = Number(entry.sourceOrdinal);
   return {
     timestamp: entry.timestamp || nowIso(),
     speaker,
@@ -1560,6 +1618,11 @@ function normalizeStoredTranscriptEntry(entry) {
     clientRequestId: clientRequestId || null,
     ...(deliveryStatus ? { deliveryStatus } : {}),
     files,
+    ...(turnId ? { turnId } : {}),
+    ...(activityOwner ? { activityOwner } : {}),
+    ...(eventId ? { eventId } : {}),
+    ...(Number.isSafeInteger(sourceOffset) && sourceOffset >= 0 ? { sourceOffset } : {}),
+    ...(Number.isSafeInteger(sourceOrdinal) && sourceOrdinal >= 0 ? { sourceOrdinal } : {}),
     ...(assistantMessageId ? {
       assistantMessageId,
       assistantSeq: Number.isSafeInteger(assistantSeq) && assistantSeq >= 0
@@ -1568,6 +1631,44 @@ function normalizeStoredTranscriptEntry(entry) {
       assistantAt: entry.assistantAt || null,
       notifiable: entry.notifiable === true,
     } : {}),
+  };
+}
+
+function transcriptIdentityCoordinate(entry = {}) {
+  const eventId = String(entry.eventId || entry.event_id || '').trim();
+  const sourceOffset = Number(entry.sourceOffset);
+  const sourceOrdinal = Number(entry.sourceOrdinal);
+  const source = String(entry.source || '').trim();
+  const turnId = String(entry.turnId || entry.turn_id || '').trim();
+  if (eventId) {
+    return `event:${eventId}`;
+  }
+  if (Number.isSafeInteger(sourceOffset) && sourceOffset >= 0) {
+    return `offset:${source}|${turnId}|${sourceOffset}`;
+  }
+  if (Number.isSafeInteger(sourceOrdinal) && sourceOrdinal >= 0) {
+    return `ordinal:${source}|${turnId}|${sourceOrdinal}`;
+  }
+  return '';
+}
+
+function mergeAssistantTranscriptMetadata(previous, entry, base = null) {
+  const previousSeq = Number(previous?.assistantSeq);
+  const entrySeq = Number(entry?.assistantSeq);
+  const assistantSeq = Math.max(
+    Number.isSafeInteger(previousSeq) && previousSeq >= 0 ? previousSeq : 0,
+    Number.isSafeInteger(entrySeq) && entrySeq >= 0 ? entrySeq : 0
+  );
+  const assistantAt = previous?.assistantAt || entry?.assistantAt || null;
+  return {
+    ...(previous || {}),
+    ...(entry || {}),
+    // Callers choose the authoritative content and attachment union before
+    // merging notification metadata. Do not let a late snapshot undo that.
+    ...(base || {}),
+    assistantSeq,
+    assistantAt,
+    notifiable: previous?.notifiable === true || entry?.notifiable === true,
   };
 }
 
@@ -1707,12 +1808,18 @@ function mergeAdjacentTranscriptDuplicate(previous, entry) {
     ? previous
     : (entry?.assistantMessageId || entry?.clientRequestId) ? entry : previous;
   const other = identified === entry ? previous : entry;
-  return normalizeStoredTranscriptEntry({
+  const merged = normalizeStoredTranscriptEntry({
     ...other,
     ...identified,
     files: mergeExportTranscriptFiles(previous?.files, entry?.files),
     source: identified?.source || other?.source || null,
+    turnId: identified?.turnId || other?.turnId || null,
+    activityOwner: identified?.activityOwner || other?.activityOwner || null,
   }) || identified || previous;
+  if (merged?.assistantMessageId) {
+    return mergeAssistantTranscriptMetadata(previous, entry, merged);
+  }
+  return merged;
 }
 
 function isAdjacentTranscriptDuplicate(previous, entry) {
@@ -1757,36 +1864,49 @@ function isAdjacentTranscriptDuplicate(previous, entry) {
       return true;
     }
     if (previousAssistantId && entryAssistantId) {
-      return Boolean(
-        exactContentMatch
-        && previous.source === 'codex-jsonl'
-        && entry.source === 'codex-jsonl'
-        && timeDeltaMs <= 250
-      );
+      // Two different assistant identities are two distinct messages, even
+      // when a rollout mirror happens to contain identical text.
+      return false;
     }
+    // A history/JSONL projection can arrive just before the app-server emits
+    // the same finalized answer with a durable identity.  Absorb that one
+    // unidentified mirror, but only when its content and timestamp agree;
+    // otherwise two adjacent answers must remain separate.
+    const unidentifiedSource = previousAssistantId
+      ? String(entry.source || '').trim().toLowerCase()
+      : String(previous.source || '').trim().toLowerCase();
+    const identifiedSource = previousAssistantId
+      ? String(previous.source || '').trim().toLowerCase()
+      : String(entry.source || '').trim().toLowerCase();
+    const isRolloutOrUnmarked = !unidentifiedSource || unidentifiedSource === 'codex-jsonl';
+    const isAppServerIdentity = !identifiedSource
+      || identifiedSource === 'codex-app-server'
+      || identifiedSource === 'managed';
     return Boolean(
-      timeDeltaMs <= 5000
-      && ['agent', 'assistant'].includes(String(previous.speaker || '').toLowerCase())
-      && exactContentMatch
+      exactContentMatch
+      && timeDeltaMs <= 30_000
+      && isRolloutOrUnmarked
+      && isAppServerIdentity
     );
   }
-  if (exactContentMatch) {
-    return true;
-  }
-
-  if (timeDeltaMs > 30_000) {
+  const previousTurnId = String(previous.turnId || '').trim();
+  const entryTurnId = String(entry.turnId || '').trim();
+  if (previousTurnId && entryTurnId && previousTurnId !== entryTurnId) {
     return false;
   }
-  if (previousFiles !== entryFiles) {
-    return isInlineTextFileEchoDuplicate(previous, entry);
+  const previousCoordinate = transcriptIdentityCoordinate(previous);
+  const entryCoordinate = transcriptIdentityCoordinate(entry);
+  if (previousCoordinate || entryCoordinate) {
+    return Boolean(previousCoordinate && entryCoordinate && previousCoordinate === entryCoordinate);
   }
-  if (previousText.length >= 80 && entryText.includes(previousText)) {
-    return true;
+  // Without a durable identity or event coordinate, equal/near-equal text is
+  // not enough to prove that two assistant messages are mirrors.  The one
+  // retained legacy exception is the explicit text-file echo shape, which is
+  // produced by the input projection path and carries its own wrapper.
+  if (timeDeltaMs > 30_000 || previousFiles === entryFiles) {
+    return false;
   }
-  if (entryText.length >= 80 && previousText.includes(entryText)) {
-    return true;
-  }
-  return false;
+  return isInlineTextFileEchoDuplicate(previous, entry);
 }
 
 function firstTranscriptContentLine(value) {
@@ -2288,7 +2408,7 @@ function reconcileHostCodexMaintenance(hostId, input) {
 }
 
 function boundedDiagnosticIdentity(value) {
-  const text = String(value == null ? '' : value).trim();
+  const text = structuredScalar(value, '').trim();
   return text ? redactSecretText(text).slice(0, 512) : null;
 }
 
@@ -2296,7 +2416,7 @@ function normalizeStoredSessionDiagnostic(entry) {
   if (!entry || typeof entry !== 'object') {
     return null;
   }
-  const message = redactSecretText(entry.message || '').trim();
+  const message = redactSecretText(structuredText(entry.message)).trim();
   if (!message) {
     return null;
   }
@@ -2311,12 +2431,15 @@ function normalizeStoredSessionDiagnostic(entry) {
   const itemId = boundedDiagnosticIdentity(entry.itemId || data?.itemId || data?.item_id);
   const callId = boundedDiagnosticIdentity(entry.callId || data?.callId || data?.call_id);
   const requestId = boundedDiagnosticIdentity(entry.requestId || data?.requestId || data?.request_id);
+  const clientRequestId = boundedDiagnosticIdentity(
+    entry.clientRequestId || data?.clientRequestId || data?.client_request_id
+  );
   return {
     timestamp: entry.timestamp || nowIso(),
-    severity: entry.severity || 'info',
-    source: entry.source || 'codex',
-    kind: entry.kind || 'event',
-    method: entry.method ? redactSecretText(entry.method) : null,
+    severity: structuredScalar(entry.severity, 'info'),
+    source: structuredScalar(entry.source, 'codex'),
+    kind: structuredScalar(entry.kind, 'event'),
+    method: entry.method ? redactSecretText(structuredText(entry.method)) : null,
     message,
     detail,
     data,
@@ -2325,6 +2448,7 @@ function normalizeStoredSessionDiagnostic(entry) {
     itemId,
     callId,
     requestId,
+    clientRequestId,
     status: boundedDiagnosticIdentity(entry.status || data?.status),
     final: entry.final === true,
   };
@@ -2541,7 +2665,47 @@ async function flushSessionDiagnosticsSave() {
   return null;
 }
 
-async function flushAgentEventBatchPersistence() {
+function collectTerminalThinkingActivity(context, canonicalKey, snapshot) {
+  if (!context?.thinkingActivities || !canonicalKey || !isTerminalActivity(snapshot)) {
+    return false;
+  }
+  const activities = context.thinkingActivities.get(canonicalKey) || [];
+  activities.push(stripSecrets(snapshot));
+  context.thinkingActivities.set(canonicalKey, activities);
+  return true;
+}
+
+function canonicalIdentityFromKey(canonicalKeyValue) {
+  const canonicalKey = String(canonicalKeyValue || '').trim();
+  const separator = canonicalKey.indexOf('::');
+  if (separator <= 0 || separator >= canonicalKey.length - 2) return null;
+  return {
+    hostId: canonicalKey.slice(0, separator),
+    conversationKey: canonicalKey.slice(separator + 2),
+  };
+}
+
+async function flushThinkingActivityPersistence(context) {
+  const pending = context?.thinkingActivities;
+  if (!pending?.size || !state.thinkingActivityPersistence) return;
+  const grouped = new Map();
+  for (const [canonicalKey, snapshots] of pending) {
+    const identity = canonicalIdentityFromKey(canonicalKey);
+    const currentCanonicalKey = identity
+      ? state.sessionRecordStore?.resolveCanonicalKey(identity) || canonicalKey
+      : canonicalKey;
+    const current = grouped.get(currentCanonicalKey) || [];
+    current.push(...snapshots);
+    grouped.set(currentCanonicalKey, current);
+  }
+  for (const [canonicalKey, snapshots] of grouped) {
+    await state.thinkingActivityPersistence.persistMany(canonicalKey, snapshots);
+  }
+  pending.clear();
+}
+
+async function flushAgentEventBatchPersistence(context) {
+  await flushThinkingActivityPersistence(context);
   await flushSessionLogsSave();
   await flushSessionDiagnosticsSave();
   if (sessionDiagnosticsSaveError) {
@@ -2568,6 +2732,7 @@ const state = {
   sessions: new Map(),
   sessionAliases: new Map(),
   commandQueues: new Map(),
+  commandDeliveryCursors: new Map(),
   subscribers: new Map(),
   sessionEventStream: new SessionEventStream({
     epoch: RELAY_INSTANCE_ID,
@@ -2578,9 +2743,19 @@ const state = {
   sessionLogs: new Map(),
   sessionAlerts: new Map(),
   sessionRuntime: new Map(),
+  // Tail-derived external activity is an auxiliary projection.  Keep a
+  // per-session monotonic receipt sequence so a delayed JSONL observation
+  // cannot replace a newer Turn merely because it arrived later.
+  externalActivityReceiptRevisions: new Map(),
   sessionDiagnostics: new Map(),
   sessionRequests: new Map(),
+  // An approval claim is an in-memory compare-and-release fence.  It is
+  // intentionally separate from the request payload so a failed command
+  // enqueue can return the request to `pending` without overwriting a later
+  // authoritative resolution event.
+  sessionRequestClaimTokens: new Map(),
   pendingDirectoryRequests: new Map(),
+  pendingTerminalOpenRequests: new Map(),
   pendingHostProbes: new Map(),
   pendingCodexUpdateRequests: new Map(),
   pendingApiTestRequests: new Map(),
@@ -2604,6 +2779,9 @@ const state = {
   inputRequestCache: new Map(),
   pendingInputProjectionCheckpoints: new Map(),
   inputCommandOutbox,
+  sessionSteerOperations: createSessionSteerOperations({
+    limit: Math.max(128, Math.min(16_384, Number(process.env.SESSION_STEER_OPERATION_LIMIT || 4096) || 4096)),
+  }),
   agentEventLedger,
   appliedAgentEventBatches: agentEventLedger.applied,
   partialAgentEventBatches: agentEventLedger.partial,
@@ -2629,6 +2807,7 @@ const state = {
   skillAudit: null,
   skillAutomation: null,
   sessionRecordStore: null,
+  thinkingActivityPersistence: null,
   provenance: null,
   modelCatalog: null,
   sessionMetadata: new Map(),
@@ -2797,10 +2976,18 @@ function readBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
     let totalBytes = 0;
     let rejected = false;
     const declaredBytes = Number(req.headers?.['content-length'] || 0);
-    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+    const rejectOversized = (receivedBytes) => {
       rejected = true;
-      reject(new Error(`request body too large; limit is ${maxBytes} bytes`));
-      req.destroy();
+      const error = new Error(`request body too large; limit is ${maxBytes} bytes`);
+      error.code = 'request_body_too_large';
+      error.statusCode = 413;
+      error.limitBytes = maxBytes;
+      error.receivedBytes = receivedBytes;
+      reject(error);
+      req.resume();
+    };
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+      rejectOversized(declaredBytes);
       return;
     }
     req.on('data', (chunk) => {
@@ -2810,9 +2997,7 @@ function readBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
       chunks.push(chunk);
       totalBytes += chunk.length;
       if (totalBytes > maxBytes) {
-        rejected = true;
-        reject(new Error(`request body too large; limit is ${maxBytes} bytes`));
-        req.destroy();
+        rejectOversized(totalBytes);
       }
     });
     req.on('end', () => {
@@ -3080,6 +3265,7 @@ function managedLaunchRequestFingerprint(input = {}) {
     apiConfigFingerprint: rebindCatalogApiConfigFingerprint(apiConfig),
     apiProfile: apiConfig ? {
       profileId: String(apiConfig.profileId || '').trim() || null,
+      nativeResumeCompatibilityKey: String(apiConfig.nativeResumeCompatibilityKey || '').trim().toLowerCase() || null,
       providerKind: String(apiConfig.providerKind || '').trim().toLowerCase() || null,
       provider: String(apiConfig.provider || '').trim().toLowerCase() || null,
       baseUrl: String(apiConfig.baseUrl || '').trim().replace(/\/+$/, '') || null,
@@ -3093,6 +3279,29 @@ function managedLaunchRequestFingerprint(input = {}) {
     label: String(body.label || '').trim(),
     command: body.command == null ? null : body.command,
     args: Array.isArray(body.args) ? body.args : [],
+  })).digest('hex');
+}
+
+function managedRebindRequestFingerprint(input = {}) {
+  const body = input.body || {};
+  // Rebind changes its own source record. Fingerprint submitted intent, not
+  // defaults derived from the replacement's readiness or native identity.
+  const requestFingerprint = managedLaunchRequestFingerprint({
+    ...input,
+    launchMode: 'rebind',
+    cwd: body.cwd,
+    conversationKey: body.conversationKey,
+    originSessionId: body.originSessionId,
+    nativeThreadId: body.nativeThreadId,
+  });
+  return crypto.createHash('sha256').update(JSON.stringify({
+    requestFingerprint,
+    expectedRunId: String(body.expectedRunId || '').trim() || null,
+    expectedRunStatus: Object.prototype.hasOwnProperty.call(body, 'expectedRunStatus')
+      ? String(body.expectedRunStatus || '').trim() : null,
+    expectedBindingFingerprint: Object.prototype.hasOwnProperty.call(body, 'expectedBindingFingerprint')
+      ? String(body.expectedBindingFingerprint || '').trim() : null,
+    requireIdle: body.requireIdle === true,
   })).digest('hex');
 }
 
@@ -7254,9 +7463,27 @@ async function assignAssistantObservations(hostId, input = {}, observations = []
   if (!identity.sessionId && !identity.nativeThreadId && !identity.bridgeSessionId) {
     throw new TypeError('Assistant observation requires a Session identity');
   }
-  const values = (Array.isArray(observations) ? observations : [observations])
+  const candidateValues = (Array.isArray(observations) ? observations : [observations])
     .filter((observation) => observation && typeof observation === 'object');
+  const observationSource = cursor
+    ? 'codex-jsonl'
+    : String(input.assistantObservationSource || input.source || '').trim().toLowerCase();
   const currentRecord = state.sessionRecordStore.readRecord(identity);
+  // Cursor observations are a secondary view of the rollout file. A durable
+  // managed app-server run owns that file while it is pending/live, so only
+  // the cursor position may be recorded; assistant identities must wait for
+  // the authoritative app-server transcript (or an explicitly external
+  // terminal observation). Re-evaluate this at the transaction boundary too,
+  // because a Stop/Rebind can change ownership between the initial read and
+  // the WAL commit.
+  const cursorTargetsManaged = cursorTargetsManagedAppServer(
+    hostId,
+    input,
+    cursor,
+    currentRecord,
+    state.hosts.get(hostId)
+  );
+  const values = cursorTargetsManaged ? [] : candidateValues;
   const cursorNeedsMutation = assistantCursorNeedsMutation(currentRecord, cursor);
   if (!values.length && !cursor) {
     return {
@@ -7266,7 +7493,11 @@ async function assignAssistantObservations(hostId, input = {}, observations = []
       changed: false,
     };
   }
-  if (!values.length && !cursorNeedsMutation) {
+  // Even when the first ownership probe suppressed the candidate values, keep
+  // a transaction in flight while observations exist. A concurrent Stop may
+  // release the cursor before the WAL boundary; the transaction then needs to
+  // ingest the original candidates (see valuesForTransaction below).
+  if (!values.length && !cursorNeedsMutation && !candidateValues.length) {
     return {
       canonicalKey: resolveCanonicalConversationKey(hostId, identity),
       entries: [],
@@ -7280,16 +7511,24 @@ async function assignAssistantObservations(hostId, input = {}, observations = []
     (tx) => {
       const canonicalKey = tx.resolveCanonicalKey(identity);
       let record = tx.getRecord(canonicalKey);
+      const transactionOwnsCursor = cursor
+        && recordOwnsManagedAppServer(record, state.hosts.get(hostId), input);
+      // Re-evaluate ownership at the WAL boundary. If the initial read saw a
+      // managed run but a concurrent Stop released it before this transaction,
+      // retain the original cursor observations instead of committing an empty
+      // batch and permanently losing the assistant messages.
+      const valuesForTransaction = transactionOwnsCursor ? [] : candidateValues;
       const baselineAt = record?.notification?.migrationBaselineAt
         || record?.updatedAt
-        || values[0]?.firstObservedAt
+        || valuesForTransaction[0]?.firstObservedAt
         || nowIso();
       const entries = [];
-      for (const observation of values) {
+      for (const observation of valuesForTransaction) {
         const result = ingestAssistantObservation(tx, {
           canonicalKey,
           lineageKey: `${hostId}::${input.sessionId || input.nativeThreadId || input.bridgeSessionId}`,
           observation,
+          source: observationSource,
           baselineAt,
         });
         record = tx.getRecord(canonicalKey);
@@ -7318,6 +7557,7 @@ async function assignAssistantObservations(hostId, input = {}, observations = []
         canonicalKey,
         entries,
         changed: cursorChanged || entries.some((entry) => entry.created || entry.updated),
+        observationsSuppressed: transactionOwnsCursor === true,
       };
     }
   );
@@ -7332,30 +7572,231 @@ function sessionOwnershipIdentityValues(session = {}) {
     session.sessionId,
     session.bridgeSessionId,
     session.nativeThreadId,
+    session.conversationKey,
   ]
     .map((value) => String(value || '').trim())
     .filter(Boolean);
 }
 
+function normalizedRuntimeKind(value) {
+  if (!value || typeof value !== 'object') return '';
+  const raw = value.adapterId
+    || value.kind
+    || value.runtimeKind
+    || value.runtimeId
+    || value.runtime?.adapterId
+    || value.runtime?.kind
+    || value.runtime?.runtimeKind
+    || '';
+  return String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+}
+
+function discoverySessionUsesManagedAppServer(session) {
+  return Boolean(
+    session
+    && session.source === 'managed'
+    && session.live === true
+    && normalizedRuntimeKind(session.runtime) === 'codex-app-server'
+  );
+}
+
+function discoveryRecordMatchesIdentities(record, canonicalKey, hostId, identities) {
+  if (!record || record.hostId !== hostId) return false;
+  const prefix = `${hostId}::`;
+  const canonicalIdentity = String(canonicalKey || '').startsWith(prefix)
+    ? String(canonicalKey).slice(prefix.length)
+    : '';
+  const recordIdentities = [
+    canonicalIdentity,
+    record.conversationKey,
+    record.sessionId,
+    record.bridgeSessionId,
+    record.nativeThreadId,
+    record.rolloutSessionId,
+    ...(Array.isArray(record.rolloutSessionIds) ? record.rolloutSessionIds : []),
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  const candidateSet = new Set(
+    identities.map((value) => String(value || '').trim()).filter(Boolean)
+  );
+  return recordIdentities.some((value) => candidateSet.has(value));
+}
+
+function durableDiscoveryRecords(hostId, session, fallbackRecord = null) {
+  const identities = sessionOwnershipIdentityValues(session);
+  if (!hostId || !identities.length) return [];
+  const records = [];
+  const seen = new Set();
+  const add = (record, canonicalKey = '') => {
+    if (!record || !discoveryRecordMatchesIdentities(record, canonicalKey, hostId, identities)) {
+      return false;
+    }
+    const key = String(canonicalKey || record.canonicalKey || [
+      record.hostId,
+      record.conversationKey,
+      record.nativeThreadId,
+      record.bridgeSessionId,
+    ].find(Boolean) || '').trim();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    records.push(record);
+    return true;
+  };
+
+  // The direct lookup normally follows durable aliases. Keep a fallback
+  // snapshot scan for the short Relay-restart window where an identity was
+  // observed before its alias was rebuilt in memory.
+  try {
+    const direct = state.provenance?.getSessionRecord(
+      sessionIdentity(hostId, session)
+    );
+    const directKey = state.sessionRecordStore?.resolveCanonicalKey?.(
+      sessionIdentity(hostId, session)
+    ) || '';
+    if (add(direct, directKey)) {
+      // The alias-resolved record is authoritative. Avoid cloning and scanning
+      // the entire durable snapshot for every history row in a discovery batch.
+      return records;
+    }
+  } catch (_) {
+    // A read-only ownership probe must never make discovery fail closed by
+    // throwing. The snapshot fallback below remains conservative.
+  }
+  if (add(fallbackRecord, '')) {
+    return records;
+  }
+  try {
+    const matches = state.sessionRecordStore?.readDiscoveryIdentityMatches(hostId, identities) || [];
+    for (const { canonicalKey, record } of matches) {
+      add(record, canonicalKey);
+    }
+  } catch (_) {
+    // Keep the identity probe best-effort; no record means no suppression.
+  }
+  return records;
+}
+
+function recordOwnsManagedAppServer(record, host, session = {}) {
+  if (!record || record.source !== 'managed') return false;
+  const activeRunId = String(record.activeRunId || '').trim();
+  const activeRun = activeRunId ? record.runs?.[activeRunId] || null : null;
+  if (!activeRun || !['pending', 'live'].includes(String(activeRun.status || '').trim().toLowerCase())) {
+    return false;
+  }
+
+  const projected = getSession(record.hostId, session.sessionId)
+    || findManagedLiveSessionByIdentities(record.hostId, sessionOwnershipIdentityValues(session));
+  const runtimeCandidates = [
+    session.runtime,
+    projected?.runtime,
+    state.sessionRuntime.get(sessionKey(record.hostId, projected?.sessionId || session.sessionId)),
+    activeRun.runtime,
+    record.runtime,
+  ];
+  if (runtimeCandidates.some((candidate) => normalizedRuntimeKind(candidate) === 'codex-app-server')) {
+    return true;
+  }
+
+  // A managed run with a durable binding is created only for the managed
+  // app-server path. This survives Relay restarts even when the in-memory
+  // runtime/identity projection has not been rehydrated yet.
+  return Boolean(
+    activeRun.apiBinding?.bindingFingerprint
+    && (
+      host?.capabilities?.runApiBinding === true
+      || activeRun.launchMode
+      || record.source === 'managed'
+    )
+  );
+}
+
+function cursorTargetsManagedAppServer(hostId, session, cursor, fallbackRecord = null, host = null) {
+  if (!cursor || typeof cursor !== 'object') return false;
+  const normalizedHost = host || state.hosts.get(hostId) || null;
+  return durableDiscoveryRecords(hostId, session, fallbackRecord)
+    .some((record) => recordOwnsManagedAppServer(record, normalizedHost, session));
+}
+
 function findManagedLiveSessionByIdentities(hostId, identities = []) {
-  const candidates = new Set(
-    identities
+  if (!hostId) {
+    return null;
+  }
+
+  // Callers that only have a flattened identity list retain the historical
+  // lookup semantics. Lifecycle upserts pass the source object instead so we
+  // can distinguish concrete runner IDs from inherited lineage metadata.
+  const identityObject = !Array.isArray(identities)
+    && identities
+    && typeof identities === 'object'
+    ? identities
+    : null;
+  const candidateValues = new Set(
+    (Array.isArray(identities) ? identities : sessionOwnershipIdentityValues(identities))
       .map((value) => String(value || '').trim())
       .filter(Boolean)
   );
-  if (!hostId || !candidates.size) {
+  if (!candidateValues.size) {
     return null;
   }
-  for (const session of state.sessions.values()) {
-    if (session.hostId !== hostId || session.source !== 'managed' || !session.live) {
-      continue;
-    }
-    const values = sessionOwnershipIdentityValues(session);
-    if (values.some((value) => candidates.has(value))) {
-      return session;
-    }
+
+  const liveSessions = Array.from(state.sessions.values()).filter((session) => (
+    session.hostId === hostId
+      && session.source === 'managed'
+      && session.live === true
+  ));
+  if (!identityObject) {
+    return liveSessions.find((session) => (
+      sessionOwnershipIdentityValues(session).some((value) => candidateValues.has(value))
+    )) || null;
   }
-  return null;
+
+  const concreteValues = [
+    identityObject.sessionId,
+    identityObject.bridgeSessionId,
+    identityObject.nativeThreadId,
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+  const lineageValues = [
+    identityObject.conversationKey,
+    identityObject.originSessionId,
+    identityObject.sourceSessionId,
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+
+  // Concrete IDs identify a runner. Prefer an exact overlap before looking at
+  // lineage, because a parent and a fork child intentionally share origin and
+  // conversation fields while owning different native processes.
+  const exact = liveSessions.find((session) => {
+    const sessionConcreteValues = [
+      session.sessionId,
+      session.bridgeSessionId,
+      session.nativeThreadId,
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    return concreteValues.some((value) => sessionConcreteValues.includes(value));
+  });
+  if (exact) {
+    return exact;
+  }
+
+  // A lineage/conversation fallback is safe only when one side has no
+  // concrete runner identity. If both sides have concrete IDs and they do not
+  // overlap, matching by inherited conversationKey would alias an unrelated
+  // fork/fallback child into its parent.
+  return liveSessions.find((session) => {
+    const sessionConcreteValues = [
+      session.sessionId,
+      session.bridgeSessionId,
+      session.nativeThreadId,
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    if (concreteValues.length && sessionConcreteValues.length) {
+      return false;
+    }
+    const sessionLineageValues = [
+      session.conversationKey,
+      session.originSessionId,
+      session.sourceSessionId,
+    ].map((value) => String(value || '').trim()).filter(Boolean);
+    return lineageValues.some((value) => sessionLineageValues.includes(value));
+  }) || null;
 }
 
 function getSession(hostId, sessionId) {
@@ -7493,6 +7934,7 @@ function diagnosticIdentitySignature(entry) {
   return [
     entry?.runId || entry?.data?.runId || '',
     entry?.turnId || entry?.data?.turnId || '',
+    entry?.clientRequestId || entry?.data?.clientRequestId || entry?.data?.client_request_id || '',
     entry?.itemId || entry?.data?.itemId || entry?.data?.item_id || '',
     entry?.callId || entry?.data?.callId || entry?.data?.call_id || '',
     entry?.requestId || entry?.data?.requestId || entry?.data?.request_id || '',
@@ -7613,31 +8055,9 @@ function mergeExportTranscriptEntries(entries) {
       .filter(Boolean)
   )) {
     const previous = merged[merged.length - 1];
-    if (previous && previous.speaker === entry.speaker) {
-      const previousText = canonicalTranscriptText(previous.text);
-      const entryText = canonicalTranscriptText(entry.text);
-      const previousTime = Date.parse(previous.timestamp || '');
-      const entryTime = Date.parse(entry.timestamp || '');
-      const near = Number.isFinite(previousTime) && Number.isFinite(entryTime) && Math.abs(entryTime - previousTime) <= 30000;
-      if (
-        near
-        && previousText
-        && entryText
-        && (
-          previousText === entryText
-          || previousText.includes(entryText)
-          || entryText.includes(previousText)
-        )
-      ) {
-        if (entryText.length > previousText.length) {
-          previous.text = entry.text;
-        }
-        previous.files = mergeExportTranscriptFiles(previous.files, entry.files);
-        if (!previous.stream && entry.stream) {
-          previous.stream = entry.stream;
-        }
-        continue;
-      }
+    if (isAdjacentTranscriptDuplicate(previous, entry)) {
+      merged[merged.length - 1] = mergeAdjacentTranscriptDuplicate(previous, entry);
+      continue;
     }
     merged.push({
       ...entry,
@@ -7941,6 +8361,22 @@ function sessionExportTitle(session) {
   const cwd = exportLineValue(session?.cwd || '(unknown path)', '(unknown path)');
   const sessionId = exportLineValue(session?.sessionId || 'unknown-session', 'unknown-session');
   return `${cwd} | ${sessionId}`;
+}
+
+function getSessionExportAvailabilityError(detail) {
+  const reason = String(detail?.remoteDetail?.error || '').trim();
+  if (!reason) {
+    return null;
+  }
+  return {
+    statusCode: 502,
+    payload: {
+      ok: false,
+      code: 'session_history_unavailable',
+      error: 'Session history could not be loaded from the Host, so the export/import was not started.',
+      detail: reason,
+    },
+  };
 }
 
 function formatExportEntry(entry) {
@@ -8805,7 +9241,14 @@ function transcriptFingerprint(entry) {
   if (entry.clientRequestId) {
     return `request|${entry.speaker || 'system'}|${entry.clientRequestId}`;
   }
-  return `${entry.speaker || 'system'}|${entry.timestamp || ''}|${canonicalTranscriptText(entry.text || '')}|${(entry.files || []).map((file) => file.path || file.name || '').join(',')}`;
+  return [
+    entry.speaker || 'system',
+    entry.turnId || '',
+    transcriptIdentityCoordinate(entry),
+    entry.timestamp || '',
+    canonicalTranscriptText(entry.text || ''),
+    (entry.files || []).map((file) => file.path || file.name || '').join(','),
+  ].join('|');
 }
 
 function diagnosticFingerprint(entry) {
@@ -8843,6 +9286,7 @@ function setSessionDiagnostics(hostId, sessionId, entries, options = {}) {
 
 function mergeByFingerprint(entries, fingerprint, limit) {
   const seen = new Set();
+  const indexes = new Map();
   const merged = [];
   for (const entry of entries || []) {
     if (!entry) {
@@ -8850,9 +9294,19 @@ function mergeByFingerprint(entries, fingerprint, limit) {
     }
     const key = fingerprint(entry);
     if (seen.has(key)) {
+      const existingIndex = indexes.get(key);
+      const existing = Number.isSafeInteger(existingIndex) ? merged[existingIndex] : null;
+      if (
+        existing?.assistantMessageId
+        && entry?.assistantMessageId
+        && existing.assistantMessageId === entry.assistantMessageId
+      ) {
+        merged[existingIndex] = mergeAssistantTranscriptMetadata(existing, entry, existing);
+      }
       continue;
     }
     seen.add(key);
+    indexes.set(key, merged.length);
     merged.push(entry);
   }
   return sortTranscriptEntries(merged).slice(-limit);
@@ -8883,6 +9337,71 @@ function runtimePatchHasStaleRevision(existing, incoming) {
   );
 }
 
+function externalActivityTimestampMs(activity = {}, event = null) {
+  const values = [activity.updatedAt, event?.timestamp];
+  for (const value of values) {
+    const parsed = Date.parse(String(value || ''));
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
+function externalActivityReceiptRevision(key, runtime = {}) {
+  const stored = Number(runtime?.externalActivityRevision || 0);
+  const observed = Number(state.externalActivityReceiptRevisions.get(key) || 0);
+  return Math.max(
+    Number.isSafeInteger(stored) && stored > 0 ? stored : 0,
+    Number.isSafeInteger(observed) && observed > 0 ? observed : 0
+  );
+}
+
+function nextExternalActivityReceiptRevision(key, runtime = {}) {
+  const next = externalActivityReceiptRevision(key, runtime) + 1;
+  state.externalActivityReceiptRevisions.set(key, next);
+  return next;
+}
+
+function shouldAcceptExternalActivityObservation(key, existingRuntime, observed, event) {
+  const current = existingRuntime?.externalActivity;
+  if (!current || typeof current !== 'object') {
+    return true;
+  }
+  const incomingTurnId = String(observed?.turnId || '').trim() || null;
+  const currentTurnId = String(current.turnId || '').trim() || null;
+  const incomingActive = observed?.active === true;
+  const currentActive = current.active === true;
+  const incomingTimestamp = externalActivityTimestampMs(observed, event);
+  const currentTimestamp = externalActivityTimestampMs(current);
+  const currentRevision = externalActivityReceiptRevision(key, existingRuntime);
+
+  // A terminal observation is guarded by exact Turn identity below.  For an
+  // active observation, a different currently-active Turn may only be
+  // replaced by a chronologically newer observation.  This is the critical
+  // late-batch guard: arrival order is not transcript order.
+  if (incomingActive && currentActive && incomingTurnId !== currentTurnId) {
+    if (incomingTimestamp && currentTimestamp) {
+      return incomingTimestamp >= currentTimestamp;
+    }
+    // Un-timestamped legacy observations cannot prove that they are newer.
+    // Keep the current active Turn rather than reviving an ambiguous one.
+    return false;
+  }
+
+  // Once a Turn has been settled, do not let an older or un-timestamped tail
+  // row resurrect it.  A first legacy observation is still accepted when no
+  // timestamp/revision exists at all.
+  if (incomingActive && !currentActive) {
+    if (incomingTimestamp && currentTimestamp) {
+      return incomingTimestamp >= currentTimestamp;
+    }
+    return currentRevision === 0 && !currentTimestamp;
+  }
+
+  return true;
+}
+
 function setSessionRuntime(hostId, sessionId, runtime, options = {}) {
   const key = resolveSessionKey(hostId, sessionId);
   if (!runtime || typeof runtime !== 'object') {
@@ -8899,12 +9418,19 @@ function setSessionRuntime(hostId, sessionId, runtime, options = {}) {
     ...runtime,
     updatedAt: runtime.updatedAt || nowIso(),
   };
-  const incomingPhase = String(runtime.phase || '').trim().toLowerCase();
-  if (
-    ['idle', 'error', 'interrupted', 'closed', 'quota-exhausted'].includes(incomingPhase)
-    && runtime.activeTurnId == null
+  const ownsPhase = Object.prototype.hasOwnProperty.call(runtime, 'phase');
+  const ownsBusy = Object.prototype.hasOwnProperty.call(runtime, 'busy');
+  const incomingPhase = ownsPhase
+    ? String(runtime.phase || '').trim().toLowerCase()
+    : '';
+  const explicitTerminalProjection = ownsPhase
+    && ownsBusy
     && runtime.busy === false
-  ) {
+    && ['idle', 'error', 'interrupted', 'closed', 'quota-exhausted'].includes(incomingPhase);
+  if (explicitTerminalProjection) {
+    next.activeTurnId = null;
+    next.waitingOnApproval = false;
+    next.waitingOnUserInput = false;
     next.queuedCommandId = null;
     next.pendingClientRequestId = null;
     next.queuedInputAt = null;
@@ -8912,6 +9438,20 @@ function setSessionRuntime(hostId, sessionId, runtime, options = {}) {
     next.preparingClientRequestId = null;
     next.preparingInputAt = null;
     next.inputPreparationExpiresAt = null;
+    next.terminalReconciliation = null;
+    const incomingTurnStatus = String(runtime.currentTurnStatus || '').trim().toLowerCase();
+    if (
+      !Object.prototype.hasOwnProperty.call(runtime, 'currentTurnStatus')
+      || ['inprogress', 'in_progress', 'running', 'started', 'interrupting', 'settling', 'unknown'].includes(incomingTurnStatus)
+    ) {
+      next.currentTurnStatus = incomingPhase === 'interrupted'
+        ? 'interrupted'
+        : incomingPhase === 'closed'
+          ? 'closed'
+          : ['error', 'quota-exhausted'].includes(incomingPhase)
+            ? 'failed'
+            : 'idle';
+    }
   }
   state.sessionRuntime.set(key, next);
   return next;
@@ -8961,7 +9501,9 @@ function projectManagedStartFailure(hostId, sessionId, runId, failedRecord, deta
       error: message,
       stage: details.stage || 'start',
       canRebind: Boolean(details.canRebind),
-      canTranscriptFallback: sessionCanTranscriptFallback(hostId, effectiveSessionId),
+      ...resumeErrorFallbackFlags(hostId, effectiveSessionId, code, {
+        allowTranscriptFallback: false,
+      }),
     },
     lastUpdatedAt: timestamp,
   }, {
@@ -9020,6 +9562,7 @@ function projectTerminalManagedStartFailure(hostId, sessionId, runId, details = 
     queuedCommandId: null,
     pendingClientRequestId: null,
     pendingInputSummary: null,
+    externalActivity: null,
     runId,
     updatedAt: timestamp,
   };
@@ -9036,7 +9579,7 @@ function projectTerminalManagedStartFailure(hostId, sessionId, runId, details = 
       error: message,
       stage: 'start',
       canRebind: Boolean(details.canRebind),
-      canTranscriptFallback: sessionCanTranscriptFallback(hostId, effectiveSessionId),
+      ...resumeErrorFallbackFlags(hostId, effectiveSessionId, code),
     },
     lastUpdatedAt: timestamp,
   }, { preserveManagedLive: false });
@@ -9076,6 +9619,10 @@ function appendSessionDiagnostic(hostId, sessionId, entry) {
     itemId: entry.itemId || entry.data?.itemId || null,
     callId: entry.callId || entry.data?.callId || null,
     requestId: entry.requestId || entry.data?.requestId || null,
+    clientRequestId: entry.clientRequestId
+      || entry.data?.clientRequestId
+      || entry.data?.client_request_id
+      || null,
     status: entry.status || entry.data?.status || null,
     final: entry.final === true,
   });
@@ -9189,6 +9736,10 @@ function findSessionRequest(hostId, sessionId, requestId) {
   return { effectiveSessionId, request };
 }
 
+function sessionRequestClaimKey(hostId, sessionId, requestId) {
+  return `${sessionKey(hostId, resolveSessionId(hostId, sessionId))}::request:${String(requestId || '').trim()}`;
+}
+
 function claimSessionRequestResponse(hostId, sessionId, requestId, response, options = {}) {
   const { effectiveSessionId, request } = findSessionRequest(hostId, sessionId, requestId);
   if (!request) {
@@ -9205,15 +9756,27 @@ function claimSessionRequestResponse(hostId, sessionId, requestId, response, opt
   const requestRunId = String(request.runId || '').trim();
   const currentRunId = String(session?.runId || '').trim();
   const submittedRunId = String(options.runId || '').trim();
+  const authoritativeRunId = requestRunId || submittedRunId || currentRunId || null;
   if (
     (submittedRunId && requestRunId && submittedRunId !== requestRunId)
     || (requestRunId && currentRunId && requestRunId !== currentRunId)
+    || (!requestRunId && submittedRunId && currentRunId && submittedRunId !== currentRunId)
   ) {
     return {
       ok: false,
       statusCode: 409,
       error: 'This approval belongs to an earlier Session run.',
       code: 'session_request_stale_run',
+      effectiveSessionId,
+      request,
+    };
+  }
+  if (!authoritativeRunId) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: 'This approval has no verifiable Session run identity.',
+      code: 'session_request_run_unavailable',
       effectiveSessionId,
       request,
     };
@@ -9228,18 +9791,48 @@ function claimSessionRequestResponse(hostId, sessionId, requestId, response, opt
     };
   }
 
+  const claimToken = makeId();
   const responding = emitSessionRequest(hostId, effectiveSessionId, {
     ...request,
+    runId: authoritativeRunId,
     status: 'responding',
     updatedAt: nowIso(),
     response: response || null,
   });
+  state.sessionRequestClaimTokens.set(
+    sessionRequestClaimKey(hostId, effectiveSessionId, requestId),
+    claimToken
+  );
   return {
     ok: true,
     claimed: true,
+    claimToken,
     effectiveSessionId,
     request: responding,
   };
+}
+
+function releaseSessionRequestResponseClaim(hostId, sessionId, requestId, claimToken) {
+  const effectiveSessionId = resolveSessionId(hostId, sessionId);
+  const key = sessionRequestClaimKey(hostId, effectiveSessionId, requestId);
+  if (!claimToken || state.sessionRequestClaimTokens.get(key) !== claimToken) {
+    return false;
+  }
+  const { request } = findSessionRequest(hostId, effectiveSessionId, requestId);
+  // Never roll back an approval after the Host has already resolved it (or a
+  // different response claim has superseded this one).
+  if (!request || request.status !== 'responding') {
+    state.sessionRequestClaimTokens.delete(key);
+    return false;
+  }
+  state.sessionRequestClaimTokens.delete(key);
+  emitSessionRequest(hostId, effectiveSessionId, {
+    ...request,
+    status: 'pending',
+    updatedAt: nowIso(),
+    response: null,
+  });
+  return true;
 }
 
 function goalAutoApproveKey(hostId, sessionId) {
@@ -9325,13 +9918,35 @@ function maybeAutoApproveSessionRequest(hostId, sessionId, requestEntry) {
   if (!claim.claimed) {
     return false;
   }
-  enqueueCommand(hostId, {
-    type: 'session.request.respond',
-    sessionId: claim.effectiveSessionId,
-    requestId,
-    response,
-    ...sessionIdentityPatch(hostId, claim.effectiveSessionId),
-  });
+  try {
+    enqueueCommand(hostId, {
+      type: 'session.request.respond',
+      sessionId: claim.effectiveSessionId,
+      requestId,
+      response,
+      ...sessionIdentityPatch(hostId, claim.effectiveSessionId),
+      // Keep the approval's originating run authoritative even if the Session
+      // projection has already advanced to a replacement run.
+      runId: claim.request?.runId || requestEntry?.runId || null,
+    });
+  } catch (error) {
+    releaseSessionRequestResponseClaim(
+      hostId,
+      claim.effectiveSessionId,
+      requestId,
+      claim.claimToken
+    );
+    emitSessionDiagnostic(hostId, claim.effectiveSessionId, {
+      severity: 'warning',
+      source: 'relay',
+      kind: 'control',
+      method: 'session.request.respond/queue-failed',
+      message: `Automatic approval could not be queued: ${error.message || error}`,
+      requestId,
+      runId: claim.request?.runId || requestEntry?.runId || null,
+    });
+    return false;
+  }
   return true;
 }
 
@@ -9357,6 +9972,7 @@ function resolveSessionRequest(hostId, sessionId, requestId, patch = {}) {
     itemId: patch.itemId ?? existing?.itemId ?? null,
     callId: patch.callId ?? existing?.callId ?? null,
   });
+  state.sessionRequestClaimTokens.delete(sessionRequestClaimKey(hostId, sessionId, requestId));
   const payload = {
     ...resolved,
     hostId,
@@ -9404,7 +10020,7 @@ function appendSessionLog(hostId, sessionId, entry) {
           ? { ...nextEntry, ...previous }
           : { ...previous, ...nextEntry }
       );
-      existing[existingIndex] = merged;
+      existing[existingIndex] = mergeAssistantTranscriptMetadata(previous, nextEntry, merged);
       state.sessionLogs.set(
         key,
         compactTranscriptEntries(existing).slice(-SESSION_LOG_ENTRY_LIMIT)
@@ -9451,26 +10067,143 @@ function appendSessionLog(hostId, sessionId, entry) {
   return nextEntry;
 }
 
+function normalizeSessionInputCapabilityError(value, rawMessage = '', inputTypes = []) {
+  const supplied = value && typeof value === 'object' ? value : null;
+  const suppliedRaw = String(supplied?.rawMessage || rawMessage || '').trim();
+  const normalizedTypes = normalizeInputTypes(
+    supplied?.inputTypes || inputTypes
+  );
+  const classified = classifyCodexInputCompatibilityError(suppliedRaw, normalizedTypes);
+  const source = (supplied || classified)
+    ? { ...(classified || {}), ...(supplied || {}) }
+    : null;
+  if (!source || (!source.code && !classified)) {
+    return null;
+  }
+  const code = String(source.code || classified?.code || '').trim();
+  if (!code) {
+    return null;
+  }
+  const userMessage = String(
+    source.userMessage
+      || classified?.userMessage
+      || ''
+  ).trim();
+  return {
+    code: redactSecretText(code).slice(0, 128),
+    kind: redactSecretText(String(source.kind || classified?.kind || 'input')).slice(0, 64),
+    inputTypes: normalizedTypes,
+    userMessage: redactSecretText(userMessage).slice(0, 1024),
+    rawMessage: suppliedRaw ? redactSecretText(suppliedRaw).slice(0, 8192) : null,
+  };
+}
+
 function appendSessionAlert(hostId, sessionId, entry) {
   const key = sessionKey(hostId, sessionId);
   let existing = state.sessionAlerts.get(key) || [];
   const turnId = String(entry.turnId || '').trim();
+  const clientRequestId = String(entry.clientRequestId || '').trim();
   if (entry.supersedesProvisionalError === true && turnId) {
     existing = existing.filter((item) => !(
       item?.provisionalSystemError === true
       && String(item.turnId || '').trim() === turnId
     ));
   }
+  const rawMessage = String(
+    entry.rawMessage
+      || entry.inputCapabilityError?.rawMessage
+      || entry.rawError
+      || ''
+  ).trim() || null;
+  const inputCapabilityError = normalizeSessionInputCapabilityError(
+    entry.inputCapabilityError,
+    rawMessage || entry.message,
+    entry.inputTypes
+  );
+  const storedRawMessage = inputCapabilityError?.rawMessage
+    || (rawMessage ? redactSecretText(rawMessage).slice(0, 8192) : null);
+  const capabilityCode = inputCapabilityError?.code || String(entry.code || '').trim() || null;
+  const capabilityKind = inputCapabilityError?.kind || String(entry.kind || '').trim() || null;
+  const capabilityInputTypes = inputCapabilityError?.inputTypes
+    || normalizeInputTypes(entry.inputTypes);
+  const userMessage = inputCapabilityError?.userMessage || entry.message || '';
+
+  // A provider may first emit its raw protocol error and then a structured
+  // user-facing error for the same turn. Merge those observations into one
+  // visible Alert while retaining the raw payload for diagnostics/details.
+  const duplicateCapabilityIndex = capabilityCode
+    ? existing.findIndex((candidate) => {
+      const candidateCode = candidate?.inputCapabilityError?.code || candidate?.code || null;
+      const sameIdentity = turnId
+        ? String(candidate.turnId || '').trim() === turnId
+        : clientRequestId
+          ? String(candidate.clientRequestId || '').trim() === clientRequestId
+          : false;
+      const sameRawMessage = storedRawMessage
+        && (candidate.rawMessage === storedRawMessage
+          || candidate.message === storedRawMessage
+          || candidate.inputCapabilityError?.rawMessage === storedRawMessage);
+      return sameIdentity
+        && (candidateCode === capabilityCode || sameRawMessage);
+    })
+    : -1;
+  if (duplicateCapabilityIndex >= 0) {
+    const previous = existing[duplicateCapabilityIndex] || {};
+    const severityRank = {
+      info: 0,
+      warning: 1,
+      error: 2,
+    };
+    const previousSeverity = String(previous.severity || 'warning').trim().toLowerCase();
+    const incomingSeverity = String(entry.severity || 'warning').trim().toLowerCase();
+    const mergedSeverity = (severityRank[incomingSeverity] || 0) >= (severityRank[previousSeverity] || 0)
+      ? incomingSeverity
+      : previousSeverity;
+    // A terminal session.error can arrive after one or more transient native
+    // retry notifications. Preserve the useful raw provider detail, but make
+    // the merged alert reflect the terminal outcome instead of remaining a
+    // dismissible warning forever.
+    const previousTerminal = previous.transient !== true && previousSeverity === 'error';
+    const incomingTerminal = entry.transient !== true && incomingSeverity === 'error';
+    const merged = {
+      ...previous,
+      severity: mergedSeverity,
+      timestamp: entry.timestamp || previous.timestamp || nowIso(),
+      message: userMessage || previous.message,
+      rawMessage: storedRawMessage || previous.rawMessage || null,
+      code: capabilityCode,
+      kind: capabilityKind,
+      inputTypes: capabilityInputTypes,
+      inputCapabilityError: inputCapabilityError || previous.inputCapabilityError || null,
+      codexError: entry.codexError || previous.codexError || null,
+      transient: previousTerminal || incomingTerminal
+        ? false
+        : (entry.transient === true || previous.transient === true),
+      clientRequestId: clientRequestId || previous.clientRequestId || null,
+      supersedesProvisionalError: entry.supersedesProvisionalError === true
+        || previous.supersedesProvisionalError === true,
+    };
+    existing[duplicateCapabilityIndex] = merged;
+    state.sessionAlerts.set(key, existing);
+    return merged;
+  }
+
   const nextEntry = {
     timestamp: entry.timestamp || nowIso(),
     severity: entry.severity || 'warning',
     source: entry.source || 'runtime',
-    message: entry.message || '',
+    message: userMessage,
     transient: entry.transient === true,
     turnId: turnId || null,
+    clientRequestId: clientRequestId || null,
     codexError: entry.codexError || null,
     provisionalSystemError: entry.provisionalSystemError === true,
     supersedesProvisionalError: entry.supersedesProvisionalError === true,
+    code: capabilityCode,
+    kind: capabilityKind,
+    inputTypes: capabilityInputTypes,
+    rawMessage: storedRawMessage,
+    inputCapabilityError: inputCapabilityError || null,
   };
   existing.push(nextEntry);
   state.sessionAlerts.set(
@@ -9492,6 +10225,38 @@ function emitTranscriptEntry(hostId, sessionId, entry) {
   };
   broadcastSessionEvent(hostId, sessionId, 'session.transcript', payload);
   return payload;
+}
+
+function externalTerminalTranscriptMatchesRuntime(event, session, runtime) {
+  const owner = String(
+    event?.activityOwner
+      || event?.activity_owner
+      || event?.externalActivity?.owner
+      || ''
+  ).trim().toLowerCase();
+  if (owner !== 'external-terminal') {
+    return false;
+  }
+  const eventTurnId = String(
+    event?.turnId
+      || event?.turn_id
+      || event?.externalActivity?.turnId
+      || ''
+  ).trim();
+  const currentActivity = runtime?.externalActivity;
+  const currentTurnId = String(currentActivity?.turnId || '').trim();
+  if (
+    currentActivity?.owner !== 'external-terminal'
+    || currentActivity?.active !== true
+    || !eventTurnId
+    || !currentTurnId
+    || eventTurnId !== currentTurnId
+  ) {
+    return false;
+  }
+  const eventRunId = String(event?.runId || '').trim();
+  const currentRunId = String(runtime?.runId || session?.runId || '').trim();
+  return !eventRunId || !currentRunId || eventRunId === currentRunId;
 }
 
 const PENDING_USER_TRANSCRIPT_ECHO_TTL_MS = 5 * 60 * 1000;
@@ -9781,6 +10546,68 @@ function emitSessionAlert(hostId, sessionId, entry) {
   return payload;
 }
 
+function emitSessionInputCapabilityDiagnostic(hostId, sessionId, event, capability, rawMessage, method) {
+  if (!capability) {
+    return null;
+  }
+  const key = resolveSessionKey(hostId, sessionId);
+  const turnId = String(event?.turnId || '').trim() || null;
+  const normalizedRaw = String(rawMessage || capability.rawMessage || '').trim();
+  const existing = state.sessionDiagnostics.get(key) || [];
+  const duplicate = existing.some((entry) => (
+    entry?.kind === 'input-capability'
+    && entry?.data?.code === capability.code
+    && (!turnId || String(entry.turnId || '').trim() === turnId)
+  ));
+  if (duplicate) {
+    return null;
+  }
+  return emitSessionDiagnostic(hostId, sessionId, {
+    severity: 'error',
+    source: 'codex',
+    kind: 'input-capability',
+    method: method || 'session.error',
+    message: capability.userMessage || normalizedRaw,
+    detail: normalizedRaw || null,
+    data: {
+      code: capability.code,
+      kind: capability.kind,
+      inputTypes: capability.inputTypes,
+      rawMessage: normalizedRaw || null,
+    },
+    runId: event?.runId || null,
+    turnId,
+    clientRequestId: event?.clientRequestId || null,
+    timestamp: event?.timestamp || nowIso(),
+  });
+}
+
+function emitMetadataFallbackDiagnostic(hostId, sessionId, event, message, method) {
+  const key = resolveSessionKey(hostId, sessionId);
+  const existing = state.sessionDiagnostics.get(key) || [];
+  const duplicate = existing.some((entry) => (
+    entry?.kind === 'metadata-fallback'
+    && String(entry.message || '') === String(message || '')
+  ));
+  if (duplicate) {
+    return null;
+  }
+  return emitSessionDiagnostic(hostId, sessionId, {
+    severity: 'info',
+    source: 'codex',
+    kind: 'metadata-fallback',
+    method: method || 'session.error',
+    message,
+    detail: message,
+    data: {
+      metadataFallback: true,
+    },
+    runId: event?.runId || null,
+    turnId: event?.turnId || null,
+    timestamp: event?.timestamp || nowIso(),
+  });
+}
+
 function isBenignSessionWatchNoLiveError(message) {
   return /no live session for command session\.(watch|unwatch)\b/i.test(String(message || ''));
 }
@@ -10014,7 +10841,7 @@ function moveSessionArtifacts(hostId, fromSessionId, toSessionId) {
       toKey,
       mergeByFingerprint(
         [...toDiagnostics, ...fromDiagnostics],
-        (entry) => `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}`,
+        (entry) => `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${diagnosticIdentitySignature(entry)}`,
         SESSION_DIAGNOSTIC_ENTRY_LIMIT
       )
     );
@@ -10908,13 +11735,13 @@ function runProcess(command, args, options = {}) {
         return;
       }
       settled = true;
-      resolve({
+      resolve(attachAskpassOutcome({
         ...result,
         stdout: stdout.trim(),
         stderr: stderr.trim(),
         startedAt,
         completedAt: nowIso(),
-      });
+      }, options.env));
     }
 
     try {
@@ -11119,62 +11946,8 @@ function connectorUsesAskpass(connector, secret) {
 function ensureAskpassHelper() {
   const helperPath = path.join(RELAY_STATE_ROOT, 'remote-codex-askpass.cmd');
   const helperScriptPath = path.join(RELAY_STATE_ROOT, 'remote-codex-askpass.ps1');
-  const psScript = [
-    '$ErrorActionPreference = "SilentlyContinue"',
-    '$promptText = [string]$env:RC_ASKPASS_PROMPT',
-    'function Decode-B64([string]$value) {',
-    '  if ([string]::IsNullOrWhiteSpace($value)) { return "" }',
-    '  try { return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) } catch { return "" }',
-    '}',
-    'function Encode-Query([string]$value) {',
-    '  return [uri]::EscapeDataString($value)',
-    '}',
-    'function Try-BrokerPrompt {',
-    '  if ([string]::IsNullOrWhiteSpace($env:RC_ASKPASS_RELAY_URL) -or [string]::IsNullOrWhiteSpace($env:RC_ASKPASS_CONNECTOR_ID) -or [string]::IsNullOrWhiteSpace($env:RC_ASKPASS_ACTION_ID) -or [string]::IsNullOrWhiteSpace($env:RC_ASKPASS_TOKEN)) { return $null }',
-    '  $timeoutSeconds = 180',
-    '  if ($env:RC_ASKPASS_TIMEOUT_SECONDS) { try { $timeoutSeconds = [Math]::Max(10, [int]$env:RC_ASKPASS_TIMEOUT_SECONDS) } catch {} }',
-    '  $base = [string]$env:RC_ASKPASS_RELAY_URL',
-    '  $headers = @{}',
-    '  if (-not [string]::IsNullOrWhiteSpace($env:RC_RELAY_AUTH_TOKEN)) { $headers["Authorization"] = "Bearer $env:RC_RELAY_AUTH_TOKEN" }',
-    '  $body = @{ connectorId = [string]$env:RC_ASKPASS_CONNECTOR_ID; actionId = [string]$env:RC_ASKPASS_ACTION_ID; token = [string]$env:RC_ASKPASS_TOKEN; prompt = $promptText } | ConvertTo-Json -Compress',
-    '  try { $created = Invoke-RestMethod -Method Post -Uri "$base/api/askpass/prompts" -Headers $headers -ContentType "application/json; charset=utf-8" -Body $body -TimeoutSec 8 } catch { exit 1 }',
-    '  if (-not $created -or [string]::IsNullOrWhiteSpace([string]$created.promptId)) { exit 1 }',
-    '  $promptId = [string]$created.promptId',
-    '  $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)',
-    '  $query = "connectorId=$(Encode-Query $env:RC_ASKPASS_CONNECTOR_ID)&actionId=$(Encode-Query $env:RC_ASKPASS_ACTION_ID)&token=$(Encode-Query $env:RC_ASKPASS_TOKEN)"',
-    '  while ([DateTime]::UtcNow -lt $deadline) {',
-    '    try { $status = Invoke-RestMethod -Method Get -Uri "$base/api/askpass/prompts/$promptId`?$query" -Headers $headers -TimeoutSec 8 } catch { Start-Sleep -Milliseconds 700; continue }',
-    '    if ($status.status -eq "answered") { [Console]::Out.Write([string]$status.response); exit 0 }',
-    '    if ($status.status -eq "cancelled" -or $status.status -eq "closed") { exit 1 }',
-    '    Start-Sleep -Milliseconds 500',
-    '  }',
-    '  exit 1',
-    '}',
-    'Try-BrokerPrompt | Out-Null',
-    '$index = 1',
-    'if ($env:RC_ASKPASS_STATE_FILE -and (Test-Path -LiteralPath $env:RC_ASKPASS_STATE_FILE)) { try { $index = [int](Get-Content -LiteralPath $env:RC_ASKPASS_STATE_FILE -TotalCount 1) } catch { $index = 1 } }',
-    'if ($index -lt 1) { $index = 1 }',
-    '$nextIndex = $index + 1',
-    'if ($env:RC_ASKPASS_STATE_FILE) { try { Set-Content -LiteralPath $env:RC_ASKPASS_STATE_FILE -Value ([string]$nextIndex) -NoNewline } catch {} }',
-    '$b64 = [Environment]::GetEnvironmentVariable("RC_ASKPASS_PASSWORD_${index}_B64")',
-    'if ([string]::IsNullOrWhiteSpace($b64)) { $b64 = $env:RC_ASKPASS_PASSWORD_LAST_B64 }',
-    'if ([string]::IsNullOrWhiteSpace($b64)) { $b64 = $env:RC_ASKPASS_PASSWORD_1_B64 }',
-    'if ($env:RC_ASKPASS_OTP_B64 -and $promptText -match "(?i)(otp|mfa|verification|authenticator|passcode|one[- _]?time|2fa|two[- _]?factor|totp|google|duo|challenge|token|code)") {',
-    '  $b64 = $env:RC_ASKPASS_OTP_B64',
-    '} elseif ($env:RC_ASKPASS_PASSWORD_PROMPT_B64 -and $promptText -match "(?i)password") {',
-    '  $b64 = $env:RC_ASKPASS_PASSWORD_PROMPT_B64',
-    '}',
-    '$answer = Decode-B64 $b64',
-    'if ([string]::IsNullOrWhiteSpace($answer)) { exit 1 }',
-    '[Console]::Out.Write($answer)',
-  ].join('\r\n');
-  const script = [
-    '@echo off',
-    'setlocal EnableExtensions',
-    'set "RC_ASKPASS_PROMPT=%*"',
-    `powershell -NoProfile -ExecutionPolicy Bypass -File "${helperScriptPath.replace(/"/g, '""')}"`,
-    'exit /b %ERRORLEVEL%',
-  ].join('\r\n');
+  const psScript = buildWindowsAskpassPowerShell();
+  const script = buildWindowsAskpassCommand(helperScriptPath);
   fs.mkdirSync(path.dirname(helperPath), { recursive: true });
   fs.writeFileSync(helperScriptPath, psScript, 'utf8');
   fs.writeFileSync(helperPath, script, 'utf8');
@@ -11196,13 +11969,15 @@ function buildAskpassEnv(connector, secret) {
     secret?.targetOtp || '',
   ].filter(Boolean);
   const firstResponse = responses[0] || '';
-  const lastResponse = responses[responses.length - 1] || firstResponse;
-  const statePath = path.join(RELAY_STATE_ROOT, `askpass-state-${connector.connectorId || makeId()}.txt`);
+  const askpassFileId = `${String(connector.connectorId || 'connector').replace(/[^a-zA-Z0-9_.-]+/g, '-')}-${makeId()}`;
+  const statePath = path.join(RELAY_STATE_ROOT, `askpass-state-${askpassFileId}.txt`);
+  const outcomePath = path.join(RELAY_STATE_ROOT, `askpass-outcome-${askpassFileId}.txt`);
 
   try {
     fs.rmSync(statePath, { force: true });
+    fs.rmSync(outcomePath, { force: true });
   } catch (_) {
-    // Best effort. A stale state file only changes which response is tried first.
+    // Both paths are unique per SSH process; cleanup is only a defensive step.
   }
 
   const env = {
@@ -11210,9 +11985,13 @@ function buildAskpassEnv(connector, secret) {
     SSH_ASKPASS_REQUIRE: 'force',
     DISPLAY: process.env.DISPLAY || 'remote-codex',
     RC_ASKPASS_STATE_FILE: statePath,
+    RC_ASKPASS_OUTCOME_FILE: outcomePath,
     RC_ASKPASS_PASSWORD_1_B64: base64Secret(firstResponse),
-    RC_ASKPASS_PASSWORD_LAST_B64: base64Secret(lastResponse),
-    RC_ASKPASS_PASSWORD_PROMPT_B64: base64Secret(passwordResponses[0] || ''),
+    RC_ASKPASS_GATEWAY_HOST: connector.gateway?.host || '',
+    RC_ASKPASS_TARGET_HOST: connector.targetHost || '',
+    RC_ASKPASS_GATEWAY_PASSWORD_B64: base64Secret(secret?.gatewayPassword || ''),
+    RC_ASKPASS_TARGET_PASSWORD_B64: base64Secret(secret?.targetPassword || ''),
+    RC_ASKPASS_ONLY_PASSWORD_B64: base64Secret(passwordResponses.length === 1 ? passwordResponses[0] : ''),
     RC_ASKPASS_OTP_B64: base64Secret(otpResponses[0] || ''),
   };
 
@@ -11221,7 +12000,7 @@ function buildAskpassEnv(connector, secret) {
     env.RC_ASKPASS_CONNECTOR_ID = connector.connectorId || secret.connectorId || '';
     env.RC_ASKPASS_ACTION_ID = secret.askpassActionId || '';
     env.RC_ASKPASS_TOKEN = secret.askpassToken || '';
-    env.RC_ASKPASS_TIMEOUT_SECONDS = '180';
+    env.RC_ASKPASS_TIMEOUT_SECONDS = String(ASKPASS_BROWSER_TIMEOUT_SECONDS);
     if (RELAY_AUTH_TOKEN) {
       env.RC_RELAY_AUTH_TOKEN = RELAY_AUTH_TOKEN;
     }
@@ -11288,6 +12067,34 @@ function sshRunText(run) {
 }
 
 function classifyConnectorSshAuthenticationFailure(run) {
+  if (run?.askpassStatus === 'askpass_timeout') {
+    return {
+      status: 'askpass_timeout',
+      reason: 'askpass_timeout',
+      message: 'SSH authentication timed out while waiting for a response in the browser.',
+    };
+  }
+  if (run?.askpassStatus === 'askpass_cancelled') {
+    return {
+      status: 'askpass_cancelled',
+      reason: 'askpass_cancelled',
+      message: 'The browser SSH authentication prompt was cancelled.',
+    };
+  }
+  if (run?.askpassStatus === 'askpass_unavailable') {
+    return {
+      status: 'askpass_unavailable',
+      reason: 'askpass_unavailable',
+      message: 'The SSH authentication prompt could not be delivered to the browser.',
+    };
+  }
+  if (run?.askpassStatus === 'askpass_missing_answer') {
+    return {
+      status: 'askpass_missing_answer',
+      reason: 'askpass_missing_answer',
+      message: 'SSH requested authentication input, but no saved answer or browser prompt was available.',
+    };
+  }
   const text = sshRunText(run);
   if (/too many authentication failures/i.test(text)) {
     return {
@@ -11735,7 +12542,9 @@ function buildSshActionOptions(connector, action, secret) {
 }
 
 function authAwareTimeout(baseMs, secret) {
-  return secret?.interactiveAskpass ? Math.max(baseMs, 180_000) : baseMs;
+  return secret?.interactiveAskpass
+    ? Math.max(baseMs, (ASKPASS_BROWSER_TIMEOUT_SECONDS * 1000) + ASKPASS_PROCESS_TIMEOUT_GRACE_MS)
+    : baseMs;
 }
 
 function buildRemoteBootstrapProbeCommand() {
@@ -11744,6 +12553,67 @@ function buildRemoteBootstrapProbeCommand() {
     'printf "CODEX_REMOTE_ARCH=%s\\n" "$remote_arch"',
     'if command -v node >/dev/null 2>&1 || command -v nodejs >/dev/null 2>&1; then echo CODEX_REMOTE_NODE_PRESENT; else echo CODEX_REMOTE_NODE_MISSING; fi',
   ].join('; ');
+}
+
+// Keep the public probe status stable for existing clients, but make the
+// failure actionable. A null exit code is otherwise indistinguishable from
+// an unsupported architecture even though it usually means the local ssh
+// process timed out or could not be started.
+function describeRemoteBootstrapProbeFailure(run, architectureToken) {
+  const askpassFailure = classifyConnectorSshAuthenticationFailure(run);
+  if (askpassFailure?.reason?.startsWith('askpass_')) {
+    return {
+      reason: askpassFailure.reason,
+      message: askpassFailure.message,
+    };
+  }
+  if (run?.timedOut) {
+    return {
+      reason: 'timeout',
+      message: 'Remote runtime probe timed out while waiting for SSH. Check network reachability and the SSH login prompt.',
+    };
+  }
+  if (run?.error) {
+    return {
+      reason: 'process_start_failed',
+      message: `Unable to start the local SSH probe process: ${redactSecretText(run.error)}.`,
+    };
+  }
+  const text = redactSecretText(String(run?.stderr || run?.stdout || '').trim());
+  if (/could not resolve hostname|name or service not known|getaddrinfo/i.test(text)) {
+    return {
+      reason: 'host_unresolved',
+      message: 'SSH could not resolve the remote host name or address.',
+    };
+  }
+  if (/connection refused/i.test(text)) {
+    return {
+      reason: 'connection_refused',
+      message: 'The remote SSH port refused the connection.',
+    };
+  }
+  if (/connection timed out|operation timed out|no route to host|network is unreachable/i.test(text)) {
+    return {
+      reason: 'network_unreachable',
+      message: 'The Relay could not reach the remote SSH endpoint.',
+    };
+  }
+  if (/permission denied|authentication failed|too many authentication failures/i.test(text)) {
+    return {
+      reason: 'authentication_failed',
+      message: 'SSH reached the host but authentication was rejected.',
+    };
+  }
+  const detail = text.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line && !/^CODEX_REMOTE_[A-Z_]+=/.test(line));
+  return {
+    reason: 'ssh_failed',
+    message: detail
+      ? `SSH runtime probe failed: ${detail.slice(0, 240)}`
+      : `SSH runtime probe failed (exit ${run?.exitCode ?? 'unknown'}).`,
+    architectureToken: architectureToken || null,
+  };
 }
 
 async function probeConnectorBootstrapRuntime(connector, secret) {
@@ -11771,14 +12641,22 @@ async function probeConnectorBootstrapRuntime(connector, secret) {
     const authenticationFailure = run.exitCode !== 0
       ? classifyConnectorSshAuthenticationFailure(run)
       : null;
+    const probeFailure = describeRemoteBootstrapProbeFailure(run, match?.[1]);
+    const failureReason = authenticationFailure?.reason
+      || (authenticationFailure ? 'authentication_failed' : probeFailure.reason);
     return {
       ok: false,
       status: authenticationFailure?.status
         || (run.exitCode === 0 ? 'remote_architecture_unsupported' : 'remote_probe_failed'),
       message: authenticationFailure?.message || (run.exitCode === 0
         ? `Unsupported remote Linux architecture: ${match?.[1] || 'unknown'}.`
-        : 'Unable to probe the remote Linux architecture before bootstrap.'),
-      step: { name: 'remote_runtime_probe', ...run },
+        : probeFailure.message),
+      reason: failureReason,
+      step: {
+        name: 'remote_runtime_probe',
+        ...run,
+        probeReason: failureReason,
+      },
     };
   }
   return {
@@ -11986,7 +12864,7 @@ function buildRemoteOneShotAgentLauncherScript(connector, restart, options = {})
     '  while [ -n "$frontier" ]; do',
     '    next_frontier=""',
     '    for parent_pid in $frontier; do',
-    `      for child_pid in $(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$parent_pid" '$2 == parent { print $1 }'); do`,
+    `      for child_pid in $(ps -eo pid= -o ppid= 2>/dev/null | awk -v parent="$parent_pid" '$2 == parent { print $1 }'); do`,
     '        case " $tree " in *" $child_pid "*) ;; *) tree="$tree $child_pid"; next_frontier="$next_frontier $child_pid" ;; esac',
     '      done',
     '    done',
@@ -12039,7 +12917,7 @@ function buildRemoteOneShotAgentLauncherScript(connector, restart, options = {})
     '  rm -f "$pid_file"',
     '}',
     'stop_untracked_control_agents() {',
-    '  ps -eo pid=,comm=,args= 2>/dev/null | while read -r candidate_pid candidate_comm candidate_args; do',
+    '  ps -eo pid= -o comm= -o args= 2>/dev/null | while read -r candidate_pid candidate_comm candidate_args; do',
     '    case "$candidate_comm" in node|nodejs) ;; *) continue ;; esac',
     '    case "$candidate_args" in *apps/host-agent/agent.js*) ;; *) continue ;; esac',
     '    if is_control_agent_pid "$candidate_pid"; then',
@@ -12193,6 +13071,7 @@ async function runConnectorBootstrapOneShot(connector, action, secret) {
       ok: false,
       status: probe.status,
       message: probe.message,
+      probeReason: probe.reason || probe.step?.probeReason || null,
       remoteDirectory: baseConnector.bootstrap?.remoteDirectory || '',
       connector: baseConnector,
       step: probe.step || null,
@@ -12635,6 +13514,10 @@ async function ensureRemoteCodexRuntime(connector, secret, remoteDirectory, make
 
 function classifyConnectorAction(action, run) {
   const stdout = run.stdout || '';
+  const authenticationFailure = classifyConnectorSshAuthenticationFailure(run);
+  if (authenticationFailure) {
+    return { ok: false, ...authenticationFailure };
+  }
   if (run.timedOut) {
     return { ok: false, status: 'timeout', message: 'SSH command timed out.' };
   }
@@ -12744,11 +13627,13 @@ async function runConnectorAction(connector, action, secretOverride = null) {
         signal: bootstrap.step?.signal ?? null,
         timedOut: Boolean(bootstrap.step?.timedOut),
         error: bootstrap.step?.error || null,
+        probeReason: bootstrap.probeReason || bootstrap.step?.probeReason || null,
         remoteDirectory: bootstrap.remoteDirectory,
         deploy: {
           ok: bootstrap.ok,
           status: bootstrap.status,
           message: bootstrap.message,
+          probeReason: bootstrap.probeReason || bootstrap.step?.probeReason || null,
           remoteDirectory: bootstrap.remoteDirectory,
           payload: bootstrap.payload,
           steps: bootstrap.steps,
@@ -12909,6 +13794,56 @@ function awaitDirectoryRequest(requestId, timeoutMs = 12000) {
       },
     });
   });
+}
+
+function awaitTerminalOpenRequest(requestId, identity = {}, timeoutMs = 15000) {
+  const hostId = String(identity.hostId || '').trim();
+  const sessionId = String(identity.sessionId || '').trim();
+  const existing = state.pendingTerminalOpenRequests.get(requestId);
+  if (existing) {
+    if (existing.hostId !== hostId || existing.sessionId !== sessionId) {
+      const error = new Error('terminal request ID is already pending for another target');
+      error.code = 'terminal_request_id_conflict';
+      throw error;
+    }
+    return { created: false, record: existing, promise: existing.promise };
+  }
+
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  const record = {
+    hostId,
+    sessionId,
+    command: null,
+    promise,
+    timer: null,
+    resolve: null,
+    reject: null,
+  };
+  const clearPending = () => {
+    clearTimeout(record.timer);
+    if (state.pendingTerminalOpenRequests.get(requestId) === record) {
+      state.pendingTerminalOpenRequests.delete(requestId);
+    }
+  };
+  record.resolve = (payload) => {
+    clearPending();
+    resolvePromise(payload);
+  };
+  record.reject = (error) => {
+    clearPending();
+    rejectPromise(error);
+  };
+  record.timer = setTimeout(() => {
+    record.reject(new Error('terminal open request timed out while waiting for the Host Agent'));
+  }, timeoutMs);
+  record.timer.unref?.();
+  state.pendingTerminalOpenRequests.set(requestId, record);
+  return { created: true, record, promise };
 }
 
 function awaitHostProbe(requestId, timeoutMs = 5000) {
@@ -14041,6 +14976,177 @@ function normalizeReviewTarget(input = {}) {
   return { type: 'uncommittedChanges' };
 }
 
+function sessionReviewIdentityKeys(hostId, input = {}) {
+  const normalizedHostId = String(hostId || '').trim();
+  if (!normalizedHostId) return new Set();
+  const candidate = typeof input === 'string' ? { sessionId: input } : input || {};
+  const keys = new Set();
+  const addIdentity = (value) => {
+    const identity = String(value || '').trim();
+    if (!identity) return;
+    keys.add(sessionKey(normalizedHostId, identity));
+    keys.add(resolveSessionKey(normalizedHostId, identity));
+  };
+  for (const identity of [
+    candidate.sessionId,
+    candidate.requestedSessionId,
+    candidate.bridgeSessionId,
+    candidate.nativeThreadId,
+    candidate.conversationKey,
+  ]) {
+    addIdentity(identity);
+  }
+  const canonicalKey = resolveCanonicalConversationKey(normalizedHostId, candidate);
+  if (canonicalKey) keys.add(canonicalKey);
+  return keys;
+}
+
+function sessionReviewKeysIntersect(left, right) {
+  for (const key of left) {
+    if (right.has(key)) return true;
+  }
+  return false;
+}
+
+function sessionReviewCommandTargets(hostId, command, targetKeys) {
+  if (!command || !targetKeys?.size) return false;
+  return sessionReviewKeysIntersect(
+    targetKeys,
+    sessionReviewIdentityKeys(hostId, command)
+  );
+}
+
+function sessionReviewOutboxEntryTargets(hostId, entry, targetKeys) {
+  return Boolean(
+    entry?.hostId === hostId
+    && (
+      targetKeys.has(String(entry.scopeKey || '').trim())
+      || sessionReviewCommandTargets(hostId, entry.command, targetKeys)
+    )
+  );
+}
+
+function sessionReviewRuntime(hostId, session, targetKeys) {
+  for (const key of targetKeys) {
+    const runtime = state.sessionRuntime.get(key);
+    if (runtime) return runtime;
+  }
+  return session?.runtime && typeof session.runtime === 'object' ? session.runtime : null;
+}
+
+function inspectSessionReviewPendingInput(hostId, session, targetKeys) {
+  const queue = pruneCommandQueue(state.commandQueues.get(hostId) || []);
+  state.commandQueues.set(hostId, queue);
+  const queuedInput = queue.find((command) => (
+    command?.type === 'session.input'
+    && sessionReviewCommandTargets(hostId, command, targetKeys)
+  )) || null;
+  const reviewQueued = queue.some((command) => (
+    command?.type === 'session.review_start'
+    && sessionReviewCommandTargets(hostId, command, targetKeys)
+  ));
+
+  let recovery;
+  try {
+    recovery = state.inputCommandOutbox.getRecoveryState();
+  } catch (error) {
+    return {
+      inputStateKnown: false,
+      pendingInput: null,
+      reviewQueued,
+    };
+  }
+  const pendingOutbox = (recovery.pendingCommands || []).find((entry) => (
+    sessionReviewOutboxEntryTargets(hostId, entry, targetKeys)
+  )) || null;
+  const completedForSession = (recovery.completedCommands || []).filter((entry) => (
+    sessionReviewOutboxEntryTargets(hostId, entry, targetKeys)
+  ));
+  const resolvedRequestIds = new Set(completedForSession
+    .filter((entry) => ['accepted', 'rejected'].includes(entry.completedOutcome))
+    .map((entry) => normalizeClientRequestId(entry.clientRequestId))
+    .filter(Boolean));
+  const acceptedTranscriptRequestIds = new Set();
+  let pendingTranscript = null;
+  for (const key of targetKeys) {
+    for (const entry of state.sessionLogs.get(key) || []) {
+      if (entry?.speaker !== 'user') continue;
+      const requestId = normalizeClientRequestId(entry.clientRequestId);
+      if (entry.deliveryStatus === 'accepted' && requestId) {
+        acceptedTranscriptRequestIds.add(requestId);
+      } else if (
+        entry.deliveryStatus === 'pending'
+        && (!requestId || !resolvedRequestIds.has(requestId))
+      ) {
+        pendingTranscript ||= entry;
+      }
+    }
+  }
+
+  const acceptanceUnknown = completedForSession.find((entry) => {
+    if (entry.completedOutcome !== 'acceptance_unknown') return false;
+    const requestId = normalizeClientRequestId(entry.clientRequestId);
+    // A malformed historical record cannot be correlated safely, so keep the
+    // guard fail-closed. Valid records stop blocking once a later terminal
+    // receipt or an accepted transcript proves that prompt was resolved.
+    return !requestId || (
+      !resolvedRequestIds.has(requestId)
+      && !acceptedTranscriptRequestIds.has(requestId)
+    );
+  }) || null;
+
+  const echoCutoff = Date.now() - PENDING_USER_TRANSCRIPT_ECHO_TTL_MS;
+  let pendingEcho = null;
+  for (const key of targetKeys) {
+    pendingEcho ||= (state.pendingUserTranscriptEchoes.get(key) || []).find((entry) => {
+      const requestId = normalizeClientRequestId(entry?.clientRequestId);
+      return entry?.status !== 'rejected'
+        && Number(entry?.createdAt || 0) >= echoCutoff
+        && (!requestId || (
+          !resolvedRequestIds.has(requestId)
+          && !acceptedTranscriptRequestIds.has(requestId)
+        ));
+    }) || null;
+  }
+
+  const pending = pendingOutbox || queuedInput || pendingTranscript || pendingEcho;
+  return {
+    inputStateKnown: true,
+    reviewQueued,
+    pendingInput: acceptanceUnknown ? {
+      present: true,
+      acceptanceUnknown: true,
+      outcome: 'acceptance_unknown',
+      clientRequestId: acceptanceUnknown.clientRequestId || null,
+      commandId: acceptanceUnknown.originalCommandId || null,
+    } : pending ? {
+      present: true,
+      acceptanceUnknown: false,
+      outcome: 'pending',
+      clientRequestId: pending.clientRequestId || null,
+      commandId: pending.originalCommandId || pending.id || null,
+    } : null,
+  };
+}
+
+function assertSessionReviewAvailable(hostId, session) {
+  const targetKeys = sessionReviewIdentityKeys(hostId, session);
+  const inputState = inspectSessionReviewPendingInput(hostId, session, targetKeys);
+  const blocker = assessSessionReviewAvailability({
+    live: sessionAcceptsLiveControl(hostId, session),
+    runtime: sessionReviewRuntime(hostId, session, targetKeys),
+    pendingInput: inputState.pendingInput,
+    reviewQueued: inputState.reviewQueued,
+    inputStateKnown: inputState.inputStateKnown,
+  });
+  if (!blocker) return true;
+  const { code, message, ...details } = blocker;
+  throw new SessionContractError(code, message, {
+    ...details,
+    statusCode: 409,
+  });
+}
+
 function earliestIso(...values) {
   let best = null;
   let bestTime = Infinity;
@@ -14066,12 +15172,29 @@ function resolveSessionCreatedAt(existing, patch) {
 }
 
 function upsertSession(hostId, patch, options = {}) {
-  const ownershipIdentities = sessionOwnershipIdentityValues(patch);
+  const hasHistoricalLineage = Boolean(
+    patch?.originSessionId
+    || patch?.sourceSessionId
+    || patch?.source === 'vscode'
+    || patch?.source === 'rollout'
+    || patch?.source === 'subagent'
+  );
+  // A conversation key from an imported/history row is provenance, not proof
+  // that the row owns a currently live managed runner.  Restrict collision
+  // matching for those rows to concrete session/bridge/native identities;
+  // otherwise an unrelated historical row can be silently remapped into a
+  // live Session that happens to share its origin key.
+  const ownershipIdentity = hasHistoricalLineage && patch?.live !== true
+    ? {
+      ...patch,
+      conversationKey: null,
+    }
+    : patch;
   const preserveManagedLive = options.preserveManagedLive !== false;
   // A managed live record is authoritative for every alternate identity it
   // announces. Keep same-ID managed lifecycle updates free to advance state.
   const managedLiveCandidate = preserveManagedLive
-    ? findManagedLiveSessionByIdentities(hostId, ownershipIdentities)
+    ? findManagedLiveSessionByIdentities(hostId, ownershipIdentity)
     : null;
   const patchExplicitlyNonManaged = Object.prototype.hasOwnProperty.call(patch || {}, 'source')
     && patch.source !== 'managed';
@@ -14153,9 +15276,19 @@ function upsertSession(hostId, patch, options = {}) {
 
 function enqueueCommand(hostId, command, options = {}) {
   const queue = state.commandQueues.get(hostId) || [];
+  const requestedCommandId = Number(options.commandId || 0);
+  const commandId = Number.isSafeInteger(requestedCommandId) && requestedCommandId > 0
+    ? requestedCommandId
+    : state.nextCommandId++;
+  // A reserved id may have been allocated before a durable lifecycle claim.
+  // Keep the global cursor ahead of it while allowing harmless gaps after a
+  // failed claim/queue transaction.
+  if (commandId >= state.nextCommandId) {
+    state.nextCommandId = commandId + 1;
+  }
   const next = {
     ...command,
-    id: state.nextCommandId++,
+    id: commandId,
     createdAt: nowIso(),
     priority: commandPriority(command),
   };
@@ -14184,6 +15317,384 @@ function enqueueCommand(hostId, command, options = {}) {
   queue.push(next);
   state.commandQueues.set(hostId, pruneCommandQueue(queue));
   return next;
+}
+
+function normalizedCommandCursor(value) {
+  const numeric = Number(value);
+  // MAX_SAFE_INTEGER is used by the shutdown flush request as a sentinel,
+  // not as a cursor proving that commands were delivered.
+  return Number.isSafeInteger(numeric) && numeric >= 0 && numeric < Number.MAX_SAFE_INTEGER
+    ? numeric
+    : null;
+}
+
+function commandDeliveryIdentity(agentInstanceId = '', leaseId = '') {
+  return {
+    agentInstanceId: String(agentInstanceId || '').trim(),
+    leaseId: String(leaseId || '').trim(),
+  };
+}
+
+function commandDeliveryIdentityMatches(current, agentInstanceId = '', leaseId = '') {
+  if (!current) return true;
+  const identity = commandDeliveryIdentity(agentInstanceId, leaseId);
+  return String(current.agentInstanceId || '') === identity.agentInstanceId
+    && String(current.leaseId || '') === identity.leaseId;
+}
+
+function resetHostCommandDeliveryCursor(hostId, agentInstanceId = '', leaseId = '', options = {}) {
+  const normalizedHostId = String(hostId || '').trim();
+  if (!normalizedHostId) return false;
+  const current = state.commandDeliveryCursors.get(normalizedHostId);
+  if (!current) return false;
+  const identity = commandDeliveryIdentity(agentInstanceId, leaseId);
+  const changed = !commandDeliveryIdentityMatches(
+    current,
+    identity.agentInstanceId,
+    identity.leaseId
+  );
+  if (changed || options.force === true) {
+    state.commandDeliveryCursors.delete(normalizedHostId);
+    return true;
+  }
+  return false;
+}
+
+function hostCommandDeliveryCursor(hostId, agentInstanceId = '', leaseId = '', options = {}) {
+  const normalizedHostId = String(hostId || '').trim();
+  if (!normalizedHostId) return null;
+  const identity = commandDeliveryIdentity(agentInstanceId, leaseId);
+  let current = state.commandDeliveryCursors.get(normalizedHostId) || null;
+  if (current && !commandDeliveryIdentityMatches(
+    current,
+    identity.agentInstanceId,
+    identity.leaseId
+  )) {
+    // A late request from a previous Agent lease must never reset or mutate
+    // the cursor belonging to the current lease.
+    return null;
+  }
+  if (!current && options.create !== false) {
+    current = {
+      agentInstanceId: identity.agentInstanceId || null,
+      leaseId: identity.leaseId || null,
+      after: 0,
+      ack: 0,
+      lanes: {},
+    };
+    state.commandDeliveryCursors.set(normalizedHostId, current);
+  }
+  return current;
+}
+
+function normalizeCommandLane(lane) {
+  const value = String(lane || '').trim().toLowerCase();
+  if (value === 'normal' || value === 'control') return value;
+  return null;
+}
+
+function commandBelongsToLane(command, lane = null) {
+  const normalizedLane = normalizeCommandLane(lane);
+  if (!normalizedLane) return true;
+  const isControl = CONTROL_COMMAND_TYPES.has(String(command?.type || ''));
+  return normalizedLane === 'control' ? isControl : !isControl;
+}
+
+function observeHostCommandDeliveryCursor(
+  hostId,
+  agentInstanceId,
+  afterId,
+  ackId,
+  lane = null,
+  options = {}
+) {
+  const normalizedHostId = String(hostId || '').trim();
+  if (!normalizedHostId) return;
+  const current = hostCommandDeliveryCursor(
+    normalizedHostId,
+    agentInstanceId,
+    options.leaseId || '',
+    { create: true }
+  );
+  if (!current) return false;
+  current.lanes ||= {};
+  const normalizedLane = normalizeCommandLane(lane) || 'legacy';
+  const laneCursor = current.lanes[normalizedLane] || { after: 0, ack: 0 };
+  const deliveredCommandIds = Array.isArray(options.deliveredCommandIds)
+    ? options.deliveredCommandIds
+      .map((value) => normalizedCommandCursor(value))
+      .filter((value) => value !== null)
+    : [];
+  const deliveredThrough = normalizedCommandCursor(options.deliveredThrough);
+  const observedDeliveredThrough = deliveredThrough === null
+    ? (deliveredCommandIds.length ? Math.max(...deliveredCommandIds) : null)
+    : deliveredThrough;
+  if (observedDeliveredThrough !== null) {
+    laneCursor.deliveredThrough = Math.max(
+      Number(laneCursor.deliveredThrough || 0),
+      observedDeliveredThrough
+    );
+    laneCursor.after = Math.max(laneCursor.after, observedDeliveredThrough);
+    current.after = Math.max(Number(current.after || 0), observedDeliveredThrough);
+  }
+  // `afterId` and `ackId` are client claims. They are intentionally not used
+  // as delivery evidence; ACKs are bounded by laneCursor.deliveredThrough.
+  current.lanes[normalizedLane] = laneCursor;
+  if (options.ackThrough !== undefined) {
+    const acknowledgedThrough = normalizedCommandCursor(options.ackThrough);
+    if (acknowledgedThrough !== null) {
+      laneCursor.ack = Math.max(laneCursor.ack, acknowledgedThrough);
+      current.ack = Math.max(Number(current.ack || 0), acknowledgedThrough);
+    }
+  }
+  state.commandDeliveryCursors.set(normalizedHostId, current);
+  return true;
+}
+
+function commandDeliveryWatermark(hostId, agentInstanceId = '', leaseId = '', lane = null) {
+  const current = hostCommandDeliveryCursor(hostId, agentInstanceId, leaseId, { create: false });
+  if (!current) return 0;
+  const normalizedLane = normalizeCommandLane(lane) || 'legacy';
+  return Number(current.lanes?.[normalizedLane]?.deliveredThrough || 0) || 0;
+}
+
+function boundedCommandCursorForDelivery(
+  hostId,
+  value,
+  agentInstanceId = '',
+  leaseId = '',
+  lane = null,
+  options = {}
+) {
+  const numeric = Number(value);
+  if (options.allowShutdownSentinel === true && numeric === Number.MAX_SAFE_INTEGER) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  const normalized = normalizedCommandCursor(numeric);
+  if (normalized === null) return 0;
+  const watermark = commandDeliveryWatermark(hostId, agentInstanceId, leaseId, lane);
+  return Math.min(normalized, watermark);
+}
+
+function recordHostCommandDelivery(hostId, agentInstanceId, leaseId, lane, commands) {
+  const deliveredCommandIds = (Array.isArray(commands) ? commands : [])
+    .map((command) => Number(command?.id || 0))
+    .filter((id) => Number.isSafeInteger(id) && id > 0 && id < Number.MAX_SAFE_INTEGER);
+  return observeHostCommandDeliveryCursor(
+    hostId,
+    agentInstanceId,
+    0,
+    0,
+    lane,
+    { leaseId, deliveredCommandIds }
+  );
+}
+
+function observedHostCommandAfter(hostId) {
+  return Number(state.commandDeliveryCursors.get(String(hostId || '').trim())?.after || 0) || 0;
+}
+
+function canonicalSessionIdFromKey(hostId, canonicalKey) {
+  const prefix = `${String(hostId || '').trim()}::`;
+  const value = String(canonicalKey || '').trim();
+  return value.startsWith(prefix) ? value.slice(prefix.length) : value;
+}
+
+function queuedRunnerRetirementCommand(hostId, retirementId) {
+  return (state.commandQueues.get(hostId) || []).find((command) => (
+    command?.type === 'session.stop'
+      && String(command.retirementId || '').trim() === String(retirementId || '').trim()
+  )) || null;
+}
+
+function queuedStaleSessionStopCommand(hostId, sessionId, runId) {
+  const normalizedSessionId = String(sessionId || '').trim();
+  const normalizedRunId = String(runId || '').trim();
+  if (!normalizedSessionId || !normalizedRunId) return null;
+  return (state.commandQueues.get(hostId) || []).find((command) => (
+    command?.type === 'session.stop'
+      && !command.retirementId
+      && String(command.runId || '').trim() === normalizedRunId
+      && String(command.requestedSessionId || command.sessionId || '').trim() === normalizedSessionId
+  )) || null;
+}
+
+function reserveRunnerRetirementCommandId(hostId, commandId) {
+  const normalizedHostId = String(hostId || '').trim();
+  const id = Number(commandId || 0);
+  if (!normalizedHostId || !Number.isSafeInteger(id) || id <= 0) return;
+  let reservations = runnerRetirementCommandReservations.get(normalizedHostId);
+  if (!reservations) {
+    reservations = new Set();
+    runnerRetirementCommandReservations.set(normalizedHostId, reservations);
+  }
+  reservations.add(id);
+}
+
+function releaseRunnerRetirementCommandId(hostId, commandId) {
+  const normalizedHostId = String(hostId || '').trim();
+  const id = Number(commandId || 0);
+  const reservations = runnerRetirementCommandReservations.get(normalizedHostId);
+  if (!reservations || !Number.isSafeInteger(id) || id <= 0) return;
+  reservations.delete(id);
+  if (!reservations.size) runnerRetirementCommandReservations.delete(normalizedHostId);
+}
+
+function reservedRunnerRetirementCommandId(hostId) {
+  const reservations = runnerRetirementCommandReservations.get(String(hostId || '').trim());
+  if (!reservations?.size) return null;
+  return Math.min(...reservations);
+}
+
+function withRunnerRetirementEnqueueLock(hostId, retirementId, task) {
+  const key = String(hostId || '').trim() + '::' + String(retirementId || '').trim();
+  const previous = runnerRetirementEnqueueLocks.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  const safe = current.then(() => undefined, () => undefined);
+  const settled = safe.finally(() => {
+    if (runnerRetirementEnqueueLocks.get(key) === settled) {
+      runnerRetirementEnqueueLocks.delete(key);
+    }
+  });
+  // Keep the chain itself resolved so a failed reconciliation cannot create an
+  // unhandled rejection for the next trigger.
+  runnerRetirementEnqueueLocks.set(key, settled);
+  return current;
+}
+
+async function enqueueRunnerRetirement(hostId, retirement, options = {}) {
+  const normalizedHostId = String(hostId || retirement?.hostId || '').trim();
+  const retirementId = String(retirement?.retirementId || '').trim();
+  const runId = String(retirement?.runId || '').trim();
+  if (!normalizedHostId || !retirementId || !runId) return null;
+  return withRunnerRetirementEnqueueLock(normalizedHostId, retirementId, async () => {
+    const host = state.hosts.get(normalizedHostId);
+    // A runless/legacy Host cannot safely identify the superseded process.
+    if (host?.capabilities?.runApiBinding !== true) {
+      return null;
+    }
+
+    // Re-read inside the lock. Registration/heartbeat/discovery often hand us
+    // a stale snapshot, and using it here would allow a second attempt after a
+    // concurrent trigger has already claimed the intent.
+    const freshRetirement = state.provenance
+      ?.listRunnerRetirements({ hostId: normalizedHostId })
+      .find((candidate) => candidate.retirementId === retirementId) || retirement;
+    if (!freshRetirement || freshRetirement.status === 'succeeded' || freshRetirement.status === 'blocked') {
+      return null;
+    }
+    const nextAt = Date.parse(String(freshRetirement.nextAttemptAt || ''));
+    const clockNow = typeof state.provenance?.clockNow === 'function'
+      ? state.provenance.clockNow().ms
+      : Date.now();
+    if (options.force !== true && Number.isFinite(nextAt) && nextAt > clockNow) return null;
+    const queued = queuedRunnerRetirementCommand(normalizedHostId, retirementId);
+    if (queued && options.force !== true) return null;
+
+    const sessionId = canonicalSessionIdFromKey(normalizedHostId, freshRetirement.canonicalKey);
+    // Reserve the command id before yielding to the durable transaction.  This
+    // lets the attempt record carry the exact id that the Host will receive.
+    let reservedCommandId = state.nextCommandId++;
+    reserveRunnerRetirementCommandId(normalizedHostId, reservedCommandId);
+    let command = null;
+    let attempt = null;
+    try {
+      attempt = await state.provenance.markRunnerRetirementAttempt({
+        identity: { hostId: normalizedHostId, sessionId },
+        retirementId,
+        runId: freshRetirement.runId,
+        commandId: reservedCommandId,
+        ackTimeoutMs: RUNNER_RETIREMENT_ACK_TIMEOUT_MS,
+      });
+      if (attempt?.transitioned !== true || attempt?.retirement?.status === 'blocked') return null;
+      // A poll that began just before the reservation may already have
+      // advanced the Host cursor past this ID. Reassign the durable command
+      // identity above that cursor without consuming another retry attempt.
+      const observedAfter = observedHostCommandAfter(normalizedHostId);
+      if (observedAfter >= reservedCommandId) {
+        const replacementCommandId = Math.max(
+          state.nextCommandId++,
+          observedAfter + 1
+        );
+        await state.provenance.reassignRunnerRetirementCommand({
+          identity: { hostId: normalizedHostId, sessionId },
+          retirementId,
+          runId: freshRetirement.runId,
+          expectedCommandId: reservedCommandId,
+          commandId: replacementCommandId,
+        });
+        releaseRunnerRetirementCommandId(normalizedHostId, reservedCommandId);
+        reservedCommandId = replacementCommandId;
+        reserveRunnerRetirementCommandId(normalizedHostId, reservedCommandId);
+      }
+      if (queued) {
+        removeQueuedCommandById(normalizedHostId, queued.id, 'session.stop');
+      }
+      command = enqueueCommand(normalizedHostId, {
+        type: 'session.stop',
+        sessionId,
+        requestedSessionId: sessionId,
+        runId: freshRetirement.runId,
+        retirementId,
+        suppressTerminalEvent: true,
+        reason: freshRetirement.reason || 'native-rebind-confirmed',
+      }, { commandId: reservedCommandId });
+      return command;
+    } catch (error) {
+      if (command) removeQueuedCommandById(normalizedHostId, command.id, 'session.stop');
+      // The durable claim happened before queue insertion. Convert a queue
+      // failure into a retryable state instead of leaving the intent marked as
+      // attempted forever.
+      if (attempt?.transitioned === true) {
+        try {
+          await state.provenance.markRunnerRetirementFailed({
+            identity: { hostId: normalizedHostId, sessionId },
+            retirementId,
+            runId: freshRetirement.runId,
+            code: 'session_retirement_enqueue_failed',
+            message: error?.message || 'The retirement Stop command could not be queued.',
+            commandId: reservedCommandId,
+          });
+        } catch (rollbackError) {
+          console.error('[relay] failed to record retirement enqueue failure ' + retirementId + ': ' + (rollbackError.message || rollbackError));
+        }
+      }
+      throw error;
+    } finally {
+      releaseRunnerRetirementCommandId(normalizedHostId, reservedCommandId);
+    }
+  });
+}
+
+async function reconcileRunnerRetirementsAfterRestart(hostId = '', options = {}) {
+  if (!state.provenance) return 0;
+  let retirements;
+  try {
+    retirements = state.provenance.listRunnerRetirements({
+      hostId: String(hostId || '').trim() || undefined,
+      dueOnly: true,
+    });
+  } catch (error) {
+    console.error('[relay] failed to list runner retirements: ' + (error.message || error));
+    return 0;
+  }
+  let queued = 0;
+  for (const retirement of retirements) {
+    try {
+      if (await enqueueRunnerRetirement(retirement.hostId, retirement, options)) queued += 1;
+    } catch (error) {
+      console.error(`[relay] failed to queue runner retirement ${retirement.retirementId}: ${error.message || error}`);
+    }
+  }
+  return queued;
+}
+
+function scheduleRunnerRetirementReconcile(hostId = '', options = {}) {
+  const task = reconcileRunnerRetirementsAfterRestart(hostId, options).catch((error) => {
+    console.error('[relay] runner-retirement reconciliation failed:', error?.stack || error);
+    return 0;
+  });
+  return trackRelayBackgroundTask(task);
 }
 
 function commandPriority(command) {
@@ -14402,10 +15913,15 @@ function managedDiscoveryRunKey(hostId, sessionId, runId) {
 const RUNLESS_MANAGED_DISCOVERY_PRESENCE = Symbol('runless-managed-discovery-presence');
 
 function noteManagedDiscoveryRunPresence(presence, session, options = {}) {
-  if (!session?.live || session.source !== 'managed') {
+  const pendingStart = options.allowPendingStart === true
+    && session?.managedStartPending === true;
+  if ((!session?.live && !pendingStart) || session.source !== 'managed') {
     return;
   }
   const runId = String(session.runId || session.runtime?.runId || '').trim();
+  if (pendingStart && !runId) {
+    return;
+  }
   if (!runId && options.allowRunlessWildcard !== true) {
     return;
   }
@@ -14559,6 +16075,10 @@ async function closeManagedSessionsMissingFromDiscovery(hostId, managedRunPresen
       noteManagedRunPresent(evaluation, missingKey);
       continue;
     }
+    if (stalePendingStart && queuedManagedLaunchCommand(hostId, runId)) {
+      noteManagedRunPresent(evaluation, missingKey);
+      continue;
+    }
     if (session.state === 'starting' && sessionAgeMs(session, run) < STALE_MANAGED_SESSION_GRACE_MS) {
       noteManagedRunPresent(evaluation, missingKey);
       continue;
@@ -14650,8 +16170,8 @@ async function closeManagedSessionsMissingFromDiscovery(hostId, managedRunPresen
       closedCount += 1;
     }
   }
-  const snapshot = state.sessionRecordStore?.readSnapshot();
-  for (const [canonicalKey, record] of Object.entries(snapshot?.records || {})) {
+  const activeRuns = state.sessionRecordStore?.readActiveManagedRunEntries(hostId) || [];
+  for (const { canonicalKey, record } of activeRuns) {
     if (record?.hostId !== hostId || record.source !== 'managed') {
       continue;
     }
@@ -15246,10 +16766,38 @@ function updateCodexOperationSessionProgress(operation, input = {}) {
   return patchCodexUpdateOperation(operation, { sessions });
 }
 
-function getCommands(hostId, afterId = 0) {
+function getCommands(hostId, afterId = 0, lane = null) {
   const queue = pruneCommandQueue(state.commandQueues.get(hostId) || []);
   state.commandQueues.set(hostId, queue);
-  return sortCommandsForDelivery(queue.filter((command) => command.id > afterId));
+  const normalizedAfterId = Number(afterId || 0) || 0;
+  // An omitted lane is the legacy protocol: return the complete FIFO stream.
+  // Explicit lanes are opt-in so an older Agent never loses commands merely
+  // because it does not understand the lane query parameter.
+  const normalizedLane = normalizeCommandLane(lane);
+  const canRetireRunners = state.hosts.get(hostId)?.capabilities?.runApiBinding === true;
+  // Keep the first exact-run cleanup command as a delivery barrier while a
+  // legacy/downgraded Host cannot safely identify the superseded process. This
+  // prevents its monotonic cursor from advancing past the hidden retirement.
+  const retirementBarrier = !canRetireRunners
+    ? queue
+      .filter((command) => command?.retirementId)
+      .sort((left, right) => Number(left?.id || 0) - Number(right?.id || 0))[0]
+    : null;
+  const reservedRetirementId = reservedRunnerRetirementCommandId(hostId);
+  const retirementBarrierId = Math.min(
+    ...[retirementBarrier?.id, reservedRetirementId]
+      .map((value) => Number(value || 0))
+      .filter((value) => Number.isSafeInteger(value) && value > 0)
+  );
+  return sortCommandsForDelivery(queue.filter((command) => {
+    const commandId = Number(command?.id || 0);
+    if (commandId <= normalizedAfterId) return false;
+    if (Number.isSafeInteger(retirementBarrierId) && commandId >= retirementBarrierId) return false;
+    if (normalizedLane && !commandBelongsToLane(command, normalizedLane)) {
+      return false;
+    }
+    return true;
+  }));
 }
 
 function sortCommandsForDelivery(commands) {
@@ -15269,7 +16817,42 @@ function pruneCommandQueue(queue) {
   if (fresh.length <= COMMAND_QUEUE_MAX_LENGTH) {
     return fresh;
   }
-  return fresh.slice(fresh.length - COMMAND_QUEUE_MAX_LENGTH);
+
+  // Capacity pressure must never silently discard Stop, Interrupt, approval,
+  // or shutdown commands. Keep every control-lane command, then spend the
+  // remaining bounded capacity on the highest-priority, newest normal-lane
+  // commands. Reconstruct from the original array so delivery remains in
+  // monotonic command-id order.
+  const retainedIndexes = new Set();
+  const normalCandidates = [];
+  for (let index = 0; index < fresh.length; index += 1) {
+    const command = fresh[index];
+    if (commandBelongsToLane(command, 'control')) {
+      retainedIndexes.add(index);
+      continue;
+    }
+    const explicitPriority = Number(command?.priority);
+    normalCandidates.push({
+      index,
+      priority: Number.isFinite(explicitPriority)
+        ? explicitPriority
+        : commandPriority(command),
+    });
+  }
+
+  const remainingCapacity = Math.max(
+    0,
+    COMMAND_QUEUE_MAX_LENGTH - retainedIndexes.size
+  );
+  normalCandidates
+    .sort((left, right) => (
+      left.priority - right.priority
+      || right.index - left.index
+    ))
+    .slice(0, remainingCapacity)
+    .forEach(({ index }) => retainedIndexes.add(index));
+
+  return fresh.filter((_, index) => retainedIndexes.has(index));
 }
 
 function purgeLegacySkillMutationCommands(queue) {
@@ -15287,21 +16870,62 @@ function purgeLegacySkillMutationCommands(queue) {
   });
 }
 
-function ackCommands(hostId, throughId = 0) {
-  const id = Number(throughId || 0) || 0;
-  if (!hostId || id <= 0) {
+function ackCommands(hostId, throughId = 0, lane = null, identity = null) {
+  const requestedId = Number(throughId || 0) || 0;
+  if (!hostId || requestedId <= 0) {
+    return 0;
+  }
+  const normalizedLane = normalizeCommandLane(lane);
+  const enforceDeliveryWatermark = Boolean(identity && typeof identity === 'object');
+  const agentInstanceId = enforceDeliveryWatermark ? identity.agentInstanceId || '' : '';
+  const leaseId = enforceDeliveryWatermark ? identity.leaseId || '' : '';
+  const id = enforceDeliveryWatermark
+    ? boundedCommandCursorForDelivery(
+      hostId,
+      requestedId,
+      agentInstanceId,
+      leaseId,
+      normalizedLane
+    )
+    : normalizedCommandCursor(requestedId) || 0;
+  if (id <= 0) {
     return 0;
   }
   const queue = state.commandQueues.get(hostId) || [];
+  const canRetireRunners = state.hosts.get(hostId)?.capabilities?.runApiBinding === true;
   if (queue.some((command) => (
     command?.type === 'session.input'
     && command.clientRequestId
     && Number(command.id || 0) <= id
+    && (!normalizedLane || commandBelongsToLane(command, normalizedLane))
   ))) {
     state.inputCommandOutbox.ackThrough(hostId, id);
   }
-  const next = pruneCommandQueue(queue.filter((command) => Number(command?.id || 0) > id));
+  const next = pruneCommandQueue(queue.filter((command) => {
+    const commandId = Number(command?.id || 0);
+    if (commandId > id) return true;
+    // Explicit lane ACKs may only remove commands delivered through that
+    // lane. A control ACK must never discard an older normal command (or vice
+    // versa) that was intentionally skipped by its poller.
+    if (normalizedLane && !commandBelongsToLane(command, normalizedLane)) return true;
+    // Do not let a legacy/downgraded Host ACK away an exact-run cleanup it
+    // was deliberately prevented from receiving.
+    if (!canRetireRunners && command?.retirementId) return true;
+    return false;
+  }));
   state.commandQueues.set(hostId, next);
+  if (enforceDeliveryWatermark) {
+    const cursor = hostCommandDeliveryCursor(hostId, agentInstanceId, leaseId, { create: false });
+    if (cursor) {
+      cursor.lanes ||= {};
+      const laneKey = normalizedLane || 'legacy';
+      const laneCursor = cursor.lanes[laneKey] || { after: 0, ack: 0 };
+      laneCursor.ack = Math.max(Number(laneCursor.ack || 0), id);
+      cursor.lanes[laneKey] = laneCursor;
+      cursor.ack = Math.max(Number(cursor.ack || 0), id);
+      state.commandDeliveryCursors.set(hostId, cursor);
+    }
+  }
   return Math.max(0, queue.length - next.length);
 }
 
@@ -15619,9 +17243,13 @@ function removeSessionSubscriber(res) {
 function serveStatic(req, res, pathname) {
   const relative = pathname === '/' ? '/index.html' : pathname;
   const safePath = path.normalize(relative).replace(/^(\.\.[/\\])+/, '');
-  const filePath = path.join(PUBLIC_DIR, safePath);
+  // This exact public asset is shared by Host, Relay and browser capability parsing.
+  const isModelReasoningAsset = relative === '/model-reasoning.js';
+  const filePath = isModelReasoningAsset
+    ? path.join(__dirname, '..', '..', 'shared', 'model-reasoning.js')
+    : path.join(PUBLIC_DIR, safePath);
 
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  if (!isModelReasoningAsset && !filePath.startsWith(PUBLIC_DIR)) {
     sendJson(res, 403, { error: 'forbidden' });
     return true;
   }
@@ -15663,6 +17291,8 @@ function sendSessionContractError(res, error, fallbackStage = 'session-launch') 
     currentRunStatus: error?.currentRunStatus || null,
     currentBindingFingerprint: error?.currentBindingFingerprint || null,
     canRebind: Boolean(error?.canRebind),
+    canTranscriptFallback: Boolean(error?.canTranscriptFallback),
+    requiresExplicitTranscriptFallback: Boolean(error?.requiresExplicitTranscriptFallback),
     clientRequestId: normalizeClientRequestId(error?.clientRequestId) || null,
     preparingClientRequestId: normalizeClientRequestId(error?.preparingClientRequestId) || null,
     preparingSince: error?.preparingSince || null,
@@ -15671,6 +17301,17 @@ function sendSessionContractError(res, error, fallbackStage = 'session-launch') 
       ? Math.max(0, Number(error.retryAfterMs))
       : null,
     safeToRetry: error?.safeToRetry === true,
+    reason: error?.reason || null,
+    phase: error?.phase || null,
+    currentTurnStatus: error?.currentTurnStatus || null,
+    activeTurnId: error?.activeTurnId || null,
+    pendingClientRequestId: normalizeClientRequestId(error?.pendingClientRequestId) || null,
+    queuedCommandId: Number.isSafeInteger(Number(error?.queuedCommandId))
+      && Number(error.queuedCommandId) > 0
+      ? Number(error.queuedCommandId)
+      : null,
+    inputOutcome: error?.inputOutcome || null,
+    launchOutcome: error?.launchOutcome || null,
   });
 }
 
@@ -15770,6 +17411,21 @@ function assertRebindRunExpectation(record, body = {}) {
   const activeRunId = String(record?.activeRunId || '').trim() || null;
   const activeRun = activeRunId ? record?.runs?.[activeRunId] || null : null;
   if (activeRun?.status === 'pending') {
+    if (activeRunId !== expectedRunId) {
+      throw new SessionContractError(
+        'session_run_changed',
+        'The Session run changed after it was loaded. Reload it before retrying this operation.',
+        {
+          statusCode: 409,
+          currentRunId: activeRunId,
+          currentRunStatus: 'pending',
+          currentBindingFingerprint: bindingFingerprint(activeRun.apiBinding),
+          expectedRunId,
+          expectedRunStatus,
+          expectedBindingFingerprint: String(body.expectedBindingFingerprint || '').trim() || null,
+        }
+      );
+    }
     throw new SessionContractError(
       'session_run_pending',
       `Run ${activeRunId} is still pending for this Session.`,
@@ -16061,12 +17717,13 @@ async function failPlannedRun(hostId, sessionId, runId, error) {
     return { transitioned: false, missing: true };
   }
   try {
-    return await state.provenance.failRun({
+    const result = await state.provenance.failRun({
       identity: { hostId, sessionId },
       runId,
       code: error?.code || 'session_spawn_failed',
       message: error?.message || 'Session launch failed.',
     });
+    return result;
   } catch (failError) {
     if (failError?.code === 'session_run_not_found') {
       return { transitioned: false, missing: true };
@@ -16176,17 +17833,50 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     assertNoExplicitRebindRuntimeOverride(body);
   }
 
+  const acceptedReplayBinding = acceptedManagedLaunchReplayBinding(
+    hostId,
+    targetSessionId,
+    runId,
+    clientRequestId
+  );
   let submittedBinding;
   try {
-    submittedBinding = acceptedManagedLaunchReplayBinding(
-      hostId,
-      targetSessionId,
-      runId,
-      clientRequestId
-    ) || await resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind);
+    submittedBinding = acceptedReplayBinding
+      || await resolveLaunchBinding(hostId, apiConfig, sourceRecord, explicitRebind);
   } catch (error) {
     throw stageSessionError(error, 'resolve-binding');
   }
+
+  // A stale browser must receive the run-precondition error before any API
+  // binding comparison. This keeps the response about the observed Session
+  // identity and avoids revealing or probing a replacement provider.
+  if (explicitRebind && !acceptedReplayBinding) {
+    try {
+      assertRebindRunExpectation(sourceRecord, body);
+    } catch (error) {
+      throw stageSessionError(error, 'plan-run');
+    }
+  }
+
+  const nativeThreadId = String(
+    body.nativeThreadId
+    || sourceSession?.nativeThreadId
+    || sourceSession?.sessionId
+    || ''
+  ).trim() || null;
+  // An explicit Rebind is adaptive: a ready source run with a native thread is
+  // still a candidate for native resume even when the local compatibility
+  // fingerprints differ or are unavailable. The Host/app-server is the
+  // authority that can determine whether the rollout is actually resumable.
+  // Only records that cannot provide a native candidate are forced fresh.
+  const nativeResumeCandidate = explicitRebind
+    && Boolean(sourceRun)
+    && sourceRun.nativeResumeReady !== false
+    && Boolean(nativeThreadId);
+  const forceFreshRebind = explicitRebind && (
+    !nativeResumeCandidate
+  );
+  const plannedLaunchMode = forceFreshRebind ? 'fresh_rebind' : launchMode;
 
   const conversationKey = String(
     body.conversationKey
@@ -16201,12 +17891,7 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     || sourceSessionId
     || ''
   ).trim() || null;
-  const nativeThreadId = String(
-    body.nativeThreadId
-    || sourceSession?.nativeThreadId
-    || sourceSession?.sessionId
-    || ''
-  ).trim() || null;
+  const catalogNativeThreadId = nativeThreadId;
   const identity = {
     hostId,
     sessionId: targetSessionId,
@@ -16222,11 +17907,14 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     ...(submittedEffort && body.allowUnverifiedEffort === true ? { allowUnverifiedEffort: true } : {}),
     source: String(body.selectionSource || 'user').trim() || 'user',
   } : undefined;
-  const requestFingerprint = clientRequestId ? managedLaunchRequestFingerprint({
+  const fingerprintLaunchRequest = explicitRebind
+    ? managedRebindRequestFingerprint
+    : managedLaunchRequestFingerprint;
+  const requestFingerprint = clientRequestId ? fingerprintLaunchRequest({
     hostId,
     targetSessionId,
     sourceSessionId,
-    launchMode,
+    launchMode: plannedLaunchMode,
     cwd,
     conversationKey,
     originSessionId,
@@ -16237,7 +17925,7 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     body,
   }) : '';
 
-  if (explicitRebind && body.requireIdle === true) {
+  if (explicitRebind && !acceptedReplayBinding && body.requireIdle === true) {
     try {
       assertIdleBatchRebind(hostId, sourceSessionId, targetSessionId, sourceSession);
     } catch (error) {
@@ -16252,7 +17940,8 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
       sourceIdentity: sourceSessionId ? { hostId, sessionId: sourceSessionId } : null,
       conversationKey,
       runId,
-      launchMode,
+      launchMode: plannedLaunchMode,
+      forceFreshRebind,
       clientRequestId,
       requestFingerprint,
       submittedBinding,
@@ -16280,7 +17969,7 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     sourceDetail,
     sourceSession,
     cwd,
-    launchMode: planned.run.launchMode || launchMode,
+    launchMode: planned.run.launchMode || plannedLaunchMode,
     runId,
     conversationKey,
     originSessionId,
@@ -16289,6 +17978,8 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
     apiProfile: summarizeApiConfig(apiConfig),
     planned,
     explicitRebind,
+    forceFreshRebind,
+    forceTranscriptFallback: planned.run.transcriptFallback === true,
     clientRequestId: clientRequestId || null,
     idempotentReplay: planned.idempotentReplay === true,
   };
@@ -16310,7 +18001,7 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
         hostId,
         identity,
         sessionId: targetSessionId,
-        nativeThreadId,
+        nativeThreadId: catalogNativeThreadId,
         bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
         runId,
         liveRunId: planned.run.parentRunId || null,
@@ -16353,7 +18044,7 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
         hostId,
         identity,
         sessionId: targetSessionId,
-        nativeThreadId,
+        nativeThreadId: catalogNativeThreadId,
         bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
         runId,
         liveRunId: planned.run.parentRunId || null,
@@ -16373,7 +18064,7 @@ async function planManagedLaunch(hostId, body = {}, options = {}) {
         hostId,
         identity,
         sessionId: targetSessionId,
-        nativeThreadId,
+        nativeThreadId: catalogNativeThreadId,
         bindingFingerprint: planned.run.apiBinding.bindingFingerprint,
         runId,
         liveRunId: planned.run.parentRunId || null,
@@ -16436,6 +18127,15 @@ async function validateManagedRebind(hostId, sourceSessionId, body = {}) {
   } catch (error) {
     throw stageSessionError(error, 'resolve-binding');
   }
+
+  // Native Rebind is optimistic. Fingerprints are useful diagnostics, but
+  // they are not a proof that two API profiles cannot share a rollout. Let
+  // the Host/app-server attempt thread/resume and report an actual failure.
+  let nativeResumeDecision = assessNativeResumeCompatibility(
+    observed.run?.apiBinding,
+    submittedBinding,
+    observed.run
+  );
 
   const proposedRunId = String(body.runId || '').trim() || null;
   if (proposedRunId && observed.record?.runs?.[proposedRunId]) {
@@ -16510,6 +18210,11 @@ async function validateManagedRebind(hostId, sourceSessionId, body = {}) {
   } catch (error) {
     throw stageSessionError(error, 'plan-run');
   }
+  nativeResumeDecision = assessNativeResumeCompatibility(
+    observed.run?.apiBinding,
+    submittedBinding,
+    observed.run
+  );
 
   const runtime = state.sessionRuntime.get(resolveSessionKey(hostId, sourceSession.sessionId || sourceSessionId))
     || state.sessionRuntime.get(sessionKey(hostId, sourceSessionId))
@@ -16535,6 +18240,20 @@ async function validateManagedRebind(hostId, sourceSessionId, body = {}) {
     ),
     catalog,
   });
+  const {
+    nativeResumeReady,
+    nativeResumeReadyKnown,
+  } = nativeResumeDecision;
+  // A different compatibility fingerprint is not proof of incompatibility.
+  // If the source has a native rollout and a native thread identity, report
+  // an attempted native Rebind; the Host/app-server will reject it if the
+  // upstream history format is actually unsupported.
+  const nativeResumeAttemptable = Boolean(
+    observed.run
+      && nativeResumeReady !== false
+      && (String(body.nativeThreadId || sourceSession.nativeThreadId || observed.record?.nativeThreadId || '').trim())
+  );
+  const validationLaunchMode = nativeResumeAttemptable ? 'resume' : 'fresh_rebind';
   return {
     ok: true,
     valid: true,
@@ -16553,9 +18272,15 @@ async function validateManagedRebind(hostId, sourceSessionId, body = {}) {
       || sourceSessionId,
     currentRunId: observed.runId,
     currentRunStatus: observed.runStatus,
-    nativeResumeReady: observed.run?.nativeResumeReady !== false,
-    nativeResumeReadyKnown: typeof observed.run?.nativeResumeReady === 'boolean',
-    launchMode: observed.run?.nativeResumeReady === false ? 'fresh_rebind' : 'resume',
+    nativeResumeReady,
+    nativeResumeReadyKnown,
+    launchMode: validationLaunchMode,
+    resumeStrategy: validationLaunchMode === 'resume' ? 'native_resume' : 'fresh',
+    nativeResumeAttemptable,
+    nativeResumeCompatibility: nativeResumeDecision.reason,
+    crossApiTranscriptFallback: false,
+    requiresExplicitTranscriptFallback: false,
+    canTranscriptFallback: sessionCanTranscriptFallback(hostId, sourceSessionId),
     sessionBinding: publicBinding(observed.run?.apiBinding),
     submittedBinding: publicBinding(submittedBinding),
     requestedSelection,
@@ -16608,17 +18333,32 @@ async function enqueueManagedLaunch(plan, body = {}) {
     }
   }
   const createdAt = nowIso();
-  const resumeTranscript = plan.launchMode === 'transcript_fallback' && plan.sourceDetail
+  const usesTranscriptFallback = plan.forceTranscriptFallback === true
+    || plan.planned.run?.transcriptFallback === true
+    || plan.launchMode === 'transcript_fallback';
+  const resumeTranscript = usesTranscriptFallback && plan.sourceDetail
     ? buildResumeTranscript(plan.sourceDetail.transcript)
     : [];
   const requestedSelection = plan.planned.run.requestedSelection || {};
   const parentRunId = String(plan.planned.run.parentRunId || '').trim() || null;
   const parentRun = parentRunId ? plan.planned.record?.runs?.[parentRunId] || null : null;
+  // Keep the previous runtime alive until the replacement native thread has
+  // actually been confirmed. If thread/resume fails, the pending run can be
+  // failed and the original live runner remains usable. Transcript fallback
+  // and fresh replacements retain the historical stop-before-start behavior.
+  const deferParentStop = Boolean(
+    plan.explicitRebind
+      && plan.launchMode === 'resume'
+      && !usesTranscriptFallback
+      && parentRun?.status === 'live'
+  );
 
-  if (parentRun?.status === 'live') {
+  if (parentRun?.status === 'live' && !deferParentStop) {
     beginSessionStop(plan.hostId, plan.targetSessionId, { runId: parentRunId });
   } else if (plan.explicitRebind && getSession(plan.hostId, plan.targetSessionId)?.live) {
-    beginSessionStop(plan.hostId, plan.targetSessionId);
+    if (!deferParentStop) {
+      beginSessionStop(plan.hostId, plan.targetSessionId);
+    }
   }
 
   upsertSession(plan.hostId, {
@@ -16635,7 +18375,7 @@ async function enqueueManagedLaunch(plan, body = {}) {
     launchMode: plan.launchMode,
     bridgeSessionId: plan.targetSessionId,
     runId: plan.runId,
-    nativeThreadId: plan.launchMode === 'fresh_rebind'
+    nativeThreadId: usesTranscriptFallback || plan.launchMode === 'fresh_rebind'
       ? null
       : plan.launchMode === 'resume'
         ? plan.nativeThreadId || plan.targetSessionId
@@ -16671,8 +18411,15 @@ async function enqueueManagedLaunch(plan, body = {}) {
     conversationKey: plan.conversationKey,
     launchMode: plan.launchMode,
     resumeTranscript,
-    nativeThreadId: plan.launchMode === 'fresh_rebind' ? null : plan.nativeThreadId,
-    rebindNativeThreadId: plan.explicitRebind ? plan.nativeThreadId : null,
+    nativeThreadId: usesTranscriptFallback || plan.launchMode === 'fresh_rebind'
+      ? null
+      : plan.nativeThreadId,
+    rebindNativeThreadId: plan.explicitRebind && !usesTranscriptFallback
+      && !plan.forceFreshRebind
+      && plan.planned.run?.nativeResumeReady !== false
+      ? plan.nativeThreadId
+      : null,
+    forceTranscriptFallback: usesTranscriptFallback,
     explicitRebind: plan.explicitRebind === true,
     apiConfig: plan.apiConfig,
     apiBinding: plan.planned.run.apiBinding?.kind === 'profile'
@@ -16688,7 +18435,9 @@ async function enqueueManagedLaunch(plan, body = {}) {
 }
 
 function queuedManagedLaunchCommand(hostId, runId) {
-  return (state.commandQueues.get(hostId) || []).find((command) => (
+  const queue = pruneCommandQueue(state.commandQueues.get(hostId) || []);
+  state.commandQueues.set(hostId, queue);
+  return queue.find((command) => (
     command?.type === 'session.start'
     && String(command.runId || '') === String(runId || '')
   )) || null;
@@ -16714,6 +18463,56 @@ function assertManagedLaunchReplayStillExists(plan) {
     'The original Session creation request is no longer queued or starting and cannot be replayed. Start a new Session instead.',
     { statusCode: 409, currentRunId: plan.runId, currentRunStatus: run.status }
   );
+}
+
+const managedLaunchRequestsInFlight = new Map();
+
+async function planAndEnqueueManagedLaunch(hostId, body, options = {}) {
+  const clientRequestId = normalizeClientRequestId(body.clientRequestId);
+  const namespace = options.explicitRebind ? `rebind:${options.sourceSessionId}` : 'start';
+  const requestKey = clientRequestId ? `${hostId}::${namespace}::${clientRequestId}` : null;
+  const previous = requestKey ? managedLaunchRequestsInFlight.get(requestKey) : null;
+  const pending = (async () => {
+    // A duplicate can arrive after the durable plan but before catalog checks
+    // and enqueue finish. Wait, then validate its own fingerprint normally.
+    if (previous) await previous.catch(() => {});
+    try {
+      const plan = await planManagedLaunch(hostId, body, { ...options, acceptClientRequestId: true });
+      const command = plan.idempotentReplay
+        ? queuedManagedLaunchCommand(hostId, plan.runId)
+        : await enqueueManagedLaunch(plan, body);
+      return { plan, command };
+    } catch (error) {
+      if (clientRequestId) {
+        const sourceSessionId = options.sourceSessionId || body.sourceSessionId || body.originSessionId;
+        const launchMode = options.launchMode || body.launchMode || (sourceSessionId ? 'resume' : 'fresh');
+        const targetSessionId = options.targetSessionId || body.sessionId || (
+          ['resume', 'fresh_rebind'].includes(launchMode)
+            ? sourceSessionId : deterministicLaunchUuid(hostId, clientRequestId, 'session')
+        );
+        const record = state.provenance.getSessionRecord({ hostId, sessionId: targetSessionId });
+        const accepted = Object.entries(record?.runs || {}).find(([, run]) => run?.clientRequestId === clientRequestId);
+        error.clientRequestId = clientRequestId;
+        error.launchOutcome = accepted
+          ? accepted[1].status === 'failed' ? 'failed' : 'acceptance_unknown'
+          : error instanceof SessionContractError || error instanceof ModelCatalogError
+            ? 'not_accepted' : 'acceptance_unknown';
+        if (accepted) {
+          error.currentRunId = accepted[0];
+          error.currentRunStatus = accepted[1].status;
+        }
+      }
+      throw error;
+    }
+  })();
+  if (requestKey) managedLaunchRequestsInFlight.set(requestKey, pending);
+  try {
+    return await pending;
+  } finally {
+    if (requestKey && managedLaunchRequestsInFlight.get(requestKey) === pending) {
+      managedLaunchRequestsInFlight.delete(requestKey);
+    }
+  }
 }
 
 async function handleRequest(req, res) {
@@ -16878,6 +18677,9 @@ async function handleRequest(req, res) {
       writable: false,
       revision: 0,
       snapshotError: null,
+      walError: null,
+      walErrorCode: null,
+      sentinelError: null,
       error: null,
     };
     const ok = relayReady && persistence.status !== 'failed';
@@ -18195,6 +19997,118 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/sessions\/[^/]+\/open-terminal$/)) {
+    const segments = url.pathname.split('/');
+    const hostId = decodeURIComponent(segments[3]);
+    const requestedSessionId = decodeURIComponent(segments[5]);
+    const body = await readBody(req);
+    const rawClientRequestId = String(body?.requestId || '').trim();
+    const clientRequestId = normalizeClientRequestId(rawClientRequestId);
+    if (rawClientRequestId && clientRequestId !== rawClientRequestId) {
+      sendJson(res, 400, {
+        ok: false,
+        opened: false,
+        code: 'terminal_request_invalid',
+        error: 'requestId must be at most 160 letters, numbers, dots, colons, underscores, or hyphens.',
+      });
+      return;
+    }
+    const capabilityError = getHostCapabilityError(
+      hostId,
+      'openTerminalV1',
+      'this Host Agent must be restarted with terminal-opening support'
+    );
+    if (capabilityError) {
+      sendJson(res, capabilityError.statusCode, {
+        ok: false,
+        opened: false,
+        error: capabilityError.error,
+      });
+      return;
+    }
+
+    const session = getSession(hostId, requestedSessionId);
+    if (!session) {
+      sendJson(res, 404, {
+        ok: false,
+        opened: false,
+        error: 'session not found',
+      });
+      return;
+    }
+    const cwd = String(session.cwd || '').trim();
+    if (!cwd) {
+      sendJson(res, 409, {
+        ok: false,
+        opened: false,
+        code: 'terminal_cwd_missing',
+        error: 'This Session has no known working directory.',
+      });
+      return;
+    }
+
+    const requestId = clientRequestId
+      ? deterministicLaunchUuid(hostId, clientRequestId, `open-terminal:${session.sessionId}`)
+      : makeId();
+    let pending;
+    try {
+      pending = awaitTerminalOpenRequest(requestId, {
+        hostId,
+        sessionId: session.sessionId,
+      });
+    } catch (error) {
+      sendJson(res, 409, {
+        ok: false,
+        opened: false,
+        hostId,
+        sessionId: session.sessionId,
+        clientRequestId: clientRequestId || null,
+        code: error.code || 'terminal_request_id_conflict',
+        error: error.message || 'terminal request ID conflicts with another pending request',
+      });
+      return;
+    }
+    if (pending.created) {
+      pending.record.command = enqueueCommand(hostId, {
+        type: 'host.open_terminal',
+        requestId,
+        clientRequestId: clientRequestId || null,
+        sessionId: session.sessionId,
+        cwd,
+      });
+    }
+    const command = pending.record.command;
+
+    try {
+      const result = await pending.promise;
+      const unavailable = new Set([
+        'terminal_cwd_missing',
+        'terminal_cwd_unavailable',
+        'terminal_cwd_not_directory',
+        'terminal_gui_unavailable',
+        'terminal_platform_unsupported',
+      ]).has(String(result?.code || ''));
+      sendJson(res, result?.ok === false ? (unavailable ? 409 : 502) : 200, {
+        ...result,
+        clientRequestId: clientRequestId || null,
+        commandId: command?.id || null,
+      });
+    } catch (error) {
+      sendJson(res, 504, {
+        ok: false,
+        opened: false,
+        hostId,
+        sessionId: session.sessionId,
+        requestId,
+        clientRequestId: clientRequestId || null,
+        cwd,
+        code: 'terminal_open_timeout',
+        error: error.message || 'terminal open request timed out',
+      });
+    }
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname.match(/^\/api\/hosts\/[^/]+\/files\/uploads$/)) {
     const hostId = decodeURIComponent(url.pathname.split('/')[3]);
     const capabilityError = getHostCapabilityError(
@@ -18725,6 +20639,11 @@ async function handleRequest(req, res) {
       sendJson(res, 404, { error: 'session not found' });
       return;
     }
+    const availabilityError = getSessionExportAvailabilityError(detail);
+    if (availabilityError) {
+      sendJson(res, availabilityError.statusCode, availabilityError.payload);
+      return;
+    }
 
     sendJson(res, 200, buildSessionExportSummary(detail));
     return;
@@ -18756,6 +20675,11 @@ async function handleRequest(req, res) {
     const detail = await getSessionDetailHydrated(hostId, sessionId, { fullTranscript: true, fullDiagnostics: true });
     if (!detail) {
       sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    const availabilityError = getSessionExportAvailabilityError(detail);
+    if (availabilityError) {
+      sendJson(res, availabilityError.statusCode, availabilityError.payload);
       return;
     }
 
@@ -18892,6 +20816,7 @@ async function handleRequest(req, res) {
       state.hostAgentLeases.delete(hostId);
     }
     state.commandQueues.delete(hostId);
+    state.commandDeliveryCursors.delete(hostId);
     const removedCanonicalKeys = new Set();
     for (const key of Array.from(state.sessions.keys())) {
       if (key.startsWith(`${hostId}::`)) {
@@ -18961,6 +20886,11 @@ async function handleRequest(req, res) {
       });
       return;
     }
+    resetHostCommandDeliveryCursor(
+      body.hostId,
+      body.agentInstanceId,
+      leaseRegistration.lease?.leaseId || ''
+    );
 
     const existingHost = state.hosts.get(body.hostId);
     const host = {
@@ -18977,6 +20907,10 @@ async function handleRequest(req, res) {
     };
     state.hosts.set(body.hostId, host);
     reconcileHostCodexMaintenance(body.hostId, body.codexMaintenance);
+    scheduleRunnerRetirementReconcile(body.hostId, {
+      force: existingHost?.capabilities?.runApiBinding !== true
+        && host.capabilities?.runApiBinding === true,
+    });
     attachMatchingConnectorsToHost(host);
     const registeredQueue = pruneCommandQueue(state.commandQueues.get(body.hostId) || []);
     state.commandQueues.set(
@@ -18991,6 +20925,8 @@ async function handleRequest(req, res) {
       ok: true,
       host,
       relayInstanceId: RELAY_INSTANCE_ID,
+      commandLanesV1: true,
+      discoveryPreviewV1: true,
       agentLeaseId: publicLease?.leaseId || null,
       agentLeaseExpiresAt: publicLease?.expiresAt || null,
       agentLeaseTtlMs: publicLease?.ttlMs || null,
@@ -19041,8 +20977,14 @@ async function handleRequest(req, res) {
       });
       return;
     }
+    resetHostCommandDeliveryCursor(
+      body.hostId,
+      leaseCredentials.agentInstanceId,
+      leaseHeartbeat.lease?.leaseId || ''
+    );
     const host = state.hosts.get(body.hostId);
     const hostWasKnown = Boolean(host);
+    const hadRunApiBinding = host?.capabilities?.runApiBinding === true;
     if (host) {
       host.label = body.label || host.label || body.hostId;
       host.platform = body.platform || host.platform || 'unknown';
@@ -19054,6 +20996,9 @@ async function handleRequest(req, res) {
       host.lastSeenAt = nowIso();
       state.hosts.set(body.hostId, host);
       reconcileHostCodexMaintenance(body.hostId, body.codexMaintenance);
+      scheduleRunnerRetirementReconcile(body.hostId, {
+        force: !hadRunApiBinding && host.capabilities?.runApiBinding === true,
+      });
       attachMatchingConnectorsToHost(host);
     } else if (body.hostId) {
       const nextHost = {
@@ -19079,6 +21024,7 @@ async function handleRequest(req, res) {
     sendJson(res, 200, {
       ok: true,
       relayInstanceId: RELAY_INSTANCE_ID,
+      commandLanesV1: true,
       agentLeaseId: publicLease?.leaseId || null,
       agentLeaseExpiresAt: publicLease?.expiresAt || null,
       agentLeaseTtlMs: publicLease?.ttlMs || null,
@@ -19116,6 +21062,12 @@ async function handleRequest(req, res) {
       });
       return;
     }
+    resetHostCommandDeliveryCursor(
+      hostId,
+      credentials.agentInstanceId,
+      credentials.leaseId,
+      { force: true }
+    );
     sendJson(res, 200, {
       ok: true,
       released: released.released,
@@ -19142,14 +21094,73 @@ async function handleRequest(req, res) {
 
     const clientRelayInstanceId = String(url.searchParams.get('relayInstanceId') || '').trim();
     const cursorBelongsToRelay = !clientRelayInstanceId || clientRelayInstanceId === RELAY_INSTANCE_ID;
-    const after = cursorBelongsToRelay ? Number(url.searchParams.get('after') || '0') : 0;
-    const ack = cursorBelongsToRelay
+    const rawLane = String(url.searchParams.get('lane') || '').trim();
+    const requestedLane = normalizeCommandLane(rawLane);
+    if (rawLane && !requestedLane) {
+      sendJson(res, 400, {
+        error: 'lane must be normal or control',
+        code: 'invalid_command_lane',
+        relayInstanceId: RELAY_INSTANCE_ID,
+        commandLanesV1: true,
+      });
+      return;
+    }
+    const pollCredentials = agentLeaseCredentials(req);
+    const requestedAfter = cursorBelongsToRelay
+      ? Number(url.searchParams.get('after') || '0')
+      : 0;
+    const requestedAck = cursorBelongsToRelay
       ? Number(url.searchParams.get('ack') || url.searchParams.get('lastProcessed') || '0')
       : 0;
-    const acked = ackCommands(hostId, ack);
-    const commands = getCommands(hostId, after);
+    const deliveryIdentity = {
+      agentInstanceId: pollCredentials.agentInstanceId,
+      leaseId: pollCredentials.leaseId,
+    };
+    // A client may only advance its cursor to a command id that this exact
+    // Agent lease/lane has actually received. Preserve MAX_SAFE_INTEGER only
+    // for the shutdown flush request; it is never a delivery watermark.
+    const after = boundedCommandCursorForDelivery(
+      hostId,
+      requestedAfter,
+      pollCredentials.agentInstanceId,
+      pollCredentials.leaseId,
+      requestedLane,
+      { allowShutdownSentinel: true }
+    );
+    const ackThrough = boundedCommandCursorForDelivery(
+      hostId,
+      requestedAck,
+      pollCredentials.agentInstanceId,
+      pollCredentials.leaseId,
+      requestedLane
+    );
+    const acked = ackCommands(hostId, requestedAck, requestedLane, deliveryIdentity);
+    const commands = getCommands(hostId, after, requestedLane);
+    recordHostCommandDelivery(
+      hostId,
+      pollCredentials.agentInstanceId,
+      pollCredentials.leaseId,
+      requestedLane,
+      commands
+    );
     markDeliveredSkillDeploymentCommands(hostId, commands);
-    sendJson(res, 200, { commands, acked, relayInstanceId: RELAY_INSTANCE_ID });
+    sendJson(res, 200, {
+      commands,
+      acked,
+      ackThrough,
+      ackClamped: Number.isFinite(requestedAck)
+        && requestedAck > 0
+        && ackThrough < requestedAck,
+      deliveryWatermark: commandDeliveryWatermark(
+        hostId,
+        pollCredentials.agentInstanceId,
+        pollCredentials.leaseId,
+        requestedLane
+      ),
+      relayInstanceId: RELAY_INSTANCE_ID,
+      commandLanesV1: true,
+      lane: requestedLane || 'legacy',
+    });
     return;
   }
 
@@ -19166,13 +21177,11 @@ async function handleRequest(req, res) {
       return;
     }
     try {
-      const plan = await planManagedLaunch(hostId, body, { acceptClientRequestId: true });
-      const command = plan.idempotentReplay
-        ? queuedManagedLaunchCommand(hostId, plan.runId)
-        : await enqueueManagedLaunch(plan, body);
+      const { plan, command } = await planAndEnqueueManagedLaunch(hostId, body);
       sendJson(res, 200, {
         ok: true,
         idempotentReplay: plan.idempotentReplay === true,
+        clientRequestId: plan.clientRequestId,
         sessionId: plan.targetSessionId,
         bridgeSessionId: plan.targetSessionId,
         runId: plan.runId,
@@ -19181,6 +21190,9 @@ async function handleRequest(req, res) {
         sourceSessionId: plan.sourceSessionId,
         conversationKey: plan.conversationKey,
         launchMode: plan.launchMode,
+        resumeStrategy: plan.forceTranscriptFallback ? 'transcript_fallback'
+          : plan.launchMode === 'resume' ? 'native_resume' : 'fresh',
+        transcriptFallback: plan.forceTranscriptFallback === true,
         sessionBinding: publicBinding(plan.planned.run.apiBinding),
         requestedSelection: plan.planned.run.requestedSelection,
         command: publicQueuedCommand(command),
@@ -19359,17 +21371,20 @@ async function handleRequest(req, res) {
       return;
     }
     try {
-      const currentRun = sessionRunRecord(hostId, sourceSessionId).run;
-      const launchMode = currentRun?.nativeResumeReady === false ? 'fresh_rebind' : 'resume';
-      const plan = await planManagedLaunch(hostId, body, {
+      // Start explicit Rebind planning from the adaptive mode. The provenance
+      // transaction upgrades it to native `resume` when the source has a
+      // resumable rollout; compatibility fingerprints are diagnostics only.
+      // A real upstream rejection is handled after the Host attempts resume.
+      const { plan, command } = await planAndEnqueueManagedLaunch(hostId, body, {
         sourceSessionId,
         targetSessionId: sourceSessionId,
-        launchMode,
+        launchMode: 'fresh_rebind',
         explicitRebind: true,
       });
-      const command = await enqueueManagedLaunch(plan, body);
       sendJson(res, 200, {
         ok: true,
+        idempotentReplay: plan.idempotentReplay === true,
+        clientRequestId: plan.clientRequestId,
         sessionId: plan.targetSessionId,
         bridgeSessionId: plan.targetSessionId,
         runId: plan.runId,
@@ -19378,6 +21393,9 @@ async function handleRequest(req, res) {
         sourceSessionId: plan.sourceSessionId,
         conversationKey: plan.conversationKey,
         launchMode: plan.launchMode,
+        resumeStrategy: plan.forceTranscriptFallback ? 'transcript_fallback'
+          : plan.launchMode === 'resume' ? 'native_resume' : 'fresh',
+        transcriptFallback: plan.forceTranscriptFallback === true,
         sessionBinding: publicBinding(plan.planned.run.apiBinding),
         requestedSelection: plan.planned.run.requestedSelection,
         modelCatalog: plan.catalog ? {
@@ -19438,6 +21456,9 @@ async function handleRequest(req, res) {
         sourceSessionId: plan.sourceSessionId,
         conversationKey: plan.conversationKey,
         launchMode: plan.launchMode,
+        resumeStrategy: plan.forceTranscriptFallback ? 'transcript_fallback'
+          : plan.launchMode === 'resume' ? 'native_resume' : 'fresh',
+        transcriptFallback: plan.forceTranscriptFallback === true,
         sessionBinding: publicBinding(plan.planned.run.apiBinding),
         requestedSelection: plan.planned.run.requestedSelection,
         command: publicQueuedCommand(command),
@@ -19545,16 +21566,22 @@ async function handleRequest(req, res) {
 
   if (req.method === 'POST' && url.pathname.match(/^\/api\/sessions\/[^/]+\/input$/)) {
     const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const inputTiming = createInputRequestTimer({ enabled: INPUT_REQUEST_TIMING_ENABLED });
+    const sendInputResponse = (statusCode, payload) => {
+      inputTiming.mark('response_prepare');
+      sendJson(res, statusCode, payload, inputTiming.headers());
+    };
     const body = await readBody(req);
+    inputTiming.mark('body_parse');
     const hostId = body.hostId;
     if (!hostId) {
-      sendJson(res, 400, { error: 'hostId is required' });
+      sendInputResponse(400, { error: 'hostId is required' });
       return;
     }
     const session = getSession(hostId, sessionId);
     const effectiveSessionId = session?.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
     if (!session) {
-      sendJson(res, 404, { error: 'session not found' });
+      sendInputResponse(404, { error: 'session not found' });
       return;
     }
     if (isSubagentSession(session) || session.readOnly === true) {
@@ -19570,10 +21597,11 @@ async function handleRequest(req, res) {
       return;
     }
     const inputFingerprint = inputRequestFingerprint(body);
+    inputTiming.mark('fingerprint');
     const rawInputRequestId = String(body.clientRequestId || '').trim();
     const providedInputRequestId = normalizeClientRequestId(rawInputRequestId);
     if (rawInputRequestId && providedInputRequestId !== rawInputRequestId) {
-      sendJson(res, 400, {
+      sendInputResponse(400, {
         error: 'clientRequestId must be at most 160 letters, numbers, dots, colons, underscores, or hyphens.',
       });
       return;
@@ -19589,7 +21617,8 @@ async function handleRequest(req, res) {
     try {
       const cachedInput = getCachedInputRequest(inputCacheKey, inputFingerprint);
       if (cachedInput) {
-        sendJson(res, 200, cachedInput);
+        inputTiming.mark('dedupe_lookup');
+        sendInputResponse(200, cachedInput);
         return;
       }
     } catch (error) {
@@ -19598,7 +21627,7 @@ async function handleRequest(req, res) {
     }
     const hostError = getHostUnavailableError(hostId);
     if (hostError) {
-      sendJson(res, hostError.statusCode, { error: hostError.error });
+      sendInputResponse(hostError.statusCode, { error: hostError.error });
       return;
     }
     const inputSessionRuntime = state.sessionRuntime.get(
@@ -19620,7 +21649,7 @@ async function handleRequest(req, res) {
       return;
     }
     if (!sessionAcceptsLiveControl(hostId, session)) {
-      sendJson(res, 409, { error: 'session is not live' });
+      sendInputResponse(409, { error: 'session is not live' });
       return;
     }
 
@@ -19645,7 +21674,8 @@ async function handleRequest(req, res) {
       try {
         const migratedCachedInput = getCachedInputRequest(inputCacheKey, inputFingerprint);
         if (migratedCachedInput) {
-          sendJson(res, 200, migratedCachedInput);
+          inputTiming.mark('dedupe_lookup');
+          sendInputResponse(200, migratedCachedInput);
           return;
         }
       } catch (error) {
@@ -19662,13 +21692,13 @@ async function handleRequest(req, res) {
     const transcriptText = summarizeTurnInput(displayText, inputItems, uploadedFiles)
       || summarizeTurnInput(text, inputItems, uploadedFiles);
     if (!transcriptText) {
-      sendJson(res, 400, { error: 'text or inputItems are required' });
+      sendInputResponse(400, { error: 'text or inputItems are required' });
       return;
     }
     const host = state.hosts.get(hostId);
     const hasImageInputItems = inputItems.some((item) => item.type === 'image' || item.type === 'localImage');
     if (hasImageInputItems && !host?.capabilities?.imageInput) {
-      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can receive image inputs' });
+      sendInputResponse(409, { error: 'this host agent needs to be restarted before it can receive image inputs' });
       return;
     }
     const advancedTurnControlRequested = Boolean(
@@ -19683,7 +21713,7 @@ async function handleRequest(req, res) {
       || (String(body.approvalPolicy || '').trim() && String(body.approvalPolicy || '').trim() !== 'on-request')
     );
     if (advancedTurnControlRequested && !host?.capabilities?.turnControls) {
-      sendJson(res, 409, { error: 'this host agent needs to be restarted before it can use Codex turn controls' });
+      sendInputResponse(409, { error: 'this host agent needs to be restarted before it can use Codex turn controls' });
       return;
     }
     try {
@@ -19700,6 +21730,7 @@ async function handleRequest(req, res) {
       const inlineImageFiles = cacheInlineImageInputFiles(hostId, sessionId, inputItems);
       const inlineTextFiles = cacheInlineTextFiles(hostId, sessionId, body.inlineFiles || body.inlineFileRefs || []);
       const transcriptFiles = normalizeFileTransferRefs([...uploadedFiles, ...inlineImageFiles, ...inlineTextFiles]);
+      inputTiming.mark('inline_cache');
       const transcriptTimestamp = nowIso();
       // No await is allowed between this check and enqueueCommand. The Relay's
       // event loop makes the check and durable enqueue one atomic operation.
@@ -19741,6 +21772,7 @@ async function handleRequest(req, res) {
           deliveryStatus: 'pending',
         },
       });
+      inputTiming.mark('outbox_durable');
       acceptedResponsePayload = {
         ok: true,
         clientRequestId: command.clientRequestId || null,
@@ -19807,6 +21839,7 @@ async function handleRequest(req, res) {
         pendingInputSummary: transcriptText.slice(0, 240),
         lastError: null,
         lastCodexError: null,
+        userFacingError: null,
         runId: liveRun.runId || null,
       });
       emitSessionDiagnostic(hostId, effectiveSessionId, {
@@ -19822,7 +21855,8 @@ async function handleRequest(req, res) {
           inputTypes: inputItems.map((item) => item.type),
         },
       });
-      sendJson(res, 200, acceptedResponsePayload);
+      inputTiming.mark('projection');
+      sendInputResponse(200, acceptedResponsePayload);
       if (!liveRun.compatibilityRuntime) {
         setImmediate(() => {
           recordLiveRequestedSelection(
@@ -19851,7 +21885,7 @@ async function handleRequest(req, res) {
         console.error(
           `[relay] input command ${acceptedResponsePayload.command?.id || '(unknown)'} was durably queued but its UI projection failed: ${error.message || error}`
         );
-        sendJson(res, 200, acceptedResponsePayload);
+        sendInputResponse(200, acceptedResponsePayload);
         return;
       }
       sendSessionContractError(res, error, 'queue-input-request');
@@ -19897,14 +21931,34 @@ async function handleRequest(req, res) {
       return;
     }
 
+    try {
+      assertSessionReviewAvailable(hostId, session);
+    } catch (error) {
+      sendSessionContractError(res, error, 'validate-review');
+      return;
+    }
+
+    const effectiveSessionId = session.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+    const runtime = sessionReviewRuntime(
+      hostId,
+      session,
+      sessionReviewIdentityKeys(hostId, session)
+    ) || {};
     const delivery = String(body.delivery || 'inline').trim() === 'detached' ? 'detached' : 'inline';
     const command = enqueueCommand(hostId, {
       type: 'session.review_start',
-      sessionId,
+      sessionId: effectiveSessionId,
+      requestedSessionId: sessionId,
+      nativeThreadId: session.nativeThreadId || null,
+      bridgeSessionId: session.bridgeSessionId || null,
+      originSessionId: session.originSessionId || null,
+      sourceSessionId: session.sourceSessionId || null,
+      conversationKey: session.conversationKey || null,
+      runId: session.runId || runtime.runId || null,
       target,
       delivery,
     });
-    emitSessionDiagnostic(hostId, sessionId, {
+    emitSessionDiagnostic(hostId, effectiveSessionId, {
       severity: 'info',
       source: 'ui',
       kind: 'control',
@@ -20108,24 +22162,97 @@ async function handleRequest(req, res) {
       return;
     }
 
+    const rawRequestId = String(body.requestId || '').trim();
+    const requestId = normalizeClientRequestId(rawRequestId);
+    const expectedRunId = String(body.expectedRunId || body.runId || '').trim();
+    const expectedTurnId = String(body.expectedTurnId || '').trim();
     const text = String(body.text || '').trim();
-    if (!text) {
-      sendJson(res, 400, { error: 'text is required' });
+    if (!rawRequestId || requestId !== rawRequestId || !expectedRunId || !expectedTurnId || !text) {
+      sendJson(res, 400, { error: 'requestId, expectedRunId, expectedTurnId, and text are required.' });
+      return;
+    }
+    const allowedSteerFields = new Set(['hostId', 'requestId', 'expectedRunId', 'runId', 'expectedTurnId', 'text']);
+    if (Object.keys(body).some((field) => !allowedSteerFields.has(field))) {
+      sendJson(res, 400, { error: 'Guide currently accepts text only; keep structured inputs in the queue.' });
       return;
     }
 
     const session = getSession(hostId, sessionId);
-    const command = enqueueCommand(hostId, {
-      type: 'session.steer',
-      sessionId,
-      bridgeSessionId: session?.bridgeSessionId || null,
-      nativeThreadId: session?.nativeThreadId || null,
-      originSessionId: session?.originSessionId || null,
-      sourceSessionId: session?.sourceSessionId || null,
-      conversationKey: session?.conversationKey || null,
-      text,
-    });
-    sendJson(res, 200, { ok: true, command });
+    const effectiveSessionId = session?.sessionId || resolveSessionId(hostId, sessionId) || sessionId;
+    const existing = state.sessionSteerOperations.get(hostId, requestId);
+    if (existing) {
+      if (resolveSessionId(hostId, existing.sessionId) !== effectiveSessionId) {
+        sendJson(res, 409, { error: 'Guide request belongs to another Session.', code: 'steer_request_id_conflict' });
+        return;
+      }
+      try {
+        const replay = state.sessionSteerOperations.replay({
+          hostId, sessionId: existing.sessionId, requestId,
+          runId: expectedRunId, expectedTurnId, text,
+        });
+        sendJson(res, 200, { ok: true, ...replay, replay: true });
+      } catch (error) {
+        sendJson(res, error.statusCode || 409, { error: error.message || String(error), code: error.code || null });
+      }
+      return;
+    }
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found' });
+      return;
+    }
+    if (!sessionAcceptsLiveControl(hostId, session)) {
+      sendJson(res, 409, { error: 'session is not live' });
+      return;
+    }
+    if (state.hosts.get(hostId)?.capabilities?.turnControls === false) {
+      sendJson(res, 409, { error: 'This Host does not support Guide.', code: 'steer_unsupported' });
+      return;
+    }
+    const runtime = state.sessionRuntime.get(resolveSessionKey(hostId, effectiveSessionId)) || session.runtime || {};
+    const currentRunId = String(session.runId || runtime.runId || '').trim();
+    const currentTurnId = String(runtime.activeTurnId || '').trim();
+    if (expectedRunId !== currentRunId || expectedTurnId !== currentTurnId || !currentTurnId
+      || (runtime.runId && runtime.runId !== expectedRunId)) {
+      sendJson(res, 409, {
+        error: 'The live Session run or turn changed before Guide was queued. Reload the Session and try again.',
+        code: 'steer_target_changed', currentRunId: currentRunId || null, currentTurnId: currentTurnId || null,
+      });
+      return;
+    }
+    try {
+      const queued = state.sessionSteerOperations.begin({
+        hostId, sessionId: effectiveSessionId, requestId,
+        runId: expectedRunId, expectedTurnId, text,
+      }, () => enqueueCommand(hostId, {
+        type: 'session.steer', requestId, sessionId: effectiveSessionId,
+        bridgeSessionId: session?.bridgeSessionId || null,
+        nativeThreadId: session?.nativeThreadId || null,
+        originSessionId: session?.originSessionId || null,
+        sourceSessionId: session?.sourceSessionId || null,
+        conversationKey: session?.conversationKey || null,
+        runId: expectedRunId, expectedTurnId, text,
+      }));
+      sendJson(res, 202, { ok: true, ...queued, resultUrl: `/api/sessions/${encodeURIComponent(effectiveSessionId)}/steer/${encodeURIComponent(requestId)}?hostId=${encodeURIComponent(hostId)}` });
+    } catch (error) {
+      sendJson(res, error.statusCode || 503, { error: error.message || String(error), code: error.code || null });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.match(/^\/api\/sessions\/[^/]+\/steer\/[^/]+$/)) {
+    const sessionId = decodeURIComponent(url.pathname.split('/')[3]);
+    const requestId = decodeURIComponent(url.pathname.split('/')[5]);
+    const hostId = String(url.searchParams.get('hostId') || '').trim();
+    if (!hostId || !normalizeClientRequestId(requestId)) {
+      sendJson(res, 400, { error: 'hostId and requestId are required.' });
+      return;
+    }
+    const operation = state.sessionSteerOperations.get(hostId, requestId);
+    if (!operation || resolveSessionId(hostId, operation.sessionId) !== (resolveSessionId(hostId, sessionId) || sessionId)) {
+      sendJson(res, 404, { error: 'Guide operation not found.' });
+      return;
+    }
+    sendJson(res, 200, { ok: true, ...operation });
     return;
   }
 
@@ -20352,23 +22479,56 @@ async function handleRequest(req, res) {
 
     const effectiveSessionId = claim.effectiveSessionId;
     const session = getSession(hostId, effectiveSessionId);
-    const command = enqueueCommand(hostId, {
-      type: 'session.request.respond',
-      sessionId: effectiveSessionId,
-      requestId,
-      response: body.response || null,
-      nativeThreadId: session?.nativeThreadId || null,
-      bridgeSessionId: session?.bridgeSessionId || null,
-      originSessionId: session?.originSessionId || null,
-      sourceSessionId: session?.sourceSessionId || null,
-      conversationKey: session?.conversationKey || null,
-      runId: session?.runId || null,
-    });
-    sendJson(res, 200, {
-      ok: true,
-      status: 'responding',
-      command,
-    });
+    const requestPayload = claim.request?.payload && typeof claim.request.payload === 'object'
+      ? claim.request.payload
+      : {};
+    // Approval ownership belongs to the request's originating run.  Reading
+    // the current Session run here can retarget a response to a newer Rebind
+    // if that run changes between the claim and command delivery.
+    const requestRunId = String(
+      claim.request?.runId
+      || body.runId
+      || ''
+    ).trim() || null;
+    try {
+      const command = enqueueCommand(hostId, {
+        type: 'session.request.respond',
+        sessionId: effectiveSessionId,
+        requestedSessionId: sessionId,
+        requestId,
+        response: body.response || null,
+        nativeThreadId: session?.nativeThreadId || null
+          || requestPayload.threadId || null,
+        bridgeSessionId: session?.bridgeSessionId || null,
+        originSessionId: session?.originSessionId || null,
+        sourceSessionId: session?.sourceSessionId || null,
+        conversationKey: session?.conversationKey || null,
+        runId: requestRunId,
+      });
+      sendJson(res, 200, {
+        ok: true,
+        status: 'responding',
+        command,
+      });
+    } catch (error) {
+      // The request was claimed before enqueueing so concurrent clients cannot
+      // double-respond.  If durable queueing fails, release that claim and let
+      // the user retry instead of leaving the request stuck in `responding`.
+      releaseSessionRequestResponseClaim(
+        hostId,
+        effectiveSessionId,
+        requestId,
+        claim.claimToken
+      );
+      const queueError = error instanceof SessionContractError
+        ? error
+        : new SessionContractError(
+          'session_request_queue_failed',
+          `The approval response could not be queued. The request remains available to retry: ${error.message || error}`,
+          { statusCode: 503, retryAfterMs: 1000, safeToRetry: true }
+        );
+      sendSessionContractError(res, queueError, 'queue-request-response');
+    }
     return;
   }
 
@@ -20408,6 +22568,14 @@ async function handleRequest(req, res) {
         const currentRuntime = state.sessionRuntime.get(resolveSessionKey(hostId, sessionId))
           || currentSession?.runtime
           || null;
+        const durableAssistantProjection = assistantProjectionForIdentity(
+          hostId,
+          currentSession || identity,
+          {
+            afterSeq: Number.MAX_SAFE_INTEGER,
+            limit: 1,
+          }
+        );
         const activitySummary = state.activitySnapshots.summary(currentCanonicalKey);
         return {
           session: boundedSessionResetRecord(currentSession ? {
@@ -20415,7 +22583,7 @@ async function handleRequest(req, res) {
             runtime: currentRuntime,
           } : null),
           assistantProjection: boundedSessionResetAssistantProjection(
-            currentSession?.assistantProjection
+            compactAssistantProjection(durableAssistantProjection)
           ),
           activities: [],
           activitiesTruncated: activitySummary.count > 0,
@@ -20523,6 +22691,7 @@ async function handleRequest(req, res) {
       let application = pendingBatch?.promise || null;
       const duplicate = Boolean(pendingBatch);
       if (!application) {
+        const applicationContext = { thinkingActivities: new Map() };
         application = (async () => {
           let appliedCount = Math.max(
             0,
@@ -20531,24 +22700,32 @@ async function handleRequest(req, res) {
           try {
             for (let index = appliedCount; index < events.length; index += 1) {
               const event = events[index];
-              await applyAgentEvent(event);
+              await applyAgentEvent(event, applicationContext);
               appliedCount = index + 1;
             }
             if (batchKey) {
               // The dedupe checkpoint must never outrun transcript/diagnostic
               // persistence. Otherwise a restart could discard an accepted
               // event whose response was lost before its deferred save ran.
-              await flushAgentEventBatchPersistence();
+              await flushAgentEventBatchPersistence(applicationContext);
               rememberAppliedAgentEventBatch(batchKey, batchDigest);
+            } else {
+              await flushThinkingActivityPersistence(applicationContext);
             }
           } catch (error) {
-            if (batchKey && appliedCount > 0) {
+            if (appliedCount > 0 || applicationContext.thinkingActivities.size) {
               try {
                 // Keep the in-flight batch registered until this durable
                 // checkpoint attempt settles. Concurrent retries must join the
                 // same Promise instead of reapplying the accepted prefix.
-                await flushAgentEventBatchPersistence();
-                rememberPartialAgentEventBatch(batchKey, batchDigest, appliedCount);
+                if (batchKey) {
+                  await flushAgentEventBatchPersistence(applicationContext);
+                  if (appliedCount > 0) {
+                    rememberPartialAgentEventBatch(batchKey, batchDigest, appliedCount);
+                  }
+                } else {
+                  await flushThinkingActivityPersistence(applicationContext);
+                }
               } catch (checkpointError) {
                 if (checkpointError !== error && !checkpointError.cause) {
                   checkpointError.cause = error;
@@ -20796,6 +22973,28 @@ function sessionCanTranscriptFallback(hostId, sessionId) {
   return buildResumeTranscript(detail?.transcript || []).length > 0;
 }
 
+// A transcript fallback is a deliberate recovery path for a native resume
+// failure.  Startup timeouts, missing-host discovery, and replacement
+// failures must remain retryable errors; exposing the fallback button for
+// those cases would create a new Session while the original may still be
+// recoverable.
+function resumeErrorFallbackFlags(hostId, sessionId, code, options = {}) {
+  const normalizedCode = String(code || '').trim();
+  // A concrete history-schema rejection is always eligible once it reaches
+  // the runtime. Generic native-resume failures may still offer the explicit
+  // transcript recovery action when the caller has opted into that recovery,
+  // but they are not classified as API incompatibility.
+  const concreteHistoryRejection = normalizedCode === 'session_responses_history_incompatible';
+  const nativeResumeFailure = normalizedCode === 'session_native_resume_failed';
+  const eligible = (options.allowTranscriptFallback !== false || concreteHistoryRejection)
+    && (concreteHistoryRejection || nativeResumeFailure)
+    && sessionCanTranscriptFallback(hostId, sessionId);
+  return {
+    canTranscriptFallback: eligible,
+    requiresExplicitTranscriptFallback: eligible,
+  };
+}
+
 function sessionDiscoveryNeedsCommit(record, input = {}) {
   if (!record) {
     return true;
@@ -20900,7 +23099,7 @@ function managedDiscoveryTargetsStaleRun(host, session, current, record) {
   );
 }
 
-async function applyAgentEvent(event) {
+async function applyAgentEvent(event, context = {}) {
   if (!event || !event.type || !event.hostId) {
     return;
   }
@@ -20948,6 +23147,7 @@ async function applyAgentEvent(event) {
       canonicalKey,
       stripSecrets(event)
     );
+    collectTerminalThinkingActivity(context, canonicalKey, accepted || stripSecrets(event));
     if (accepted) {
       publishCanonicalSessionEvent(canonicalKey, 'session.activity', {
         ...accepted,
@@ -20971,8 +23171,9 @@ async function applyAgentEvent(event) {
     return;
   }
 
-  if (event.type === 'session.discovery') {
-    if (host) {
+  if (event.type === 'session.discovery' || event.type === 'session.discovery.preview') {
+    const previewOnly = event.type === 'session.discovery.preview';
+    if (host && !previewOnly) {
       host.lastDiscoveryAt = nowIso();
       state.hosts.set(event.hostId, host);
     }
@@ -20998,11 +23199,21 @@ async function applyAgentEvent(event) {
       );
     };
     const publishedLiveSessionIds = new Set();
+    // Host discovery emits historical rollout rows before the live runner
+    // rows. Keep an ephemeral same-batch hint for that ordering window; all
+    // cross-batch/restart decisions must still come from durable ownership.
+    const managedAppServerBatchIdentities = new Set();
     const managedRunPresence = new Map();
     for (const discoveredSession of sessions) {
       noteManagedDiscoveryRunPresence(managedRunPresence, discoveredSession, {
         allowRunlessWildcard: host?.capabilities?.runApiBinding !== true,
+        allowPendingStart: host?.capabilities?.managedStartPresenceV1 === true,
       });
+      if (discoverySessionUsesManagedAppServer(discoveredSession)) {
+        for (const identity of sessionOwnershipIdentityValues(discoveredSession)) {
+          managedAppServerBatchIdentities.add(identity);
+        }
+      }
       if (!discoveryPublishesLive(discoveredSession)) {
         continue;
       }
@@ -21071,6 +23282,18 @@ async function applyAgentEvent(event) {
       const cursor = session.assistantCursor && typeof session.assistantCursor === 'object'
         ? session.assistantCursor
         : null;
+      const cursorOwnedByManagedAppServer = cursorTargetsManagedAppServer(
+        event.hostId,
+        session,
+        cursor,
+        storedDiscovery,
+        host
+      ) || (
+        cursor
+        && sessionOwnershipIdentityValues(session).some((identity) => (
+          managedAppServerBatchIdentities.has(identity)
+        ))
+      );
       let mergedDiscovery = { record: storedDiscovery };
       let assignedAssistant = null;
       if (!suppressStaleRunSideEffects) {
@@ -21093,7 +23316,7 @@ async function applyAgentEvent(event) {
           ? await assignAssistantObservations(
             event.hostId,
             discoveryInput,
-            cursor.observations || [],
+            cursorOwnedByManagedAppServer ? [] : cursor.observations || [],
             cursor
           )
           : null;
@@ -21220,9 +23443,12 @@ async function applyAgentEvent(event) {
         broadcastSessionEvent(event.hostId, next.sessionId, 'session.snapshot', next);
       }
     }
-    await closeManagedSessionsMissingFromDiscovery(event.hostId, managedRunPresence, {
-      discoveryId: event.discoveryId || null,
-    });
+    if (!previewOnly) {
+      await closeManagedSessionsMissingFromDiscovery(event.hostId, managedRunPresence, {
+        discoveryId: event.discoveryId || null,
+      });
+      scheduleRunnerRetirementReconcile(event.hostId);
+    }
     return;
   }
 
@@ -21260,6 +23486,53 @@ async function applyAgentEvent(event) {
     const pending = state.pendingDirectoryRequests.get(event.requestId);
     if (pending) {
       pending.reject(new Error(event.message || 'directory listing failed'));
+    }
+    return;
+  }
+
+  if (event.type === 'host.terminal_opened' && event.requestId) {
+    const pending = state.pendingTerminalOpenRequests.get(event.requestId);
+    const eventHostId = String(event.hostId || '').trim();
+    const eventSessionId = String(event.sessionId || '').trim();
+    if (
+      pending
+      && pending.hostId === eventHostId
+      && pending.sessionId === eventSessionId
+    ) {
+      pending.resolve({
+        ok: true,
+        opened: true,
+        hostId: eventHostId,
+        sessionId: eventSessionId,
+        requestId: event.requestId,
+        cwd: event.cwd || null,
+        platform: event.platform || state.hosts.get(event.hostId)?.platform || null,
+        terminal: event.terminal || null,
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'host.terminal_error' && event.requestId) {
+    const pending = state.pendingTerminalOpenRequests.get(event.requestId);
+    const eventHostId = String(event.hostId || '').trim();
+    const eventSessionId = String(event.sessionId || '').trim();
+    if (
+      pending
+      && pending.hostId === eventHostId
+      && pending.sessionId === eventSessionId
+    ) {
+      pending.resolve({
+        ok: false,
+        opened: false,
+        hostId: eventHostId,
+        sessionId: eventSessionId,
+        requestId: event.requestId,
+        cwd: event.cwd || null,
+        platform: event.platform || state.hosts.get(event.hostId)?.platform || null,
+        code: event.code || 'terminal_open_failed',
+        error: event.error || 'The Host Agent could not open a terminal.',
+      });
     }
     return;
   }
@@ -21701,14 +23974,62 @@ async function applyAgentEvent(event) {
     scheduleSessionLogsSave(0);
   }
 
+  if (event.type === 'session.command_succeeded') {
+    if (event.operation === 'stop' && event.retirementId && event.runId) {
+      const currentSession = getSession(event.hostId, sessionId);
+      const identitySessionId = currentSession?.sessionId || resolveSessionId(event.hostId, sessionId) || sessionId;
+      try {
+        await state.provenance.markRunnerRetirementSucceeded({
+          identity: { hostId: event.hostId, sessionId: identitySessionId },
+          retirementId: event.retirementId,
+          runId: event.runId,
+          commandId: event.commandId,
+        });
+      } catch (error) {
+        if (error?.code !== 'session_runner_retirement_not_found') throw error;
+      }
+    }
+    return;
+  }
+
   if (event.type === 'session.command_failed') {
     const effectiveSessionId = resolveSessionId(event.hostId, sessionId);
-    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
-      return;
-    }
     const currentSession = getSession(event.hostId, effectiveSessionId) || getSession(event.hostId, sessionId);
     const code = String(event.code || 'session_command_failed').trim() || 'session_command_failed';
     const message = String(event.error || event.message || 'Session command failed.');
+    // A runner-retirement Stop intentionally targets a superseded parent run.
+    // Once the replacement child is active, that parent run is stale by design,
+    // so handle its durable cleanup receipt before the generic stale-run guard.
+    if (event.operation === 'stop' && event.retirementId && event.runId) {
+      const identitySessionId = currentSession?.sessionId || effectiveSessionId;
+      try {
+        await state.provenance.markRunnerRetirementFailed({
+          identity: { hostId: event.hostId, sessionId: identitySessionId },
+          retirementId: event.retirementId,
+          runId: event.runId,
+          commandId: event.commandId,
+          code,
+          message,
+        });
+      } catch (error) {
+        if (error?.code !== 'session_runner_retirement_not_found') throw error;
+      }
+      // Do not project a user-facing Stop failure onto the confirmed child.
+      scheduleRunnerRetirementReconcile(event.hostId);
+      return;
+    }
+    if (isStaleSessionRunEvent(event, effectiveSessionId)) {
+      return;
+    }
+    const inputCapabilityError = normalizeSessionInputCapabilityError(
+      event.inputCapabilityError,
+      event.inputCapabilityError?.rawMessage || event.rawError || message,
+      event.inputTypes || event.inputCapabilityError?.inputTypes
+    );
+    const rawMessage = String(
+      event.inputCapabilityError?.rawMessage || event.rawError || message
+    ).trim();
+    const userFacingMessage = inputCapabilityError?.userMessage || message;
     if (event.operation === 'start' && event.runId) {
       const failedRun = await failPlannedRun(
         event.hostId,
@@ -21764,18 +24085,59 @@ async function applyAgentEvent(event) {
     }
     const transientInputConflict = event.operation === 'input'
       && ['session_turn_active', 'session_input_preparing'].includes(code);
+    if (!inputCapabilityError && isModelMetadataFallbackNotice(rawMessage)) {
+      emitMetadataFallbackDiagnostic(
+        event.hostId,
+        effectiveSessionId,
+        event,
+        rawMessage,
+        'session.command_failed'
+      );
+      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.command_failed', {
+        ...event,
+        code,
+        error: rawMessage,
+        diagnosticOnly: true,
+        alertSuppressed: true,
+        timestamp: event.timestamp || nowIso(),
+      });
+      return;
+    }
+    if (inputCapabilityError) {
+      emitSessionInputCapabilityDiagnostic(
+        event.hostId,
+        effectiveSessionId,
+        event,
+        inputCapabilityError,
+        rawMessage,
+        'session.command_failed'
+      );
+    }
     emitSessionAlert(event.hostId, effectiveSessionId, {
       severity: transientInputConflict ? 'warning' : 'error',
       source: 'runtime',
-      message,
+      message: userFacingMessage,
+      rawMessage: inputCapabilityError ? rawMessage : null,
+      inputCapabilityError,
+      code: inputCapabilityError?.code || null,
+      kind: inputCapabilityError?.kind || null,
+      inputTypes: inputCapabilityError?.inputTypes || [],
       transient: transientInputConflict,
       turnId: event.turnId || null,
+      clientRequestId: event.clientRequestId || null,
       timestamp: event.timestamp || nowIso(),
     });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.command_failed', {
       ...event,
       code,
-      error: message,
+      error: userFacingMessage,
+      ...(inputCapabilityError
+        ? {
+          userFacingMessage,
+          rawError: rawMessage,
+          inputCapabilityError,
+        }
+        : {}),
       timestamp: event.timestamp || nowIso(),
     });
     return;
@@ -21805,6 +24167,22 @@ async function applyAgentEvent(event) {
       });
     }
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.interrupt_result', payload);
+    return;
+  }
+
+  if (event.type === 'session.steer_result') {
+    const effectiveSessionId = resolveSessionId(event.hostId, sessionId);
+    const operation = state.sessionSteerOperations.get(event.hostId, event.requestId);
+    if (!operation || resolveSessionId(event.hostId, operation.sessionId) !== effectiveSessionId) return;
+    // Resolve the old operation before any current-run projection guard. A
+    // late ACK may settle Guide A, but must not mutate Session run B.
+    const resolved = state.sessionSteerOperations.resolve({
+      ...event,
+      sessionId: operation.sessionId,
+      commandId: Number(event.commandId || 0),
+    });
+    if (!resolved) return;
+    broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.steer_result', resolved);
     return;
   }
 
@@ -21882,6 +24260,7 @@ async function applyAgentEvent(event) {
       ? (state.sessions.get(sessionKey(event.hostId, bridgeSessionId)) || getSession(event.hostId, bridgeSessionId))
       : null;
     const currentSession = getSession(event.hostId, effectiveSessionId);
+    const eventHost = state.hosts.get(event.hostId);
     const plannedSessionId = bridgeSession?.sessionId
       || event.bridgeSessionId
       || currentSession?.bridgeSessionId
@@ -21944,19 +24323,40 @@ async function applyAgentEvent(event) {
         staleRun
         && (
           ['pending', 'failed'].includes(staleRun.status)
-          || startedRecord.activeRunId !== event.runId
+           || startedRecord?.activeRunId !== event.runId
         )
       ) {
-        enqueueCommand(event.hostId, {
-          type: 'session.stop',
-          sessionId: effectiveSessionId,
-          requestedSessionId: plannedSessionId,
-          bridgeSessionId: event.bridgeSessionId || plannedSessionId,
-          nativeThreadId: event.nativeThreadId || effectiveSessionId,
-          runId: event.runId,
-          suppressTerminalEvent: true,
-          reason: 'stale-session-started',
-        });
+        // A delayed start notification can arrive after a native replacement
+        // already created a durable retirement intent for this exact parent.
+        // Reuse that intent so this cleanup Stop cannot race the retirement
+        // Stop and turn a completed cleanup into a false failure.
+        const staleRetirement = Object.values(startedRecord?.runnerRetirements || {})
+          .find((candidate) => (
+            String(candidate?.runId || '').trim() === String(event.runId || '').trim()
+              && (!candidate?.replacementRunId
+                || String(candidate.replacementRunId).trim() === String(currentRunId || '').trim())
+              && !['succeeded', 'blocked'].includes(candidate.status)
+          ));
+        if (staleRetirement?.retirementId) {
+          // Reconcile through the durable intent and respect its retry
+          // deadline. Repeated delayed started events must not burn the
+          // retirement budget or enqueue an untracked generic Stop.
+          await enqueueRunnerRetirement(event.hostId, staleRetirement);
+        } else if (
+          eventHost?.capabilities?.runApiBinding === true
+          && !queuedStaleSessionStopCommand(event.hostId, plannedSessionId, event.runId)
+        ) {
+          enqueueCommand(event.hostId, {
+            type: 'session.stop',
+            sessionId: effectiveSessionId,
+            requestedSessionId: plannedSessionId,
+            bridgeSessionId: event.bridgeSessionId || plannedSessionId,
+            nativeThreadId: event.nativeThreadId || effectiveSessionId,
+            runId: event.runId,
+            suppressTerminalEvent: true,
+            reason: 'stale-session-started',
+          });
+        }
       }
       return;
     }
@@ -21979,7 +24379,6 @@ async function applyAgentEvent(event) {
     } catch (error) {
       const failureSessionId = bridgeSession?.sessionId || event.bridgeSessionId || effectiveSessionId;
       const failedRun = await failPlannedRun(event.hostId, failureSessionId, event.runId || currentRunId, error);
-      const eventHost = state.hosts.get(event.hostId);
       const wouldOverwriteLiveProjection = Boolean(bridgeSession?.live || currentSession?.live);
       const rejectedRunId = event.runId || currentRunId || null;
       const rejectedRecord = rejectedRunId ? state.provenance.getSessionRecord({
@@ -21987,7 +24386,10 @@ async function applyAgentEvent(event) {
         sessionId: failureSessionId,
       }) : null;
       const rejectedRun = rejectedRunId ? rejectedRecord?.runs?.[rejectedRunId] || null : null;
-      if ((failedRun?.transitioned === true || rejectedRun?.status === 'failed') && rejectedRunId) {
+      if (
+        (failedRun?.transitioned === true || rejectedRun?.status === 'failed')
+        && rejectedRunId
+      ) {
         enqueueCommand(event.hostId, {
           type: 'session.stop',
           sessionId: effectiveSessionId,
@@ -22016,7 +24418,7 @@ async function applyAgentEvent(event) {
           error: error.message || 'Session start confirmation failed.',
           stage: 'confirm-start',
           canRebind: Boolean(error.canRebind),
-          canTranscriptFallback: sessionCanTranscriptFallback(event.hostId, failureSessionId),
+          ...resumeErrorFallbackFlags(event.hostId, failureSessionId, error.code),
         },
         lastUpdatedAt: event.timestamp || nowIso(),
       }, { preserveManagedLive: false });
@@ -22151,6 +24553,24 @@ async function applyAgentEvent(event) {
       runtime,
       lastUpdatedAt: startedTimestamp,
     });
+    // Native Rebind is a two-runtime handoff. The old runner was deliberately
+    // kept alive while the replacement performed thread/resume. Once the new
+    // run is durably confirmed, stop only the old run by identity. Its terminal
+    // event is suppressed so it cannot overwrite the confirmed replacement.
+    const confirmedParentRunId = String(confirmedRun?.parentRunId || '').trim();
+    if (
+      confirmedParentRunId
+      && confirmedParentRunId !== runId
+      && event.launchMode === 'resume'
+    ) {
+      const retirementId = Object.values(confirmedProvenance.record?.runnerRetirements || {})
+        .find((retirement) => String(retirement.runId || '').trim() === confirmedParentRunId
+          && String(retirement.replacementRunId || '').trim() === runId
+          && retirement.status !== 'succeeded')?.retirementId || null;
+      if (retirementId) {
+        await reconcileRunnerRetirementsAfterRestart(event.hostId);
+      }
+    }
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.started', next);
     broadcastSessionRuntimePatch(event.hostId, effectiveSessionId, runtime, {
       runId,
@@ -22280,7 +24700,9 @@ async function applyAgentEvent(event) {
       && liveSession?.source === 'managed'
       && runtimeKind === 'codex-app-server'
     ) {
-      return;
+      if (!externalTerminalTranscriptMatchesRuntime(event, liveSession, liveRuntime)) {
+        return;
+      }
     }
     let normalizedTranscript = normalizeStoredTranscriptEntry({
       speaker: event.speaker || 'system',
@@ -22290,6 +24712,11 @@ async function applyAgentEvent(event) {
       clientRequestId: event.clientRequestId || null,
       files: event.files || event.attachments || [],
       timestamp: event.timestamp || nowIso(),
+      turnId: event.turnId || event.turn_id || null,
+      activityOwner: event.activityOwner || event.activity_owner || null,
+      eventId: event.eventId || event.event_id || null,
+      sourceOffset: event.sourceOffset,
+      sourceOrdinal: event.sourceOrdinal,
     });
     if (!normalizedTranscript) {
       return;
@@ -22479,6 +24906,10 @@ async function applyAgentEvent(event) {
         currentTurnStatus: 'closed',
         waitingOnApproval: false,
         waitingOnUserInput: false,
+        // External terminal activity belongs to a live Session only. Clear
+        // the durable projection when the canonical lifecycle closes so a
+        // later history/detail read cannot resurrect a stale yellow state.
+        externalActivity: null,
         runId: event.runId || existingRunId || null,
         updatedAt: event.timestamp || nowIso(),
       });
@@ -22525,10 +24956,35 @@ async function applyAgentEvent(event) {
       && event.runId
       && state.hosts.get(event.hostId)?.capabilities?.nativeResumeReadiness === true
     ) {
-      await state.provenance.confirmNativeResumeReady({
-        identity: { hostId: event.hostId, sessionId: effectiveSessionId },
-        runId: event.runId,
+      const readinessRecord = state.provenance.getSessionRecord({
+        hostId: event.hostId,
+        sessionId: effectiveSessionId,
       });
+      const readinessRun = readinessRecord?.runs?.[event.runId] || null;
+      if (readinessRun?.status === 'live' && readinessRun.nativeResumeReady !== true) {
+        try {
+          await state.provenance.confirmNativeResumeReady({
+            identity: { hostId: event.hostId, sessionId: effectiveSessionId },
+            runId: event.runId,
+          });
+        } catch (error) {
+          // A Stop or terminal failure may win the Store queue after the
+          // read above but before the readiness transaction. Treat that
+          // readiness notification as late evidence; it must not turn an
+          // otherwise successful Stop into an Agent-event 409.
+          if (error?.code !== 'session_run_state_conflict') {
+            throw error;
+          }
+          const latestRecord = state.provenance.getSessionRecord({
+            hostId: event.hostId,
+            sessionId: effectiveSessionId,
+          });
+          const latestRun = latestRecord?.runs?.[event.runId] || null;
+          if (latestRun?.status === 'live') {
+            throw error;
+          }
+        }
+      }
     }
     if (eventTargetsPublishedParentRun(event, effectiveSessionId)) {
       return;
@@ -22551,19 +25007,49 @@ async function applyAgentEvent(event) {
         // live error, Stop, or completed managed turn.
         return;
       }
+      const existingRuntime = state.sessionRuntime.get(resolveSessionKey(event.hostId, effectiveSessionId))
+        || existing.runtime
+        || {};
+      const observedTurnId = String(observed.turnId || '').trim() || null;
+      const currentExternalActivity = existingRuntime.externalActivity;
+      if (
+        observed.active === false
+        && (
+          !observedTurnId
+          || currentExternalActivity?.owner !== 'external-terminal'
+          || currentExternalActivity?.active !== true
+          || String(currentExternalActivity.turnId || '').trim() !== observedTurnId
+        )
+      ) {
+        // A terminal tail observation is only valid for the external Turn it
+        // originally opened. This prevents a delayed Review repair or stale
+        // JSONL batch from clearing a newer terminal-owned Turn.
+        return;
+      }
+      if (!shouldAcceptExternalActivityObservation(
+        resolveSessionKey(event.hostId, effectiveSessionId),
+        existingRuntime,
+        observed,
+        event
+      )) {
+        // Keep the newest verified projection.  This is intentionally silent:
+        // the stale row is expected when a batched tail request crosses a
+        // newer Turn boundary.
+        return;
+      }
+      const runtimeKey = resolveSessionKey(event.hostId, effectiveSessionId);
+      const receiptRevision = nextExternalActivityReceiptRevision(runtimeKey, existingRuntime);
       const externalActivity = {
         owner: 'external-terminal',
         active: observed.active,
-        turnId: String(observed.turnId || '').trim() || null,
+        turnId: observedTurnId,
         phase: String(observed.phase || '').trim() || (observed.active ? 'thinking' : 'idle'),
         status: String(observed.status || '').trim() || (observed.active ? 'inProgress' : 'completed'),
         updatedAt: observed.updatedAt || event.timestamp || nowIso(),
       };
-      const existingRuntime = state.sessionRuntime.get(resolveSessionKey(event.hostId, effectiveSessionId))
-        || existing.runtime
-        || {};
       const runtime = setSessionRuntime(event.hostId, effectiveSessionId, {
         externalActivity,
+        externalActivityRevision: receiptRevision,
         updatedAt: existingRuntime.updatedAt || event.timestamp || nowIso(),
       });
       upsertSession(event.hostId, {
@@ -22678,19 +25164,26 @@ async function applyAgentEvent(event) {
       lastUpdatedAt: event.timestamp || nowIso(),
       nativeThreadId: existing?.nativeThreadId || event.nativeThreadId || effectiveSessionId,
     });
+    const metadataFallback = isModelMetadataFallbackNotice(event.message || '');
     emitSessionDiagnostic(event.hostId, effectiveSessionId, {
-      severity: event.severity || 'info',
+      severity: metadataFallback ? 'info' : (event.severity || 'info'),
       source: event.source || 'codex',
-      kind: event.kind || 'event',
+      kind: metadataFallback ? 'metadata-fallback' : (event.kind || 'event'),
       method: event.method || null,
       message: event.message || '',
       detail: event.detail || null,
-      data: event.data || null,
+      data: metadataFallback
+        ? { ...(event.data && typeof event.data === 'object' ? event.data : {}), metadataFallback: true }
+        : (event.data || null),
       runId: event.runId || event.data?.runId || null,
       turnId: event.turnId || event.data?.turnId || null,
       itemId: event.itemId || event.data?.itemId || null,
       callId: event.callId || event.data?.callId || null,
       requestId: event.requestId || event.data?.requestId || null,
+      clientRequestId: event.clientRequestId
+        || event.data?.clientRequestId
+        || event.data?.client_request_id
+        || null,
       status: event.status || event.data?.status || null,
       final: event.final === true,
       timestamp: event.timestamp || nowIso(),
@@ -22747,6 +25240,15 @@ async function applyAgentEvent(event) {
       return;
     }
     const message = event.message || 'session error';
+    const inputCapabilityError = normalizeSessionInputCapabilityError(
+      event.inputCapabilityError,
+      event.inputCapabilityError?.rawMessage || message,
+      event.inputTypes || event.inputCapabilityError?.inputTypes
+    );
+    const rawMessage = String(
+      event.inputCapabilityError?.rawMessage || event.rawMessage || message || ''
+    ).trim();
+    const userFacingMessage = inputCapabilityError?.userMessage || message;
     if (isBenignSessionWatchNoLiveError(message)) {
       broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.watch.updated', {
         hostId: event.hostId,
@@ -22760,6 +25262,23 @@ async function applyAgentEvent(event) {
     }
     if (/no live session for command session\.(model_list|stop)/i.test(message)) {
       markSessionClosed(event.hostId, effectiveSessionId);
+      return;
+    }
+    if (!inputCapabilityError && isModelMetadataFallbackNotice(rawMessage)) {
+      emitMetadataFallbackDiagnostic(
+        event.hostId,
+        effectiveSessionId,
+        event,
+        rawMessage,
+        'session.error'
+      );
+      broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.error', {
+        ...event,
+        message: rawMessage,
+        diagnosticOnly: true,
+        alertSuppressed: true,
+        timestamp: event.timestamp || nowIso(),
+      });
       return;
     }
     if (isDuplicateManagedStartFailureError(event, effectiveSessionId, message)) {
@@ -22784,11 +25303,27 @@ async function applyAgentEvent(event) {
       return;
     }
 
+    if (inputCapabilityError) {
+      emitSessionInputCapabilityDiagnostic(
+        event.hostId,
+        effectiveSessionId,
+        event,
+        inputCapabilityError,
+        rawMessage,
+        'session.error'
+      );
+    }
     emitSessionAlert(event.hostId, effectiveSessionId, {
       severity: 'error',
       source: 'runtime',
-      message,
+      message: userFacingMessage,
+      rawMessage: inputCapabilityError ? rawMessage : null,
+      code: inputCapabilityError?.code || null,
+      kind: inputCapabilityError?.kind || null,
+      inputTypes: inputCapabilityError?.inputTypes || [],
+      inputCapabilityError,
       turnId: event.turnId || null,
+      clientRequestId: event.clientRequestId || null,
       codexError: event.codexError || null,
       provisionalSystemError: event.provisionalSystemError === true,
       supersedesProvisionalError: event.supersedesProvisionalError === true,
@@ -22796,6 +25331,14 @@ async function applyAgentEvent(event) {
     });
     broadcastSessionEvent(event.hostId, effectiveSessionId, 'session.error', {
       ...event,
+      ...(inputCapabilityError
+        ? {
+          message: userFacingMessage,
+          userFacingMessage,
+          rawMessage,
+          inputCapabilityError,
+        }
+        : {}),
       timestamp: event.timestamp || nowIso(),
     });
     return;
@@ -22806,12 +25349,46 @@ async function applyAgentEvent(event) {
     if (isStaleSessionRunEvent(event, effectiveSessionId)) {
       return;
     }
+    const rawMessage = String(
+      event.inputCapabilityError?.rawMessage || event.rawMessage || event.message || ''
+    ).trim();
+    const inputCapabilityError = normalizeSessionInputCapabilityError(
+      event.inputCapabilityError,
+      rawMessage,
+      event.inputTypes || event.inputCapabilityError?.inputTypes
+    );
+    if (!inputCapabilityError && isModelMetadataFallbackNotice(rawMessage)) {
+      emitMetadataFallbackDiagnostic(
+        event.hostId,
+        effectiveSessionId,
+        event,
+        rawMessage,
+        'session.alert'
+      );
+      return;
+    }
+    if (inputCapabilityError) {
+      emitSessionInputCapabilityDiagnostic(
+        event.hostId,
+        effectiveSessionId,
+        event,
+        inputCapabilityError,
+        rawMessage,
+        'session.alert'
+      );
+    }
     emitSessionAlert(event.hostId, effectiveSessionId, {
       severity: event.severity || 'warning',
       source: event.source || 'runtime',
-      message: event.message || '',
+      message: inputCapabilityError?.userMessage || event.message || '',
+      rawMessage: inputCapabilityError ? rawMessage : null,
+      code: inputCapabilityError?.code || null,
+      kind: inputCapabilityError?.kind || null,
+      inputTypes: inputCapabilityError?.inputTypes || [],
+      inputCapabilityError,
       transient: event.transient === true,
       turnId: event.turnId || null,
+      clientRequestId: event.clientRequestId || null,
       timestamp: event.timestamp || nowIso(),
     });
     return;
@@ -22840,7 +25417,14 @@ const server = http.createServer((req, res) => {
       }
       console.error(error);
       if (!res.headersSent) {
-        sendJson(res, 500, { error: error.message || 'internal error' });
+        sendJson(res, Number(error.statusCode || 500), {
+          error: error.message || 'internal error',
+          ...(error.code ? { code: error.code } : {}),
+          ...(error.code === 'request_body_too_large' ? {
+            limitBytes: error.limitBytes,
+            receivedBytes: error.receivedBytes,
+          } : {}),
+        });
         return;
       }
       res.destroy(error);
@@ -23025,11 +25609,22 @@ async function startRelay() {
       legacyMetadataPath: SESSION_METADATA_PATH,
       now: nowIso,
     });
+    state.thinkingActivityPersistence = new ThinkingActivityPersistence({
+      sessionRecordStore: state.sessionRecordStore,
+      now: nowIso,
+    });
+    state.thinkingActivityPersistence.hydrate(state.activitySnapshots, {
+      epoch: state.sessionEventStream.epoch,
+    });
     state.provenance = new SessionProvenanceService({
       store: state.sessionRecordStore,
       now: nowIso,
     });
     hydrateSessionMetadataCacheFromStore();
+    // Re-issue any exact parent-run cleanup intents that survived a Relay
+    // restart. Host registration may not have happened yet, so this is also
+    // repeated from the registration/discovery paths below.
+    await reconcileRunnerRetirementsAfterRestart();
     await reconcileStopRequestsAfterRestart();
     await reconcilePendingSessionRunsAfterRestart();
     state.modelCatalog = new ModelCatalogService({
@@ -23085,6 +25680,9 @@ async function startRelay() {
     state.skillAutomation?.stop();
     const cleanupErrors = [];
     await closeRelayServer().catch((cleanupError) => cleanupErrors.push(cleanupError));
+    await state.thinkingActivityPersistence?.flush()
+      .catch((cleanupError) => cleanupErrors.push(cleanupError));
+    state.thinkingActivityPersistence = null;
     await state.sessionRecordStore?.close().catch((cleanupError) => cleanupErrors.push(cleanupError));
     state.sessionRecordStore = null;
     if (relayOwnerMarkerWritten) {
@@ -23200,6 +25798,12 @@ async function flushRelayPersistence() {
     if (sessionDiagnosticsSaveError) {
       throw sessionDiagnosticsSaveError;
     }
+  } catch (error) {
+    errors.push(error);
+  }
+
+  try {
+    await state.thinkingActivityPersistence?.flush();
   } catch (error) {
     errors.push(error);
   }

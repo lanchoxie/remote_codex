@@ -1,0 +1,39 @@
+@layer workbench {
+  .remote-confirm-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1300;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: var(--ui-backdrop, rgba(25, 35, 30, .34));
+  }
+  .remote-confirm-overlay.hidden { display: none; }
+  .remote-confirm-dialog {
+    width: min(480px, 100%);
+    padding: 20px;
+    color: var(--ui-text, #202b28);
+    background: var(--ui-raised, #ffffff);
+    border: 1px solid var(--ui-border-strong, #b6c4bb);
+    border-radius: var(--ui-radius-lg, 14px);
+    box-shadow: var(--ui-shadow, 0 14px 48px rgba(28, 42, 34, .12));
+  }
+  .remote-confirm-title { margin: 0; font-size: 1.05rem; }
+  .remote-confirm-message {
+    margin: 12px 0 18px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+  }
+  .remote-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .remote-confirm-actions .primary-button {
+    color: var(--ui-on-accent, #ffffff);
+    background: var(--ui-accent, #1c6452);
+    border-color: var(--ui-accent, #1c6452);
+  }
+  .remote-confirm-actions .primary-button:hover:not(:disabled) {
+    background: var(--ui-accent-hover, #144f41);
+    border-color: var(--ui-accent-hover, #144f41);
+  }
+  body.remote-confirm-open { overflow: hidden; }
+}

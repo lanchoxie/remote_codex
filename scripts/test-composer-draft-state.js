@@ -36,7 +36,23 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-const internalTranscriptContext = vm.createContext({});
+const internalTranscriptContext = vm.createContext({
+  structuredThinkingText(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map((item) => this.structuredThinkingText(item)).filter(Boolean).join('\n');
+    if (typeof value === 'object') {
+      for (const key of ['text', 'content', 'message', 'summary']) {
+        if (value[key] != null) {
+          const text = this.structuredThinkingText(value[key]);
+          if (text) return text;
+        }
+      }
+      try { return JSON.stringify(value); } catch (_) { return ''; }
+    }
+    return String(value);
+  },
+});
 vm.runInContext(extractFunction('isInternalTranscriptText'), internalTranscriptContext);
 assert.strictEqual(
   internalTranscriptContext.isInternalTranscriptText(
@@ -616,6 +632,7 @@ async function run() {
 
   const postedBodies = [];
   const deliveryContext = vm.createContext({
+    makeClientId: () => 'fallback-input-request',
     getActiveTurnBlocker: () => null,
     openStatusForActiveTurnBlocker: () => {},
     assertModelSelectionIsSelectable: () => {},
@@ -837,12 +854,135 @@ async function run() {
   assert.strictEqual(serverWins.length, 1);
   assert.strictEqual(serverWins[0].deliveryStatus, 'accepted', 'server delivery status must beat the local optimistic copy');
 
+  const queuedPromptTimers = new Map();
+  const queuedPromptSends = [];
+  const queuedPromptErrors = [];
+  let nextQueuedPromptTimerId = 1;
+  const queuedPromptState = {
+    sessions: [sessionA, sessionB],
+    codexControls: {
+      steerQueue: [],
+      queueAutoSendTimersBySession: new Map(),
+      composerSessionKeyAliases: new Map(),
+      activeDraftsBySession: new Map(),
+      steerNotice: null,
+    },
+  };
+  const queuedPromptContext = vm.createContext({
+    state: queuedPromptState,
+    selectedSession: sessionB,
+    window: {
+      setTimeout: (callback, delayMs) => {
+        const timerId = nextQueuedPromptTimerId++;
+        queuedPromptTimers.set(timerId, { callback, delayMs });
+        return timerId;
+      },
+      clearTimeout: (timerId) => queuedPromptTimers.delete(timerId),
+    },
+    getSessionKey: (session) => session ? `${session.hostId}::${session.sessionId}` : '',
+    getSelectedSession: () => queuedPromptContext.selectedSession,
+    getRuntimeForSession: () => ({ phase: 'idle', busy: false, activeTurnId: null }),
+    runtimeIsActive: (runtime) => Boolean(runtime?.busy || runtime?.activeTurnId),
+    getExternalTerminalActivityForSession: () => ({ active: false }),
+    sendInputToSession: async (session, text) => {
+      queuedPromptSends.push({ sessionKey: `${session.hostId}::${session.sessionId}`, text });
+    },
+    setActiveDraftForSession: () => {},
+    renderComposerTurnNotice: () => {},
+    reportError: (error) => queuedPromptErrors.push(error),
+    Date,
+  });
+  for (const name of [
+    'resolveComposerSessionKey',
+    'findSessionForResolvedComposerKey',
+    'findSteerQueueItem',
+    'getSteerQueueText',
+    'setSteerQueueItemText',
+    'removeSteerQueueItem',
+    'getFirstQueuedPrompt',
+    'sendQueuedPrompt',
+    'maybeScheduleQueuedPromptSend',
+    'clearActiveDraftForSessionRequest',
+  ]) {
+    vm.runInContext(extractFunction(name), queuedPromptContext, { filename: `${name}.js` });
+  }
+  const runOnlyQueuedPromptTimer = async () => {
+    assert.strictEqual(queuedPromptTimers.size, 1, 'exactly one queued-prompt timer should be armed');
+    const [timerId, timer] = queuedPromptTimers.entries().next().value;
+    queuedPromptTimers.delete(timerId);
+    timer.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  const makeQueuedPrompt = (id, sessionKey, text) => ({
+    id,
+    sessionKey,
+    hostId: sessionKey === keyA ? sessionA.hostId : sessionB.hostId,
+    sessionId: sessionKey === keyA ? sessionA.sessionId : sessionB.sessionId,
+    text,
+    payload: { text, displayText: text },
+    status: 'queued',
+    sending: false,
+    forceSending: false,
+    error: '',
+  });
+
+  queuedPromptState.codexControls.steerQueue.push(makeQueuedPrompt('queue-a', keyA, 'send to A'));
+  queuedPromptContext.maybeScheduleQueuedPromptSend(sessionA);
+  await runOnlyQueuedPromptTimer();
+  assert.deepStrictEqual(
+    queuedPromptSends.map((entry) => entry.sessionKey),
+    [keyA],
+    'switching the selected Session to B must not strand A or redirect A\'s queued prompt to B'
+  );
+  assert.strictEqual(queuedPromptErrors.length, 0);
+
+  queuedPromptTimers.clear();
+  queuedPromptState.codexControls.queueAutoSendTimersBySession.clear();
+  queuedPromptState.codexControls.steerQueue = [makeQueuedPrompt('queue-a-after-draft', keyA, 'send after draft clears')];
+  queuedPromptState.codexControls.activeDraftsBySession.set(keyA, { clientRequestId: 'active-a' });
+  queuedPromptContext.maybeScheduleQueuedPromptSend(sessionA);
+  assert.strictEqual(
+    queuedPromptTimers.size,
+    0,
+    'an active draft must block queued sending without creating a busy retry loop'
+  );
+  assert.strictEqual(
+    queuedPromptContext.clearActiveDraftForSessionRequest(sessionA, 'active-a'),
+    true,
+    'the matching active draft should clear'
+  );
+  await runOnlyQueuedPromptTimer();
+  assert.deepStrictEqual(
+    queuedPromptSends.map((entry) => entry.sessionKey),
+    [keyA, keyA],
+    'clearing A\'s active draft must wake A\'s queue even while B remains selected'
+  );
+  assert(!queuedPromptSends.some((entry) => entry.sessionKey === keyB), 'A queue items must never be sent to B');
+  const uncertain = makeQueuedPrompt('queue-uncertain', keyA, 'preserve this text');
+  queuedPromptState.codexControls.steerQueue.push(uncertain);
+  let uncertainSends = 0;
+  queuedPromptContext.sendInputToSession = async () => {
+    uncertainSends++;
+    throw Object.assign(new Error('response lost'), { inputAcceptanceUnknown: true,
+      inputRequest: { url: '/original/input', body: JSON.stringify({ clientRequestId: 'stable-unknown', text: uncertain.text }) } });
+  };
+  await queuedPromptContext.sendQueuedPrompt(uncertain.id);
+  assert.strictEqual(uncertain.status, 'input_unknown', 'a lost queue response is not a definite rejection');
+  assert.strictEqual(uncertain.payload.clientRequestId, 'stable-unknown');
+  queuedPromptContext.setSteerQueueItemText(uncertain, 'must not replace frozen payload');
+  await queuedPromptContext.sendQueuedPrompt(uncertain.id);
+  assert.strictEqual(uncertainSends, 1, 'unknown input must not automatically resend');
+  assert.strictEqual(uncertain.text, 'preserve this text');
+
   const interruptRuntime = new Map([[keyA, {
     phase: 'interrupting',
     busy: true,
     activeTurnId: 'turn-a',
   }]]);
   let interruptCleanupCount = 0;
+  let queuedSendCount = 0;
+  let runtimeRenderCount = 0;
   const interruptContext = vm.createContext({
     state: {
       sessions: [sessionA],
@@ -862,15 +1002,23 @@ async function run() {
       : `${sessionOrKey.hostId}::${sessionOrKey.sessionId}`,
     findSessionForResolvedComposerKey: () => sessionA,
     getRuntimeForSession: () => interruptRuntime.get(keyA),
+    patchRuntimeForSession: (_hostId, _sessionId, patch) => {
+      const merged = { ...(interruptRuntime.get(keyA) || {}), ...patch };
+      interruptRuntime.set(keyA, merged);
+      return merged;
+    },
     runtimeIsActive: (runtime) => Boolean(runtime?.activeTurnId || runtime?.busy),
     clearSentDraftSnapshotInterruptMarker: () => true,
     restoreSentDraftSnapshotForSession: () => false,
     restoreSentDraftAfterInterrupt: async () => {},
     scheduleInterruptOperationCleanup: () => { interruptCleanupCount += 1; },
+    maybeScheduleQueuedPromptSend: () => { queuedSendCount += 1; },
+    scheduleRuntimeStatusRender: () => { runtimeRenderCount += 1; },
     renderComposerControls: () => {},
     renderComposerTurnNotice: () => {},
   });
   vm.runInContext(extractFunction('getInterruptOperation'), interruptContext);
+  vm.runInContext(extractFunction('reconcileNoActiveInterruptRuntime'), interruptContext);
   vm.runInContext(extractFunction('applySessionInterruptResult'), interruptContext);
   vm.runInContext(extractFunction('settlePendingInterruptFromInactiveRuntime'), interruptContext);
   assert.strictEqual(interruptContext.applySessionInterruptResult(sessionA, {
@@ -891,8 +1039,94 @@ async function run() {
   assert.strictEqual(interruptContext.state.codexControls.interruptBusyKeys.has(keyA), false);
   assert.strictEqual(interruptCleanupCount, 1, 'inactive runtime must settle and schedule cleanup exactly once');
 
+  const staleInterrupt = {
+    interruptRequestId: 'interrupt-stale',
+    status: 'queued',
+    pending: true,
+    restoreDraft: false,
+    expectedRunId: 'run-stale',
+    expectedTurnId: 'turn-stale',
+    expectedRuntimeRevision: 10,
+  };
+  interruptContext.state.codexControls.interruptOperationsBySession.set(keyA, staleInterrupt);
+  interruptContext.state.codexControls.interruptBusyKeys.add(keyA);
+  interruptRuntime.set(keyA, {
+    runId: 'run-stale',
+    runtimeRevision: 11,
+    phase: 'idle',
+    busy: false,
+    activeTurnId: 'turn-stale',
+    currentTurnStatus: 'inProgress',
+  });
+  assert.strictEqual(interruptContext.applySessionInterruptResult(sessionA, {
+    interruptRequestId: 'interrupt-stale',
+    status: 'no_active',
+    reason: 'turn_already_completed',
+    runId: 'run-stale',
+    turnId: 'turn-stale',
+  }), true);
+  assert.strictEqual(interruptRuntime.get(keyA).activeTurnId, null, 'matching no_active must clear the stale browser turn');
+  assert.strictEqual(interruptRuntime.get(keyA).currentTurnStatus, 'idle');
+  assert.strictEqual(interruptContext.state.codexControls.interruptBusyKeys.has(keyA), false);
+  assert.strictEqual(queuedSendCount, 1, 'reconciled no_active must wake the queued prompt scheduler once');
+  assert.strictEqual(runtimeRenderCount, 1);
+
+  const lateInterrupt = {
+    interruptRequestId: 'interrupt-late',
+    status: 'queued',
+    pending: true,
+    restoreDraft: false,
+    expectedRunId: 'run-stale',
+    expectedTurnId: 'turn-stale',
+    expectedRuntimeRevision: 11,
+  };
+  interruptContext.state.codexControls.interruptOperationsBySession.set(keyA, lateInterrupt);
+  interruptContext.state.codexControls.interruptBusyKeys.add(keyA);
+  interruptRuntime.set(keyA, {
+    runId: 'run-new',
+    runtimeRevision: 1,
+    phase: 'thinking',
+    busy: true,
+    activeTurnId: 'turn-new',
+    currentTurnStatus: 'inProgress',
+  });
+  assert.strictEqual(interruptContext.applySessionInterruptResult(sessionA, {
+    interruptRequestId: 'interrupt-late',
+    status: 'no_active',
+    reason: 'turn_already_completed',
+    runId: 'run-stale',
+    turnId: 'turn-stale',
+  }), true);
+  assert.strictEqual(interruptRuntime.get(keyA).activeTurnId, 'turn-new', 'a delayed old-run result must not clear the new turn');
+  assert.strictEqual(interruptRuntime.get(keyA).busy, true);
+  assert.strictEqual(queuedSendCount, 1, 'a fenced late result must not wake queued sending');
+  assert.strictEqual(runtimeRenderCount, 1);
+
+  const changedTurnInterrupt = {
+    interruptRequestId: 'interrupt-changed-turn',
+    status: 'queued',
+    pending: true,
+    restoreDraft: false,
+    expectedRunId: 'run-new',
+    expectedTurnId: 'turn-old',
+    expectedRuntimeRevision: 1,
+  };
+  interruptContext.state.codexControls.interruptOperationsBySession.set(keyA, changedTurnInterrupt);
+  interruptContext.state.codexControls.interruptBusyKeys.add(keyA);
+  assert.strictEqual(interruptContext.applySessionInterruptResult(sessionA, {
+    interruptRequestId: 'interrupt-changed-turn',
+    status: 'no_active',
+    reason: 'active_turn_changed',
+    runId: 'run-new',
+    turnId: 'turn-new',
+  }), true);
+  assert.strictEqual(interruptRuntime.get(keyA).activeTurnId, 'turn-new', 'active_turn_changed must preserve the replacement turn');
+  assert.strictEqual(queuedSendCount, 1);
+  assert.strictEqual(runtimeRenderCount, 1);
+
   assert(source.includes('attachHistoryMarkdown(session, exportOptions, composerSessionKey)'));
-  assert(source.includes('addComposerFiles([fileFromBlob(blob, name, \'text/markdown\')], composerSessionKey)'));
+  assert(source.includes('addComposerFiles([fileFromBlob(blob, name, \'text/markdown\')], composerSessionKey, {'));
+  assert(source.includes('historyImportBatchId'), 'history imports should tag attachments for batch rollback');
   console.log('composer draft state tests passed');
 }
 

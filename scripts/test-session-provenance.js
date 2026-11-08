@@ -15,12 +15,14 @@ const {
   makeUnknownBinding,
   normalizeBaseUrl,
   publicBinding,
+  resumeBindingsCompatible,
 } = require('../shared/api-binding');
 
 async function main() {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-codex-provenance-'));
   let tick = 0;
-  const now = () => `2026-07-16T00:00:${String(tick++).padStart(2, '0')}.000Z`;
+  const clockBaseMs = Date.parse('2026-07-16T00:00:00.000Z');
+  const now = () => new Date(clockBaseMs + (tick++ * 1000)).toISOString();
   const store = await SessionRecordStore.open({ rootDir, snapshotEvery: 2, now });
   const service = new SessionProvenanceService({ store, now });
 
@@ -44,6 +46,28 @@ async function main() {
     provider: 'OpenAI',
     baseUrl: 'https://other.example/v1',
   });
+  const asxsRotatedProfile = makeProfileBinding({
+    profileId: 'api-asxs-rotated-profile',
+    label: 'Asxs rotated profile',
+    provider: 'OpenAI',
+    baseUrl: 'https://api.asxs.top/v1',
+  });
+  const keyedGatewayA = makeProfileBinding({
+    profileId: 'keyed-gateway-a',
+    label: 'Gateway A',
+    provider: 'Custom',
+    providerKind: 'custom',
+    baseUrl: 'https://gateway-a.example/v1',
+    nativeResumeCompatibilityKey: 'shared-sub2api-gateway',
+  });
+  const keyedGatewayB = makeProfileBinding({
+    profileId: 'keyed-gateway-b',
+    label: 'Gateway B',
+    provider: 'Custom',
+    providerKind: 'custom',
+    baseUrl: 'https://gateway-b.example/v1',
+    nativeResumeCompatibilityKey: 'shared-sub2api-gateway',
+  });
   const legacyOpenAiKeyOnlyBinding = {
     kind: 'profile',
     profileId: 'legacy-openai-key-only',
@@ -66,6 +90,133 @@ async function main() {
     'publicBinding must recalculate legacy OpenAI null-base identity with the official endpoint'
   );
   assert.strictEqual(bindingsEqual(asxs, renamedAsxs), true, 'label/key rotation must not change API identity');
+  assert.notStrictEqual(
+    asxs.bindingFingerprint,
+    asxsRotatedProfile.bindingFingerprint,
+    'a distinct profile ID must remain a distinct durable binding identity'
+  );
+  assert.strictEqual(
+    bindingsEqual(asxs, asxsRotatedProfile),
+    false,
+    'same-endpoint profile rotation must not collapse durable binding identities'
+  );
+  assert.strictEqual(
+    resumeBindingsCompatible(asxs, asxsRotatedProfile),
+    true,
+    'same endpoint profiles must be compatible for native resume'
+  );
+  assert.strictEqual(
+    resumeBindingsCompatible(asxs, other),
+    false,
+    'different endpoints must remain incompatible without an explicit key'
+  );
+  assert.notStrictEqual(
+    keyedGatewayA.bindingFingerprint,
+    keyedGatewayB.bindingFingerprint,
+    'explicit compatibility keys must not weaken durable binding identity'
+  );
+  assert.strictEqual(
+    resumeBindingsCompatible(keyedGatewayA, keyedGatewayB),
+    true,
+    'an explicit compatibility key may authorize a cross-endpoint native resume'
+  );
+  const providerOnlyA = makeProfileBinding({
+    profileId: 'provider-only-a',
+    provider: 'MineMine',
+    providerKind: 'custom',
+  });
+  const providerOnlyB = makeProfileBinding({
+    profileId: 'provider-only-b',
+    provider: 'MineMine',
+    providerKind: 'custom',
+  });
+  assert(providerOnlyA.bindingFingerprint, 'provider-only profiles retain strict identity');
+  assert.strictEqual(
+    providerOnlyA.nativeResumeCompatibilityFingerprint,
+    null,
+    'a custom provider label without an endpoint cannot attest native history compatibility'
+  );
+  assert.strictEqual(
+    resumeBindingsCompatible(providerOnlyA, providerOnlyB),
+    false,
+    'two provider-only custom profiles must not collapse into one native compatibility group'
+  );
+  const providerOnlyLegacyHost = publicBinding({
+    kind: 'host_environment',
+    provider: 'MineMine',
+    modelProviderHint: null,
+    bindingFingerprint: 'c'.repeat(64),
+    nativeResumeCompatibilityFingerprint: 'd'.repeat(64),
+  });
+  assert.strictEqual(
+    providerOnlyLegacyHost.bindingFingerprint,
+    null,
+    'a provider-only Host must not reuse a persisted identity digest as current evidence'
+  );
+  assert.strictEqual(
+    providerOnlyLegacyHost.nativeResumeCompatibilityFingerprint,
+    null,
+    'a provider-only Host must not reuse persisted native compatibility evidence'
+  );
+  const hintOnlyHost = makeHostEnvironmentBinding({ modelProviderHint: 'remote_codex_hint' });
+  assert.strictEqual(
+    hintOnlyHost.bindingFingerprint,
+    null,
+    'a model provider hint alone cannot attest Host API identity'
+  );
+  assert.strictEqual(hintOnlyHost.nativeResumeCompatibilityFingerprint, null);
+  const hintOnlyLegacyHost = publicBinding({
+    kind: 'host_environment',
+    modelProviderHint: 'remote_codex_hint',
+    bindingFingerprint: 'e'.repeat(64),
+    nativeResumeCompatibilityFingerprint: 'f'.repeat(64),
+  });
+  assert.strictEqual(
+    hintOnlyLegacyHost.bindingFingerprint,
+    null,
+    'a hint-only Host must not reuse a persisted identity digest'
+  );
+  assert.strictEqual(
+    hintOnlyLegacyHost.nativeResumeCompatibilityFingerprint,
+    null,
+    'a hint-only Host must not reuse persisted native compatibility evidence'
+  );
+  const defaultOpenAiHost = makeHostEnvironmentBinding({
+    provider: 'OpenAI',
+    modelProviderHint: 'openai',
+  });
+  const explicitOpenAiHost = makeHostEnvironmentBinding({
+    provider: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+  });
+  assert.strictEqual(
+    defaultOpenAiHost.normalizedBaseUrl,
+    'https://api.openai.com/v1',
+    'a Host using the official OpenAI default must receive the canonical endpoint'
+  );
+  assert.strictEqual(
+    resumeBindingsCompatible(defaultOpenAiHost, explicitOpenAiHost),
+    true,
+    'default and explicit official OpenAI Host bindings must share native compatibility'
+  );
+  const persistedOnlyBinding = publicBinding({
+    kind: 'profile',
+    profileId: null,
+    provider: null,
+    normalizedBaseUrl: null,
+    bindingFingerprint: 'a'.repeat(64),
+    nativeResumeCompatibilityFingerprint: 'b'.repeat(64),
+  });
+  assert.strictEqual(
+    persistedOnlyBinding.bindingFingerprint,
+    'a'.repeat(64),
+    'fingerprint-only legacy records retain their strict persisted evidence'
+  );
+  assert.strictEqual(
+    persistedOnlyBinding.nativeResumeCompatibilityFingerprint,
+    'b'.repeat(64),
+    'fingerprint-only legacy records retain persisted native compatibility evidence'
+  );
   assert.strictEqual(JSON.stringify(asxs).includes('secret-one'), false);
   assert.strictEqual(
     normalizeBaseUrl(
@@ -549,10 +700,10 @@ async function main() {
     identity: { hostId: 'host-a', sessionId: 'native-a' },
     runId: 'run-rebind',
     launchMode: 'resume',
-    submittedBinding: other,
+    submittedBinding: asxs,
     explicitRebind: true,
   });
-  assert.strictEqual(rebound.run.apiBinding.bindingFingerprint, other.bindingFingerprint);
+  assert.strictEqual(rebound.run.apiBinding.bindingFingerprint, asxs.bindingFingerprint);
   await service.stopRun({
     identity: { hostId: 'host-a', sessionId: 'native-a' },
     runId: 'run-2',
@@ -580,7 +731,7 @@ async function main() {
       identity: { hostId: 'host-a', sessionId: 'native-a' },
       runId: 'run-rebind',
       nativeThreadId: 'native-a',
-      effectiveBinding: other,
+      effectiveBinding: asxs,
     }),
     (error) => error instanceof SessionContractError
       && error.code === 'session_run_state_conflict'
@@ -728,6 +879,67 @@ async function main() {
     runId: 'run-explicit-fresh-rebind',
     code: 'simulated_fresh_rebind_failure',
   });
+  const compatibleProfileRebind = await service.planRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    sourceIdentity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-compatible-profile-rebind',
+    launchMode: 'fresh_rebind',
+    submittedBinding: asxsRotatedProfile,
+    explicitRebind: true,
+  });
+  assert.strictEqual(
+    compatibleProfileRebind.run.launchMode,
+    'resume',
+    'same-endpoint profiles must be allowed to use native resume'
+  );
+  assert.strictEqual(compatibleProfileRebind.run.parentRunId, 'run-live-race');
+  assert.strictEqual(
+    compatibleProfileRebind.run.apiBinding.profileId,
+    asxsRotatedProfile.profileId
+  );
+  await service.failRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-compatible-profile-rebind',
+    code: 'simulated_compatible_rebind_cleanup',
+  });
+
+  const keyedGatewayHost = 'host-keyed-gateway-rebind';
+  await service.planRun({
+    identity: { hostId: keyedGatewayHost, sessionId: 'keyed-gateway' },
+    runId: 'keyed-parent',
+    launchMode: 'fresh',
+    submittedBinding: keyedGatewayA,
+  });
+  await service.confirmRun({
+    identity: { hostId: keyedGatewayHost, sessionId: 'keyed-gateway' },
+    runId: 'keyed-parent',
+    nativeThreadId: 'keyed-gateway-native',
+    effectiveBinding: keyedGatewayA,
+  });
+  await service.confirmNativeResumeReady({
+    identity: { hostId: keyedGatewayHost, sessionId: 'keyed-gateway' },
+    runId: 'keyed-parent',
+  });
+  const keyedGatewayRebind = await service.planRun({
+    identity: { hostId: keyedGatewayHost, sessionId: 'keyed-gateway' },
+    sourceIdentity: { hostId: keyedGatewayHost, sessionId: 'keyed-gateway' },
+    runId: 'keyed-child',
+    launchMode: 'fresh_rebind',
+    submittedBinding: keyedGatewayB,
+    explicitRebind: true,
+  });
+  assert.strictEqual(
+    keyedGatewayRebind.run.launchMode,
+    'resume',
+    'an explicit compatibility key must authorize native resume across endpoints'
+  );
+  assert.strictEqual(keyedGatewayRebind.run.parentRunId, 'keyed-parent');
+  assert.strictEqual(keyedGatewayRebind.run.apiBinding.profileId, keyedGatewayB.profileId);
+  await service.failRun({
+    identity: { hostId: keyedGatewayHost, sessionId: 'keyed-gateway' },
+    runId: 'keyed-child',
+    code: 'simulated_keyed_rebind_cleanup',
+  });
   const duplicateReadiness = await service.confirmNativeResumeReady({
     identity: { hostId: 'host-live-race', sessionId: 'live-race' },
     runId: 'run-live-race',
@@ -735,25 +947,89 @@ async function main() {
   assert.strictEqual(duplicateReadiness.transitioned, false, 'native readiness confirmation must be idempotent');
   liveRaceRecord = service.getSessionRecord({ hostId: 'host-live-race', sessionId: 'live-race' });
   assert.strictEqual(liveRaceRecord.runs['run-live-race'].nativeResumeReady, true);
+  const crossBindingNativeResume = await service.planRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    sourceIdentity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-cross-binding-native-resume',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+  });
+  assert.strictEqual(crossBindingNativeResume.run.launchMode, 'resume');
+  assert.strictEqual(crossBindingNativeResume.run.parentRunId, 'run-live-race');
+  await service.failRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-cross-binding-native-resume',
+    code: 'session_native_resume_failed',
+  });
+  liveRaceRecord = service.getSessionRecord({ hostId: 'host-live-race', sessionId: 'live-race' });
+  assert.strictEqual(
+    liveRaceRecord.activeRunId,
+    'run-live-race',
+    'a rejected cross-binding Rebind must leave the original native run active'
+  );
+  const forceFreshBefore = service.getSessionRecord({
+    hostId: 'host-live-race',
+    sessionId: 'live-race',
+  });
+  const forcedCrossBindingResume = await service.planRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    sourceIdentity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-cross-binding-force-fresh',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+    forceFreshRebind: true,
+  });
+  assert.strictEqual(forcedCrossBindingResume.run.launchMode, 'resume');
+  await service.failRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-cross-binding-force-fresh',
+    code: 'session_native_resume_failed',
+  });
+  const forceFreshAfter = service.getSessionRecord({
+    hostId: 'host-live-race',
+    sessionId: 'live-race',
+  });
+  assert.strictEqual(forceFreshAfter.activeRunId, forceFreshBefore.activeRunId);
+  assert.strictEqual(forceFreshAfter.runs['run-cross-binding-force-fresh'].status, 'failed');
   const materializedResume = await service.planRun({
     identity: { hostId: 'host-live-race', sessionId: 'live-race' },
     sourceIdentity: { hostId: 'host-live-race', sessionId: 'live-race' },
     runId: 'run-materialized-resume',
     launchMode: 'fresh_rebind',
-    submittedBinding: other,
+    submittedBinding: asxs,
     explicitRebind: true,
   });
   assert.strictEqual(materializedResume.run.parentRunId, 'run-live-race');
   assert.strictEqual(
     materializedResume.run.launchMode,
     'resume',
-    'planRun must atomically upgrade fresh_rebind when the inherited parent is already ready'
+    'same-binding Rebind may still upgrade to native resume when the parent is ready'
   );
   assert.strictEqual(materializedResume.run.nativeResumeReady, true);
   await service.failRun({
     identity: { hostId: 'host-live-race', sessionId: 'live-race' },
     runId: 'run-materialized-resume',
     code: 'simulated_resume_failure',
+  });
+
+  const forcedTranscript = await service.planRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    sourceIdentity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-forced-cross-binding-transcript',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+    forceTranscriptFallback: true,
+  });
+  assert.strictEqual(forcedTranscript.run.launchMode, 'fresh_rebind');
+  assert.strictEqual(forcedTranscript.run.transcriptFallback, true);
+  assert.strictEqual(forcedTranscript.run.nativeResumeReady, false);
+  await service.failRun({
+    identity: { hostId: 'host-live-race', sessionId: 'live-race' },
+    runId: 'run-forced-cross-binding-transcript',
+    code: 'simulated_transcript_rebind_failure',
   });
 
   const adaptiveHostId = 'host-adaptive-rebind-confirm';
@@ -774,7 +1050,7 @@ async function main() {
     sourceIdentity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
     runId: 'adaptive-child',
     launchMode: 'fresh_rebind',
-    submittedBinding: other,
+    submittedBinding: asxs,
     explicitRebind: true,
   });
   assert.strictEqual(adaptiveFresh.run.launchMode, 'fresh_rebind');
@@ -782,12 +1058,173 @@ async function main() {
     identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
     runId: 'adaptive-child',
     nativeThreadId: 'adaptive-native',
-    effectiveBinding: other,
+    effectiveBinding: asxs,
     launchMode: 'resume',
     nativeResumeReady: true,
   });
   assert.strictEqual(adaptiveResumed.record.runs['adaptive-child'].launchMode, 'resume');
   assert.strictEqual(adaptiveResumed.record.runs['adaptive-child'].nativeResumeReady, true);
+  assert.strictEqual(adaptiveResumed.record.runs['adaptive-parent'].status, 'stopped');
+  const adaptiveRetirement = Object.values(adaptiveResumed.record.runnerRetirements || {})[0];
+  assert(adaptiveRetirement, 'confirming a native replacement must persist parent runner cleanup');
+  assert.strictEqual(adaptiveRetirement.runId, 'adaptive-parent');
+  assert.strictEqual(adaptiveRetirement.replacementRunId, 'adaptive-child');
+  assert.strictEqual(adaptiveRetirement.status, 'pending');
+  const attemptedRetirement = await service.markRunnerRetirementAttempt({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    retirementId: adaptiveRetirement.retirementId,
+    runId: 'adaptive-parent',
+    commandId: 42,
+    ackTimeoutMs: 1000,
+  });
+  assert.strictEqual(attemptedRetirement.retirement.attemptCount, 1);
+  await assert.rejects(
+    service.markRunnerRetirementFailed({
+      identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+      retirementId: adaptiveRetirement.retirementId,
+      runId: 'unrelated-run',
+      code: 'test_stop_failure',
+    }),
+    (error) => error?.code === 'session_runner_retirement_run_mismatch',
+    'a delayed cleanup receipt must not retire a different run'
+  );
+  const failedRetirement = await service.markRunnerRetirementFailed({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    retirementId: adaptiveRetirement.retirementId,
+    runId: 'adaptive-parent',
+    code: 'test_stop_failure',
+    message: 'simulated cleanup failure',
+  });
+  assert.strictEqual(failedRetirement.retirement.status, 'pending');
+  assert(failedRetirement.retirement.nextAttemptAt);
+  const retryRetirement = await service.markRunnerRetirementAttempt({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    retirementId: adaptiveRetirement.retirementId,
+    runId: 'adaptive-parent',
+    commandId: 43,
+    ackTimeoutMs: 1000,
+  });
+  assert.strictEqual(retryRetirement.retirement.attemptCount, 2);
+  const staleFailureReceipt = await service.markRunnerRetirementFailed({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    retirementId: adaptiveRetirement.retirementId,
+    runId: 'adaptive-parent',
+    commandId: 42,
+    code: 'delayed_old_failure',
+  });
+  assert.strictEqual(staleFailureReceipt.transitioned, false);
+  assert.strictEqual(staleFailureReceipt.stale, true);
+  assert.strictEqual(staleFailureReceipt.retirement.commandId, 43);
+  assert.strictEqual(staleFailureReceipt.retirement.lastError, null);
+  const completedRetirement = await service.markRunnerRetirementSucceeded({
+    identity: { hostId: adaptiveHostId, sessionId: 'adaptive-rebind' },
+    retirementId: adaptiveRetirement.retirementId,
+    runId: 'adaptive-parent',
+    commandId: 43,
+  });
+  assert.strictEqual(completedRetirement.retirement.status, 'succeeded');
+  assert.strictEqual(
+    service.listRunnerRetirements({ hostId: adaptiveHostId }).length,
+    0,
+    'successful cleanup receipts must remove the retirement from pending work'
+  );
+  const originalReadSnapshot = store.readSnapshot;
+  store.readSnapshot = () => {
+    throw new Error('runner retirement reconciliation must not clone the entire Store');
+  };
+  try {
+    assert.deepStrictEqual(service.listRunnerRetirements({ hostId: adaptiveHostId }), []);
+  } finally {
+    store.readSnapshot = originalReadSnapshot;
+  }
+
+  const mergeTerminalHost = 'host-retirement-terminal-merge';
+  await service.mergeDiscovery({
+    hostId: mergeTerminalHost,
+    sessionId: 'merge-success',
+    nativeThreadId: 'merge-success',
+    source: 'managed',
+  });
+  await service.mergeDiscovery({
+    hostId: mergeTerminalHost,
+    sessionId: 'merge-pending',
+    nativeThreadId: 'merge-pending',
+    source: 'rollout',
+  });
+  await store.transact('test.runner_retirement_merge_seed', (tx) => {
+    const succeeded = tx.getRecord(`${mergeTerminalHost}::merge-success`);
+    const pending = tx.getRecord(`${mergeTerminalHost}::merge-pending`);
+    succeeded.runnerRetirements = {
+      'merge-retirement': {
+        retirementId: 'merge-retirement',
+        runId: 'merge-parent',
+        status: 'succeeded',
+        attemptCount: 2,
+        completedAt: '2026-07-16T00:00:05.000Z',
+        lastError: null,
+      },
+    };
+    pending.runnerRetirements = {
+      'merge-retirement': {
+        retirementId: 'merge-retirement',
+        runId: 'merge-parent',
+        status: 'pending',
+        attemptCount: 1,
+        lastAttemptAt: '2026-07-16T00:00:04.000Z',
+        lastError: { code: 'stale_failure', message: 'old failure' },
+      },
+    };
+    tx.markDirty(`${mergeTerminalHost}::merge-success`);
+    tx.markDirty(`${mergeTerminalHost}::merge-pending`);
+  });
+  const mergedRetirementRecord = await service.mergeDiscovery({
+    hostId: mergeTerminalHost,
+    sessionId: 'merge-success',
+    bridgeSessionId: 'merge-pending',
+    source: 'managed',
+  });
+  assert.strictEqual(
+    mergedRetirementRecord.record.runnerRetirements['merge-retirement'].status,
+    'succeeded'
+  );
+  assert.strictEqual(
+    mergedRetirementRecord.record.runnerRetirements['merge-retirement'].lastError,
+    null,
+    'a succeeded retirement must not retain a stale merged failure'
+  );
+
+  const malformedAttemptHost = 'host-retirement-malformed-attempt';
+  await service.mergeDiscovery({
+    hostId: malformedAttemptHost,
+    sessionId: 'malformed-attempt',
+    source: 'managed',
+  });
+  await store.transact('test.runner_retirement_malformed_attempt_seed', (tx) => {
+    const record = tx.getRecord(`${malformedAttemptHost}::malformed-attempt`);
+    record.runnerRetirements = {
+      'malformed-retirement': {
+        retirementId: 'malformed-retirement',
+        runId: 'malformed-parent',
+        status: 'pending',
+        attemptCount: 'not-a-number',
+        nextAttemptAt: '2026-07-16T00:30:00.000Z',
+      },
+    };
+    tx.markDirty(`${malformedAttemptHost}::malformed-attempt`);
+  });
+  const blockedMalformedAttempt = await service.markRunnerRetirementAttempt({
+    identity: { hostId: malformedAttemptHost, sessionId: 'malformed-attempt' },
+    retirementId: 'malformed-retirement',
+    runId: 'malformed-parent',
+    commandId: 55,
+  });
+  assert.strictEqual(blockedMalformedAttempt.retirement.status, 'blocked');
+  assert.strictEqual(blockedMalformedAttempt.retirement.attemptCount, 7);
+  assert.strictEqual(
+    blockedMalformedAttempt.retirement.nextAttemptAt,
+    null,
+    'a malformed attempt counter must block without advertising a retry deadline'
+  );
 
   const legacyHostId = 'host-legacy-adaptive-rebind';
   await service.planRun({
@@ -806,7 +1243,11 @@ async function main() {
     identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
     runId: 'legacy-parent',
   });
-  const legacyPlannedResume = await service.planRun({
+  const legacyBeforeRebind = service.getSessionRecord({
+    hostId: legacyHostId,
+    sessionId: 'legacy-adaptive',
+  });
+  const legacyNativeRebind = await service.planRun({
     identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
     sourceIdentity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
     runId: 'legacy-child',
@@ -814,17 +1255,39 @@ async function main() {
     submittedBinding: other,
     explicitRebind: true,
   });
-  assert.strictEqual(legacyPlannedResume.run.launchMode, 'resume');
-  const legacyFresh = await service.confirmRun({
+  assert.strictEqual(legacyNativeRebind.run.launchMode, 'resume');
+  await service.failRun({
     identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
     runId: 'legacy-child',
+    code: 'session_native_resume_failed',
+  });
+  const legacyAfterRejectedRebind = service.getSessionRecord({
+    hostId: legacyHostId,
+    sessionId: 'legacy-adaptive',
+  });
+  assert.strictEqual(legacyAfterRejectedRebind.activeRunId, legacyBeforeRebind.activeRunId);
+  assert.strictEqual(legacyAfterRejectedRebind.runs['legacy-child'].status, 'failed');
+  const legacyPlannedFallback = await service.planRun({
+    identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    sourceIdentity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    runId: 'legacy-fallback',
+    launchMode: 'fresh_rebind',
+    submittedBinding: other,
+    explicitRebind: true,
+    forceTranscriptFallback: true,
+  });
+  assert.strictEqual(legacyPlannedFallback.run.launchMode, 'fresh_rebind');
+  assert.strictEqual(legacyPlannedFallback.run.transcriptFallback, true);
+  const legacyFresh = await service.confirmRun({
+    identity: { hostId: legacyHostId, sessionId: 'legacy-adaptive' },
+    runId: 'legacy-fallback',
     nativeThreadId: 'legacy-new-native',
     effectiveBinding: other,
     launchMode: 'fresh_rebind',
     nativeResumeReady: false,
   });
-  assert.strictEqual(legacyFresh.record.runs['legacy-child'].launchMode, 'fresh_rebind');
-  assert.strictEqual(legacyFresh.record.runs['legacy-child'].nativeResumeReady, false);
+  assert.strictEqual(legacyFresh.record.runs['legacy-fallback'].launchMode, 'fresh_rebind');
+  assert.strictEqual(legacyFresh.record.runs['legacy-fallback'].nativeResumeReady, false);
 
   await assert.rejects(
     service.planRun({
@@ -1391,6 +1854,107 @@ async function main() {
     'a stronger record with an unknown colliding legacy run must not erase verified binding evidence'
   );
   assert(collisionMerge.record.runs.legacy.apiBinding.bindingFingerprint);
+
+  await service.mergeDiscovery({
+    hostId: 'host-thinking-merge',
+    sessionId: 'thinking-winner',
+    nativeThreadId: 'thinking-winner',
+    source: 'managed',
+  });
+  await service.mergeDiscovery({
+    hostId: 'host-thinking-merge',
+    sessionId: 'thinking-loser',
+    nativeThreadId: 'thinking-loser',
+    source: 'rollout',
+  });
+  await store.transact('test.thinking.provenance_merge_seed', (tx) => {
+    const winnerKey = 'host-thinking-merge::thinking-winner';
+    const loserKey = 'host-thinking-merge::thinking-loser';
+    tx.getRecord(winnerKey).thinking = {
+      schemaVersion: 1,
+      nextOrdinal: 3,
+      activities: [
+        {
+          runId: 'thinking-run',
+          turnId: 'thinking-turn',
+          itemId: 'winner-only',
+          kind: 'reasoning',
+          status: 'completed',
+          activityRevision: 1,
+          final: true,
+          firstObservedOrdinal: 1,
+          text: 'winner history',
+        },
+        {
+          runId: 'thinking-run',
+          turnId: 'thinking-turn',
+          itemId: 'shared',
+          kind: 'reasoning',
+          status: 'completed',
+          activityRevision: 1,
+          final: true,
+          firstObservedOrdinal: 2,
+          text: 'winner old revision',
+        },
+      ],
+    };
+    tx.getRecord(loserKey).thinking = {
+      schemaVersion: 1,
+      nextOrdinal: 4,
+      activities: [
+        {
+          runId: 'thinking-run',
+          turnId: 'thinking-turn',
+          itemId: 'loser-only',
+          kind: 'reasoning',
+          status: 'completed',
+          activityRevision: 1,
+          final: true,
+          firstObservedOrdinal: 1,
+          text: 'loser history',
+        },
+        {
+          runId: 'thinking-run',
+          turnId: 'thinking-turn',
+          itemId: 'shared',
+          kind: 'reasoning',
+          status: 'completed',
+          activityRevision: 2,
+          final: true,
+          firstObservedOrdinal: 3,
+          text: 'loser newer revision',
+        },
+      ],
+    };
+    tx.markDirty(winnerKey);
+    tx.markDirty(loserKey);
+  });
+  const thinkingMerge = await service.mergeDiscovery({
+    hostId: 'host-thinking-merge',
+    sessionId: 'thinking-winner',
+    bridgeSessionId: 'thinking-loser',
+    source: 'managed',
+  });
+  assert.deepStrictEqual(
+    thinkingMerge.record.thinking.activities.map((activity) => activity.itemId),
+    ['winner-only', 'shared', 'loser-only'],
+    'provenance alias merge must preserve winner history and append loser-only Thinking entries'
+  );
+  const mergedSharedThinking = thinkingMerge.record.thinking.activities.find(
+    (activity) => activity.itemId === 'shared'
+  );
+  assert.strictEqual(mergedSharedThinking.text, 'loser newer revision');
+  assert.strictEqual(
+    mergedSharedThinking.firstObservedOrdinal,
+    2,
+    'a newer loser revision must retain the winner history position'
+  );
+  const thinkingMergeSnapshot = store.readSnapshot();
+  assert.strictEqual(
+    thinkingMergeSnapshot.records['host-thinking-merge::thinking-loser'],
+    undefined,
+    'the merged loser record must remain deleted'
+  );
 
   await store.close();
   console.log('session provenance tests passed');

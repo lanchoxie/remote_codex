@@ -28,14 +28,20 @@ const state = {
   selectedSessionId: null,
   eventSource: null,
   eventSourceKey: null,
+  sessionStreamGeneration: 0,
   eventCursorByCanonical: new Map(),
+  eventCursorGenerationByCanonical: new Map(),
   streamRecoveryInFlight: false,
   streamDetailRecoveryInFlight: false,
+  streamDetailRecoveryOwner: null,
+  streamDetailRecoveryContext: null,
   streamDetailRecoveryPendingKey: null,
   streamActivityRecoveryPendingKeys: new Set(),
   streamDetailRecoveryRetryTimer: null,
   streamDetailRecoveryRetryKey: null,
   streamDetailRecoveryRetryAttempt: 0,
+  streamDetailRecoveryRetryGeneration: null,
+  streamDetailRecoveryRetrySource: null,
   streamDetailRecoveryCanonicalKeys: new Map(),
   activitySnapshotRecoveryTasks: new Map(),
   transcripts: new Map(),
@@ -48,13 +54,17 @@ const state = {
   diagnostics: new Map(),
   externalActivityKeys: new Set(),
   requests: new Map(),
+  requestApplyGenerations: new Map(),
   receivedFiles: new Map(),
   receivedFilesLoadingKeys: new Set(),
+  receivedFilesLoadingTokens: new Map(),
+  receivedFilesLoadingPromises: new Map(),
   streamStatus: new Map(),
   activityProjection: window.RemoteCodexTranscriptState?.createTranscriptActivityProjection?.({
     onConversationRemoved: (canonicalKey) => forgetActivityCanonicalConversation(canonicalKey),
   }) || null,
   activityCanonicalKeysBySession: new Map(),
+  activityClientRequestIdsByCanonical: new Map(),
   thinkingPanels: new Map(),
   thinkingScrollPositions: new Map(),
   thinkingScrollMachines: new WeakMap(),
@@ -65,6 +75,7 @@ const state = {
   messageReceiptStore: null,
   legacyMessageReadReceipts: {},
   assistantProjections: new Map(),
+  assistantProjectionCoverage: new Map(),
   assistantCanonicalKeysBySession: new Map(),
   messageProjectionRequests: new Map(),
   messageProjectionSyncPromise: null,
@@ -72,6 +83,7 @@ const state = {
   messageReadRenderReady: new Set(),
   transcriptNotificationRenderVersions: new Map(),
   transcriptNotificationRenderedAssistantSeq: new Map(),
+  transcriptNotificationRenderedAssistantIds: new Map(),
   messageNotificationOutbox: null,
   messageNotificationChannel: null,
   messageNotificationDrainPromise: null,
@@ -225,10 +237,18 @@ const state = {
   hostCodexUpdateBusyId: null,
   hostCodexUpdates: new Map(),
   sessionLaunchBusy: new Map(),
+  sessionLaunchReceipts: new Map(),
+  sessionLaunchTrackers: new Map(),
+  sessionLaunchRecoveryHandlers: new Map(),
+  sessionLaunchSoftTimeouts: new Map(),
+  sessionLaunchTerminalProjections: new Set(),
+  sessionLaunchCoordinator: null,
   newSessionLaunchError: null,
   sessionApiRebindBusyKeys: new Set(),
   sessionRebindFailures: new Map(),
   sessionTranscriptFallbackBusyKeys: new Set(),
+  sessionTerminalBusyKeys: new Set(),
+  sessionTerminalFeedback: new Map(),
   imagePreview: {
     open: false,
     src: '',
@@ -307,6 +327,8 @@ const state = {
     attachments: [],
     modelsLoading: false,
     steerQueue: [],
+    queueStore: null,
+    queueStoreRestored: false,
     queueAutoSendTimersBySession: new Map(),
     composerDraftsBySession: new Map(),
     composerSessionKeyAliases: new Map(),
@@ -316,12 +338,14 @@ const state = {
     sentDraftSnapshotsBySession: new Map(),
     pendingComposerDraftsBySession: new Map(),
     composerSubmissionsBySession: new Map(),
+    reviewBusyKeys: new Set(),
     interruptBusyKeys: new Set(),
     interruptOperationsBySession: new Map(),
     inputAnswersByRequest: new Map(),
     respondingRequestKeys: new Set(),
     recentSubmissions: new Map(),
     steerNotice: null,
+    steerClient: null,
     apiSwitchNoticesBySession: new Map(),
   },
   slashMenu: {
@@ -364,6 +388,10 @@ const MAX_COMPOSER_UPLOAD_FILES = 8;
 const MAX_COMPOSER_UPLOAD_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_COMPOSER_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const COMPOSER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+// History exports are staged in browser memory before they become composer
+// attachments. Keep a bounded copy and reject oversized responses early.
+const MAX_HISTORY_IMPORT_MARKDOWN_BYTES = 32 * 1024 * 1024;
+const MAX_HISTORY_IMPORT_BUNDLE_BYTES = 256 * 1024 * 1024;
 const COMPOSER_DRAFT_SESSION_LIMIT = 32;
 const SENT_DRAFT_SNAPSHOT_TTL_MS = 30 * 60 * 1000;
 const SENT_DRAFT_SNAPSHOT_LIMIT = 32;
@@ -395,6 +423,7 @@ const UI_SETTINGS_STORAGE_KEY = 'mobile-codex-remote.ui-settings.v1';
 const API_PROFILE_MODEL_CATALOGS_STORAGE_KEY = 'mobile-codex-remote.api-profile-model-catalogs.v1';
 const COMPOSER_SESSION_OPTIONS_STORAGE_KEY = 'mobile-codex-remote.session-options.v1';
 const SESSION_REBIND_FAILURES_STORAGE_KEY = 'mobile-codex-remote.session-rebind-failures.v1';
+const SESSION_LAUNCH_RECEIPTS_STORAGE_KEY = 'mobile-codex-remote.session-launch-receipts.v1';
 const DISMISSED_ALERTS_STORAGE_KEY = 'mobile-codex-remote.dismissed-alerts.v1';
 const MANUAL_SESSION_TITLES_STORAGE_KEY = 'mobile-codex-remote.manual-session-titles.v1';
 const LEGACY_MESSAGE_READ_RECEIPTS_STORAGE_KEY = 'mobile-codex-remote.message-read-receipts.v1';
@@ -405,6 +434,10 @@ const MESSAGE_RECEIPT_WRITE_LOCK_NAME = 'mobile-codex-remote.message-receipt-wri
 const MESSAGE_OUTBOX_WRITE_LOCK_NAME = 'mobile-codex-remote.message-outbox-write.v1';
 const MESSAGE_NOTIFICATION_LOCK_DB_NAME = 'mobile-codex-remote.notification-locks.v1';
 const MESSAGE_NOTIFICATION_LOCK_STORE_NAME = 'locks';
+const SESSION_LAUNCH_RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SESSION_LAUNCH_RECEIPT_MAX_ENTRIES = 64;
+const SESSION_LAUNCH_OBSERVATION_REQUEST_TIMEOUT_MS = 10_000;
+const SESSION_LAUNCH_OBSERVATION_LEASE_MS = 10 * 60 * 1000;
 const MESSAGE_NOTIFICATION_CHANNEL_NAME = 'mobile-codex-remote.message-notifications.v1';
 const MESSAGE_NOTIFICATION_BROADCAST_DEBOUNCE_MS = 80;
 const OPENAI_OFFICIAL_BASE_URL = 'https://api.openai.com/v1';
@@ -448,7 +481,10 @@ const DEFAULT_UI_SETTINGS = {
 };
 const UI_TEXT = {
   en: {
+    'composer.advancedSettings': 'Run settings',
     'common.close': 'Close',
+    'common.confirm': 'Confirm',
+    'common.cancel': 'Cancel',
     'common.save': 'Save settings',
     'nav.open': 'Open nav',
     'nav.close': 'Collapse nav',
@@ -507,6 +543,7 @@ const UI_TEXT = {
     'session.endConfirm': 'End this live Codex session? The history stays available and can be resumed later.',
     'session.endAlreadyClosed': 'This conversation is already history only.',
     'session.rebindConfirmTitle': 'Rebind this Session?',
+    'session.transcriptFallbackTitle': 'Start from saved transcript?',
     'session.rebindConfirmFrom': 'From: {binding}',
     'session.rebindConfirmTo': 'To: {binding}',
     'session.rebindConfirmEndpoint': 'Final /responses endpoint: {endpoint}',
@@ -514,6 +551,7 @@ const UI_TEXT = {
     'session.apiSwitchCanceled': 'API switch canceled. The current API was kept.',
     'session.apiSwitchSuccess': 'API switched to {target}; the Session restarted successfully.',
     'session.apiSwitchSuccessSelection': 'API switched to {target}; next model is {model} and thinking is Auto.',
+    'session.apiSwitchNoVerifiedDefault': 'API switched to {target}; no provider model could be verified against the live Codex catalog, so model and thinking remain Auto.',
     'session.apiSwitchWaitIdle': 'Finish or stop the current turn before switching API.',
     'session.apiSwitchBusy': 'Checking the API and restarting this Session...',
     'session.turnControlsUnsupported': 'This runtime does not support per-turn model or thinking controls.',
@@ -530,7 +568,10 @@ const UI_TEXT = {
     'session.batchApplyPartial': 'Batch apply finished: {success} succeeded; {failed} need attention.',
   },
   'zh-CN': {
+    'composer.advancedSettings': '运行设置',
     'common.close': '关闭',
+    'common.confirm': '确认',
+    'common.cancel': '取消',
     'common.save': '保存设置',
     'nav.open': '打开导航',
     'nav.close': '收起导航',
@@ -589,6 +630,7 @@ const UI_TEXT = {
     'session.endConfirm': '结束当前 live Codex 会话？历史仍然保留，之后可以继续 Resume。',
     'session.endAlreadyClosed': '这个对话已经是历史状态。',
     'session.rebindConfirmTitle': '重新绑定这个 Session？',
+    'session.transcriptFallbackTitle': '从已保存的 transcript 创建新 Session？',
     'session.rebindConfirmFrom': '当前：{binding}',
     'session.rebindConfirmTo': '目标：{binding}',
     'session.rebindConfirmEndpoint': '最终 /responses 地址：{endpoint}',
@@ -596,6 +638,7 @@ const UI_TEXT = {
     'session.apiSwitchCanceled': '已取消切换 API，当前 API 保持不变。',
     'session.apiSwitchSuccess': '已切换到 {target}，Session 重启成功。',
     'session.apiSwitchSuccessSelection': '已切换到 {target}；下一轮模型为 {model}，推理强度为 Auto。',
+    'session.apiSwitchNoVerifiedDefault': '已切换到 {target}；未找到同时存在于目标 API 和实时 Codex 目录的模型，因此模型和推理强度保持 Auto。',
     'session.apiSwitchWaitIdle': '请先等待当前轮次完成或停止当前轮次，再切换 API。',
     'session.apiSwitchBusy': '正在检查 API 并重启当前 Session...',
     'session.turnControlsUnsupported': '当前运行器不支持逐轮模型或推理强度设置。',
@@ -917,6 +960,14 @@ const TEXT_FILE_EXTENSIONS = new Set([
   'tsx',
   'txt',
   'xml',
+  'xsf',
+  'pdb',
+  'pbd',
+  'xyz',
+  'cif',
+  'vasp',
+  'poscar',
+  'contcar',
   'yaml',
   'yml',
 ]);
@@ -987,18 +1038,151 @@ const DOWNLOADABLE_FILE_EXTENSIONS = new Set([
   'yaml',
   'yml',
   'zip',
+  'xsf',
+  'pdb',
+  'pbd',
+  'xyz',
+  'cif',
+  'vasp',
+  'poscar',
+  'contcar',
 ]);
 
 const el = (id) => document.getElementById(id);
+
+// UI controllers own their DOM/event lifecycle. Keep the state adapters here
+// so the session application remains the single source of truth for data.
+let imagePreviewController = null;
+let directoryPickerController = null;
+let relayApiClient = null;
+let sessionStreamClient = null;
+let sessionModalController = null;
+
+function getSessionStreamClient() {
+  if (sessionStreamClient) {
+    return sessionStreamClient;
+  }
+  const factory = window.RemoteCodexSessionStream?.createSessionStreamClient;
+  if (typeof factory !== 'function') {
+    throw new Error('Session stream client module is unavailable.');
+  }
+  sessionStreamClient = factory({
+    getCurrent: () => ({
+      source: state.eventSource,
+      streamKey: state.eventSourceKey,
+      generation: state.sessionStreamGeneration,
+    }),
+    resolveCanonicalKey: sessionStreamEventCanonicalKey,
+    cursorStore: state.eventCursorByCanonical,
+    cursorGenerationStore: state.eventCursorGenerationByCanonical,
+    onError: reportError,
+  });
+  return sessionStreamClient;
+}
+
+function getRelayApiClient() {
+  if (relayApiClient) {
+    return relayApiClient;
+  }
+  const factory = window.RemoteCodexRelayApi?.createRelayApi;
+  if (typeof factory !== 'function') {
+    return null;
+  }
+  relayApiClient = factory({
+    fetch: window.fetch?.bind(window),
+    onUnauthorized: (message) => requireRelayLogin(message),
+  });
+  return relayApiClient;
+}
+
+function getImagePreviewController() {
+  if (imagePreviewController) {
+    return imagePreviewController;
+  }
+  const factory = window.RemoteCodexImagePreview?.createImagePreviewController;
+  if (typeof factory !== 'function') {
+    return null;
+  }
+  imagePreviewController = factory({
+    document,
+    getElement: el,
+    getState: () => state.imagePreview,
+    setState: (patch) => {
+      state.imagePreview = { ...state.imagePreview, ...patch };
+    },
+    syncModalBodyState,
+  });
+  return imagePreviewController;
+}
+
+function getDirectoryPickerController() {
+  if (directoryPickerController) {
+    return directoryPickerController;
+  }
+  const factory = window.RemoteCodexDirectoryPicker?.createDirectoryPickerController;
+  if (typeof factory !== 'function') {
+    return null;
+  }
+  directoryPickerController = factory({
+    document,
+    getElement: el,
+    getState: () => state.directoryPicker,
+    setState: (nextState) => {
+      state.directoryPicker = { ...state.directoryPicker, ...nextState };
+    },
+    getSelectedHost: () => getHost(state.selectedHostId),
+    getRecentDirectories,
+    fetchJson,
+    getOpenSeedPath: () => String(el('new-session-cwd')?.value || '').trim()
+      || getSelectedSession()?.cwd
+      || state.directoryPicker.currentPath
+      || null,
+    onApply: (currentPath) => {
+      const cwd = el('new-session-cwd');
+      const label = el('new-session-label');
+      if (cwd) cwd.value = currentPath;
+      if (label && !label.value.trim()) label.value = pathLeaf(currentPath);
+    },
+    onError: reportDirectoryPickerError,
+    syncModalBodyState,
+  });
+  return directoryPickerController;
+}
+
+function getSessionModalController() {
+  if (sessionModalController) {
+    return sessionModalController;
+  }
+  const factory = window.RemoteCodexSessionModal?.createSessionModalController;
+  if (typeof factory !== 'function') {
+    throw new Error('Session modal controller is not loaded');
+  }
+  sessionModalController = factory({
+    getSelectedSession,
+    getState: () => state,
+    renderSessionDetails,
+    renderStatusWindow,
+    renderAlertsWindow,
+    syncModalBodyState,
+  });
+  return sessionModalController;
+}
+
+function initializeUiControllers() {
+  getSessionModalController();
+  getImagePreviewController()?.bind();
+  getDirectoryPickerController()?.bind();
+}
+
 const cssEscape = (value) => {
   if (window.CSS?.escape) {
-    return window.CSS.escape(String(value || ''));
+    return window.CSS.escape(structuredThinkingText(value));
   }
-  return String(value || '').replace(/["\\]/g, '\\$&');
+  return structuredThinkingText(value).replace(/["\\]/g, '\\$&');
 };
 
 function escapeHtml(value) {
-  return String(value || '')
+  return structuredThinkingText(value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -1007,7 +1191,7 @@ function escapeHtml(value) {
 }
 
 function escapeRegExp(value) {
-  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return structuredThinkingText(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function normalizeSearchTerms(query) {
@@ -1070,7 +1254,7 @@ function highlightTermsInElement(root, query) {
 }
 
 function searchTermsMatchText(text, terms) {
-  const haystack = String(text || '').toLowerCase();
+  const haystack = structuredThinkingText(text).toLowerCase();
   return terms.length > 0 && terms.every((term) => haystack.includes(term));
 }
 
@@ -1174,6 +1358,10 @@ function formatSessionDefaultsSummary(input = {}) {
   ].join(' | ');
 }
 
+function normalizeNativeResumeCompatibilityKey(value) {
+  return String(value || '').trim().slice(0, 160).toLowerCase();
+}
+
 function normalizeApiProfile(input = {}, index = 0) {
   const fallback = DEFAULT_UI_SETTINGS.apiProfiles[0];
   const profileId = String(input.profileId || input.id || (index === 0 ? fallback.profileId : makeApiProfileId())).trim() || makeApiProfileId();
@@ -1190,6 +1378,7 @@ function normalizeApiProfile(input = {}, index = 0) {
     provider: provider || canonicalProviderLabel(providerKind),
     baseUrl: String(input.baseUrl || '').trim(),
     apiKey: String(input.apiKey || ''),
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(input.nativeResumeCompatibilityKey),
     rememberApiKey: input.rememberApiKey !== false || Boolean(input.apiKey),
     sessionDefaults: normalizeSessionDefaults(input.sessionDefaults),
   };
@@ -1386,6 +1575,7 @@ function browserSafeApiBinding(value) {
     label: String(value.label || '').trim().slice(0, 120) || null,
     provider: String(value.provider || '').trim().slice(0, 80) || null,
     providerKind: String(value.providerKind || '').trim().toLowerCase().slice(0, 32) || null,
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(value.nativeResumeCompatibilityKey) || null,
     normalizedBaseUrl: browserSafeUrl(value.normalizedBaseUrl || value.baseUrl, 500),
     modelProviderHint: kind === 'host_environment'
       ? String(value.modelProviderHint || '').trim().slice(0, 120) || null
@@ -1404,6 +1594,7 @@ function browserSafeRebindTarget(value) {
     label: String(value.label || '').trim().slice(0, 120) || null,
     provider: String(value.provider || '').trim().slice(0, 80) || null,
     providerKind: String(value.providerKind || '').trim().toLowerCase().slice(0, 32) || null,
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(value.nativeResumeCompatibilityKey) || null,
     baseUrl: browserSafeUrl(value.baseUrl, 500),
     responsesEndpoint: browserSafeUrl(value.responsesEndpoint, 600)
       || (value.kind === 'host_environment' ? 'Host-resolved /responses endpoint' : null),
@@ -1737,10 +1928,32 @@ function currentTheme() {
 
 function applyUiTheme() {
   document.documentElement.dataset.theme = currentTheme();
+  window.RemoteCodexTheme?.apply(document, currentTheme());
 }
 
 function t(key) {
-  return UI_TEXT[currentLocale()]?.[key] || UI_TEXT.en[key] || key;
+  return window.RemoteCodexNavigationI18n?.translate(currentLocale(), key)
+    || UI_TEXT[currentLocale()]?.[key] || UI_TEXT.en[key] || key;
+}
+
+let uiConfirmDialogController = null;
+
+function requestUiConfirmation(message, options = {}) {
+  const api = window.RemoteCodexConfirmDialog;
+  if (!api?.createConfirmDialog) {
+    console.error('[ui] confirmation dialog module is unavailable; refusing the action');
+    return Promise.resolve(false);
+  }
+  if (!uiConfirmDialogController) {
+    uiConfirmDialogController = api.createConfirmDialog({ document });
+  }
+  return uiConfirmDialogController.request({
+    ...options,
+    message,
+    locale: currentLocale(),
+    cancelLabel: options.cancelLabel || t('common.cancel'),
+    confirmLabel: options.confirmLabel || t('common.confirm'),
+  });
 }
 
 function formatUiText(key, values = {}) {
@@ -1763,7 +1976,7 @@ function translateStaticText(value) {
 function shouldPruneLocalizationElement(node) {
   return Boolean(
     node?.nodeType === 1
-    && node.matches?.('#session-log, .markdown-body, pre, code, script, style')
+    && node.matches?.('#session-log, .markdown-body, [data-i18n-skip], pre, code, script, style')
   );
 }
 
@@ -1905,6 +2118,7 @@ function getApiRequestConfig(hostId = state.selectedHostId) {
     apiKey: api.apiKey,
     profileId: api.profileId,
     label: api.label,
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(api.nativeResumeCompatibilityKey),
   };
   return config.baseUrl || config.apiKey ? config : null;
 }
@@ -1920,6 +2134,7 @@ function apiProfileRequestConfig(profile) {
     apiKey: profile.apiKey || '',
     profileId: profile.profileId || '',
     label: profile.label || profile.provider || profile.profileId || '',
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(profile.nativeResumeCompatibilityKey),
   };
 }
 
@@ -1961,6 +2176,10 @@ function apiProfileEditorDraft(profile) {
       : canonicalProviderLabel(providerKind, providerInput),
     baseUrl: String(el('settings-api-base-url')?.value || '').trim(),
     apiKey: String(el('settings-api-key')?.value || ''),
+    // Keep a legacy compatibility key in persisted profiles for import/backward
+    // compatibility, but do not expose it as a normal editing control. Native
+    // Rebind is decided by the Host/app-server, not this browser hint.
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(profile.nativeResumeCompatibilityKey),
   };
 }
 
@@ -2317,6 +2536,11 @@ function apiBindingMatchesProfileIdentity(binding, profile) {
   ) {
     return false;
   }
+  const bindingCompatibilityKey = normalizeNativeResumeCompatibilityKey(binding.nativeResumeCompatibilityKey);
+  const profileCompatibilityKey = normalizeNativeResumeCompatibilityKey(profile.nativeResumeCompatibilityKey);
+  if (bindingCompatibilityKey !== profileCompatibilityKey) {
+    return false;
+  }
   return effectiveApiBaseUrl(binding) === effectiveApiBaseUrl(profile);
 }
 
@@ -2471,6 +2695,8 @@ function resolveLaunchApiConfig({ hostId, sourceSession = null, explicitProfileI
           profileId: profile.profileId || null,
           label: profile.label || null,
           provider: profile.provider || 'OpenAI',
+          providerKind: profile.providerKind || inferApiProviderKind(profile),
+          nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(profile.nativeResumeCompatibilityKey) || null,
           normalizedBaseUrl: effectiveApiBaseUrl(profile) || null,
         },
         canRebind: true,
@@ -2596,58 +2822,11 @@ function getSessionApiProfileSummary(session) {
 }
 
 async function fetchJson(url, options = {}) {
-  const { timeoutMs: requestedTimeoutMs, ...requestOptions } = options;
-  const timeoutMs = Math.max(0, Number(requestedTimeoutMs || 0) || 0);
-  const controller = timeoutMs > 0 && !requestOptions.signal ? new AbortController() : null;
-  let timedOut = false;
-  let timeout = null;
-  if (controller) {
-    requestOptions.signal = controller.signal;
-    timeout = window.setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
+  const client = getRelayApiClient();
+  if (!client) {
+    throw new Error('Relay API module is unavailable. Reload the page and try again.');
   }
-
-  let response;
-  let body;
-  try {
-    response = await fetch(url, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...(requestOptions.headers || {}),
-      },
-      ...requestOptions,
-    });
-    body = await response.json();
-  } catch (error) {
-    if (timedOut) {
-      const timeoutError = new Error(`Request timed out after ${timeoutMs}ms.`);
-      timeoutError.code = 'request_timeout';
-      timeoutError.url = url;
-      throw timeoutError;
-    }
-    throw error;
-  } finally {
-    if (timeout !== null) window.clearTimeout(timeout);
-  }
-  if (!response.ok) {
-    const error = new Error(body.error || body.message || `request failed: ${response.status}`);
-    error.status = response.status;
-    error.body = body;
-    error.url = url;
-    error.code = body.code || null;
-    error.stage = body.stage || null;
-    error.sessionBinding = body.sessionBinding || null;
-    error.submittedBinding = body.submittedBinding || null;
-    error.canRebind = Boolean(body.canRebind);
-    error.canTranscriptFallback = Boolean(body.canTranscriptFallback);
-    if (response.status === 401 && body?.authRequired && !options.skipAuthHandling) {
-      requireRelayLogin(error.message);
-    }
-    throw error;
-  }
-  return body;
+  return client.requestJson(url, options);
 }
 
 function waitForSharedRequestWithSignal(request, signal) {
@@ -2783,6 +2962,7 @@ function renderAccountDialog() {
 }
 
 function requireRelayLogin(message = '') {
+  getManagedSessionLaunchCoordinator().pause(null, 'authentication-required');
   state.auth.required = true;
   state.auth.authenticated = false;
   state.auth.error = message || 'Relay login is required.';
@@ -2793,6 +2973,7 @@ function requireRelayLogin(message = '') {
 }
 
 function applyAuthConfig(config = {}) {
+  const wasAuthenticated = state.auth.authenticated;
   state.auth.ready = true;
   state.auth.required = Boolean(config.authRequired);
   state.auth.authenticated = !state.auth.required || Boolean(config.authenticated);
@@ -2803,7 +2984,12 @@ function applyAuthConfig(config = {}) {
   state.auth.tokenFile = config.tokenFile || 'tmp/relay-auth-token.txt';
   state.auth.accountFile = config.accountFile || 'tmp/relay-auth-account.json';
   if (!state.auth.authenticated) {
+    if (wasAuthenticated || state.sessionLaunchCoordinator) {
+      getManagedSessionLaunchCoordinator().pause(null, 'authentication-required');
+    }
     closeSkillsInventoryEvents();
+  } else if (!wasAuthenticated && state.sessionLaunchCoordinator) {
+    getManagedSessionLaunchCoordinator().resumeAuthentication();
   }
 }
 
@@ -2827,6 +3013,8 @@ async function setupRelayAccount(username, password, confirmPassword) {
   state.auth.error = '';
   renderAuthGate();
   await refresh();
+  getManagedSessionLaunchCoordinator().resumeAuthentication();
+  await recoverManagedLaunchReceipts();
 }
 
 async function loginRelay(credentials) {
@@ -2839,6 +3027,8 @@ async function loginRelay(credentials) {
   state.auth.error = '';
   renderAuthGate();
   await refresh();
+  getManagedSessionLaunchCoordinator().resumeAuthentication();
+  await recoverManagedLaunchReceipts();
 }
 
 async function changeRelayPassword(payload) {
@@ -2854,6 +3044,7 @@ async function changeRelayPassword(payload) {
 }
 
 async function logoutRelay() {
+  getManagedSessionLaunchCoordinator().pause(null, 'authentication-required');
   await unwatchSelectedSession({ silent: true }).catch(() => null);
   await fetchJson('/api/auth/logout', {
     method: 'POST',
@@ -2936,6 +3127,7 @@ function sessionCacheProtectedKeys() {
   if (selectedKey) protectedKeys.add(selectedKey);
   if (state.eventSourceKey) protectedKeys.add(state.eventSourceKey);
   for (const key of state.historyLoading || []) protectedKeys.add(key);
+  for (const key of state.receivedFilesLoadingKeys || []) protectedKeys.add(key);
   for (const session of state.sessions || []) {
     const key = getSessionKey(session);
     if (key && (session.live || runtimeIsActive(state.runtime.get(key) || session.runtime || {}))) {
@@ -2970,11 +3162,11 @@ function evictSessionCacheKey(sessionKey) {
     state.diagnostics,
     state.receivedFiles,
     state.alerts,
-    state.dismissedAlerts,
     state.runtime,
     state.runtimeApplyGenerations,
     state.runtimeStreamGenerations,
     state.requests,
+    state.requestApplyGenerations,
     state.streamStatus,
     state.transcriptTombstones,
     state.transcriptVisibleLimits,
@@ -2982,6 +3174,7 @@ function evictSessionCacheKey(sessionKey) {
     state.messageReadGates,
     state.transcriptNotificationRenderVersions,
     state.transcriptNotificationRenderedAssistantSeq,
+    state.transcriptNotificationRenderedAssistantIds,
     state.thinkingPanels,
     state.thinkingScrollPositions,
     state.thinkingEntryCounts,
@@ -3029,11 +3222,13 @@ function pruneSessionCaches(options = {}) {
     ...state.runtimeApplyGenerations.keys(),
     ...state.runtimeStreamGenerations.keys(),
     ...state.requests.keys(),
+    ...state.requestApplyGenerations.keys(),
     ...state.streamStatus.keys(),
     ...state.transcriptTombstones.keys(),
     ...state.messageReadGates.keys(),
     ...state.transcriptNotificationRenderVersions.keys(),
     ...state.transcriptNotificationRenderedAssistantSeq.keys(),
+    ...state.transcriptNotificationRenderedAssistantIds.keys(),
     ...state.codexControls.skillOptionsBySession.keys(),
     ...state.codexControls.sessionOptionsByKey.keys(),
     ...state.sessionCacheWeights.keys(),
@@ -3105,12 +3300,37 @@ function forgetActivityCanonicalConversation(canonicalKey) {
     return false;
   }
   state.eventCursorByCanonical.delete(normalized);
+  state.activityClientRequestIdsByCanonical.delete(normalized);
   for (const [sessionKey, rememberedCanonicalKey] of state.activityCanonicalKeysBySession) {
     if (rememberedCanonicalKey === normalized) {
       state.activityCanonicalKeysBySession.delete(sessionKey);
     }
   }
   return true;
+}
+
+function rememberActivityClientRequestIds(canonicalKey, activities) {
+  const key = String(canonicalKey || '').trim();
+  if (!key) return false;
+  let bindings = state.activityClientRequestIdsByCanonical.get(key) || null;
+  let changed = false;
+  for (const activity of Array.isArray(activities) ? activities : [activities]) {
+    const activityKey = String(activity?.activityKey || '').trim();
+    const clientRequestId = String(activity?.clientRequestId || '').trim();
+    if (!activityKey || !clientRequestId) continue;
+    if (!bindings) {
+      bindings = new Map();
+      state.activityClientRequestIdsByCanonical.set(key, bindings);
+    }
+    if (bindings.get(activityKey) === clientRequestId) continue;
+    bindings.delete(activityKey);
+    bindings.set(activityKey, clientRequestId);
+    changed = true;
+  }
+  while (bindings?.size > ACTIVITY_CANONICAL_ALIAS_LIMIT) {
+    bindings.delete(bindings.keys().next().value);
+  }
+  return changed;
 }
 
 function rememberActivityCanonicalAlias(sessionKey, canonicalKey) {
@@ -3281,25 +3501,256 @@ function sessionLaunchLabel(mode) {
   if (mode === 'fork') {
     return 'Forking Branch...';
   }
+  if (mode === 'rebind' || mode === 'fresh_rebind') {
+    return 'Rebinding Session...';
+  }
   return 'Starting Session...';
 }
 
 function sessionLaunchIntentKey({ hostId, cwd, launchMode, sourceSession } = {}) {
-  const sourceIdentity = sourceSession
-    ? String(
-      sourceSession.runId
-      || sourceSession.activeRunId
-      || sourceSession.nativeThreadId
-      || sourceSession.sessionId
-      || ''
-    ).trim()
-    : '';
-  return JSON.stringify([
-    String(hostId || '').trim(),
-    normalizeConversationPath(cwd),
-    String(launchMode || 'fresh').trim() || 'fresh',
-    sourceIdentity,
-  ]);
+  const api = window.RemoteCodexManagedSessionLaunchIntent;
+  if (!api?.createLaunchIntentKey) {
+    throw new Error('Managed Session launch intent coordination is unavailable.');
+  }
+  return api.createLaunchIntentKey({
+    hostId,
+    hostPlatform: getHost(hostId)?.platform || '',
+    cwd,
+    launchMode,
+    sourceSession,
+  });
+}
+
+function managedSessionLaunchApi() {
+  return window.RemoteCodexManagedSessionLaunch || null;
+}
+
+function managedSessionLaunchCoordinatorApi() {
+  return window.RemoteCodexManagedSessionLaunchCoordinator || null;
+}
+
+function storedManagedLaunchLedgerRaw(raw = null) {
+  const source = raw == null
+    ? window.localStorage?.getItem?.(SESSION_LAUNCH_RECEIPTS_STORAGE_KEY)
+    : raw;
+  return source == null || source === '' ? null : source;
+}
+
+function syncManagedLaunchReceiptProjection(ledger = {}) {
+  const receipts = Array.isArray(ledger.receipts) ? ledger.receipts : [];
+  const next = new Map();
+  for (const receipt of receipts) {
+    const key = managedLaunchReceiptKey(receipt);
+    if (key && !state.sessionLaunchTerminalProjections.has(key)) next.set(key, receipt);
+  }
+  state.sessionLaunchReceipts = next;
+  const retainedReceiptKeys = new Set(next.keys());
+  for (const busy of sessionLaunchBusyEntries()) {
+    if (busy?.receiptKey && !retainedReceiptKeys.has(busy.receiptKey)) {
+      state.sessionLaunchBusy.delete(busy.intentKey || busy.id);
+    }
+  }
+  for (const receipt of receipts) {
+    const busy = managedLaunchBusyFromReceipt(receipt);
+    if (!getSessionLaunchBusyForIntent(busy.intentKey)) {
+      state.sessionLaunchBusy.set(busy.intentKey || busy.id, busy);
+    }
+  }
+}
+
+function managedLaunchCrossTabLockError() {
+  const error = new Error(
+    'Session coordination storage is unavailable. Reload this page before starting a Session.'
+  );
+  error.code = 'cross-tab-lock-unavailable';
+  return error;
+}
+
+function withManagedLaunchIntentLock(intentKey, operation) {
+  const name = `remote-codex-managed-session-launch:${String(intentKey || '').slice(0, 2048)}`;
+  return getManagedLaunchStorage().withIntent(name, operation);
+}
+
+let managedLaunchStorage = null;
+function getManagedLaunchStorage() {
+  if (!managedLaunchStorage) {
+    const api = window.RemoteCodexManagedSessionLaunchStorage;
+    if (!api?.createLaunchStorage) throw managedLaunchCrossTabLockError();
+    managedLaunchStorage = api.createLaunchStorage();
+  }
+  return managedLaunchStorage;
+}
+
+function getManagedSessionLaunchCoordinator() {
+  if (state.sessionLaunchCoordinator) return state.sessionLaunchCoordinator;
+  const api = managedSessionLaunchCoordinatorApi();
+  if (!api?.createManagedSessionLaunchCoordinator) {
+    throw new Error('Managed Session launch coordination is unavailable.');
+  }
+  state.sessionLaunchCoordinator = api.createManagedSessionLaunchCoordinator({
+    readLedger: () => getManagedLaunchStorage().readLedger(),
+    mutateLedger: (update) => getManagedLaunchStorage().mutateLedger(update),
+    subscribeLedgerChange: (listener) => {
+      return getManagedLaunchStorage().subscribe(() => {
+        getManagedLaunchStorage().readLedger().then(listener).catch((error) => {
+          console.warn('[managed-session-launch] receipt refresh failed', error);
+        });
+      });
+    },
+    observe: observeManagedLaunchOnce,
+    leaseMs: SESSION_LAUNCH_OBSERVATION_LEASE_MS,
+    maxReceiptAgeMs: SESSION_LAUNCH_RECEIPT_MAX_AGE_MS,
+    maxLedgerEntries: SESSION_LAUNCH_RECEIPT_MAX_ENTRIES,
+    initialBackoffMs: 400,
+    maxBackoffMs: 5_000,
+    onLedgerChange: (ledger) => {
+      syncManagedLaunchReceiptProjection(ledger);
+      ledger.receipts.forEach((receipt) => beginManagedLaunchReceiptRecovery(receipt));
+      queueMicrotask(() => {
+        void recoverManagedLaunchReceipts();
+      });
+    },
+    onUpdate: handleManagedLaunchCoordinatorUpdate,
+    onTerminal: handleManagedLaunchCoordinatorTerminal,
+    onError: (error, context) => {
+      console.warn('[managed-session-launch]', context?.phase || 'coordination', error);
+    },
+  });
+  return state.sessionLaunchCoordinator;
+}
+
+function managedLaunchReceiptKey(receipt = {}) {
+  const safeReceipt = receipt && typeof receipt === 'object' ? receipt : {};
+  const hostId = String(safeReceipt.hostId || '').trim();
+  const runId = String(safeReceipt.runId || '').trim();
+  return hostId && runId ? `${hostId}::${runId}` : '';
+}
+
+function managedLaunchReceiptIntentKey(receipt = {}) {
+  const safeReceipt = receipt && typeof receipt === 'object' ? receipt : {};
+  if (safeReceipt.intentKey) return String(safeReceipt.intentKey);
+  return sessionLaunchIntentKey({
+    hostId: safeReceipt.hostId,
+    cwd: safeReceipt.cwd,
+    launchMode: safeReceipt.launchMode,
+    sourceSession: safeReceipt.sourceSessionId || safeReceipt.nativeThreadId
+      ? {
+        sessionId: safeReceipt.sourceSessionId,
+        nativeThreadId: safeReceipt.nativeThreadId,
+        bridgeSessionId: safeReceipt.bridgeSessionId,
+        originSessionId: safeReceipt.originSessionId,
+        conversationKey: safeReceipt.conversationKey,
+      }
+      : null,
+  });
+}
+
+function managedLaunchReceiptIdentityValues(receipt = {}) {
+  return new Set([
+    receipt.sessionId,
+    receipt.bridgeSessionId,
+    receipt.nativeThreadId,
+    receipt.originSessionId,
+    receipt.sourceSessionId,
+    receipt.conversationKey,
+  ].map((value) => String(value || '').trim()).filter(Boolean));
+}
+
+function managedLaunchReceiptMatchesSession(receipt, session) {
+  if (!receipt || !session || String(receipt.hostId || '') !== String(session.hostId || '')) {
+    return false;
+  }
+  const receiptRunId = String(receipt.runId || '').trim();
+  const sessionRunId = String(session.runId || session.runtime?.runId || '').trim();
+  if (receiptRunId && sessionRunId && receiptRunId !== sessionRunId) return false;
+  const identities = managedLaunchReceiptIdentityValues(receipt);
+  return [
+    session.sessionId,
+    session.bridgeSessionId,
+    session.nativeThreadId,
+    session.originSessionId,
+    session.sourceSessionId,
+    session.conversationKey,
+  ].some((value) => identities.has(String(value || '').trim()));
+}
+
+function hasManagedLaunchReceiptForSession(session) {
+  return [...state.sessionLaunchReceipts.values()]
+    .some((receipt) => managedLaunchReceiptMatchesSession(receipt, session));
+}
+
+function managedLaunchBusyFromReceipt(receipt) {
+  const intentKey = managedLaunchReceiptIntentKey(receipt);
+  return {
+    id: receipt.clientRequestId || managedLaunchReceiptKey(receipt),
+    intentKey,
+    receiptKey: managedLaunchReceiptKey(receipt),
+    hostId: receipt.hostId,
+    sessionId: receipt.sessionId,
+    sourceSessionId: receipt.sourceSessionId,
+    originSessionId: receipt.originSessionId,
+    nativeThreadId: receipt.nativeThreadId,
+    conversationKey: receipt.conversationKey,
+    sessionKey: makeSessionKey(receipt.hostId, receipt.sessionId),
+    launchMode: receipt.launchMode,
+    label: receipt.label || receipt.cwd || receipt.sessionId,
+    cwd: receipt.cwd,
+    stage: 'recovering-accepted-start',
+    startedAt: receipt.acceptedAt,
+    updatedAt: new Date().toISOString(),
+    runId: receipt.runId,
+  };
+}
+
+async function restoreManagedLaunchReceipts() {
+  const ledger = await getManagedSessionLaunchCoordinator().restore({ track: false });
+  syncManagedLaunchReceiptProjection(ledger);
+  return ledger;
+}
+
+async function rememberManagedLaunchReceipt(response, context = {}) {
+  const api = managedSessionLaunchApi();
+  if (!api?.normalizeLaunchReceipt) {
+    throw new Error('Managed Session launch tracking is unavailable.');
+  }
+  const receipt = api.normalizeLaunchReceipt(response, {
+    hostId: context.hostId,
+    clientRequestId: context.clientRequestId,
+    intentKey: context.intentKey,
+    cwd: context.cwd,
+    label: context.label,
+    rebindTargetKind: context.rebindTargetKind,
+    rebindProfileId: context.rebindProfileId,
+    rebindProvider: context.rebindProvider,
+    rebindProviderKind: context.rebindProviderKind,
+    rebindCompatibilityKey: context.rebindCompatibilityKey,
+    rebindBaseUrl: context.rebindBaseUrl,
+    acceptedAtMs: Date.now(),
+  });
+  const key = managedLaunchReceiptKey(receipt);
+  if (!key || !receipt.sessionId) {
+    throw new Error('Relay accepted a Session start without a durable Session/run identity.');
+  }
+  state.sessionLaunchReceipts.set(key, receipt);
+  let persisted = true;
+  try {
+    await getManagedSessionLaunchCoordinator().mergeReceipts([receipt]);
+  } catch (error) {
+    persisted = false;
+    console.warn('[managed-session-launch] receipt is memory-only', error);
+  }
+  const busyPatch = {
+    ...managedLaunchBusyFromReceipt(receipt),
+    stage: 'waiting-live-session',
+    receiptPersistence: persisted ? 'durable' : 'memory-only',
+  };
+  const existingBusy = managedLaunchBusyForReceipt(receipt);
+  if (existingBusy) {
+    updateSessionLaunchBusy(existingBusy.id, busyPatch);
+  } else {
+    setSessionLaunchBusy(busyPatch);
+  }
+  return receipt;
 }
 
 function sessionLaunchBusyEntries() {
@@ -3415,19 +3866,26 @@ function renderNewSessionLaunchState() {
     sourceSession: null,
   });
   const busy = getSessionLaunchBusyForIntent(intentKey);
-  const disabled = Boolean(busy);
-  cwdInput.disabled = disabled;
-  if (labelInput) labelInput.disabled = disabled;
-  if (browseButton) browseButton.disabled = disabled;
-  if (usePathButton) usePathButton.disabled = disabled;
-  submitButton.disabled = disabled;
-  submitButton.textContent = disabled ? 'Creating Session...' : 'New In Directory';
+  const canRecheck = busy?.stage === 'startup-observation-paused';
+  const locked = Boolean(busy);
+  cwdInput.disabled = locked;
+  if (labelInput) labelInput.disabled = locked;
+  if (browseButton) browseButton.disabled = locked;
+  if (usePathButton) usePathButton.disabled = locked;
+  submitButton.disabled = locked && !canRecheck;
+  submitButton.textContent = canRecheck
+    ? 'Recheck Accepted Run'
+    : locked
+      ? 'Creating Session...'
+      : 'New In Directory';
   if (status) {
-    status.textContent = disabled
-      ? 'A Session is already being created for this Host and path. Please wait.'
+    status.textContent = locked
+      ? canRecheck
+        ? 'Automatic observation paused. Recheck the already accepted run without creating another Session.'
+        : 'A Session is already being created for this Host and path. Please wait.'
       : state.newSessionLaunchError?.error || '';
-    status.classList.toggle('error', Boolean(!disabled && state.newSessionLaunchError));
-    status.classList.toggle('hidden', !disabled && !state.newSessionLaunchError);
+    status.classList.toggle('error', Boolean(!locked && state.newSessionLaunchError));
+    status.classList.toggle('hidden', !locked && !state.newSessionLaunchError);
   }
 }
 
@@ -3463,11 +3921,11 @@ function compareSessions(a, b) {
 }
 
 function truncatePreview(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  return structuredThinkingText(value).replace(/\s+/g, ' ').trim().slice(0, 160);
 }
 
 function basename(value) {
-  const text = String(value || '');
+  const text = structuredThinkingText(value);
   if (!text) {
     return '';
   }
@@ -3525,7 +3983,10 @@ function formatElapsedSince(value, now = Date.now()) {
 }
 
 function prettyStatusLabel(value) {
-  const text = String(value || '').trim();
+  // Status values can arrive as protocol objects (for example
+  // `{ status: "running" }`).  Never let the browser's implicit object
+  // coercion leak `[object Object]` into the Thinking UI.
+  const text = structuredThinkingScalar(value, '').trim();
   if (!text) {
     return '';
   }
@@ -3604,9 +4065,9 @@ function resolveExternalTerminalActivity(runtime = {}, diagnostics = []) {
   let result = {
     owner: 'external-terminal',
     active: projected?.active === true,
-    turnId: String(projected?.turnId || '').trim() || null,
-    phase: String(projected?.phase || '').trim() || (projected?.active === true ? 'thinking' : 'idle'),
-    status: String(projected?.status || '').trim() || (projected?.active === true ? 'inProgress' : 'completed'),
+    turnId: structuredThinkingScalar(projected?.turnId, '').trim() || null,
+    phase: structuredThinkingScalar(projected?.phase, '').trim() || (projected?.active === true ? 'thinking' : 'idle'),
+    status: structuredThinkingScalar(projected?.status, '').trim() || (projected?.active === true ? 'inProgress' : 'completed'),
     updatedAt: projected?.updatedAt || null,
   };
   let updatedAtMs = Date.parse(result.updatedAt || '');
@@ -3618,7 +4079,7 @@ function resolveExternalTerminalActivity(runtime = {}, diagnostics = []) {
     if (Number.isFinite(updatedAtMs) && Number.isFinite(timestampMs) && timestampMs < updatedAtMs) {
       continue;
     }
-    const method = String(entry?.method || '').toLowerCase();
+    const method = structuredThinkingScalar(entry?.method, '').toLowerCase();
     const terminal = method.endsWith('/task_complete') || method.endsWith('/turn_aborted');
     const started = method.endsWith('/task_started');
     if (!terminal && !started && !isThinkingActivityDiagnostic(entry)) {
@@ -3627,7 +4088,7 @@ function resolveExternalTerminalActivity(runtime = {}, diagnostics = []) {
     result = {
       ...result,
       active: !terminal,
-      turnId: String(entry.turnId || entry.data?.turnId || result.turnId || '').trim() || null,
+      turnId: structuredThinkingScalar(entry.turnId || entry.data?.turnId || result.turnId, '').trim() || null,
       phase: terminal ? (method.endsWith('/turn_aborted') ? 'interrupted' : 'idle') : 'thinking',
       status: terminal ? (method.endsWith('/turn_aborted') ? 'interrupted' : 'completed') : 'inProgress',
       updatedAt: entry.timestamp || result.updatedAt,
@@ -3641,6 +4102,14 @@ function getExternalTerminalActivityForSession(session, runtime = null) {
   if (!session) {
     return resolveExternalTerminalActivity();
   }
+  // A complete history projection is not a live control surface.  Runtime
+  // snapshots can retain the last external-terminal observation after the
+  // Session was closed; never let that stale projection make history look
+  // active.  SSE/runtime callback objects intentionally omit `live`, so they
+  // continue through the normal merge path while an update is being applied.
+  if (Object.prototype.hasOwnProperty.call(session, 'live') && session.live === false) {
+    return resolveExternalTerminalActivity();
+  }
   return resolveExternalTerminalActivity(
     runtime || getRuntimeForSession(session) || session.runtime || {},
     state.externalActivityKeys?.has?.(getSessionKey(session))
@@ -3651,9 +4120,9 @@ function getExternalTerminalActivityForSession(session, runtime = null) {
 
 function describeRuntimeStatus(runtime, stream, session) {
   const connection = stream?.connection || runtime?.connection || (session?.live ? 'connecting' : 'history only');
-  const phase = prettyStatusLabel(runtime?.phase || session?.state || 'unknown');
+  const phase = prettyStatusLabel(window.RemoteCodexSessionRuntimeState.displayPhase(runtime, session?.state || 'unknown'));
   const turn = runtime?.currentTurnStatus ? prettyStatusLabel(runtime.currentTurnStatus) : (runtimeIsActive(runtime) ? 'Active' : 'Idle');
-  const busy = runtime?.busy ? 'Busy' : 'Idle';
+  const busy = runtimeIsActive(runtime) ? 'Busy' : 'Idle';
   return {
     connection,
     phase,
@@ -3663,7 +4132,7 @@ function describeRuntimeStatus(runtime, stream, session) {
 }
 
 function getRuntimeElapsedAnchor(runtime) {
-  return runtime?.busy && runtime?.busyStartedAt
+  return runtimeIsActive(runtime) && runtime?.busyStartedAt
     ? runtime.busyStartedAt
     : runtime?.phaseStartedAt || runtime?.updatedAt || null;
 }
@@ -3673,7 +4142,7 @@ function getStreamElapsedAnchor(stream) {
 }
 
 function limitText(value, max = 220) {
-  const text = String(value || '');
+  const text = structuredThinkingText(value);
   if (text.length <= max) {
     return text;
   }
@@ -3681,7 +4150,7 @@ function limitText(value, max = 220) {
 }
 
 function limitSearchText(value, max = 1000) {
-  return isOptimizeSpeedMode() ? limitText(value, max) : String(value || '');
+  return isOptimizeSpeedMode() ? limitText(value, max) : structuredThinkingText(value);
 }
 
 function summarizeData(value) {
@@ -3692,68 +4161,67 @@ function summarizeData(value) {
     return limitText(value, 220);
   }
   try {
-    return limitText(JSON.stringify(value), 320);
+    const serialized = window.RemoteCodexStructuredText?.safeJson
+      ? window.RemoteCodexStructuredText.safeJson(value)
+      : JSON.stringify(value);
+    return limitText(serialized, 320);
   } catch (_) {
-    return limitText(String(value), 220);
+    return '[Unserializable structured value]';
   }
 }
 
-function formatThinkingValue(value, depth = 0) {
-  if (value === null || typeof value === 'undefined') {
-    return '';
+function structuredThinkingText(value, options = {}) {
+  const helper = window.RemoteCodexStructuredText;
+  if (helper?.toText) {
+    return helper.toText(value, options);
   }
-
-  if (typeof value === 'string') {
-    return value.trim();
-  }
-
-  if (typeof value === 'number' || typeof value === 'boolean') {
+  // Keep a defensive fallback for tests or pages loaded without the helper.
+  const seen = options.seen instanceof WeakSet ? options.seen : new WeakSet();
+  const depth = Number.isSafeInteger(options.depth) ? options.depth : 0;
+  if (value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
     return String(value);
   }
-
-  if (Array.isArray(value)) {
-    return joinThinkingTextParts(value
-      .map((item) => (typeof item === 'string' ? item : formatThinkingValue(item, depth + 1)))
-      .filter(Boolean));
+  if (typeof value !== 'object') return String(value);
+  if (seen.has(value)) return '[Circular]';
+  if (depth > 8) return '[Nested value omitted]';
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => structuredThinkingText(item, { ...options, depth: depth + 1, seen }))
+        .filter(Boolean).join(options.separator || '\n').trim();
+    }
+    for (const key of ['text', 'output_text', 'outputText', 'input_text', 'inputText', 'content', 'summary', 'message', 'description', 'title', 'label', 'delta', 'value', 'step', 'command', 'query', 'path', 'output', 'stdout', 'stderr', 'reason', 'type', 'status', 'state', 'phase', 'kind', 'name', 'id']) {
+      if (value[key] == null) continue;
+      const text = structuredThinkingText(value[key], { ...options, depth: depth + 1, seen }).trim();
+      if (text) return text;
+    }
+    return summarizeData(value);
+  } finally {
+    seen.delete(value);
   }
+}
 
-  if (typeof value === 'object') {
-    if (typeof value.step === 'string' && value.step.trim()) {
-      const status = typeof value.status === 'string' && value.status.trim()
-        ? `[${value.status.trim()}] `
-        : '';
-      const extra = typeof value.summary === 'string' && value.summary.trim() && value.summary.trim() !== value.step.trim()
-        ? ` - ${value.summary.trim()}`
-        : '';
-      return `${status}${value.step.trim()}${extra}`.trim();
-    }
-
-    for (const key of ['text', 'content', 'summary', 'description', 'title', 'label']) {
-      if (typeof value[key] === 'string' && value[key].trim()) {
-        return value[key].trim();
-      }
-    }
-
-    if (depth > 1) {
-      return summarizeData(value);
-    }
-
-    return Object.entries(value)
-      .map(([key, item]) => {
-        const normalized = formatThinkingValue(item, depth + 1);
-        return normalized ? `${key}: ${normalized}` : '';
-      })
-      .filter(Boolean)
-      .join('\n')
-      .trim();
+function structuredThinkingScalar(value, fallback = '') {
+  const helper = window.RemoteCodexStructuredText;
+  if (helper?.toScalar) return helper.toScalar(value, fallback);
+  if (value == null || value === '') return fallback;
+  if (typeof value !== 'object') return String(value);
+  for (const key of ['type', 'status', 'state', 'phase', 'kind', 'name', 'id']) {
+    if (value[key] == null || value[key] === '') continue;
+    const text = structuredThinkingScalar(value[key], '').trim();
+    if (text) return text;
   }
+  return structuredThinkingText(value) || fallback;
+}
 
-  return String(value).trim();
+function formatThinkingValue(value) {
+  return structuredThinkingText(value).trim();
 }
 
 function joinThinkingTextParts(parts) {
   const rawValues = (Array.isArray(parts) ? parts : [])
-    .map((part) => String(part || ''))
+    .map((part) => structuredThinkingText(part))
     .filter((part) => part.trim());
   if (!rawValues.length) {
     return '';
@@ -3779,7 +4247,7 @@ function normalizeThinkingMessage(entry) {
     return '';
   }
 
-  const kind = String(entry.kind || '').toLowerCase();
+  const kind = structuredThinkingScalar(entry.kind, '').toLowerCase();
   if (kind === 'token-usage') {
     const usage = entry.data?.tokenUsage || entry.data || null;
     const text = usage ? formatTokenUsage({ tokenUsage: usage }) : '';
@@ -3829,7 +4297,7 @@ function subagentActivityItem(entry) {
   return candidates.find((item) => (
     item
     && typeof item === 'object'
-    && String(item.type || '').trim() === 'subAgentActivity'
+    && structuredThinkingScalar(item.type, '').trim().toLowerCase() === 'subagentactivity'
   )) || null;
 }
 
@@ -3841,8 +4309,8 @@ function isThinkingActivityDiagnostic(entry) {
     return true;
   }
 
-  const kind = String(entry.kind || '').toLowerCase();
-  const method = String(entry.method || '').toLowerCase();
+  const kind = structuredThinkingScalar(entry.kind, '').toLowerCase();
+  const method = structuredThinkingScalar(entry.method, '').toLowerCase();
   if (subagentActivityItem(entry)) {
     return true;
   }
@@ -3875,9 +4343,9 @@ function requestToThinkingDiagnostic(request) {
   if (!request) {
     return null;
   }
-  const method = request.method || '';
-  let kind = request.kind || 'request';
-  if (isFileChangeDiagnostic({ kind, method, message: request.summary || request.message || '' })) {
+  const method = structuredThinkingText(request.method);
+  let kind = structuredThinkingScalar(request.kind, 'request');
+  if (isFileChangeDiagnostic({ kind, method, message: structuredThinkingText(request.summary || request.message || '') })) {
     kind = 'file-change';
   } else if (kind === 'request') {
     kind = method.includes('requestUserInput') ? 'user-input' : 'approval';
@@ -3888,9 +4356,12 @@ function requestToThinkingDiagnostic(request) {
     source: 'codex',
     kind,
     method: method || 'request',
-    message: request.summary || request.message || request.title || 'Codex requested user action',
+    message: structuredThinkingText(
+      request.summary || request.message || request.title || 'Codex requested user action'
+    ),
     data: request.payload || null,
     turnId: request.payload?.turnId || null,
+    clientRequestId: request.payload?.clientRequestId || request.clientRequestId || null,
     itemId: request.payload?.itemId || null,
     callId: request.payload?.callId || null,
     requestId: request.requestId || null,
@@ -3935,33 +4406,50 @@ function firstThinkingField(entry, ...names) {
 function normalizeThinkingActivityForModel(entry, index = 0) {
   if (!entry) return null;
   const subagentItem = subagentActivityItem(entry);
-  const itemTypeHint = String(firstThinkingField(entry, 'itemType', 'item_type', 'type') || '').trim().toLowerCase();
+  const itemTypeHint = structuredThinkingScalar(firstThinkingField(entry, 'itemType', 'item_type', 'type'), '').trim().toLowerCase();
   const subagent = subagentItem || itemTypeHint === 'subagentactivity';
   const kind = isFileChangeDiagnostic(entry)
     ? 'file-change'
     : subagent
       ? 'collaboration'
-      : String(entry.kind || 'thinking');
-  const method = String(entry.method || firstThinkingField(entry, 'method') || '');
+      : structuredThinkingScalar(entry.kind, 'thinking');
+  const method = structuredThinkingText(entry.method || firstThinkingField(entry, 'method'));
   const deltaLike = /delta/i.test(method);
   const rawDelta = deltaLike
     ? (entry.delta ?? entry.data?.delta ?? entry.data?.text ?? entry.payload?.delta ?? entry.message)
     : null;
-  const subagentKind = firstThinkingField(entry, 'subagentKind', 'subagent_kind')
-    || subagentItem?.kind
-    || subagentItem?.status
-    || null;
-  const subagentPath = firstThinkingField(entry, 'agentPath', 'agent_path') || subagentItem?.agentPath || subagentItem?.agent_path || null;
-  const subagentNickname = firstThinkingField(entry, 'agentNickname', 'agent_nickname') || subagentItem?.agentNickname || subagentItem?.agent_nickname || null;
-  const subagentThreadId = firstThinkingField(entry, 'agentThreadId', 'agent_thread_id') || subagentItem?.agentThreadId || subagentItem?.agent_thread_id || null;
-  const parentThreadId = firstThinkingField(entry, 'parentThreadId', 'parent_thread_id')
-    || entry.data?.threadId
-    || entry.data?.thread_id
-    || null;
+  const subagentKind = structuredThinkingScalar(
+    firstThinkingField(entry, 'subagentKind', 'subagent_kind')
+      || subagentItem?.kind
+      || subagentItem?.status,
+    ''
+  ) || null;
+  const subagentPath = structuredThinkingText(
+    firstThinkingField(entry, 'agentPath', 'agent_path')
+      || subagentItem?.agentPath
+      || subagentItem?.agent_path
+  ) || null;
+  const subagentNickname = structuredThinkingText(
+    firstThinkingField(entry, 'agentNickname', 'agent_nickname')
+      || subagentItem?.agentNickname
+      || subagentItem?.agent_nickname
+  ) || null;
+  const subagentThreadId = structuredThinkingScalar(
+    firstThinkingField(entry, 'agentThreadId', 'agent_thread_id')
+      || subagentItem?.agentThreadId
+      || subagentItem?.agent_thread_id,
+    ''
+  ) || null;
+  const parentThreadId = structuredThinkingScalar(
+    firstThinkingField(entry, 'parentThreadId', 'parent_thread_id')
+      || entry.data?.threadId
+      || entry.data?.thread_id,
+    ''
+  ) || null;
   const text = subagent
     ? `Sub-agent ${subagentPath || subagentNickname || subagentThreadId || 'sub-agent'}: ${subagentKind || 'activity'}`
-    : deltaLike && typeof rawDelta === 'string'
-    ? rawDelta
+    : deltaLike && rawDelta != null
+    ? structuredThinkingText(rawDelta)
     : normalizeThinkingMessage(entry);
   const fileChanges = normalizeFileChanges(entry);
   const argumentsValue = firstThinkingField(entry, 'arguments', 'args');
@@ -3977,8 +4465,8 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
     return null;
   }
   const normalizedSubagentStatus = subagent
-    ? String(subagentKind || 'running').trim()
-    : firstThinkingField(entry, 'status');
+    ? structuredThinkingScalar(subagentKind, 'running').trim()
+    : structuredThinkingScalar(firstThinkingField(entry, 'status'), '');
   const startedAt = firstThinkingField(entry, 'startedAt', 'createdAt')
     || entry.timestamp
     || null;
@@ -3986,25 +4474,29 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
     || entry.timestamp
     || startedAt;
   const normalized = {
-    activityKey: firstThinkingField(entry, 'activityKey'),
+    activityKey: structuredThinkingScalar(firstThinkingField(entry, 'activityKey'), '') || null,
     activityRevision: firstThinkingField(entry, 'activityRevision', 'revision'),
-    canonicalConversationKey: firstThinkingField(entry, 'canonicalConversationKey'),
-    runId: firstThinkingField(entry, 'runId'),
-    turnId: firstThinkingField(entry, 'turnId', 'turn_id'),
-    itemId: firstThinkingField(entry, 'itemId', 'item_id', 'id'),
-    callId: firstThinkingField(entry, 'callId', 'call_id'),
-    requestId: firstThinkingField(entry, 'requestId', 'request_id'),
-    processId: firstThinkingField(entry, 'processId', 'process_id', 'processHandle'),
+    canonicalConversationKey: structuredThinkingScalar(firstThinkingField(entry, 'canonicalConversationKey'), '') || null,
+    runId: structuredThinkingScalar(firstThinkingField(entry, 'runId'), '') || null,
+    turnId: structuredThinkingScalar(firstThinkingField(entry, 'turnId', 'turn_id'), '') || null,
+    clientRequestId: structuredThinkingScalar(firstThinkingField(entry, 'clientRequestId', 'client_request_id'), '') || null,
+    itemId: structuredThinkingScalar(firstThinkingField(entry, 'itemId', 'item_id', 'id'), '') || null,
+    callId: structuredThinkingScalar(firstThinkingField(entry, 'callId', 'call_id'), '') || null,
+    requestId: structuredThinkingScalar(firstThinkingField(entry, 'requestId', 'request_id'), '') || null,
+    processId: structuredThinkingScalar(firstThinkingField(entry, 'processId', 'process_id', 'processHandle'), '') || null,
     summaryIndex: firstThinkingField(entry, 'summaryIndex', 'summary_index') || 0,
     kind,
-    itemType: firstThinkingField(entry, 'itemType', 'type') || (subagent ? 'subAgentActivity' : null),
+    itemType: structuredThinkingScalar(
+      firstThinkingField(entry, 'itemType', 'type'),
+      subagent ? 'subAgentActivity' : ''
+    ) || null,
     method,
-    name: firstThinkingField(entry, 'name'),
+    name: structuredThinkingText(firstThinkingField(entry, 'name')) || null,
     status: normalizedSubagentStatus,
-    text: text || (fileChanges.length ? 'File changes updated' : ''),
+    text: structuredThinkingText(text || (fileChanges.length ? 'File changes updated' : '')),
     textTruncated: firstThinkingField(entry, 'textTruncated') === true,
-    command: firstThinkingField(entry, 'command', 'cmd'),
-    cwd: firstThinkingField(entry, 'cwd', 'workdir', 'workingDirectory'),
+    command: structuredThinkingText(firstThinkingField(entry, 'command', 'cmd')) || null,
+    cwd: structuredThinkingText(firstThinkingField(entry, 'cwd', 'workdir', 'workingDirectory')) || null,
     output: firstThinkingField(entry, 'output', 'aggregatedOutput', 'delta'),
     outputTruncated: firstThinkingField(entry, 'outputTruncated') === true,
     stdout: firstThinkingField(entry, 'stdout'),
@@ -4012,16 +4504,20 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
     stream: firstThinkingField(entry, 'stream'),
     exitCode: firstThinkingField(entry, 'exitCode', 'exit_code'),
     durationMs: firstThinkingField(entry, 'durationMs', 'duration_ms'),
-    server: firstThinkingField(entry, 'server'),
-    tool: firstThinkingField(entry, 'tool', 'name'),
-    namespace: firstThinkingField(entry, 'namespace'),
-    resourceUri: firstThinkingField(entry, 'resourceUri'),
-    senderThreadId: firstThinkingField(entry, 'senderThreadId') || parentThreadId,
+    server: structuredThinkingText(firstThinkingField(entry, 'server')) || null,
+    tool: structuredThinkingText(firstThinkingField(entry, 'tool', 'name')) || null,
+    namespace: structuredThinkingText(firstThinkingField(entry, 'namespace')) || null,
+    resourceUri: structuredThinkingText(firstThinkingField(entry, 'resourceUri')) || null,
+    senderThreadId: structuredThinkingScalar(firstThinkingField(entry, 'senderThreadId'), '') || parentThreadId,
     receiverThreadIds: firstThinkingField(entry, 'receiverThreadIds') || (subagentThreadId ? [subagentThreadId] : null),
     agentThreadId: subagentThreadId,
     agentPath: subagentPath,
     agentNickname: subagentNickname,
-    agentRole: firstThinkingField(entry, 'agentRole', 'agent_role') || subagentItem?.agentRole || subagentItem?.agent_role || null,
+    agentRole: structuredThinkingText(
+      firstThinkingField(entry, 'agentRole', 'agent_role')
+        || subagentItem?.agentRole
+        || subagentItem?.agent_role
+    ) || null,
     parentThreadId,
     subagentKind,
     prompt: firstThinkingField(entry, 'prompt'),
@@ -4043,16 +4539,23 @@ function normalizeThinkingActivityForModel(entry, index = 0) {
     fileChangesTruncated: firstThinkingField(entry, 'fileChangesTruncated') === true,
     final: entry.final === true
       || (subagent && /item\/completed$/i.test(method))
-      || /(?:completed|failed|cancelled|canceled|interrupted)$/.test(String(normalizedSubagentStatus || '').toLowerCase()),
+      || /(?:completed|failed|cancelled|canceled|interrupted)$/.test(structuredThinkingScalar(normalizedSubagentStatus, '').toLowerCase()),
     success: firstThinkingField(entry, 'success'),
     startedAt,
     timestamp: startedAt,
     updatedAt,
-    source: entry.source || null,
+    source: structuredThinkingScalar(entry.source, '') || null,
   };
-  return window.RemoteCodexThinkingEntryModel?.normalizeThinkingActivityEntry
-    ? window.RemoteCodexThinkingEntryModel.normalizeThinkingActivityEntry(normalized, index)
-    : normalized;
+  if (!window.RemoteCodexThinkingEntryModel?.normalizeThinkingActivityEntry) {
+    return normalized;
+  }
+  const modelEntry = window.RemoteCodexThinkingEntryModel.normalizeThinkingActivityEntry(
+    normalized,
+    index
+  );
+  return modelEntry
+    ? { ...modelEntry, clientRequestId: normalized.clientRequestId || modelEntry.clientRequestId || null }
+    : modelEntry;
 }
 
 function aggregateThinkingActivityEntries(entries) {
@@ -4060,8 +4563,29 @@ function aggregateThinkingActivityEntries(entries) {
   if (!window.RemoteCodexThinkingEntryModel?.aggregateThinkingEntries) {
     return normalized;
   }
+  const clientRequestIdsByActivityKey = new Map();
+  const clientRequestIdsByTurnId = new Map();
+  for (const entry of normalized) {
+    const clientRequestId = structuredThinkingScalar(entry?.clientRequestId, '').trim();
+    if (!clientRequestId) continue;
+    for (const activityKey of [entry?.activityKey, ...(entry?.activityKeys || [])]) {
+      const normalizedActivityKey = structuredThinkingScalar(activityKey, '').trim();
+      if (normalizedActivityKey) clientRequestIdsByActivityKey.set(normalizedActivityKey, clientRequestId);
+    }
+    const turnId = structuredThinkingScalar(entry?.turnId, '').trim();
+    if (turnId && !clientRequestIdsByTurnId.has(turnId)) {
+      clientRequestIdsByTurnId.set(turnId, clientRequestId);
+    }
+  }
   return window.RemoteCodexThinkingEntryModel.aggregateThinkingEntries(normalized, {
     maxEntries: LIVE_THINKING_ACTIVITY_ENTRY_LIMIT,
+  }).map((entry) => {
+    const activityKeys = [entry?.activityKey, ...(entry?.activityKeys || [])].filter(Boolean);
+    const clientRequestId = structuredThinkingScalar(entry?.clientRequestId, '').trim()
+      || activityKeys.map((key) => clientRequestIdsByActivityKey.get(structuredThinkingScalar(key, '').trim())).find(Boolean)
+      || clientRequestIdsByTurnId.get(structuredThinkingScalar(entry?.turnId, '').trim())
+      || null;
+    return clientRequestId ? { ...entry, clientRequestId } : entry;
   });
 }
 
@@ -4080,14 +4604,17 @@ function getProjectedThinkingActivities(session) {
     limit: LIVE_THINKING_ACTIVITY_ENTRY_LIMIT,
   }).map((activity, index) => normalizeThinkingActivityForModel({
     ...activity,
-    activityKey: String(activity.activityKey || ''),
+    activityKey: structuredThinkingScalar(activity.activityKey, ''),
     activityRevision: Number(activity.activityRevision || 0),
-    kind: activity.kind || 'reasoning',
-    method: activity.method || null,
-    text: String(activity.text == null ? '' : activity.text),
+    kind: structuredThinkingScalar(activity.kind, 'reasoning'),
+    method: structuredThinkingText(activity.method) || null,
+    text: structuredThinkingText(activity.text),
     timestamp: activity.timestamp || activity.updatedAt || null,
-    turnId: activity.turnId || null,
-    itemId: activity.itemId || null,
+    turnId: structuredThinkingScalar(activity.turnId, '') || null,
+    clientRequestId: structuredThinkingScalar(activity.clientRequestId, '')
+      || state.activityClientRequestIdsByCanonical.get(canonicalKey)?.get(activity.activityKey)
+      || null,
+    itemId: structuredThinkingScalar(activity.itemId, '') || null,
     final: activity.final === true,
     fileChanges: activity.fileChanges || [],
   }, index)).filter(Boolean);
@@ -4095,24 +4622,29 @@ function getProjectedThinkingActivities(session) {
 
 function mergeProjectedThinkingEntries(diagnostics, projected) {
   const projectedEntries = Array.isArray(projected) ? projected : [];
-  const projectedReasoning = projectedEntries.some((entry) => entry.kind === 'reasoning');
-  const diagnosticEntries = (diagnostics || []).filter((entry) => (
-    !projectedReasoning || String(entry?.kind || '').toLowerCase() !== 'reasoning'
-  )).map((entry, index) => normalizeThinkingActivityForModel(entry, index)).filter(Boolean);
+  // Diagnostics and the durable activity projection are two observations of
+  // the same conversation, not mutually exclusive sources.  Filtering every
+  // diagnostic reasoning row whenever one projected reasoning row exists
+  // drops completed Thinking during the short projection/reconnect window.
+  // Keep both streams and let the model's stable item/call/request/process or
+  // activity identity merge only the observations that are actually aliases.
+  const diagnosticEntries = (diagnostics || [])
+    .map((entry, index) => normalizeThinkingActivityForModel(entry, index))
+    .filter(Boolean);
   const ordered = [...diagnosticEntries, ...projectedEntries]
     .sort((left, right) => (
       Date.parse(left.timestamp || 0) - Date.parse(right.timestamp || 0)
-      || String(left.activityKey || '').localeCompare(String(right.activityKey || ''))
+      || structuredThinkingScalar(left.activityKey, '').localeCompare(structuredThinkingScalar(right.activityKey, ''))
     ));
   return aggregateThinkingActivityEntries(ordered);
 }
 
 function isUserSuitableThinkingText(text, entry = {}) {
-  const value = String(text || '').trim();
+  const value = structuredThinkingText(text).trim();
   if (!value) {
     return false;
   }
-  if (String(entry.kind || '').toLowerCase() === 'notification') {
+  if (structuredThinkingScalar(entry.kind, '').toLowerCase() === 'notification') {
     return false;
   }
   if (/^\{\s*item:\s*\{/.test(value) || /^\{\s*threadId:/.test(value)) {
@@ -4124,14 +4656,98 @@ function isUserSuitableThinkingText(text, entry = {}) {
   return true;
 }
 
+function thinkingTurnIdentity(entry) {
+  return {
+    clientRequestId: structuredThinkingScalar(
+      firstThinkingField(entry, 'clientRequestId', 'client_request_id'),
+      ''
+    ).trim() || null,
+    turnId: structuredThinkingScalar(
+      firstThinkingField(entry, 'turnId', 'turn_id'),
+      ''
+    ).trim() || null,
+  };
+}
+
+function buildThinkingTurnOwnershipIndex(entries = []) {
+  const turnIdsByClientRequestId = new Map();
+  const clientRequestIdsByTurnId = new Map();
+  function remember(map, key, value) {
+    if (!key || !value) return;
+    if (!map.has(key)) map.set(key, new Set());
+    map.get(key).add(value);
+  }
+  for (const entry of entries) {
+    const identity = thinkingTurnIdentity(entry);
+    if (!identity.clientRequestId || !identity.turnId) continue;
+    remember(turnIdsByClientRequestId, identity.clientRequestId, identity.turnId);
+    remember(clientRequestIdsByTurnId, identity.turnId, identity.clientRequestId);
+  }
+  return { turnIdsByClientRequestId, clientRequestIdsByTurnId };
+}
+
+function thinkingTurnIdentityAliases(entry, ownership) {
+  const identity = thinkingTurnIdentity(entry);
+  const aliases = new Set();
+  if (identity.clientRequestId) {
+    aliases.add(`client:${identity.clientRequestId}`);
+    for (const turnId of ownership?.turnIdsByClientRequestId?.get(identity.clientRequestId) || []) {
+      aliases.add(`turn:${turnId}`);
+    }
+  }
+  if (identity.turnId) {
+    aliases.add(`turn:${identity.turnId}`);
+    for (const clientRequestId of ownership?.clientRequestIdsByTurnId?.get(identity.turnId) || []) {
+      aliases.add(`client:${clientRequestId}`);
+    }
+  }
+  return aliases;
+}
+
+function thinkingEntryMatchesUserTurn(entry, userEntry, ownership) {
+  const entryIdentity = thinkingTurnIdentity(entry);
+  const userIdentity = thinkingTurnIdentity(userEntry);
+  if (
+    entryIdentity.clientRequestId
+    && userIdentity.clientRequestId
+  ) {
+    return entryIdentity.clientRequestId === userIdentity.clientRequestId;
+  }
+  if (
+    entryIdentity.turnId
+    && userIdentity.turnId
+    && (!entryIdentity.clientRequestId || !userIdentity.clientRequestId)
+  ) {
+    return entryIdentity.turnId === userIdentity.turnId;
+  }
+  const entryAliases = thinkingTurnIdentityAliases(entry, ownership);
+  if (!entryAliases.size) return false;
+  const userAliases = thinkingTurnIdentityAliases(userEntry, ownership);
+  if (!userAliases.size) return false;
+  for (const alias of entryAliases) {
+    if (userAliases.has(alias)) return true;
+  }
+  return false;
+}
+
 function buildLiveActivitySegment(session, latestUserEntry = null, diagnostics = null) {
   const startTime = Date.parse(latestUserEntry?.timestamp || '');
   const startGraceMs = 5000;
   const sourceDiagnostics = Array.isArray(diagnostics)
     ? diagnostics.filter(isThinkingActivityDiagnostic)
     : getThinkingDiagnosticsForSession(session);
+  const projectedActivities = getProjectedThinkingActivities(session);
+  const ownership = buildThinkingTurnOwnershipIndex([
+    ...(latestUserEntry ? [latestUserEntry] : []),
+    ...sourceDiagnostics,
+    ...projectedActivities,
+  ]);
   const entries = sourceDiagnostics
     .filter((diag) => {
+      const identity = thinkingTurnIdentity(diag);
+      if (identity.clientRequestId || identity.turnId) {
+        return thinkingEntryMatchesUserTurn(diag, latestUserEntry, ownership);
+      }
       if (!Number.isFinite(startTime)) {
         return true;
       }
@@ -4139,7 +4755,11 @@ function buildLiveActivitySegment(session, latestUserEntry = null, diagnostics =
       return Number.isFinite(diagTime) && diagTime >= startTime - startGraceMs;
     })
     .sort((a, b) => Date.parse(a.timestamp || 0) - Date.parse(b.timestamp || 0));
-  const projected = getProjectedThinkingActivities(session).filter((entry) => {
+  const projected = projectedActivities.filter((entry) => {
+    const identity = thinkingTurnIdentity(entry);
+    if (identity.clientRequestId || identity.turnId) {
+      return thinkingEntryMatchesUserTurn(entry, latestUserEntry, ownership);
+    }
     if (!Number.isFinite(startTime)) {
       return true;
     }
@@ -4152,6 +4772,9 @@ function buildLiveActivitySegment(session, latestUserEntry = null, diagnostics =
     return null;
   }
   return {
+    userEntryKey: latestUserEntry && typeof transcriptEntryStableTurnKey === 'function'
+      ? transcriptEntryStableTurnKey(latestUserEntry)
+      : latestUserEntry?.timestamp || 'live',
     userTimestamp: latestUserEntry?.timestamp || 'live',
     userText: latestUserEntry?.text || '',
     entries: activity,
@@ -4179,7 +4802,7 @@ function getLatestFormalAgentMessage(session) {
   const transcript = getTranscriptForSession(session)
     .filter((entry) => entry && (entry.speaker === 'agent' || entry.speaker === 'assistant') && entry.text);
   const latest = transcript[transcript.length - 1];
-  const fallback = String(session.latestAgentMessage || '').trim();
+  const fallback = structuredThinkingText(session.latestAgentMessage).trim();
   if (fallback && fallback !== '[object Object]' && !/^\s*[\[{]/.test(fallback)) {
     return latest?.text || fallback;
   }
@@ -4201,11 +4824,33 @@ function buildThinkingEntriesForSession(session, options = {}) {
     : getThinkingDiagnosticsForSession(session);
   const projectedActivities = getProjectedThinkingActivities(session);
 
+  const ownership = buildThinkingTurnOwnershipIndex([
+    ...transcript.filter((entry) => entry.speaker === 'user'),
+    ...thinkingDiagnostics,
+    ...projectedActivities,
+  ]);
+  const explicitDiagnostics = thinkingDiagnostics.filter((entry) => {
+    const identity = thinkingTurnIdentity(entry);
+    return Boolean(identity.clientRequestId || identity.turnId);
+  });
+  const explicitActivities = projectedActivities.filter((entry) => {
+    const identity = thinkingTurnIdentity(entry);
+    return Boolean(identity.clientRequestId || identity.turnId);
+  });
+
   const timestampedDiagnostics = thinkingDiagnostics
+    .filter((entry) => {
+      const identity = thinkingTurnIdentity(entry);
+      return !identity.clientRequestId && !identity.turnId;
+    })
     .map((entry) => ({ entry, timestamp: Date.parse(entry?.timestamp || '') }))
     .filter((item) => Number.isFinite(item.timestamp))
     .sort((left, right) => left.timestamp - right.timestamp);
   const timestampedActivities = projectedActivities
+    .filter((entry) => {
+      const identity = thinkingTurnIdentity(entry);
+      return !identity.clientRequestId && !identity.turnId;
+    })
     .map((entry) => ({ entry, timestamp: Date.parse(entry?.timestamp || '') }))
     .filter((item) => Number.isFinite(item.timestamp))
     .sort((left, right) => left.timestamp - right.timestamp);
@@ -4239,7 +4884,12 @@ function buildThinkingEntriesForSession(session, options = {}) {
     }
 
     const startTime = transcriptTimes[index];
-    if (!Number.isFinite(startTime)) {
+    const userIdentity = thinkingTurnIdentity(entry);
+    if (
+      !Number.isFinite(startTime)
+      && !userIdentity.clientRequestId
+      && !userIdentity.turnId
+    ) {
       continue;
     }
 
@@ -4262,21 +4912,38 @@ function buildThinkingEntriesForSession(session, options = {}) {
       }
     }
 
-    const windowEntries = entriesBetween(
-      timestampedDiagnostics,
-      startTime - startGraceMs,
-      replyTime,
-      80
-    );
-    const windowActivities = entriesBetween(
-      timestampedActivities,
-      startTime - startGraceMs,
-      replyTime
-    );
+    const windowEntries = [
+      ...(Number.isFinite(startTime)
+        ? entriesBetween(
+          timestampedDiagnostics,
+          startTime - startGraceMs,
+          replyTime,
+          80
+        )
+        : []),
+      ...explicitDiagnostics.filter((candidate) => (
+        thinkingEntryMatchesUserTurn(candidate, entry, ownership)
+      )),
+    ];
+    const windowActivities = [
+      ...(Number.isFinite(startTime)
+        ? entriesBetween(
+          timestampedActivities,
+          startTime - startGraceMs,
+          replyTime
+        )
+        : []),
+      ...explicitActivities.filter((candidate) => (
+        thinkingEntryMatchesUserTurn(candidate, entry, ownership)
+      )),
+    ];
     const merged = mergeProjectedThinkingEntries(windowEntries, windowActivities);
 
     if (merged.length) {
       segments.push({
+        userEntryKey: typeof transcriptEntryStableTurnKey === 'function'
+          ? transcriptEntryStableTurnKey(entry)
+          : entry.timestamp || null,
         userTimestamp: entry.timestamp || null,
         userText: entry.text || '',
         entries: merged,
@@ -4379,22 +5046,26 @@ function renderTranscriptSearchNavigator(session, matches = [], activeIndex = 0)
   label.textContent = `${activeIndex + 1} / ${matches.length}`;
   const queryText = document.createElement('div');
   queryText.className = 'transcript-search-query';
+  queryText.setAttribute('data-i18n-skip', '');
   queryText.textContent = query;
   const previous = document.createElement('button');
   previous.type = 'button';
   previous.className = 'secondary-button transcript-search-nav-button';
   previous.dataset.transcriptSearchNav = 'previous';
-  previous.textContent = 'Prev';
+  previous.dataset.i18nKey = 'navSearch.previous';
+  previous.textContent = t('navSearch.previous');
   const next = document.createElement('button');
   next.type = 'button';
   next.className = 'secondary-button transcript-search-nav-button';
   next.dataset.transcriptSearchNav = 'next';
-  next.textContent = 'Next';
+  next.dataset.i18nKey = 'navSearch.next';
+  next.textContent = t('navSearch.next');
   const close = document.createElement('button');
   close.type = 'button';
   close.className = 'secondary-button transcript-search-close-button';
   close.dataset.transcriptSearchNav = 'clear';
   close.textContent = '\u00d7';
+  close.setAttribute('aria-label', t('navSearch.clear'));
   container.append(label, queryText, previous, next, close);
 }
 
@@ -4425,9 +5096,9 @@ function focusTranscriptSearchMatch(direction = 'next') {
 }
 
 function isFileChangeDiagnostic(entry) {
-  const method = String(entry?.method || '').toLowerCase();
-  const kind = String(entry?.kind || '').toLowerCase();
-  const message = String(entry?.message || '').toLowerCase();
+  const method = structuredThinkingScalar(entry?.method, '').toLowerCase();
+  const kind = structuredThinkingScalar(entry?.kind, '').toLowerCase();
+  const message = structuredThinkingText(entry?.message).toLowerCase();
   return kind === 'file-change'
     || kind === 'filechange'
     || method.includes('filechange')
@@ -4440,7 +5111,7 @@ function isFileChangeDiagnostic(entry) {
 function countDiffLines(diffText) {
   let additions = 0;
   let deletions = 0;
-  for (const line of String(diffText || '').split(/\r?\n/)) {
+  for (const line of structuredThinkingText(diffText).split(/\r?\n/)) {
     if (line.startsWith('+++') || line.startsWith('---')) {
       continue;
     }
@@ -4454,7 +5125,7 @@ function countDiffLines(diffText) {
 }
 
 function countTextLines(text) {
-  const value = String(text || '');
+  const value = structuredThinkingText(text);
   if (!value) {
     return 0;
   }
@@ -4467,7 +5138,7 @@ function toCount(value) {
 }
 
 function normalizeFileChangeStatus(value) {
-  const text = String(value || '').toLowerCase();
+  const text = structuredThinkingScalar(value, '').toLowerCase();
   if (['a', 'add', 'added', 'create', 'created', 'new'].includes(text)) {
     return 'added';
   }
@@ -4499,7 +5170,7 @@ function fileChangeStatusLabel(status) {
 }
 
 function pathFromDiffHeader(diffText) {
-  const text = String(diffText || '');
+  const text = structuredThinkingText(diffText);
   const gitMatch = text.match(/^diff --git a\/(.+?) b\/(.+)$/m);
   if (gitMatch) {
     return gitMatch[2] || gitMatch[1];
@@ -4516,7 +5187,7 @@ function pathFromDiffHeader(diffText) {
 }
 
 function splitUnifiedDiff(diffText) {
-  const text = String(diffText || '').trim();
+  const text = structuredThinkingText(diffText).trim();
   if (!text) {
     return [];
   }
@@ -4537,22 +5208,34 @@ function normalizeFileChangeRecord(raw, fallbackPath = '') {
   if (!raw || typeof raw !== 'object') {
     return null;
   }
-  const diff = String(raw.diff || raw.patch || raw.unifiedDiff || raw.unified_diff || '').trim();
+  const diffCandidate = [
+    raw.diff,
+    raw.patch,
+    raw.unifiedDiff,
+    raw.unified_diff,
+  ].find((value) => value !== null && typeof value !== 'undefined' && value !== '');
+  const diff = structuredThinkingText(diffCandidate).trim();
   const counts = countDiffLines(diff);
-  const rawStatus = normalizeFileChangeStatus(raw.status || raw.changeType || raw.change_type || raw.type || raw.kind || raw.action);
-  const pathValue = String(
-    raw.path
-      || raw.filePath
-      || raw.file_path
-      || raw.absolutePath
-      || raw.relativePath
-      || raw.filename
-      || raw.name
-      || fallbackPath
-      || pathFromDiffHeader(diff)
-      || ''
-  ).trim();
-  const contentLineCount = countTextLines(raw.content || raw.text || '');
+  const rawStatus = [
+    raw.status,
+    raw.changeType,
+    raw.change_type,
+    raw.type,
+    raw.kind,
+    raw.action,
+  ].map((value) => normalizeFileChangeStatus(value)).find(Boolean) || '';
+  const pathValue = [
+    raw.path,
+    raw.filePath,
+    raw.file_path,
+    raw.absolutePath,
+    raw.relativePath,
+    raw.filename,
+    raw.name,
+    fallbackPath,
+    pathFromDiffHeader(diff),
+  ].map((value) => structuredThinkingText(value).trim()).find(Boolean) || '';
+  const contentLineCount = countTextLines(raw.content ?? raw.text);
   const additions = toCount(raw.additions ?? raw.added ?? raw.insertions ?? raw.linesAdded ?? raw.addedLines)
     ?? (diff ? counts.additions : rawStatus === 'added' ? contentLineCount : null);
   const deletions = toCount(raw.deletions ?? raw.deleted ?? raw.removed ?? raw.linesDeleted ?? raw.deletedLines)
@@ -4570,7 +5253,7 @@ function normalizeFileChangeRecord(raw, fallbackPath = '') {
 }
 
 function parsePatchApplyUpdatedFiles(value) {
-  const text = String(value || '');
+  const text = structuredThinkingText(value);
   const marker = 'Updated the following files:';
   const markerIndex = text.indexOf(marker);
   if (markerIndex < 0) {
@@ -4647,7 +5330,14 @@ function normalizeFileChanges(entry) {
       return;
     }
 
-    const nextFallback = String(value.path || value.filePath || value.file_path || value.filename || value.name || fallbackPath || '');
+    const nextFallback = [
+      value.path,
+      value.filePath,
+      value.file_path,
+      value.filename,
+      value.name,
+      fallbackPath,
+    ].map((candidate) => structuredThinkingText(candidate).trim()).find(Boolean) || '';
     const looksLikeFileChangeMap = !Array.isArray(value)
       && Object.keys(value).length > 0
       && Object.values(value).every((item) => item && typeof item === 'object' && (
@@ -4692,7 +5382,7 @@ function normalizeFileChanges(entry) {
 }
 
 function shortId(value) {
-  const text = String(value || '');
+  const text = structuredThinkingScalar(value, '');
   if (!text) {
     return '';
   }
@@ -4706,8 +5396,10 @@ function normalizeTranscriptFiles(rawFiles) {
     if (!rawFile || typeof rawFile !== 'object') {
       continue;
     }
-    const pathValue = normalizeRemoteFilePath(rawFile.path || rawFile.remotePath || '');
-    const name = String(rawFile.name || basename(pathValue) || 'file').trim();
+    const pathValue = normalizeRemoteFilePath(
+      structuredThinkingText(rawFile.path || rawFile.remotePath || '')
+    );
+    const name = structuredThinkingText(rawFile.name || basename(pathValue) || 'file').trim();
     if (!pathValue && !name) {
       continue;
     }
@@ -4716,9 +5408,9 @@ function normalizeTranscriptFiles(rawFiles) {
       continue;
     }
     seen.add(key);
-    const mime = String(rawFile.mime || rawFile.type || '').trim();
+    const mime = structuredThinkingScalar(rawFile.mime || rawFile.type, '').trim();
     files.push({
-      fileId: String(rawFile.fileId || rawFile.id || key),
+      fileId: structuredThinkingScalar(rawFile.fileId || rawFile.id, key),
       name,
       path: pathValue,
       size: Number(rawFile.size || 0) || 0,
@@ -4740,17 +5432,27 @@ function dedupeTranscript(entries) {
       continue;
     }
 
+    const speaker = normalizeTranscriptSpeaker(entry.speaker);
+    const assistantMessageId = normalizeTranscriptIdentity(entry.assistantMessageId);
+    const clientRequestId = normalizeTranscriptIdentity(entry.clientRequestId);
+    const turnId = normalizeTranscriptIdentity(entry.turnId);
+    const deliveryStatus = normalizeTranscriptIdentity(entry.deliveryStatus);
+    const stream = normalizeTranscriptIdentity(entry.stream);
+    const source = normalizeTranscriptIdentity(entry.source);
+    const timestamp = normalizeTranscriptTimestamp(entry.timestamp);
+
     const normalized = {
-      speaker: entry.speaker || 'system',
-      text: cleanTranscriptTextForDisplay(entry.text || '', entry.speaker || 'system'),
-      timestamp: entry.timestamp || null,
-      stream: entry.stream || null,
-      source: entry.source || null,
-      clientRequestId: entry.clientRequestId || null,
-      deliveryStatus: entry.deliveryStatus || null,
-      assistantMessageId: entry.assistantMessageId || null,
+      speaker,
+      text: cleanTranscriptTextForDisplay(entry.text || '', speaker),
+      timestamp,
+      stream: stream || null,
+      source: source || null,
+      clientRequestId: clientRequestId || null,
+      turnId: turnId || null,
+      deliveryStatus: deliveryStatus || null,
+      assistantMessageId: assistantMessageId || null,
       assistantSeq: Number.isSafeInteger(Number(entry.assistantSeq)) ? Number(entry.assistantSeq) : null,
-      assistantAt: entry.assistantAt || null,
+      assistantAt: normalizeTranscriptTimestamp(entry.assistantAt),
       notifiable: entry.notifiable === true,
       files,
     };
@@ -4761,10 +5463,38 @@ function dedupeTranscript(entries) {
       ? `assistant|${normalized.assistantMessageId}`
       : normalized.clientRequestId
         ? `${normalized.speaker}|request|${normalized.clientRequestId}`
-        : `${normalized.speaker}|${normalized.timestamp || ''}|${canonicalTranscriptText(normalized.text)}|${files.map((file) => file.path || file.name).join(',')}`;
+        : `${normalized.speaker}|${normalized.turnId || ''}|${normalized.timestamp || ''}|${canonicalTranscriptText(normalized.text)}|${files.map((file) => file.path || file.name).join(',')}`;
     if (seen.has(key)) {
       const index = seen.get(key);
-      deduped[index] = { ...deduped[index], ...normalized };
+      const previous = deduped[index];
+      const previousAssistantSeq = Number(previous.assistantSeq);
+      const incomingAssistantSeq = Number(normalized.assistantSeq);
+      const mergedAssistantSeq = Math.max(
+        Number.isSafeInteger(previousAssistantSeq) && previousAssistantSeq > 0 ? previousAssistantSeq : 0,
+        Number.isSafeInteger(incomingAssistantSeq) && incomingAssistantSeq > 0 ? incomingAssistantSeq : 0
+      );
+      deduped[index] = {
+        ...previous,
+        ...normalized,
+        // Incremental events are allowed to omit fields. Preserve the last
+        // non-empty value so a sparse update cannot make a rendered message
+        // or its file cards disappear for one reconciliation pass.
+        text: normalized.text || previous.text || '',
+        timestamp: normalized.timestamp || previous.timestamp || null,
+        stream: normalized.stream || previous.stream || null,
+        source: normalized.source || previous.source || null,
+        clientRequestId: normalized.clientRequestId || previous.clientRequestId || null,
+        turnId: normalized.turnId || previous.turnId || null,
+        deliveryStatus: normalized.deliveryStatus || previous.deliveryStatus || null,
+        assistantMessageId: normalized.assistantMessageId || previous.assistantMessageId || null,
+        assistantSeq: mergedAssistantSeq || null,
+        assistantAt: normalized.assistantAt || previous.assistantAt || null,
+        files: normalized.files.length ? normalized.files : (previous.files || []),
+        // Assistant notification metadata is monotonic. A full-detail JSONL
+        // row can carry the same identity with legacy/default metadata; it
+        // must not demote the live durable projection.
+        notifiable: previous.notifiable === true || normalized.notifiable === true,
+      };
       continue;
     }
     seen.set(key, deduped.length);
@@ -4797,9 +5527,40 @@ function dedupeTranscript(entries) {
     const assistantIdentityPresent = Boolean(
       previous?.assistantMessageId || entry.assistantMessageId
     );
+    const explicitTurnIdentityConflict = Boolean(
+      previous?.clientRequestId
+      && entry.clientRequestId
+      && previous.clientRequestId !== entry.clientRequestId
+    ) || Boolean(
+      previous?.turnId
+      && entry.turnId
+      && previous.turnId !== entry.turnId
+    );
+    const sameExplicitTranscriptIdentity = Boolean(
+      previous?.clientRequestId
+      && entry.clientRequestId
+      && previous.clientRequestId === entry.clientRequestId
+    ) || Boolean(
+      previous?.turnId
+      && entry.turnId
+      && previous.turnId === entry.turnId
+    );
     const previousText = canonicalTranscriptText(previous?.text || '');
     const entryText = canonicalTranscriptText(entry.text || '');
-    if (!assistantIdentityPresent && sameSpeakerAndFiles && previousText && entryText && previousText === entryText) {
+    if (
+      !assistantIdentityPresent
+      && !explicitTurnIdentityConflict
+      && sameExplicitTranscriptIdentity
+      && sameSpeakerAndFiles
+      && previousText
+      && entryText
+      && previousText === entryText
+    ) {
+      compacted[compacted.length - 1] = {
+        ...previous,
+        clientRequestId: previous.clientRequestId || entry.clientRequestId || null,
+        turnId: previous.turnId || entry.turnId || null,
+      };
       continue;
     }
 
@@ -4808,6 +5569,8 @@ function dedupeTranscript(entries) {
     const nearDuplicate = previous
       && sameSpeakerAndFiles
       && !assistantIdentityPresent
+      && !explicitTurnIdentityConflict
+      && sameExplicitTranscriptIdentity
       && previousText
       && entryText
       && Number.isFinite(entryTime)
@@ -4815,6 +5578,11 @@ function dedupeTranscript(entries) {
       && Math.abs(entryTime - previousTime) <= 30000
       && (previousText.includes(entryText) || entryText.includes(previousText));
     if (nearDuplicate) {
+      compacted[compacted.length - 1] = {
+        ...previous,
+        clientRequestId: previous.clientRequestId || entry.clientRequestId || null,
+        turnId: previous.turnId || entry.turnId || null,
+      };
       continue;
     }
     compacted.push(entry);
@@ -5241,11 +6009,16 @@ const SESSION_SORT_LABELS = {
 };
 
 function getSessionSearchModeLabel(mode) {
-  return SESSION_SEARCH_MODE_LABELS[mode] || SESSION_SEARCH_MODE_LABELS.keyword;
+  return t('navSearch.' + (Object.hasOwn(SESSION_SEARCH_MODE_LABELS, mode) ? mode : 'keyword'));
 }
 
 function getSessionSortLabel(mode) {
-  return SESSION_SORT_LABELS[mode] || SESSION_SORT_LABELS.updatedAt;
+  return t('navSearch.' + (Object.hasOwn(SESSION_SORT_LABELS, mode) ? mode : 'updatedAt'));
+}
+
+function collectionDisplayName(collection) {
+  return window.RemoteCodexNavigationI18n?.collectionDisplayName(currentLocale(), collection)
+    || collection?.name || 'Collection';
 }
 
 function closeMobileSelectMenus() {
@@ -5797,6 +6570,10 @@ function structuredSessionError(error) {
     submittedBinding: error.submittedBinding || error.body?.submittedBinding || null,
     canRebind: Boolean(error.canRebind || error.body?.canRebind),
     canTranscriptFallback: Boolean(error.canTranscriptFallback || error.body?.canTranscriptFallback),
+    requiresExplicitTranscriptFallback: Boolean(
+      error.requiresExplicitTranscriptFallback
+      || error.body?.requiresExplicitTranscriptFallback
+    ),
   };
 }
 
@@ -5996,6 +6773,7 @@ function rebindTargetSummary(profileId, apiConfig = null) {
     label: apiConfig?.label || apiConfig?.provider || profileId || 'API profile',
     provider: apiConfig?.provider || null,
     providerKind: apiConfig?.providerKind || inferApiProviderKind(apiConfig || {}),
+    nativeResumeCompatibilityKey: apiConfig?.nativeResumeCompatibilityKey || null,
     baseUrl,
     responsesEndpoint: apiResponsesEndpoint(baseUrl),
   });
@@ -6164,6 +6942,7 @@ function applyConfirmedSessionStarted(payload, fallbackSession = null) {
     ...(payload || {}),
     hostId,
     sessionId,
+    resumeError: null,
   }));
   if (started?.hostId && started?.sessionId) {
     const failure = state.sessionRebindFailures.get(getSessionKey(started)) || null;
@@ -6391,7 +7170,19 @@ function mergeAssistantProjection(currentValue, incomingValue) {
   }
   const messages = new Map();
   for (const message of [...current.messages, ...incoming.messages]) {
-    messages.set(message.assistantMessageId, { ...(messages.get(message.assistantMessageId) || {}), ...message });
+    const previous = messages.get(message.assistantMessageId) || {};
+    const previousSeq = Number(previous.assistantSeq);
+    const incomingSeq = Number(message.assistantSeq);
+    const assistantSeq = Math.max(
+      Number.isSafeInteger(previousSeq) && previousSeq > 0 ? previousSeq : 0,
+      Number.isSafeInteger(incomingSeq) && incomingSeq > 0 ? incomingSeq : 0
+    );
+    messages.set(message.assistantMessageId, {
+      ...previous,
+      ...message,
+      ...(assistantSeq ? { assistantSeq } : {}),
+      notifiable: previous.notifiable === true || message.notifiable === true,
+    });
   }
   return {
     canonicalConversationKey: incoming.canonicalConversationKey || current.canonicalConversationKey,
@@ -6434,6 +7225,77 @@ function rememberAssistantProjection(session, projectionValue) {
   state.assistantProjections.set(canonicalKey, merged);
   state.assistantCanonicalKeysBySession.set(sessionKey, canonicalKey);
   return merged;
+}
+
+function rememberAuthoritativeAssistantProjection(session, projectionValue, afterSeqValue) {
+  const projection = normalizeAssistantProjection(projectionValue);
+  const afterSeq = Number(afterSeqValue);
+  const canonicalKey = projection.canonicalConversationKey;
+  const sessionKey = getSessionKey(session);
+  if (!canonicalKey || !sessionKey || !Number.isSafeInteger(afterSeq) || afterSeq < 0) {
+    return rememberAssistantProjection(session, projection);
+  }
+  const current = state.assistantProjections.get(canonicalKey);
+  let completed = projection;
+  if (current && Number(current.projectionRevision) === projection.projectionRevision) {
+    const retainedPrefix = normalizeAssistantProjection(current, canonicalKey).messages.filter((message) => {
+      const assistantSeq = Number(message?.assistantSeq || 0);
+      return Number.isSafeInteger(assistantSeq) && assistantSeq > 0 && assistantSeq <= afterSeq;
+    });
+    completed = mergeAssistantProjection(
+      { ...normalizeAssistantProjection(current, canonicalKey), messages: retainedPrefix },
+      projection
+    );
+  }
+  state.assistantProjections.set(canonicalKey, completed);
+  state.assistantCanonicalKeysBySession.set(sessionKey, canonicalKey);
+  return completed;
+}
+
+function assistantProjectionCoverageFor(projectionValue, requiredAfterSeq = null) {
+  const projection = normalizeAssistantProjection(projectionValue);
+  const canonicalKey = projection.canonicalConversationKey;
+  if (!canonicalKey) return null;
+  const coverage = state.assistantProjectionCoverage.get(canonicalKey);
+  if (
+    !coverage
+    || Number(coverage.projectionRevision) !== projection.projectionRevision
+    || !Number.isSafeInteger(Number(coverage.afterSeq))
+    || Number(coverage.afterSeq) < 0
+  ) return null;
+  if (
+    requiredAfterSeq !== null
+    && (!Number.isSafeInteger(Number(requiredAfterSeq)) || Number(coverage.afterSeq) > Number(requiredAfterSeq))
+  ) return null;
+  return {
+    projectionRevision: projection.projectionRevision,
+    afterSeq: Number(coverage.afterSeq),
+  };
+}
+
+function rememberAssistantProjectionCoverage(projectionValue, afterSeqValue) {
+  const projection = normalizeAssistantProjection(projectionValue);
+  const canonicalKey = projection.canonicalConversationKey;
+  const afterSeq = Number(afterSeqValue);
+  if (
+    !canonicalKey
+    || !Number.isSafeInteger(afterSeq)
+    || afterSeq < 0
+    || projection.cursorUnknown
+    || projection.hasMore
+  ) return null;
+  const current = state.assistantProjectionCoverage.get(canonicalKey);
+  if (current && Number(current.projectionRevision) > projection.projectionRevision) {
+    return null;
+  }
+  const coverage = {
+    projectionRevision: projection.projectionRevision,
+    afterSeq: current && Number(current.projectionRevision) === projection.projectionRevision
+      ? Math.min(Number(current.afterSeq), afterSeq)
+      : afterSeq,
+  };
+  state.assistantProjectionCoverage.set(canonicalKey, coverage);
+  return coverage;
 }
 
 function messageReceiptKeys(session, projection) {
@@ -6768,13 +7630,22 @@ function enqueueAssistantProjectionAlerts(session, projection, receipt) {
 }
 
 function applyAssistantProjectionForSession(session, projectionValue, options = {}) {
+  if (typeof options.isCurrent === 'function' && !options.isCurrent()) {
+    return null;
+  }
   const client = window.MessageNotificationClient;
   if (!client || !session || !projectionValue?.canonicalConversationKey) return null;
   const projection = rememberAssistantProjection(session, projectionValue);
   const receipt = receiptForAssistantProjection(session, projection);
   if (!receipt) return null;
-  const applied = client.applyAssistantProjection(receipt, projection);
+  const applied = client.applyAssistantProjection(receipt, projection, {
+    authoritativeAfterSeq: options.authoritativeAfterSeq,
+  });
   persistAssistantReceipt(applied.receipt, projection, session);
+  state.messageNotificationOutbox?.removeMessages?.(
+    projection.canonicalConversationKey,
+    applied.removedUnnotifiedAssistantIds || []
+  );
   enqueueAssistantProjectionAlerts(session, projection, applied.receipt);
   if (!options.deferUnreadRefresh) {
     refreshMessageUnreadState();
@@ -6788,9 +7659,10 @@ function applyAssistantProjectionForSession(session, projectionValue, options = 
 }
 
 function finishAssistantProjectionCatchUp(session, projection, options = {}) {
+  const authoritativeAfterSeq = options.authoritativeAfterSeq ?? null;
   return options.deferApply
-    ? { projection }
-    : applyAssistantProjectionForSession(session, projection);
+    ? { projection, authoritativeAfterSeq }
+    : applyAssistantProjectionForSession(session, projection, { authoritativeAfterSeq });
 }
 
 function assistantProjectionFetchStart(session, projection) {
@@ -6807,38 +7679,110 @@ function assistantProjectionFetchStart(session, projection) {
   );
 }
 
+function assistantProjectionUnreadReconciliationAfter(session, projection) {
+  const receipt = receiptForAssistantProjection(session, projection);
+  const retainedIds = new Set((projection.messages || [])
+    .filter((message) => message?.notifiable !== false)
+    .map((message) => String(message?.assistantMessageId || '').trim())
+    .filter(Boolean));
+  const missingStates = [
+    ...(receipt?.unreadAssistantIds || []).map((assistantMessageId) => ({
+      assistantMessageId,
+      state: receipt?.unreadAssistantStates?.[assistantMessageId] || null,
+    })),
+    ...(receipt?.unnotifiedAssistantIds || []).map((assistantMessageId) => ({
+      assistantMessageId,
+      state: receipt?.unnotifiedAssistantStates?.[assistantMessageId] || null,
+    })),
+  ]
+    .filter(({ assistantMessageId }) => !retainedIds.has(String(assistantMessageId || '').trim()))
+    .map(({ state }) => state);
+  if (!missingStates.length) return null;
+  const sequences = missingStates.map((entry) => Number(entry?.assistantSeq || 0));
+  if (sequences.some((value) => !Number.isSafeInteger(value) || value <= 0)) return 0;
+  return Math.max(0, Math.min(...sequences) - 1);
+}
+
 async function catchUpAssistantProjection(session, seedProjection = null, options = {}) {
   if (!session?.hostId || !session?.sessionId) return null;
+  const hasAsyncFence = typeof options.isCurrent === 'function'
+    || Object.prototype.hasOwnProperty.call(options, 'streamGeneration')
+    || Object.prototype.hasOwnProperty.call(options, 'source');
+  const asyncFence = hasAsyncFence
+    ? createSessionAsyncFence(session, options)
+    : null;
+  assertSessionAsyncFenceCurrent(asyncFence);
   const sessionKey = getSessionKey(session);
   const seed = seedProjection || session.assistantProjection || null;
   if (!seed?.canonicalConversationKey) return null;
+  const requiredCoverageValue = Number(options.requireCoverageAfterSeq);
+  const requiredCoverageAfterSeq = options.requireCoverageAfterSeq !== null
+    && typeof options.requireCoverageAfterSeq !== 'undefined'
+    && Number.isSafeInteger(requiredCoverageValue)
+    && requiredCoverageValue >= 0
+    ? requiredCoverageValue
+    : null;
   const existingRequest = state.messageProjectionRequests.get(sessionKey);
   if (existingRequest) {
     return existingRequest.then((result) => {
+      assertSessionAsyncFenceCurrent(asyncFence);
       const requestedRevision = Number(seed.projectionRevision || 0);
       if (requestedRevision > Number(result?.projection?.projectionRevision || 0)) {
         return catchUpAssistantProjection(session, seed, options);
       }
+      const coverage = assistantProjectionCoverageFor(
+        result?.projection,
+        requiredCoverageAfterSeq
+      );
+      if (requiredCoverageAfterSeq !== null && !coverage) {
+        return catchUpAssistantProjection(session, seed, options);
+      }
       if (!options.deferApply && result?.projection && !result.receipt) {
-        return applyAssistantProjectionForSession(session, result.projection);
+        return applyAssistantProjectionForSession(session, result.projection, {
+          authoritativeAfterSeq: coverage?.afterSeq ?? result.authoritativeAfterSeq,
+          isCurrent: asyncFence?.isCurrent,
+        });
       }
       return result;
+    }).catch((error) => {
+      if (isStaleStreamRecoveryError(error) && asyncFence?.isCurrent()) {
+        return catchUpAssistantProjection(session, seed, options);
+      }
+      throw error;
     });
   }
 
   const request = (async () => {
+    assertSessionAsyncFenceCurrent(asyncFence);
     let projection = rememberAssistantProjection(session, seed);
-    const startAfter = assistantProjectionFetchStart(session, projection);
+    const reconciliationAfterSeq = assistantProjectionUnreadReconciliationAfter(session, projection);
+    const defaultStartAfter = assistantProjectionFetchStart(session, projection);
+    let startAfter = reconciliationAfterSeq === null
+      ? defaultStartAfter
+      : Math.min(defaultStartAfter, reconciliationAfterSeq);
+    if (requiredCoverageAfterSeq !== null) {
+      startAfter = Math.min(startAfter, requiredCoverageAfterSeq);
+    }
+    const retainedCoverage = assistantProjectionCoverageFor(projection, requiredCoverageAfterSeq);
     const cachedMax = Math.max(0, ...projection.messages.map((message) => Number(message.assistantSeq || 0)));
     const needsFetch = options.force === true
+      || (requiredCoverageAfterSeq !== null && !retainedCoverage)
+      || reconciliationAfterSeq !== null
       || projection.cursorUnknown
       || projection.hasMore
       || (projection.latestAssistantSeq > startAfter && cachedMax < projection.latestAssistantSeq);
-    if (!needsFetch) return finishAssistantProjectionCatchUp(session, projection, options);
+    if (!needsFetch) {
+      return finishAssistantProjectionCatchUp(session, projection, {
+        ...options,
+        authoritativeAfterSeq: retainedCoverage?.afterSeq ?? null,
+      });
+    }
 
     let afterSeq = startAfter;
+    let paginationStartAfter = startAfter;
     let candidate = null;
     let candidateIdentity = '';
+    const initialProjectionIdentity = `${projection.canonicalConversationKey}\0${projection.projectionRevision}`;
     let restartCount = 0;
     const restartPagination = () => {
       restartCount += 1;
@@ -6848,6 +7792,7 @@ async function catchUpAssistantProjection(session, seedProjection = null, option
         throw error;
       }
       afterSeq = 0;
+      paginationStartAfter = 0;
       candidate = null;
       candidateIdentity = '';
     };
@@ -6859,11 +7804,16 @@ async function catchUpAssistantProjection(session, seedProjection = null, option
           limit: String(ASSISTANT_PROJECTION_PAGE_LIMIT),
         });
         const pageValue = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/assistant-messages?${params.toString()}`);
+        assertSessionAsyncFenceCurrent(asyncFence);
         const page = normalizeAssistantProjection(pageValue);
         if (!page.canonicalConversationKey) {
           throw new Error('Assistant projection page is missing its canonical conversation key.');
         }
         const pageIdentity = `${page.canonicalConversationKey}\0${page.projectionRevision}`;
+        if (!candidateIdentity && paginationStartAfter > 0 && pageIdentity !== initialProjectionIdentity) {
+          restartPagination();
+          continue;
+        }
         if (candidateIdentity && pageIdentity !== candidateIdentity) {
           restartPagination();
           continue;
@@ -6892,7 +7842,14 @@ async function catchUpAssistantProjection(session, seedProjection = null, option
             restartPagination();
             continue;
           }
-          projection = rememberAssistantProjection(session, candidate);
+          assertSessionAsyncFenceCurrent(asyncFence);
+          projection = rememberAuthoritativeAssistantProjection(
+            session,
+            candidate,
+            paginationStartAfter
+          );
+          assertSessionAsyncFenceCurrent(asyncFence);
+          rememberAssistantProjectionCoverage(projection, paginationStartAfter);
           break;
         }
         const nextAfter = Number(pageValue?.nextAfterSeq);
@@ -6906,7 +7863,14 @@ async function catchUpAssistantProjection(session, seedProjection = null, option
     } catch (error) {
       throw error;
     }
-    return finishAssistantProjectionCatchUp(session, projection, options);
+    assertSessionAsyncFenceCurrent(asyncFence);
+    const authoritativeAfterSeq = assistantProjectionCoverageFor(projection)?.afterSeq ?? null;
+    return options.deferApply
+      ? { projection, authoritativeAfterSeq }
+      : applyAssistantProjectionForSession(session, projection, {
+        authoritativeAfterSeq,
+        isCurrent: asyncFence?.isCurrent,
+      });
   })().finally(() => {
     if (state.messageProjectionRequests.get(sessionKey) === request) {
       state.messageProjectionRequests.delete(sessionKey);
@@ -6956,6 +7920,9 @@ async function syncAssistantProjectionsForSessions(sessions = state.sessions, op
         applyAssistantProjectionForSession(session, projection, {
           deferUnreadRefresh: true,
           deferUi: true,
+          authoritativeAfterSeq: result?.status === 'fulfilled'
+            ? result.value?.authoritativeAfterSeq
+            : null,
         });
       } catch (error) {
         failures.push(error);
@@ -7011,10 +7978,26 @@ function markSessionMessagesRead(sessionOrHostId, sessionId = null, options = {}
   const projection = getAssistantProjectionForSession(session);
   const client = window.MessageNotificationClient;
   if (!session || !projection || !client || !state.messageReceiptStore) return false;
+  const key = getSessionKey(session);
+  const readAssistantIds = Array.isArray(options.readAssistantIds)
+    ? options.readAssistantIds
+    : [...(state.transcriptNotificationRenderedAssistantIds.get(key) || [])];
+  if (options.clearAllUnread !== true && !readAssistantIds.length) return false;
   const receipt = receiptForAssistantProjection(session, projection);
+  const pendingNotificationIds = options.clearAllUnread === true
+    ? [...(receipt?.unnotifiedAssistantIds || [])]
+    : readAssistantIds.filter((assistantMessageId) => (
+      receipt?.unnotifiedAssistantStates?.[assistantMessageId]?.active !== false
+    ));
   persistAssistantReceipt(client.advanceReadReceipt(receipt, projection, {
     clearAllUnread: options.clearAllUnread === true,
+    readAssistantIds,
+    authoritativeAfterSeq: options.authoritativeAfterSeq,
   }), projection, session);
+  state.messageNotificationOutbox?.removeMessages?.(
+    projection.canonicalConversationKey,
+    pendingNotificationIds
+  );
   if (!options.deferUnreadRefresh) {
     refreshMessageUnreadState();
   }
@@ -7090,16 +8073,25 @@ async function maybeAdvanceReadReceipt(session = getSelectedSession(), expectedR
   ) return false;
 
   const projection = getAssistantProjectionForSession(session);
-  if (projection?.canonicalConversationKey) {
-    await catchUpAssistantProjection(session, projection).catch(() => null);
-  }
+  if (!projection?.canonicalConversationKey) return false;
+  const receiptBeforeCatchUp = receiptForAssistantProjection(session, projection);
+  const readCursor = Number(receiptBeforeCatchUp?.readThroughAssistantSeq || 0);
+  if (!Number.isSafeInteger(readCursor) || readCursor < 0) return false;
+  const caughtUp = await catchUpAssistantProjection(session, projection, {
+    requireCoverageAfterSeq: readCursor,
+  }).catch(() => null);
+  if (!caughtUp) return false;
   if (
     key !== getSessionKey(getSelectedSession())
     || Number(state.transcriptNotificationRenderVersions.get(key) || 0) !== renderVersion
   ) return false;
   const currentProjection = getAssistantProjectionForSession(session);
-  const renderedAssistantSeq = Number(state.transcriptNotificationRenderedAssistantSeq.get(key) || 0);
-  if (Number(currentProjection?.latestAssistantSeq || 0) > renderedAssistantSeq) return false;
+  const currentReceipt = receiptForAssistantProjection(session, currentProjection);
+  const currentReadCursor = Number(currentReceipt?.readThroughAssistantSeq || 0);
+  const coverage = assistantProjectionCoverageFor(currentProjection, currentReadCursor);
+  if (!coverage) return false;
+  const renderedAssistantIds = state.transcriptNotificationRenderedAssistantIds.get(key);
+  if (!renderedAssistantIds?.size) return false;
 
   const gate = getMessageReadGate(session);
   const gateState = gate?.state?.() || {};
@@ -7113,7 +8105,9 @@ async function maybeAdvanceReadReceipt(session = getSelectedSession(), expectedR
     outerScrollSource: gateState.lastSource === 'user' ? 'user' : 'programmatic',
   });
   if (!eligible) return false;
-  const changed = markSessionMessagesRead(session);
+  const changed = markSessionMessagesRead(session, null, {
+    authoritativeAfterSeq: coverage.afterSeq,
+  });
   if (changed) {
     renderConversationNav();
     renderMessageNotificationBell();
@@ -7126,10 +8120,15 @@ function completeTranscriptNotificationRender(session) {
   if (!key) return;
   const version = Number(state.transcriptNotificationRenderVersions.get(key) || 0) + 1;
   state.transcriptNotificationRenderVersions.set(key, version);
-  state.transcriptNotificationRenderedAssistantSeq.set(
-    key,
-    Number(getAssistantProjectionForSession(session)?.latestAssistantSeq || 0)
-  );
+  const renderedAssistantIds = new Set(Array.from(
+    el('session-log')?.querySelectorAll?.('[data-assistant-message-id]') || []
+  ).map((node) => String(node?.dataset?.assistantMessageId || '').trim()).filter(Boolean));
+  const renderedAssistantSeq = Math.max(0, ...(getAssistantProjectionForSession(session)?.messages || [])
+    .filter((message) => renderedAssistantIds.has(String(message?.assistantMessageId || '').trim()))
+    .map((message) => Number(message?.assistantSeq || 0))
+    .filter((value) => Number.isSafeInteger(value) && value > 0));
+  state.transcriptNotificationRenderedAssistantSeq.set(key, renderedAssistantSeq);
+  state.transcriptNotificationRenderedAssistantIds.set(key, renderedAssistantIds);
   const log = el('session-log');
   if (log?.dataset?.sessionKey === key) {
     log.dataset.notificationRenderVersion = String(version);
@@ -7148,29 +8147,94 @@ function hasUnreadMessagesForGroup(group) {
   return Boolean((group?.sessions || []).some(hasUnreadMessagesForSession));
 }
 
+function sessionUnreadDirectIdentityKeys(session) {
+  if (!session?.hostId) return new Set();
+  return new Set([
+    session.sessionId,
+    session.bridgeSessionId,
+    session.nativeThreadId,
+    session.originSessionId,
+    session.sourceSessionId,
+  ].map((value) => String(value || '').trim()).filter(Boolean).map((value) => (
+    `${session.hostId}::${value}`
+  )));
+}
+
+function unreadCandidateForSession(session) {
+  if (!hasUnreadMessagesForSession(session)) return null;
+  const projection = getAssistantProjectionForSession(session);
+  const receipt = projection ? receiptForAssistantProjection(session, projection) : null;
+  const unreadIds = new Set(receipt?.unreadAssistantIds || []);
+  const directKeys = sessionUnreadDirectIdentityKeys(session);
+  const candidates = (projection?.messages || []).filter((message) => (
+    message?.notifiable !== false && unreadIds.has(message.assistantMessageId)
+  ));
+  if (!candidates.length) return null;
+  candidates.sort((left, right) => (
+    Number(right.assistantSeq || 0) - Number(left.assistantSeq || 0)
+    || Date.parse(right.assistantAt || '') - Date.parse(left.assistantAt || '')
+    || String(right.assistantMessageId || '').localeCompare(String(left.assistantMessageId || ''))
+  ));
+  const lineageMessage = candidates.find((entry) => (
+    (entry.lineageKeys || []).some((key) => directKeys.has(String(key || '').trim()))
+  )) || null;
+  const message = lineageMessage || candidates[0] || null;
+  return {
+    session,
+    message,
+    lineageMatched: Boolean(lineageMessage),
+    timestamp: message?.assistantAt || projection?.latestAssistantAt || session.lastUpdatedAt || '',
+    assistantSeq: Number(message?.assistantSeq || projection?.latestAssistantSeq || 0),
+  };
+}
+
+function getUnreadTargetForGroup(group) {
+  const candidates = (group?.sessions || [])
+    .map(unreadCandidateForSession)
+    .filter(Boolean)
+    .sort((left, right) => (
+      Number(right.lineageMatched) - Number(left.lineageMatched)
+      || Number(Boolean(right.message)) - Number(Boolean(left.message))
+      || right.assistantSeq - left.assistantSeq
+      || Date.parse(right.timestamp || '') - Date.parse(left.timestamp || '')
+      || String(left.session.sessionId || '').localeCompare(String(right.session.sessionId || ''))
+    ));
+  return candidates[0] || null;
+}
+
 function getUnreadMessageNotifications() {
-  const byCanonical = new Map();
+  const groupsByCanonical = new Map();
   for (const session of state.sessions || []) {
     if (!hasUnreadMessagesForSession(session)) continue;
     const projection = getAssistantProjectionForSession(session);
     const canonicalKey = projection?.canonicalConversationKey || getSessionKey(session);
-    const latest = projection?.messages?.find((message) => (
+    const group = groupsByCanonical.get(canonicalKey) || {
+      hostId: session.hostId,
+      canonicalKey,
+      sessions: [],
+    };
+    group.sessions.push(session);
+    groupsByCanonical.set(canonicalKey, group);
+  }
+  const notifications = [];
+  for (const group of groupsByCanonical.values()) {
+    const target = getUnreadTargetForGroup(group);
+    if (!target) continue;
+    const session = target.session;
+    const projection = getAssistantProjectionForSession(session);
+    const latest = target.message || projection?.messages?.find((message) => (
       message.assistantMessageId === projection.latestAssistantId
     )) || projection?.messages?.at(-1) || null;
-    const candidate = {
+    notifications.push({
       session,
-      key: canonicalKey,
+      key: group.canonicalKey,
       title: session.title || session.conversationKey || session.sessionId,
       hostLabel: getHost(session.hostId)?.label || session.hostId,
       text: latest?.previewText || '',
-      timestamp: projection?.latestAssistantAt || latest?.assistantAt || '',
-    };
-    const current = byCanonical.get(canonicalKey);
-    if (!current || Date.parse(candidate.timestamp || '') > Date.parse(current.timestamp || '')) {
-      byCanonical.set(canonicalKey, candidate);
-    }
+      timestamp: target.timestamp || projection?.latestAssistantAt || latest?.assistantAt || '',
+    });
   }
-  return [...byCanonical.values()]
+  return notifications
     .sort((a, b) => Date.parse(b.timestamp || '') - Date.parse(a.timestamp || ''));
 }
 
@@ -7207,6 +8271,7 @@ function renderMessageNotificationBell() {
     button.classList.toggle('has-unread', count > 0);
     button.setAttribute('aria-expanded', state.messageNotificationOpen ? 'true' : 'false');
     button.title = count > 0 ? `${count} session(s) have unread Codex messages` : 'No unread Codex messages';
+    button.setAttribute('aria-label', button.title);
   }
   if (countEl) {
     countEl.textContent = String(count);
@@ -7244,7 +8309,7 @@ function renderMessageNotificationBell() {
 }
 
 function dedupeAlerts(entries) {
-  const seen = new Set();
+  const indexes = new Map();
   const deduped = [];
 
   for (const entry of entries || []) {
@@ -7252,6 +8317,15 @@ function dedupeAlerts(entries) {
       continue;
     }
 
+    const inputCapabilityError = entry.inputCapabilityError
+      && typeof entry.inputCapabilityError === 'object'
+      ? {
+        ...entry.inputCapabilityError,
+        inputTypes: Array.isArray(entry.inputCapabilityError.inputTypes)
+          ? entry.inputCapabilityError.inputTypes.slice(0, 8)
+          : [],
+      }
+      : null;
     const normalized = {
       alertId: entry.alertId || null,
       assistantMessageId: entry.assistantMessageId || null,
@@ -7260,21 +8334,65 @@ function dedupeAlerts(entries) {
       timestamp: entry.timestamp || null,
       severity: entry.severity || 'warning',
       source: entry.source || 'runtime',
-      message: String(entry.message || ''),
+      message: structuredThinkingText(inputCapabilityError?.userMessage ?? entry.message),
       sessionId: entry.sessionId || null,
       hostId: entry.hostId || null,
       transient: entry.transient === true,
       turnId: entry.turnId || null,
+      clientRequestId: entry.clientRequestId || null,
       codexError: entry.codexError || null,
+      code: entry.code || inputCapabilityError?.code || null,
+      kind: entry.kind || inputCapabilityError?.kind || null,
+      inputTypes: Array.isArray(entry.inputTypes)
+        ? entry.inputTypes.slice(0, 8)
+        : inputCapabilityError?.inputTypes || [],
+      rawMessage: entry.rawMessage == null && inputCapabilityError?.rawMessage == null
+        ? null
+        : structuredThinkingText(entry.rawMessage ?? inputCapabilityError?.rawMessage),
+      inputCapabilityError,
       provisionalSystemError: entry.provisionalSystemError === true,
       supersedesProvisionalError: entry.supersedesProvisionalError === true,
     };
+    const capabilityIdentity = normalized.code && (normalized.turnId || normalized.clientRequestId)
+      ? `input-capability|${normalized.code}|${normalized.turnId || ''}|${normalized.clientRequestId || ''}`
+      : '';
     const key = normalized.alertId
+      || capabilityIdentity
       || `${normalized.severity}|${normalized.timestamp || ''}|${normalized.message}`;
-    if (seen.has(key)) {
+    let existingIndex = indexes.get(key);
+    if (existingIndex == null && (normalized.turnId || normalized.clientRequestId)) {
+      existingIndex = deduped.findIndex((candidate) => {
+        const sameTurn = normalized.turnId
+          && String(candidate.turnId || '').trim() === String(normalized.turnId).trim();
+        const sameRequest = normalized.clientRequestId
+          && String(candidate.clientRequestId || '').trim() === String(normalized.clientRequestId).trim();
+        if (!sameTurn && !sameRequest) return false;
+        return !candidate.code
+          || !normalized.code
+          || candidate.code === normalized.code
+          || candidate.rawMessage === normalized.rawMessage
+          || candidate.message === normalized.rawMessage;
+      });
+      if (existingIndex < 0) existingIndex = null;
+    }
+    if (existingIndex != null) {
+      const previous = deduped[existingIndex];
+      deduped[existingIndex] = {
+        ...previous,
+        ...normalized,
+        message: normalized.inputCapabilityError?.userMessage
+          || previous.inputCapabilityError?.userMessage
+          || (normalized.code ? normalized.message : previous.message)
+          || normalized.message
+          || previous.message,
+        rawMessage: normalized.rawMessage || previous.rawMessage || null,
+        inputCapabilityError: normalized.inputCapabilityError || previous.inputCapabilityError || null,
+        inputTypes: normalized.inputTypes.length ? normalized.inputTypes : previous.inputTypes,
+      };
+      indexes.set(key, existingIndex);
       continue;
     }
-    seen.add(key);
+    indexes.set(key, deduped.length);
     deduped.push(normalized);
   }
 
@@ -7310,14 +8428,14 @@ function alertFingerprint(entry) {
     entry?.severity || 'warning',
     entry?.source || 'runtime',
     entry?.timestamp || '',
-    String(entry?.message || '').trim(),
+    structuredThinkingText(entry?.message).trim(),
   ].join('\u0000');
 }
 
 function shouldDisplayAlert(entry) {
   const severity = String(entry?.severity || 'warning').trim().toLowerCase();
   const source = String(entry?.source || '').trim().toLowerCase();
-  const message = String(entry?.message || '');
+  const message = structuredThinkingText(entry?.message);
   if (!['warning', 'error'].includes(severity)) {
     return false;
   }
@@ -7338,7 +8456,7 @@ function isStaleStartupFailureAlert(entry, session) {
     return false;
   }
 
-  const message = String(entry?.message || '');
+  const message = structuredThinkingText(entry?.message);
   if (!/runner: no pipe-in provided|codex app-server exited early|failed to spawn managed session|failed:spawn-error|exited:1:null/i.test(message)) {
     return false;
   }
@@ -7353,7 +8471,7 @@ function isRecoveredTransientRetryAlert(entry, session) {
   if (entry?.transient !== true || String(entry?.severity || '').toLowerCase() !== 'warning') {
     return false;
   }
-  const message = String(entry?.message || '');
+  const message = structuredThinkingText(entry?.message);
   if (/no live session for command session\.input\b/i.test(message)) {
     return false;
   }
@@ -7890,7 +9008,7 @@ function scrollTranscriptTo(position, options = {}) {
 }
 
 function stripResumeBootstrapText(value, speaker = '') {
-  const text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  const text = structuredThinkingText(value).replace(/\r\n?/g, '\n').trim();
   if (!text) {
     return '';
   }
@@ -7912,7 +9030,7 @@ function stripResumeBootstrapText(value, speaker = '') {
 }
 
 function cleanTranscriptTextForDisplay(value, speaker = '') {
-  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  let text = structuredThinkingText(value).replace(/\r\n?/g, '\n').trim();
   if (!text || isInternalTranscriptText(text)) {
     return '';
   }
@@ -7936,7 +9054,7 @@ function cleanTranscriptTextForDisplay(value, speaker = '') {
 }
 
 function stripTranscriptWrapperText(value) {
-  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  let text = structuredThinkingText(value).replace(/\r\n?/g, '\n').trim();
   if (!text) {
     return '';
   }
@@ -7958,19 +9076,19 @@ function stripTranscriptWrapperText(value) {
 }
 
 function stripEnvironmentContextText(value) {
-  return String(value || '')
+  return structuredThinkingText(value)
     .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, '')
     .trim();
 }
 
 function stripIdeContextText(value) {
-  const text = String(value || '').trim();
+  const text = structuredThinkingText(value).trim();
   const requestMatch = text.match(/(?:^|\n)## My request for Codex:\s*([\s\S]*)$/i);
   return requestMatch ? requestMatch[1].trim() : text;
 }
 
 function isInternalTranscriptText(value) {
-  const text = String(value || '').trim();
+  const text = structuredThinkingText(value).trim();
   if (!text) {
     return true;
   }
@@ -7996,16 +9114,66 @@ function isInternalTranscriptText(value) {
 }
 
 function canonicalTranscriptText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
+  return structuredThinkingText(value).replace(/\s+/g, ' ').trim();
 }
 
-function transcriptViewportKey(entry, index) {
-  return [
-    'transcript',
-    Number.isFinite(index) ? index : '',
-    entry?.speaker || '',
+function normalizeTranscriptSpeaker(value, fallback = 'system') {
+  const speaker = structuredThinkingScalar(value, fallback).trim().toLowerCase();
+  if (!speaker) return fallback;
+  return speaker === 'assistant' ? 'agent' : speaker;
+}
+
+function normalizeTranscriptIdentity(value) {
+  return structuredThinkingScalar(value, '').trim();
+}
+
+function normalizeTranscriptTimestamp(value) {
+  return structuredThinkingText(value).trim() || null;
+}
+
+function transcriptEntryIdentityKey(entry) {
+  const speaker = normalizeTranscriptSpeaker(entry?.speaker);
+  const assistantMessageId = normalizeTranscriptIdentity(entry?.assistantMessageId);
+  if (assistantMessageId) {
+    return `assistant|${assistantMessageId}`;
+  }
+  const clientRequestId = normalizeTranscriptIdentity(entry?.clientRequestId);
+  if (clientRequestId) {
+    return `${speaker}|request|${clientRequestId}`;
+  }
+  const files = normalizeTranscriptFiles(entry?.files || entry?.attachments || [])
+    .map((file) => file.path || file.name)
+    .join('|');
+  return `fallback|${hashThinkingEntryVersion([
+    speaker,
     entry?.timestamp || '',
-  ].join('|');
+    canonicalTranscriptText(entry?.text || ''),
+    files,
+  ].join('|'))}`;
+}
+
+function transcriptEntryAliasKeys(entry) {
+  const speaker = normalizeTranscriptSpeaker(entry?.speaker);
+  const timestamp = normalizeTranscriptTimestamp(entry?.timestamp) || '';
+  const aliases = [transcriptEntryIdentityKey(entry)];
+  if (timestamp) {
+    aliases.push(`time|${hashThinkingEntryVersion(`${speaker}|${timestamp}`)}`);
+  }
+  return [...new Set(aliases)];
+}
+
+function transcriptEntryStableTurnKey(entry) {
+  const speaker = normalizeTranscriptSpeaker(entry?.speaker);
+  const clientRequestId = normalizeTranscriptIdentity(entry?.clientRequestId);
+  if (clientRequestId) return `${speaker}|request|${clientRequestId}`;
+  const turnId = normalizeTranscriptIdentity(entry?.turnId);
+  if (turnId) return `${speaker}|turn|${turnId}`;
+  return transcriptEntryAliasKeys(entry).find((key) => key.startsWith('time|'))
+    || transcriptEntryIdentityKey(entry);
+}
+
+function transcriptViewportKey(entry) {
+  return `transcript|${transcriptEntryStableTurnKey(entry)}`;
 }
 
 function setRuntimeForSession(hostId, sessionId, runtime, options = {}) {
@@ -8021,6 +9189,7 @@ function setRuntimeForSession(hostId, sessionId, runtime, options = {}) {
     return null;
   }
 
+  const authoritativeSnapshot = options.authoritativeSnapshot === true;
   const previous = state.runtime.get(key) || {};
   const updatedAt = runtime.updatedAt || new Date().toISOString();
   const previousRevision = Number(previous.runtimeRevision || 0);
@@ -8036,7 +9205,10 @@ function setRuntimeForSession(hostId, sessionId, runtime, options = {}) {
     && previousRunId
     && incomingRunId
     && previousRunId === incomingRunId
-    && incomingRevision <= previousRevision
+    && (
+      incomingRevision < previousRevision
+      || (incomingRevision === previousRevision && !authoritativeSnapshot)
+    )
   ) {
     return previous;
   }
@@ -8044,17 +9216,17 @@ function setRuntimeForSession(hostId, sessionId, runtime, options = {}) {
   const incomingUpdatedAtMs = Date.parse(updatedAt);
   if (
     options.allowStale !== true
+    && !authoritativeSnapshot
     && Number.isFinite(previousUpdatedAtMs)
     && Number.isFinite(incomingUpdatedAtMs)
     && incomingUpdatedAtMs < previousUpdatedAtMs
   ) {
     return previous;
   }
-  const next = {
-    ...previous,
-    ...runtime,
-    updatedAt,
-  };
+  runtime = normalizeRuntimePatchForStorage(runtime);
+  const next = authoritativeSnapshot
+    ? { ...runtime, updatedAt }
+    : { ...previous, ...runtime, updatedAt };
 
   if (Object.prototype.hasOwnProperty.call(runtime, 'phase')) {
     next.phaseStartedAt = runtime.phase !== previous.phase
@@ -8106,6 +9278,24 @@ function setRuntimeForSession(hostId, sessionId, runtime, options = {}) {
     state.runtimeStreamGenerations.set(key, (state.runtimeStreamGenerations.get(key) || 0) + 1);
   }
   return next;
+}
+
+function runtimePatchConfirmsInactiveTurn(runtime = {}) {
+  return window.RemoteCodexSessionRuntimeState.confirmsInactivePatch(runtime);
+}
+
+function normalizeRuntimePatchForStorage(runtime = {}) {
+  if (!runtimePatchConfirmsInactiveTurn(runtime)) return runtime;
+  const normalized = {
+    ...runtime,
+    activeTurnId: null,
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+  };
+  if (!Object.prototype.hasOwnProperty.call(runtime, 'currentTurnStatus')) {
+    normalized.currentTurnStatus = 'idle';
+  }
+  return normalized;
 }
 
 function patchRuntimeForSession(hostId, sessionId, patch, options = {}) {
@@ -8172,25 +9362,26 @@ function normalizeDiagnosticEntry(entry) {
   }
   return {
     timestamp: entry.timestamp || null,
-    severity: entry.severity || 'info',
-    source: entry.source || 'codex',
-    kind: entry.kind || 'event',
-    method: entry.method || null,
-    message: String(entry.message || ''),
-    detail: entry.detail || null,
+    severity: structuredThinkingScalar(entry.severity, 'info'),
+    source: structuredThinkingScalar(entry.source, 'codex'),
+    kind: structuredThinkingScalar(entry.kind, 'event'),
+    method: structuredThinkingText(entry.method) || null,
+    message: structuredThinkingText(entry.message),
+    detail: entry.detail == null ? null : structuredThinkingText(entry.detail),
     data: entry.data || null,
     runId: entry.runId || entry.data?.runId || null,
     turnId: entry.turnId || entry.data?.turnId || null,
+    clientRequestId: entry.clientRequestId || entry.data?.clientRequestId || null,
     itemId: entry.itemId || entry.data?.itemId || null,
     callId: entry.callId || entry.data?.callId || null,
     requestId: entry.requestId || entry.data?.requestId || null,
-    status: entry.status || entry.data?.status || null,
+    status: structuredThinkingScalar(entry.status || entry.data?.status, '') || null,
     final: entry.final === true,
   };
 }
 
 function diagnosticEntryKey(entry) {
-  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.turnId || ''}|${entry.itemId || entry.callId || entry.requestId || ''}`;
+  return `${entry.timestamp || ''}|${entry.kind || ''}|${entry.method || ''}|${entry.message || ''}|${entry.detail || ''}|${entry.clientRequestId || ''}|${entry.turnId || ''}|${entry.itemId || entry.callId || entry.requestId || ''}`;
 }
 
 function trimDiagnosticsForClient(entries) {
@@ -8310,10 +9501,22 @@ function getDiagnosticsForSession(session) {
   return key ? state.diagnostics.get(key) || [] : [];
 }
 
+function getRequestApplyGeneration(hostId, sessionId) {
+  return Number(state.requestApplyGenerations.get(makeSessionKey(hostId, sessionId)) || 0);
+}
+
+function advanceRequestApplyGeneration(hostId, sessionId) {
+  const key = makeSessionKey(hostId, sessionId);
+  const next = getRequestApplyGeneration(hostId, sessionId) + 1;
+  state.requestApplyGenerations.set(key, next);
+  return next;
+}
+
 function setRequestsForSession(hostId, sessionId, requests) {
   const key = makeSessionKey(hostId, sessionId);
   const normalized = Array.isArray(requests) ? requests.slice(-40) : [];
   state.requests.set(key, normalized);
+  advanceRequestApplyGeneration(hostId, sessionId);
   const pendingRequestIds = new Set(normalized
     .filter((request) => request?.status === 'pending')
     .map((request) => String(request.requestId || ''))
@@ -8353,6 +9556,7 @@ function upsertRequestForSession(hostId, sessionId, request) {
     };
   }
   state.requests.set(key, existing.slice(-40));
+  advanceRequestApplyGeneration(hostId, sessionId);
 }
 
 function resolveRequestForSession(hostId, sessionId, request) {
@@ -8468,7 +9672,6 @@ function syncModalBodyState() {
   const open = Boolean(
     state.connectorManagerOpen
     || state.directoryPicker.open
-    || state.statusWindowOpen
     || state.sessionDetailsOpen
     || state.settingsOpen
     || state.apiProfileBackup.open
@@ -8636,6 +9839,7 @@ async function pingHostApiProfile(hostId, profileId = '') {
     apiKey: profile.apiKey,
     profileId: profile.profileId,
     label: profile.label,
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(profile.nativeResumeCompatibilityKey),
   } : null;
   if (!apiConfig || (!apiConfig.baseUrl && !apiConfig.apiKey)) {
     throw new Error('Enter a Base URL or API Key before testing.');
@@ -8885,6 +10089,39 @@ function connectorCodexInstallGuidance(result) {
   ];
 }
 
+function connectorActionStepLines(step) {
+  const record = step && typeof step === 'object' ? step : {};
+  const name = record.name || 'step';
+  const lines = [];
+  if (record.timedOut) {
+    lines.push(`${name} timed out`);
+  } else if (record.signal) {
+    lines.push(`${name} stopped by signal ${record.signal}`);
+  } else if (typeof record.exitCode !== 'undefined' && record.exitCode !== null) {
+    lines.push(`${name} exit ${record.exitCode}`);
+  } else if (record.error) {
+    lines.push(`${name} failed before an exit code was returned`);
+  } else {
+    lines.push(`${name} exit code unavailable`);
+  }
+  if (record.probeReason) {
+    lines.push(`Reason: ${prettyStatusLabel(record.probeReason)}`);
+  }
+  if (record.error) {
+    lines.push('error:');
+    lines.push(String(record.error));
+  }
+  if (record.stdout) {
+    lines.push('stdout:');
+    lines.push(String(record.stdout));
+  }
+  if (record.stderr) {
+    lines.push('stderr:');
+    lines.push(String(record.stderr));
+  }
+  return lines;
+}
+
 function renderConnectorActionResult(container, result, busy) {
   if (!result && !busy) {
     container.className = 'connector-action-result hidden';
@@ -8911,17 +10148,23 @@ function renderConnectorActionResult(container, result, busy) {
     if (typeof result.exitCode !== 'undefined' && result.exitCode !== null) {
       lines.push(`Exit code: ${result.exitCode}`);
     }
+    if (result.probeReason) {
+      lines.push(`Probe reason: ${prettyStatusLabel(result.probeReason)}`);
+    }
+    if (result.timedOut) {
+      lines.push('Timed out while waiting for the SSH process.');
+    }
+    if (result.signal) {
+      lines.push(`Process signal: ${result.signal}`);
+    }
+    if (result.error) {
+      lines.push('Process error:');
+      lines.push(String(result.error));
+    }
     if (result.deploy) {
       lines.push(`deploy: ${prettyStatusLabel(result.deploy.status || 'deploy')} - ${result.deploy.message || ''}`.trim());
       for (const step of result.deploy.steps || []) {
-        const stepLines = [`${step.name || 'step'} exit ${step.exitCode}`];
-        if (step.stdout) {
-          stepLines.push(`stdout:\n${step.stdout}`);
-        }
-        if (step.stderr) {
-          stepLines.push(`stderr:\n${step.stderr}`);
-        }
-        lines.push(stepLines.join('\n'));
+        lines.push(connectorActionStepLines(step).join('\n'));
       }
     }
     if (result.stdout) {
@@ -9612,18 +10855,19 @@ function renderHostSwitcher() {
   const button = el('host-switcher-button');
   const menu = el('host-switcher-menu');
   const selectedHostId = state.selectedHostId || '';
+  for (const node of [switcher, button, menu]) node?.setAttribute('data-i18n-skip', '');
   switcher.innerHTML = '';
 
   if (!state.hosts.length) {
     const option = document.createElement('option');
     option.value = '';
-    option.textContent = 'No hosts available';
+    option.textContent = t('navSearch.noHosts');
     switcher.appendChild(option);
     switcher.disabled = true;
     renderMobileSelectMenu({
       button,
       menu,
-      label: 'No hosts available',
+      label: t('navSearch.noHosts'),
       options: [],
       selectedValue: '',
       open: false,
@@ -9636,7 +10880,7 @@ function renderHostSwitcher() {
   for (const host of state.hosts) {
     const option = document.createElement('option');
     option.value = host.hostId;
-    option.textContent = `${host.label} (${host.online ? 'online' : 'offline'})`;
+    option.textContent = `${host.label} (${t(host.online ? 'navSearch.online' : 'navSearch.offline')})`;
     switcher.appendChild(option);
     mobileOptions.push({
       value: host.hostId,
@@ -9649,10 +10893,10 @@ function renderHostSwitcher() {
   switcher.value = selectedHostId;
   const selectedHost = getHost(selectedHostId) || state.hosts[0];
   const buttonLabel = state.hostSwitchBusyId
-    ? 'Checking host...'
+    ? t('navSearch.checkingHost')
     : selectedHost
-      ? `${selectedHost.label} (${selectedHost.online ? 'online' : 'offline'})`
-      : 'Select host';
+      ? `${selectedHost.label} (${t(selectedHost.online ? 'navSearch.online' : 'navSearch.offline')})`
+      : t('navSearch.selectHost');
   renderMobileSelectMenu({
     button,
     menu,
@@ -9766,13 +11010,14 @@ function renderCollectionTabs() {
   if (!select) {
     return;
   }
+  for (const node of [select, button, menu]) node?.setAttribute('data-i18n-skip', '');
 
   select.innerHTML = '';
   const mobileOptions = [];
   for (const collection of state.sessionCollections) {
     const option = document.createElement('option');
     option.value = collection.collectionId;
-    option.textContent = `${collection.name || 'Collection'} (${collection.itemCount || 0})`;
+    option.textContent = `${collectionDisplayName(collection)} (${collection.itemCount || 0})`;
     select.appendChild(option);
     mobileOptions.push({
       value: collection.collectionId,
@@ -9785,8 +11030,8 @@ function renderCollectionTabs() {
     button,
     menu,
     label: selectedCollection
-      ? `${selectedCollection.name || 'Collection'} (${selectedCollection.itemCount || 0})`
-      : 'Default',
+      ? `${collectionDisplayName(selectedCollection)} (${selectedCollection.itemCount || 0})`
+      : t('navSearch.defaultCollection'),
     options: mobileOptions,
     selectedValue: state.selectedCollectionId,
     open: state.mobileMenus.collection,
@@ -9885,12 +11130,18 @@ function renderCollectionTabs() {
 }
 
 function renderConversationNav() {
+  // sync also fences an in-flight search when Host/collection changes.
+  const searchView = getFullSessionSearchController()?.sync() || { phase: 'idle', results: [] };
+  state.sessionSearchResults = searchView.results;
+  state.sessionSearchLoading = ['pending', 'searching'].includes(searchView.phase);
   const list = el('session-list');
   list.innerHTML = '';
 
   const host = getHost(state.selectedHostId);
-  el('selected-host-title').textContent = host ? host.label : 'No host selected';
-  el('selected-host-meta').textContent = host ? `${host.platform} | ${host.online ? 'online' : 'offline'}` : '';
+  el('selected-host-title').textContent = host ? host.label : t('navSearch.selectHost');
+  el('selected-host-title').setAttribute('data-i18n-skip', '');
+  el('selected-host-meta').textContent = host ? `${host.platform} | ${t(host.online ? 'navSearch.online' : 'navSearch.offline')}` : '';
+  el('selected-host-meta').setAttribute('data-i18n-skip', '');
   renderHostSwitcher();
   renderCollectionTabs();
 
@@ -9912,12 +11163,14 @@ function renderConversationNav() {
   }
   if (searchMode) {
     searchMode.value = state.sessionSearchMode;
+    for (const option of Array.from(searchMode.options || [])) option.textContent = getSessionSearchModeLabel(option.value);
+    searchMode.setAttribute('aria-label', t('navSearch.searchMode'));
   }
   renderMobileSelectMenu({
     button: searchModeButton,
     menu: searchModeMenu,
     label: getSessionSearchModeLabel(state.sessionSearchMode),
-    options: Object.entries(SESSION_SEARCH_MODE_LABELS).map(([value, label]) => ({ value, label })),
+    options: Object.keys(SESSION_SEARCH_MODE_LABELS).map(value => ({ value, label: getSessionSearchModeLabel(value) })),
     selectedValue: state.sessionSearchMode,
     open: state.mobileMenus.searchMode,
     onSelect: async (mode) => {
@@ -9926,12 +11179,14 @@ function renderConversationNav() {
   });
   if (sortMode) {
     sortMode.value = state.sessionSortBy;
+    for (const option of Array.from(sortMode.options || [])) option.textContent = getSessionSortLabel(option.value);
+    sortMode.setAttribute('aria-label', t('navSearch.sortMode'));
   }
   renderMobileSelectMenu({
     button: sortModeButton,
     menu: sortModeMenu,
     label: getSessionSortLabel(state.sessionSortBy),
-    options: Object.entries(SESSION_SORT_LABELS).map(([value, label]) => ({ value, label })),
+    options: Object.keys(SESSION_SORT_LABELS).map(value => ({ value, label: getSessionSortLabel(value) })),
     selectedValue: state.sessionSortBy,
     open: state.mobileMenus.sortBy,
     onSelect: async (mode) => {
@@ -9939,41 +11194,51 @@ function renderConversationNav() {
     },
   });
   if (sortDirButton) {
-    sortDirButton.textContent = state.sessionSortDir === 'asc' ? 'Asc' : 'Desc';
-    sortDirButton.title = state.sessionSortDir === 'asc' ? 'Oldest or smallest first' : 'Newest or largest first';
+    sortDirButton.textContent = t('navSearch.' + (state.sessionSortDir === 'asc' ? 'asc' : 'desc'));
+    sortDirButton.title = t('navSearch.' + (state.sessionSortDir === 'asc' ? 'ascHint' : 'descHint'));
+    sortDirButton.setAttribute('aria-label', t('navSearch.toggleDirection'));
   }
   if (searchSummary) {
     const query = state.sessionSearchQuery.trim();
     const scope = collection.collectionId === DEFAULT_COLLECTION_ID
-      ? `Default on ${host?.label || 'selected host'}`
-      : collection.name;
+      ? formatUiText('navSearch.scopeDefault', { host: host?.label || t('navSearch.selectedHost') })
+      : collectionDisplayName(collection);
     const fullMatchCount = state.sessionSearchResults.length;
-    const loadingText = state.sessionSearchLoading ? ' Searching full history...' : '';
-    searchSummary.textContent = query
-      ? `${visibleGroups.length} of ${groups.length} in ${scope} match "${query}"${fullMatchCount ? ` | ${fullMatchCount} full-history hits` : ''}.${loadingText}`
-      : groups.length
-        ? `${groups.length} conversations in ${scope}`
-        : '';
+    const feedback = searchView.phase === 'pending' ? t('navSearch.waiting')
+      : searchView.phase === 'searching' ? t('navSearch.loading')
+      : searchView.phase === 'error' ? formatUiText('navSearch.error', { error: searchView.error })
+      : searchView.phase === 'short' ? t('navSearch.localOnly')
+      : searchView.partial ? t('navSearch.partial') : '';
+    searchSummary.dataset.searchPhase = searchView.phase;
+    searchSummary.setAttribute('aria-busy', String(state.sessionSearchLoading));
+    searchSummary.textContent = [
+      feedback,
+      query ? formatUiText('navSearch.summary', { visible: visibleGroups.length, total: groups.length, scope, query })
+        : groups.length ? formatUiText('navSearch.count', { total: groups.length, scope }) : '',
+      fullMatchCount ? formatUiText('navSearch.fullHits', { count: fullMatchCount }) : '',
+    ].filter(Boolean).join(' ');
   }
+  if (searchInput) searchInput.placeholder = t('navSearch.placeholder');
   if (clearSearchButton) {
     clearSearchButton.classList.toggle('hidden', !state.sessionSearchQuery.trim());
+    clearSearchButton.setAttribute('aria-label', t('navSearch.clear'));
   }
 
   if (!groups.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
     empty.textContent = collection.collectionId === DEFAULT_COLLECTION_ID
-      ? 'Import a host or start a managed session to see conversations here.'
+      ? t('navSearch.noSessions')
       : collection.collectionId === TRASH_COLLECTION_ID
-        ? 'Trash is empty.'
-        : 'This collection is empty. Save a conversation into it from Default.';
+        ? t('navSearch.emptyTrash')
+        : t('navSearch.emptyCollection');
     list.appendChild(empty);
     return;
   }
   if (!visibleGroups.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = 'No conversations match this search.';
+    empty.textContent = state.sessionSearchLoading ? t('navSearch.loading') : t('navSearch.noMatches');
     list.appendChild(empty);
     return;
   }
@@ -9990,7 +11255,9 @@ function renderConversationNav() {
         : 'No prompt preview available';
 
     const item = document.createElement('div');
-    item.className = `conversation-card ${group.liveCount > 0 ? 'live' : 'history'} ${hasUnreadMessagesForGroup(group) ? 'message-unread' : ''} ${group.conversationKey === state.selectedConversationKey ? 'active' : ''}`.trim();
+    const runtimeIndicator = deriveConversationRuntimeIndicator(group);
+    const unreadTarget = getUnreadTargetForGroup(group);
+    item.className = `conversation-card ${runtimeIndicator.tone} ${unreadTarget ? 'message-unread' : ''} ${group.conversationKey === state.selectedConversationKey ? 'active' : ''}`.trim();
     const createdLabel = formatTime(group.createdAt) || 'Unknown';
     const updatedLabel = formatTime(group.lastUpdatedAt) || 'Unknown';
     const messageCount = Number(group.messageCount || 0);
@@ -10024,11 +11291,34 @@ function renderConversationNav() {
     const variantRow = document.createElement('div');
     variantRow.className = 'variant-row';
     renderVariantButtons(variantRow, group, state.selectedSessionId);
-    if (group.liveCount > 0) {
-      const liveDot = document.createElement('span');
-      liveDot.className = 'conversation-live-dot';
-      liveDot.title = 'Live session';
-      item.appendChild(liveDot);
+    const runtimeDot = document.createElement('span');
+    runtimeDot.className = `conversation-runtime-dot ${runtimeIndicator.tone}`;
+    runtimeDot.title = runtimeIndicator.label;
+    runtimeDot.setAttribute('role', 'img');
+    runtimeDot.setAttribute('aria-label', runtimeIndicator.label);
+    item.appendChild(runtimeDot);
+    const currentIssue = window.RemoteCodexSessionRuntimeState.conversationIssue(group, getRuntimeForSession);
+    if (currentIssue) {
+      const errorBadge = document.createElement('span');
+      errorBadge.className = 'conversation-error-badge';
+      errorBadge.textContent = '!';
+      errorBadge.title = `Session error: ${currentIssue.issue.message}`;
+      errorBadge.setAttribute('role', 'img');
+      errorBadge.setAttribute('aria-label', errorBadge.title);
+      item.appendChild(errorBadge);
+    }
+    if (unreadTarget) {
+      const unreadButton = document.createElement('button');
+      unreadButton.type = 'button';
+      unreadButton.className = 'conversation-unread-button';
+      unreadButton.title = `Open unread reply in ${unreadTarget.session.title || unreadTarget.session.sessionId}`;
+      unreadButton.setAttribute('aria-label', unreadButton.title);
+      unreadButton.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        selectSession(unreadTarget.session, { trusted: event.isTrusted === true }).catch(reportError);
+      };
+      item.appendChild(unreadButton);
     }
     item.appendChild(variantRow);
 
@@ -10186,6 +11476,7 @@ function renderConversationNav() {
 function renderConversationSearchHits(group, results) {
   const box = document.createElement('div');
   box.className = 'conversation-search-hits';
+  box.setAttribute('data-i18n-skip', '');
   const query = state.sessionSearchQuery;
   const matches = [];
   for (const result of results.slice(0, 3)) {
@@ -10208,7 +11499,7 @@ function renderConversationSearchHits(group, results) {
     button.dataset.searchSessionId = result.sessionId;
     button.dataset.searchEntryIndex = String(match.entryIndex ?? -1);
     button.innerHTML = `
-      <span class="conversation-search-hit-meta">${escapeHtml(match.speaker || match.type || 'match')} ${escapeHtml(formatTime(match.timestamp) || '')}</span>
+      <span class="conversation-search-hit-meta">${escapeHtml(window.RemoteCodexNavigationI18n?.speakerLabel(currentLocale(), match.speaker === 'agent' ? 'assistant' : match.speaker || match.type) || match.speaker || match.type || 'match')} ${escapeHtml(formatTime(match.timestamp) || '')}</span>
       <span class="conversation-search-hit-snippet">${highlightSearchSnippet(match.snippet || '', query)}</span>
     `;
     button.onclick = async (event) => {
@@ -10291,6 +11582,7 @@ function rebindProfilePreviewIdentity(profile) {
     config.profileId || '',
     config.providerKind || '',
     String(config.provider || 'OpenAI').trim().toLowerCase(),
+    normalizeNativeResumeCompatibilityKey(config.nativeResumeCompatibilityKey),
     effectiveApiBaseUrl(config),
     localConfigRevision(config.apiKey),
   ].map((value) => encodeURIComponent(String(value))).join(':');
@@ -10351,7 +11643,8 @@ function preferredModelForApiSwitch(catalog, options = {}) {
     const id = String(candidate?.id || candidate?.model || candidate || '').trim();
     return id && modelsById.has(id) ? id : '';
   };
-  const providerModels = (catalog?.sources || [])
+  const providerCatalog = options.providerCatalog || catalog;
+  const providerModels = (providerCatalog?.sources || [])
     .filter((source) => (
       (source?.source === 'provider' || source?.originSource === 'provider')
       && !source?.error
@@ -10362,6 +11655,40 @@ function preferredModelForApiSwitch(catalog, options = {}) {
     ))
     .flatMap((source) => Array.isArray(source.models) ? source.models : []);
   const providerDefault = providerModels.find((model) => model?.isDefault === true && usableId(model));
+  const providerModelIds = new Set(providerModels
+    .map((model) => usableId(model))
+    .filter(Boolean));
+  const freshLiveModels = (catalog?.sources || [])
+    .filter((source) => (
+      source?.source === 'live'
+      && source?.stale !== true
+      && !source?.error
+    ))
+    .flatMap((source) => Array.isArray(source.models) ? source.models : []);
+  const liveModelIds = new Set(freshLiveModels
+    .map((model) => usableId(model))
+    .filter(Boolean));
+  if (options.requireFreshProvider === true) {
+    const liveDefaultCandidates = [
+      ...freshLiveModels.filter((model) => model?.isDefault === true),
+      catalog?.defaultModel,
+    ];
+    for (const candidate of liveDefaultCandidates) {
+      const id = usableId(candidate);
+      if (id && providerModelIds.has(id) && liveModelIds.has(id)) {
+        return id;
+      }
+    }
+    for (const model of freshLiveModels) {
+      const id = usableId(model);
+      if (id && providerModelIds.has(id)) {
+        return id;
+      }
+    }
+    // /models ordering is not a compatibility or recency guarantee. Keep the
+    // next turn on Auto until the app-server confirms a usable intersection.
+    return '';
+  }
   if (providerDefault) {
     return usableId(providerDefault);
   }
@@ -10370,9 +11697,6 @@ function preferredModelForApiSwitch(catalog, options = {}) {
     if (id) {
       return id;
     }
-  }
-  if (options.requireFreshProvider === true) {
-    return '';
   }
   const catalogDefault = usableId(catalog?.defaultModel);
   if (catalogDefault) {
@@ -10473,6 +11797,18 @@ function isImageFileRef(file) {
   return mime.startsWith('image/') || IMAGE_FILE_EXTENSIONS.has(fileExtension(file?.name || file?.path));
 }
 
+function isStructureFileRef(file) {
+  const helper = window.RemoteCodexStructurePreview;
+  if (helper?.isSupportedFile) {
+    return helper.isSupportedFile(file);
+  }
+  const name = String(file?.name || file?.remoteName || file?.path || file?.remotePath || '').trim();
+  const leaf = name.split(/[\\/]/).pop()?.toLowerCase();
+  return ['xsf', 'pdb', 'pbd', 'xyz', 'cif', 'vasp', 'poscar', 'contcar'].includes(fileExtension(name))
+    || leaf === 'poscar'
+    || leaf === 'contcar';
+}
+
 function formatHostCapabilityName(host) {
   return host?.label || host?.hostId || 'selected host';
 }
@@ -10521,7 +11857,7 @@ function decodePathCandidate(value) {
 }
 
 function extractFileRefsFromText(text) {
-  const source = String(text || '');
+  const source = structuredThinkingText(text);
   const refs = [];
   const addRef = (candidate, label = '') => {
     const pathValue = decodePathCandidate(candidate);
@@ -10591,7 +11927,7 @@ function extractFileRefsFromText(text) {
 }
 
 function extractDirectoryRefsFromText(text) {
-  const source = String(text || '');
+  const source = structuredThinkingText(text);
   const refs = [];
   const addRef = (candidate) => {
     const pathValue = decodePathCandidate(candidate);
@@ -10706,6 +12042,47 @@ function buildReceivedFileUrl(file, inline = false) {
     params.set('inline', '1');
   }
   return `/api/received-files/${encodeURIComponent(file.fileId)}${params.toString() ? `?${params.toString()}` : ''}`;
+}
+
+async function openStructurePreviewForFile({ session = null, file = null, attachment = null } = {}) {
+  const targetSession = session || getSelectedSession();
+  const helper = window.RemoteCodexStructurePreview;
+  if (!helper?.open) {
+    throw new Error('Structure preview is unavailable in this browser build.');
+  }
+  const sourceFile = attachment || file || {};
+  const name = String(sourceFile.name || sourceFile.remoteName || basename(sourceFile.path || '') || 'structure');
+  if (!isStructureFileRef(sourceFile)) {
+    throw new Error(name + ' is not a supported structure format (xsf, pdb, pbd, xyz, cif, vasp, POSCAR).');
+  }
+  let sourceText = '';
+  let source = sourceFile.path || sourceFile.remotePath || name;
+  if (sourceFile.text != null) {
+    sourceText = String(sourceFile.text);
+  } else if (sourceFile.fileObject) {
+    sourceText = await readFileAsText(sourceFile.fileObject);
+  } else if (sourceFile.dataBase64) {
+    const binary = atob(String(sourceFile.dataBase64));
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    sourceText = typeof TextDecoder === 'function' ? new TextDecoder().decode(bytes) : binary;
+  } else {
+    const cached = targetSession ? getCachedReceivedFileRefForPath(targetSession, sourceFile.path || sourceFile.remotePath) : null;
+    const cachedFile = {
+      ...(cached || sourceFile),
+      path: sourceFile.path || sourceFile.remotePath || cached?.path || '',
+    };
+    const url = cachedFile.cached && cachedFile.fileId
+      ? buildReceivedFileUrl(cachedFile, true)
+      : buildHostFileUrl(targetSession, cachedFile, true);
+    source = sourceFile.path || sourceFile.remotePath || name;
+    if (helper.openFromUrl) {
+      return helper.openFromUrl({ url, name, source });
+    }
+    const response = await fetch(url, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error('Unable to load ' + name + ' (' + response.status + ').');
+    sourceText = await response.text();
+  }
+  return helper.open({ structure: sourceText, name, source });
 }
 
 function normalizeModelOption(model) {
@@ -10838,6 +12215,12 @@ function modelSelectLabel(model) {
   if (model.defaultReasoningEffort) {
     badges.push(model.defaultReasoningEffort);
   }
+  if (
+    (model.providerAdvertised === true || model.previouslyAdvertised === true)
+    && model.cliSupported !== true
+  ) {
+    badges.push('API only / Codex unverified');
+  }
   return `${model.displayName || model.model}${badges.length ? ` | ${badges.join(' | ')}` : ''}`;
 }
 
@@ -10879,7 +12262,7 @@ function renderComposerModelOptions(session) {
     datalistSpecs.push({
       value: model.model,
       text: '',
-      label: `${model.displayName || model.model}${model.isDefault ? ' | default' : ''}${effort}${model.description ? ` | ${model.description}` : ''}`,
+      label: `${modelSelectLabel(model)}${effort && !model.defaultReasoningEffort ? effort : ''}${model.description ? ` | ${model.description}` : ''}`,
       disabled: model.selectable === false,
     });
 
@@ -11360,65 +12743,26 @@ function getComposerAttachmentPreviewUrl(attachment) {
 }
 
 function openImagePreview({ src, title = 'Image preview', subtitle = '', downloadUrl = '' } = {}) {
-  if (!src) {
+  const controller = getImagePreviewController();
+  if (controller) {
+    controller.open({ src, title, subtitle, downloadUrl });
     return;
   }
-  state.imagePreview = {
-    open: true,
-    src,
-    title,
-    subtitle,
-    downloadUrl: downloadUrl || src,
-  };
-  renderImagePreview();
+  if (!src) return;
+  state.imagePreview = { open: true, src, title, subtitle, downloadUrl: downloadUrl || src };
 }
 
 function closeImagePreview() {
-  state.imagePreview = {
-    open: false,
-    src: '',
-    title: '',
-    subtitle: '',
-    downloadUrl: '',
-  };
-  renderImagePreview();
+  const controller = getImagePreviewController();
+  if (controller) {
+    controller.close();
+    return;
+  }
+  state.imagePreview = { open: false, src: '', title: '', subtitle: '', downloadUrl: '' };
 }
 
 function renderImagePreview() {
-  const overlay = el('image-preview-overlay');
-  if (!overlay) {
-    return;
-  }
-  const preview = state.imagePreview || {};
-  const isOpen = Boolean(preview.open && preview.src);
-  overlay.classList.toggle('hidden', !isOpen);
-  overlay.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
-
-  const image = el('image-preview-img');
-  if (image) {
-    image.src = isOpen ? preview.src : '';
-    image.alt = preview.title || 'Image preview';
-  }
-  const title = el('image-preview-title');
-  if (title) {
-    title.textContent = preview.title || 'Image preview';
-  }
-  const subtitle = el('image-preview-subtitle');
-  if (subtitle) {
-    subtitle.textContent = preview.subtitle || '';
-  }
-  const openLink = el('image-preview-open-link');
-  if (openLink) {
-    openLink.href = preview.src || '#';
-    openLink.classList.toggle('hidden', !isOpen);
-  }
-  const saveLink = el('image-preview-save-link');
-  if (saveLink) {
-    saveLink.href = preview.downloadUrl || preview.src || '#';
-    saveLink.download = preview.title || 'image';
-    saveLink.classList.toggle('hidden', !isOpen);
-  }
-  syncModalBodyState();
+  getImagePreviewController()?.render();
 }
 
 function shouldMountTranscriptControlsGlobally() {
@@ -11495,6 +12839,24 @@ function renderAttachmentChips() {
         });
       };
       chip.appendChild(previewButton);
+    } else if (isStructureFileRef(attachment)) {
+      const structureButton = document.createElement('button');
+      structureButton.type = 'button';
+      structureButton.className = 'attachment-chip-preview structure-attachment-preview';
+      structureButton.title = 'Preview molecular structure';
+      structureButton.textContent = 'View structure: ' + (attachment.name || 'structure');
+      structureButton.onclick = async (event) => {
+        event.stopPropagation();
+        structureButton.disabled = true;
+        try {
+          await openStructurePreviewForFile({ attachment });
+        } catch (error) {
+          reportError(error);
+        } finally {
+          structureButton.disabled = false;
+        }
+      };
+      chip.appendChild(structureButton);
     } else {
       const span = document.createElement('span');
       span.textContent = text;
@@ -11687,6 +13049,72 @@ function renderComposerModeBanner() {
   }
 }
 
+function getSessionReviewBlocker(session = getSelectedSession()) {
+  const guard = window.RemoteCodexSessionReviewGuard;
+  if (!guard?.assessSessionReviewAvailability) {
+    return {
+      code: 'session_review_runtime_unknown',
+      reason: 'review_guard_unavailable',
+      message: 'The Review state guard is unavailable. Review was not queued. Reload this page, then retry.',
+      retryAfterMs: null,
+    };
+  }
+  const sessionKey = resolveComposerSessionKey(session);
+  return guard.assessSessionReviewAvailability({
+    live: session?.live === true,
+    runtime: getRuntimeForSession(session) || session?.runtime || null,
+    submission: getComposerSubmission(session),
+    reviewQueued: Boolean(sessionKey && state.codexControls.reviewBusyKeys?.has(sessionKey)),
+    inputStateKnown: true,
+  });
+}
+
+function throwIfSessionReviewBlocked(session = getSelectedSession()) {
+  const blocker = getSessionReviewBlocker(session);
+  if (!blocker) return true;
+  const guard = window.RemoteCodexSessionReviewGuard;
+  if (guard?.sessionReviewBlockerError) {
+    throw guard.sessionReviewBlockerError(blocker);
+  }
+  const error = new Error(blocker.message || 'Review is not available for this Session.');
+  Object.assign(error, blocker, { stage: 'validate-review' });
+  throw error;
+}
+
+function renderComposerPermissions(session = getSelectedSession(), disabled = false) {
+  const container = el('composer-permissions');
+  const api = window.RemoteCodexComposerPermissions;
+  if (!container || !api) return;
+  if (!renderComposerPermissions.controller) {
+    renderComposerPermissions.controller = api.createComposerPermissions({
+      container,
+      confirmFullAccess: (message) => window.confirm(message),
+      onChange: (sessionKey, patch) => {
+        const selected = getSelectedSession();
+        if (!selected || resolveComposerSessionKey(selected) !== sessionKey) return;
+        const next = { ...getComposerOptionsForSession(selected), ...patch };
+        state.codexControls.sessionOptionsByKey.set(sessionKey, next);
+        state.codexControls.persistedSessionOptionKeys.add(sessionKey);
+        persistComposerSessionOptions();
+        applyComposerOptionsToControls(selected);
+        renderComposerPermissions(selected);
+      },
+      onAdvanced: (sessionKey) => {
+        if (resolveComposerSessionKey(getSelectedSession()) !== sessionKey) return;
+        openSettingsDialog();
+        el('codex-approval-policy-select')?.focus();
+      },
+    });
+  }
+  renderComposerPermissions.controller.update({
+    sessionKey: session ? resolveComposerSessionKey(session) : '',
+    locale: currentLocale(),
+    disabled: Boolean(disabled),
+    current: session ? getRuntimeForSession(session) || session.runtime || null : null,
+    next: session ? getComposerOptionsForSession(session) : null,
+  });
+}
+
 function renderComposerControls(session, disabled) {
   const submitting = isComposerSubmitting(session);
   const supportsTurnSelection = sessionSupportsTurnSelectionControls(session);
@@ -11701,6 +13129,7 @@ function renderComposerControls(session, disabled) {
   requestModelOptionsForSession(session);
   requestSkillOptionsForSession(session);
   renderComposerTurnNotice();
+  renderComposerPermissions(session, disabled || submitting);
 
   const controlIds = [
     'codex-model-input',
@@ -11764,7 +13193,9 @@ function renderComposerControls(session, disabled) {
 
   const reviewButton = el('codex-review-button');
   if (reviewButton) {
-    reviewButton.disabled = disabled || submitting || !session?.live;
+    const reviewBlocker = getSessionReviewBlocker(session);
+    reviewButton.disabled = disabled || Boolean(reviewBlocker);
+    reviewButton.title = reviewBlocker?.message || 'Review uncommitted changes in this Session.';
   }
 
   const runtime = getRuntimeForSession(session) || session?.runtime || {};
@@ -11783,11 +13214,60 @@ function renderComposerControls(session, disabled) {
 }
 
 function getSelectedSteerQueue() {
-  const selectedKey = getSessionKey(getSelectedSession());
+  const selectedKey = resolveComposerSessionKey(getSelectedSession());
   if (!selectedKey) {
     return [];
   }
-  return state.codexControls.steerQueue.filter((item) => item.sessionKey === selectedKey);
+  return state.codexControls.steerQueue.filter((item) => resolveComposerSessionKey(item.sessionKey) === selectedKey);
+}
+
+function getComposerQueueStore() {
+  if (!state.codexControls.queueStore && window.RemoteCodexComposerQueueStore?.createQueueStore) {
+    state.codexControls.queueStore = window.RemoteCodexComposerQueueStore.createQueueStore({
+      storage: (() => { try { return window.localStorage; } catch (_) { return null; } })(),
+    });
+  }
+  return state.codexControls.queueStore || null;
+}
+
+function persistSteerQueue() {
+  const store = getComposerQueueStore();
+  if (!store) return { ok: false, warning: 'storage_unavailable' };
+  const result = store.save(state.codexControls.steerQueue);
+  if (!result.ok) {
+    state.codexControls.steerNotice = {
+      title: steerCopy().queue,
+      message: steerCopy().persistWarning,
+    };
+  }
+  return result;
+}
+
+function restorePersistedSteerQueue() {
+  if (state.codexControls.queueStoreRestored) return false;
+  state.codexControls.queueStoreRestored = true;
+  const store = getComposerQueueStore();
+  if (!store) return false;
+  const result = store.load();
+  const existing = new Set(state.codexControls.steerQueue.map((item) => String(item.id || '')));
+  let restored = 0;
+  for (const item of result.items || []) {
+    if (!item || existing.has(String(item.id || ''))) continue;
+    state.codexControls.steerQueue.push(item);
+    existing.add(String(item.id || ''));
+    restored += 1;
+  }
+  if (restored || result.warning) {
+    state.codexControls.steerNotice = {
+      title: steerCopy().queue,
+      message: result.warning
+        ? steerCopy().restoreWarning
+        : steerCopy().restored,
+    };
+    renderComposerTurnNotice();
+  }
+  if (restored && typeof persistSteerQueue === 'function') persistSteerQueue();
+  return restored > 0;
 }
 
 function findSteerQueueItem(itemId) {
@@ -11795,30 +13275,42 @@ function findSteerQueueItem(itemId) {
 }
 
 function getSteerQueueText(item) {
-  return String(item?.text || item?.payload?.displayText || item?.payload?.composerDraft?.text || item?.payload?.text || '');
+  return String(item?.text ?? item?.payload?.composerDraft?.text ?? item?.payload?.displayText ?? item?.payload?.text ?? '');
 }
 
 function setSteerQueueItemText(item, text) {
-  if (!item) {
+  if (!item || item.sending || item.forceSending || item.steerOperation?.status === 'accepted' || ['guided', 'guide_pending', 'steer_unknown', 'input_unknown'].includes(item.status)) {
     return;
   }
   const previousPayload = item.payload || {};
+  const previousItemText = getSteerQueueText(item);
   const previousDisplayText = String(previousPayload.displayText || item.text || previousPayload.composerDraft?.text || '');
   const previousPayloadText = String(previousPayload.text || '');
-  const hasStructuredInputs = Boolean(
-    previousPayload.inputItems?.length
-    || previousPayload.uploadedFiles?.length
-    || previousPayload.inlineFiles?.length
-  );
   const nextText = String(text || '');
+  if (nextText === getSteerQueueText(item)) return;
   item.text = nextText;
   item.updatedAt = new Date().toISOString();
   const nextPayload = {
     ...previousPayload,
     displayText: nextText,
   };
-  if (!hasStructuredInputs && (!previousPayloadText || previousPayloadText === previousDisplayText)) {
+  if (previousPayload.composerDraft) {
+    const draft = { ...previousPayload.composerDraft, text: nextText };
+    const sections = getComposerTextFileSections(draft);
+    nextPayload.text = [nextText.trim(), ...getComposerPromptCardSections(draft),
+      ...getComposerUploadedFileSections(previousPayload.uploadedFiles || []),
+      sections.length ? 'Attached text file contents:' : '', ...sections].filter(Boolean).join('\n\n');
+    if (!nextPayload.text && previousPayload.inputItems?.length) nextPayload.text = getDefaultTextForInputItems(previousPayload.inputItems);
+    nextPayload.displayText = buildComposerDisplayText(nextText, previousPayload.inputItems || [], previousPayload.uploadedFiles || [], draft);
+  } else if (!previousPayloadText || previousPayloadText === previousDisplayText) {
     nextPayload.text = nextText;
+  } else if (previousDisplayText && previousPayloadText.startsWith(previousDisplayText + '\n\n')) {
+    nextPayload.text = nextText + previousPayloadText.slice(previousDisplayText.length);
+  } else {
+    // Keep unknown structured content intact instead of replacing it with an
+    // edited display summary that would discard attachments or imported context.
+    item.text = previousItemText;
+    throw new Error('This queued payload cannot be edited safely. Remove it and prepare the message again.');
   }
   item.payload = {
     ...nextPayload,
@@ -11829,10 +13321,11 @@ function setSteerQueueItemText(item, text) {
       text: nextText,
     };
   }
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
 }
 
 function addSteerQueueItem(session, payload, steerText) {
-  const text = String(steerText || payload?.displayText || payload?.composerDraft?.text || '').trim();
+  const text = String(payload?.composerDraft?.text ?? steerText ?? payload?.displayText ?? '').trim();
   const item = {
     id: makeClientId(),
     sessionKey: getSessionKey(session),
@@ -11851,11 +13344,13 @@ function addSteerQueueItem(session, payload, steerText) {
     error: '',
   };
   state.codexControls.steerQueue.push(item);
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
   return item;
 }
 
 function removeSteerQueueItem(itemId) {
   state.codexControls.steerQueue = state.codexControls.steerQueue.filter((item) => item.id !== itemId);
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
 }
 
 function clearSteerQueueForSession(session) {
@@ -11864,6 +13359,7 @@ function clearSteerQueueForSession(session) {
     return;
   }
   state.codexControls.steerQueue = state.codexControls.steerQueue.filter((item) => item.sessionKey !== key);
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
 }
 
 function summarizeQueuedPayload(payload) {
@@ -11883,144 +13379,125 @@ function summarizeQueuedPayload(payload) {
 }
 
 function getFirstQueuedPrompt(session = getSelectedSession()) {
-  const sessionKey = getSessionKey(session);
+  const sessionKey = resolveComposerSessionKey(session);
   if (!sessionKey) {
     return null;
   }
-  return state.codexControls.steerQueue.find((item) => (
-    item.sessionKey === sessionKey
-    && item.status === 'queued'
-    && !item.sending
-    && !item.forceSending
-  )) || null;
+  for (const item of state.codexControls.steerQueue) {
+    if (resolveComposerSessionKey(item.sessionKey) !== sessionKey) continue;
+    if (item.status === 'guided' || item.steerOperation?.status === 'accepted') continue;
+    // Editing/unknown/failed head entries must not be overtaken automatically.
+    return item.status === 'queued' && !item.editing && !item.sending && !item.forceSending ? item : null;
+  }
+  return null;
 }
 
 function getQueueStatusLabel(item) {
+  const words = steerCopy();
+  if (item.status === 'input_unknown') return words.inputUnknown;
+  if (item.steerOperation) return words[item.steerOperation.status] || words.queued;
   if (item.forceSending) {
-    return 'interrupting';
+    return words.interrupting;
   }
   if (item.sending) {
-    return 'sending';
+    return words.sending;
   }
   if (item.status === 'guided') {
-    return 'guided';
+    return words.accepted;
   }
   if (item.status === 'failed') {
-    return 'failed';
+    return words.failed;
   }
-  return 'waiting';
+  return words.waiting;
+}
+
+function composerQueueItemView(item, selected = getSelectedSession()) {
+  const sessionKey = resolveComposerSessionKey(item.sessionKey);
+  const session = findSessionForResolvedComposerKey(sessionKey);
+  const own = sessionKey === resolveComposerSessionKey(selected);
+  const locked = queuedPromptDeliveryLocked(item);
+  const guided = item.status === 'guided' || item.steerOperation?.status === 'accepted';
+  const textOnly = window.RemoteCodexSessionSteer.textOnly(item.payload);
+  const active = session?.live && runtimeIsActive(getRuntimeForSession(session) || session.runtime || {});
+  return {
+    id: item.id, sessionKey, text: getSteerQueueText(item),
+    title: [session?.title || session?.cwd || item.sessionId, session?.hostId || item.hostId].filter(Boolean).join(' · '),
+    status: item.status, statusLabel: getQueueStatusLabel(item), error: item.error || '',
+    meta: summarizeQueuedPayload(item.payload), canOpen: Boolean(session),
+    canEdit: own && !locked && !guided,
+    canForce: own && Boolean(session?.live) && !locked && !guided && !item.editing,
+    canGuide: own && Boolean(active) && !locked && !guided && !item.editing && textOnly,
+    canRemove: own && !locked && !item.editing,
+    canRetry: own && item.status === 'input_unknown' && Boolean(item.inputRequest) && !item.sending,
+    canCheck: own && ['guide_pending', 'steer_unknown'].includes(item.status) && Boolean(item.steerOperation),
+    guideHint: !textOnly ? steerCopy().textOnly : !active ? steerCopy().target : '',
+  };
+}
+
+function setComposerQueueEditing(itemId, editing) {
+  const item = findSteerQueueItem(itemId);
+  if (!item) return;
+  item.editing = Boolean(editing);
+  // Do not allow a previously armed idle timer to take an open editor.
+  const key = resolveComposerSessionKey(item.sessionKey);
+  const timers = state.codexControls.queueAutoSendTimersBySession;
+  if (timers.has(key)) {
+    window.clearTimeout(timers.get(key));
+    timers.delete(key);
+  }
+  if (!editing) maybeScheduleQueuedPromptSend(key);
+}
+
+async function runComposerQueueAction(action, itemId, trusted = false) {
+  const item = findSteerQueueItem(itemId);
+  if (!item) return;
+  const view = composerQueueItemView(item);
+  if (action === 'open') {
+    if (view.canOpen) await selectSession(findSessionForResolvedComposerKey(item.sessionKey), { trusted });
+    return;
+  }
+  // Re-read the selected Session and status at action time, not menu-open time.
+  const permission = { force: 'canForce', guide: 'canGuide', remove: 'canRemove', retry: 'canRetry', check: 'canCheck' }[action];
+  if (!permission || !view[permission]) return;
+  try {
+    if (action === 'force') await interruptAndSendQueuedPrompt(item.id);
+    else if (action === 'guide') await guideQueuedPrompt(item.id);
+    else if (action === 'retry') await retryUnknownQueuedInput(item.id);
+    else if (action === 'check') await getSteerClient().check(item.steerOperation);
+    else if (action === 'remove') removeSteerQueueItem(item.id);
+  } finally {
+    renderComposerTurnNotice();
+    maybeScheduleQueuedPromptSend(item.sessionKey);
+  }
 }
 
 function renderComposerTurnNotice() {
-  const notice = el('composer-turn-notice');
-  if (!notice) {
-    return;
+  const container = el('composer-turn-notice');
+  if (!container) return;
+  if (!state.codexControls.queueRenderer) {
+    state.codexControls.queueRenderer = window.RemoteCodexComposerQueue.createRenderer({
+      container,
+      onAction: runComposerQueueAction,
+      onEdit(itemId, text) {
+        const item = findSteerQueueItem(itemId);
+        if (item && composerQueueItemView(item).canEdit) setSteerQueueItemText(item, text);
+      },
+      onEditingChange: setComposerQueueEditing,
+    });
   }
-  const queue = getSelectedSteerQueue();
-  const steerNotice = state.codexControls.steerNotice;
-  const interruptOperation = getInterruptOperation(getSelectedSession());
-  const show = Boolean(queue.length || steerNotice || interruptOperation);
-  notice.classList.toggle('hidden', !show);
-  if (!show) {
-    return;
-  }
-
-  const title = el('composer-turn-notice-title');
-  const copy = el('composer-turn-notice-copy');
-  const forceButton = el('composer-force-send-button');
-  const list = el('composer-steer-queue-list');
-  if (queue.length) {
-    const waitingCount = queue.filter((item) => item.status === 'queued').length;
-    title.textContent = `Pending queue (${queue.length})`;
-    copy.textContent = waitingCount
-      ? 'These prompts are waiting in order. Edit or remove them, guide one into the current turn, or interrupt and send one immediately.'
-      : 'These prompts were guided into the current turn. They stay visible so you can edit, remove, or force-send a fresh turn if needed.';
-    forceButton.classList.remove('hidden');
-    forceButton.disabled = queue.some((item) => item.forceSending);
-    forceButton.textContent = 'Interrupt & Send First';
-  } else {
-    const interruptPresentation = interruptOperationPresentation(interruptOperation);
-    title.textContent = interruptOperation
-      ? interruptPresentation.title
-      : steerNotice?.title || 'Active turn updated';
-    copy.textContent = interruptOperation
-      ? interruptPresentation.message
-      : steerNotice?.message || 'Your message was added to the current Codex turn.';
-    forceButton.classList.add('hidden');
-    forceButton.disabled = true;
-  }
-
-  if (!list) {
-    return;
-  }
-  list.innerHTML = '';
-  list.classList.toggle('hidden', !queue.length);
-  for (const [index, item] of queue.entries()) {
-    const card = document.createElement('div');
-    card.className = 'steer-queue-item';
-
-    const header = document.createElement('div');
-    header.className = 'steer-queue-item-header';
-
-    const label = document.createElement('div');
-    label.className = 'steer-queue-item-label';
-    label.textContent = `#${index + 1} | ${getQueueStatusLabel(item)}`;
-    header.appendChild(label);
-
-    const meta = summarizeQueuedPayload(item.payload);
-    if (meta) {
-      const metaNode = document.createElement('div');
-      metaNode.className = 'steer-queue-item-meta';
-      metaNode.textContent = meta;
-      header.appendChild(metaNode);
-    }
-    card.appendChild(header);
-
-    const textarea = document.createElement('textarea');
-    textarea.className = 'steer-queue-text';
-    textarea.dataset.steerQueueText = item.id;
-    textarea.rows = 3;
-    textarea.value = getSteerQueueText(item);
-    textarea.placeholder = 'Edit this waiting prompt before it is sent or guided...';
-    card.appendChild(textarea);
-
-    if (item.error) {
-      const error = document.createElement('div');
-      error.className = 'steer-queue-error';
-      error.textContent = item.error;
-      card.appendChild(error);
-    }
-
-    const actions = document.createElement('div');
-    actions.className = 'steer-queue-actions';
-
-    const force = document.createElement('button');
-    force.type = 'button';
-    force.className = 'secondary-button';
-    force.dataset.forceSteerQueueId = item.id;
-    force.disabled = item.forceSending || item.sending;
-    force.textContent = item.forceSending ? 'Interrupting...' : 'Interrupt & Send';
-    actions.appendChild(force);
-
-    const guide = document.createElement('button');
-    guide.type = 'button';
-    guide.className = 'secondary-button';
-    guide.dataset.guideSteerQueueId = item.id;
-    guide.disabled = item.forceSending || item.sending || item.status === 'guided' || !runtimeIsActive(getRuntimeForSession(getSelectedSession()) || getSelectedSession()?.runtime || {});
-    guide.textContent = item.status === 'guided' ? 'Guided' : 'Guide';
-    actions.appendChild(guide);
-
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'secondary-button';
-    remove.dataset.removeSteerQueueId = item.id;
-    remove.disabled = item.forceSending || item.sending;
-    remove.textContent = 'Remove';
-    actions.appendChild(remove);
-
-    card.appendChild(actions);
-    list.appendChild(card);
-  }
+  const selected = getSelectedSession();
+  const sessionKey = resolveComposerSessionKey(selected);
+  const items = state.codexControls.steerQueue.map(item => composerQueueItemView(item, selected));
+  const interrupt = getInterruptOperation(selected);
+  const presentation = interrupt ? interruptOperationPresentation(interrupt) : null;
+  const first = getFirstQueuedPrompt(selected);
+  state.codexControls.queueRenderer.update({
+    sessionKey, locale: state.ui.locale,
+    items: items.filter(item => item.sessionKey === sessionKey),
+    others: items.filter(item => item.sessionKey !== sessionKey),
+    firstId: first?.id || '',
+    notice: presentation || state.codexControls.steerNotice || null,
+  });
 }
 
 function getComposerDraftAttachments(draft = null) {
@@ -12374,6 +13851,7 @@ function clearComposerDraftForSessionKey(sessionKey) {
         input.value = '';
         input.selectionStart = 0;
         input.selectionEnd = 0;
+        window.RemoteCodexComposerMobileLayoutController?.resizeInput();
       }
       const localImageInput = el('codex-local-image-path');
       if (localImageInput) localImageInput.value = '';
@@ -12427,6 +13905,7 @@ function applyMountedComposerDraft(sessionKey, draft = null) {
         : selectionStart;
       input.selectionStart = selectionStart;
       input.selectionEnd = selectionEnd;
+      window.RemoteCodexComposerMobileLayoutController?.resizeInput();
     }
     if (localImageInput) localImageInput.value = next.localImagePath;
     renderAttachmentChips();
@@ -12519,6 +13998,7 @@ function moveComposerDraftSessionKey(previousKeyValue, nextKeyValue) {
       item.sessionKey = nextKey;
     }
   }
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
   const queueTimers = state.codexControls.queueAutoSendTimersBySession;
   const previousQueueTimer = queueTimers.get(previousKey) || queueTimers.get(rawPreviousKey) || null;
   queueTimers.delete(rawPreviousKey);
@@ -12555,6 +14035,7 @@ function moveComposerDraftSessionKey(previousKeyValue, nextKeyValue) {
   moveSetEntry(state.codexControls.persistedSessionOptionKeys);
   moveMapEntry(state.codexControls.apiSwitchNoticesBySession);
   moveMapEntry(state.codexControls.interruptOperationsBySession);
+  moveSetEntry(state.codexControls.reviewBusyKeys);
   moveSetEntry(state.codexControls.interruptBusyKeys);
   moveSetEntry(state.sessionApiRebindBusyKeys);
   moveSetEntry(state.sessionTranscriptFallbackBusyKeys);
@@ -12664,6 +14145,13 @@ function clearActiveDraftForSessionRequest(session, clientRequestId = '') {
   const activeDraft = key ? state.codexControls.activeDraftsBySession.get(key) || null : null;
   if (!key || !expected || activeDraft?.clientRequestId !== expected) return false;
   state.codexControls.activeDraftsBySession.delete(key);
+  const queuedSession = findSessionForResolvedComposerKey(
+    key,
+    session && typeof session === 'object' ? session : null
+  );
+  if (queuedSession && typeof maybeScheduleQueuedPromptSend === 'function') {
+    maybeScheduleQueuedPromptSend(queuedSession);
+  }
   return true;
 }
 
@@ -13393,6 +14881,54 @@ function composerAttachmentKey(attachment) {
   return attachment.fileId || `${attachment.type}|${attachment.name}|${attachment.size}|${attachment.remotePath || ''}`;
 }
 
+function removeHistoryImportBatch(composerSessionKey, batchId) {
+  const normalizedBatchId = String(batchId || '').trim();
+  if (!normalizedBatchId) {
+    return 0;
+  }
+  const key = resolveComposerSessionKey(composerSessionKey);
+  if (!key) {
+    return 0;
+  }
+  const removeBatch = (attachments) => {
+    const source = Array.isArray(attachments) ? attachments : [];
+    const removed = source.filter((attachment) => attachment?.historyImportBatchId === normalizedBatchId);
+    for (const attachment of removed) {
+      revokeComposerAttachmentPreview(attachment);
+    }
+    return {
+      removed,
+      remaining: source.filter((attachment) => attachment?.historyImportBatchId !== normalizedBatchId),
+    };
+  };
+
+  if (getMountedComposerSessionKey() === key) {
+    const result = removeBatch(state.codexControls.attachments);
+    if (result.removed.length) {
+      state.codexControls.attachments = result.remaining;
+      renderAttachmentChips();
+    }
+    return result.removed.length;
+  }
+
+  const hadPending = state.codexControls.pendingComposerDraftsBySession.has(key);
+  const draft = getComposerDraftForSessionKey(key);
+  const result = removeBatch(draft.attachments);
+  if (!result.removed.length) {
+    return 0;
+  }
+  draft.attachments = result.remaining;
+  const saved = setComposerDraftForSessionKey(key, draft);
+  if (hadPending) {
+    if (saved) {
+      state.codexControls.pendingComposerDraftsBySession.set(key, cloneComposerDraft(saved));
+    } else {
+      state.codexControls.pendingComposerDraftsBySession.delete(key);
+    }
+  }
+  return result.removed.length;
+}
+
 function addComposerPromptCardAttachment(card = {}) {
   const text = String(card.text || '').trim();
   if (!text) {
@@ -14030,8 +15566,16 @@ async function addComposerTextFiles(files, sessionKey = getMountedComposerSessio
   appendComposerAttachmentsForSessionKey(composerSessionKey, nextAttachments);
 }
 
-async function addComposerFiles(files, sessionKey = getMountedComposerSessionKey()) {
+async function addComposerFiles(files, sessionKey = getMountedComposerSessionKey(), metadata = {}) {
   const composerSessionKey = resolveComposerSessionKey(sessionKey);
+  const historyImportBatchId = String(metadata.historyImportBatchId || '').trim();
+  const historyImportMetadata = historyImportBatchId
+    ? {
+        source: 'historyImport',
+        historyImportBatchId,
+        historyImportSessionKey: String(metadata.historyImportSessionKey || '').trim() || null,
+      }
+    : {};
   const allFiles = Array.from(files || []).filter(Boolean);
   if (!allFiles.length) {
     return;
@@ -14068,6 +15612,7 @@ async function addComposerFiles(files, sessionKey = getMountedComposerSessionKey
       isImage: Boolean(previewUrl),
       previewUrl,
       previewObjectUrl: Boolean(previewUrl),
+      ...historyImportMetadata,
     });
   }
   appendComposerAttachmentsForSessionKey(composerSessionKey, nextAttachments);
@@ -14106,12 +15651,117 @@ async function handleComposerDrop(event) {
   }
 }
 
+function sessionTerminalAvailability(session) {
+  if (!session) {
+    return { enabled: false, message: 'Select a Session first.' };
+  }
+  if (!String(session.cwd || '').trim()) {
+    return { enabled: false, message: 'This Session has no known working directory.' };
+  }
+  const host = getHost(session.hostId);
+  if (!host) {
+    return { enabled: false, message: `Host ${session.hostId || '(unknown)'} is unavailable.` };
+  }
+  if (!host.online) {
+    return { enabled: false, message: `Host ${host.label || host.hostId || session.hostId} is offline.` };
+  }
+  if (host.capabilities?.openTerminalV1 !== true) {
+    return {
+      enabled: false,
+      message: 'Restart or update this Host Agent to enable opening a terminal.',
+    };
+  }
+  return {
+    enabled: true,
+    message: `Open a terminal on ${host.label || host.hostId || session.hostId} at ${session.cwd}`,
+  };
+}
+
+function clearSessionTerminalFeedback(sessionKey) {
+  const current = state.sessionTerminalFeedback.get(sessionKey);
+  if (current?.timer) window.clearTimeout(current.timer);
+  state.sessionTerminalFeedback.delete(sessionKey);
+}
+
+function setSessionTerminalFeedback(session, status, message, durationMs = 2400) {
+  const sessionKey = getSessionKey(session);
+  if (!sessionKey) return;
+  clearSessionTerminalFeedback(sessionKey);
+  const feedback = {
+    status,
+    message: String(message || '').trim(),
+    token: makeClientId(),
+    timer: null,
+  };
+  feedback.timer = window.setTimeout(() => {
+    const current = state.sessionTerminalFeedback.get(sessionKey);
+    if (current?.token !== feedback.token) return;
+    state.sessionTerminalFeedback.delete(sessionKey);
+    renderSessionDetails();
+  }, Math.max(800, Number(durationMs || 0) || 2400));
+  state.sessionTerminalFeedback.set(sessionKey, feedback);
+}
+
+async function openTerminalForSession(session) {
+  if (!session) return false;
+  const sessionKey = getSessionKey(session);
+  if (!sessionKey || state.sessionTerminalBusyKeys.has(sessionKey)) return false;
+  const availability = sessionTerminalAvailability(session);
+  if (!availability.enabled) {
+    setSessionTerminalFeedback(session, 'failed', availability.message, 4000);
+    renderSessionDetails();
+    return false;
+  }
+
+  clearSessionTerminalFeedback(sessionKey);
+  state.sessionTerminalBusyKeys.add(sessionKey);
+  renderSessionDetails();
+  try {
+    const requestId = makeClientId();
+    const result = await fetchJson(
+      `/api/hosts/${encodeURIComponent(session.hostId)}/sessions/${encodeURIComponent(session.sessionId)}/open-terminal`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ requestId }),
+        timeoutMs: 20000,
+      }
+    );
+    if (result?.hostId && result.hostId !== session.hostId) {
+      throw new Error('The terminal response came from a different Host.');
+    }
+    if (result?.sessionId && result.sessionId !== session.sessionId) {
+      throw new Error('The terminal response belongs to a different Session.');
+    }
+    if (result?.opened !== true) {
+      throw new Error(result?.error || 'The Host Agent did not confirm that the terminal opened.');
+    }
+    const terminalLabel = String(result.terminal || 'Terminal').trim() || 'Terminal';
+    setSessionTerminalFeedback(
+      session,
+      'opened',
+      `${terminalLabel} opened on the target Host at ${result.cwd || session.cwd}.`
+    );
+    return true;
+  } catch (error) {
+    setSessionTerminalFeedback(
+      session,
+      'failed',
+      error?.message || 'The terminal could not be opened.',
+      5000
+    );
+    return false;
+  } finally {
+    state.sessionTerminalBusyKeys.delete(sessionKey);
+    renderSessionDetails();
+  }
+}
+
 function renderSessionDetails() {
   const session = getSelectedSession();
   syncMountedComposerDraftSession(session);
   renderSessionApiControls(session);
-  if (!session && state.sessionDetailsOpen) {
-    state.sessionDetailsOpen = false;
+  if (!session && (state.sessionDetailsOpen || state.statusWindowOpen || state.alertWindowOpen)) {
+    getSessionModalController().closeIfNoSelectedSession();
   }
   const conversation = getSelectedConversation();
   const joinButton = el('join-session-button');
@@ -14120,6 +15770,9 @@ function renderSessionDetails() {
   const alertsButton = el('toggle-alerts-button');
   const exportButton = el('export-session-button');
   const renameButton = el('rename-session-button');
+  const terminalButton = el('open-session-terminal-button');
+  const terminalButtonLabel = el('open-session-terminal-label');
+  const terminalButtonFeedback = el('open-session-terminal-feedback');
   const statusButton = el('toggle-status-button');
   const endSessionButton = el('end-session-button');
   const endAllSessionsButton = el('end-all-sessions-button');
@@ -14210,7 +15863,11 @@ function renderSessionDetails() {
     warningCard.classList.add('hidden');
   }
   alertsButton.disabled = !session;
+  const currentRuntimeIssue = session ? runtimeIssuePresentation(runtime || {}) : null;
   alertsButton.textContent = alerts.length ? `Alerts (${alerts.length})` : 'Alerts';
+  alertsButton.title = currentRuntimeIssue?.message || 'Saved warnings and errors; not the current running state.';
+  alertsButton.classList.toggle('has-current-error', Boolean(currentRuntimeIssue?.tone === 'error'));
+  alertsButton.classList.toggle('has-current-warning', Boolean(currentRuntimeIssue?.tone === 'warning'));
   if (exportButton) {
     exportButton.disabled = !session;
     exportButton.textContent = 'Export';
@@ -14222,6 +15879,34 @@ function renderSessionDetails() {
     renameButton.disabled = !session;
     renameButton.classList.toggle('hidden', !session);
     renameButton.title = session ? 'Rename this conversation.' : 'Select a conversation to rename it.';
+  }
+  if (terminalButton) {
+    const sessionKey = session ? getSessionKey(session) : '';
+    const availability = sessionTerminalAvailability(session);
+    const busy = Boolean(sessionKey && state.sessionTerminalBusyKeys.has(sessionKey));
+    const feedback = sessionKey ? state.sessionTerminalFeedback.get(sessionKey) : null;
+    const visible = Boolean(session);
+    terminalButton.hidden = !visible;
+    terminalButton.classList.toggle('hidden', !visible);
+    terminalButton.disabled = !availability.enabled || busy;
+    const label = busy
+      ? 'Opening...'
+      : feedback?.status === 'opened'
+        ? 'Opened'
+        : feedback?.status === 'failed'
+          ? 'Failed'
+          : 'Terminal';
+    if (terminalButtonLabel) terminalButtonLabel.textContent = label;
+    terminalButton.title = busy
+      ? `Opening a terminal on ${getHost(session?.hostId)?.label || session?.hostId || 'the target Host'}...`
+      : feedback?.message || availability.message;
+    terminalButton.setAttribute('aria-label', terminalButton.title);
+    if (terminalButtonFeedback) {
+      const feedbackMessage = visible ? String(feedback?.message || '').trim() : '';
+      terminalButtonFeedback.hidden = !feedbackMessage;
+      terminalButtonFeedback.textContent = feedbackMessage;
+      terminalButtonFeedback.dataset.status = feedback?.status || '';
+    }
   }
   statusButton.disabled = !session;
   statusButton.textContent = pendingRequests.length
@@ -14251,6 +15936,7 @@ function renderSessionDetails() {
   const canActivateHistory = canActivateSessionHistory(session);
   const canFork = canForkSession(session);
   const launchBusy = getSessionLaunchBusyForSession(session);
+  const launchCanRecheck = launchBusy?.stage === 'startup-observation-paused';
   const historyNeedsApiRebind = Boolean(
     session
     && !session.live
@@ -14285,9 +15971,13 @@ function renderSessionDetails() {
     }
 
     const isEnding = runtime?.phase === 'ending' || runtime?.connection === 'closing';
-    resumeButton.classList.toggle('danger-button', Boolean(session.live));
-    resumeButton.classList.toggle('secondary-button', !session.live);
-    if (session.live) {
+    resumeButton.classList.toggle('danger-button', Boolean(session.live && !launchCanRecheck));
+    resumeButton.classList.toggle('secondary-button', !session.live || launchCanRecheck);
+    if (launchCanRecheck) {
+      resumeButton.disabled = false;
+      resumeButton.textContent = 'Recheck Accepted Run';
+      resumeButton.title = 'Recheck the already accepted run without starting another Session.';
+    } else if (session.live) {
       resumeButton.disabled = isEnding || Boolean(launchBusy);
       resumeButton.textContent = isEnding ? 'Stopping Session...' : 'Stop Session';
     } else if (launchBusy) {
@@ -14345,9 +16035,6 @@ function renderSessionDetails() {
   } else {
     input.placeholder = 'Join or start a live session first...';
   }
-
-  renderApprovalPopup();
-  renderStatusWindow();
 }
 
 function createRuntimeChip(container, label, value, tone = 'info') {
@@ -14442,11 +16129,11 @@ function renderRuntimePanel() {
       : runtimeState.connection === 'disconnected' || runtimeState.connection === 'closed'
         ? 'error'
         : 'info';
-  const phaseTone = runtime.phase === 'error' || runtime.phase === 'quota-exhausted'
+  const phaseTone = runtimeIssue?.tone === 'error'
     ? 'error'
-    : runtime.phase === 'waiting-approval' || runtime.phase === 'waiting-user-input' || runtime.phase === 'retrying' || runtime.phase === 'reconnecting'
+    : runtimeActive && ['waiting-approval', 'waiting-user-input', 'retrying', 'reconnecting'].includes(runtime.phase)
       ? 'warning'
-      : runtime.busy
+      : runtimeActive
         ? 'active'
         : 'info';
 
@@ -14454,7 +16141,7 @@ function renderRuntimePanel() {
     titleEl.textContent = `${session.title || session.sessionId} is live`;
     subtitleEl.textContent = externalActivity.active && !runtimeActive
       ? `External terminal activity for ${formatElapsedSince(externalActivity.updatedAt) || '0s'} | ${prettyStatusLabel(runtimeState.connection)}`
-      : runtime.busy
+      : runtimeActive
       ? `${runtimeState.phase} for ${phaseSince || '0s'} | ${prettyStatusLabel(runtimeState.connection)}${connectionSince ? ` for ${connectionSince}` : ''}`
       : `${prettyStatusLabel(runtimeState.connection)}${connectionSince ? ` for ${connectionSince}` : ''} | ${runtimeState.phase}`;
   } else if (launchBusy) {
@@ -14491,7 +16178,7 @@ function renderRuntimePanel() {
     'Turn',
     externalActivity.active && !runtimeActive
       ? `${externalActivity.turnId ? `${shortId(externalActivity.turnId)} | ` : ''}External terminal`
-      : runtime.activeTurnId
+      : runtimeActive && runtime.activeTurnId
       ? `${shortId(runtime.activeTurnId)} | ${runtimeState.turn}`
       : runtimeState.turn,
     displayActive ? 'active' : 'info'
@@ -14505,7 +16192,7 @@ function renderRuntimePanel() {
     'Processing',
     externalActivity.active && !runtimeActive
       ? `Terminal active | update ${formatElapsedSince(externalActivity.updatedAt) || 'just now'} ago`
-      : runtime.busy
+      : runtimeActive
       ? `Running for ${formatElapsedSince(runtime.busyStartedAt || runtime.phaseStartedAt || runtime.updatedAt) || '0s'}`
       : `Last update ${formatElapsedSince(runtime.updatedAt) || 'just now'} ago`,
     displayActive ? 'active' : 'info'
@@ -14530,13 +16217,13 @@ function renderRuntimePanel() {
     statusButton.disabled = false;
   }
   if (steerInput) {
-    steerInput.disabled = !session.live || !runtime.activeTurnId;
-    steerInput.placeholder = runtime.activeTurnId
+    steerInput.disabled = !session.live || !runtimeIsActive(runtime) || !runtime.activeTurnId;
+    steerInput.placeholder = runtimeActive && runtime.activeTurnId
       ? 'Guide the current live turn without sending a fresh prompt'
       : 'No active turn to steer right now';
   }
   if (steerSubmit) {
-    steerSubmit.disabled = !session.live || !runtime.activeTurnId;
+    steerSubmit.disabled = !session.live || !runtimeIsActive(runtime) || !runtime.activeTurnId;
   }
   if (shellInput) {
     shellInput.disabled = !session.live || !runtime.threadId;
@@ -14585,13 +16272,16 @@ function renderThinkingPanel() {
   const latestUserEntry = getLatestUserTranscriptEntry(session);
   const liveSegment = buildLiveActivitySegment(session, latestUserEntry, diagnostics);
   const placeholderSegment = liveSegment ? null : {
+    userEntryKey: latestUserEntry
+      ? transcriptEntryStableTurnKey(latestUserEntry)
+      : 'live',
     userTimestamp: latestUserEntry?.timestamp || 'live',
     userText: latestUserEntry?.text || '',
     entries: [],
     live: true,
   };
   const displayedSegment = liveSegment || placeholderSegment;
-  const expectedStateKey = `${getSessionKey(session) || session.sessionId || 'session'}::thinking::${displayedSegment.userTimestamp || 'live'}`;
+  const expectedStateKey = thinkingSegmentStateKey(session, displayedSegment);
   const existingCard = log?.querySelector(`.thinking-card[data-thinking-state-key="${cssEscape(expectedStateKey)}"]`);
   const existingMessage = existingCard?.closest('.message.thinking');
   if (!existingMessage) {
@@ -14609,7 +16299,7 @@ function renderThinkingPanel() {
 
 function normalizeAlertSeverity(value, fallback = 'warning') {
   const normalizedFallback = ['info', 'warning', 'error'].includes(fallback) ? fallback : 'warning';
-  const severity = String(value || '').trim().toLowerCase();
+  const severity = structuredThinkingScalar(value, '').trim().toLowerCase();
   return ['info', 'warning', 'error'].includes(severity) ? severity : normalizedFallback;
 }
 
@@ -14618,7 +16308,7 @@ function appendTextElement(parent, tagName, className, value) {
   if (className) {
     node.className = className;
   }
-  node.textContent = String(value == null ? '' : value);
+  node.textContent = structuredThinkingText(value);
   parent.appendChild(node);
   return node;
 }
@@ -15548,6 +17238,57 @@ async function restoreSentDraftAfterInterrupt(session, operation) {
   }
 }
 
+function reconcileNoActiveInterruptRuntime(session, operation, payload, currentRuntime) {
+  if (!session?.hostId || !session?.sessionId || !operation || !currentRuntime) return null;
+  const reason = String(payload?.reason || '').trim().toLowerCase();
+  if (reason === 'active_turn_changed') return null;
+
+  const expectedRunId = String(operation.expectedRunId || '').trim();
+  const payloadRunId = String(payload?.runId || '').trim();
+  const currentRunId = String(currentRuntime.runId || '').trim();
+  if (expectedRunId && payloadRunId && payloadRunId !== expectedRunId) return null;
+  if (expectedRunId && currentRunId && currentRunId !== expectedRunId) return null;
+
+  const expectedTurnId = String(operation.expectedTurnId || '').trim();
+  const payloadTurnId = String(payload?.turnId || '').trim();
+  const currentTurnId = String(currentRuntime.activeTurnId || '').trim();
+  if (!expectedTurnId || currentTurnId !== expectedTurnId) return null;
+  if (payloadTurnId && payloadTurnId !== expectedTurnId) return null;
+
+  const expectedRevision = Number(operation.expectedRuntimeRevision || 0);
+  const currentRevision = Number(currentRuntime.runtimeRevision || 0);
+  const currentPhase = String(currentRuntime.phase || '').trim().toLowerCase();
+  const alreadyReportsIdle = currentPhase === 'idle' && currentRuntime.busy === false;
+  if (
+    Number.isSafeInteger(expectedRevision)
+    && expectedRevision > 0
+    && Number.isSafeInteger(currentRevision)
+    && currentRevision > expectedRevision
+    && !alreadyReportsIdle
+  ) {
+    return null;
+  }
+
+  const preserveLifecyclePhase = [
+    'ending',
+    'closed',
+    'stop-failed',
+    'error',
+    'failed',
+    'quota-exhausted',
+  ].includes(currentPhase);
+  const reconciled = patchRuntimeForSession(session.hostId, session.sessionId, {
+    phase: preserveLifecyclePhase ? currentRuntime.phase : 'idle',
+    busy: false,
+    activeTurnId: null,
+    currentTurnStatus: preserveLifecyclePhase ? currentRuntime.currentTurnStatus : 'idle',
+    waitingOnApproval: false,
+    waitingOnUserInput: false,
+    updatedAt: new Date().toISOString(),
+  });
+  return reconciled && !runtimeIsActive(reconciled) ? reconciled : null;
+}
+
 function applySessionInterruptResult(sessionOrKey, payload = {}) {
   const key = resolveComposerSessionKey(sessionOrKey);
   const operation = key ? state.codexControls.interruptOperationsBySession.get(key) || null : null;
@@ -15564,6 +17305,9 @@ function applySessionInterruptResult(sessionOrKey, payload = {}) {
   const runtimeSession = findSessionForResolvedComposerKey(key, sessionOrKey) || sessionOrKey;
   const currentRuntime = runtimeSession && typeof runtimeSession === 'object'
     ? getRuntimeForSession(runtimeSession) || runtimeSession.runtime || null
+    : null;
+  const reconciledNoActiveRuntime = status === 'no_active'
+    ? reconcileNoActiveInterruptRuntime(runtimeSession, operation, payload, currentRuntime)
     : null;
   const acceptedTurnSettled = status === 'accepted' && (
     payload.turnSettled === true
@@ -15598,6 +17342,10 @@ function applySessionInterruptResult(sessionOrKey, payload = {}) {
   }
   renderComposerControls();
   renderComposerTurnNotice();
+  if (reconciledNoActiveRuntime) {
+    maybeScheduleQueuedPromptSend(runtimeSession);
+    scheduleRuntimeStatusRender();
+  }
   return true;
 }
 
@@ -15628,6 +17376,7 @@ async function interruptActiveTurn(options = {}) {
   if (state.codexControls.interruptBusyKeys.has(resolvedSessionKey)) return;
   const interruptRequestId = makeClientId();
   const runtime = getRuntimeForSession(session) || session.runtime || {};
+  const runtimeRevision = Number(runtime.runtimeRevision || 0);
   const operation = {
     interruptRequestId,
     status: 'queueing',
@@ -15635,6 +17384,11 @@ async function interruptActiveTurn(options = {}) {
     restoreDraft: options.restoreDraft === true,
     restoreScheduled: false,
     draftRestored: false,
+    expectedRunId: session.runId || runtime.runId || null,
+    expectedTurnId: runtime.activeTurnId || null,
+    expectedRuntimeRevision: Number.isSafeInteger(runtimeRevision) && runtimeRevision > 0
+      ? runtimeRevision
+      : null,
     expectedClientRequestId: runtime.clientRequestId || runtime.pendingClientRequestId || null,
     startedAt: new Date().toISOString(),
   };
@@ -15655,8 +17409,8 @@ async function interruptActiveTurn(options = {}) {
       body: JSON.stringify({
         hostId: session.hostId,
         interruptRequestId,
-        expectedRunId: session.runId || runtime.runId || null,
-        expectedTurnId: runtime.activeTurnId || null,
+        expectedRunId: operation.expectedRunId,
+        expectedTurnId: operation.expectedTurnId,
         expectedClientRequestId: runtime.clientRequestId || runtime.pendingClientRequestId || null,
       }),
     });
@@ -15679,24 +17433,88 @@ async function interruptActiveTurn(options = {}) {
   }
 }
 
-async function steerActiveTurn(text) {
-  const session = getSelectedSession();
-  if (!session) {
-    return;
-  }
+function steerCopy() {
+  return window.RemoteCodexSessionSteer.words(state.ui.locale);
+}
 
+function getSteerClient() {
+  if (!state.codexControls.steerClient) {
+    const client = window.RemoteCodexSessionSteer.createClient({
+      request: fetchJson, makeId: makeClientId,
+      onChange(operation) {
+        const item = state.codexControls.steerQueue.find((entry) => entry.steerOperation === operation);
+        if (!item) return;
+        item.sending = operation.status === 'queued';
+        item.status = ({ accepted: 'guided', rejected: 'failed', queued: 'guide_pending', acceptance_unknown: 'steer_unknown' })[operation.status];
+        item.error = operation.status === 'rejected' ? operation.error : '';
+        if (operation.status === 'accepted') item.sentAt = new Date().toISOString();
+        if (typeof persistSteerQueue === 'function') persistSteerQueue();
+        renderComposerTurnNotice();
+      },
+    });
+    for (const item of state.codexControls.steerQueue) {
+      if (!item?.steerOperation || typeof client.restore !== 'function') continue;
+      const restored = client.restore(item.steerOperation);
+      if (restored) item.steerOperation = restored;
+    }
+    state.codexControls.steerClient = client;
+  }
+  return state.codexControls.steerClient;
+}
+
+function queuedPromptDeliveryLocked(item) {
+  return Boolean(item?.sending || item?.forceSending || ['guide_pending', 'steer_unknown', 'input_unknown'].includes(item?.status));
+}
+
+async function retryUnknownQueuedInput(itemId) {
+  const item = findSteerQueueItem(itemId);
+  if (!item || item.status !== 'input_unknown' || item.sending || !item.inputRequest) return;
+  const request = item.inputRequest;
+  item.sending = true;
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
+  renderComposerTurnNotice();
+  try {
+    // This is an explicit retry of the durable INPUT outbox key, not native
+    // Steer. Keep the exact original URL, payload and clientRequestId.
+    await fetchJson(request.url, { method: 'POST', body: request.body, timeoutMs: 30000 });
+    const session = findSessionForResolvedComposerKey(resolveComposerSessionKey(item.sessionKey));
+    if (session) setActiveDraftForSession(session, item.payload);
+    removeSteerQueueItem(item.id);
+  } catch (error) {
+    // A later HTTP rejection does not negate an earlier ambiguous delivery.
+    // Retain the frozen request until a positive reply confirms the outbox.
+    item.error = error.message || steerCopy().inputUnknown;
+  } finally {
+    item.sending = false;
+    if (typeof persistSteerQueue === 'function') persistSteerQueue();
+    renderComposerTurnNotice();
+  }
+}
+
+async function steerActiveTurn(text, options = {}) {
+  const session = options.session || getSelectedSession();
+  const runtime = getRuntimeForSession(session) || session?.runtime || {};
   const prompt = String(text || '').trim();
-  if (!prompt) {
-    return;
+  const runId = String(session?.runId || runtime.runId || '').trim();
+  const expectedTurnId = String(runtime.activeTurnId || '').trim();
+  if (!session?.live || !runId || !expectedTurnId || !runtimeIsActive(runtime)
+    || (runtime.runId && runtime.runId !== runId) || !prompt) throw new Error(steerCopy().target);
+  if (options.item && !window.RemoteCodexSessionSteer.textOnly(options.item.payload)) throw new Error(steerCopy().textOnly);
+  const client = getSteerClient();
+  if (!options.item) {
+    const existing = state.codexControls.steerQueue.find((entry) => {
+      const op = entry.steerOperation;
+      return op && ['queued', 'acceptance_unknown'].includes(op.status)
+        && op.target.hostId === session.hostId && op.target.sessionId === session.sessionId
+        && op.target.runId === runId && op.target.expectedTurnId === expectedTurnId && op.target.text === prompt;
+    });
+    if (existing) return client.check(existing.steerOperation);
   }
-
-  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/steer`, {
-    method: 'POST',
-    body: JSON.stringify({
-      hostId: session.hostId,
-      text: prompt,
-    }),
-  });
+  const operation = client.create({ hostId: session.hostId, sessionId: session.sessionId, runId, expectedTurnId, text: prompt });
+  const item = options.item || addSteerQueueItem(session, { text: prompt, displayText: prompt }, prompt);
+  item.steerOperation = operation;
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
+  return client.submit(operation);
 }
 
 async function compactCurrentThread() {
@@ -16219,7 +18037,9 @@ async function preflightSessionActionDialog() {
           }
           : {
             status: response.canExecute === false ? 'failure' : 'ready',
-            message: response.canExecute === false ? 'Preflight rejected' : `${response.modelCatalog?.models?.length || 0} models checked`,
+            message: response.canExecute === false
+              ? 'Preflight rejected; the original Session is unchanged.'
+              : `${response.modelCatalog?.models?.length || 0} models checked`,
             validation,
           });
       } catch (error) {
@@ -16316,36 +18136,11 @@ async function rebindResponseWasAccepted(session, target, previousRunId, expecte
 }
 
 async function waitForProfileRebindCompletion(session, profile, response) {
-  const expectedRunId = String(response?.runId || '').trim();
-  if (!expectedRunId) {
-    throw sessionContractError('session_run_not_found', 'Rebind did not return a run ID.');
-  }
-  const completed = await waitForSessionReady(
-    session.hostId,
-    response.sessionId || session.sessionId,
-    managedSessionStartTimeoutMs(getHost(session.hostId), 'resume'),
-    { launchResponse: response }
+  return waitForAcceptedRebindCompletion(
+    session,
+    response,
+    rebindTargetSummary(profile?.profileId, profile)
   );
-  if (!completed?.live) {
-    const failure = completed?.resumeError || {};
-    throw sessionContractError(
-      failure.code || 'session_rebind_failed',
-      failure.error || `Rebind failed while starting run ${shortId(expectedRunId)} (${completed?.state || 'unknown state'}).`
-    );
-  }
-  const runtime = await fetchJson(`/api/sessions/${encodeURIComponent(response.sessionId || session.sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
-  const binding = runtime?.apiBinding || runtime?.sessionBinding || null;
-  if (
-    String(runtime?.runId || '').trim() !== expectedRunId
-    || runtime?.runStatus !== 'live'
-    || !rebindTargetMatchesBinding(binding, profile)
-  ) {
-    throw sessionContractError(
-      'session_run_state_conflict',
-      'Rebind completed with a different run or API binding.'
-    );
-  }
-  return { ...completed, runtimeConfig: runtime, apiBinding: binding };
 }
 
 async function applyProfileRebindSessionActionDialog() {
@@ -16404,7 +18199,9 @@ async function applyProfileRebindSessionActionDialog() {
         applySessionSelectionToSessionOptions(session, response?.clientSelection || latestValidation.selection);
         dialog.resultsByKey.set(key, { status: 'success', message: 'Rebind live' });
       } catch (error) {
-        const acceptedResponse = rebindAttempted && rebindFailureMayHaveLostAcceptedResponse(error)
+        const acceptedResponse = rebindAttempted
+          && !rebindFailureIsLocalCoordinationError(error)
+          && rebindFailureMayHaveLostAcceptedResponse(error)
           ? rebindResponseWithClientSelection(
             await rebindResponseWasAccepted(
               session,
@@ -16426,7 +18223,11 @@ async function applyProfileRebindSessionActionDialog() {
             finalError = completionError;
           }
         }
-        if (finalError) {
+        if (
+          finalError
+          && finalError.code !== 'session_start_observation_unresolved'
+          && !rebindFailureIsLocalCoordinationError(finalError)
+        ) {
           const canonical = latestValidation?.canonical || session;
           recordSessionRebindFailure(
             canonical,
@@ -16437,7 +18238,13 @@ async function applyProfileRebindSessionActionDialog() {
         }
         if (!sessionActionOperationIsCurrent(operationId)) return;
         dialog.resultsByKey.set(key, finalError
-          ? { status: sessionActionErrorStatus(finalError), message: finalError.message || String(finalError), code: finalError.code || '' }
+          ? {
+            status: finalError.code === 'session_start_observation_unresolved'
+              ? 'skipped'
+              : sessionActionErrorStatus(finalError),
+            message: finalError.message || String(finalError),
+            code: finalError.code || '',
+          }
           : { status: 'success', message: 'Rebind live; response was interrupted' });
       } finally {
         setSessionApiRebindBusy(session, false);
@@ -17027,7 +18834,8 @@ function renderStatusWindow() {
 
   const runtime = getRuntimeForSession(session) || {};
   const externalActivity = getExternalTerminalActivityForSession(session, runtime);
-  const activeTurn = Boolean(session.live && runtimeIsActive(runtime));
+  const runtimeActive = runtimeIsActive(runtime);
+  const activeTurn = Boolean(session.live && runtimeActive);
   const runtimeIssue = runtimeIssuePresentation(runtime);
   const host = getHost(session.hostId);
   const stream = getStreamStatusForSession(session) || {};
@@ -17062,10 +18870,10 @@ function renderStatusWindow() {
   renderStatusSummaryCard(
     summaryGrid,
     'Phase',
-    prettyStatusLabel(runtime.phase || session.state || 'unknown'),
+    prettyStatusLabel(window.RemoteCodexSessionRuntimeState.displayPhase(runtime, session.state || 'unknown')),
     externalActivity.active && !runtimeIsActive(runtime)
       ? `External terminal active for ${formatElapsedSince(externalActivity.updatedAt) || '0s'}`
-      : runtime.busy
+      : runtimeActive
       ? `Busy for ${phaseSince || '0s'}`
       : phaseSince
         ? `Updated ${phaseSince} ago`
@@ -17077,7 +18885,7 @@ function renderStatusWindow() {
     'Turn',
     externalActivity.active && !runtimeIsActive(runtime)
       ? `${externalActivity.turnId ? `${shortId(externalActivity.turnId)} | ` : ''}External terminal`
-      : runtime.activeTurnId ? shortId(runtime.activeTurnId) : (activeTurn ? prettyStatusLabel(runtime.currentTurnStatus || runtime.phase || 'active') : 'none'),
+      : runtimeActive && runtime.activeTurnId ? shortId(runtime.activeTurnId) : (activeTurn && runtimeActive ? prettyStatusLabel(runtime.currentTurnStatus || runtime.phase || 'active') : 'none'),
     externalActivity.active && !runtimeIsActive(runtime)
       ? 'Observed from the native Codex rollout; Remote Runner controls remain idle.'
       : activeTurn
@@ -17129,9 +18937,9 @@ function renderStatusWindow() {
     : 'Session Ended';
   compactButton.disabled = !session.live || !runtime.threadId;
   compactButton.textContent = runtime.threadId ? 'Compact Context' : 'No Thread';
-  steerInput.disabled = !session.live || !runtime.activeTurnId;
-  steerSubmitButton.disabled = !session.live || !runtime.activeTurnId;
-  steerInput.placeholder = runtime.activeTurnId
+  steerInput.disabled = !session.live || !runtimeActive || !runtime.activeTurnId;
+  steerSubmitButton.disabled = !session.live || !runtimeActive || !runtime.activeTurnId;
+  steerInput.placeholder = runtimeActive && runtime.activeTurnId
     ? 'Ask Codex to adjust the current turn without starting over'
     : 'No active turn to steer right now';
   shellCommandInput.disabled = !session.live || !runtime.threadId;
@@ -17325,119 +19133,8 @@ function renderStatusWindow() {
   el('status-window-subtitle').textContent = `${pendingRequests.length} pending request${pendingRequests.length === 1 ? '' : 's'} | ${diagnostics.length} events captured`;
 }
 
-function renderPickerEntries(container, entries, emptyText, onSelect) {
-  container.innerHTML = '';
-
-  if (!entries.length) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    empty.textContent = emptyText;
-    container.appendChild(empty);
-    return;
-  }
-
-  for (const entry of entries) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'picker-entry';
-    button.innerHTML = `
-      <div class="name">${entry.title || entry.name || pathLeaf(entry.path) || entry.path}</div>
-      <div class="path">${entry.path}</div>
-    `;
-    button.onclick = () => onSelect(entry.path);
-    container.appendChild(button);
-  }
-}
-
-function renderPickerChips(container, entries, activePath, onSelect) {
-  container.innerHTML = '';
-
-  if (!entries.length) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    empty.textContent = 'No root paths were reported by this host.';
-    container.appendChild(empty);
-    return;
-  }
-
-  for (const entry of entries) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = `picker-chip secondary-button ${entry.path === activePath ? 'active' : ''}`.trim();
-    button.textContent = entry.name || entry.path;
-    button.onclick = () => {
-      browseDirectoryPath(entry.path).catch(reportDirectoryPickerError);
-    };
-    container.appendChild(button);
-  }
-}
-
 function renderDirectoryPicker() {
-  const overlay = el('directory-picker-overlay');
-  const picker = el('directory-picker');
-  const host = getHost(state.selectedHostId);
-  const pickerHost = el('picker-host');
-  const pickerStatus = el('picker-status');
-  const pickerCurrentPath = el('picker-current-path');
-  const upButton = el('picker-up-button');
-  const refreshButton = el('picker-refresh-button');
-  const selectButton = el('picker-select-button');
-
-  if (!state.directoryPicker.open) {
-    overlay.classList.add('hidden');
-    picker.classList.add('hidden');
-    syncModalBodyState();
-    return;
-  }
-
-  overlay.classList.remove('hidden');
-  picker.classList.remove('hidden');
-  syncModalBodyState();
-  pickerHost.textContent = host ? host.label : 'No host selected';
-  pickerCurrentPath.textContent = state.directoryPicker.currentPath || '(pick a root or recent directory)';
-
-  if (!host) {
-    pickerStatus.textContent = 'Choose a host first, then browse directories on that machine.';
-  } else if (state.directoryPicker.loading) {
-    pickerStatus.textContent = 'Loading directories from the selected host...';
-  } else if (state.directoryPicker.error) {
-    pickerStatus.textContent = state.directoryPicker.error;
-  } else {
-    pickerStatus.textContent = 'Tap a folder to enter it, then use the current directory.';
-  }
-
-  upButton.disabled = state.directoryPicker.loading || !state.directoryPicker.parentPath;
-  refreshButton.disabled = state.directoryPicker.loading || !host;
-  selectButton.disabled = state.directoryPicker.loading || !state.directoryPicker.currentPath;
-
-  renderPickerChips(
-    el('picker-roots'),
-    state.directoryPicker.roots,
-    state.directoryPicker.currentPath,
-    (targetPath) => {
-      browseDirectoryPath(targetPath).catch(reportDirectoryPickerError);
-    }
-  );
-
-  renderPickerEntries(
-    el('picker-recents'),
-    host ? getRecentDirectories(host.hostId) : [],
-    'No recent workspace paths were discovered for this host yet.',
-    (targetPath) => {
-      browseDirectoryPath(targetPath).catch(reportDirectoryPickerError);
-    }
-  );
-
-  renderPickerEntries(
-    el('picker-directories'),
-    state.directoryPicker.directories,
-    state.directoryPicker.loading
-      ? 'Loading...'
-      : 'This folder does not have any visible subdirectories.',
-    (targetPath) => {
-      browseDirectoryPath(targetPath).catch(reportDirectoryPickerError);
-    }
-  );
+  getDirectoryPickerController()?.render();
 }
 
 function renderDiffLine(line) {
@@ -17484,11 +19181,13 @@ function renderFileChangeDetails(fileChanges = [], stateKey = '', disclosurePref
   for (const [index, change] of fileChanges.entries()) {
     const details = document.createElement('details');
     details.className = 'thinking-file-change-card';
-    const disclosureKey = `${disclosurePrefix}::${change.path || index}`;
+    const changePath = structuredThinkingText(change?.path).trim() || 'workspace change';
+    const disclosureKey = `${disclosurePrefix}::${changePath || index}`;
     bindThinkingDisclosure(details, stateKey, disclosureKey, false);
-    const additions = toCount(change.additions);
-    const deletions = toCount(change.deletions);
-    const status = normalizeFileChangeStatus(change.status) || (change.diff ? 'modified' : 'changed');
+    const additions = toCount(change?.additions);
+    const deletions = toCount(change?.deletions);
+    const diffText = structuredThinkingText(change?.diff).trim();
+    const status = normalizeFileChangeStatus(change?.status) || (diffText ? 'modified' : 'changed');
     const stats = [];
     if (additions !== null) {
       stats.push(`<span class="diff-stat added">+${additions}</span>`);
@@ -17501,13 +19200,12 @@ function renderFileChangeDetails(fileChanges = [], stateKey = '', disclosurePref
     }
     details.innerHTML = `
       <summary class="thinking-file-change-summary">
-        <span class="thinking-file-path">${escapeHtml(change.path || 'workspace change')}</span>
+        <span class="thinking-file-path">${escapeHtml(changePath)}</span>
         ${stats.join('')}
       </summary>
     `;
     const diff = document.createElement('div');
     diff.className = 'thinking-diff-block';
-    const diffText = String(change.diff || '').trim();
     if (diffText) {
       const lines = diffText.split(/\r?\n/);
       const diffDisclosureKey = `${disclosureKey}::diff`;
@@ -17612,31 +19310,41 @@ function isThinkingContentPinnedToBottom(scroller) {
   return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
 }
 
-function thinkingEntryViewportKey(entry, index) {
-  const stableKey = entry?.groupKey
-    || entry?.identity?.groupKey
-    || entry?.activityKey
-    || entry?.identity?.activityKey;
+function thinkingEntryStableIdentityKey(entry, index = 0) {
+  const identity = entry?.identity || {};
+  const stableEntities = [
+    ['call', identity.callId || entry?.callId],
+    ['request', identity.requestId || entry?.requestId],
+    ['process', identity.processId || entry?.processId],
+    ['activity', identity.activityKey || entry?.activityKey],
+    ['item', identity.itemId || entry?.itemId],
+  ];
+  for (const [kind, value] of stableEntities) {
+    const normalized = structuredThinkingScalar(value, '').trim();
+    if (normalized) return `${kind}|${normalized}`;
+  }
+  const stableKey = entry?.groupKey || identity.groupKey;
   if (stableKey) {
-    return `thinking|${stableKey}`;
+    return structuredThinkingText(stableKey).trim();
   }
   const identityKey = [
-    entry?.identity?.runId || entry?.runId || '',
-    entry?.identity?.turnId || entry?.turnId || '',
-    entry?.identity?.itemId || entry?.itemId || '',
-    entry?.identity?.callId || entry?.callId || '',
-    entry?.identity?.requestId || entry?.requestId || '',
-    entry?.category || entry?.kind || '',
+    structuredThinkingScalar(identity.runId || entry?.runId, ''),
+    structuredThinkingScalar(identity.turnId || entry?.turnId, ''),
+    structuredThinkingScalar(entry?.category || entry?.kind, ''),
   ].join('|');
   if (identityKey.replaceAll('|', '')) {
-    return `thinking|${identityKey}`;
+    return identityKey;
   }
   return [
-    'thinking',
+    'fallback',
     Number.isFinite(index) ? index : '',
-    entry?.kind || '',
-    entry?.timestamp || '',
+    structuredThinkingScalar(entry?.kind, ''),
+    structuredThinkingText(entry?.timestamp),
   ].join('|');
+}
+
+function thinkingEntryViewportKey(entry, index) {
+  return `thinking|${thinkingEntryStableIdentityKey(entry, index)}`;
 }
 
 function hasDetachedThinkingScroller(container = el('session-log')) {
@@ -17926,7 +19634,7 @@ function appendMathBlock(container, mathText, delimiter = '$$') {
 }
 
 function parseMarkdownTableRow(line) {
-  return String(line || '')
+  return structuredThinkingText(line)
     .trim()
     .replace(/^\|/, '')
     .replace(/\|$/, '')
@@ -17940,7 +19648,7 @@ function isMarkdownTableSeparator(line) {
 }
 
 function readMarkdownTable(lines, startIndex) {
-  if (!String(lines[startIndex] || '').includes('|') || !isMarkdownTableSeparator(lines[startIndex + 1] || '')) {
+  if (!structuredThinkingText(lines[startIndex]).includes('|') || !isMarkdownTableSeparator(lines[startIndex + 1] || '')) {
     return null;
   }
 
@@ -17949,7 +19657,7 @@ function readMarkdownTable(lines, startIndex) {
   let nextIndex = startIndex + 2;
   while (nextIndex < lines.length) {
     const line = lines[nextIndex];
-    if (!String(line || '').trim() || !String(line || '').includes('|')) {
+    if (!structuredThinkingText(line).trim() || !structuredThinkingText(line).includes('|')) {
       break;
     }
     rows.push(parseMarkdownTableRow(line));
@@ -17988,10 +19696,21 @@ function appendMarkdownTable(container, table) {
   container.appendChild(wrapper);
 }
 
+const pendingMathTypesetContainers = new Set();
+let mathTypesetScheduled = false;
+
 function scheduleMathTypeset(container) {
+  if (container) pendingMathTypesetContainers.add(container);
+  if (mathTypesetScheduled) return;
+  mathTypesetScheduled = true;
   const run = () => {
+    mathTypesetScheduled = false;
+    const containers = Array.from(pendingMathTypesetContainers)
+      .filter((candidate) => candidate?.isConnected);
+    pendingMathTypesetContainers.clear();
+    if (!containers.length) return;
     const scrollSnapshot = captureTranscriptScrollSnapshot();
-    const promise = window.MathJax?.typesetPromise?.([container]);
+    const promise = window.MathJax?.typesetPromise?.(containers);
     if (!promise?.then) {
       restoreTranscriptScrollSnapshot(scrollSnapshot);
       return;
@@ -18012,7 +19731,7 @@ function scheduleMathTypeset(container) {
 }
 
 function renderInlineMarkdown(parent, text) {
-  const source = String(text || '');
+  const source = structuredThinkingText(text);
   const tokenPattern = /(`[^`]+`|\$\$[^$]+\$\$|\\\([^]*?\\\)|\\\[[^]*?\\\]|\$[^\s$](?:\\.|[^$])*?\$|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
   let lastIndex = 0;
   let match = tokenPattern.exec(source);
@@ -18098,19 +19817,20 @@ function appendCodeBlock(container, codeText, language = '') {
 }
 
 function renderMarkdown(container, text) {
+  const normalizedText = structuredThinkingText(text);
   const renderer = window.RemoteCodexMarkdownRenderer;
   if (!renderer?.render) {
     container.replaceChildren();
     container.classList.add('markdown-plain-fallback');
-    container.textContent = String(text == null ? '' : text);
+    container.textContent = normalizedText;
     return;
   }
   try {
-    renderer.render(container, text);
+    renderer.render(container, normalizedText);
   } catch (_) {
     container.replaceChildren();
     container.classList.add('markdown-plain-fallback');
-    container.textContent = String(text == null ? '' : text);
+    container.textContent = normalizedText;
   }
   if (container.querySelector?.('.markdown-math-inline, .markdown-math-block')) {
     scheduleMathTypeset(container);
@@ -18118,7 +19838,7 @@ function renderMarkdown(container, text) {
 }
 
 async function copyTextToClipboard(text) {
-  const value = String(text || '');
+  const value = structuredThinkingText(text);
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value);
     return;
@@ -18148,13 +19868,7 @@ function flashCopyButton(button, label = 'Copied') {
 }
 
 function thinkingEntryKey(entry, index = 0) {
-  return String(
-    entry?.groupKey
-      || entry?.identity?.groupKey
-      || entry?.activityKey
-      || entry?.identity?.activityKey
-      || thinkingEntryViewportKey(entry, index)
-  );
+  return thinkingEntryStableIdentityKey(entry, index);
 }
 
 function thinkingEntryActivityKeys(entry) {
@@ -18162,7 +19876,7 @@ function thinkingEntryActivityKeys(entry) {
     ...(Array.isArray(entry?.activityKeys) ? entry.activityKeys : []),
     entry?.activityKey,
     entry?.identity?.activityKey,
-  ].map((value) => String(value || '')).filter(Boolean);
+  ].map((value) => structuredThinkingScalar(value, '').trim()).filter(Boolean);
   return [...new Set(values)];
 }
 
@@ -18171,7 +19885,10 @@ function applyThinkingEntryData(node, entry, index = 0) {
   const activityKeys = thinkingEntryActivityKeys(entry);
   node.dataset.thinkingEntryKey = entryKey;
   node.dataset.thinkingViewportKey = thinkingEntryViewportKey(entry, index);
-  node.dataset.thinkingEntryCategory = String(entry?.category || entry?.kind || 'thinking');
+  node.dataset.thinkingEntryCategory = structuredThinkingScalar(
+    entry?.category || entry?.kind,
+    'thinking'
+  );
   node.dataset.thinkingRenderVersion = thinkingEntryRenderVersion(entry, index);
   if (activityKeys.length) {
     node.dataset.thinkingActivityKey = activityKeys[0];
@@ -18182,7 +19899,7 @@ function applyThinkingEntryData(node, entry, index = 0) {
 }
 
 function isThinkingOperationEntry(entry) {
-  const category = String(entry?.category || entry?.kind || '').toLowerCase();
+  const category = structuredThinkingScalar(entry?.category || entry?.kind, '').toLowerCase();
   return !['reasoning', 'plan', 'commentary'].includes(category)
     || (Array.isArray(entry?.fileChanges) && entry.fileChanges.length > 0);
 }
@@ -18191,9 +19908,12 @@ function formatThinkingStructuredValue(value) {
   if (value == null || value === '') return '';
   if (typeof value === 'string') return value;
   try {
-    return JSON.stringify(value, null, 2);
+    const serialized = window.RemoteCodexStructuredText?.safeJson
+      ? window.RemoteCodexStructuredText.safeJson(value)
+      : JSON.stringify(value, null, 2);
+    return serialized || structuredThinkingText(value);
   } catch (_) {
-    return String(value);
+    return structuredThinkingText(value);
   }
 }
 
@@ -18225,7 +19945,7 @@ function thinkingRetainedPreviewCopy() {
 }
 
 function thinkingTextNeedsExpansion(value, options = {}) {
-  const text = String(value || '');
+  const text = structuredThinkingText(value);
   const preformatted = options.preformatted === true || options.code === true;
   const maxChars = Math.max(1, Number(options.maxChars || (
     preformatted ? THINKING_EXPANDABLE_CODE_CHAR_LIMIT : THINKING_EXPANDABLE_TEXT_CHAR_LIMIT
@@ -18237,7 +19957,7 @@ function thinkingTextNeedsExpansion(value, options = {}) {
 }
 
 function thinkingSourceWasTruncated(value, flagged = false) {
-  const text = String(value || '');
+  const text = structuredThinkingText(value);
   return flagged === true
     || /(?:^|\r?\n)\.\.\.\[(?:activity|notification|text|assistant output|diff) truncated\]\s*$/i.test(text)
     || /^\.\.\.\[earlier output truncated\]\r?\n/i.test(text);
@@ -18253,7 +19973,7 @@ function thinkingStructuredValueWasTruncated(value) {
 
 function bindThinkingTextExpansion(container, content, value, options = {}) {
   if (!container || !content) return null;
-  const text = String(value || '');
+  const text = structuredThinkingText(value);
   const disclosureKey = String(options.disclosureKey || '').trim();
   const storageKey = options.stateKey && disclosureKey
     ? thinkingDisclosureStateKey(options.stateKey, disclosureKey)
@@ -18356,27 +20076,30 @@ function appendThinkingOperationField(parent, labelText, value, options = {}) {
 }
 
 function thinkingOperationTitle(entry) {
-  const category = String(entry?.category || entry?.kind || 'tool').toLowerCase();
+  const category = structuredThinkingScalar(entry?.category || entry?.kind, 'tool').toLowerCase();
   if (category === 'collaboration' || category === 'subagent') {
-    const label = entry.agentPath || entry.agentNickname || entry.agentThreadId || 'sub-agent';
+    const label = structuredThinkingText(entry.agentPath || entry.agentNickname || entry.agentThreadId) || 'sub-agent';
     return limitText(`Sub-agent ${label}`, 120);
   }
   if (category === 'command') {
-    return limitText(String(entry.command || entry.name || entry.text || 'Command').split(/\r?\n/)[0], 120);
+    return limitText(structuredThinkingText(entry.command || entry.name || entry.text || 'Command').split(/\r?\n/)[0], 120);
   }
   if (category === 'file') {
     const count = Array.isArray(entry.fileChanges) ? entry.fileChanges.length : 0;
     return count ? `${count} file${count === 1 ? '' : 's'} changed` : 'Workspace changes';
   }
   if (category === 'search') {
-    return limitText(entry.query || entry.text || 'Web search', 120);
+    return limitText(structuredThinkingText(entry.query || entry.text || 'Web search'), 120);
   }
-  const toolName = [entry.server || entry.namespace, entry.tool || entry.name].filter(Boolean).join(' / ');
-  return limitText(toolName || entry.name || entry.text || prettyStatusLabel(category), 120);
+  const toolName = [entry.server || entry.namespace, entry.tool || entry.name]
+    .map((value) => structuredThinkingText(value))
+    .filter(Boolean)
+    .join(' / ');
+  return limitText(toolName || structuredThinkingText(entry.name || entry.text) || prettyStatusLabel(category), 120);
 }
 
 function thinkingOperationStatus(entry) {
-  const status = String(entry?.status || '').trim();
+  const status = structuredThinkingScalar(entry?.status, '').trim();
   if (status) return status;
   if (entry?.success === false || entry?.error) return 'failed';
   if (entry?.final === true || entry?.terminal === true) return 'completed';
@@ -18384,7 +20107,7 @@ function thinkingOperationStatus(entry) {
 }
 
 function thinkingOperationStatusTone(status) {
-  const value = String(status || '').toLowerCase();
+  const value = structuredThinkingScalar(status, '').toLowerCase();
   if (/fail|error|cancel|declin|denied|interrupted/.test(value)) return 'failed';
   if (/complete|success|done|approved|interacted|spawned|finished/.test(value)) return 'completed';
   return 'running';
@@ -18392,9 +20115,9 @@ function thinkingOperationStatusTone(status) {
 
 function formatThinkingOperationMeta(entry) {
   const values = [];
-  if (entry?.cwd) values.push(entry.cwd);
+  if (entry?.cwd) values.push(structuredThinkingText(entry.cwd));
   if (entry?.exitCode !== null && typeof entry?.exitCode !== 'undefined') {
-    values.push(`exit ${entry.exitCode}`);
+    values.push(`exit ${structuredThinkingScalar(entry.exitCode, '')}`);
   }
   if (Number.isFinite(Number(entry?.durationMs))) {
     const duration = Number(entry.durationMs);
@@ -18437,8 +20160,8 @@ function createThinkingOperationEntry(entry, index, stateKey, session) {
     body.appendChild(metaNode);
   }
 
-  const category = String(entry.category || entry.kind || '').toLowerCase();
-  const overview = String(entry.text || '').trim();
+  const category = structuredThinkingScalar(entry.category || entry.kind, '').toLowerCase();
+  const overview = structuredThinkingText(entry.text).trim();
   const titleText = thinkingOperationTitle(entry);
   const appendField = (labelText, value, options = {}) => appendThinkingOperationField(
     body,
@@ -18487,7 +20210,7 @@ function createThinkingOperationEntry(entry, index, stateKey, session) {
   const commandFallbackOutput = category === 'command'
     && !entry.output
     && !entry.stdout
-    && overview !== String(entry.command || '').trim()
+    && overview !== structuredThinkingText(entry.command).trim()
     ? overview
     : '';
   appendField('Output', entry.output || entry.stdout || commandFallbackOutput, {
@@ -18536,13 +20259,14 @@ function createThinkingNarrativeEntry(entry, index, stateKey, session) {
   top.className = 'thinking-history-top';
   const kind = document.createElement('span');
   kind.className = 'thinking-history-kind';
-  kind.textContent = prettyStatusLabel(entry.kind || entry.category || 'thinking');
+  kind.textContent = prettyStatusLabel(structuredThinkingScalar(entry.kind || entry.category, 'thinking'));
   const timestamp = document.createElement('span');
   timestamp.textContent = formatTime(entry.updatedAt || entry.timestamp);
   top.append(kind, timestamp);
   const text = document.createElement('div');
   text.className = 'thinking-history-text markdown-body';
-  const narrativeText = String(entry.text == null ? '' : entry.text);
+  const narrativeText = structuredThinkingText(entry.text);
+  text.dataset.thinkingTextVersion = hashThinkingEntryVersion(narrativeText);
   renderMarkdown(text, narrativeText);
   item.append(top, text);
   bindThinkingTextExpansion(item, text, narrativeText, {
@@ -18564,7 +20288,7 @@ function createThinkingEntryElement(entry, index, stateKey, session) {
 }
 
 function hashThinkingEntryVersion(value) {
-  const text = String(value == null ? '' : value);
+  const text = structuredThinkingText(value);
   let hash = 2166136261;
   for (let index = 0; index < text.length; index += 1) {
     hash ^= text.charCodeAt(index);
@@ -18628,9 +20352,37 @@ function thinkingEntriesRenderVersion(entries = []) {
   return hashThinkingEntryVersion(versionParts.join('\u001e'));
 }
 
-function buildThinkingMessageElement(session, segment, runtime, stream, isLivePlaceholder = false) {
+function thinkingSegmentStateKey(session, segment) {
   const keyBase = getSessionKey(session) || session.sessionId || 'session';
-  const stateKey = `${keyBase}::thinking::${segment?.userTimestamp || 'live'}`;
+  const segmentKey = segment?.userEntryKey || segment?.userTimestamp || 'live';
+  return `${keyBase}::thinking::${segmentKey}`;
+}
+
+function stabilizeThinkingSummaryLayout(details) {
+  const preview = details?.querySelector?.(':scope > .thinking-summary > .thinking-preview');
+  if (preview) {
+    Object.assign(preview.style, {
+      display: '-webkit-box',
+      minHeight: '2.9em',
+      overflow: 'hidden',
+      whiteSpace: 'pre-wrap',
+      WebkitBoxOrient: 'vertical',
+      WebkitLineClamp: '2',
+    });
+  }
+  const note = details?.querySelector?.(':scope > .thinking-summary > .thinking-note');
+  if (note) {
+    Object.assign(note.style, {
+      minHeight: '1.45em',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    });
+  }
+}
+
+function buildThinkingMessageElement(session, segment, runtime, stream, isLivePlaceholder = false) {
+  const stateKey = thinkingSegmentStateKey(session, segment);
   const details = document.createElement('details');
   details.className = 'thinking-card';
   details.dataset.thinkingStateKey = stateKey;
@@ -18690,6 +20442,7 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
       <div class="thinking-note">${escapeHtml(meta)}</div>
     </summary>
   `;
+  stabilizeThinkingSummaryLayout(details);
 
   const content = document.createElement('div');
   content.className = 'thinking-content';
@@ -18706,9 +20459,11 @@ function buildThinkingMessageElement(session, segment, runtime, stream, isLivePl
     }
     content.appendChild(history);
   } else {
+    const reasoningSummary = structuredThinkingText(runtime?.reasoningSummary).trim();
+    const planSummary = structuredThinkingText(runtime?.planSummary).trim();
     const liveThinking = [
-      runtime.reasoningSummary ? `Reasoning:\n${runtime.reasoningSummary}` : '',
-      runtime.planSummary ? `Plan:\n${runtime.planSummary}` : '',
+      reasoningSummary ? `Reasoning:\n${reasoningSummary}` : '',
+      planSummary ? `Plan:\n${planSummary}` : '',
     ].filter(Boolean).join('\n\n');
     const block = document.createElement('div');
     block.className = 'thinking-block';
@@ -18847,12 +20602,199 @@ function restoreThinkingEntryInnerState(root, snapshot) {
   }
 }
 
+function syncThinkingPatchAttributes(existing, next) {
+  if (!existing || !next) return;
+  existing.className = next.className;
+  for (const name of existing.getAttributeNames()) {
+    if (name.startsWith('data-') || name.startsWith('aria-')) {
+      existing.removeAttribute(name);
+    }
+  }
+  for (const name of next.getAttributeNames()) {
+    if (name.startsWith('data-') || name.startsWith('aria-')) {
+      existing.setAttribute(name, next.getAttribute(name));
+    }
+  }
+}
+
+function patchThinkingSimpleElement(existing, next) {
+  if (!existing || !next || existing.tagName !== next.tagName) return next;
+  syncThinkingPatchAttributes(existing, next);
+  if (existing.textContent !== next.textContent) {
+    existing.textContent = next.textContent;
+  }
+  return existing;
+}
+
+function patchThinkingExpansionAccessories(existing, next, content = null) {
+  const expanded = existing.classList.contains('is-expanded')
+    || existing.querySelector(':scope > .thinking-expand-toggle')?.getAttribute('aria-expanded') === 'true';
+  const existingToggle = existing.querySelector(':scope > .thinking-expand-toggle');
+  const nextToggle = next.querySelector(':scope > .thinking-expand-toggle');
+  if (existingToggle && nextToggle) {
+    syncThinkingPatchAttributes(existingToggle, nextToggle);
+    existingToggle.setAttribute('aria-expanded', String(expanded));
+    existingToggle.textContent = thinkingExpansionCopy(expanded);
+    existingToggle.title = thinkingExpansionCopy(expanded);
+  } else if (!existingToggle && nextToggle) {
+    existing.appendChild(nextToggle);
+  } else if (existingToggle && !nextToggle) {
+    existingToggle.remove();
+  }
+
+  const existingNote = existing.querySelector(':scope > .thinking-source-truncation-note');
+  const nextNote = next.querySelector(':scope > .thinking-source-truncation-note');
+  if (existingNote && nextNote) {
+    patchThinkingSimpleElement(existingNote, nextNote);
+  } else if (!existingNote && nextNote) {
+    existing.appendChild(nextNote);
+  } else if (existingNote && !nextNote) {
+    existingNote.remove();
+  }
+
+  existing.classList.toggle('is-expanded', expanded && Boolean(nextToggle));
+  content?.classList.toggle('is-expanded', expanded && Boolean(nextToggle));
+}
+
+function patchThinkingOperationField(existing, next) {
+  if (!existing || !next) return next;
+  const expanded = existing.classList.contains('is-expanded');
+  syncThinkingPatchAttributes(existing, next);
+  const existingLabel = existing.querySelector(':scope > .thinking-operation-field-label');
+  const nextLabel = next.querySelector(':scope > .thinking-operation-field-label');
+  if (existingLabel && nextLabel) patchThinkingSimpleElement(existingLabel, nextLabel);
+
+  let existingContent = existing.querySelector(':scope > .thinking-operation-code, :scope > .thinking-operation-value');
+  const nextContent = next.querySelector(':scope > .thinking-operation-code, :scope > .thinking-operation-value');
+  if (existingContent && nextContent && existingContent.tagName === nextContent.tagName) {
+    patchThinkingSimpleElement(existingContent, nextContent);
+  } else if (nextContent) {
+    existingContent?.replaceWith(nextContent);
+    existingContent = nextContent;
+  } else {
+    existingContent?.remove();
+    existingContent = null;
+  }
+  existing.classList.toggle('is-expanded', expanded);
+  existingContent?.classList.toggle('is-expanded', expanded);
+  patchThinkingExpansionAccessories(existing, next, existingContent);
+  return existing;
+}
+
+function thinkingOperationBodyChildKey(node, index = 0) {
+  const fieldKey = node?.dataset?.thinkingFieldKey || '';
+  if (fieldKey) return `field|${fieldKey}`;
+  if (node?.classList?.contains('thinking-operation-meta')) return 'meta';
+  if (node?.classList?.contains('thinking-file-change-list')) return 'file-changes';
+  if (node?.classList?.contains('message-file-list')) return 'files';
+  return `other|${node?.tagName || ''}|${node?.className || ''}|${index}`;
+}
+
+function patchThinkingOperationBody(existingBody, nextBody) {
+  if (!existingBody || !nextBody) return nextBody;
+  syncThinkingPatchAttributes(existingBody, nextBody);
+  const existingByKey = new Map(Array.from(existingBody.children).map((node, index) => [
+    thinkingOperationBodyChildKey(node, index),
+    node,
+  ]));
+  const desired = Array.from(nextBody.children).map((nextNode, index) => {
+    const key = thinkingOperationBodyChildKey(nextNode, index);
+    const existing = existingByKey.get(key) || null;
+    if (existing) existingByKey.delete(key);
+    if (!existing) return nextNode;
+    if (key.startsWith('field|')) {
+      return patchThinkingOperationField(existing, nextNode);
+    }
+    if (key === 'meta') {
+      return patchThinkingSimpleElement(existing, nextNode);
+    }
+    if (key === 'files') {
+      return existing.dataset.fileRenderVersion === nextNode.dataset.fileRenderVersion
+        ? existing
+        : nextNode;
+    }
+    return existing.textContent === nextNode.textContent ? existing : nextNode;
+  });
+  for (const stale of existingByKey.values()) stale.remove();
+  let cursor = existingBody.firstChild;
+  for (const node of desired) {
+    if (node === cursor) {
+      cursor = cursor.nextSibling;
+    } else {
+      existingBody.insertBefore(node, cursor);
+    }
+  }
+  return existingBody;
+}
+
+function patchThinkingOperationSummary(existingSummary, nextSummary) {
+  if (!existingSummary || !nextSummary) return nextSummary;
+  syncThinkingPatchAttributes(existingSummary, nextSummary);
+  const existingIdentity = existingSummary.querySelector(':scope > .thinking-operation-identity');
+  const nextIdentity = nextSummary.querySelector(':scope > .thinking-operation-identity');
+  if (existingIdentity && nextIdentity) {
+    syncThinkingPatchAttributes(existingIdentity, nextIdentity);
+    for (const className of ['thinking-operation-kind', 'thinking-operation-title']) {
+      const existingPart = existingIdentity.querySelector(`:scope > .${className}`);
+      const nextPart = nextIdentity.querySelector(`:scope > .${className}`);
+      if (existingPart && nextPart) patchThinkingSimpleElement(existingPart, nextPart);
+    }
+  }
+  const existingStatus = existingSummary.querySelector(':scope > .thinking-operation-status');
+  const nextStatus = nextSummary.querySelector(':scope > .thinking-operation-status');
+  if (existingStatus && nextStatus) patchThinkingSimpleElement(existingStatus, nextStatus);
+  return existingSummary;
+}
+
 function patchThinkingHistoryEntry(existing, next, stateKey) {
   if (!existing || !next || existing.tagName !== next.tagName) return next;
   const keepOpen = existing instanceof HTMLDetailsElement ? existing.open : null;
   const innerState = captureThinkingEntryInnerState(existing);
+  const existingOperation = existing.classList.contains('thinking-operation');
+  const nextOperation = next.classList.contains('thinking-operation');
+  if (existingOperation !== nextOperation) return next;
   syncThinkingEntryAttributes(existing, next);
-  existing.replaceChildren(...Array.from(next.childNodes));
+  if (existingOperation) {
+    const existingSummary = existing.querySelector(':scope > .thinking-operation-summary');
+    const nextSummary = next.querySelector(':scope > .thinking-operation-summary');
+    if (existingSummary && nextSummary) {
+      patchThinkingOperationSummary(existingSummary, nextSummary);
+    }
+    const existingBody = existing.querySelector(':scope > .thinking-operation-body');
+    const nextBody = next.querySelector(':scope > .thinking-operation-body');
+    if (existingBody && nextBody) {
+      patchThinkingOperationBody(existingBody, nextBody);
+    }
+  } else {
+    const existingTop = existing.querySelector(':scope > .thinking-history-top');
+    const nextTop = next.querySelector(':scope > .thinking-history-top');
+    if (existingTop && nextTop) {
+      syncThinkingPatchAttributes(existingTop, nextTop);
+      const existingParts = Array.from(existingTop.children);
+      const nextParts = Array.from(nextTop.children);
+      for (let index = 0; index < nextParts.length; index += 1) {
+        if (existingParts[index]) patchThinkingSimpleElement(existingParts[index], nextParts[index]);
+      }
+    }
+    const existingText = existing.querySelector(':scope > .thinking-history-text');
+    const nextText = next.querySelector(':scope > .thinking-history-text');
+    if (existingText && nextText) {
+      syncThinkingPatchAttributes(existingText, nextText);
+      if (existingText.dataset.thinkingTextVersion !== nextText.dataset.thinkingTextVersion) {
+        existingText.replaceChildren(...Array.from(nextText.childNodes));
+      }
+    }
+    patchThinkingExpansionAccessories(existing, next, existingText);
+    const existingChanges = existing.querySelector(':scope > .thinking-file-change-list');
+    const nextChanges = next.querySelector(':scope > .thinking-file-change-list');
+    if (existingChanges && nextChanges && existingChanges.textContent !== nextChanges.textContent) {
+      existingChanges.replaceWith(nextChanges);
+    } else if (!existingChanges && nextChanges) {
+      existing.appendChild(nextChanges);
+    } else if (existingChanges && !nextChanges) {
+      existingChanges.remove();
+    }
+  }
   if (keepOpen !== null) {
     existing.open = keepOpen;
     const disclosureKey = existing.dataset.thinkingDisclosureKey || '';
@@ -18901,6 +20843,59 @@ function patchThinkingHistoryList(existingHistory, nextHistory, stateKey) {
   }
 }
 
+function patchThinkingCardSummary(existingSummary, nextSummary) {
+  if (!existingSummary || !nextSummary) return nextSummary;
+  syncThinkingPatchAttributes(existingSummary, nextSummary);
+  const existingTitleRow = existingSummary.querySelector(':scope > .thinking-title-row');
+  const nextTitleRow = nextSummary.querySelector(':scope > .thinking-title-row');
+  if (existingTitleRow && nextTitleRow) {
+    syncThinkingPatchAttributes(existingTitleRow, nextTitleRow);
+    for (const className of ['thinking-title', 'thinking-phase']) {
+      const existingPart = existingTitleRow.querySelector(`:scope > .${className}`);
+      const nextPart = nextTitleRow.querySelector(`:scope > .${className}`);
+      if (existingPart && nextPart) patchThinkingSimpleElement(existingPart, nextPart);
+    }
+  }
+  for (const className of ['thinking-preview', 'thinking-note']) {
+    const existingPart = existingSummary.querySelector(`:scope > .${className}`);
+    const nextPart = nextSummary.querySelector(`:scope > .${className}`);
+    if (existingPart && nextPart) patchThinkingSimpleElement(existingPart, nextPart);
+  }
+  return existingSummary;
+}
+
+function patchThinkingScrollerContents(existingScroller, nextScroller, stateKey) {
+  if (!existingScroller || !nextScroller) return;
+  const existingHistory = existingScroller.querySelector(':scope > .thinking-history-list');
+  const nextHistory = nextScroller.querySelector(':scope > .thinking-history-list');
+  const existingBlock = existingScroller.querySelector(':scope > .thinking-block');
+  const nextBlock = nextScroller.querySelector(':scope > .thinking-block');
+  const bottomAnchor = existingScroller.querySelector(':scope > .thinking-bottom-anchor');
+  if (existingHistory && nextHistory) {
+    patchThinkingHistoryList(existingHistory, nextHistory, stateKey);
+  } else if (nextHistory) {
+    existingHistory?.remove();
+    existingBlock?.remove();
+    existingScroller.insertBefore(nextHistory, bottomAnchor);
+  } else if (nextBlock) {
+    existingHistory?.remove();
+    if (existingBlock) {
+      syncThinkingPatchAttributes(existingBlock, nextBlock);
+      const existingLabel = existingBlock.querySelector(':scope > .thinking-label');
+      const nextLabel = nextBlock.querySelector(':scope > .thinking-label');
+      const existingText = existingBlock.querySelector(':scope > .thinking-text');
+      const nextText = nextBlock.querySelector(':scope > .thinking-text');
+      if (existingLabel && nextLabel) patchThinkingSimpleElement(existingLabel, nextLabel);
+      if (existingText && nextText) patchThinkingSimpleElement(existingText, nextText);
+    } else {
+      existingScroller.insertBefore(nextBlock, bottomAnchor);
+    }
+  } else {
+    existingHistory?.remove();
+    existingBlock?.remove();
+  }
+}
+
 function patchThinkingMessageElement(existingMessage, nextMessage) {
   if (!existingMessage || !nextMessage) {
     return;
@@ -18909,13 +20904,6 @@ function patchThinkingMessageElement(existingMessage, nextMessage) {
   const nextCard = nextMessage.querySelector('.thinking-card');
   const existingStateKey = existingCard?.dataset?.thinkingStateKey || '';
   const existingScroller = existingMessage.querySelector('.thinking-content[data-thinking-state-key]');
-  const outerSnapshot = captureTranscriptScrollSnapshot();
-  const thinkingMachine = existingStateKey && existingScroller
-    ? getThinkingScrollMachine(existingStateKey, existingScroller)
-    : null;
-  const thinkingViewportSnapshot = thinkingMachine?.state().mode === 'detached'
-    ? captureViewportElementOffset(existingScroller)
-    : null;
   if (existingStateKey && existingScroller) {
     preserveThinkingViewportForPatch(existingStateKey, existingScroller);
     captureThinkingDisclosureStates(existingMessage, existingStateKey);
@@ -18940,12 +20928,10 @@ function patchThinkingMessageElement(existingMessage, nextMessage) {
   const nextMeta = nextMessage.querySelector(':scope > .message-meta');
   if (existingMeta && nextMeta) existingMeta.textContent = nextMeta.textContent;
   if (existingSummary && nextSummary) {
-    existingSummary.replaceChildren(...Array.from(nextSummary.childNodes));
+    patchThinkingCardSummary(existingSummary, nextSummary);
   }
-  if (existingHistory && nextHistory) {
-    patchThinkingHistoryList(existingHistory, nextHistory, patchedStateKey);
-  } else if (existingScroller && nextScroller) {
-    existingScroller.replaceChildren(...Array.from(nextScroller.childNodes));
+  if (existingScroller && nextScroller) {
+    patchThinkingScrollerContents(existingScroller, nextScroller, patchedStateKey);
   }
 
   const patchedCard = existingMessage.querySelector('.thinking-card');
@@ -18960,8 +20946,6 @@ function patchThinkingMessageElement(existingMessage, nextMessage) {
     restoreThinkingDisclosureStates(existingMessage, patchedStateKey);
     restoreThinkingScrollState(patchedStateKey, patchedScroller, { preserveDetached: true, immediate: true });
   }
-  restoreTranscriptScrollSnapshot(outerSnapshot);
-  restoreViewportElementOffset(thinkingViewportSnapshot);
 }
 
 function renderFileCards(container, session, entry) {
@@ -18972,6 +20956,9 @@ function renderFileCards(container, session, entry) {
 
   const list = document.createElement('div');
   list.className = 'message-file-list';
+  list.dataset.fileRenderVersion = hashThinkingEntryVersion(JSON.stringify(
+    transcriptFileRenderSignature(session, entry)
+  ));
   let imagePreviewCount = 0;
   let uncachedImagePreviewCount = 0;
   const visibleFiles = files.slice(0, MAX_TRANSCRIPT_FILE_CARDS);
@@ -18994,6 +20981,8 @@ function renderFileCards(container, session, entry) {
     ].filter(Boolean).join(' | ');
 
     const isImage = isImageFileRef(displayFile);
+    const isStructure = isStructureFileRef(displayFile);
+    card.classList.toggle('structure', isStructure);
     const canShowUncachedInlinePreview = !isCachedFile && uncachedImagePreviewCount < MAX_UNCACHED_INLINE_IMAGE_PREVIEWS;
     const showInlinePreview = isImage
       && imagePreviewCount < MAX_INLINE_IMAGE_PREVIEWS
@@ -19060,6 +21049,25 @@ function renderFileCards(container, session, entry) {
       };
       actions.appendChild(previewButton);
     }
+    if (isStructure) {
+      const structureButton = document.createElement('button');
+      structureButton.type = 'button';
+      structureButton.className = 'secondary-button structure-preview-action';
+      structureButton.textContent = 'View structure';
+      structureButton.title = 'Open interactive structure preview';
+      structureButton.onclick = async (event) => {
+        event.preventDefault();
+        structureButton.disabled = true;
+        try {
+          await openStructurePreviewForFile({ session, file: displayFile });
+        } catch (error) {
+          reportError(error);
+        } finally {
+          structureButton.disabled = false;
+        }
+      };
+      actions.appendChild(structureButton);
+    }
     const saveLink = document.createElement('a');
     saveLink.className = 'secondary-button';
     saveLink.href = downloadUrl;
@@ -19084,7 +21092,7 @@ function renderFileCards(container, session, entry) {
 }
 
 function estimateTranscriptEntryRenderCost(entry) {
-  const text = String(entry?.text || '');
+  const text = structuredThinkingText(entry?.text);
   const newlineMatches = text.match(/\n/g);
   const fenceMatches = text.match(/```/g);
   return {
@@ -19138,12 +21146,278 @@ function selectTranscriptRenderWindow(visibleTranscript, desiredLimit, options =
   };
 }
 
+function transcriptNodeAliasList(node) {
+  try {
+    const parsed = JSON.parse(node?.dataset?.transcriptNodeAliases || '[]');
+    return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function reconcileTranscriptChildren(log, descriptors, options = {}) {
+  const desired = Array.isArray(descriptors) ? descriptors : [];
+  if (options.replaceAll === true) {
+    const nodes = desired.map((descriptor) => {
+      const node = descriptor.build();
+      node.dataset.transcriptNodeKey = descriptor.key;
+      node.dataset.transcriptRenderVersion = descriptor.version || '';
+      node.dataset.transcriptNodeAliases = JSON.stringify(descriptor.aliases || []);
+      return node;
+    });
+    log.replaceChildren(...nodes);
+    return nodes;
+  }
+
+  const existingNodes = Array.from(log.children);
+  const existingByKey = new Map();
+  const existingByAlias = new Map();
+  for (const node of existingNodes) {
+    const key = node.dataset.transcriptNodeKey || '';
+    if (key && !existingByKey.has(key)) existingByKey.set(key, node);
+    for (const alias of transcriptNodeAliasList(node)) {
+      if (!existingByAlias.has(alias)) existingByAlias.set(alias, node);
+    }
+  }
+  const stale = new Set(existingNodes);
+  const used = new Set();
+  const nextNodes = [];
+
+  for (const descriptor of desired) {
+    let existing = existingByKey.get(descriptor.key) || null;
+    if (!existing) {
+      for (const alias of descriptor.aliases || []) {
+        const candidate = existingByAlias.get(alias) || existingByKey.get(alias) || null;
+        if (candidate && !used.has(candidate)) {
+          existing = candidate;
+          break;
+        }
+      }
+    }
+    if (existing && used.has(existing)) existing = null;
+    if (existing) {
+      used.add(existing);
+      stale.delete(existing);
+    }
+
+    let node = existing;
+    if (!node) {
+      node = descriptor.build();
+    } else if (node.dataset.transcriptRenderVersion !== String(descriptor.version || '')) {
+      const next = descriptor.build();
+      const patched = typeof descriptor.patch === 'function'
+        ? descriptor.patch(node, next)
+        : next;
+      if (patched && patched !== node) {
+        node.remove();
+        node = patched;
+      }
+    }
+    node.dataset.transcriptNodeKey = descriptor.key;
+    node.dataset.transcriptRenderVersion = descriptor.version || '';
+    node.dataset.transcriptNodeAliases = JSON.stringify(descriptor.aliases || []);
+    nextNodes.push(node);
+  }
+
+  for (const node of stale) node.remove();
+  let cursor = log.firstChild;
+  for (const node of nextNodes) {
+    if (node === cursor) {
+      cursor = cursor.nextSibling;
+    } else {
+      log.insertBefore(node, cursor);
+    }
+  }
+  return nextNodes;
+}
+
+function patchTranscriptMessageElement(existing, next) {
+  if (!existing || !next) return next;
+  existing.className = next.className;
+  existing.title = next.title;
+  if (next.id) existing.id = next.id;
+  else existing.removeAttribute('id');
+  existing.dataset.viewportKey = next.dataset.viewportKey || '';
+  if (next.dataset.assistantMessageId) {
+    existing.dataset.assistantMessageId = next.dataset.assistantMessageId;
+  } else {
+    delete existing.dataset.assistantMessageId;
+  }
+
+  const existingToolbar = existing.querySelector(':scope > .message-toolbar');
+  const nextToolbar = next.querySelector(':scope > .message-toolbar');
+  if (existingToolbar && nextToolbar) {
+    const existingMeta = existingToolbar.querySelector(':scope > .message-meta');
+    const nextMeta = nextToolbar.querySelector(':scope > .message-meta');
+    if (existingMeta && nextMeta) existingMeta.textContent = nextMeta.textContent;
+    const existingCopy = existingToolbar.querySelector(':scope > .message-copy-button');
+    const nextCopy = nextToolbar.querySelector(':scope > .message-copy-button');
+    if (existingCopy && nextCopy) {
+      existingCopy.dataset.copyText = nextCopy.dataset.copyText || '';
+      existingCopy.textContent = nextCopy.textContent;
+    }
+  } else if (!existingToolbar && nextToolbar) {
+    existing.insertBefore(nextToolbar, existing.firstChild);
+  } else if (existingToolbar && !nextToolbar) {
+    existingToolbar.remove();
+  }
+
+  const existingBubble = existing.querySelector(':scope > .bubble');
+  const nextBubble = next.querySelector(':scope > .bubble');
+  if (existingBubble && nextBubble) {
+    if (existing.dataset.transcriptTextVersion !== next.dataset.transcriptTextVersion) {
+      existingBubble.className = nextBubble.className;
+      existingBubble.replaceChildren(...Array.from(nextBubble.childNodes));
+    }
+  } else if (!existingBubble && nextBubble) {
+    existing.appendChild(nextBubble);
+  } else if (existingBubble && !nextBubble) {
+    existingBubble.remove();
+  }
+
+  const existingFiles = existing.querySelector(':scope > .message-file-list');
+  const nextFiles = next.querySelector(':scope > .message-file-list');
+  if (existing.dataset.transcriptFilesVersion !== next.dataset.transcriptFilesVersion) {
+    if (existingFiles && nextFiles) existingFiles.replaceWith(nextFiles);
+    else if (!existingFiles && nextFiles) existing.appendChild(nextFiles);
+    else existingFiles?.remove();
+  }
+  existing.dataset.transcriptTextVersion = next.dataset.transcriptTextVersion || '';
+  existing.dataset.transcriptFilesVersion = next.dataset.transcriptFilesVersion || '';
+  return existing;
+}
+
+function transcriptFileRenderSignature(session, entry) {
+  return getTranscriptFileRefs(session, entry).map((file) => {
+    const cached = file.path ? getCachedReceivedFileRefForPath(session, file.path) : null;
+    const display = cached || file;
+    return [
+      display.fileId || '',
+      display.path || '',
+      display.name || '',
+      display.mime || '',
+      Number(display.size || 0),
+      display.cached === true ? 1 : 0,
+    ];
+  });
+}
+
+function transcriptMessageRenderState(session, entry, view = {}) {
+  const textVersion = hashThinkingEntryVersion(formatThinkingStructuredValue([
+    structuredThinkingText(entry?.text),
+    view.isSearchMatched ? structuredThinkingText(state.sessionSearchQuery).trim() : '',
+  ]));
+  const filesVersion = hashThinkingEntryVersion(formatThinkingStructuredValue(
+    transcriptFileRenderSignature(session, entry)
+  ));
+  const version = hashThinkingEntryVersion(formatThinkingStructuredValue([
+    normalizeTranscriptSpeaker(entry?.speaker),
+    normalizeTranscriptIdentity(entry?.assistantMessageId),
+    normalizeTranscriptTimestamp(entry?.timestamp) || '',
+    normalizeTranscriptIdentity(entry?.deliveryStatus),
+    textVersion,
+    filesVersion,
+    view.isSearchMatched === true,
+    view.isFocused === true,
+    view.isActiveSearchMatch === true,
+  ]));
+  return { version, textVersion, filesVersion };
+}
+
+function buildTranscriptMessageElement(session, entry, view = {}) {
+  const message = document.createElement('div');
+  const speaker = entry.speaker === 'assistant' ? 'agent' : entry.speaker;
+  message.className = `message ${speaker || 'agent'}`;
+  message.title = entry.timestamp ? `Sent ${formatTime(entry.timestamp)}` : '';
+  message.dataset.viewportKey = transcriptViewportKey(entry, view.fullEntryIndex);
+  if (entry.assistantMessageId) {
+    message.dataset.assistantMessageId = String(entry.assistantMessageId);
+  }
+  if (view.isSearchMatched) message.classList.add('search-match-message');
+  if (view.isFocused || view.isActiveSearchMatch) {
+    message.id = 'focused-transcript-entry';
+    message.classList.add('search-focused-message');
+  }
+
+  if (speaker !== 'system') {
+    const toolbar = document.createElement('div');
+    toolbar.className = 'message-toolbar';
+    const meta = document.createElement('div');
+    meta.className = 'message-meta';
+    meta.textContent = `${speaker === 'user' ? 'You' : 'Codex'} ${formatTime(entry.timestamp)}`.trim();
+    toolbar.appendChild(meta);
+    const copyButton = document.createElement('button');
+    copyButton.type = 'button';
+    copyButton.className = 'message-copy-button secondary-button';
+    copyButton.dataset.copyText = structuredThinkingText(entry.text);
+    copyButton.textContent = 'Copy';
+    toolbar.appendChild(copyButton);
+    message.appendChild(toolbar);
+  }
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble markdown-body';
+  renderMarkdown(bubble, structuredThinkingText(entry.text));
+  if (view.isSearchMatched && state.sessionSearchQuery.trim()) {
+    highlightTermsInElement(bubble, state.sessionSearchQuery);
+  }
+  message.appendChild(bubble);
+  renderFileCards(message, session, entry);
+
+  const renderState = transcriptMessageRenderState(session, entry, view);
+  message.dataset.transcriptTextVersion = renderState.textVersion;
+  message.dataset.transcriptFilesVersion = renderState.filesVersion;
+  return message;
+}
+
+function transcriptMessageDescriptor(session, entry, view = {}) {
+  const identity = transcriptEntryIdentityKey(entry);
+  const renderState = transcriptMessageRenderState(session, entry, view);
+  return {
+    key: `message|${identity}`,
+    aliases: transcriptEntryAliasKeys(entry).map((alias) => `message|${alias}`),
+    version: renderState.version,
+    build: () => buildTranscriptMessageElement(session, entry, view),
+    patch: patchTranscriptMessageElement,
+  };
+}
+
+function thinkingMessageDescriptor(session, segment, runtime, stream, isLivePlaceholder = false) {
+  const stateKey = thinkingSegmentStateKey(session, segment);
+  const entries = Array.isArray(segment?.entries) ? segment.entries : [];
+  const version = hashThinkingEntryVersion(formatThinkingStructuredValue([
+    thinkingEntriesRenderVersion(entries),
+    entries.map((entry) => transcriptFileRenderSignature(session, entry)),
+    isLivePlaceholder === true,
+    structuredThinkingScalar(runtime?.phase, ''),
+    structuredThinkingScalar(runtime?.currentTurnStatus, ''),
+    structuredThinkingText(runtime?.reasoningSummary),
+    structuredThinkingText(runtime?.planSummary),
+    structuredThinkingScalar(stream?.connection || runtime?.connection, ''),
+  ]));
+  return {
+    key: `thinking|${stateKey}`,
+    aliases: [`thinking|${stateKey}`],
+    version,
+    build: () => buildThinkingMessageElement(
+      session,
+      segment,
+      runtime,
+      stream,
+      isLivePlaceholder
+    ),
+    patch(existing, next) {
+      patchThinkingMessageElement(existing, next);
+      return existing;
+    },
+  };
+}
+
 function renderTranscript(session = getSelectedSession(), options = {}) {
   const log = el('session-log');
   const key = getSessionKey(session) || '';
   const previousKey = log.dataset.sessionKey || '';
   captureThinkingScrollStates(log);
-  const thinkingViewportSnapshots = captureDetachedThinkingViewportOffsets(log);
   const switchingSession = previousKey !== key;
   const pinnedToBottom = isTranscriptPinnedAcrossScrollTargets();
   const userDetached = !switchingSession && isTranscriptUserDetached(key);
@@ -19153,28 +21427,35 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     setTranscriptUserDetached(key, false);
     getTranscriptScrollMachine()?.establishFollow();
   }
-  const previousScrollTop = log.scrollTop;
-  const bottomOffset = log.scrollHeight - log.scrollTop - log.clientHeight;
-  const scrollSnapshot = captureTranscriptScrollSnapshot();
-  log.innerHTML = '';
+  const scrollSnapshot = switchingSession ? [] : captureTranscriptScrollSnapshot();
+  const descriptors = [];
   log.dataset.sessionKey = key;
 
   if (!session) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    empty.textContent = 'Select a conversation on the left to inspect it here.';
-    log.appendChild(empty);
+    const emptyText = 'Select a conversation on the left to inspect it here.';
+    descriptors.push({
+      key: 'empty|no-session',
+      version: hashThinkingEntryVersion(emptyText),
+      build() {
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = emptyText;
+        return empty;
+      },
+    });
+    reconcileTranscriptChildren(log, descriptors, { replaceAll: switchingSession });
     pruneThinkingUiState(log);
-    restoreTranscriptScroll(log, { forceScroll: true });
+    restoreTranscriptScrollTargetsToBottom();
     updateTranscriptUnreadButton('');
     return;
   }
 
   const transcript = getTranscriptForSession(session);
   const visibleTranscript = transcript.filter((entry) => entry.speaker === 'user' || entry.speaker === 'agent' || entry.speaker === 'assistant');
-  const focus = options.focus || (state.pendingTranscriptFocus && state.pendingTranscriptFocus.hostId === session.hostId && state.pendingTranscriptFocus.sessionId === session.sessionId
+  const focus = state.pendingTranscriptFocus && state.pendingTranscriptFocus.hostId === session.hostId && state.pendingTranscriptFocus.sessionId === session.sessionId
+    && (!options.focus || options.focus === state.pendingTranscriptFocus)
     ? state.pendingTranscriptFocus
-    : null);
+    : null;
   const searchMatches = buildTranscriptSearchMatches(visibleTranscript, focus);
   let activeSearchIndex = searchMatches.length ? clampTranscriptSearchIndex(searchMatches, focus) : 0;
   let activeSearchMatch = searchMatches[activeSearchIndex] || null;
@@ -19227,20 +21508,30 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     }
     state.transcriptEntryCounts.set(key, renderedEntryCount);
   }
-  const thinkingByUserTimestamp = new Map(thinkingSegments.map((segment) => [segment.userTimestamp || '', segment]));
+  const thinkingByUserEntryKey = new Map(thinkingSegments.map((segment) => [
+    segment.userEntryKey || segment.userTimestamp || '',
+    segment,
+  ]));
   const searchMatchIndexes = new Set(searchMatches.map((match) => match.entryIndex));
   const runtime = getRuntimeForSession(session) || {};
   const stream = getStreamStatusForSession(session) || {};
   const latestUserEntry = [...visibleTranscript].reverse().find((entry) => entry.speaker === 'user') || null;
   if (!visibleTranscript.length) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    empty.textContent = isHistoryLoading(session)
+    const emptyText = isHistoryLoading(session)
       ? 'Loading history...'
       : session.source === 'managed'
       ? 'Waiting for the managed session transcript...'
       : 'No transcript preview was captured for this imported session.';
-    log.appendChild(empty);
+    descriptors.push({
+      key: 'empty|transcript',
+      version: hashThinkingEntryVersion(emptyText),
+      build() {
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = emptyText;
+        return empty;
+      },
+    });
     const liveSegment = buildLiveActivitySegment(session, null);
     const externalActivity = getExternalTerminalActivityForSession(session, runtime);
     const showLiveActivity = liveSegment || (
@@ -19249,25 +21540,26 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
     );
     if (showLiveActivity) {
       const displayedSegment = liveSegment || {
+        userEntryKey: 'live',
         userTimestamp: 'live',
         userText: '',
         entries: [],
         live: true,
       };
-      log.appendChild(buildThinkingMessageElement(session, displayedSegment, runtime, stream, !liveSegment));
+      descriptors.push(thinkingMessageDescriptor(
+        session,
+        displayedSegment,
+        runtime,
+        stream,
+        !liveSegment
+      ));
     }
+    reconcileTranscriptChildren(log, descriptors, { replaceAll: switchingSession });
     pruneThinkingUiState(log);
-    restoreTranscriptScroll(log, {
-      forceScroll: shouldStickToBottom,
-      preserveScroll: options.preserveScroll,
-      scrollTop: previousScrollTop,
-      bottomOffset,
-    });
-    if (!shouldStickToBottom && !focus) {
+    if (shouldStickToBottom) {
+      restoreTranscriptScrollTargetsToBottom();
+    } else {
       restoreTranscriptScrollSnapshot(scrollSnapshot);
-    }
-    if (!focus) {
-      restoreDetachedThinkingViewportOffsets(log, thinkingViewportSnapshots);
     }
     updateTranscriptUnreadButton(key);
     renderTranscriptSearchNavigator(session, [], 0);
@@ -19278,68 +21570,46 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
   renderTranscriptSearchNavigator(session, searchMatches, activeSearchIndex);
 
   if (hiddenTranscriptCount > 0) {
-    const gate = document.createElement('div');
-    gate.className = 'transcript-history-gate';
-    const loadOlder = document.createElement('button');
-    loadOlder.type = 'button';
-    loadOlder.className = 'secondary-button transcript-load-older-button';
-    loadOlder.dataset.loadOlderTranscript = key;
-    loadOlder.textContent = `Load ${Math.min(TRANSCRIPT_RENDER_INCREMENT, hiddenTranscriptCount)} older messages (${hiddenTranscriptCount} hidden)`;
-    gate.appendChild(loadOlder);
-    log.appendChild(gate);
+    const loadCount = Math.min(TRANSCRIPT_RENDER_INCREMENT, hiddenTranscriptCount);
+    descriptors.push({
+      key: 'gate|history',
+      version: `${loadCount}|${hiddenTranscriptCount}`,
+      build() {
+        const gate = document.createElement('div');
+        gate.className = 'transcript-history-gate';
+        const loadOlder = document.createElement('button');
+        loadOlder.type = 'button';
+        loadOlder.className = 'secondary-button transcript-load-older-button';
+        loadOlder.dataset.loadOlderTranscript = key;
+        loadOlder.textContent = `Load ${loadCount} older messages (${hiddenTranscriptCount} hidden)`;
+        gate.appendChild(loadOlder);
+        return gate;
+      },
+    });
   }
 
   const renderedStartIndex = hiddenTranscriptCount ? Math.max(0, visibleTranscript.length - renderedTranscript.length) : 0;
   for (const [renderedIndex, entry] of renderedTranscript.entries()) {
-    const message = document.createElement('div');
     const speaker = entry.speaker === 'assistant' ? 'agent' : entry.speaker;
-    message.className = `message ${speaker || 'agent'}`;
-    message.title = entry.timestamp ? `Sent ${formatTime(entry.timestamp)}` : '';
     const fullEntryIndex = renderedStartIndex + renderedIndex;
-    message.dataset.viewportKey = transcriptViewportKey(entry, fullEntryIndex);
-    const isFocused = focus && (
+    const isFocused = Boolean(focus && (
       (focusIndex >= 0 && fullEntryIndex === focusIndex)
       || transcriptEntryMatchesSearchMatch(entry, focus)
-    );
+    ));
     const isSearchMatched = searchMatchIndexes.has(fullEntryIndex);
     const isActiveSearchMatch = Boolean(activeSearchMatch && fullEntryIndex === activeSearchMatch.entryIndex);
-    if (isSearchMatched) {
-      message.classList.add('search-match-message');
-    }
-    if (isFocused || isActiveSearchMatch) {
-      message.id = 'focused-transcript-entry';
-      message.classList.add('search-focused-message');
-    }
-
-    if (speaker !== 'system') {
-      const toolbar = document.createElement('div');
-      toolbar.className = 'message-toolbar';
-      const meta = document.createElement('div');
-      meta.className = 'message-meta';
-      meta.textContent = `${speaker === 'user' ? 'You' : 'Codex'} ${formatTime(entry.timestamp)}`.trim();
-      toolbar.appendChild(meta);
-      const copyButton = document.createElement('button');
-      copyButton.type = 'button';
-      copyButton.className = 'message-copy-button secondary-button';
-      copyButton.dataset.copyText = entry.text || '';
-      copyButton.textContent = 'Copy';
-      toolbar.appendChild(copyButton);
-      message.appendChild(toolbar);
-    }
-
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble markdown-body';
-    renderMarkdown(bubble, entry.text || '');
-    if (isSearchMatched && state.sessionSearchQuery.trim()) {
-      highlightTermsInElement(bubble, state.sessionSearchQuery);
-    }
-    message.appendChild(bubble);
-    renderFileCards(message, session, entry);
-
-    log.appendChild(message);
+    descriptors.push(transcriptMessageDescriptor(session, entry, {
+      fullEntryIndex,
+      isFocused,
+      isSearchMatched,
+      isActiveSearchMatch,
+    }));
 
     if (speaker === 'user') {
-      const segment = thinkingByUserTimestamp.get(entry.timestamp || '') || null;
+      const userEntryKey = transcriptEntryStableTurnKey(entry);
+      const segment = thinkingByUserEntryKey.get(userEntryKey)
+        || thinkingByUserEntryKey.get(entry.timestamp || '')
+        || null;
       const isLatestUser = latestUserEntry && latestUserEntry.timestamp === entry.timestamp && latestUserEntry.text === entry.text;
       const shouldShowLivePlaceholder = Boolean(
         isLatestUser
@@ -19356,45 +21626,57 @@ function renderTranscript(session = getSelectedSession(), options = {}) {
           : null;
         const livePlaceholder = shouldShowLivePlaceholder && !segment && !liveSegment;
         const displayedSegment = segment || liveSegment || {
+          userEntryKey,
           userTimestamp: latestUserEntry?.timestamp || 'live',
           userText: latestUserEntry?.text || '',
           entries: [],
           live: true,
         };
-        log.appendChild(buildThinkingMessageElement(session, displayedSegment, runtime, stream, livePlaceholder));
+        descriptors.push(thinkingMessageDescriptor(
+          session,
+          displayedSegment,
+          runtime,
+          stream,
+          livePlaceholder
+        ));
       }
     }
   }
 
+  reconcileTranscriptChildren(log, descriptors, { replaceAll: switchingSession });
   pruneThinkingUiState(log);
-  restoreTranscriptScroll(log, {
-    forceScroll: shouldForceScroll && !focus,
-    shouldStickToBottom: focus ? false : shouldStickToBottom,
-    preserveScroll: options.preserveScroll,
-    scrollTop: previousScrollTop,
-    bottomOffset,
-  });
-  if (shouldStickToBottom && !focus) {
-    restoreTranscriptScrollTargetsToBottom();
-  }
-  if (!shouldStickToBottom && !focus) {
-    restoreTranscriptScrollSnapshot(scrollSnapshot);
-  }
-  if (!focus) {
-    restoreDetachedThinkingViewportOffsets(log, thinkingViewportSnapshots);
-  }
   if (focus) {
+    const focusQuery = state.sessionSearchQuery;
     window.setTimeout(() => {
-      const target = document.getElementById('focused-transcript-entry');
+      // Do not let a delayed focus for another query/Session move the new view.
+      if (getSessionKey(getSelectedSession()) !== key || log.dataset.sessionKey !== key
+        || state.sessionSearchQuery !== focusQuery || state.pendingTranscriptFocus !== focus) return;
+      // Cached previews can have incomplete indices/layout. Consume focus only
+      // after showSession has rendered the completed detail response.
+      if (isHistoryLoading(session)) return;
+      const target = log.querySelector('#focused-transcript-entry');
       if (target) {
-        target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        const owner = getTranscriptScrollOwner();
+        const machine = getTranscriptScrollMachine(owner);
+        setTranscriptUserDetached(key, true);
+        // Explicit search navigation invalidates older asynchronous scroll restores.
+        machine?.beginTrustedInteraction();
+        noteMessageReadProgrammaticScroll();
+        const apply = () => window.RemoteCodexSessionSearch?.centerHighlight(target, owner)
+          || (target.querySelector('.bubble mark') || target).scrollIntoView({ block: 'center', behavior: 'instant' });
+        if (machine) machine.withProgrammaticScroll(apply);
+        else apply();
         state.pendingTranscriptFocus = null;
       }
     }, 80);
+  } else if (shouldStickToBottom) {
+    restoreTranscriptScrollTargetsToBottom();
+  } else {
+    restoreTranscriptScrollSnapshot(scrollSnapshot);
   }
-    updateTranscriptUnreadButton(key);
-    completeTranscriptNotificationRender(session);
-  }
+  updateTranscriptUnreadButton(key);
+  completeTranscriptNotificationRender(session);
+}
 
 function renderLocaleLabels() {
   document.documentElement.lang = currentLocale();
@@ -19402,6 +21684,7 @@ function renderLocaleLabels() {
   for (const node of document.querySelectorAll('[data-i18n-key]')) {
     node.textContent = t(node.dataset.i18nKey);
   }
+  document.querySelector('[data-transcript-search-nav="clear"]')?.setAttribute('aria-label', t('navSearch.clear'));
 
   const navigatorButton = el('toggle-navigator-button');
   if (navigatorButton) {
@@ -19487,21 +21770,9 @@ function renderApiProviderEditorState(profile = getSelectedApiProfile()) {
   const providerKind = el('settings-api-provider-kind')?.value
     || profile?.providerKind
     || inferApiProviderKind(profile || {});
-  const registry = providerCapabilitiesRegistry();
   const customRow = el('settings-api-custom-provider-row');
   customRow?.classList.toggle('hidden', providerKind !== 'custom');
   renderApiProfileModelCatalogControls(profile);
-
-  const status = el('settings-provider-capability-status');
-  if (status) {
-    if (providerKind === 'openai') {
-      status.textContent = `OpenAI capability registry ${registry?.REGISTRY_VERSION || 'bundled'}; the selected Session verifies model and thinking support against its Rebind target.`;
-    } else if (providerKind === 'custom') {
-      status.textContent = 'Custom providers use the target API catalog; unverified thinking values still require explicit approval.';
-    } else {
-      status.textContent = `${canonicalProviderLabel(providerKind)} model and thinking support is verified from the selected Session before Rebind.`;
-    }
-  }
 }
 
 function saveActiveApiProfileFromSettingsForm(options = {}) {
@@ -19519,6 +21790,7 @@ function saveActiveApiProfileFromSettingsForm(options = {}) {
       : canonicalProviderLabel(providerKind, providerInput),
     baseUrl: el('settings-api-base-url').value.trim(),
     apiKey: el('settings-api-key').value,
+    nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(profile.nativeResumeCompatibilityKey),
     rememberApiKey: true,
   };
   Object.assign(profile, draft);
@@ -19587,6 +21859,7 @@ function apiProfileBackupPayload() {
       providerKind: profile.providerKind,
       baseUrl: profile.baseUrl || '',
       apiKey: profile.apiKey || '',
+      nativeResumeCompatibilityKey: normalizeNativeResumeCompatibilityKey(profile.nativeResumeCompatibilityKey),
       sessionDefaults: normalizeSessionDefaults(profile.sessionDefaults),
     })),
     selectedApiProfileId: settings.selectedApiProfileId,
@@ -19935,18 +22208,39 @@ async function switchSessionApiFromComposer(session, targetProfileId, options = 
     ? { ...apiProfileRequestConfig(profile) }
     : undefined;
 
+  // Confirm while the click/change event still carries a user gesture.
+  // Embedded browsers may return false from a native dialog opened after an
+  // async preflight, which was surfaced as a misleading API cancellation.
+  // rebindSessionApi() still revalidates the canonical Session lifecycle
+  // expectation before submitting any request.
+  const currentSelection = getComposerOptionsForSession(current);
+  const resetSelection = normalizeRebindSelectionSnapshot({
+    model: '',
+    effort: '',
+    summary: currentSelection?.summary || '',
+  });
+  const earlyTarget = rebindTargetSummary(targetProfile, apiConfigSnapshot);
+  if (!await requestUiConfirmation(formatSessionRebindConfirmation(
+    sessionApiBinding(current),
+    earlyTarget,
+    resetSelection,
+    'current-session'
+  ), {
+    title: t('session.rebindConfirmTitle'),
+    kind: 'session-rebind',
+  })) {
+    setSessionApiSwitchNotice(current, t('session.apiSwitchCanceled'));
+    renderSessionApiControls(getSelectedSession());
+    return null;
+  }
+
   setSessionApiSwitchNotice(current);
   setSessionApiRebindBusy(current, true);
   renderSessionDetails();
   try {
-    const currentSelection = getComposerOptionsForSession(current);
-    const resetSelection = normalizeRebindSelectionSnapshot({
-      model: '',
-      effort: '',
-      summary: currentSelection?.summary || '',
-    });
     const response = await rebindSessionApi(current, targetProfile, resetSelection, apiConfigSnapshot, {
       requireIdle: true,
+      confirm: false,
     });
     if (!response) {
       setSessionApiSwitchNotice(current, t('session.apiSwitchCanceled'));
@@ -19957,14 +22251,16 @@ async function switchSessionApiFromComposer(session, targetProfileId, options = 
     const resolvedRequestSessionKey = resolveComposerSessionKey(requestSessionKey);
     const reboundSession = findSessionForResolvedComposerKey(resolvedRequestSessionKey, current);
     try {
-      let catalog = response?.modelCatalog || null;
-      if (catalog) {
-        applyModelCatalogResponse(captureModelCatalogRequest(reboundSession), catalog);
-      } else {
-        catalog = await loadModelOptionsForSession(reboundSession, { force: true });
+      const providerCatalog = response?.modelCatalog || null;
+      if (providerCatalog) {
+        applyModelCatalogResponse(captureModelCatalogRequest(reboundSession), providerCatalog);
       }
+      const catalog = profile
+        ? await loadModelOptionsForSession(reboundSession, { force: true, refresh: true })
+        : providerCatalog || await loadModelOptionsForSession(reboundSession, { force: true });
       nextSelection.model = preferredModelForApiSwitch(catalog, {
         requireFreshProvider: Boolean(profile),
+        providerCatalog,
       });
     } catch (_) {
       // The API switch itself succeeded. Auto remains valid if its live model
@@ -19972,13 +22268,14 @@ async function switchSessionApiFromComposer(session, targetProfileId, options = 
     }
     applySessionSelectionToSessionOptions(reboundSession, nextSelection);
     const target = rebindTargetSummary(targetProfile, apiConfigSnapshot);
+    const noVerifiedDefault = Boolean(profile) && !nextSelection.model;
     setSessionApiSwitchNotice(
       reboundSession,
-      formatUiText('session.apiSwitchSuccessSelection', {
-        target: rebindTargetDisplayLabel(target),
-        model: nextSelection.model || 'Auto / default',
-      }),
-      'success'
+      formatUiText(
+        noVerifiedDefault ? 'session.apiSwitchNoVerifiedDefault' : 'session.apiSwitchSuccessSelection',
+        { target: rebindTargetDisplayLabel(target), model: nextSelection.model || 'Auto / default' }
+      ),
+      noVerifiedDefault ? 'warning' : 'success'
     );
     return rebindResponseWithClientSelection(response, nextSelection);
   } catch (error) {
@@ -20154,6 +22451,11 @@ function renderSessionApiControls(session) {
       composerSelectionStatus.classList.add('warning');
     } else if (rebindBusy) {
       composerSelectionStatus.textContent = t('session.apiSwitchBusy');
+    } else if (session?.resumeError?.requiresExplicitTranscriptFallback) {
+      composerSelectionStatus.textContent = session.resumeError.code === 'session_responses_history_incompatible'
+        ? 'Provider rejected the native Responses history. Update Sub2API and retry, or create a new Session from the transcript. The original Session is unchanged.'
+        : 'Native resume failed. Retry, or create a new Session from the transcript. The original Session is unchanged.';
+      composerSelectionStatus.classList.add('warning');
     } else if (activeTurn) {
       const effective = session.runtimeConfig?.effectiveSelection || session.effectiveSelection || {};
       composerSelectionStatus.textContent = formatUiText('session.runningSelection', {
@@ -20166,6 +22468,13 @@ function renderSessionApiControls(session) {
         effort: selectedSettings?.effort || 'Auto',
       });
     }
+  }
+  const compactSettingsStatus = el('composer-next-turn-settings-status');
+  if (compactSettingsStatus && composerSelectionStatus) {
+    compactSettingsStatus.textContent = composerSelectionStatus.textContent;
+    compactSettingsStatus.className = Array.from(composerSelectionStatus.classList)
+      .filter((className) => ['success', 'warning', 'error'].includes(className))
+      .join(' ');
   }
 
   if (rebindSelect) {
@@ -20212,8 +22521,16 @@ function renderSessionApiControls(session) {
   const resumeError = session?.resumeError || null;
   const fallbackBusy = isSessionTranscriptFallbackBusy(session);
   if (fallbackButton) {
-    fallbackButton.classList.toggle('hidden', !resumeError?.canTranscriptFallback);
-    fallbackButton.disabled = !session || !resumeError?.canTranscriptFallback || fallbackBusy;
+    const fallbackAvailable = Boolean(resumeError?.canTranscriptFallback);
+    const explicitFallbackRequired = Boolean(resumeError?.requiresExplicitTranscriptFallback);
+    fallbackButton.classList.toggle('hidden', !fallbackAvailable);
+    fallbackButton.disabled = !session || !fallbackAvailable || fallbackBusy;
+    fallbackButton.title = explicitFallbackRequired
+      ? 'The original native Session is unchanged. Create a separate Session from its visible transcript.'
+      : 'Create a separate Session from the saved visible transcript.';
+    fallbackButton.setAttribute('aria-label', explicitFallbackRequired
+      ? 'Create a separate transcript Session; the original Session is unchanged'
+      : 'Start transcript fallback');
     fallbackButton.setAttribute('aria-busy', fallbackBusy ? 'true' : 'false');
   }
 }
@@ -22980,7 +25297,7 @@ function flushQueuedUiRenders() {
     if (renderPlan.runtimePanel) {
       renderRuntimePanel();
     }
-    if (renderPlan.thinkingPanel) {
+    if (renderPlan.thinkingPanel && !renderPlan.transcript) {
       renderThinkingPanel();
     }
     if (renderPlan.alertsWindow) {
@@ -23014,6 +25331,9 @@ function flushQueuedUiRenders() {
 function closeStream() {
   discardStaleActivitySnapshotRecoveryTasks();
   discardStaleStreamDetailRecovery();
+  // Invalidate callbacks already queued by the old EventSource before it is
+  // closed. A reconnect receives a strictly newer generation.
+  state.sessionStreamGeneration = Number(state.sessionStreamGeneration || 0) + 1;
   if (state.eventSource) {
     if (state.eventSourceKey) {
       state.streamStatus.set(state.eventSourceKey, {
@@ -23044,6 +25364,21 @@ async function resumeSelectedSessionRealtime(options = {}) {
   if (!selected?.hostId || !selected?.sessionId) {
     return;
   }
+  const selectedKey = getSessionKey(selected);
+  const existingStream = getStreamStatusForSession(selected) || {};
+  // EventSource performs its own handshake/retry while it is connecting.
+  // Focus/visibility callbacks arriving during that window must not tear it
+  // down and create another subscription unless an explicit forced recovery
+  // was requested.
+  if (
+    options.force !== true
+    && options.forceDetail !== true
+    && state.eventSource
+    && state.eventSourceKey === selectedKey
+    && String(existingStream.connection || '').toLowerCase() === 'connecting'
+  ) {
+    return;
+  }
   if (
     options.force !== true
     && options.forceDetail !== true
@@ -23055,7 +25390,6 @@ async function resumeSelectedSessionRealtime(options = {}) {
   state.streamRecoveryInFlight = true;
   try {
     const forceDetail = options.forceDetail === true || state.sessionWatchCatchUpRequired;
-    const selectedKey = getSessionKey(selected);
     if (selectedKey) {
       state.fullTranscriptLoaded.delete(selectedKey);
     }
@@ -23090,6 +25424,8 @@ async function withStreamRecoveryTimeout(operation) {
 
 async function loadSessionActivitySnapshot(session, options = {}) {
   if (!session?.hostId || !session?.sessionId) return null;
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : null;
+  assertStreamRecoveryCurrent(isCurrent);
   const projectionKeyAtStart = getActivityCanonicalKeyForSession(session);
   const preserveAfterGeneration = state.activityProjection
     ?.mutationGeneration(projectionKeyAtStart) || 0;
@@ -23101,6 +25437,7 @@ async function loadSessionActivitySnapshot(session, options = {}) {
     const activities = [];
     let restartRequired = false;
     for (let pageIndex = 0; pageIndex < 256; pageIndex += 1) {
+      assertStreamRecoveryCurrent(isCurrent);
       const params = new URLSearchParams({
         hostId: session.hostId,
         limit: '64',
@@ -23111,6 +25448,7 @@ async function loadSessionActivitySnapshot(session, options = {}) {
         `/api/sessions/${encodeURIComponent(session.sessionId)}/activities?${params.toString()}`,
         { signal: options.signal }
       );
+      assertStreamRecoveryCurrent(isCurrent);
       canonicalKey = rememberActivityCanonicalKey(
         snapshot.canonicalConversationKey || getActivityCanonicalKeyForSession(session),
         session,
@@ -23131,14 +25469,20 @@ async function loadSessionActivitySnapshot(session, options = {}) {
       cursor = nextCursor;
     }
     if (restartRequired) continue;
+    assertStreamRecoveryCurrent(isCurrent);
     if (canonicalKey && state.activityProjection) {
-      state.activityProjection.replaceSnapshot(canonicalKey, {
+      const replaced = state.activityProjection.replaceSnapshot(canonicalKey, {
         streamEpoch: snapshot.streamEpoch,
         activities,
         preserveAfterGeneration,
       });
+      if (replaced === false) {
+        throw new Error('Activity snapshot could not be applied to the browser projection.');
+      }
+      rememberActivityClientRequestIds(canonicalKey, activities);
     }
     const selected = getSelectedSession();
+    assertStreamRecoveryCurrent(isCurrent);
     if (selected && getActivityCanonicalKeyForSession(selected) === canonicalKey) {
       scheduleTranscriptRender({ preserveScroll: true });
     }
@@ -23148,6 +25492,8 @@ async function loadSessionActivitySnapshot(session, options = {}) {
 }
 
 async function loadSessionActivityRecords(session, requestedActivities, options = {}) {
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : null;
+  assertStreamRecoveryCurrent(isCurrent);
   const targets = [...requestedActivities.entries()];
   if (
     !targets.length
@@ -23159,6 +25505,7 @@ async function loadSessionActivityRecords(session, requestedActivities, options 
   }
 
   const responses = await Promise.all(targets.map(async ([token, expectedRevision]) => {
+    assertStreamRecoveryCurrent(isCurrent);
     const params = new URLSearchParams({
       hostId: session.hostId,
       activityToken: token,
@@ -23167,9 +25514,11 @@ async function loadSessionActivityRecords(session, requestedActivities, options 
       `/api/sessions/${encodeURIComponent(session.sessionId)}/activities?${params.toString()}`,
       { signal: options.signal }
     );
+    assertStreamRecoveryCurrent(isCurrent);
     const activity = Array.isArray(snapshot.activities) ? snapshot.activities[0] : null;
     return { token, expectedRevision, snapshot, activity };
   }));
+  assertStreamRecoveryCurrent(isCurrent);
 
   if (responses.some(({ activity, expectedRevision }) => (
     !activity || Number(activity.activityRevision || 0) < expectedRevision
@@ -23180,19 +25529,35 @@ async function loadSessionActivityRecords(session, requestedActivities, options 
 
   const recoveredRevisions = new Map();
   let canonicalKey = '';
+  let projectionApplyFailed = false;
   for (const { token, snapshot, activity } of responses) {
+    assertStreamRecoveryCurrent(isCurrent);
     canonicalKey = rememberActivityCanonicalKey(
       snapshot.canonicalConversationKey || getActivityCanonicalKeyForSession(session),
       session,
       snapshot
     );
-    state.activityProjection?.applyActivity(canonicalKey, {
+    const applied = state.activityProjection?.applyActivity(canonicalKey, {
       ...activity,
       streamEpoch: snapshot.streamEpoch,
     });
+    if (
+      state.activityProjection
+      && applied === false
+      && state.activityProjection.epochFor(canonicalKey) !== snapshot.streamEpoch
+    ) {
+      projectionApplyFailed = true;
+    }
+    rememberActivityClientRequestIds(canonicalKey, activity);
     recoveredRevisions.set(token, Number(activity.activityRevision || 0));
   }
+  assertStreamRecoveryCurrent(isCurrent);
+  if (projectionApplyFailed) {
+    await loadSessionActivitySnapshot(session, options);
+    return new Map(requestedActivities);
+  }
   const selected = getSelectedSession();
+  assertStreamRecoveryCurrent(isCurrent);
   if (selected && getActivityCanonicalKeyForSession(selected) === canonicalKey) {
     scheduleTranscriptRender({ preserveScroll: true });
   }
@@ -23240,11 +25605,29 @@ function retryActivitySnapshotRecovery(task) {
   }, delayMs);
 }
 
+function activitySnapshotRecoveryTaskIsCurrent(task) {
+  const sessionKey = getSessionKey(task?.session);
+  return Boolean(
+    task
+    && sessionKey
+    && state.activitySnapshotRecoveryTasks.get(task.canonicalKey) === task
+    && getActivityCanonicalKeyForSession(getSelectedSession()) === task.canonicalKey
+    && streamRecoveryContextIsCurrent(sessionKey, task.streamGeneration, task.source)
+  );
+}
+
 async function runActivitySnapshotRecovery(task) {
   if (
     state.activitySnapshotRecoveryTasks.get(task.canonicalKey) !== task
     || discardStaleActivitySnapshotRecoveryTasks() !== task.canonicalKey
   ) {
+    return;
+  }
+  if (!activitySnapshotRecoveryTaskIsCurrent(task)) {
+    if (state.activitySnapshotRecoveryTasks.get(task.canonicalKey) === task) {
+      if (task.timer) window.clearTimeout(task.timer);
+      state.activitySnapshotRecoveryTasks.delete(task.canonicalKey);
+    }
     return;
   }
   if (task.inFlight) return;
@@ -23258,18 +25641,23 @@ async function runActivitySnapshotRecovery(task) {
   task.lastInvalidatedAt = 0;
   let recoveryError = null;
   let recoveredRevisions = new Map();
+  const isCurrent = () => activitySnapshotRecoveryTaskIsCurrent(task);
   try {
     recoveredRevisions = await withStreamRecoveryTimeout(async (signal) => {
       if (fullSnapshotRequired) {
-        await loadSessionActivitySnapshot(task.session, { signal });
+        await loadSessionActivitySnapshot(task.session, { signal, isCurrent });
         return new Map();
       }
-      return loadSessionActivityRecords(task.session, requestedActivities, { signal });
+      return loadSessionActivityRecords(task.session, requestedActivities, { signal, isCurrent });
     });
+    assertStreamRecoveryCurrent(isCurrent);
     task.retryAttempt = 0;
     task.retryNotBefore = 0;
     task.errorReported = false;
   } catch (error) {
+    if (isStaleStreamRecoveryError(error)) {
+      return;
+    }
     recoveryError = error;
     task.fullSnapshotRequired ||= fullSnapshotRequired;
     for (const [token, revision] of requestedActivities) {
@@ -23286,6 +25674,13 @@ async function runActivitySnapshotRecovery(task) {
     }
   } finally {
     task.inFlight = false;
+    if (!activitySnapshotRecoveryTaskIsCurrent(task)) {
+      if (state.activitySnapshotRecoveryTasks.get(task.canonicalKey) === task) {
+        if (task.timer) window.clearTimeout(task.timer);
+        state.activitySnapshotRecoveryTasks.delete(task.canonicalKey);
+      }
+      return;
+    }
     if (
       state.activitySnapshotRecoveryTasks.get(task.canonicalKey) !== task
       || discardStaleActivitySnapshotRecoveryTasks() !== task.canonicalKey
@@ -23297,20 +25692,34 @@ async function runActivitySnapshotRecovery(task) {
         task.pendingActivities.delete(token);
       }
     }
-    if (activitySnapshotRecoveryPending(task)) {
+    const recoveryPending = activitySnapshotRecoveryPending(task);
+    if (recoveryPending) {
       if (recoveryError) {
         retryActivitySnapshotRecovery(task);
       } else {
         armActivitySnapshotRecovery(task, ACTIVITY_SNAPSHOT_RECOVERY_DEBOUNCE_MS);
       }
     } else {
+      // A compact `session.activity` event is only considered consumed after
+      // its authoritative record/snapshot has been applied successfully.
+      // Keep its cursor staged while recovery is pending so a failed request
+      // can be replayed after reconnect.
+      for (const pendingEvent of task.pendingStreamEvents?.values?.() || []) {
+        commitSessionStreamEvent(
+          pendingEvent.session,
+          pendingEvent.event,
+          pendingEvent.payload,
+          task.canonicalKey
+        );
+      }
+      task.pendingStreamEvents?.clear?.();
       state.activitySnapshotRecoveryTasks.delete(task.canonicalKey);
     }
   }
 }
 
 function scheduleActivitySnapshotRecovery(session, event, payload) {
-  const canonicalKey = rememberSessionStreamEvent(session, event, payload);
+  const canonicalKey = sessionStreamEventCanonicalKey(session, event, payload);
   const selected = getSelectedSession();
   if (!canonicalKey || getActivityCanonicalKeyForSession(selected) !== canonicalKey) {
     if (canonicalKey) state.eventCursorByCanonical.delete(canonicalKey);
@@ -23320,11 +25729,26 @@ function scheduleActivitySnapshotRecovery(session, event, payload) {
   discardStaleActivitySnapshotRecoveryTasks(selected);
 
   const now = Date.now();
+  const streamGeneration = Number(state.sessionStreamGeneration || 0);
+  const source = state.eventSource;
   let task = state.activitySnapshotRecoveryTasks.get(canonicalKey);
+  if (
+    task
+    && (
+      Number(task.streamGeneration) !== streamGeneration
+      || task.source !== source
+    )
+  ) {
+    if (task.timer) window.clearTimeout(task.timer);
+    state.activitySnapshotRecoveryTasks.delete(canonicalKey);
+    task = null;
+  }
   if (!task) {
     task = {
       canonicalKey,
       session: selected,
+      streamGeneration,
+      source,
       timer: null,
       inFlight: false,
       pendingActivities: new Map(),
@@ -23334,12 +25758,24 @@ function scheduleActivitySnapshotRecovery(session, event, payload) {
       retryAttempt: 0,
       retryNotBefore: 0,
       errorReported: false,
+      pendingStreamEvents: new Map(),
     };
     state.activitySnapshotRecoveryTasks.set(canonicalKey, task);
   } else {
     task.session = selected;
     if (!task.pendingSince) task.pendingSince = now;
     task.lastInvalidatedAt = now;
+  }
+  if (!(task.pendingStreamEvents instanceof Map)) {
+    task.pendingStreamEvents = new Map();
+  }
+  const cursor = String(event?.lastEventId || '').trim();
+  if (cursor) {
+    task.pendingStreamEvents.set(cursor, {
+      session: selected,
+      event,
+      payload,
+    });
   }
   const recoveryToken = String(payload.activityRecoveryToken || '').trim();
   if (recoveryToken && !task.fullSnapshotRequired) {
@@ -23361,6 +25797,90 @@ function scheduleActivitySnapshotRecovery(session, event, payload) {
   return true;
 }
 
+function streamRecoveryContextIsCurrent(recoveryKey, streamGeneration = null, source = null) {
+  if (!recoveryKey || getSessionKey(getSelectedSession()) !== recoveryKey) {
+    return false;
+  }
+  if (
+    streamGeneration !== null
+    && Number.isSafeInteger(Number(streamGeneration))
+    && Number(state.sessionStreamGeneration) !== Number(streamGeneration)
+  ) {
+    return false;
+  }
+  if (source && state.eventSource !== source) {
+    return false;
+  }
+  if (source && state.eventSourceKey !== recoveryKey) {
+    return false;
+  }
+  return true;
+}
+
+// Async detail/projection work must be tied to the stream generation that
+// initiated it.  EventSource callbacks are fenced by the stream client, but
+// fetch promises can still settle after that source has been replaced.  Keep
+// this fence small and reusable so every stateful recovery path can check it
+// immediately after an await and before applying a snapshot.
+function createSessionAsyncFence(session, options = {}) {
+  const initialKey = getSessionKey(session);
+  const allowedKeys = new Set(initialKey ? [initialKey] : []);
+  const hasSource = Object.prototype.hasOwnProperty.call(options, 'source');
+  const expectedSource = hasSource ? options.source : state.eventSource;
+  const requestedGeneration = Number(
+    Object.prototype.hasOwnProperty.call(options, 'streamGeneration')
+      ? options.streamGeneration
+      : state.sessionStreamGeneration
+  );
+  const expectedGeneration = Number.isSafeInteger(requestedGeneration)
+    ? requestedGeneration
+    : null;
+  const externalGuard = typeof options.isCurrent === 'function' ? options.isCurrent : null;
+  const requireSelected = options.requireSelected !== false;
+  const isCurrent = () => {
+    if (externalGuard && !externalGuard()) return false;
+    if (expectedGeneration !== null
+      && Number(state.sessionStreamGeneration) !== expectedGeneration) {
+      return false;
+    }
+    if (hasSource && state.eventSource !== expectedSource) return false;
+    if (requireSelected && !allowedKeys.has(getSessionKey(getSelectedSession()))) {
+      return false;
+    }
+    return true;
+  };
+  return Object.freeze({
+    expectedGeneration,
+    expectedSource,
+    allowSession(value) {
+      const key = typeof value === 'string' ? value : getSessionKey(value);
+      if (key) allowedKeys.add(key);
+      return key || null;
+    },
+    isCurrent,
+  });
+}
+
+function assertSessionAsyncFenceCurrent(fence) {
+  if (fence && typeof fence.isCurrent === 'function' && !fence.isCurrent()) {
+    const error = new Error('Session async work was superseded by a newer connection.');
+    error.code = 'stream_recovery_stale';
+    throw error;
+  }
+}
+
+function assertStreamRecoveryCurrent(isCurrent) {
+  if (typeof isCurrent === 'function' && !isCurrent()) {
+    const error = new Error('Session stream recovery was superseded by a newer connection.');
+    error.code = 'stream_recovery_stale';
+    throw error;
+  }
+}
+
+function isStaleStreamRecoveryError(error) {
+  return error?.code === 'stream_recovery_stale';
+}
+
 function clearStreamDetailRecoveryRetry() {
   if (state.streamDetailRecoveryRetryTimer) {
     window.clearTimeout(state.streamDetailRecoveryRetryTimer);
@@ -23368,6 +25888,8 @@ function clearStreamDetailRecoveryRetry() {
   state.streamDetailRecoveryRetryTimer = null;
   state.streamDetailRecoveryRetryKey = null;
   state.streamDetailRecoveryRetryAttempt = 0;
+  state.streamDetailRecoveryRetryGeneration = null;
+  state.streamDetailRecoveryRetrySource = null;
 }
 
 function discardStaleStreamDetailRecovery(selectedSession = getSelectedSession()) {
@@ -23397,9 +25919,25 @@ function discardStaleStreamDetailRecovery(selectedSession = getSelectedSession()
   return selectedKey;
 }
 
-function scheduleStreamDetailRecoveryRetry(recoveryKey) {
-  if (!recoveryKey || state.streamDetailRecoveryRetryTimer) return;
+function scheduleStreamDetailRecoveryRetry(recoveryKey, options = {}) {
+  if (!recoveryKey) return;
+  const requestedGeneration = Number(options.streamGeneration);
+  const streamGeneration = Number.isSafeInteger(requestedGeneration) && requestedGeneration > 0
+    ? requestedGeneration
+    : null;
+  const source = options.source || null;
+  if (state.streamDetailRecoveryRetryTimer) {
+    const sameGeneration = state.streamDetailRecoveryRetryGeneration === streamGeneration;
+    const sameSource = state.streamDetailRecoveryRetrySource === source;
+    if (state.streamDetailRecoveryRetryKey === recoveryKey && sameGeneration && sameSource) {
+      return;
+    }
+    window.clearTimeout(state.streamDetailRecoveryRetryTimer);
+    state.streamDetailRecoveryRetryTimer = null;
+  }
   state.streamDetailRecoveryRetryKey = recoveryKey;
+  state.streamDetailRecoveryRetryGeneration = streamGeneration;
+  state.streamDetailRecoveryRetrySource = source;
   state.streamDetailRecoveryRetryAttempt += 1;
   const delayMs = Math.min(
     ACTIVITY_SNAPSHOT_RECOVERY_RETRY_MAX_MS,
@@ -23407,13 +25945,17 @@ function scheduleStreamDetailRecoveryRetry(recoveryKey) {
   );
   state.streamDetailRecoveryRetryTimer = window.setTimeout(() => {
     state.streamDetailRecoveryRetryTimer = null;
+    const retryGeneration = state.streamDetailRecoveryRetryGeneration;
+    const retrySource = state.streamDetailRecoveryRetrySource;
     const selected = getSelectedSession();
-    if (getSessionKey(selected) !== recoveryKey) {
+    if (!streamRecoveryContextIsCurrent(recoveryKey, retryGeneration, retrySource)) {
       discardStaleStreamDetailRecovery(selected);
       return;
     }
     void reconcileSelectedSessionAfterStreamReset(selected, {
       activities: state.streamActivityRecoveryPendingKeys.has(recoveryKey),
+      streamGeneration: retryGeneration,
+      source: retrySource,
     }).catch(() => {});
   }, delayMs);
 }
@@ -23421,24 +25963,59 @@ function scheduleStreamDetailRecoveryRetry(recoveryKey) {
 async function reconcileSelectedSessionAfterStreamReset(session, options = {}) {
   const requestedKey = getSessionKey(session);
   if (!requestedKey) return;
+  const requestedGeneration = Number(options.streamGeneration);
+  const streamGeneration = Number.isSafeInteger(requestedGeneration) && requestedGeneration > 0
+    ? requestedGeneration
+    : null;
+  const source = options.source || null;
+  const isCurrentRecovery = () => streamRecoveryContextIsCurrent(
+    requestedKey,
+    streamGeneration,
+    source
+  );
+  if (!isCurrentRecovery()) return { stale: true };
+
   const selectedAtRequest = getSelectedSession();
-  if (getSessionKey(selectedAtRequest) !== requestedKey) return;
   state.streamDetailRecoveryCanonicalKeys.set(
     requestedKey,
     getActivityCanonicalKeyForSession(selectedAtRequest)
   );
   state.streamDetailRecoveryPendingKey = requestedKey;
   if (options.activities) state.streamActivityRecoveryPendingKeys.add(requestedKey);
-  if (state.streamDetailRecoveryInFlight) return;
+
+  // Coalesce resets from the same live source. If the previous owner belongs
+  // to a replaced source, take ownership so its late finally block cannot
+  // clear the new recovery's in-flight flag.
+  const currentOwner = state.streamDetailRecoveryContext;
+  if (
+    state.streamDetailRecoveryInFlight
+    && currentOwner
+    && streamRecoveryContextIsCurrent(
+      currentOwner.key,
+      currentOwner.streamGeneration,
+      currentOwner.source
+    )
+  ) {
+    return;
+  }
   if (state.streamDetailRecoveryRetryTimer) {
     window.clearTimeout(state.streamDetailRecoveryRetryTimer);
     state.streamDetailRecoveryRetryTimer = null;
   }
+  const owner = Symbol('stream-detail-recovery');
+  state.streamDetailRecoveryOwner = owner;
+  state.streamDetailRecoveryContext = {
+    owner,
+    key: requestedKey,
+    streamGeneration,
+    source,
+  };
   state.streamDetailRecoveryInFlight = true;
   let recoveryError = null;
   let failedRecoveryKey = null;
   try {
     while (state.streamDetailRecoveryPendingKey) {
+      if (!isCurrentRecovery()) return { stale: true };
       const recoveryKey = state.streamDetailRecoveryPendingKey;
       state.streamDetailRecoveryPendingKey = null;
       const recoverActivities = state.streamActivityRecoveryPendingKeys.delete(recoveryKey);
@@ -23448,6 +26025,7 @@ async function reconcileSelectedSessionAfterStreamReset(session, options = {}) {
         || !selected?.sessionId
         || getSessionKey(selected) !== recoveryKey
       ) {
+        if (!isCurrentRecovery()) return { stale: true };
         const canonicalKey = state.streamDetailRecoveryCanonicalKeys.get(recoveryKey);
         if (canonicalKey) state.eventCursorByCanonical.delete(canonicalKey);
         state.streamDetailRecoveryCanonicalKeys.delete(recoveryKey);
@@ -23456,34 +26034,36 @@ async function reconcileSelectedSessionAfterStreamReset(session, options = {}) {
       let detailError = null;
       let activityError = null;
       try {
+        if (!isCurrentRecovery()) return { stale: true };
         state.fullTranscriptLoaded.delete(recoveryKey);
         await withStreamRecoveryTimeout((signal) => showSession(selected, {
           full: true,
           preserveScroll: true,
           signal,
           throwOnError: true,
+          isCurrent: isCurrentRecovery,
+          streamGeneration,
+          source,
         }));
+        if (!isCurrentRecovery()) return { stale: true };
       } catch (error) {
+        if (!isCurrentRecovery()) return { stale: true };
         detailError = error;
       }
       if (recoverActivities) {
         try {
+          if (!isCurrentRecovery()) return { stale: true };
           await withStreamRecoveryTimeout((signal) => (
-            loadSessionActivitySnapshot(selected, { signal })
+            loadSessionActivitySnapshot(selected, { signal, isCurrent: isCurrentRecovery })
           ));
+          if (!isCurrentRecovery()) return { stale: true };
         } catch (error) {
+          if (!isCurrentRecovery()) return { stale: true };
           activityError = error;
           state.streamActivityRecoveryPendingKeys.add(recoveryKey);
         }
       }
-      if (getSessionKey(getSelectedSession()) !== recoveryKey) {
-        state.streamActivityRecoveryPendingKeys.delete(recoveryKey);
-        if (detailError || activityError) {
-          state.eventCursorByCanonical.delete(getActivityCanonicalKeyForSession(selected));
-        }
-        state.streamDetailRecoveryCanonicalKeys.delete(recoveryKey);
-        continue;
-      }
+      if (!isCurrentRecovery()) return { stale: true };
       recoveryError = detailError || activityError;
       if (recoveryError) {
         failedRecoveryKey = recoveryKey;
@@ -23494,10 +26074,18 @@ async function reconcileSelectedSessionAfterStreamReset(session, options = {}) {
       state.streamDetailRecoveryCanonicalKeys.delete(recoveryKey);
     }
   } finally {
-    state.streamDetailRecoveryInFlight = false;
+    if (state.streamDetailRecoveryOwner === owner) {
+      state.streamDetailRecoveryInFlight = false;
+      state.streamDetailRecoveryOwner = null;
+      state.streamDetailRecoveryContext = null;
+    }
   }
+  if (!isCurrentRecovery()) return { stale: true };
   if (recoveryError) {
-    scheduleStreamDetailRecoveryRetry(failedRecoveryKey);
+    scheduleStreamDetailRecoveryRetry(failedRecoveryKey, {
+      streamGeneration,
+      source,
+    });
     throw recoveryError;
   }
   clearStreamDetailRecoveryRetry();
@@ -23518,17 +26106,64 @@ function updateSelectedViews(session) {
   renderExportDialog();
 }
 
-function rememberSessionStreamEvent(session, event, payload = null) {
-  const canonicalKey = rememberActivityCanonicalKey(
+function sessionStreamEventCanonicalKey(session, event, payload = null) {
+  return rememberActivityCanonicalKey(
     payload?.canonicalConversationKey || getActivityCanonicalKeyForSession(session),
     session,
     payload
   );
-  const cursor = String(event?.lastEventId || '').trim();
-  if (canonicalKey && cursor) {
-    state.eventCursorByCanonical.set(canonicalKey, cursor);
-  }
-  return canonicalKey;
+}
+
+// The stream client owns event contexts, cursor fencing, and ordered commit
+// semantics. These wrappers keep the existing business-handler call sites
+// stable while making the transport lifecycle independently testable.
+function parseSessionStreamCursor(value) {
+  return getSessionStreamClient().parseCursor(value);
+}
+
+function commitSessionStreamEventDirect(
+  session,
+  event,
+  payload = null,
+  canonicalKey = '',
+  streamGeneration = null
+) {
+  return getSessionStreamClient().commitDirect(
+    session,
+    event,
+    payload,
+    canonicalKey,
+    streamGeneration
+  );
+}
+
+function createSessionStreamCursorGate(session, source, streamKey, streamGeneration, options = {}) {
+  return getSessionStreamClient().createGate(
+    session,
+    source,
+    streamKey,
+    streamGeneration,
+    options
+  );
+}
+
+function deferSessionStreamEvent(event) {
+  return getSessionStreamClient().defer(event);
+}
+
+function failSessionStreamEvent(event, error) {
+  return getSessionStreamClient().fail(event, error);
+}
+
+function commitSessionStreamEvent(session, event, payload = null, canonicalKey = '') {
+  return getSessionStreamClient().commit(session, event, payload, canonicalKey);
+}
+
+// Kept as a compatibility wrapper for non-SSE callers. Event handlers must
+// use sessionStreamEventCanonicalKey() before applying and
+// commitSessionStreamEvent() only after the application succeeds.
+function rememberSessionStreamEvent(session, event, payload = null) {
+  return commitSessionStreamEvent(session, event, payload);
 }
 
 function patchProjectedThinkingActivity(canonicalKey, activity) {
@@ -23541,7 +26176,12 @@ function patchProjectedThinkingActivity(canonicalKey, activity) {
   }
   const log = el('session-log');
   const latestUserEntry = getLatestUserTranscriptEntry(selected);
-  const stateKey = `${getSessionKey(selected) || selected.sessionId || 'session'}::thinking::${latestUserEntry?.timestamp || 'live'}`;
+  const stateKey = thinkingSegmentStateKey(selected, {
+    userEntryKey: latestUserEntry
+      ? transcriptEntryStableTurnKey(latestUserEntry)
+      : 'live',
+    userTimestamp: latestUserEntry?.timestamp || 'live',
+  });
   if (!log?.querySelector?.(`.thinking-card[data-thinking-state-key="${cssEscape(stateKey)}"]`)) {
     return false;
   }
@@ -23550,10 +26190,38 @@ function patchProjectedThinkingActivity(canonicalKey, activity) {
   return true;
 }
 
-function applyActivityEvent(session, event, payload) {
-  const canonicalKey = rememberSessionStreamEvent(session, event, payload);
-  if (!canonicalKey || !state.activityProjection?.applyActivity(canonicalKey, payload)) {
+function applyActivityEvent(session, event, payload, options = {}) {
+  const canonicalKey = sessionStreamEventCanonicalKey(session, event, payload);
+  if (!canonicalKey || !state.activityProjection) {
     return false;
+  }
+  const previousEpoch = state.activityProjection.epochFor?.(canonicalKey) || '';
+  const previousActivity = state.activityProjection.activitiesFor(canonicalKey)
+    .find((activity) => activity.activityKey === payload?.activityKey) || null;
+  const previousRevision = Number(previousActivity?.activityRevision || 0);
+  const incomingRevision = Number(payload?.activityRevision || 0);
+  const applied = state.activityProjection.applyActivity(canonicalKey, payload);
+  if (applied === false) {
+    const currentEpoch = state.activityProjection.epochFor?.(canonicalKey) || '';
+    const incomingEpoch = String(payload?.streamEpoch || '').trim();
+    const duplicateOrOlder = Boolean(
+      previousActivity
+      && payload?.activityKey
+      && incomingRevision > 0
+      && previousRevision >= incomingRevision
+      && incomingEpoch
+      && previousEpoch === incomingEpoch
+      && currentEpoch === incomingEpoch
+    );
+    if (!duplicateOrOlder) return false;
+    if (options.commit !== false) {
+      commitSessionStreamEvent(session, event, payload, canonicalKey);
+    }
+    return true;
+  }
+  rememberActivityClientRequestIds(canonicalKey, payload);
+  if (options.commit !== false) {
+    commitSessionStreamEvent(session, event, payload, canonicalKey);
   }
   if (!patchProjectedThinkingActivity(canonicalKey, payload)) {
     const selected = getSelectedSession();
@@ -23564,27 +26232,48 @@ function applyActivityEvent(session, event, payload) {
   return true;
 }
 
-function applySessionStreamReset(session, event, payload) {
-  const canonicalKey = rememberSessionStreamEvent(session, event, payload);
+function applySessionStreamReset(session, event, payload, options = {}) {
+  if (typeof options.isCurrent === 'function' && !options.isCurrent()) {
+    return false;
+  }
+  const canonicalKey = sessionStreamEventCanonicalKey(session, event, payload);
   if (!canonicalKey) {
     return false;
   }
   if (payload.session) {
+    if (typeof options.isCurrent === 'function' && !options.isCurrent()) {
+      return false;
+    }
     mergeSession(payload.session);
     if (payload.session.runtime) {
       setRuntimeForSession(
         payload.session.hostId || session.hostId,
         payload.session.sessionId || session.sessionId,
-        payload.session?.runtime, { source: 'stream', allowStale: true }
+        payload.session?.runtime, { source: 'stream', allowStale: true, authoritativeSnapshot: true }
       );
     }
   }
-  state.activityProjection?.applyReset(canonicalKey, {
+  const resetApplied = !state.activityProjection || state.activityProjection.applyReset(canonicalKey, {
     streamEpoch: payload.streamEpoch,
     activities: payload.activities || [],
-  });
+    activitiesTruncated: payload.activitiesTruncated === true,
+    incomplete: payload.incomplete === true,
+  }) !== false;
+  if (!resetApplied) {
+    return false;
+  }
+  if (typeof options.isCurrent === 'function' && !options.isCurrent()) {
+    return false;
+  }
+  rememberActivityClientRequestIds(canonicalKey, payload.activities || []);
+  if (options.commit !== false) {
+    commitSessionStreamEvent(session, event, payload, canonicalKey);
+  }
   if (payload.assistantProjection?.canonicalConversationKey) {
-    void catchUpAssistantProjection(session, payload.assistantProjection, { force: true }).catch(() => {});
+    void catchUpAssistantProjection(session, payload.assistantProjection, {
+      force: true,
+      isCurrent: options.isCurrent,
+    }).catch(() => {});
   }
   const selected = getSelectedSession();
   if (selected && getActivityCanonicalKeyForSession(selected) === canonicalKey) {
@@ -23616,6 +26305,8 @@ function subscribeSession(session) {
   }
 
   closeStream();
+  const streamGeneration = Number(state.sessionStreamGeneration || 0) + 1;
+  state.sessionStreamGeneration = streamGeneration;
 
   const eventParams = new URLSearchParams({ hostId: session.hostId });
   if (!isOptimizeSpeedMode()) {
@@ -23631,6 +26322,10 @@ function subscribeSession(session) {
     state.eventCursorByCanonical.delete(canonicalKey);
     resumeCursor = '';
   }
+  // Publish the new generation before constructing the EventSource. This
+  // closes the small window in which late non-listener callbacks from the
+  // previous source could otherwise pass the cursor generation check.
+  state.eventCursorGenerationByCanonical?.set(canonicalKey, streamGeneration);
   if (resumeCursor) {
     eventParams.set('lastEventId', resumeCursor);
   }
@@ -23640,30 +26335,58 @@ function subscribeSession(session) {
     eventParams.set('assistantAfter', String(receipt?.notifiedThroughAssistantSeq || 0));
   }
   const url = `/api/sessions/${encodeURIComponent(session.sessionId)}/events?${eventParams.toString()}`;
-  state.eventSource = new EventSource(url);
+  const source = new EventSource(url);
+  state.eventSource = source;
   state.eventSourceKey = key;
+  const streamClient = getSessionStreamClient();
+  const streamGate = createSessionStreamCursorGate(session, source, key, streamGeneration, {
+    onFailure: (error) => {
+      if (!streamGate.isCurrent()) return;
+      setStreamStatusForSession(session.hostId, session.sessionId, {
+        connection: 'reconnecting',
+        lastError: error?.message || String(error || 'Session stream event failed.'),
+      });
+      // Leave the last contiguous cursor in place and let the normal resume
+      // path replay the failed event. Closing first also invalidates any late
+      // callbacks from this source.
+      // A full reconnect supersedes a pending detail-recovery retry; keeping
+      // that timer alive would issue a second overlapping recovery request.
+      clearStreamDetailRecoveryRetry();
+      closeStream();
+      window.setTimeout(() => {
+        if (getSessionKey(getSelectedSession()) !== key) return;
+        resumeSelectedSessionRealtime({ force: true }).catch(reportError);
+      }, 0);
+    },
+  });
+  const guardStreamCallback = (callback) => streamClient.guardCallback(
+    source,
+    key,
+    streamGeneration,
+    callback
+  );
   setStreamStatusForSession(session.hostId, session.sessionId, {
     connection: 'connecting',
     lastPingAt: null,
   });
   scheduleRuntimeStatusRender();
 
-  state.eventSource.addEventListener('open', () => {
+  source.addEventListener('open', guardStreamCallback(() => {
     setStreamStatusForSession(session.hostId, session.sessionId, {
       connection: 'connected',
     });
     scheduleRuntimeStatusRender();
-  });
+  }));
 
-  state.eventSource.addEventListener('ready', () => {
+  source.addEventListener('ready', guardStreamCallback(() => {
     setStreamStatusForSession(session.hostId, session.sessionId, {
       connection: 'connected',
       lastPingAt: new Date().toISOString(),
     });
     scheduleRuntimeStatusRender();
-  });
+  }));
 
-  state.eventSource.addEventListener('ping', () => {
+  source.addEventListener('ping', guardStreamCallback(() => {
     setStreamStatusForSession(session.hostId, session.sessionId, {
       connection: 'connected',
       lastPingAt: new Date().toISOString(),
@@ -23671,77 +26394,115 @@ function subscribeSession(session) {
     queuedUiRenders.runtimePanel = true;
     queuedUiRenders.statusWindow = true;
     scheduleQueuedUiFlush();
-  });
+  }));
 
-  const cursorEvents = [
-    'stream.reset',
-    'session.snapshot',
-    'session.started',
-    'session.state_changed',
-    'session.transcript',
-    'session.transcript_removed',
-    'session.alert',
-    'session.runtime_updated',
-    'session.diagnostic',
-    'session.request',
-    'session.request.resolved',
-    'session.interrupt_result',
-    'session.activity',
-    'session.assistant_projection',
-  ];
-  for (const eventName of cursorEvents) {
-    state.eventSource.addEventListener(eventName, (event) => {
-      let payload = null;
-      try {
-        payload = JSON.parse(event.data);
-      } catch (_) {
-        // Cursor retention does not depend on parsing the payload.
-      }
-      rememberSessionStreamEvent(session, event, payload);
-    });
-  }
-
-  state.eventSource.addEventListener('stream.reset', (event) => {
+  streamGate.listen('stream.reset', (event) => {
     const payload = JSON.parse(event.data);
-    applySessionStreamReset(session, event, payload);
-    if (
-      sessionStreamResetNeedsDetailRecovery(session)
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
+    const applied = applySessionStreamReset(session, event, payload, {
+      commit: false,
+      isCurrent: streamGate.isCurrent,
+    });
+    if (!applied) {
+      return false;
+    }
+    // A fully loaded history Session already has an authoritative transcript
+    // and activity projection. Only live or not-yet-complete Sessions need a
+    // costly detail/activity round trip after a cursor reset; otherwise every
+    // reconnect of an idle history row would block the stream on a full fetch.
+    const recoveryRequired = sessionStreamResetNeedsDetailRecovery(session)
       && (
         sessionStreamResetNeedsRecovery(payload.reason)
-        || payload.detailRecoveryRequired
-        || payload.activitiesTruncated
-      )
-    ) {
-      reconcileSelectedSessionAfterStreamReset(session, {
+        || payload.detailRecoveryRequired === true
+        || payload.activitiesTruncated === true
+      );
+    if (recoveryRequired) {
+      deferSessionStreamEvent(event);
+      return reconcileSelectedSessionAfterStreamReset(session, {
         activities: payload.activitiesTruncated === true,
-      }).catch(reportError);
+        streamGeneration,
+        source,
+      }).then(() => {
+        if (!streamGate.isCurrent()) return false;
+        return commitSessionStreamEvent(session, event, payload) !== false;
+      }).catch((error) => {
+        failSessionStreamEvent(event, error);
+        throw error;
+      });
     }
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.activity', (event) => {
+  streamGate.listen('session.activity', (event) => {
     const payload = JSON.parse(event.data);
-    if (payload.activityTruncated === true) {
-      scheduleActivitySnapshotRecovery(session, event, payload);
-      return;
+    if (!payload || typeof payload !== 'object') {
+      return false;
     }
-    applyActivityEvent(session, event, payload);
+    if (payload.activityTruncated === true) {
+      const scheduled = scheduleActivitySnapshotRecovery(session, event, payload);
+      if (!scheduled) return false;
+      // The recovery task commits the original event once its authoritative
+      // snapshot/record has been applied. Keep this event at the gate until
+      // then so later events cannot skip it.
+      deferSessionStreamEvent(event);
+      return true;
+    }
+    const applied = applyActivityEvent(session, event, payload);
+    return applied !== false;
   });
 
-  state.eventSource.addEventListener('session.assistant_projection', (event) => {
+  streamGate.listen('session.assistant_projection', (event) => {
     const projection = JSON.parse(event.data);
-    void catchUpAssistantProjection(session, projection, { force: true }).catch(() => {});
+    if (!projection || typeof projection !== 'object' || !projection.canonicalConversationKey) {
+      return false;
+    }
+    deferSessionStreamEvent(event);
+    return catchUpAssistantProjection(session, projection, {
+      force: true,
+      isCurrent: streamGate.isCurrent,
+    })
+      .then((result) => {
+        if (result === null || typeof result === 'undefined') {
+          throw new Error('Assistant projection event could not be applied.');
+        }
+        const committed = commitSessionStreamEvent(session, event, projection);
+        if (committed === false) {
+          // A replaced EventSource must not leave this async record pending;
+          // the gate marks it stale and the new source replays from its cursor.
+          return false;
+        }
+        return true;
+      }).catch((error) => {
+        if (isStaleStreamRecoveryError(error) && !streamGate.isCurrent()) {
+          return false;
+        }
+        throw error;
+      });
   });
 
-  state.eventSource.addEventListener('error', () => {
+  source.addEventListener('error', guardStreamCallback(() => {
     setStreamStatusForSession(session.hostId, session.sessionId, {
       connection: session.live ? 'reconnecting' : 'disconnected',
     });
     scheduleRuntimeStatusRender();
-  });
+  }));
 
-  state.eventSource.addEventListener('session.snapshot', (event) => {
+  streamGate.listen('session.snapshot', (event) => {
     const payload = JSON.parse(event.data);
-    mergeSession(payload);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
+    const merged = mergeSession({
+      ...payload,
+      hostId: payload.hostId || session.hostId,
+      sessionId: payload.sessionId || session.sessionId,
+    });
+    if (!merged) {
+      return false;
+    }
     markSessionMessageNotificationChanged(
       payload.hostId || session.hostId,
       payload.sessionId || session.sessionId,
@@ -23753,11 +26514,19 @@ function subscribeSession(session) {
     if (payload.hostId === state.selectedHostId) {
       scheduleSelectedViewsRender();
     }
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.started', (event) => {
+  streamGate.listen('session.started', (event) => {
     const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
     const started = applyConfirmedSessionStarted(payload, session);
+    if (!started) {
+      return false;
+    }
     markSessionMessageNotificationChanged(
       started?.hostId || session.hostId,
       started?.sessionId || session.sessionId,
@@ -23767,11 +26536,23 @@ function subscribeSession(session) {
       state.selectedSessionId = payload.sessionId;
     }
     scheduleSelectedViewsRender();
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.state_changed', (event) => {
+  streamGate.listen('session.state_changed', (event) => {
     const payload = JSON.parse(event.data);
-    const changed = mergeSession(payload);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
+    const changed = mergeSession({
+      ...payload,
+      hostId: payload.hostId || session.hostId,
+      sessionId: payload.sessionId || session.sessionId,
+    });
+    if (!changed) {
+      return false;
+    }
     if (isTerminalSessionLifecycleState(changed)) {
       void loadSessionRuntimeConfigForSession(changed).catch(() => {});
     }
@@ -23781,11 +26562,26 @@ function subscribeSession(session) {
       changed?.assistantProjection || payload.assistantProjection
     );
     scheduleSelectedViewsRender();
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.transcript', (event) => {
+  streamGate.listen('session.transcript', (event) => {
     const payload = JSON.parse(event.data);
-    appendTranscriptEntry(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
+    const eventHostId = payload.hostId || session.hostId;
+    const eventSessionId = payload.sessionId || session.sessionId;
+    const eventSessionKey = makeSessionKey(eventHostId, eventSessionId);
+    const appended = appendTranscriptEntry(eventHostId, eventSessionId, payload);
+    const tombstoned = transcriptEntryIsTombstoned(
+      makeSessionKey(eventHostId, eventSessionId),
+      payload
+    );
+    if (!appended && !tombstoned) {
+      return false;
+    }
     const completedSession = {
       hostId: payload.hostId || session.hostId,
       sessionId: payload.sessionId || session.sessionId,
@@ -23801,17 +26597,22 @@ function subscribeSession(session) {
       }
     }
     const selected = getSelectedSession();
-    if (selected && getSessionKey(selected) === key) {
+    if (selected && getSessionKey(selected) === eventSessionKey) {
       scheduleTranscriptRender({ forceScroll: payload.speaker === 'user' });
       queuedUiRenders.thinkingPanel = true;
       scheduleQueuedUiFlush();
     } else if (payload.speaker === 'agent' || payload.speaker === 'assistant') {
       scheduleQueuedUiFlush();
     }
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.transcript_removed', (event) => {
+  streamGate.listen('session.transcript_removed', (event) => {
     const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
     const removedSession = {
       hostId: payload.hostId || session.hostId,
       sessionId: payload.sessionId || session.sessionId,
@@ -23821,28 +26622,48 @@ function subscribeSession(session) {
       removedSession.sessionId,
       payload
     );
-    if (payload.clientRequestId) {
+    if (
+      payload.clientRequestId
+      && String(payload.speaker || 'user').toLowerCase() === 'user'
+    ) {
       recoverComposerSubmissionForSession(removedSession, {
         clientRequestId: payload.clientRequestId,
       });
     }
-    const selected = getSelectedSession();
-    if (selected && getSessionKey(selected) === makeSessionKey(removedSession.hostId, removedSession.sessionId)) {
+    if (
+      payload.clientRequestId
+      && String(payload.speaker || 'user').toLowerCase() === 'user'
+      && getSessionKey(getSelectedSession()) === makeSessionKey(removedSession.hostId, removedSession.sessionId)
+    ) {
+      const selected = getSelectedSession();
       scheduleTranscriptRender({ preserveScroll: true });
       queuedUiRenders.thinkingPanel = true;
       scheduleQueuedUiFlush();
     }
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.alert', (event) => {
+  streamGate.listen('session.alert', (event) => {
     const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
     appendAlertForSession(payload.hostId || session.hostId, payload.sessionId || session.sessionId, payload);
     if ((payload.severity || 'warning') === 'error') {
-      state.alertWindowOpen = true;
+      getSessionModalController().setAlertOpen(true, {
+        expectedSession: {
+          hostId: payload.hostId || session.hostId,
+          sessionId: payload.sessionId || session.sessionId,
+        },
+        render: false,
+      });
     }
     queuedUiRenders.sessionDetails = true;
     queuedUiRenders.alertsWindow = true;
     scheduleQueuedUiFlush();
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
   const handleRuntimePayload = (payload) => {
@@ -23926,6 +26747,7 @@ function subscribeSession(session) {
       }
       clearSentDraftSnapshotForSessionRequest(runtimeSession, runtimeClientRequestId);
     }
+    maybeScheduleQueuedPromptSend(runtimeSession);
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === makeSessionKey(runtimePayload.hostId || session.hostId, runtimePayload.sessionId || session.sessionId)) {
       if (
@@ -23935,26 +26757,53 @@ function subscribeSession(session) {
       ) {
         scheduleTranscriptRender({ preserveScroll: true });
       }
-      maybeScheduleQueuedPromptSend(selected);
       refreshInferredComposerOptionsForSession(selected);
     }
+    queuedUiRenders.conversationNav = true;
     scheduleRuntimeStatusRender();
+    return true;
   };
 
-  state.eventSource.addEventListener('session.runtime_updated', (event) => {
-    handleRuntimePayload(JSON.parse(event.data));
+  streamGate.listen('session.runtime_updated', (event) => {
+    const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
+    const applied = handleRuntimePayload(payload);
+    if (applied !== false) {
+      commitSessionStreamEvent(session, event, payload);
+    }
+    return applied !== false;
   });
 
-  state.eventSource.addEventListener('session.interrupt_result', (event) => {
+  streamGate.listen('session.steer_result', (event) => {
     const payload = JSON.parse(event.data);
-    applySessionInterruptResult({
+    if (!payload || typeof payload !== 'object') return false;
+    getSteerClient().apply(payload);
+    commitSessionStreamEvent(session, event, payload);
+    return true;
+  });
+
+  streamGate.listen('session.interrupt_result', (event) => {
+    const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
+    const applied = applySessionInterruptResult({
       hostId: payload.hostId || session.hostId,
       sessionId: payload.sessionId || session.sessionId,
     }, payload);
+    // An unknown/duplicate interrupt result is still a valid stream event;
+    // consume it after the best-effort local reconciliation.
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.command_failed', (event) => {
+  streamGate.listen('session.command_failed', (event) => {
     const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
     if (String(payload.operation || '').toLowerCase() === 'input') {
       recoverComposerSubmissionForSession({
         hostId: payload.hostId || session.hostId,
@@ -23966,10 +26815,15 @@ function subscribeSession(session) {
     queuedUiRenders.sessionDetails = true;
     queuedUiRenders.statusWindow = true;
     scheduleQueuedUiFlush();
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.diagnostic', (event) => {
+  streamGate.listen('session.diagnostic', (event) => {
     const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
     const diagnosticSession = {
       hostId: payload.hostId || session.hostId,
       sessionId: payload.sessionId || session.sessionId,
@@ -23997,10 +26851,15 @@ function subscribeSession(session) {
     }
     queuedUiRenders.statusWindow = true;
     scheduleQueuedUiFlush();
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.request', (event) => {
+  streamGate.listen('session.request', (event) => {
     const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
     const eventHostId = payload.hostId || session.hostId;
     const eventSessionId = payload.sessionId || session.sessionId;
     const eventSessionKey = makeSessionKey(eventHostId, eventSessionId);
@@ -24018,10 +26877,15 @@ function subscribeSession(session) {
       queuedUiRenders.statusWindow = true;
       scheduleQueuedUiFlush();
     }
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 
-  state.eventSource.addEventListener('session.request.resolved', (event) => {
+  streamGate.listen('session.request.resolved', (event) => {
     const payload = JSON.parse(event.data);
+    if (!payload || typeof payload !== 'object') {
+      return false;
+    }
     const eventHostId = payload.hostId || session.hostId;
     const eventSessionId = payload.sessionId || session.sessionId;
     const eventSessionKey = makeSessionKey(eventHostId, eventSessionId);
@@ -24042,6 +26906,8 @@ function subscribeSession(session) {
       queuedUiRenders.statusWindow = true;
       scheduleQueuedUiFlush();
     }
+    commitSessionStreamEvent(session, event, payload);
+    return true;
   });
 }
 
@@ -24049,6 +26915,13 @@ async function showSession(session = getSelectedSession(), options = {}) {
   if (session && getSessionKey(session) !== getSessionKey(getSelectedSession())) {
     return;
   }
+  const hasAsyncFence = typeof options.isCurrent === 'function'
+    || Object.prototype.hasOwnProperty.call(options, 'streamGeneration')
+    || Object.prototype.hasOwnProperty.call(options, 'source');
+  let asyncFence = hasAsyncFence
+    ? createSessionAsyncFence(session, options)
+    : null;
+  assertSessionAsyncFenceCurrent(asyncFence);
   renderSessionDetails();
   renderRuntimePanel();
   renderThinkingPanel();
@@ -24067,7 +26940,7 @@ async function showSession(session = getSelectedSession(), options = {}) {
     state.shownSessionKey = sessionKey;
   }
 
-  if (shouldLoadSessionRuntimeConfigOnOpen(session)) {
+  if (!hasAsyncFence && shouldLoadSessionRuntimeConfigOnOpen(session)) {
     void loadSessionRuntimeConfigForSession(session).catch(() => {});
   }
 
@@ -24079,6 +26952,15 @@ async function showSession(session = getSelectedSession(), options = {}) {
   };
   renderTranscript(session, initialTranscriptRenderOptions);
   subscribeSession(session);
+  // A normal selection does not arrive with a stream guard. Capture one only
+  // after subscribeSession(), which may advance the generation while replacing
+  // the previous Session's EventSource.
+  if (!asyncFence) {
+    asyncFence = createSessionAsyncFence(session, {
+      streamGeneration: state.sessionStreamGeneration,
+    });
+  }
+  assertSessionAsyncFenceCurrent(asyncFence);
   const sessionKeyAtWatchStart = getSessionKey(session);
   void watchSelectedSession(session).catch((error) => {
     if (getSessionKey(getSelectedSession()) === sessionKeyAtWatchStart) {
@@ -24108,7 +26990,12 @@ async function showSession(session = getSelectedSession(), options = {}) {
 
     const originalSessionKey = getSessionKey(session);
     const shouldLoadFullTranscript = Boolean(options.full || !state.fullTranscriptLoaded.has(originalSessionKey));
+    const detailRequestApplyGeneration = getRequestApplyGeneration(
+      session.hostId,
+      session.sessionId
+    );
     const detailRuntimeStreamGeneration = getRuntimeStreamGeneration(session.hostId, session.sessionId);
+    const detailRuntimeApplyGeneration = getRuntimeApplyGeneration(session.hostId, session.sessionId);
     const detailParams = new URLSearchParams({ hostId: session.hostId });
     if (shouldLoadFullTranscript) {
       detailParams.set('full', '1');
@@ -24119,6 +27006,11 @@ async function showSession(session = getSelectedSession(), options = {}) {
     const detail = await fetchSharedSessionDetail(session, detailParams, {
       signal: options.signal,
     });
+    assertSessionAsyncFenceCurrent(asyncFence);
+    const responseHostId = detail.session?.hostId || session.hostId;
+    const responseSessionId = detail.session?.sessionId || session.sessionId;
+    asyncFence?.allowSession(makeSessionKey(responseHostId, responseSessionId));
+    assertSessionAsyncFenceCurrent(asyncFence);
     const detailSession = mergeSession(detail.session) || session;
     const detailHostId = detailSession.hostId || session.hostId;
     const detailSessionId = detailSession.sessionId || session.sessionId;
@@ -24155,9 +27047,13 @@ async function showSession(session = getSelectedSession(), options = {}) {
     setAlertsForSession(detailHostId, detailSessionId, detail.alerts || []);
     const detailRuntimeCanApply = detailSessionKey === originalSessionKey
       ? getRuntimeStreamGeneration(detailHostId, detailSessionId) === detailRuntimeStreamGeneration
+        && getRuntimeApplyGeneration(detailHostId, detailSessionId) === detailRuntimeApplyGeneration
       : !state.runtime.has(detailSessionKey);
     if (detailRuntimeCanApply) {
-      setRuntimeForSession(detailHostId, detailSessionId, detail.runtime || null, { source: 'detail' });
+      setRuntimeForSession(detailHostId, detailSessionId, detail.runtime || null, {
+        source: 'detail',
+        authoritativeSnapshot: true,
+      });
     }
     const reconciledRuntime = getRuntimeForSession(detailSession) || detail.runtime || null;
     if (reconciledRuntime && !runtimeIsActive(reconciledRuntime)) {
@@ -24168,11 +27064,17 @@ async function showSession(session = getSelectedSession(), options = {}) {
     if (options.fullDiagnostics) {
       state.fullDiagnosticsLoaded.add(detailSessionKey);
     }
-    setRequestsForSession(detailHostId, detailSessionId, detail.requests || []);
+    const detailRequestsCanApply = detailSessionKey === originalSessionKey
+      ? getRequestApplyGeneration(detailHostId, detailSessionId) === detailRequestApplyGeneration
+      : !state.requests.has(detailSessionKey);
+    if (detailRequestsCanApply) {
+      setRequestsForSession(detailHostId, detailSessionId, detail.requests || []);
+    }
     setHistoryLoading(session, false);
     setHistoryLoading(detailSession, false);
     state.messageReadRenderReady.add(detailSessionKey);
-    loadReceivedFilesForSession(detailSession).then((files) => {
+    loadReceivedFilesForSession(detailSession, { isCurrent: asyncFence?.isCurrent }).then((files) => {
+      assertSessionAsyncFenceCurrent(asyncFence);
       if (!files.length) {
         return;
       }
@@ -24181,7 +27083,9 @@ async function showSession(session = getSelectedSession(), options = {}) {
         renderTranscript(selected, { preserveScroll: true });
         renderStatusWindow();
       }
-    }).catch(reportError);
+    }).catch((error) => {
+      if (!isStaleStreamRecoveryError(error)) reportError(error);
+    });
 
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === getSessionKey(detailSession)) {
@@ -24190,13 +27094,18 @@ async function showSession(session = getSelectedSession(), options = {}) {
       renderThinkingPanel();
       renderAlertsWindow();
       renderStatusWindow();
-    renderTranscript(selected, {
-      forceScroll: !options.preserveScroll && !options.focus,
-      focus: options.focus || null,
-      preserveScroll: Boolean(options.preserveScroll),
-    });
+      renderApprovalPopup();
+      renderTranscript(selected, {
+        forceScroll: !options.preserveScroll && !options.focus,
+        focus: options.focus || null,
+        preserveScroll: Boolean(options.preserveScroll),
+      });
     }
   } catch (error) {
+    if (isStaleStreamRecoveryError(error)) {
+      setHistoryLoading(session, false);
+      return { stale: true };
+    }
     setHistoryLoading(session, false);
     appendAlertForSession(session.hostId, session.sessionId, {
       severity: 'error',
@@ -24204,10 +27113,9 @@ async function showSession(session = getSelectedSession(), options = {}) {
       message: error.message,
       timestamp: new Date().toISOString(),
     });
-    state.alertWindowOpen = true;
-
     const selected = getSelectedSession();
     if (selected && getSessionKey(selected) === getSessionKey(session)) {
+      getSessionModalController().setAlertOpen(true, { expectedSession: session, render: false });
       renderSessionDetails();
       renderRuntimePanel();
       renderThinkingPanel();
@@ -24929,26 +27837,174 @@ function fileFromBlob(blob, name, type = '') {
 async function fetchSessionExportResponse(session, format, options = {}) {
   const url = buildSessionExportUrl(session, format, options);
   if (!url) {
-    throw new Error('Select a conversation before importing history.');
+    const error = new Error('This saved collection entry has no resolvable Host/Session identity. Refresh the Host or remove the stale collection entry.');
+    error.code = 'history_import_session_unresolved';
+    throw error;
   }
-  const response = await fetch(url, { headers: { Accept: format === 'zip' ? 'application/zip' : 'text/markdown' } });
+  let response;
+  try {
+    response = await fetch(url, { headers: { Accept: format === 'zip' ? 'application/zip' : 'text/markdown' } });
+  } catch (error) {
+    const normalized = new Error(
+      error?.name === 'AbortError'
+        ? 'History export was interrupted before the attachment was downloaded.'
+        : /failed to fetch|networkerror|load failed/i.test(String(error?.message || error))
+          ? 'History export could not reach the Relay or Host. Check that the Host is online and retry.'
+          : `History export failed: ${error?.message || error}`
+    );
+    normalized.code = error?.name === 'AbortError'
+      ? 'history_import_aborted'
+      : 'history_import_network_error';
+    normalized.cause = error;
+    throw normalized;
+  }
   if (!response.ok) {
     let message = `history export failed: ${response.status}`;
+    let payload = null;
     try {
-      const body = await response.json();
-      message = body?.error || message;
+      payload = await response.json();
+      message = payload?.error || message;
+      if (payload?.detail) {
+        message = `${message} Reason: ${payload.detail}`;
+      }
     } catch {
       // Export endpoints may return plain text on proxy errors.
     }
-    throw new Error(message);
+    const error = new Error(message);
+    error.code = String(payload?.code || '').trim() || 'history_export_http_error';
+    error.status = response.status;
+    error.detail = payload?.detail || '';
+    throw error;
   }
   return response;
 }
 
+function historyImportSizeError(format, maxBytes, actualBytes = null) {
+  const label = format === 'zip' ? 'History bundle' : 'History Markdown';
+  const suffix = Number.isFinite(actualBytes) && actualBytes > 0
+    ? ` (${formatBytes(actualBytes)})`
+    : '';
+  const error = new Error(`${label}${suffix} exceeds the browser import limit of ${formatBytes(maxBytes)}.`);
+  error.code = format === 'zip'
+    ? 'history_import_bundle_too_large'
+    : 'history_import_markdown_too_large';
+  error.format = format;
+  error.maxBytes = maxBytes;
+  error.actualBytes = Number.isFinite(actualBytes) ? actualBytes : null;
+  return error;
+}
+
+function responseContentLength(response) {
+  const value = response?.headers?.get?.('content-length');
+  const bytes = Number(value);
+  return Number.isFinite(bytes) && bytes >= 0 ? bytes : null;
+}
+
+async function readResponseBytesWithLimit(response, maxBytes, format) {
+  const declaredBytes = responseContentLength(response);
+  if (declaredBytes != null && declaredBytes > maxBytes) {
+    try {
+      await response?.body?.cancel?.('history import response exceeded the browser memory limit');
+    } catch {
+      // The response may already be closed; the size error is still actionable.
+    }
+    throw historyImportSizeError(format, maxBytes, declaredBytes);
+  }
+
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    try {
+      if (typeof response?.arrayBuffer === 'function') {
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength > maxBytes) {
+          throw historyImportSizeError(format, maxBytes, buffer.byteLength);
+        }
+        return new Uint8Array(buffer);
+      }
+      const text = await response.text();
+      const encoded = new TextEncoder().encode(text);
+      if (encoded.byteLength > maxBytes) {
+        throw historyImportSizeError(format, maxBytes, encoded.byteLength);
+      }
+      return encoded;
+    } catch (error) {
+      if (error?.code) throw error;
+      throw normalizeHistoryImportError(error);
+    }
+  }
+
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value || []);
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel('history import response exceeded the browser memory limit').catch(() => {});
+        throw historyImportSizeError(format, maxBytes, totalBytes);
+      }
+      chunks.push(chunk);
+    }
+  } catch (error) {
+    if (error?.code) throw error;
+    throw normalizeHistoryImportError(error);
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+async function readResponseTextWithLimit(response, maxBytes) {
+  const bytes = await readResponseBytesWithLimit(response, maxBytes, 'markdown');
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+async function readResponseBlobWithLimit(response, maxBytes) {
+  const bytes = await readResponseBytesWithLimit(response, maxBytes, 'zip');
+  return new Blob([bytes], { type: 'application/zip' });
+}
+
+function normalizeHistoryImportError(error) {
+  if (error?.code && String(error.code).startsWith('history_')) {
+    return error;
+  }
+  const raw = [error?.name, error?.code, error?.message]
+    .filter(Boolean)
+    .join(': ') || String(error || 'unknown error');
+  const lower = raw.toLowerCase();
+  const memoryFailure = /invalid string length|out of memory|array buffer|memory|enomem|heap out of/i.test(lower);
+  const quotaFailure = /quotaexceeded|quota exceeded|storage quota|enospc|no space left/i.test(lower);
+  const normalized = new Error(
+    memoryFailure
+      ? 'History export exceeded the available browser memory. Retry with Images and Files disabled.'
+      : quotaFailure
+        ? 'The browser storage quota was exceeded while staging the history attachment.'
+        : /failed to fetch|networkerror|load failed/i.test(lower)
+          ? 'History export could not be downloaded. Check Relay/Host connectivity and retry.'
+          : raw
+  );
+  normalized.code = memoryFailure
+    ? 'history_import_memory_error'
+    : quotaFailure
+      ? 'history_import_storage_quota'
+      : 'history_import_failed';
+  normalized.cause = error;
+  return normalized;
+}
+
 async function attachHistoryMarkdown(session, options = {}, sessionKey = getMountedComposerSessionKey()) {
   const composerSessionKey = resolveComposerSessionKey(sessionKey);
+  const historyImportBatchId = String(options.historyImportBatchId || '').trim();
+  const historyImportSessionKey = getSessionKey(session);
   const response = await fetchSessionExportResponse(session, 'markdown', options);
-  const text = await response.text();
+  const text = await readResponseTextWithLimit(response, MAX_HISTORY_IMPORT_MARKDOWN_BYTES);
   const title = makeSafeAttachmentName(sessionDisplayTitle(session), shortId(session?.sessionId || 'conversation'));
   const name = `${title}.history.md`;
   const size = textByteLength(text);
@@ -24961,30 +28017,41 @@ async function attachHistoryMarkdown(session, options = {}, sessionKey = getMoun
       name,
       size,
       source: 'historyImport',
-      sessionKey: getSessionKey(session),
+      sessionKey: historyImportSessionKey,
+      historyImportBatchId: historyImportBatchId || null,
+      historyImportSessionKey,
     }]);
     return;
   }
   const blob = new Blob([text], { type: 'text/markdown; charset=utf-8' });
-  await addComposerFiles([fileFromBlob(blob, name, 'text/markdown')], composerSessionKey);
+  await addComposerFiles([fileFromBlob(blob, name, 'text/markdown')], composerSessionKey, {
+    historyImportBatchId,
+    historyImportSessionKey,
+  });
 }
 
 async function attachHistoryBundle(session, options = {}, sessionKey = getMountedComposerSessionKey()) {
   const composerSessionKey = resolveComposerSessionKey(sessionKey);
+  const historyImportBatchId = String(options.historyImportBatchId || '').trim();
+  const historyImportSessionKey = getSessionKey(session);
   if (options.includeImages === false && options.includeFiles === false) {
     return;
   }
   const response = await fetchSessionExportResponse(session, 'zip', options);
-  const blob = await response.blob();
+  const blob = await readResponseBlobWithLimit(response, MAX_HISTORY_IMPORT_BUNDLE_BYTES);
   if (!blob.size) {
     return;
   }
   const title = makeSafeAttachmentName(sessionDisplayTitle(session), shortId(session?.sessionId || 'conversation'));
-  await addComposerFiles([fileFromBlob(blob, `${title}.history.zip`, 'application/zip')], composerSessionKey);
+  await addComposerFiles([fileFromBlob(blob, `${title}.history.zip`, 'application/zip')], composerSessionKey, {
+    historyImportBatchId,
+    historyImportSessionKey,
+  });
 }
 
 async function attachSessionHistory(session, options = {}) {
   const composerSessionKey = resolveComposerSessionKey(options.composerSessionKey || getMountedComposerSessionKey());
+  const historyImportBatchId = String(options.historyImportBatchId || makeClientId()).trim();
   const exportOptions = {
     includeThinking: options.includeThinking !== false,
     includeImages: options.includeImages !== false,
@@ -24992,10 +28059,29 @@ async function attachSessionHistory(session, options = {}) {
     includeAllFiles: true,
     fullTranscript: true,
     importHistory: true,
+    historyImportBatchId,
   };
-  await attachHistoryMarkdown(session, exportOptions, composerSessionKey);
-  if (exportOptions.includeImages || exportOptions.includeFiles) {
-    await attachHistoryBundle(session, exportOptions, composerSessionKey);
+  try {
+    await attachHistoryMarkdown(session, exportOptions, composerSessionKey);
+    if (exportOptions.includeImages || exportOptions.includeFiles) {
+      try {
+        await attachHistoryBundle(session, exportOptions, composerSessionKey);
+      } catch (error) {
+        const normalized = normalizeHistoryImportError(error);
+        if (['history_import_bundle_too_large', 'history_import_memory_error'].includes(normalized.code)) {
+          return {
+            historyImportBatchId,
+            bundleAttached: false,
+            warning: `${normalized.message} Markdown history was attached; images/files were skipped.`,
+          };
+        }
+        throw normalized;
+      }
+    }
+    return { historyImportBatchId, bundleAttached: true, warning: '' };
+  } catch (error) {
+    removeHistoryImportBatch(composerSessionKey, historyImportBatchId);
+    throw normalizeHistoryImportError(error);
   }
 }
 
@@ -25005,7 +28091,7 @@ async function importCurrentSessionHistory() {
     throw new Error('Select a conversation before importing its history.');
   }
   const composerSessionKey = getMountedComposerSessionKey();
-  await attachSessionHistory(session, {
+  const result = await attachSessionHistory(session, {
     includeThinking: true,
     includeImages: true,
     includeFiles: true,
@@ -25014,6 +28100,9 @@ async function importCurrentSessionHistory() {
   if (getMountedComposerSessionKey() === resolveComposerSessionKey(composerSessionKey)) {
     renderAttachmentChips();
     focusComposerInput();
+  }
+  if (result?.warning) {
+    window.alert(result.warning);
   }
 }
 
@@ -25039,7 +28128,36 @@ function getHistoryImportGroupKey(group) {
 }
 
 function getHistoryImportSessionForGroup(group) {
-  return group?.preferredSession || group?.sessions?.[0] || group || null;
+  const direct = group?.preferredSession || group?.sessions?.[0] || null;
+  if (direct?.hostId && direct?.sessionId) {
+    return direct;
+  }
+
+  // Custom collections can outlive the in-memory Session projection. Rebuild
+  // a minimal export identity from the durable collection item so a stale
+  // entry can still be resolved by Relay instead of failing with an empty URL.
+  const item = group?.collectionItem || {};
+  const hostId = String(direct?.hostId || group?.hostId || item.hostId || '').trim();
+  const sessionId = String(
+    direct?.sessionId
+      || group?.sessionId
+      || item.sessionId
+      || group?.conversationKey
+      || item.conversationKey
+      || ''
+  ).trim();
+  if (!hostId || !sessionId) {
+    return null;
+  }
+  return {
+    ...item,
+    ...group,
+    hostId,
+    sessionId,
+    conversationKey: group?.conversationKey || item.conversationKey || sessionId,
+    title: group?.title || item.title || group?.conversationKey || sessionId,
+    cwd: group?.cwd || item.cwd || '',
+  };
 }
 
 function getHistoryImportCollections() {
@@ -25332,15 +28450,26 @@ async function importSelectedHistorySessions() {
   renderHistoryImportDialog();
   const composerSessionKey = getMountedComposerSessionKey();
   const failures = [];
+  const warnings = [];
   for (const group of selected) {
     const session = getHistoryImportSessionForGroup(group);
     try {
-      await attachSessionHistory(session, {
+      if (!session) {
+        throw Object.assign(
+          new Error('This saved collection entry has no resolvable Host/Session identity. Refresh the Host or remove the stale collection entry.'),
+          { code: 'history_import_session_unresolved' }
+        );
+      }
+      const result = await attachSessionHistory(session, {
         ...getHistoryImportOptions(getHistoryImportGroupKey(group)),
         composerSessionKey,
       });
+      if (result?.warning) {
+        warnings.push(`${group.title || sessionDisplayTitle(session)}: ${result.warning}`);
+      }
     } catch (error) {
-      failures.push(`${group.title || sessionDisplayTitle(session)}: ${error.message}`);
+      const normalized = normalizeHistoryImportError(error);
+      failures.push(`${group.title || sessionDisplayTitle(session)}: ${normalized.message}`);
     }
   }
   if (getMountedComposerSessionKey() === resolveComposerSessionKey(composerSessionKey)) {
@@ -25350,8 +28479,15 @@ async function importSelectedHistorySessions() {
   if (getMountedComposerSessionKey() === resolveComposerSessionKey(composerSessionKey)) {
     focusComposerInput();
   }
-  if (failures.length) {
-    window.alert(`Some history imports failed:\n${failures.join('\n')}`);
+  if (failures.length || warnings.length) {
+    const sections = [];
+    if (failures.length) {
+      sections.push(`Some history imports failed:\n${failures.join('\n')}`);
+    }
+    if (warnings.length) {
+      sections.push(`Some history imports were partial:\n${warnings.join('\n')}`);
+    }
+    window.alert(sections.join('\n\n'));
   }
 }
 
@@ -25424,6 +28560,7 @@ async function refreshHostAndConnectorSnapshots() {
   state.dismissedHosts = hostsResponse.dismissedHosts || [];
   state.connectors = connectorsResponse.connectors || [];
   reconcileHostRecoveryResults();
+  reconcileConnectorActionResults();
   renderAll();
 }
 
@@ -25432,6 +28569,7 @@ async function refreshHostSnapshot() {
   state.hosts = hostsResponse.hosts || [];
   state.dismissedHosts = hostsResponse.dismissedHosts || [];
   reconcileHostRecoveryResults();
+  reconcileConnectorActionResults();
   renderAll();
 }
 
@@ -25454,6 +28592,34 @@ function reconcileHostRecoveryResults() {
         message: 'The pending local Agent registered successfully; the Host is online.',
       });
     }
+  }
+}
+
+function reconcileConnectorActionResults() {
+  const hostsById = new Map(state.hosts.map((host) => [host.hostId, host]));
+  for (const connector of state.connectors) {
+    const result = state.connectorActionResults.get(connector.connectorId);
+    if (
+      !result
+      || result.ok !== false
+      || result.observedHostOnlineAtStart === true
+      || !['bootstrap', 'restart'].includes(result.action)
+    ) {
+      continue;
+    }
+    const host = connector.hostId ? hostsById.get(connector.hostId) : null;
+    if (!host?.online) {
+      continue;
+    }
+    state.connectorActionResults.set(connector.connectorId, {
+      ok: true,
+      action: result.action,
+      status: 'host_online_after_action',
+      message: `${host.label || host.hostId} came online after the connector action returned ${prettyStatusLabel(result.status || 'a failure')}. The earlier failure is no longer current.`,
+      expectedHostId: host.hostId,
+      resolvedAt: new Date().toISOString(),
+      resolvedFromStatus: result.status || null,
+    });
   }
 }
 
@@ -25528,7 +28694,10 @@ async function recoverHostForSwitch(hostId, cause) {
   const host = getHost(hostId);
   state.connectorActionResults.set(connector.connectorId, {
     ok: false,
+    action: 'bootstrap',
     status: 'recovering_host',
+    observedHostOnlineAtStart: Boolean(host?.online),
+    recordedAt: new Date().toISOString(),
     message: `${host?.label || hostId} is not ready: ${cause?.message || 'health check failed'}. Starting connector ${connector.label || connector.connectorId}...`,
   });
   renderConnectorManager();
@@ -25689,59 +28858,50 @@ function setSessionSearchMode(mode) {
   renderAll();
 }
 
-let fullSessionSearchTimer = null;
+let fullSessionSearchController = null;
+
+function getFullSessionSearchController() {
+  if (fullSessionSearchController) return fullSessionSearchController;
+  if (!window.RemoteCodexSessionSearch) return null;
+  fullSessionSearchController = window.RemoteCodexSessionSearch.createController({
+    getContext: () => ({
+      query: state.sessionSearchQuery, mode: state.sessionSearchMode,
+      hostId: state.selectedHostId, collectionId: state.selectedCollectionId,
+    }),
+    setTimeout: (callback, ms) => window.setTimeout(callback, ms),
+    clearTimeout: timer => window.clearTimeout(timer),
+    request: context => {
+      const params = new URLSearchParams({
+        q: context.query, mode: context.mode, hostId: context.hostId,
+        collectionId: context.collectionId, limit: '80', matchesPerSession: '5',
+      });
+      // The Relay can wait 60s for the Host before returning its cached fallback.
+      return fetchJson(`/api/sessions/search?${params.toString()}`, { timeoutMs: 65000 });
+    },
+    onResults: results => {
+      for (const result of results) {
+        if (result?.hostId && result?.sessionId) {
+          mergeSession({
+            hostId: result.hostId, sessionId: result.sessionId,
+            conversationKey: result.conversationKey || result.sessionId,
+            title: result.title || result.sessionId, cwd: result.cwd || null,
+            ...(result.live ? { source: 'managed', state: 'running', live: true } : {}),
+            lastUpdatedAt: result.lastUpdatedAt || null,
+          });
+        }
+      }
+    },
+    onChange: () => renderConversationNav(),
+  });
+  return fullSessionSearchController;
+}
 
 function scheduleFullSessionSearch() {
-  if (fullSessionSearchTimer) {
-    window.clearTimeout(fullSessionSearchTimer);
-  }
-  fullSessionSearchTimer = window.setTimeout(() => {
-    runFullSessionSearch().catch(reportError);
-  }, 900);
+  getFullSessionSearchController()?.schedule();
 }
 
 async function runFullSessionSearch() {
-  const query = String(state.sessionSearchQuery || '').trim();
-  const mode = state.sessionSearchMode;
-  const requestId = state.sessionSearchRequestId + 1;
-  state.sessionSearchRequestId = requestId;
-  if (query.length < 3 || mode !== 'keyword') {
-    state.sessionSearchResults = [];
-    state.sessionSearchLoading = false;
-    renderConversationNav();
-    return;
-  }
-
-  state.sessionSearchLoading = true;
-  renderConversationNav();
-  const params = new URLSearchParams({
-    q: query,
-    mode,
-    hostId: state.selectedHostId || '',
-    collectionId: state.selectedCollectionId || '',
-    limit: '80',
-    matchesPerSession: '5',
-  });
-  const response = await fetchJson(`/api/sessions/search?${params.toString()}`);
-  if (state.sessionSearchRequestId !== requestId) {
-    return;
-  }
-  state.sessionSearchResults = Array.isArray(response.results) ? response.results : [];
-  for (const result of state.sessionSearchResults) {
-    if (result?.hostId && result?.sessionId) {
-      mergeSession({
-        hostId: result.hostId,
-        sessionId: result.sessionId,
-        conversationKey: result.conversationKey || result.sessionId,
-        title: result.title || result.sessionId,
-        cwd: result.cwd || null,
-        ...(result.live ? { source: 'managed', state: 'running', live: true } : {}),
-        lastUpdatedAt: result.lastUpdatedAt || null,
-      });
-    }
-  }
-  state.sessionSearchLoading = false;
-  renderConversationNav();
+  return getFullSessionSearchController()?.schedule({ immediate: true });
 }
 
 function findSessionForSearchResult(result) {
@@ -25786,6 +28946,7 @@ async function openSearchResult(result, match, group = null) {
     timestamp: match.timestamp || null,
     snippet: match.snippet || '',
   };
+  if (shouldUsePageTranscriptScroll()) state.navigatorCollapsed = true;
   renderAll();
   await showSession(session, { full: match.type === 'transcript', focus: state.pendingTranscriptFocus });
 }
@@ -25811,13 +28972,14 @@ async function selectConversation(conversation, options = {}) {
 
   state.selectedHostId = conversation.hostId;
   state.selectedConversationKey = conversation.conversationKey;
-  state.selectedSessionId = conversation.preferredSession?.sessionId || null;
-  if (conversation.preferredSession) {
-    state.messageReadRenderReady.delete(getSessionKey(conversation.preferredSession));
+  const targetSession = conversation.preferredSession || null;
+  state.selectedSessionId = targetSession?.sessionId || null;
+  if (targetSession) {
+    state.messageReadRenderReady.delete(getSessionKey(targetSession));
     if (options.trusted === true) {
-      establishMessageReadFollow(conversation.preferredSession, 'session-selection');
+      establishMessageReadFollow(targetSession, 'session-selection');
     } else {
-      getMessageReadGate(conversation.preferredSession)?.detachByUser();
+      getMessageReadGate(targetSession)?.detachByUser();
     }
   }
   renderAll();
@@ -25879,7 +29041,7 @@ function reconcileRefreshedSessions(incomingSessions, baselineSessions = new Map
       continue;
     }
     const baseline = baselineSessions.get(key) || null;
-    if (!baseline || current !== baseline) {
+    if (!baseline || current !== baseline || hasManagedLaunchReceiptForSession(current)) {
       reconciled.push(current);
     }
   }
@@ -25936,6 +29098,7 @@ async function performRefresh(requestId, baselineSessions) {
   state.hosts = refreshedHosts;
   state.dismissedHosts = hostsResponse.dismissedHosts || [];
   state.connectors = connectorsResponse.connectors || [];
+  reconcileConnectorActionResults();
   state.sessionCollections = collectionsResponse.collections || [];
   if (!state.sessionCollections.some((collection) => collection.collectionId === state.selectedCollectionId)) {
     state.selectedCollectionId = state.sessionCollections[0]?.collectionId || 'default';
@@ -26086,6 +29249,405 @@ function pickBestSessionMatch(sessions, identities, predicate, options = {}) {
   }
 
   return chooseBestSessionMatch(matches, predicate);
+}
+
+function managedLaunchTrackerKey(receipt) {
+  return managedLaunchReceiptKey(receipt);
+}
+
+function managedLaunchBusyForReceipt(receipt) {
+  const key = managedLaunchReceiptKey(receipt);
+  return sessionLaunchBusyEntries().find((entry) => entry?.receiptKey === key)
+    || getSessionLaunchBusyForIntent(managedLaunchReceiptIntentKey(receipt));
+}
+
+function updateManagedLaunchBusy(receipt, patch) {
+  const busy = managedLaunchBusyForReceipt(receipt);
+  if (busy) updateSessionLaunchBusy(busy.id, patch);
+}
+
+async function loadManagedLaunchObservation(receipt) {
+  const listUrl = `/api/hosts/${encodeURIComponent(receipt.hostId)}/sessions?${sessionListQuery()}`;
+  const runtimeUrl = `/api/sessions/${encodeURIComponent(receipt.sessionId)}/runtime-config?hostId=${encodeURIComponent(receipt.hostId)}`;
+  const [listResult, runtimeResult] = await Promise.allSettled([
+    fetchJson(listUrl, { timeoutMs: SESSION_LAUNCH_OBSERVATION_REQUEST_TIMEOUT_MS }),
+    fetchJson(runtimeUrl, { timeoutMs: SESSION_LAUNCH_OBSERVATION_REQUEST_TIMEOUT_MS }),
+  ]);
+  const sessions = listResult.status === 'fulfilled' && Array.isArray(listResult.value?.sessions)
+    ? listResult.value.sessions
+    : [];
+  for (const session of sessions) mergeSession(session);
+  return {
+    sessions,
+    runtimeConfig: runtimeResult.status === 'fulfilled' ? runtimeResult.value : null,
+    listError: listResult.status === 'rejected' ? listResult.reason : null,
+    runtimeError: runtimeResult.status === 'rejected' ? runtimeResult.reason : null,
+  };
+}
+
+function findSessionForManagedLaunch(receipt, sessions = state.sessions) {
+  const identities = collectLaunchSessionIdentities(receipt.sessionId, receipt);
+  return pickBestSessionMatch(
+    sessions,
+    identities,
+    (session) => session.live === true,
+    { launchResponse: receipt }
+  );
+}
+
+function managedLaunchObservationError(receipt, observation, sessions) {
+  const session = findSessionForManagedLaunch(receipt, sessions);
+  const resumeError = session?.resumeError || null;
+  if (observation.status === 'conflict') {
+    if (observation.reason === 'rebind-binding-mismatch') {
+      return sessionContractError(
+        'session_run_state_conflict',
+        'The accepted Rebind became live with a different API binding.',
+        { expectedRunId: receipt.runId }
+      );
+    }
+    return sessionContractError(
+      'session_run_state_conflict',
+      'Another Session run replaced the accepted start before it became live.',
+      {
+        currentRunId: observation.observedRunId || null,
+        expectedRunId: receipt.runId,
+      }
+    );
+  }
+  return sessionContractError(
+    resumeError?.code || 'session_spawn_failed',
+    resumeError?.error || 'The accepted Session start ended before the run became live.',
+    resumeError || { expectedRunId: receipt.runId }
+  );
+}
+
+function materializeManagedLaunchLiveSession(receipt, loaded = {}) {
+  const runtimeConfig = loaded.runtimeConfig && typeof loaded.runtimeConfig === 'object'
+    ? loaded.runtimeConfig
+    : {};
+  const provenance = runtimeConfig.provenance && typeof runtimeConfig.provenance === 'object'
+    ? runtimeConfig.provenance
+    : {};
+  const existing = findSessionForManagedLaunch(receipt, loaded.sessions)
+    || findSessionForManagedLaunch(receipt, state.sessions)
+    || {};
+  const nativeThreadId = provenance.nativeThreadId
+    || receipt.nativeThreadId
+    || existing.nativeThreadId
+    || null;
+  return mergeSession({
+    ...existing,
+    hostId: receipt.hostId,
+    sessionId: receipt.sessionId,
+    bridgeSessionId: provenance.bridgeSessionId
+      || receipt.bridgeSessionId
+      || existing.bridgeSessionId
+      || receipt.sessionId,
+    nativeThreadId,
+    originSessionId: provenance.originSessionId
+      || receipt.originSessionId
+      || existing.originSessionId
+      || null,
+    sourceSessionId: provenance.sourceSessionId
+      || receipt.sourceSessionId
+      || existing.sourceSessionId
+      || null,
+    conversationKey: provenance.conversationKey
+      || receipt.conversationKey
+      || existing.conversationKey
+      || receipt.sessionId,
+    title: existing.title || receipt.label || provenance.title || receipt.sessionId,
+    cwd: existing.cwd || receipt.cwd || provenance.cwd || null,
+    source: 'managed',
+    launchMode: receipt.launchMode || existing.launchMode || null,
+    runId: receipt.runId,
+    activeRunId: receipt.runId,
+    state: 'live',
+    live: true,
+    runtime: {
+      ...(existing.runtime || {}),
+      runId: receipt.runId,
+      nativeThreadId,
+      connection: 'ready',
+    },
+    runtimeConfig,
+    apiBinding: runtimeConfig.sessionBinding
+      || runtimeConfig.apiBinding
+      || existing.apiBinding
+      || null,
+    requestedSelection: runtimeConfig.requestedSelection || existing.requestedSelection || null,
+    effectiveSelection: runtimeConfig.effectiveSelection || existing.effectiveSelection || null,
+    resumeError: null,
+  });
+}
+
+function shouldPauseManagedLaunchObservation() {
+  return !authAllowsRequests()
+    || document.visibilityState === 'hidden'
+    || window.navigator?.onLine === false;
+}
+
+function managedLaunchReceiptRebindTarget(receipt = {}) {
+  const kind = String(receipt.rebindTargetKind || '').trim();
+  if (!kind) return null;
+  return browserSafeRebindTarget({
+    kind,
+    profileId: receipt.rebindProfileId || null,
+    provider: receipt.rebindProvider || null,
+    providerKind: receipt.rebindProviderKind || null,
+    nativeResumeCompatibilityKey: receipt.rebindCompatibilityKey || null,
+    baseUrl: receipt.rebindBaseUrl || null,
+  });
+}
+
+async function observeManagedLaunchOnce(receipt) {
+  const api = managedSessionLaunchApi();
+  if (!api?.classifyLaunchObservation) {
+    throw new Error('Managed Session launch tracking is unavailable.');
+  }
+  if (shouldPauseManagedLaunchObservation()) {
+    return {
+      status: 'indeterminate',
+      reason: 'observation-paused',
+      terminal: false,
+      retryAfterMs: 1_500,
+    };
+  }
+  const key = managedLaunchTrackerKey(receipt);
+  const softTimeoutMs = Math.max(
+    1,
+    Number(state.sessionLaunchSoftTimeouts.get(key) || 0)
+      || managedSessionStartTimeoutMs(getHost(receipt.hostId), receipt.launchMode)
+  );
+  const loaded = await loadManagedLaunchObservation(receipt);
+  let observation = api.classifyLaunchObservation(receipt, {
+    sessions: loaded.sessions,
+    runtimeConfig: loaded.runtimeConfig,
+    now: Date.now(),
+    softTimeoutMs,
+  });
+  const rebindTarget = managedLaunchReceiptRebindTarget(receipt);
+  if (observation.status === 'live' && rebindTarget) {
+    const exactSession = findSessionForManagedLaunch(receipt, loaded.sessions);
+    const binding = loaded.runtimeConfig?.apiBinding
+      || loaded.runtimeConfig?.sessionBinding
+      || exactSession?.apiBinding
+      || exactSession?.sessionBinding
+      || null;
+    observation = !binding
+      ? {
+        ...observation,
+        status: 'indeterminate',
+        reason: 'rebind-binding-unobserved',
+      }
+      : rebindTargetMatchesBinding(binding, rebindTarget)
+        ? observation
+        : {
+          ...observation,
+          status: 'conflict',
+          reason: 'rebind-binding-mismatch',
+        };
+  }
+  return {
+    ...observation,
+    terminal: ['live', 'failed', 'conflict'].includes(observation.status),
+    loaded,
+    retryAfterMs: ['slow', 'indeterminate'].includes(observation.status) ? 1_500 : 400,
+  };
+}
+
+function managedLaunchDisconnected(loaded = {}) {
+  if (!loaded.listError || !loaded.runtimeError) return false;
+  return [loaded.listError, loaded.runtimeError].every((error) => {
+    const status = Number(error?.status);
+    return !Number.isInteger(status) || error?.code === 'request_timeout';
+  });
+}
+
+function handleManagedLaunchCoordinatorUpdate(result, handle) {
+  const receipt = handle?.receipt || result?.receipt;
+  if (!receipt) return;
+  if (result.reason === 'receipt-persistence-failed') {
+    updateManagedLaunchBusy(receipt, { receiptPersistence: 'memory-only' });
+    return;
+  }
+  if (result.status === 'unresolved') {
+    updateManagedLaunchBusy(receipt, {
+      stage: 'startup-observation-paused',
+      launchObservation: 'unresolved',
+    });
+    return;
+  }
+  if (result.terminal === true) return;
+  updateManagedLaunchBusy(receipt, {
+    stage: result.reason === 'observation-paused'
+      ? 'startup-observation-paused'
+      : managedLaunchDisconnected(result.loaded)
+        ? 'startup-reconnecting'
+        : result.status === 'slow' || result.status === 'indeterminate'
+          ? 'startup-slow'
+          : 'waiting-live-session',
+    launchObservation: result.status,
+  });
+}
+
+async function applyManagedLaunchTerminalProjection(result, handle) {
+  const receipt = handle?.receipt || result?.receipt;
+  if (!receipt) return;
+  const key = managedLaunchTrackerKey(receipt);
+  if (state.sessionLaunchTerminalProjections.has(key)) return result;
+  state.sessionLaunchTerminalProjections.add(key);
+  if (state.sessionLaunchTerminalProjections.size > 256) {
+    state.sessionLaunchTerminalProjections.delete(
+      state.sessionLaunchTerminalProjections.values().next().value
+    );
+  }
+  try {
+    if (result.status === 'live') {
+      const loaded = result.loaded || {};
+      let session = findSessionForManagedLaunch(receipt, loaded.sessions)
+        || findSessionForManagedLaunch(receipt, state.sessions);
+      if (!session?.live && result.reason === 'exact-runtime-live') {
+        session = materializeManagedLaunchLiveSession(receipt, loaded);
+      }
+      result.session = session?.live
+        ? mergeSession({ ...session, resumeError: null })
+        : materializeManagedLaunchLiveSession(receipt, loaded);
+    } else {
+      const loaded = result.loaded || {};
+      const error = managedLaunchObservationError(receipt, result, loaded.sessions || []);
+      result.error = error;
+      const current = findSessionForManagedLaunch(receipt, loaded.sessions)
+        || findSessionForManagedLaunch(receipt, state.sessions);
+      if (current) mergeSession({ ...current, resumeError: structuredSessionError(error) });
+    }
+    state.sessionLaunchReceipts.delete(managedLaunchReceiptKey(receipt));
+    const busy = managedLaunchBusyForReceipt(receipt);
+    if (busy && state.sessionLaunchBusy instanceof Map) {
+      state.sessionLaunchBusy.delete(busy.intentKey || busy.id);
+    }
+    renderAll();
+    return result;
+  } catch (error) {
+    state.sessionLaunchTerminalProjections.delete(key);
+    throw error;
+  }
+}
+
+async function handleManagedLaunchCoordinatorTerminal(result, handle) {
+  return applyManagedLaunchTerminalProjection(result, handle);
+}
+
+function trackManagedLaunchReceipt(receipt, options = {}) {
+  const key = managedLaunchTrackerKey(receipt);
+  if (!key) return Promise.reject(new Error('Managed Session launch receipt has no run identity.'));
+  const existing = state.sessionLaunchTrackers.get(key);
+  if (existing) return existing;
+  const softTimeoutMs = Math.max(1, Number(options.softTimeoutMs || 0) || 60_000);
+  state.sessionLaunchSoftTimeouts.set(key, softTimeoutMs);
+  const coordinator = getManagedSessionLaunchCoordinator();
+  const handle = options.recheck === true
+    ? coordinator.recheck(receipt)
+    : coordinator.ensureTrack(receipt, { persist: options.persist !== false });
+  if (shouldPauseManagedLaunchObservation()) handle.pause();
+  let tracked = handle.ready.then(() => handle.done).then(async (result) => {
+    if (result.terminal === true) {
+      await applyManagedLaunchTerminalProjection(result, handle);
+    }
+    if (result.status === 'live') {
+      return result.session || materializeManagedLaunchLiveSession(receipt, result.loaded || {});
+    }
+    if (result.status === 'failed' || result.status === 'conflict') {
+      throw result.error || managedLaunchObservationError(
+        receipt,
+        result,
+        result.loaded?.sessions || []
+      );
+    }
+    const current = findSessionForManagedLaunch(receipt, state.sessions);
+    return current ? { ...current, launchObservationUnresolved: true } : null;
+  }).finally(() => {
+    if (state.sessionLaunchTrackers.get(key) === tracked) {
+      state.sessionLaunchTrackers.delete(key);
+    }
+    state.sessionLaunchSoftTimeouts.delete(key);
+  });
+  state.sessionLaunchTrackers.set(key, tracked);
+  return tracked;
+}
+
+function managedLaunchReceiptForBusy(busy) {
+  if (!busy) return null;
+  return [...state.sessionLaunchReceipts.values()].find((receipt) => (
+    (busy.receiptKey && managedLaunchReceiptKey(receipt) === busy.receiptKey)
+    || (busy.intentKey && managedLaunchReceiptIntentKey(receipt) === busy.intentKey)
+  )) || null;
+}
+
+async function recheckAcceptedManagedLaunch(busy) {
+  if (busy?.stage !== 'startup-observation-paused') return null;
+  const receipt = managedLaunchReceiptForBusy(busy);
+  if (!receipt) {
+    throw new Error('The accepted Session run receipt is unavailable and cannot be rechecked.');
+  }
+  updateSessionLaunchBusy(busy.id, { stage: 'startup-rechecking' });
+  try {
+    return await trackManagedLaunchReceipt(receipt, {
+      softTimeoutMs: managedSessionStartTimeoutMs(getHost(receipt.hostId), receipt.launchMode),
+      recheck: true,
+    });
+  } catch (error) {
+    updateSessionLaunchBusy(busy.id, { stage: 'startup-observation-paused' });
+    throw error;
+  }
+}
+
+async function recoverManagedLaunchReceipts() {
+  let ledger;
+  try {
+    ledger = await restoreManagedLaunchReceipts();
+  } catch (error) {
+    console.warn('[managed-session-launch] receipt recovery failed', error);
+    return;
+  }
+  for (const receipt of state.sessionLaunchReceipts.values()) {
+    beginManagedLaunchReceiptRecovery(receipt);
+  }
+}
+
+function beginManagedLaunchReceiptRecovery(receipt) {
+  const key = managedLaunchTrackerKey(receipt);
+  if (!key || state.sessionLaunchTerminalProjections.has(key)) return null;
+  if (Date.now() - receipt.acceptedAtMs >= SESSION_LAUNCH_OBSERVATION_LEASE_MS) {
+    updateManagedLaunchBusy(receipt, {
+      stage: 'startup-observation-paused',
+      launchObservation: 'unresolved',
+    });
+    return null;
+  }
+  if (state.sessionLaunchTrackers.has(key) || state.sessionLaunchRecoveryHandlers.has(key)) {
+    return state.sessionLaunchRecoveryHandlers.get(key) || state.sessionLaunchTrackers.get(key);
+  }
+  const softTimeoutMs = managedSessionStartTimeoutMs(getHost(receipt.hostId), receipt.launchMode);
+  const tracked = trackManagedLaunchReceipt(receipt, { softTimeoutMs, persist: false });
+  const handled = tracked.then((session) => {
+    if (session) {
+      renderAll();
+      if (getSessionKey(getSelectedSession()) === getSessionKey(session)) {
+        scheduleSelectedViewsRender();
+      }
+    }
+  }).catch((error) => {
+    reportError(error);
+    renderAll();
+  }).finally(() => {
+    if (state.sessionLaunchRecoveryHandlers.get(key) === handled) {
+      state.sessionLaunchRecoveryHandlers.delete(key);
+    }
+  });
+  state.sessionLaunchRecoveryHandlers.set(key, handled);
+  return handled;
 }
 
 async function waitForSession(hostId, sessionId, predicate, timeoutMs = 60000, options = {}) {
@@ -26242,22 +29804,6 @@ function canForkSession(session) {
   );
 }
 
-function isSessionStartTerminalState(session) {
-  const stateText = String(session?.state || '');
-  return stateText.startsWith('failed')
-    || (stateText.startsWith('exited') && !isNormalStopExitState(stateText));
-}
-
-async function waitForSessionReady(hostId, sessionId, timeoutMs = 60000, options = {}) {
-  return waitForSession(
-    hostId,
-    sessionId,
-    (session) => session.live === true || isSessionStartTerminalState(session),
-    timeoutMs,
-    options
-  );
-}
-
 function managedSessionStartTimeoutMs(host, launchMode) {
   const platform = String(host?.platform || host?.os || '').toLowerCase();
   const isWindowsHost = platform.includes('win');
@@ -26337,6 +29883,9 @@ async function deleteHost(hostId) {
   for (const key of Array.from(state.codexControls.interruptBusyKeys)) {
     if (key.startsWith(`${hostId}::`)) state.codexControls.interruptBusyKeys.delete(key);
   }
+  for (const key of Array.from(state.codexControls.reviewBusyKeys)) {
+    if (key.startsWith(`${hostId}::`)) state.codexControls.reviewBusyKeys.delete(key);
+  }
 
   for (const key of Array.from(state.alerts.keys())) {
     if (key.startsWith(`${hostId}::`)) {
@@ -26366,6 +29915,7 @@ async function deleteHost(hostId) {
   for (const key of Array.from(state.requests.keys())) {
     if (key.startsWith(`${hostId}::`)) {
       state.requests.delete(key);
+      state.requestApplyGenerations.delete(key);
     }
   }
 
@@ -26515,7 +30065,7 @@ function collectConnectorActionSecrets(payload, action, promptOptions = {}) {
   if (
     payload.gateway?.enabled
     && connectorNeedsOneTimePrompt(gatewayMethod, payload.gateway?.otpSource)
-    && !(passthrough && gatewayMethod === 'keyboard_interactive')
+    && !passthrough
   ) {
     const gatewayOtp = promptConnectorOneTimeCode('Gateway', gatewayMethod, payload.gateway?.otpSource, action, promptOptions);
     if (gatewayOtp === null) {
@@ -26526,7 +30076,7 @@ function collectConnectorActionSecrets(payload, action, promptOptions = {}) {
 
   if (connectorNeedsOneTimePrompt(targetMethod, payload.auth?.otpSource, {
     keyPath: payload.auth?.keyPath || '',
-  }) && !(passthrough && targetMethod === 'keyboard_interactive')) {
+  }) && !passthrough) {
     const targetOtp = promptConnectorOneTimeCode('Target', targetMethod, payload.auth?.otpSource, action, promptOptions);
     if (targetOtp === null) {
       return null;
@@ -26629,6 +30179,10 @@ async function executeConnectorAction(connector, action, payload = connector, op
     return null;
   }
 
+  const observedHostOnlineAtStart = Boolean(
+    connector.hostId && getHost(connector.hostId)?.online
+  );
+
   state.connectorActionBusy = {
     connectorId: connector.connectorId,
     action,
@@ -26687,6 +30241,11 @@ async function executeConnectorAction(connector, action, payload = connector, op
         promptControl.done = true;
         promptWatcher.catch(() => {});
       }
+      result = {
+        ...result,
+        observedHostOnlineAtStart,
+        recordedAt: new Date().toISOString(),
+      };
       lastResult = result;
       state.connectorActionResults.set(connector.connectorId, result);
       renderConnectorManager();
@@ -26748,11 +30307,12 @@ function pathLeaf(value) {
 }
 
 function setDirectoryPickerState(patch) {
-  state.directoryPicker = {
-    ...state.directoryPicker,
-    ...patch,
-  };
-  renderDirectoryPicker();
+  const controller = getDirectoryPickerController();
+  if (controller) {
+    controller.setState(patch);
+    return;
+  }
+  state.directoryPicker = { ...state.directoryPicker, ...patch };
 }
 
 function reportDirectoryPickerError(error) {
@@ -26763,101 +30323,54 @@ function reportDirectoryPickerError(error) {
 }
 
 async function fetchDirectoryListing(targetPath = null, hostId = state.selectedHostId) {
-  if (!hostId) {
-    setDirectoryPickerState({
-      open: true,
-      hostId: null,
-      currentPath: '',
-      parentPath: null,
-      roots: [],
-      directories: [],
-      loading: false,
-      error: 'Select a host before browsing its directories.',
-    });
-    return null;
-  }
-
-  setDirectoryPickerState({
-    open: true,
-    hostId,
-    loading: true,
-    error: null,
-  });
-
-  const query = targetPath ? `?path=${encodeURIComponent(targetPath)}` : '';
-  const response = await fetchJson(`/api/hosts/${encodeURIComponent(hostId)}/directories${query}`);
-  setDirectoryPickerState({
-    open: true,
-    hostId,
-    currentPath: response.currentPath || '',
-    parentPath: response.parentPath || null,
-    roots: Array.isArray(response.roots) ? response.roots : [],
-    directories: Array.isArray(response.directories) ? response.directories : [],
-    loading: false,
-    error: null,
-  });
-  return response;
+  const controller = getDirectoryPickerController();
+  if (controller) return controller.fetchDirectoryListing(targetPath, hostId);
+  return null;
 }
 
 async function openDirectoryPicker() {
-  const seedPath = String(el('new-session-cwd').value || '').trim()
-    || getSelectedSession()?.cwd
-    || state.directoryPicker.currentPath
-    || null;
-  await fetchDirectoryListing(seedPath);
+  const controller = getDirectoryPickerController();
+  if (controller) return controller.open();
+  return null;
 }
 
 function closeDirectoryPicker() {
-  setDirectoryPickerState({ open: false, loading: false, error: null });
+  const controller = getDirectoryPickerController();
+  if (controller) {
+    controller.close();
+    return;
+  }
+  state.directoryPicker = { ...state.directoryPicker, open: false, loading: false, error: null };
 }
 
 async function browseDirectoryPath(targetPath) {
-  const normalized = String(targetPath || '').trim();
-  await fetchDirectoryListing(normalized || null);
+  const controller = getDirectoryPickerController();
+  if (controller) return controller.browse(targetPath);
+  return null;
 }
 
 function applyPickedDirectory() {
-  if (!state.directoryPicker.currentPath) {
+  const controller = getDirectoryPickerController();
+  if (controller) {
+    controller.apply();
     return;
   }
-
-  el('new-session-cwd').value = state.directoryPicker.currentPath;
-  if (!el('new-session-label').value.trim()) {
-    el('new-session-label').value = pathLeaf(state.directoryPicker.currentPath);
-  }
-  closeDirectoryPicker();
 }
 
 function setAlertWindowOpen(open) {
-  state.alertWindowOpen = Boolean(open);
-  renderAlertsWindow();
+  getSessionModalController().setAlertOpen(open);
 }
 
 function toggleAlertWindow() {
-  const session = getSelectedSession();
-  if (!session) {
-    return;
-  }
-  setAlertWindowOpen(!state.alertWindowOpen);
+  getSessionModalController().toggleAlert();
 }
 
 function setStatusWindowOpen(open) {
-  state.statusWindowOpen = false;
-  if (open && getSelectedSession()) {
-    state.sessionDetailsOpen = true;
-    renderSessionDetails();
-  }
-  renderStatusWindow();
+  getSessionModalController().setStatusOpen(open);
 }
 
 function toggleStatusWindow() {
-  const session = getSelectedSession();
-  if (!session) {
-    return;
-  }
-  state.sessionDetailsOpen = !state.sessionDetailsOpen;
-  renderSessionDetails();
-  renderStatusWindow();
+  getSessionModalController().toggleStatus();
 }
 
 async function joinLiveSession(options = {}) {
@@ -26928,25 +30441,87 @@ function resolveFreshSessionSelection(hostId, options = {}, apiConfig = getApiRe
 }
 
 async function waitForExplicitRebindCompletion(session, response, target) {
+  return waitForAcceptedRebindCompletion(session, response, target);
+}
+
+function acceptedRebindIntentKey(session, target, selection = {}) {
+  const safeTarget = browserSafeRebindTarget(target) || {};
+  const normalizedSelection = normalizeRebindSelectionSnapshot(selection);
+  return JSON.stringify([
+    sessionLaunchIntentKey({
+      hostId: session.hostId,
+      cwd: session.cwd,
+      launchMode: 'rebind',
+      sourceSession: session,
+    }),
+    String(safeTarget.kind || ''),
+    String(safeTarget.profileId || ''),
+    String(safeTarget.provider || ''),
+    String(safeTarget.providerKind || ''),
+    String(safeTarget.nativeResumeCompatibilityKey || ''),
+    String(safeTarget.baseUrl || safeTarget.responsesEndpoint || ''),
+    normalizedSelection.model,
+    normalizedSelection.effort,
+    normalizedSelection.summary,
+    normalizedSelection.allowUnverifiedEffort === true,
+  ]);
+}
+
+async function acceptedRebindReceipt(session, response, target, options = {}) {
   const expectedRunId = String(response?.runId || '').trim();
   if (!expectedRunId) {
     throw sessionContractError('session_run_not_found', 'Rebind did not return a run ID.');
   }
-  const sessionId = response.sessionId || session.sessionId;
-  const completed = await waitForSessionReady(
-    session.hostId,
-    sessionId,
-    managedSessionStartTimeoutMs(getHost(session.hostId), 'resume'),
-    { launchResponse: response }
-  );
+  const existing = state.sessionLaunchReceipts.get(`${session.hostId}::${expectedRunId}`);
+  if (existing) return existing;
+  const safeTarget = browserSafeRebindTarget(target);
+  if (!safeTarget) {
+    throw sessionContractError('session_api_target_invalid', 'Rebind target could not be recorded safely.');
+  }
+  const submittedSelection = options.selection
+    || response?.clientSelection
+    || response?.requestedSelection
+    || {};
+  return rememberManagedLaunchReceipt({
+    ...response,
+    hostId: session.hostId,
+    sessionId: response.sessionId || session.sessionId,
+    launchMode: response.launchMode || 'rebind',
+  }, {
+    hostId: session.hostId,
+    clientRequestId: response?.clientRequestId || response?.command?.clientRequestId || null,
+    intentKey: acceptedRebindIntentKey(session, safeTarget, submittedSelection),
+    cwd: session.cwd,
+    label: session.title || session.cwd || session.sessionId,
+    rebindTargetKind: safeTarget.kind || null,
+    rebindProfileId: safeTarget.profileId || null,
+    rebindProvider: safeTarget.provider || null,
+    rebindProviderKind: safeTarget.providerKind || null,
+    rebindCompatibilityKey: safeTarget.nativeResumeCompatibilityKey || null,
+    rebindBaseUrl: safeTarget.baseUrl || safeTarget.responsesEndpoint || null,
+  });
+}
+
+async function waitForAcceptedRebindCompletion(session, response, target) {
+  const expectedRunId = String(response?.runId || '').trim();
+  if (!expectedRunId) {
+    throw sessionContractError('session_run_not_found', 'Rebind did not return a run ID.');
+  }
+  const receipt = await acceptedRebindReceipt(session, response, target);
+  const completed = await trackManagedLaunchReceipt(receipt, {
+    softTimeoutMs: managedSessionStartTimeoutMs(getHost(session.hostId), 'resume'),
+  });
   if (!completed?.live) {
-    const failure = completed?.resumeError || {};
     throw sessionContractError(
-      failure.code || 'session_rebind_failed',
-      failure.error || `Rebind failed while starting run ${shortId(expectedRunId)} (${completed?.state || 'unknown state'}).`
+      'session_start_observation_unresolved',
+      `Observation paused for accepted Rebind run ${shortId(expectedRunId)}. Use Recheck Accepted Run; no new Rebind will be submitted.`,
+      { nonTerminal: true, expectedRunId }
     );
   }
-  const runtime = await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
+  const sessionId = response.sessionId || session.sessionId;
+  const runtime = completed.runtimeConfig?.runId === expectedRunId
+    ? completed.runtimeConfig
+    : await fetchJson(`/api/sessions/${encodeURIComponent(sessionId)}/runtime-config?hostId=${encodeURIComponent(session.hostId)}`);
   const binding = runtime?.apiBinding || runtime?.sessionBinding || null;
   const bindingMatches = rebindTargetMatchesBinding(binding, target);
   if (
@@ -26999,6 +30574,56 @@ function rebindResponseWithClientSelection(response, selection) {
 function rebindFailureMayHaveLostAcceptedResponse(error) {
   const status = Number(error?.status);
   return !Number.isInteger(status) || status < 400;
+}
+
+function rebindFailureIsLocalCoordinationError(error) {
+  return ['cross-tab-lock-unavailable', 'launch-storage-failed', 'launch-submission-invalid', 'launch-intent-stale'].includes(error?.code);
+}
+
+async function completeDefinitivelyRejectedLaunchIntent(intentKey, clientRequestId, error) {
+  const response = error?.body;
+  if (response?.clientRequestId !== clientRequestId
+    || !['not_accepted', 'failed'].includes(response.launchOutcome)) return;
+  // Only Relay's persisted outcome can end this generation. Transport errors,
+  // pending acceptance and same-ID conflicts must retain their original ID.
+  await getManagedLaunchStorage().completeIntent(intentKey, clientRequestId);
+}
+
+async function submitRebindWithIntentLock(session, target, selection, body) {
+  const intentKey = acceptedRebindIntentKey(session, target, selection);
+  const startedAtMs = Date.now();
+  return withManagedLaunchIntentLock(intentKey, async () => {
+    const claim = await getManagedLaunchStorage().claimIntent(intentKey, makeClientId(), startedAtMs, {
+      expectedRunId: body.expectedRunId,
+      expectedRunStatus: body.expectedRunStatus,
+      expectedBindingFingerprint: body.expectedBindingFingerprint,
+    });
+    const ledger = await getManagedSessionLaunchCoordinator().restore({ track: false });
+    const existing = ledger.receipts.find((receipt) => receipt.intentKey === intentKey);
+    if (existing) {
+      syncManagedLaunchReceiptProjection(ledger);
+      return {
+        ...existing,
+        idempotentReplay: true,
+        requestedSelection: { ...selection },
+      };
+    }
+    let response;
+    try {
+      response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/rebind`, {
+        method: 'POST',
+        // Rebind uses Relay's expected-run fence. Keep the first expectation
+        // after a page closed before persisting the accepted receipt.
+        body: JSON.stringify({ ...body, ...(claim.expectation || {}), clientRequestId: claim.clientRequestId }),
+      });
+    } catch (error) {
+      await completeDefinitivelyRejectedLaunchIntent(intentKey, claim.clientRequestId, error);
+      throw error;
+    }
+    const accepted = { ...response, clientRequestId: claim.clientRequestId };
+    await acceptedRebindReceipt(session, accepted, target, { selection });
+    return accepted;
+  });
 }
 
 async function rebindSessionApi(session, profileId, selectionSnapshot = null, apiConfigSnapshot = undefined, requestOptions = {}) {
@@ -27063,7 +30688,10 @@ async function rebindSessionApi(session, profileId, selectionSnapshot = null, ap
   const selection = normalizeRebindSelectionSnapshot(rawSelection);
   await verifyHostAvailable(canonicalSession.hostId);
   const confirmed = requestOptions.confirm === false
-    || window.confirm(formatSessionRebindConfirmation(previousBinding, target, selection, selectionSource));
+    || await requestUiConfirmation(
+      formatSessionRebindConfirmation(previousBinding, target, selection, selectionSource),
+      { title: t('session.rebindConfirmTitle'), kind: 'session-rebind' }
+    );
   if (!confirmed) {
     return null;
   }
@@ -27085,10 +30713,7 @@ async function rebindSessionApi(session, profileId, selectionSnapshot = null, ap
   let acceptedResponse = null;
   try {
     const response = rebindResponseWithClientSelection(
-      await fetchJson(`/api/sessions/${encodeURIComponent(canonicalSession.sessionId)}/rebind`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
+      await submitRebindWithIntentLock(canonicalSession, target, selection, body),
       selection
     );
     acceptedResponse = response;
@@ -27106,7 +30731,11 @@ async function rebindSessionApi(session, profileId, selectionSnapshot = null, ap
       renderAll();
       return acceptedResponse;
     }
-    if (!acceptedResponse && rebindFailureMayHaveLostAcceptedResponse(error)) {
+    if (
+      !acceptedResponse
+      && !rebindFailureIsLocalCoordinationError(error)
+      && rebindFailureMayHaveLostAcceptedResponse(error)
+    ) {
       const observedResponse = rebindResponseWithClientSelection(
         await rebindResponseWasAccepted(
           canonicalSession,
@@ -27129,11 +30758,19 @@ async function rebindSessionApi(session, profileId, selectionSnapshot = null, ap
         }
       }
     }
-    recordSessionRebindFailure(canonicalSession, previousBinding, target, error);
-    error.rebindFailureRecorded = true;
+    const observationUnresolved = error?.code === 'session_start_observation_unresolved';
+    const localCoordinationError = rebindFailureIsLocalCoordinationError(error);
+    if (!observationUnresolved && !localCoordinationError) {
+      recordSessionRebindFailure(canonicalSession, previousBinding, target, error);
+      error.rebindFailureRecorded = true;
+    }
     const latest = state.sessions.find((candidate) => getSessionKey(candidate) === expectation.sessionKey) || canonicalSession;
     const latestRunId = String(latest?.runId || latest?.activeRunId || latest?.runtimeConfig?.runId || '').trim();
-    if (!latestRunId || latestRunId === expectation.expectedRunId) {
+    if (
+      !observationUnresolved
+      && !localCoordinationError
+      && (!latestRunId || latestRunId === expectation.expectedRunId)
+    ) {
       mergeSession({ ...latest, resumeError: latest.resumeError || structuredSessionError(error) });
     }
     renderAll();
@@ -27148,7 +30785,10 @@ async function startTranscriptFallback(session) {
       'Transcript fallback is not available for this Session.'
     );
   }
-  if (!window.confirm('Start a new Session from the saved transcript? The original native thread and history will remain unchanged.')) {
+  if (!await requestUiConfirmation(
+    'Start a new Session from the saved transcript? The original native thread and history will remain unchanged.',
+    { title: t('session.transcriptFallbackTitle'), kind: 'transcript-fallback' }
+  )) {
     return null;
   }
 
@@ -27227,6 +30867,7 @@ async function fetchManagedLaunchWithRetry(hostId, body, onRetry = null) {
 }
 
 async function startManagedSession(options = {}) {
+  const launchStartedAtMs = Date.now();
   let sourceSession = Object.prototype.hasOwnProperty.call(options, 'session')
     ? options.session
     : getSelectedSession();
@@ -27253,11 +30894,15 @@ async function startManagedSession(options = {}) {
   const existingLaunch = getSessionLaunchBusyForIntent(launchIntentKey);
   if (existingLaunch) {
     updateSessionLaunchBusy(existingLaunch.id, { duplicateAttemptedAt: new Date().toISOString() });
+    if (existingLaunch.stage === 'startup-observation-paused') {
+      return recheckAcceptedManagedLaunch(existingLaunch);
+    }
     return null;
   }
 
   const launchBusyId = options.clientRequestId || makeClientId();
   const sourceSessionKey = getSessionKey(sourceSession);
+  let launchReceipt = null;
   setSessionLaunchBusy({
     id: launchBusyId,
     intentKey: launchIntentKey,
@@ -27322,9 +30967,37 @@ async function startManagedSession(options = {}) {
       body.nativeThreadId = sourceSession.nativeThreadId || sourceSession.sessionId;
     }
 
-    const response = await fetchManagedLaunchWithRetry(hostId, body, () => {
-      updateSessionLaunchBusy(launchBusyId, { stage: 'retrying-accepted-start' });
+    const acceptedLaunch = await withManagedLaunchIntentLock(launchIntentKey, async () => {
+      const claim = await getManagedLaunchStorage().claimIntent(launchIntentKey, launchBusyId, launchStartedAtMs);
+      body.clientRequestId = claim.clientRequestId;
+      const ledger = await getManagedSessionLaunchCoordinator().restore({ track: false });
+      const existingReceipt = ledger.receipts.find(
+        (receipt) => managedLaunchReceiptIntentKey(receipt) === launchIntentKey
+      );
+      if (existingReceipt) {
+        syncManagedLaunchReceiptProjection(ledger);
+        return { response: existingReceipt, receipt: existingReceipt, reused: true };
+      }
+      let response;
+      try {
+        response = await fetchManagedLaunchWithRetry(hostId, body, () => {
+          updateSessionLaunchBusy(launchBusyId, { stage: 'retrying-accepted-start' });
+        });
+      } catch (error) {
+        await completeDefinitivelyRejectedLaunchIntent(launchIntentKey, claim.clientRequestId, error);
+        throw error;
+      }
+      const receipt = await rememberManagedLaunchReceipt(response, {
+        hostId,
+        clientRequestId: body.clientRequestId,
+        intentKey: launchIntentKey,
+        cwd,
+        label: label || cwd,
+      });
+      return { response, receipt, reused: false };
     });
+    const response = acceptedLaunch.response;
+    launchReceipt = acceptedLaunch.receipt;
     updateSessionLaunchBusy(launchBusyId, {
       stage: 'waiting-live-session',
       sessionId: response.sessionId || sourceSession?.sessionId || null,
@@ -27362,6 +31035,7 @@ async function startManagedSession(options = {}) {
           summary: body.summary || '',
         }),
         apiProfile: apiConfig ? summarizeApiConfigForDisplay(apiConfig) : sourceSession?.apiProfile || null,
+        resumeError: null,
       }));
       if (startingSession) {
         const startingKey = getSessionKey(startingSession);
@@ -27378,36 +31052,23 @@ async function startManagedSession(options = {}) {
     }
 
     const startTimeoutMs = managedSessionStartTimeoutMs(host, launchMode);
-    const startedSession = await waitForSessionReady(hostId, response.sessionId, startTimeoutMs, {
-      launchResponse: response,
-    });
-    if (!startedSession.live) {
-      if (startedSession.resumeError) {
-        const resumeFailure = sessionContractError(
-          startedSession.resumeError.code || 'session_spawn_failed',
-          startedSession.resumeError.error || 'Managed Session failed to resume.',
-          startedSession.resumeError
-        );
-        throw resumeFailure;
-      }
-      const detail = await fetchJson(`/api/sessions/${encodeURIComponent(startedSession.sessionId)}/detail?hostId=${encodeURIComponent(hostId)}`).catch(() => null);
-      if (detail?.session?.resumeError) {
-        throw sessionContractError(
-          detail.session.resumeError.code || 'session_spawn_failed',
-          detail.session.resumeError.error || 'Managed Session failed to resume.',
-          detail.session.resumeError
-        );
-      }
-      const alertMessage = Array.isArray(detail?.alerts) ? [...detail.alerts].reverse().find((entry) => entry && entry.message)?.message : null;
-      const transcript = Array.isArray(detail?.transcript) ? [...detail.transcript].reverse() : [];
-      const systemMessage = transcript.find((entry) => entry.speaker === 'system' && entry.text && !String(entry.text).startsWith('State changed:'))?.text
-        || transcript.find((entry) => entry.speaker === 'system' && entry.text)?.text
-        || null;
-      throw new Error(alertMessage || systemMessage || `Managed session failed to start: ${startedSession.state || 'unknown error'}`);
+    const startedSession = await trackManagedLaunchReceipt(launchReceipt, { softTimeoutMs: startTimeoutMs });
+    if (startedSession?.launchObservationUnresolved) {
+      renderAll();
+      return startedSession;
+    }
+    if (!startedSession?.live) {
+      throw sessionContractError(
+        'session_start_observation_cancelled',
+        'The accepted Session start is no longer being observed in this browser.'
+      );
     }
 
     await refresh();
-    const next = state.sessions.find((item) => item.hostId === hostId && item.sessionId === startedSession.sessionId) || null;
+    let next = state.sessions.find((item) => item.hostId === hostId && item.sessionId === startedSession.sessionId) || null;
+    if (!next?.live && startedSession.live) {
+      next = mergeSession({ ...next, ...startedSession, resumeError: null });
+    }
     if (next && inheritCollectionId) {
       await addSessionToCollection(inheritCollectionId, next);
     }
@@ -27435,7 +31096,10 @@ async function startManagedSession(options = {}) {
     }
     throw error;
   } finally {
-    clearSessionLaunchBusy(launchBusyId);
+    const receiptKey = managedLaunchReceiptKey(launchReceipt);
+    if (!receiptKey || !state.sessionLaunchReceipts.has(receiptKey)) {
+      clearSessionLaunchBusy(launchBusyId);
+    }
   }
 }
 
@@ -27572,20 +31236,8 @@ function getActiveTurnBlocker(session) {
     return 'The previous Stop failed. Retry Stop, then Resume the Session before sending another prompt.';
   }
   const pendingCount = getRequestsForSession(session).filter((request) => request.status === 'pending').length;
-  const activePhase = [
-    'thinking',
-    'planning',
-    'reviewing',
-    'waiting-approval',
-    'waiting-user-input',
-    'retrying',
-    'reconnecting',
-    'interrupting',
-    'queued-turn',
-    'submitting-turn',
-  ].includes(phase);
 
-  if (!runtime.activeTurnId && !runtime.busy && !runtime.waitingOnApproval && !runtime.waitingOnUserInput && !activePhase) {
+  if (!runtimeIsActive(runtime)) {
     return null;
   }
 
@@ -27605,49 +31257,53 @@ function getActiveTurnBlocker(session) {
 }
 
 function runtimeIssuePresentation(runtime = {}) {
-  const message = String(runtime.lastCodexError || '').trim();
-  if (!message) {
-    return null;
-  }
-
-  const terminalStates = new Set(['error', 'quota-exhausted', 'failed']);
-  const isTerminal = [runtime.phase, runtime.currentTurnStatus]
-    .some((value) => terminalStates.has(String(value || '').toLowerCase()));
-  const retryStates = new Set(['retrying', 'reconnecting']);
-  const isRetrying = !isTerminal && [runtime.phase, runtime.currentTurnStatus, runtime.connection]
-    .some((value) => retryStates.has(String(value || '').toLowerCase()));
-  return {
-    label: isRetrying ? 'Retry' : 'Error',
-    message,
-    tone: isRetrying ? 'warning' : 'error',
-  };
+  return window.RemoteCodexSessionRuntimeState.issue(runtime);
 }
 
 function runtimeIsActive(runtime = {}) {
-  const phase = String(runtime.phase || '').toLowerCase();
-  const activePhase = [
-    'thinking',
-    'planning',
-    'reviewing',
-    'waiting-approval',
-    'waiting-user-input',
-    'retrying',
-    'reconnecting',
-    'interrupting',
-    'queued-turn',
-    'submitting-turn',
-    'running-shell-command',
-    'compacting',
-  ].includes(phase);
-  return Boolean(runtime.activeTurnId || runtime.busy || runtime.waitingOnApproval || runtime.waitingOnUserInput || activePhase);
+  return window.RemoteCodexSessionRuntimeState.isActive(runtime);
+}
+
+function sessionRuntimeBelongsToLiveRun(session, runtime = {}) {
+  if (!session?.live) return false;
+  const liveRunId = String(
+    session.runId
+    || session.runtimeConfig?.runId
+    || session.runtime?.runId
+    || session.activeRunId
+    || ''
+  ).trim();
+  const runtimeRunId = String(runtime.runId || '').trim();
+  if (!liveRunId && !runtimeRunId) {
+    return true;
+  }
+  return Boolean(liveRunId && runtimeRunId && liveRunId === runtimeRunId);
+}
+
+function deriveConversationRuntimeIndicator(group) {
+  const sessions = group?.sessions || [];
+  const liveSessions = sessions.filter((session) => session.live === true);
+  const starting = sessions.some((session) => (
+    (session?.live === true && String(session?.state || '').trim().toLowerCase() === 'starting')
+    || Boolean(getSessionLaunchBusyForSession(session))
+  ));
+  const active = liveSessions.some((session) => {
+    const runtime = getRuntimeForSession(session) || session.runtime || {};
+    return sessionRuntimeBelongsToLiveRun(session, runtime)
+      && runtimeIsActive(runtime);
+  });
+  if (starting || active) {
+    return { tone: 'runtime-active', label: starting ? 'Session starting' : 'Session running' };
+  }
+  if (liveSessions.length) {
+    return { tone: 'live-idle', label: 'Live session idle' };
+  }
+  return { tone: 'history', label: 'History or offline' };
 }
 
 function openStatusForActiveTurnBlocker() {
-  state.statusWindowOpen = false;
-  state.sessionDetailsOpen = true;
-  renderSessionDetails();
+  setStatusWindowOpen(true);
   renderRuntimePanel();
-  renderStatusWindow();
 }
 
 function openGoalControls() {
@@ -27656,11 +31312,8 @@ function openGoalControls() {
     reportError(new Error('Select a conversation before opening Goal controls.'));
     return;
   }
-  state.statusWindowOpen = false;
-  state.sessionDetailsOpen = true;
-  renderSessionDetails();
+  setStatusWindowOpen(true);
   renderRuntimePanel();
-  renderStatusWindow();
   window.setTimeout(() => {
     el('goal-objective-input')?.focus();
     el('status-goal-summary')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -27678,7 +31331,7 @@ async function sendInputToSession(session, text, options = {}) {
   assertEffortSelectionIsValid(session, options);
   const body = {
     hostId: session.hostId,
-    clientRequestId: options.clientRequestId || null,
+    clientRequestId: options.clientRequestId || makeClientId(),
     text,
     displayText: options.displayText || text,
     inputItems: Array.isArray(options.inputItems) ? options.inputItems : [],
@@ -27708,6 +31361,7 @@ async function sendInputToSession(session, text, options = {}) {
     const status = Number(error?.status || 0);
     if (error?.code === 'request_timeout' || (!status && !error?.body)) {
       error.inputAcceptanceUnknown = true;
+      error.inputRequest = Object.freeze({ url: requestUrl, body: requestBody });
     }
     if (/still working on the previous turn/i.test(error.message || '')) {
       openStatusForActiveTurnBlocker();
@@ -27903,13 +31557,19 @@ async function waitForActiveTurnToClear(session, timeoutMs = 20000) {
     }
 
     try {
+      const detailStreamGeneration = getRuntimeStreamGeneration(session.hostId, session.sessionId);
+      const detailApplyGeneration = getRuntimeApplyGeneration(session.hostId, session.sessionId);
       const detail = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/detail?hostId=${encodeURIComponent(session.hostId)}`);
-      if (detail?.runtime) {
+      if (
+        detail?.runtime
+        && getRuntimeStreamGeneration(session.hostId, session.sessionId) === detailStreamGeneration
+        && getRuntimeApplyGeneration(session.hostId, session.sessionId) === detailApplyGeneration
+      ) {
         lastRuntime = setRuntimeForSession(
           session.hostId,
           session.sessionId,
           detail.runtime,
-          { source: 'detail' }
+          { source: 'detail', authoritativeSnapshot: true }
         ) || lastRuntime;
         if (!runtimeIsActive(lastRuntime)) {
           return true;
@@ -27931,15 +31591,16 @@ async function sendQueuedPrompt(itemId) {
     renderComposerTurnNotice();
     return;
   }
-  if (item.sending || item.forceSending) return;
+  if (item.editing || item.sending || item.forceSending || item.steerOperation?.status === 'accepted' || ['guide_pending', 'steer_unknown', 'input_unknown', 'guided'].includes(item.status)) return;
 
-  const session = getSelectedSession();
-  if (!session || getSessionKey(session) !== item.sessionKey) {
+  const sessionKey = resolveComposerSessionKey(item.sessionKey);
+  const session = findSessionForResolvedComposerKey(sessionKey);
+  if (!session?.live || resolveComposerSessionKey(session) !== sessionKey) {
     return;
   }
 
   const text = getSteerQueueText(item).trim();
-  const hasInputs = Boolean(item.payload?.inputItems?.length || item.payload?.uploadedFiles?.length);
+  const hasInputs = Boolean(item.payload?.inputItems?.length || item.payload?.uploadedFiles?.length || item.payload?.inlineFiles?.length || item.payload?.composerDraft?.attachments?.length);
   if (!text && !hasInputs) {
     item.status = 'failed';
     item.error = 'This queued prompt is empty. Edit it or remove it from the queue.';
@@ -27958,9 +31619,10 @@ async function sendQueuedPrompt(itemId) {
   ) || null;
   if (activeDraft?.clientRequestId) return;
 
-  setSteerQueueItemText(item, text || item.payload.displayText || 'Please inspect the attached file(s).');
+  setSteerQueueItemText(item, text);
   item.sending = true;
   item.error = '';
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
   renderComposerTurnNotice();
 
   try {
@@ -27970,41 +31632,56 @@ async function sendQueuedPrompt(itemId) {
     });
     setActiveDraftForSession(session, item.payload);
     removeSteerQueueItem(item.id);
-    state.codexControls.steerNotice = {
-      title: 'Queued prompt sent',
-      message: 'The previous turn finished, so the first waiting prompt was sent as the next Codex turn.',
-    };
-    window.setTimeout(() => {
-      if (state.codexControls.steerNotice?.title === 'Queued prompt sent') {
-        state.codexControls.steerNotice = null;
-        renderComposerTurnNotice();
-      }
-    }, 5000);
+    if (resolveComposerSessionKey(getSelectedSession()) === sessionKey) {
+      state.codexControls.steerNotice = {
+        title: 'Queued prompt sent',
+        message: 'The previous turn finished, so the first waiting prompt was sent as the next Codex turn.',
+      };
+      window.setTimeout(() => {
+        if (state.codexControls.steerNotice?.title === 'Queued prompt sent') {
+          state.codexControls.steerNotice = null;
+          renderComposerTurnNotice();
+        }
+      }, 5000);
+    }
   } catch (error) {
     const latest = findSteerQueueItem(item.id);
     if (latest) {
       latest.sending = false;
-      latest.status = 'failed';
+      latest.status = error?.inputAcceptanceUnknown ? 'input_unknown' : 'failed';
+      if (error?.inputRequest) {
+        latest.inputRequest = error.inputRequest;
+        latest.payload.clientRequestId = JSON.parse(error.inputRequest.body).clientRequestId;
+      }
       latest.error = error.message || 'Failed to send this queued prompt.';
+      if (typeof persistSteerQueue === 'function') persistSteerQueue();
     }
+    if (error?.inputAcceptanceUnknown) return;
     throw error;
   } finally {
     const latest = findSteerQueueItem(item.id);
     if (latest) {
       latest.sending = false;
+      if (typeof persistSteerQueue === 'function') persistSteerQueue();
     }
     renderComposerTurnNotice();
   }
 }
 
-function maybeScheduleQueuedPromptSend(session = getSelectedSession()) {
-  const sessionKey = getSessionKey(session);
+function maybeScheduleQueuedPromptSend(sessionOrKey = getSelectedSession()) {
+  const fallbackSession = sessionOrKey && typeof sessionOrKey === 'object' ? sessionOrKey : null;
+  const sessionKey = resolveComposerSessionKey(sessionOrKey);
+  const session = findSessionForResolvedComposerKey(sessionKey, fallbackSession);
   const queueTimers = state.codexControls.queueAutoSendTimersBySession;
   if (!session?.live || !sessionKey || queueTimers.has(sessionKey)) {
     return;
   }
   const runtime = getRuntimeForSession(session) || session.runtime || {};
   if (runtimeIsActive(runtime) || getExternalTerminalActivityForSession(session, runtime).active) {
+    return;
+  }
+  const activeDraft = state.codexControls.activeDraftsBySession.get(sessionKey) || null;
+  if (activeDraft?.clientRequestId) {
     return;
   }
   const next = getFirstQueuedPrompt(session);
@@ -28014,14 +31691,14 @@ function maybeScheduleQueuedPromptSend(session = getSelectedSession()) {
   const timer = window.setTimeout(() => {
     queueTimers.delete(sessionKey);
     const queued = findSteerQueueItem(next.id);
-    if (!queued || queued.sessionKey !== sessionKey) {
+    if (!queued || resolveComposerSessionKey(queued.sessionKey) !== sessionKey) {
       return;
     }
-    const current = getSelectedSession();
-    if (!current || getSessionKey(current) !== sessionKey) {
-      maybeScheduleQueuedPromptSend(current);
+    const targetSession = findSessionForResolvedComposerKey(sessionKey);
+    if (!targetSession?.live || resolveComposerSessionKey(targetSession) !== sessionKey) {
       return;
     }
+    if (getFirstQueuedPrompt(targetSession)?.id !== queued.id) return;
     sendQueuedPrompt(queued.id).catch(reportError);
   }, 350);
   queueTimers.set(sessionKey, timer);
@@ -28034,45 +31711,24 @@ async function guideQueuedPrompt(itemId) {
     renderComposerTurnNotice();
     return;
   }
-  if (item.sending || item.forceSending) return;
+  if (item.editing || item.sending || item.forceSending || queuedPromptDeliveryLocked(item) || item.status === 'guided' || item.steerOperation?.status === 'accepted') return;
 
   const session = getSelectedSession();
-  if (!session || getSessionKey(session) !== item.sessionKey) {
+  const selectedKey = typeof resolveComposerSessionKey === 'function' ? resolveComposerSessionKey(session) : getSessionKey(session);
+  const queuedKey = typeof resolveComposerSessionKey === 'function' ? resolveComposerSessionKey(item.sessionKey) : item.sessionKey;
+  if (!session || selectedKey !== queuedKey) {
     throw new Error('Select the original live session before guiding this prompt.');
   }
-  if (!runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) {
-    await sendQueuedPrompt(item.id);
-    return;
-  }
+  if (!runtimeIsActive(getRuntimeForSession(session) || session.runtime || {})) throw new Error(steerCopy().target);
+  if (!window.RemoteCodexSessionSteer.textOnly(item.payload)) throw new Error(steerCopy().textOnly);
 
   const text = getSteerQueueText(item).trim();
   if (!text) {
     throw new Error('This queued prompt is empty. Edit it or remove it from the queue.');
   }
 
-  setSteerQueueItemText(item, text || item.payload.displayText || 'Please inspect the attached file(s).');
-  item.sending = true;
-  item.error = '';
-  renderComposerTurnNotice();
-  try {
-    await steerActiveTurn(text);
-    const latest = findSteerQueueItem(item.id);
-    if (latest) {
-      latest.status = 'guided';
-      latest.sentAt = new Date().toISOString();
-      latest.sending = false;
-    }
-  } catch (error) {
-    const latest = findSteerQueueItem(item.id);
-    if (latest) {
-      latest.sending = false;
-      latest.status = 'failed';
-      latest.error = error.message || 'Failed to guide this prompt.';
-    }
-    throw error;
-  } finally {
-    renderComposerTurnNotice();
-  }
+  setSteerQueueItemText(item, text);
+  await steerActiveTurn(text, { session, item });
 }
 
 async function interruptAndSendQueuedPrompt(itemId) {
@@ -28082,22 +31738,25 @@ async function interruptAndSendQueuedPrompt(itemId) {
     renderComposerTurnNotice();
     return;
   }
-  if (item.sending || item.forceSending) return;
+  if (item.editing || item.sending || item.forceSending || queuedPromptDeliveryLocked(item) || item.status === 'guided' || item.steerOperation?.status === 'accepted') return;
 
   const session = getSelectedSession();
-  if (!session || getSessionKey(session) !== item.sessionKey) {
+  const selectedKey = typeof resolveComposerSessionKey === 'function' ? resolveComposerSessionKey(session) : getSessionKey(session);
+  const queuedKey = typeof resolveComposerSessionKey === 'function' ? resolveComposerSessionKey(item.sessionKey) : item.sessionKey;
+  if (!session || selectedKey !== queuedKey) {
     throw new Error('Select the original live session before forcing this prompt into a new turn.');
   }
 
   const text = getSteerQueueText(item).trim();
-  const hasInputs = Boolean(item.payload?.inputItems?.length || item.payload?.uploadedFiles?.length);
+  const hasInputs = Boolean(item.payload?.inputItems?.length || item.payload?.uploadedFiles?.length || item.payload?.inlineFiles?.length || item.payload?.composerDraft?.attachments?.length);
   if (!text && !hasInputs) {
     throw new Error('This queued prompt is empty. Edit it or remove it from the queue.');
   }
 
-  setSteerQueueItemText(item, text || item.payload.displayText || 'Please inspect the attached file(s).');
+  setSteerQueueItemText(item, text);
   item.forceSending = true;
   item.error = '';
+  if (typeof persistSteerQueue === 'function') persistSteerQueue();
   renderComposerTurnNotice();
 
   try {
@@ -28124,21 +31783,28 @@ async function interruptAndSendQueuedPrompt(itemId) {
     const latest = findSteerQueueItem(item.id);
     if (latest) {
       latest.forceSending = false;
-      latest.status = 'failed';
+      latest.status = error?.inputAcceptanceUnknown ? 'input_unknown' : 'failed';
+      if (error?.inputRequest) {
+        latest.inputRequest = error.inputRequest;
+        latest.payload.clientRequestId = JSON.parse(error.inputRequest.body).clientRequestId;
+      }
       latest.error = error.message || 'Failed to interrupt and send this prompt.';
+      if (typeof persistSteerQueue === 'function') persistSteerQueue();
     }
+    if (error?.inputAcceptanceUnknown) return;
     throw error;
   } finally {
     const latest = findSteerQueueItem(item.id);
     if (latest) {
       latest.forceSending = false;
+      if (typeof persistSteerQueue === 'function') persistSteerQueue();
     }
     renderComposerTurnNotice();
   }
 }
 
 async function interruptAndSendPendingPrompt() {
-  const first = getSelectedSteerQueue()[0];
+  const first = getFirstQueuedPrompt(getSelectedSession());
   if (!first) {
     renderComposerTurnNotice();
     return;
@@ -28299,6 +31965,8 @@ function requestSkillOptionsForSession(session, options = {}) {
 }
 
 async function loadReceivedFilesForSession(session, options = {}) {
+  const isCurrent = typeof options.isCurrent === 'function' ? options.isCurrent : null;
+  assertStreamRecoveryCurrent(isCurrent);
   if (!session?.sessionId || !session?.hostId) {
     return [];
   }
@@ -28309,20 +31977,54 @@ async function loadReceivedFilesForSession(session, options = {}) {
   if (!options.force && state.receivedFiles.has(key)) {
     return state.receivedFiles.get(key) || [];
   }
-  if (state.receivedFilesLoadingKeys.has(key)) {
-    return state.receivedFiles.get(key) || [];
+  const existingRequest = state.receivedFilesLoadingPromises.get(key);
+  if (existingRequest) {
+    try {
+      const files = await existingRequest;
+      assertStreamRecoveryCurrent(isCurrent);
+      return files;
+    } catch (error) {
+      // A request tied to a replaced Session selection may be shared briefly
+      // by the new selection. Once its guarded write is rejected and cleaned
+      // up, retry for the still-current caller instead of returning an empty
+      // cache and leaving attachments invisible until a manual refresh.
+      if (isStaleStreamRecoveryError(error) && (!isCurrent || isCurrent())) {
+        return loadReceivedFilesForSession(session, options);
+      }
+      throw error;
+    }
   }
 
+  const requestToken = {};
   state.receivedFilesLoadingKeys.add(key);
-  renderStatusWindow();
-  try {
-    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/received-files?hostId=${encodeURIComponent(session.hostId)}`);
-    setReceivedFilesForSession(session.hostId, session.sessionId, response.files || []);
-    return getReceivedFilesForSession(session);
-  } finally {
-    state.receivedFilesLoadingKeys.delete(key);
+  state.receivedFilesLoadingTokens.set(key, requestToken);
+  if (!isCurrent || isCurrent()) {
     renderStatusWindow();
   }
+  const request = (async () => {
+    const response = await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/received-files?hostId=${encodeURIComponent(session.hostId)}`);
+    assertStreamRecoveryCurrent(isCurrent);
+    if (state.receivedFilesLoadingTokens.get(key) !== requestToken) {
+      const error = new Error('Received-file loading was superseded by a newer request.');
+      error.code = 'stream_recovery_stale';
+      throw error;
+    }
+    setReceivedFilesForSession(session.hostId, session.sessionId, response.files || []);
+    return getReceivedFilesForSession(session);
+  })();
+  let trackedRequest;
+  trackedRequest = request.finally(() => {
+    if (state.receivedFilesLoadingPromises.get(key) === trackedRequest) {
+      state.receivedFilesLoadingPromises.delete(key);
+      state.receivedFilesLoadingTokens.delete(key);
+      state.receivedFilesLoadingKeys.delete(key);
+      if (!isCurrent || isCurrent()) {
+        renderStatusWindow();
+      }
+    }
+  });
+  state.receivedFilesLoadingPromises.set(key, trackedRequest);
+  return trackedRequest;
 }
 
 function requestReceivedFilesForSession(session) {
@@ -28338,21 +32040,34 @@ function requestReceivedFilesForSession(session) {
 
 async function startReviewForCurrentSession() {
   const session = getSelectedSession();
-  if (!session?.live) {
-    throw new Error('Select a live managed session before starting a review.');
+  const key = resolveComposerSessionKey(session);
+  // Set the local claim before any asynchronous Host check. Otherwise a
+  // double-click can pass both preflight checks and enqueue two reviews.
+  if (key && state.codexControls.reviewBusyKeys.has(key)) {
+    return { ok: true, duplicate: true };
   }
-
-  await verifyHostAvailable(session.hostId);
-  await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/review`, {
-    method: 'POST',
-    body: JSON.stringify({
-      hostId: session.hostId,
-      target: {
-        type: 'uncommittedChanges',
-      },
-      delivery: 'inline',
-    }),
-  });
+  throwIfSessionReviewBlocked(session);
+  if (key) {
+    state.codexControls.reviewBusyKeys.add(key);
+    renderSessionDetails();
+  }
+  try {
+    await verifyHostAvailable(session.hostId);
+    throwIfSessionReviewBlocked(session);
+    await fetchJson(`/api/sessions/${encodeURIComponent(session.sessionId)}/review`, {
+      method: 'POST',
+      body: JSON.stringify({
+        hostId: session.hostId,
+        target: {
+          type: 'uncommittedChanges',
+        },
+        delivery: 'inline',
+      }),
+    });
+  } finally {
+    if (key) state.codexControls.reviewBusyKeys.delete(key);
+    renderSessionDetails();
+  }
 }
 
 function sleep(ms) {
@@ -28378,7 +32093,7 @@ function reportError(error) {
       message: error.message,
       timestamp: new Date().toISOString(),
     });
-    state.alertWindowOpen = true;
+    getSessionModalController().setAlertOpen(true, { expectedSession: session, render: false });
     renderSessionDetails();
     renderAlertsWindow();
     return;
@@ -28885,7 +32600,10 @@ el('join-session-button').addEventListener('click', async (event) => {
 el('resume-session-button').addEventListener('click', async () => {
   try {
     const session = getSelectedSession();
-    if (session?.live) {
+    const launchBusy = getSessionLaunchBusyForSession(session);
+    if (launchBusy?.stage === 'startup-observation-paused') {
+      await recheckAcceptedManagedLaunch(launchBusy);
+    } else if (session?.live) {
       await endCurrentSession();
     } else {
       await resumeFromHistory();
@@ -28905,6 +32623,10 @@ el('fork-session-button').addEventListener('click', async () => {
 
 el('toggle-alerts-button').addEventListener('click', () => {
   toggleAlertWindow();
+});
+
+el('open-session-terminal-button')?.addEventListener('click', async () => {
+  await openTerminalForSession(getSelectedSession());
 });
 
 el('export-session-button')?.addEventListener('click', async () => {
@@ -29183,6 +32905,7 @@ el('export-dialog-confirm-button')?.addEventListener('click', () => {
 document.addEventListener('visibilitychange', () => {
   state.messageDocumentVisible = document.visibilityState === 'visible';
   if (document.visibilityState === 'visible') {
+    getManagedSessionLaunchCoordinator().resume(null, 'document-hidden');
     const hiddenForMs = state.sessionWatchHiddenAt
       ? Math.max(0, Date.now() - state.sessionWatchHiddenAt)
       : 0;
@@ -29192,19 +32915,24 @@ document.addEventListener('visibilitychange', () => {
     }
     void maybeAdvanceReadReceipt(getSelectedSession());
     void requestMessageNotificationOutboxDrain();
+    void recoverManagedLaunchReceipts();
     resumeSelectedSessionRealtime().catch(reportError);
   } else {
+    getManagedSessionLaunchCoordinator().pause(null, 'document-hidden');
     state.sessionWatchHiddenAt = Date.now();
   }
 });
 
 window.addEventListener('pagehide', () => {
+  getManagedSessionLaunchCoordinator().pause(null, 'page-hidden');
   state.sessionWatchCatchUpRequired = true;
   closeStream();
   void releaseSelectedSessionWatchNow();
 });
 
 window.addEventListener('pageshow', () => {
+  getManagedSessionLaunchCoordinator().resume(null, 'page-hidden');
+  void recoverManagedLaunchReceipts();
   resumeSelectedSessionRealtime().catch(reportError);
 });
 
@@ -29217,6 +32945,15 @@ window.addEventListener('focus', () => {
 
 window.addEventListener('blur', () => {
   state.messageWindowFocused = false;
+});
+
+window.addEventListener('online', () => {
+  getManagedSessionLaunchCoordinator().resume(null, 'network-offline');
+  void recoverManagedLaunchReceipts();
+});
+
+window.addEventListener('offline', () => {
+  getManagedSessionLaunchCoordinator().pause(null, 'network-offline');
 });
 
 el('rename-session-button')?.addEventListener('click', async () => {
@@ -29235,8 +32972,7 @@ el('session-details-button').addEventListener('click', () => {
   if (!getSelectedSession()) {
     return;
   }
-  state.sessionDetailsOpen = true;
-  renderSessionDetails();
+  getSessionModalController().setDetailsOpen(true);
 });
 
 el('session-meta')?.addEventListener('click', (event) => {
@@ -29267,26 +33003,21 @@ el('session-detail-panel').addEventListener('click', (event) => {
   if (!getSelectedSession()) {
     return;
   }
-  state.sessionDetailsOpen = true;
-  renderSessionDetails();
+  getSessionModalController().setDetailsOpen(true);
 });
 
 el('session-details-close-button').addEventListener('click', () => {
-  state.sessionDetailsOpen = false;
-  renderSessionDetails();
+  setStatusWindowOpen(false);
 });
 
 el('session-details-overlay').addEventListener('click', (event) => {
   if (event.target === event.currentTarget) {
-    state.sessionDetailsOpen = false;
-    renderSessionDetails();
+    setStatusWindowOpen(false);
   }
 });
 
 el('runtime-modal-open-status-button').addEventListener('click', () => {
-  state.sessionDetailsOpen = false;
   setStatusWindowOpen(true);
-  renderSessionDetails();
   renderRuntimePanel();
 });
 
@@ -29466,32 +33197,42 @@ el('goal-clear-button')?.addEventListener('click', async () => {
 el('steer-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = el('steer-input');
+  const sessionKey = getSessionKey(getSelectedSession());
+  if (input.dataset.steerSubmitting === 'true') return;
   const text = input.value.trim();
   if (!text) {
     return;
   }
 
-  input.value = '';
+  input.dataset.steerSubmitting = 'true';
   try {
     await steerActiveTurn(text);
+    if (getSessionKey(getSelectedSession()) === sessionKey && input.value.trim() === text) input.value = '';
   } catch (error) {
     reportError(error);
+  } finally {
+    delete input.dataset.steerSubmitting;
   }
 });
 
 el('inline-steer-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = el('inline-steer-input');
+  const sessionKey = getSessionKey(getSelectedSession());
+  if (input.dataset.steerSubmitting === 'true') return;
   const text = input.value.trim();
   if (!text) {
     return;
   }
 
-  input.value = '';
+  input.dataset.steerSubmitting = 'true';
   try {
     await steerActiveTurn(text);
+    if (getSessionKey(getSelectedSession()) === sessionKey && input.value.trim() === text) input.value = '';
   } catch (error) {
     reportError(error);
+  } finally {
+    delete input.dataset.steerSubmitting;
   }
 });
 
@@ -29908,6 +33649,7 @@ el('close-sidebar-navigator-button')?.addEventListener('click', () => {
 
 el('session-search-form').addEventListener('submit', (event) => {
   event.preventDefault();
+  runFullSessionSearch().catch(reportError);
 });
 
 el('session-search-input').addEventListener('input', (event) => {
@@ -30028,48 +33770,6 @@ el('host-switcher-button')?.addEventListener('click', (event) => {
   toggleMobileSelectMenu('hostSwitcher');
 });
 
-el('browse-directory-button').addEventListener('click', async () => {
-  try {
-    await openDirectoryPicker();
-  } catch (error) {
-    reportDirectoryPickerError(error);
-  }
-});
-
-el('close-directory-picker-button').addEventListener('click', () => {
-  closeDirectoryPicker();
-});
-
-el('directory-picker-overlay').addEventListener('click', (event) => {
-  if (event.target === event.currentTarget) {
-    closeDirectoryPicker();
-  }
-});
-
-el('picker-up-button').addEventListener('click', async () => {
-  if (!state.directoryPicker.parentPath) {
-    return;
-  }
-
-  try {
-    await browseDirectoryPath(state.directoryPicker.parentPath);
-  } catch (error) {
-    reportDirectoryPickerError(error);
-  }
-});
-
-el('picker-refresh-button').addEventListener('click', async () => {
-  try {
-    await fetchDirectoryListing(state.directoryPicker.currentPath || null);
-  } catch (error) {
-    reportDirectoryPickerError(error);
-  }
-});
-
-el('picker-select-button').addEventListener('click', () => {
-  applyPickedDirectory();
-});
-
 el('codex-model-refresh-button').addEventListener('click', async () => {
   try {
     await refreshVisibleModelOptionsForSelectedSession();
@@ -30145,6 +33845,9 @@ el('codex-model-input').addEventListener('input', () => {
       renderManualEffortControlState(getSelectedSession());
     }
     saveComposerOptionsFromControls();
+    if (['codex-approval-policy-select', 'codex-reviewer-select', 'codex-sandbox-mode-select'].includes(id)) {
+      renderComposerPermissions(getSelectedSession());
+    }
     if (id === 'codex-effort-select' || id === 'codex-summary-select') {
       renderSessionApiControls(getSelectedSession());
     }
@@ -30344,51 +34047,7 @@ el('codex-interrupt-button').addEventListener('click', async () => {
   }
 });
 
-el('composer-force-send-button').addEventListener('click', async () => {
-  try {
-    await interruptAndSendPendingPrompt();
-  } catch (error) {
-    reportError(error);
-  }
-});
-
-el('composer-turn-notice').addEventListener('input', (event) => {
-  const textarea = event.target.closest('[data-steer-queue-text]');
-  if (!textarea) {
-    return;
-  }
-  const item = findSteerQueueItem(textarea.dataset.steerQueueText);
-  setSteerQueueItemText(item, textarea.value);
-});
-
-el('composer-turn-notice').addEventListener('click', async (event) => {
-  const removeButton = event.target.closest('[data-remove-steer-queue-id]');
-  if (removeButton) {
-    removeSteerQueueItem(removeButton.dataset.removeSteerQueueId);
-    renderComposerTurnNotice();
-    return;
-  }
-
-  const forceButton = event.target.closest('[data-force-steer-queue-id]');
-  if (forceButton) {
-    try {
-      await interruptAndSendQueuedPrompt(forceButton.dataset.forceSteerQueueId);
-    } catch (error) {
-      reportError(error);
-    }
-    return;
-  }
-
-  const guideButton = event.target.closest('[data-guide-steer-queue-id]');
-  if (!guideButton) {
-    return;
-  }
-  try {
-    await guideQueuedPrompt(guideButton.dataset.guideSteerQueueId);
-  } catch (error) {
-    reportError(error);
-  }
-});
+// Queue DOM events are owned by ui/composer-queue.js.
 
 el('input-text').addEventListener('keydown', (event) => {
   if (state.slashMenu.open) {
@@ -30472,16 +34131,6 @@ el('input-form').addEventListener('paste', (event) => {
   handleComposerPaste(event).catch(reportError);
 });
 
-el('image-preview-overlay')?.addEventListener('click', (event) => {
-  if (event.target === event.currentTarget) {
-    closeImagePreview();
-  }
-});
-
-el('image-preview-close-button')?.addEventListener('click', () => {
-  closeImagePreview();
-});
-
 document.addEventListener('click', (event) => {
   if (!hasOpenMobileSelectMenu()) {
     return;
@@ -30515,13 +34164,8 @@ document.addEventListener('keydown', (event) => {
     closeDirectoryPicker();
   }
 
-  if (state.statusWindowOpen) {
+  if (state.sessionDetailsOpen || state.statusWindowOpen) {
     setStatusWindowOpen(false);
-  }
-
-  if (state.sessionDetailsOpen) {
-    state.sessionDetailsOpen = false;
-    renderSessionDetails();
   }
 
   if (state.settingsOpen) {
@@ -30561,6 +34205,11 @@ async function boot() {
     const authenticated = await refreshAuthState();
     if (authenticated) {
       await refresh();
+      restorePersistedSteerQueue();
+      getManagedSessionLaunchCoordinator().resumeAuthentication();
+      await recoverManagedLaunchReceipts();
+    } else {
+      getManagedSessionLaunchCoordinator().pause(null, 'authentication-required');
     }
   } catch (error) {
     reportError(error);
@@ -30571,6 +34220,7 @@ initializePersistentUiState();
 applyUiTheme();
 renderLocaleLabels();
 boot();
+initializeUiControllers();
 
 window.addEventListener('resize', () => {
   ensureTranscriptScrollControlsMounted();

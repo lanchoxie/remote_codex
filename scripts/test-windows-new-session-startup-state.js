@@ -115,8 +115,8 @@ function assertFreshLiveEmptyManagedSessionSkipsHistoryDetail() {
   );
 
   const helperStart = app.indexOf('function shouldFetchSessionDetailOnOpen(session, options = {})');
-  const helperEnd = app.indexOf('function isSessionStartTerminalState', helperStart);
-  assert(helperStart >= 0 && helperEnd > helperStart, 'app should define shouldFetchSessionDetailOnOpen before isSessionStartTerminalState');
+  const helperEnd = app.indexOf('function canActivateSessionHistory', helperStart);
+  assert(helperStart >= 0 && helperEnd > helperStart, 'app should define shouldFetchSessionDetailOnOpen before canActivateSessionHistory');
   const helper = app.slice(helperStart, helperEnd);
   assertContains(
     helper,

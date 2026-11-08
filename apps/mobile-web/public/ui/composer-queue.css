@@ -1,0 +1,58 @@
+@layer workbench {
+  /* The queue is a compact workbench utility. Keep it in normal flow so it
+     cannot cover Session Details, the composer, or the mobile keyboard. */
+  .composer-turn-notice.composer-queue {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    margin: 0 0 8px;
+    padding: 10px;
+    color: var(--ui-text);
+    background: var(--ui-surface);
+    border: 1px solid var(--ui-border);
+    border-radius: var(--ui-radius);
+    box-shadow: none;
+    text-align: left;
+  }
+  .composer-turn-notice.composer-queue.hidden { display: none; }
+  .cq-header, .cq-toolbar, .cq-row, .cq-menu { display: flex; align-items: center; gap: 6px; }
+  .cq-header { min-width: 0; justify-content: space-between; }
+  .cq-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 650; }
+  .cq-button {
+    min-width: 0; min-height: 28px; padding: 4px 8px; border: 1px solid var(--ui-border);
+    border-radius: var(--ui-radius-sm); color: var(--ui-text); background: var(--ui-subtle);
+    font: inherit; font-size: 11px; line-height: 1.25; cursor: pointer;
+  }
+  .cq-button:hover:not(:disabled), .cq-button[aria-pressed="true"] { border-color: var(--ui-accent); color: var(--ui-accent); background: var(--ui-accent-soft); }
+  .cq-button:disabled { opacity: .48; cursor: default; }
+  .cq-toolbar { flex-wrap: wrap; }
+  .cq-toolbar > :first-child { margin-left: 0; }
+  .cq-toolbar [data-queue-tab] { border-color: transparent; background: transparent; }
+  .cq-toolbar [data-queue-action="first"] { margin-left: auto; color: var(--ui-on-accent); background: var(--ui-accent); border-color: var(--ui-accent); }
+  .cq-list { display: grid; gap: 5px; min-width: 0; }
+  .cq-card { min-width: 0; padding: 6px 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+  .cq-card[hidden], .cq-menu[hidden], .cq-editor[hidden], .cq-button[hidden], .cq-meta[hidden], .cq-empty[hidden], .cq-hint[hidden], .cq-notice[hidden] { display: none !important; }
+  .cq-row { min-width: 0; min-height: 28px; }
+  .cq-index { flex: 0 0 auto; color: var(--ui-muted); font: 10px var(--ui-mono); }
+  .cq-preview { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--ui-text); font-size: 12px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+  .cq-status { flex: 0 0 auto; max-width: 32%; overflow: hidden; color: var(--ui-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .cq-more { flex: 0 0 auto; width: 28px; padding: 3px 0; border: 0; background: transparent; font-size: 17px; line-height: 1; }
+  .cq-open { flex: 0 0 auto; }
+  .cq-meta, .cq-hint, .cq-empty { color: var(--ui-muted); font-size: 10px; line-height: 1.45; }
+  .cq-meta { margin: 2px 0 0 25px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cq-editor { display: block; width: 100%; min-height: 64px; margin: 6px 0; padding: 7px; box-sizing: border-box; resize: vertical; color: var(--ui-text); background: var(--ui-surface); border: 1px solid var(--ui-border-strong); border-radius: var(--ui-radius-sm); font: 12px/1.5 var(--ui-font); }
+  .cq-editor:focus { outline: 2px solid color-mix(in srgb, var(--ui-accent) 42%, transparent); outline-offset: 1px; }
+  .cq-card > .cq-button { justify-self: end; }
+  .cq-menu { flex-wrap: wrap; justify-content: flex-end; margin: 6px 0 0 25px; padding-top: 6px; border-top: 1px solid var(--ui-border); }
+  .cq-menu .cq-button { background: transparent; }
+  .cq-error, .cq-notice { color: var(--ui-error-text); background: var(--ui-error-bg); border-radius: var(--ui-radius-sm); padding: 5px 7px; font-size: 10px; line-height: 1.4; }
+  .cq-notice { color: var(--ui-warning-text); background: var(--ui-warning-bg); }
+  .cq-hint { padding-top: 2px; }
+  @media (max-width: 560px) {
+    .composer-turn-notice.composer-queue { margin-bottom: 6px; padding: 8px; }
+    .cq-status { max-width: 26%; }
+    .cq-toolbar [data-queue-action="first"] { margin-left: 0; }
+    .cq-menu { justify-content: flex-start; margin-left: 0; }
+    .cq-meta { margin-left: 0; }
+  }
+}

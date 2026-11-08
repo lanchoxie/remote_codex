@@ -10,6 +10,31 @@ const app = fs.readFileSync(appPath, 'utf8');
 const html = fs.readFileSync(htmlPath, 'utf8');
 const styles = fs.readFileSync(stylesPath, 'utf8');
 
+function structuredTestText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(structuredTestText).filter(Boolean).join('\n');
+  if (typeof value === 'object') {
+    for (const key of ['text', 'content', 'message', 'summary', 'type', 'status', 'phase']) {
+      if (value[key] != null) {
+        const text = structuredTestText(value[key]);
+        if (text) return text;
+      }
+    }
+    try { return JSON.stringify(value); } catch (_) { return ''; }
+  }
+  return String(value);
+}
+
+function structuredTestScalar(value, fallback = '') {
+  if (value == null || value === '') return fallback;
+  if (typeof value !== 'object') return String(value);
+  for (const key of ['type', 'status', 'state', 'phase', 'kind', 'name', 'id']) {
+    if (value[key] != null && value[key] !== '') return structuredTestScalar(value[key], fallback);
+  }
+  return structuredTestText(value) || fallback;
+}
+
 function sliceBetween(startNeedle, endNeedle, label) {
   const start = app.indexOf(startNeedle);
   assert(start >= 0, `${label} start marker was not found`);
@@ -18,9 +43,15 @@ function sliceBetween(startNeedle, endNeedle, label) {
   return app.slice(start, end);
 }
 
+function sseHandlerMarker(eventName) {
+  const gated = `streamGate.listen('${eventName}'`;
+  const legacy = `state.eventSource.addEventListener('${eventName}'`;
+  return app.includes(gated) ? gated : legacy;
+}
+
 const transcriptHandler = sliceBetween(
-  "state.eventSource.addEventListener('session.transcript'",
-  "state.eventSource.addEventListener('session.alert'",
+  sseHandlerMarker('session.transcript'),
+  sseHandlerMarker('session.alert'),
   'session.transcript handler'
 );
 assert(
@@ -29,8 +60,8 @@ assert(
 );
 
 const diagnosticHandler = sliceBetween(
-  "state.eventSource.addEventListener('session.diagnostic'",
-  "state.eventSource.addEventListener('session.request'",
+  sseHandlerMarker('session.diagnostic'),
+  sseHandlerMarker('session.request'),
   'session.diagnostic handler'
 );
 assert(
@@ -126,6 +157,68 @@ assert(
   'renderThinkingPanel should not replace the whole thinking message on each diagnostic update'
 );
 
+const queuedFlush = sliceBetween(
+  'function flushQueuedUiRenders()',
+  'function closeStream()',
+  'queued UI flush'
+);
+assert(
+  queuedFlush.includes('renderPlan.thinkingPanel && !renderPlan.transcript'),
+  'a transcript reconcile must skip the redundant standalone Thinking patch'
+);
+
+const sessionDetailsRenderer = sliceBetween(
+  'function renderSessionDetails()',
+  'function createRuntimeChip(',
+  'renderSessionDetails'
+);
+assert(
+  !sessionDetailsRenderer.includes('renderApprovalPopup()')
+    && !sessionDetailsRenderer.includes('renderStatusWindow()'),
+  'renderSessionDetails must not implicitly redraw independently scheduled overlays'
+);
+
+const queuedRenderState = sliceBetween(
+  'const queuedUiRenders = {',
+  'function scheduleQueuedUiFlush(',
+  'queued UI render state'
+);
+const queuedRenderCounts = {
+  sessionDetails: 0,
+  statusWindow: 0,
+  approvalPopup: 0,
+};
+const queuedRenderContext = vm.createContext({
+  state: { selectedHostId: 'host-a' },
+  getSelectedSession: () => null,
+  renderSessionDetails: () => { queuedRenderCounts.sessionDetails += 1; },
+  renderStatusWindow: () => { queuedRenderCounts.statusWindow += 1; },
+  renderApprovalPopup: () => { queuedRenderCounts.approvalPopup += 1; },
+  renderAll: () => { throw new Error('unexpected full render'); },
+  updateSelectedViews: () => { throw new Error('unexpected selected views render'); },
+  renderConversationNav: () => {},
+  renderRuntimePanel: () => {},
+  renderThinkingPanel: () => {},
+  renderAlertsWindow: () => {},
+  renderSessionActionDialog: () => {},
+  renderExportDialog: () => {},
+  renderTranscript: () => {},
+  renderMessageNotificationBell: () => {},
+});
+vm.runInContext(`
+${queuedRenderState}
+${queuedFlush}
+queuedUiRenders.sessionDetails = true;
+queuedUiRenders.statusWindow = true;
+queuedUiRenders.approvalPopup = true;
+flushQueuedUiRenders();
+`, queuedRenderContext);
+assert.deepStrictEqual(
+  queuedRenderCounts,
+  { sessionDetails: 1, statusWindow: 1, approvalPopup: 1 },
+  'one queued UI event must invoke each independently scheduled renderer exactly once'
+);
+
 assert(
   !html.includes('id="thinking-panel"'),
   'the page should not render a second standalone thinking panel'
@@ -145,7 +238,11 @@ const runtimeIsActive = sliceBetween(
   'function openStatusForActiveTurnBlocker',
   'runtimeIsActive'
 );
-const runtimeSemantics = vm.createContext({});
+const runtimeSemantics = vm.createContext({
+  window: {
+    RemoteCodexSessionRuntimeState: require('../apps/mobile-web/public/session-runtime-state'),
+  },
+});
 vm.runInContext(`${runtimeIssuePresentation}\n${runtimeIsActive}`, runtimeSemantics);
 
 const externalActivityHelpers = sliceBetween(
@@ -155,6 +252,8 @@ const externalActivityHelpers = sliceBetween(
 );
 const externalActivitySemantics = vm.createContext({
   isThinkingActivityDiagnostic: (entry) => ['reasoning', 'command-output'].includes(entry?.kind),
+  structuredThinkingText: structuredTestText,
+  structuredThinkingScalar: structuredTestScalar,
 });
 vm.runInContext(externalActivityHelpers, externalActivitySemantics);
 const externalDiagnostics = [
@@ -249,11 +348,12 @@ assert(
 
 const statusWindow = sliceBetween(
   'function renderStatusWindow()',
-  'function renderPickerEntries(',
+  'function renderDirectoryPicker()',
   'renderStatusWindow'
 );
 assert(
-  statusWindow.includes('const activeTurn = Boolean(session.live && runtimeIsActive(runtime));'),
+  statusWindow.includes('const runtimeActive = runtimeIsActive(runtime);')
+    && statusWindow.includes('const activeTurn = Boolean(session.live && runtimeActive);'),
   'the Status interrupt control must use the same active-runtime predicate as the composer'
 );
 assert(
@@ -349,6 +449,7 @@ const runtimeStore = sliceBetween(
 const runtimeStoreState = { runtime: new Map() };
 const runtimeStoreContext = vm.createContext({
   state: runtimeStoreState,
+  window: runtimeSemantics.window,
   makeSessionKey: (hostId, sessionId) => `${hostId}::${sessionId}`,
 });
 vm.runInContext(runtimeStore, runtimeStoreContext);
@@ -365,6 +466,66 @@ const mergedRuntime = runtimeStoreContext.patchRuntimeForSession('host-a', 'sess
 assert.strictEqual(mergedRuntime.phase, 'thinking');
 assert.strictEqual(mergedRuntime.activeTurnId, 'turn-a');
 assert.strictEqual(runtimeSemantics.runtimeIsActive(mergedRuntime), true);
+
+runtimeStoreContext.setRuntimeForSession('host-idle', 'session-idle', {
+  runId: 'run-idle',
+  runtimeRevision: 1,
+  phase: 'thinking',
+  activeTurnId: 'stale-turn',
+  busy: true,
+  currentTurnStatus: 'inProgress',
+  updatedAt: '2026-07-20T12:00:00.000Z',
+});
+const explicitIdleRuntime = runtimeStoreContext.patchRuntimeForSession('host-idle', 'session-idle', {
+  runId: 'run-idle',
+  runtimeRevision: 2,
+  phase: 'idle',
+  busy: false,
+  updatedAt: '2026-07-20T12:00:01.000Z',
+}, { source: 'stream' });
+assert.strictEqual(explicitIdleRuntime.activeTurnId, null, 'explicit idle must clear an inherited turn id');
+assert.strictEqual(explicitIdleRuntime.currentTurnStatus, 'idle');
+assert.strictEqual(explicitIdleRuntime.waitingOnApproval, false);
+assert.strictEqual(runtimeSemantics.runtimeIsActive(explicitIdleRuntime), false);
+
+runtimeStoreContext.setRuntimeForSession('host-snapshot', 'session-snapshot', {
+  runId: 'run-snapshot',
+  runtimeRevision: 7,
+  phase: 'idle',
+  busy: false,
+  activeTurnId: 'corrupt-turn',
+  currentTurnStatus: 'inProgress',
+  lastCodexError: 'stale browser-only field',
+  updatedAt: '2026-07-20T12:00:07.000Z',
+});
+const ignoredEqualPatch = runtimeStoreContext.setRuntimeForSession('host-snapshot', 'session-snapshot', {
+  runId: 'run-snapshot',
+  runtimeRevision: 7,
+  phase: 'idle',
+  busy: false,
+  updatedAt: '2026-07-20T12:00:07.000Z',
+});
+assert.strictEqual(ignoredEqualPatch.activeTurnId, 'corrupt-turn', 'an equal-revision partial patch stays idempotent');
+const authoritativeEqualSnapshot = runtimeStoreContext.setRuntimeForSession('host-snapshot', 'session-snapshot', {
+  runId: 'run-snapshot',
+  runtimeRevision: 7,
+  phase: 'idle',
+  busy: false,
+  updatedAt: '2026-07-20T12:00:07.000Z',
+}, { source: 'detail', authoritativeSnapshot: true });
+assert.strictEqual(authoritativeEqualSnapshot.activeTurnId, null, 'an equal-revision snapshot must heal stale merged turn fields');
+assert.strictEqual(authoritativeEqualSnapshot.currentTurnStatus, 'idle');
+assert.strictEqual(authoritativeEqualSnapshot.lastCodexError, undefined, 'authoritative snapshots must replace omitted stale fields');
+const rejectedLowerSnapshot = runtimeStoreContext.setRuntimeForSession('host-snapshot', 'session-snapshot', {
+  runId: 'run-snapshot',
+  runtimeRevision: 6,
+  phase: 'thinking',
+  busy: true,
+  activeTurnId: 'older-turn',
+  updatedAt: '2026-07-20T12:00:08.000Z',
+}, { source: 'detail', authoritativeSnapshot: true });
+assert.strictEqual(rejectedLowerSnapshot, authoritativeEqualSnapshot, 'an authoritative snapshot must not roll a run back to a lower revision');
+
 const completedRuntime = runtimeStoreContext.patchRuntimeForSession('host-a', 'session-a', {
   phase: 'idle',
   activeTurnId: null,
@@ -445,7 +606,7 @@ assert.strictEqual(blockedEqualRevisionRollback.phase, 'closed');
 
 const runtimeEventHandler = sliceBetween(
   'const handleRuntimePayload = (payload) => {',
-  "state.eventSource.addEventListener('session.runtime_updated'",
+  sseHandlerMarker('session.runtime_updated'),
   'runtime event handler'
 );
 assert(
@@ -481,8 +642,8 @@ assert(
   'the browser must consume one canonical runtime SSE event instead of maintaining two equivalent handlers'
 );
 const lifecycleHandlers = sliceBetween(
-  "state.eventSource.addEventListener('session.started'",
-  "state.eventSource.addEventListener('session.transcript'",
+  sseHandlerMarker('session.started'),
+  sseHandlerMarker('session.transcript'),
   'lifecycle event handlers'
 );
 assert(
@@ -492,6 +653,27 @@ assert(
 assert(
   app.includes('getRuntimeStreamGeneration(detailHostId, detailSessionId) === detailRuntimeStreamGeneration'),
   'a detail response must not overwrite runtime when SSE advanced during the request'
+);
+assert(
+  app.includes('getRuntimeApplyGeneration(detailHostId, detailSessionId) === detailRuntimeApplyGeneration'),
+  'a detail response must not overwrite an optimistic or reconciled runtime update from the same request window'
+);
+assert(
+  app.includes("source: 'detail',\n        authoritativeSnapshot: true"),
+  'a detail runtime must apply as a fenced authoritative snapshot rather than a partial patch'
+);
+const activeTurnBlocker = sliceBetween(
+  'function getActiveTurnBlocker',
+  'function runtimeIssuePresentation',
+  'active turn blocker'
+);
+assert(
+  activeTurnBlocker.includes('if (!runtimeIsActive(runtime))'),
+  'send blocking and Queue rendering must share one runtime activity predicate'
+);
+assert(
+  !activeTurnBlocker.includes('!runtime.activeTurnId'),
+  'the blocker must not retain a second hand-written activity predicate'
 );
 
 console.log('diagnostic render throttle checks passed');

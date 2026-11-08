@@ -22,6 +22,12 @@ function functionSource(source, name, nextName = '') {
   return source.slice(start, end > start ? end : source.length);
 }
 
+function sseHandlerMarker(eventName) {
+  const gated = `streamGate.listen('${eventName}'`;
+  const legacy = `state.eventSource.addEventListener('${eventName}'`;
+  return app.includes(gated) ? gated : legacy;
+}
+
 const requestHandlerStart = relay.indexOf("if (event.type === 'session.request')");
 const requestHandlerEnd = relay.indexOf("if (event.type === 'session.request.resolved')", requestHandlerStart);
 assert(requestHandlerStart >= 0 && requestHandlerEnd > requestHandlerStart, 'relay should have a bounded session.request handler');
@@ -61,6 +67,21 @@ assertContains(
   respondRoute,
   'body.runId',
   'respond route should use the runId submitted with the approval request instead of silently retargeting the current Rebind run'
+);
+assertContains(
+  respondRoute,
+  'claim.request?.runId',
+  'respond route should route the command with the approval request originating run identity'
+);
+assertContains(
+  respondRoute,
+  'releaseSessionRequestResponseClaim(',
+  'respond route should release its claim when command enqueueing fails so the request remains retryable'
+);
+assertContains(
+  respondRoute,
+  'safeToRetry: true',
+  'a failed response enqueue should explicitly tell the UI that retrying is safe'
 );
 
 assertContains(
@@ -203,7 +224,18 @@ assertContains(
   'runId:',
   'approval responses must send the request runId so Relay cannot target a different Rebind run'
 );
-const resolvedRequestHandlerStart = app.indexOf("state.eventSource.addEventListener('session.request.resolved'");
+
+const startReviewBody = functionSource(app, 'startReviewForCurrentSession', 'sleep');
+assert(
+  startReviewBody.indexOf('reviewBusyKeys.add(key)') < startReviewBody.indexOf('await verifyHostAvailable'),
+  'Review should acquire its local in-flight lock before awaiting Host availability so a double-click cannot enqueue twice'
+);
+assertContains(
+  startReviewBody,
+  'throwIfSessionReviewBlocked(session);',
+  'Review should apply the shared availability guard both locally and at the Relay boundary'
+);
+const resolvedRequestHandlerStart = app.indexOf(sseHandlerMarker('session.request.resolved'));
 const resolvedRequestHandlerEnd = app.indexOf('\n  });', resolvedRequestHandlerStart);
 assert(
   resolvedRequestHandlerStart >= 0 && resolvedRequestHandlerEnd > resolvedRequestHandlerStart,
@@ -216,9 +248,9 @@ assertContains(
   'the authoritative resolved event should release the shared responding-request lock'
 );
 
-const frontendRequestHandlerStart = app.indexOf("state.eventSource.addEventListener('session.request'");
+const frontendRequestHandlerStart = app.indexOf(sseHandlerMarker('session.request'));
 const frontendRequestHandlerEnd = app.indexOf(
-  "state.eventSource.addEventListener('session.request.resolved'",
+  sseHandlerMarker('session.request.resolved'),
   frontendRequestHandlerStart
 );
 assert(

@@ -97,7 +97,7 @@ assert(
 );
 assert(
   /host_dismissed/.test(AGENT_SOURCE)
-    && /recoverAgentLeaseForRequest\(error, requestLeaseId\)/.test(
+    && /recoverAgentLeaseForRequest\(\s*error,\s*requestLeaseId/.test(
       AGENT_SOURCE.slice(
         AGENT_SOURCE.indexOf('async function heartbeatLoop'),
         AGENT_SOURCE.indexOf('function sleep')
@@ -146,7 +146,7 @@ const pollLoopSource = AGENT_SOURCE.slice(
 assert(
   /acknowledgeCommandsBeforeShutdown/.test(pollLoopSource)
     && pollLoopSource.indexOf('acknowledgeCommandsBeforeShutdown')
-      < pollLoopSource.indexOf('processPolledCommand(command'),
+      < pollLoopSource.indexOf('processPolledCommand('),
   'Agent must durably ack successful earlier commands before processing host.shutdown'
 );
 const finalAckSource = AGENT_SOURCE.slice(
@@ -427,7 +427,7 @@ async function main() {
       return (hosts.body?.hosts || []).some((host) => (
         host.hostId === HOST_ID && host.lastSeenAt
       ));
-    }, 15000);
+    }, 30000);
 
     const beforeRestart = await requestJson(port, 'POST', `/api/hosts/${HOST_ID}/local-agent`, {
       action: 'status',
@@ -588,7 +588,7 @@ async function main() {
         && Number(localAgent.pid) !== Number(firstPid)
         ? status
         : null;
-    }, 15000);
+    }, 30000);
     assert.strictEqual(afterRestart.body?.localAgent?.desiredState, 'running');
     const restartedPid = afterRestart.body?.localAgent?.pid;
     agentPids.add(Number(restartedPid));

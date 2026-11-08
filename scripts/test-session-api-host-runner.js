@@ -12,6 +12,7 @@ const {
   buildProviderModelsUrl,
   classifyProviderModelResponse,
   classifyNativeThreadError,
+  classifyThreadStartError,
   deriveRunBinding,
   modelCapabilitiesFromList,
   normalizeProviderModelPage,
@@ -52,6 +53,7 @@ const {
   makeProfileBinding,
   publicBinding,
 } = require('../shared/api-binding');
+const sessionRuntimeState = require('../apps/mobile-web/public/session-runtime-state');
 
 const sqliteOpenFailureText = 'ERROR codex_app_server: failed to initialize SQLite state runtime: database error: (code: 14) unable to open database file';
 const sqliteOpenFailure = buildCodexStateDatabaseDiagnostic(
@@ -505,6 +507,22 @@ assert.strictEqual(runner.validateModelSelection('gpt-5.6-sol', 'max').effort, '
 
 assert.strictEqual(classifyNativeThreadError('resume', new Error('not found')).code, 'session_native_resume_failed');
 assert.strictEqual(classifyNativeThreadError('fork', new Error('not found')).code, 'session_native_fork_failed');
+const incompatibleNativeHistory = classifyNativeThreadError(
+  'resume',
+  new Error("Invalid 'input[11].content': array too long. Expected an array with maximum length 0, but got an array with length 1 instead.")
+);
+assert.strictEqual(incompatibleNativeHistory.code, 'session_responses_history_incompatible');
+assert.strictEqual(incompatibleNativeHistory.canRebind, true);
+assert.strictEqual(incompatibleNativeHistory.inputCapabilityError?.kind, 'responses-history');
+const rpcTimeout = Object.assign(new Error('timed out'), {
+  code: 'codex_rpc_request_timeout',
+  timeoutMs: 1234,
+});
+assert.strictEqual(classifyNativeThreadError('resume', rpcTimeout).code, 'session_resume_confirmation_timeout');
+assert.strictEqual(classifyNativeThreadError('fork', rpcTimeout).code, 'session_fork_confirmation_timeout');
+assert.strictEqual(classifyThreadStartError(rpcTimeout).code, 'session_start_confirmation_timeout');
+const nonTimeoutStartError = new Error('provider failed');
+assert.strictEqual(classifyThreadStartError(nonTimeoutStartError), nonTimeoutStartError);
 assert.strictEqual(isMissingNativeRolloutError(new Error('no rollout found for thread id thread-a')), true);
 assert.strictEqual(isMissingNativeRolloutError(new Error('provider authentication failed')), false);
 assert.strictEqual(isMissingNativeRolloutError(new Error('unknown thread id thread-a')), false);
@@ -561,7 +579,7 @@ assert(
 assert(
   agentSource.includes('lastFetchedCommandId')
     && agentSource.includes('advanceAcknowledgedCommandId()')
-    && agentSource.includes("deliveredCommandStates.set(commandId, 'pending')"),
+    && agentSource.includes("delivered.set(commandId, 'pending')"),
   'Host input commands must remain unacknowledged until Codex accepts or rejects turn/start'
 );
 assert(
@@ -625,6 +643,12 @@ assert.notStrictEqual(
 const runnerSource = fs.readFileSync('apps/host-agent/codex-app-server-runner.js', 'utf8');
 assert(!runnerSource.includes("const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])"));
 assert(!/catch \(error\) \{\s*thread = await startTranscriptFallbackThread\(error\);\s*\}/.test(runnerSource));
+assert(
+  runnerSource.includes('this.threadOpenConfirmed = false;')
+    && runnerSource.includes("error.code = 'session_native_resume_identity_mismatch'")
+    && runnerSource.includes('if (!this.threadOpenConfirmed) {'),
+  'native thread notifications must remain provisional until the matching open response is confirmed'
+);
 assert(
   runnerSource.includes('resolveLocalCodexBin({ pathEnv: process.env.PATH })'),
   'Codex runner fallback must resolve a concrete Windows command shim instead of spawning a bare extensionless codex command'
@@ -769,10 +793,10 @@ assert(
     && managedStartSource.includes('startHandle?.finish(startCompletionError)'),
   'shutdown terminal delivery failure must reach the start gate owner completion'
 );
-const polledCommandSource = agentSource.slice(
-  agentSource.indexOf('async function processPolledCommand(command'),
-  agentSource.indexOf('async function pollCommandsLoop()')
-);
+const polledCommandStart = agentSource.indexOf('async function processPolledCommand(');
+const polledCommandEnd = agentSource.indexOf('async function pollCommandsLoop(', polledCommandStart);
+assert(polledCommandStart >= 0 && polledCommandEnd > polledCommandStart, 'polled command test must locate its source boundaries');
+const polledCommandSource = agentSource.slice(polledCommandStart, polledCommandEnd);
 assert(
   /catch \(error\) \{\s*if \(error\?\.retryCommand\) \{[\s\S]{0,180}requestDeferredCommandRetry\(commandId, error\);[\s\S]{0,80}return false;/.test(polledCommandSource),
   'retryable replay delivery failure must not advance the command acknowledgement'
@@ -2812,22 +2836,29 @@ async function verifyFirstManagedOverlayPersistsRolloutsForResume() {
     }, { sessionId: 'first-rollout', runId: 'run-first-rollout' });
 
     const overlaySessions = path.join(overlay.codexHome, 'sessions');
+    const nativeThreadId = '20000000-0000-4000-8000-000000000001';
     const relativeRolloutPath = path.join(
       '2026',
       '07',
       '21',
-      'rollout-2026-07-21T13-22-24-native-thread.jsonl'
+      `rollout-2026-07-21T13-22-24-${nativeThreadId}.jsonl`
     );
     const overlayRolloutPath = path.join(overlaySessions, relativeRolloutPath);
     fs.mkdirSync(path.dirname(overlayRolloutPath), { recursive: true });
-    fs.writeFileSync(overlayRolloutPath, '{"type":"session_meta"}\n', 'utf8');
+    fs.writeFileSync(overlayRolloutPath, `${JSON.stringify({
+      type: 'session_meta',
+      payload: { id: nativeThreadId },
+    })}\n`, 'utf8');
 
     const durableRolloutPath = path.join(baseHome, 'sessions', relativeRolloutPath);
     assert.strictEqual(
       fs.existsSync(durableRolloutPath),
-      true,
-      'the first managed runner must write rollouts into the durable base home'
+      false,
+      'Fresh must not expose or write through the global history directory'
     );
+    const publication = overlay.managedSessionStore.publishNativeThread(nativeThreadId);
+    assert.strictEqual(publication.published, true, 'the target rollout must be published explicitly');
+    assert.strictEqual(fs.existsSync(durableRolloutPath), true);
     assert.strictEqual(cleanupApiProfileCodexHome(overlay.cleanupOwner), true);
     overlay = null;
     assert.strictEqual(
@@ -2837,6 +2868,84 @@ async function verifyFirstManagedOverlayPersistsRolloutsForResume() {
     );
   } finally {
     if (overlay && fs.existsSync(overlay.profileHomeDir)) cleanupApiProfileCodexHome(overlay.cleanupOwner);
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyNativeResumeKeepsHistoricalProviderAlias() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-native-provider-alias-'));
+  const nativeThreadId = '20000000-0000-4000-8000-000000000012';
+  const oldProvider = 'remote_codex_822068d27bf8a6f6';
+  const rolloutPath = path.join(baseHome, 'sessions', '2026', '11', '08',
+    `rollout-2026-11-08T10-00-00-${nativeThreadId}.jsonl`);
+  fs.mkdirSync(path.dirname(rolloutPath), { recursive: true });
+  const originalRollout = `${JSON.stringify({
+    type: 'session_meta',
+    payload: { id: nativeThreadId, model_provider: oldProvider },
+  })}\n`;
+  fs.writeFileSync(rolloutPath, originalRollout, 'utf8');
+  let overlay = null;
+  let forkRunner = null;
+  try {
+    const selectedApi = {
+      profileId: 'selected-testvideo-profile',
+      provider: 'OpenAI',
+      baseUrl: 'https://selected.example/v1',
+      apiKey: 'selected-secret',
+    };
+    overlay = prepareApiProfileCodexHome(baseHome, selectedApi, {
+      hostId: 'historical-provider-host',
+      sessionId: nativeThreadId,
+      nativeThreadId,
+      launchMode: 'resume',
+    });
+    const configText = fs.readFileSync(path.join(overlay.codexHome, 'config.toml'), 'utf8');
+    assert.notStrictEqual(overlay.providerKey, oldProvider);
+    assert.strictEqual(overlay.nativeResumeProviderKey, oldProvider);
+    assert(configText.includes(`[model_providers.${overlay.providerKey}]`));
+    assert(configText.includes(`[model_providers.${oldProvider}]`));
+    assert(configText.includes(`model_provider = "${oldProvider}"`));
+    assert.strictEqual((configText.match(/base_url = "https:\/\/selected\.example\/v1"/g) || []).length, 2);
+    assert.strictEqual(configText.includes('selected-secret'), false, 'API key must stay in overlay auth.json');
+    assert.strictEqual(fs.readFileSync(rolloutPath, 'utf8'), originalRollout, 'native history must not be rewritten');
+
+    forkRunner = new CodexAppServerRunner({
+      hostId: 'historical-provider-host',
+      sessionId: nativeThreadId,
+      bridgeSessionId: nativeThreadId,
+      nativeThreadId,
+      runId: 'historical-provider-fork',
+      title: 'Historical provider fork',
+      cwd: process.cwd(),
+      codexHome: baseHome,
+      launchMode: 'fork',
+      apiConfig: selectedApi,
+      postEvent: async () => {},
+    });
+    let forkProvider = null;
+    forkRunner.rpc = {
+      request: async (method, params) => {
+        assert.strictEqual(method, 'thread/fork');
+        forkProvider = params.modelProvider;
+        return { thread: { id: 'historical-provider-fork-thread' } };
+      },
+    };
+    await forkRunner.openThread(forkRunner.threadOpenApiParams());
+    assert.strictEqual(forkProvider, oldProvider);
+    forkRunner.cleanupManagedOverlay();
+    forkRunner = null;
+
+    fs.writeFileSync(path.join(baseHome, 'config.toml'),
+      `[model_providers.${oldProvider}]\nbase_url = "https://wrong.example/v1"\n`, 'utf8');
+    assert.throws(() => prepareApiProfileCodexHome(baseHome, selectedApi, {
+      hostId: 'historical-provider-host',
+      sessionId: nativeThreadId,
+      nativeThreadId,
+      launchMode: 'resume',
+    }), (error) => error?.code === 'session_native_provider_alias_conflict');
+  } finally {
+    if (forkRunner) forkRunner.cleanupManagedOverlay();
+    if (overlay) cleanupApiProfileCodexHome(overlay.cleanupOwner);
     fs.rmSync(baseHome, { recursive: true, force: true });
   }
 }
@@ -3172,13 +3281,14 @@ async function verifyStartReplayResendsAttestedConfirmation() {
   assert.strictEqual(replayEvents[0].bridgeSessionId, 'bridge-reused');
 }
 
-async function verifyNativeResumeReadyAfterFirstTurnStart() {
+async function verifyNativeResumeReadyAfterRolloutPublication() {
   const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-native-resume-ready-'));
   fs.writeFileSync(path.join(baseHome, 'auth.json'), '{}\n', 'utf8');
   fs.writeFileSync(path.join(baseHome, 'config.toml'), '', 'utf8');
   const events = [];
+  let rolloutPublished = false;
   let turnStartSucceeded = false;
-  let failFirstTurnStart = true;
+  let turnStartAttempt = 0;
   const runner = new CodexAppServerRunner({
     hostId: 'host-native-resume-ready',
     sessionId: 'bridge-native-resume-ready',
@@ -3191,9 +3301,9 @@ async function verifyNativeResumeReadyAfterFirstTurnStart() {
     postEvent: async (event) => {
       if (event.type === 'session.runtime_updated' && event.patch?.nativeResumeReady === true) {
         assert.strictEqual(
-          turnStartSucceeded,
+          rolloutPublished,
           true,
-          'native readiness must not be reported before turn/start RPC succeeds'
+          'native readiness must not be reported before the rollout is published'
         );
       }
       events.push(event);
@@ -3203,12 +3313,21 @@ async function verifyNativeResumeReadyAfterFirstTurnStart() {
   runner.sessionId = runner.threadId;
   runner.nativeThreadId = runner.threadId;
   runner.runtime.nativeThreadId = runner.threadId;
+  runner.managedSessionStore.publishNativeThread = () => (
+    rolloutPublished
+      ? { published: true, mode: 'hardlink', rolloutPath: 'published-rollout.jsonl' }
+      : { published: false, reason: 'rollout-not-found' }
+  );
   runner.rpc = {
     request: async (method) => {
       assert.strictEqual(method, 'turn/start');
-      if (failFirstTurnStart) {
-        failFirstTurnStart = false;
+      turnStartAttempt += 1;
+      if (turnStartAttempt === 1) {
         throw new Error('simulated turn/start failure before rollout creation');
+      }
+      if (turnStartAttempt === 2) {
+        rolloutPublished = true;
+        throw new Error('simulated turn/start failure after rollout creation');
       }
       turnStartSucceeded = true;
       return { turn: { id: 'turn-native-resume-ready' } };
@@ -3216,6 +3335,9 @@ async function verifyNativeResumeReadyAfterFirstTurnStart() {
   };
   try {
     assert.strictEqual(runner.runtime.nativeResumeReady, false);
+    const missingPublication = await runner.publishManagedSessionRollout('thread-opened');
+    assert.strictEqual(missingPublication.published, false);
+    assert.strictEqual(missingPublication.becameNativeResumeReady, false);
     await assert.rejects(
       runner.sendInput('first attempt fails'),
       /simulated turn\/start failure/
@@ -3224,16 +3346,28 @@ async function verifyNativeResumeReadyAfterFirstTurnStart() {
     assert.strictEqual(
       events.some((event) => event.patch?.nativeResumeReady === true),
       false,
-      'a rejected turn/start must leave the native thread explicitly non-resumable'
+      'a rejected turn/start must remain fail-closed while no rollout exists'
     );
 
-    const turnId = await runner.sendInput('second attempt succeeds');
+    await assert.rejects(
+      runner.sendInput('second attempt creates a rollout, then fails'),
+      /simulated turn\/start failure after rollout creation/
+    );
+    assert.strictEqual(runner.runtime.nativeResumeReady, true);
+    assert.strictEqual(
+      events.filter((event) => event.patch?.nativeResumeReady === true).length,
+      1,
+      'a rejected turn/start must publish readiness when Codex created the rollout before rejecting the request'
+    );
+    assert.strictEqual(turnStartSucceeded, false, 'the published thread must be resumable before its first turn');
+
+    const turnId = await runner.sendInput('third attempt succeeds');
     assert.strictEqual(turnId, 'turn-native-resume-ready');
     assert.strictEqual(runner.runtime.nativeResumeReady, true);
     assert.strictEqual(
       events.filter((event) => event.type === 'session.runtime_updated' && event.patch?.nativeResumeReady === true).length,
       1,
-      'the first successful native turn must publish readiness exactly once'
+      'rollout publication must publish readiness exactly once'
     );
   } finally {
     runner.cleanupManagedOverlay();
@@ -3518,6 +3652,332 @@ async function verifyTurnCompletionOutOfOrderFallback() {
   }
 }
 
+async function verifyThreadOpenNotificationsRemainProvisional() {
+  const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-thread-open-progress-'));
+  const events = [];
+  const runner = new CodexAppServerRunner({
+    hostId: 'host-thread-open-progress',
+    sessionId: 'bridge-thread-open-progress',
+    bridgeSessionId: 'bridge-thread-open-progress',
+    runId: 'run-thread-open-progress',
+    title: 'Thread open progress',
+    cwd: process.cwd(),
+    launchMode: 'resume',
+    nativeThreadId: 'native-thread-open-progress',
+    codexHome: baseHome,
+    postEvent: async (event) => events.push(event),
+  });
+  try {
+    runner.runtime.phase = 'resuming-thread';
+    runner.runtime.startupStep = 'thread-resume';
+    runner.runtime.busy = true;
+
+    await runner.handleNotification({
+      method: 'thread/started',
+      params: { thread: { id: 'native-thread-open-progress' } },
+    });
+    assert.strictEqual(
+      runner.currentSessionId(),
+      'bridge-thread-open-progress',
+      'thread/started must not change the canonical Session identity before the resume response'
+    );
+    let runtimeEvent = [...events].reverse().find((event) => event.type === 'session.runtime_updated');
+    assert.strictEqual(runtimeEvent.sessionId, 'bridge-thread-open-progress');
+    assert.strictEqual(runtimeEvent.patch.phase, 'resuming-thread');
+    assert.strictEqual(runtimeEvent.patch.busy, true);
+    assert.strictEqual(runtimeEvent.patch.currentTurnStatus, 'starting');
+
+    await runner.handleNotification({
+      method: 'thread/status/changed',
+      params: {
+        threadId: 'native-thread-open-progress',
+        status: { type: 'idle' },
+      },
+    });
+    runtimeEvent = [...events].reverse().find((event) => event.type === 'session.runtime_updated');
+    assert.strictEqual(runtimeEvent.patch.phase, 'resuming-thread');
+    assert.strictEqual(runtimeEvent.patch.busy, true);
+    assert.strictEqual(runtimeEvent.patch.currentTurnStatus, 'starting');
+
+    runner.threadOpenConfirmed = true;
+    runner.sessionId = 'native-thread-open-progress';
+    await runner.handleNotification({
+      method: 'thread/status/changed',
+      params: {
+        threadId: 'native-thread-open-progress',
+        status: { type: 'idle' },
+      },
+    });
+    runtimeEvent = [...events].reverse().find((event) => event.type === 'session.runtime_updated');
+    assert.strictEqual(runtimeEvent.patch.phase, 'idle');
+    assert.strictEqual(runtimeEvent.patch.busy, false);
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'idle');
+    assert.strictEqual(sessionRuntimeState.isActive(runner.runtime), false);
+
+    runner.runtime.currentTurnStatus = 'starting';
+    await runner.handleNotification({
+      method: 'thread/started',
+      params: { thread: { id: 'native-thread-open-progress' } },
+    });
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'idle');
+
+    runner.runtime.threadStatus = null;
+    runner.runtime.currentTurnStatus = 'starting';
+    await runner.handleNotification({
+      method: 'thread/started',
+      params: { thread: { id: 'native-thread-open-progress' } },
+    });
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'starting');
+    assert.strictEqual(sessionRuntimeState.isActive(runner.runtime), true);
+
+    runner.activeTurnId = 'turn-open-progress';
+    runner.runtime.phase = 'thinking';
+    runner.runtime.busy = true;
+    runner.runtime.currentTurnStatus = 'starting';
+    await runner.handleNotification({
+      method: 'thread/started',
+      params: { thread: { id: 'native-thread-open-progress' } },
+    });
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'starting');
+    assert.strictEqual(runner.runtime.phase, 'thinking');
+    assert.strictEqual(runner.runtime.busy, true);
+    runner.activeTurnId = null;
+
+    runner.inputSubmissionInFlight = true;
+    runner.runtime.phase = 'submitting-turn';
+    runner.runtime.busy = true;
+    runner.runtime.currentTurnStatus = 'starting';
+    await runner.handleNotification({
+      method: 'thread/started',
+      params: { thread: { id: 'native-thread-open-progress' } },
+    });
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'starting');
+    assert.strictEqual(runner.runtime.phase, 'submitting-turn');
+    assert.strictEqual(runner.runtime.busy, true);
+    await runner.handleNotification({
+      method: 'thread/status/changed',
+      params: { threadId: 'native-thread-open-progress', status: { type: 'idle' } },
+    });
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'starting');
+    runner.inputSubmissionInFlight = false;
+
+    await runner.handleNotification({
+      method: 'thread/status/changed',
+      params: { threadId: 'native-thread-open-progress', status: { type: 'active' } },
+    });
+    runner.runtime.currentTurnStatus = 'starting';
+    await runner.handleNotification({
+      method: 'thread/started',
+      params: { thread: { id: 'native-thread-open-progress' } },
+    });
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'starting');
+    await runner.handleNotification({
+      method: 'thread/status/changed',
+      params: { threadId: 'native-thread-open-progress', status: { type: 'idle' } },
+    });
+    assert.strictEqual(runner.runtime.currentTurnStatus, 'idle');
+  } finally {
+    runner.cleanupManagedOverlay();
+    fs.rmSync(baseHome, { recursive: true, force: true });
+  }
+}
+
+async function verifyResumeStartupClearsProvisionalTurnStatus() {
+  const scenarios = [
+    { name: 'idle', threadStatus: 'idle', expectedStatus: 'idle', expectedPhase: 'idle', active: false },
+    { name: 'unknown', threadStatus: null, expectedStatus: 'starting', expectedPhase: 'idle', active: true },
+    { name: 'submitting', threadStatus: 'idle', pendingInput: true, expectedStatus: 'starting', expectedPhase: 'submitting-turn', active: true },
+    { name: 'active-turn', threadStatus: 'idle', activeTurn: true, expectedStatus: 'starting', expectedPhase: 'thinking', active: true },
+  ];
+  for (const [index, scenario] of scenarios.entries()) {
+    const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), `session-api-resume-${scenario.name}-`));
+    const events = [];
+    const child = makeFakeManagedChild(860003 + index);
+    const runner = new CodexAppServerRunner({
+      hostId: `host-resume-${scenario.name}`,
+      sessionId: `bridge-resume-${scenario.name}`,
+      bridgeSessionId: `bridge-resume-${scenario.name}`,
+      runId: `run-resume-${scenario.name}`,
+      title: `Resume ${scenario.name}`,
+      cwd: process.cwd(),
+      launchMode: 'resume',
+      nativeThreadId: `native-resume-${scenario.name}`,
+      codexHome: baseHome,
+      spawnProcess: () => {
+        queueMicrotask(() => child.emit('spawn'));
+        return child;
+      },
+      postEvent: async (event) => events.push(event),
+    });
+    child.stdin.on('data', (chunk) => {
+      for (const line of String(chunk).trim().split('\n')) {
+        if (!line) continue;
+        const request = JSON.parse(line);
+        if (request.method === 'initialize') {
+          child.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} })}\n`);
+        }
+      }
+    });
+    runner.openThread = async () => {
+      await runner.handleNotification({
+        method: 'thread/started',
+        params: { thread: { id: `native-resume-${scenario.name}` } },
+      });
+      if (scenario.threadStatus) {
+        await runner.handleNotification({
+          method: 'thread/status/changed',
+          params: { threadId: `native-resume-${scenario.name}`, status: { type: scenario.threadStatus } },
+        });
+      }
+      assert.strictEqual(runner.runtime.currentTurnStatus, 'starting');
+      if (scenario.pendingInput) {
+        runner.inputSubmissionInFlight = true;
+        runner.runtime.phase = 'submitting-turn';
+      }
+      if (scenario.activeTurn) {
+        runner.activeTurnId = 'turn-before-open-confirmation';
+        runner.runtime.phase = 'thinking';
+      }
+      return { thread: { id: `native-resume-${scenario.name}` } };
+    };
+    try {
+      await runner.startOnce();
+      const runtimeEvent = [...events].reverse().find((event) => event.type === 'session.runtime_updated');
+      assert.strictEqual(runtimeEvent.patch.phase, scenario.expectedPhase, scenario.name);
+      assert.strictEqual(runtimeEvent.patch.busy, scenario.active && scenario.name !== 'unknown', scenario.name);
+      assert.strictEqual(runner.runtime.currentTurnStatus, scenario.expectedStatus, scenario.name);
+      assert.strictEqual(sessionRuntimeState.isActive(runner.runtime), scenario.active, scenario.name);
+    } finally {
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (!runner.overlayCleaned) runner.cleanupManagedOverlay();
+      fs.rmSync(baseHome, { recursive: true, force: true });
+    }
+  }
+}
+
+async function verifyHostEnvironmentThreadModelProviderOverride() {
+  const hostBinding = makeHostEnvironmentBinding({
+    provider: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    modelProviderHint: 'openai',
+  });
+  const modeCases = [
+    ['fresh', 'thread/start'],
+    ['resume', 'thread/resume'],
+    ['fork', 'thread/fork'],
+    ['fresh_rebind', 'thread/resume'],
+  ];
+
+  for (const [launchMode, expectedMethod] of modeCases) {
+    const baseHome = fs.mkdtempSync(path.join(os.tmpdir(), `session-api-host-provider-${launchMode}-`));
+    const nativeThreadId = ['resume', 'fork'].includes(launchMode)
+      ? `native-${launchMode}`
+      : null;
+    const runner = new CodexAppServerRunner({
+      hostId: `host-provider-${launchMode}`,
+      sessionId: `bridge-provider-${launchMode}`,
+      bridgeSessionId: `bridge-provider-${launchMode}`,
+      runId: `run-provider-${launchMode}`,
+      title: `Host provider ${launchMode}`,
+      cwd: process.cwd(),
+      launchMode,
+      nativeThreadId,
+      rebindNativeThreadId: launchMode === 'fresh_rebind' ? 'native-fresh-rebind' : null,
+      explicitRebind: launchMode === 'fresh_rebind',
+      codexHome: baseHome,
+      apiBinding: hostBinding,
+      postEvent: async () => {},
+    });
+    const calls = [];
+    runner.rpc = {
+      request: async (method, params) => {
+        calls.push({ method, params });
+        return { thread: { id: params.threadId || `native-${launchMode}` } };
+      },
+    };
+    try {
+      const threadApiParams = runner.threadOpenApiParams();
+      assert.deepStrictEqual(threadApiParams, { modelProvider: 'openai' });
+      await runner.openThread(threadApiParams);
+      assert.strictEqual(calls.length, 1);
+      assert.strictEqual(calls[0].method, expectedMethod);
+      assert.strictEqual(calls[0].params.modelProvider, 'openai');
+    } finally {
+      runner.cleanupManagedOverlay();
+      fs.rmSync(baseHome, { recursive: true, force: true });
+    }
+  }
+
+  const profileHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-profile-provider-priority-'));
+  const profileRunner = new CodexAppServerRunner({
+    hostId: 'host-profile-provider-priority',
+    sessionId: 'bridge-profile-provider-priority',
+    runId: 'run-profile-provider-priority',
+    title: 'Profile provider priority',
+    cwd: process.cwd(),
+    codexHome: profileHome,
+    apiConfig: {
+      profileId: 'profile-provider-priority',
+      provider: 'OpenAI',
+      baseUrl: 'https://profile.example/v1',
+      apiKey: 'profile-secret',
+    },
+    postEvent: async () => {},
+  });
+  try {
+    assert.match(profileRunner.apiProviderKey, /^remote_codex_[a-f0-9]{16}$/);
+    profileRunner.apiBinding = hostBinding;
+    assert.deepStrictEqual(profileRunner.threadOpenApiParams(), {
+      modelProvider: profileRunner.apiProviderKey,
+    });
+  } finally {
+    profileRunner.cleanupManagedOverlay();
+    fs.rmSync(profileHome, { recursive: true, force: true });
+  }
+
+  const unknownHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-unknown-provider-'));
+  const unknownRunner = new CodexAppServerRunner({
+    hostId: 'host-unknown-provider',
+    sessionId: 'bridge-unknown-provider',
+    runId: 'run-unknown-provider',
+    title: 'Unknown provider',
+    cwd: process.cwd(),
+    codexHome: unknownHome,
+    apiBinding: { kind: 'unknown', modelProviderHint: 'remote_codex_missing' },
+    postEvent: async () => {},
+  });
+  try {
+    assert.deepStrictEqual(unknownRunner.threadOpenApiParams(), {});
+  } finally {
+    unknownRunner.cleanupManagedOverlay();
+    fs.rmSync(unknownHome, { recursive: true, force: true });
+  }
+
+  const customHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-custom-host-provider-'));
+  const customRunner = new CodexAppServerRunner({
+    hostId: 'host-custom-provider',
+    sessionId: 'bridge-custom-provider',
+    runId: 'run-custom-provider',
+    title: 'Custom Host provider',
+    cwd: process.cwd(),
+    codexHome: customHome,
+    apiBinding: makeHostEnvironmentBinding({
+      provider: 'Custom',
+      baseUrl: 'https://custom.example/v1',
+      modelProviderHint: 'acme',
+    }),
+    postEvent: async () => {},
+  });
+  try {
+    assert.deepStrictEqual(customRunner.threadOpenApiParams(), { modelProvider: 'acme' });
+  } finally {
+    customRunner.cleanupManagedOverlay();
+    fs.rmSync(customHome, { recursive: true, force: true });
+  }
+}
+
 async function verifyAdaptiveFreshRebindThreadOpen() {
   const createRunner = (baseHome, postEvent = async () => {}) => new CodexAppServerRunner({
     hostId: 'host-adaptive-rebind',
@@ -3548,9 +4008,12 @@ async function verifyAdaptiveFreshRebindThreadOpen() {
     },
   };
   try {
-    const opened = await missingRunner.openThread();
-    assert.strictEqual(opened.thread.id, 'native-rebind-fresh');
-    assert.deepStrictEqual(missingCalls.map((entry) => entry.method), ['thread/resume', 'thread/start']);
+    await assert.rejects(
+      missingRunner.openThread(),
+      (error) => error?.code === 'session_native_resume_failed',
+      'missing native rollout must fail explicit Rebind instead of opening an empty thread'
+    );
+    assert.deepStrictEqual(missingCalls.map((entry) => entry.method), ['thread/resume']);
     assert.strictEqual(missingRunner.launchMode, 'fresh_rebind');
     assert.strictEqual(missingRunner.runtime.launchMode, 'fresh_rebind');
     assert.strictEqual(missingRunner.runtime.nativeResumeReady, false);
@@ -3558,11 +4021,51 @@ async function verifyAdaptiveFreshRebindThreadOpen() {
     assert.strictEqual(
       JSON.stringify(missingEvents).includes('from transcript context'),
       false,
-      'an empty Rebind fallback must not claim that transcript context was injected'
+      'a failed Rebind must not claim that transcript context was injected'
     );
   } finally {
     missingRunner.cleanupManagedOverlay();
     fs.rmSync(missingHome, { recursive: true, force: true });
+  }
+
+  const crossBindingHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-cross-binding-rebind-'));
+  const crossBindingCalls = [];
+  const crossBindingRunner = new CodexAppServerRunner({
+    hostId: 'host-cross-binding-rebind',
+    sessionId: 'bridge-cross-binding-rebind',
+    runId: 'run-cross-binding-rebind',
+    title: 'Cross binding Rebind',
+    cwd: process.cwd(),
+    launchMode: 'fresh_rebind',
+    rebindNativeThreadId: 'native-cross-binding-source',
+    explicitRebind: true,
+    forceTranscriptFallback: true,
+    bootstrap: {
+      historyPreview: [
+        { speaker: 'user', text: 'prior user prompt' },
+        { speaker: 'assistant', text: 'prior assistant answer' },
+      ],
+    },
+    codexHome: crossBindingHome,
+    postEvent: async () => {},
+  });
+  crossBindingRunner.rpc = {
+    request: async (method, params) => {
+      crossBindingCalls.push({ method, params });
+      assert.strictEqual(method, 'thread/start');
+      return { thread: { id: 'native-cross-binding-fresh' } };
+    },
+  };
+  try {
+    const opened = await crossBindingRunner.openThread();
+    assert.strictEqual(opened.thread.id, 'native-cross-binding-fresh');
+    assert.deepStrictEqual(crossBindingCalls.map((entry) => entry.method), ['thread/start']);
+    assert.strictEqual(crossBindingRunner.runtime.resumeStrategy, 'transcript_fallback');
+    assert.strictEqual(crossBindingRunner.runtime.nativeResumeReady, false);
+    assert.strictEqual(crossBindingRunner.nativeThreadId, null);
+  } finally {
+    crossBindingRunner.cleanupManagedOverlay();
+    fs.rmSync(crossBindingHome, { recursive: true, force: true });
   }
 
   const readyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-rebind-ready-rollout-'));
@@ -3644,11 +4147,14 @@ async function verifyAdaptiveFreshRebindThreadOpen() {
     },
   };
   try {
-    const opened = await legacyRunner.openThread();
-    assert.strictEqual(opened.thread.id, 'native-legacy-fresh');
-    assert.deepStrictEqual(legacyCalls, ['thread/resume', 'thread/start']);
-    assert.strictEqual(legacyRunner.launchMode, 'fresh_rebind');
-    assert.strictEqual(legacyRunner.runtime.launchMode, 'fresh_rebind');
+    await assert.rejects(
+      legacyRunner.openThread(),
+      (error) => error?.code === 'session_native_resume_failed',
+      'legacy explicit Rebind must fail instead of silently creating a blank thread'
+    );
+    assert.deepStrictEqual(legacyCalls, ['thread/resume']);
+    assert.strictEqual(legacyRunner.launchMode, 'resume');
+    assert.strictEqual(legacyRunner.runtime.launchMode, 'resume');
     assert.strictEqual(legacyRunner.runtime.nativeResumeReady, false);
   } finally {
     legacyRunner.cleanupManagedOverlay();
@@ -3719,8 +4225,7 @@ async function verifyAdaptiveFreshRebindThreadOpen() {
 }
 
 async function verifyRejectedRunnerStartupKillsSpawnedChild() {
-  fs.mkdirSync(path.join(process.cwd(), 'tmp'), { recursive: true });
-  const fixtureRoot = fs.mkdtempSync(path.join(process.cwd(), 'tmp', 'session-api-start-reject-'));
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'session-api-start-reject-'));
   const baseHome = path.join(fixtureRoot, 'base-home');
   const pidPath = path.join(fixtureRoot, 'fake-child.pid');
   const serverPath = path.join(fixtureRoot, 'fake-app-server.js');
@@ -3975,14 +4480,18 @@ verifyPagedRunnerCapabilities()
   .then(verifyManagedOverlayCreationRejectsLinkedRoot)
   .then(verifyManagedOverlayCreationAllowsLinkedBaseHome)
   .then(verifyFirstManagedOverlayPersistsRolloutsForResume)
+  .then(verifyNativeResumeKeepsHistoricalProviderAlias)
   .then(verifyOwnedOverlayCleanupRejectsLinkedMarker)
   .then(verifyManagedOverlayShortPathBudgetAndMetadata)
   .then(verifyManagedOverlayJanitorRequiresDeadOwnerAndChild)
   .then(verifyManagedOverlayJanitorRequiresAttestationForLegacyMarkers)
-  .then(verifyNativeResumeReadyAfterFirstTurnStart)
+  .then(verifyNativeResumeReadyAfterRolloutPublication)
   .then(verifyRuntimeErrorsClearAfterTurnRecovery)
   .then(verifyAssistantTranscriptIdentityAndSubmissionLock)
   .then(verifyTurnCompletionOutOfOrderFallback)
+  .then(verifyThreadOpenNotificationsRemainProvisional)
+  .then(verifyResumeStartupClearsProvisionalTurnStatus)
+  .then(verifyHostEnvironmentThreadModelProviderOverride)
   .then(verifyAdaptiveFreshRebindThreadOpen)
   .then(verifyStartReplayResendsAttestedConfirmation)
   .then(verifyRejectedRunnerStartupKillsSpawnedChild)

@@ -1,0 +1,112 @@
+/* One component vocabulary for BOTH themes. Never set business visibility here. */
+@layer controls {
+  html, body { background: var(--ui-canvas); color: var(--ui-text); font-family: var(--ui-font); }
+  body::before, .composer::before { content: none; }
+  :where(button, input, select, textarea) { font-family: inherit; }
+  button, .secondary-button {
+    background: var(--ui-surface); color: var(--ui-text);
+    border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+    box-shadow: none; font-weight: 600;
+    transition: background-color 120ms ease, border-color 120ms ease;
+  }
+  button:hover:not(:disabled), .secondary-button:hover:not(:disabled) {
+    transform: none; box-shadow: none;
+    background: var(--ui-hover); border-color: var(--ui-border-strong);
+  }
+  button:active:not(:disabled) { transform: none; }
+  button:disabled { opacity: .48; cursor: not-allowed; }
+  :where(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+    background: var(--ui-surface); color: var(--ui-text);
+    border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+    box-shadow: none;
+  }
+  input::placeholder, textarea::placeholder { color: var(--ui-muted); opacity: .8; }
+  input[type="checkbox"], input[type="radio"] { accent-color: var(--ui-accent); }
+  :where(button, input, select, textarea, summary, a, [tabindex]):focus-visible {
+    outline: 2px solid var(--ui-accent); outline-offset: 3px; box-shadow: none;
+  }
+  :where(input, select, textarea):focus { border-color: var(--ui-accent); box-shadow: none; }
+  #codex-send-button, #new-session-submit-button, .auth-card > button[type="submit"],
+  .secondary-button[aria-pressed="true"] {
+    background: var(--ui-accent); color: var(--ui-on-accent); border-color: var(--ui-accent);
+  }
+  #codex-send-button:hover:not(:disabled), #new-session-submit-button:hover:not(:disabled) {
+    background: var(--ui-accent-hover); color: var(--ui-on-accent);
+  }
+  .danger-button, .danger-button:hover:not(:disabled) {
+    color: var(--ui-error-text); background: var(--ui-error-bg);
+    border-color: var(--ui-error-text);
+  }
+  #resume-session-button, #join-session-button {
+    background: var(--ui-accent-soft); color: var(--ui-accent); border-color: var(--ui-border);
+  }
+  :where(.eyebrow, .meta, .muted, .sub, .detail-copy, .message-meta,
+    .conversation-summary, .conversation-card .path, .conversation-card .preview,
+    .conversation-stats .label, .conversation-time-grid strong, .conversation-time-grid span) {
+    color: var(--ui-muted);
+  }
+  .eyebrow { font-size: 10px; font-weight: 600; letter-spacing: .09em; }
+  :where(.panel, .nav-section, .auth-card, .settings-modal, .runtime-details-modal,
+    .status-window-modal, .alerts-window, .choice-dialog-modal, .directory-picker-modal,
+    .connector-manager-modal, .image-preview-modal, .skills-manager-modal,
+    .collection-popover, .mobile-select-menu, .slash-command-menu, .message-notification-panel) {
+    color: var(--ui-text); background: var(--ui-surface); border-color: var(--ui-border);
+    border-radius: var(--ui-radius-lg); box-shadow: var(--ui-shadow); backdrop-filter: none;
+  }
+  :where(.auth-gate, .settings-overlay, .runtime-details-overlay, .status-window-overlay,
+    .directory-picker-overlay, .connector-manager-overlay, .choice-dialog-overlay,
+    .image-preview-overlay, .skills-manager-overlay) {
+    background: var(--ui-backdrop); backdrop-filter: blur(4px);
+  }
+  :where(.settings-section, .detail-card, .status-summary-card, .runtime-command-card,
+    .choice-session-row, .choice-file-row, .picker-entry, .picker-chip,
+    .message-notification-item, .collection-manager-row, .skills-row) {
+    color: var(--ui-text); background: var(--ui-subtle);
+    border-color: var(--ui-border); border-radius: var(--ui-radius); box-shadow: none;
+  }
+  :where(.settings-header h1, .settings-section-title, .choice-dialog-header h2,
+    .collection-manager-copy strong, .slash-command-title) { color: var(--ui-text); }
+  .runtime-chip, .runtime-chip.info, .runtime-chip.active,
+  .api-profile-chip, .variant-chip, .attachment-chip {
+    color: var(--ui-muted); background: var(--ui-subtle);
+    border-color: var(--ui-border); box-shadow: none; border-radius: var(--ui-radius-sm);
+  }
+  .runtime-chip.warning, #toggle-alerts-button.has-current-warning,
+  .composer-mode-banner, .composer-turn-notice {
+    color: var(--ui-warning-text); background: var(--ui-warning-bg); border-color: var(--ui-warning-text);
+  }
+  .runtime-chip.error, #toggle-alerts-button.has-current-error {
+    color: var(--ui-error-text); background: var(--ui-error-bg); border-color: var(--ui-error-text);
+  }
+  .runtime-chip.active, .runtime-chip.info { color: var(--ui-muted); background: var(--ui-subtle); }
+  .slash-command-item.active, .skills-tab.active, .mobile-select-option.active, .picker-chip.active {
+    color: var(--ui-on-accent); background: var(--ui-accent-soft); border-color: var(--ui-accent);
+  }
+  .variant-chip.active, .variant-chip.live { color: var(--ui-accent); border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+  .approval-popup {
+    color: var(--ui-text); background: var(--ui-raised);
+    border: 1px solid var(--ui-warning-text); border-radius: var(--ui-radius-lg); box-shadow: var(--ui-shadow);
+  }
+  .approval-popup-detail { background: var(--ui-subtle); color: var(--ui-text); }
+  .approval-popup-actions { background: var(--ui-raised); }
+  .empty-state, .log:empty::before { color: var(--ui-muted); border-color: var(--ui-border); }
+  .message-notification-button.has-unread {
+    color: var(--ui-text); background: var(--ui-accent-soft); box-shadow: none; border-color: var(--ui-border-strong);
+  }
+  .message-notification-icon svg { display: block; width: 18px; height: 18px; }
+  .message-notification-count { background: var(--ui-unread-dot); border-color: var(--ui-surface); color: white; }
+  .conversation-runtime-dot { box-shadow: none; animation: none; }
+  .conversation-runtime-dot.history { background: var(--ui-history-dot); box-shadow: none; }
+  .conversation-runtime-dot.live-idle { background: var(--ui-idle-dot); box-shadow: none; }
+  .conversation-runtime-dot.runtime-active { background: var(--ui-running-dot); box-shadow: none; }
+  .conversation-error-badge { background: var(--ui-error-badge); color: white; }
+  .conversation-unread-button, .conversation-unread-button:hover {
+    background: transparent; border: 0; box-shadow: none;
+  }
+  .conversation-unread-button::before { background: var(--ui-unread-dot); box-shadow: none; }
+  .scroll-jump-button { background: var(--ui-raised); color: var(--ui-muted); box-shadow: none; }
+  .scroll-jump-button.has-new { color: var(--ui-error-text); background: var(--ui-error-bg); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none; transition: none; scroll-behavior: auto; }
+  }
+}

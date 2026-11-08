@@ -90,6 +90,10 @@ const cleanupContext = vm.createContext({
       ['canonical-a', 'cursor-a'],
       ['canonical-b', 'cursor-b'],
     ]),
+    activityClientRequestIdsByCanonical: new Map([
+      ['canonical-a', new Map([['activity-a', 'request-a']])],
+      ['canonical-b', new Map([['activity-b', 'request-b']])],
+    ]),
     activityCanonicalKeysBySession: new Map([
       ['session-a', 'canonical-a'],
       ['session-a-alias', 'canonical-a'],
@@ -101,6 +105,8 @@ vm.runInContext(forgetCanonicalSource, cleanupContext);
 assert.strictEqual(cleanupContext.forgetActivityCanonicalConversation('canonical-a'), true);
 assert.strictEqual(cleanupContext.state.eventCursorByCanonical.has('canonical-a'), false);
 assert.strictEqual(cleanupContext.state.eventCursorByCanonical.has('canonical-b'), true);
+assert.strictEqual(cleanupContext.state.activityClientRequestIdsByCanonical.has('canonical-a'), false);
+assert.strictEqual(cleanupContext.state.activityClientRequestIdsByCanonical.has('canonical-b'), true);
 assert.deepStrictEqual(
   [...cleanupContext.state.activityCanonicalKeysBySession.entries()],
   [['session-b', 'canonical-b']]
@@ -163,6 +169,21 @@ assertContains(
 );
 assertContains(
   app,
+  'state.eventCursorGenerationByCanonical?.set(canonicalKey, streamGeneration)',
+  'a new EventSource generation must fence late cursor commits before its first event'
+);
+assertContains(
+  app,
+  'clearStreamDetailRecoveryRetry();',
+  'a forced stream reconnect must cancel a superseded detail-recovery retry timer'
+);
+assertContains(
+  app,
+  "String(existingStream.connection || '').toLowerCase() === 'connecting'",
+  'focus and visibility callbacks must not churn an EventSource that is still connecting'
+);
+assertContains(
+  app,
   'function checkSelectedSessionStreamHealth',
   'mobile realtime should proactively check selected live session stream health'
 );
@@ -183,7 +204,7 @@ assertContains(
 );
 assertContains(
   app,
-  "payload.session?.runtime, { source: 'stream', allowStale: true }",
+  "payload.session?.runtime, { source: 'stream', allowStale: true, authoritativeSnapshot: true }",
   'stream reset must authoritatively replace stale browser runtime state'
 );
 assertContains(
@@ -211,9 +232,9 @@ assertContains(
   'reconcileDetailTranscriptForSession(',
   'full detail recovery must reconcile optimistic user echoes against the authoritative Relay transcript'
 );
-assertContains(
-  app,
-  "state.eventSource.addEventListener('session.interrupt_result'",
+assert(
+  app.includes("streamGate.listen('session.interrupt_result'")
+    || app.includes("state.eventSource.addEventListener('session.interrupt_result'"),
   'Interrupt must remain correlated with the Host terminal acknowledgement instead of HTTP enqueue only'
 );
 assertContains(
@@ -244,7 +265,7 @@ assertContains(
 );
 assertContains(
   resetRecoverySource,
-  'scheduleStreamDetailRecoveryRetry(failedRecoveryKey)',
+  'scheduleStreamDetailRecoveryRetry(failedRecoveryKey, {',
   'a failed reset reconciliation should remain pending with bounded retry'
 );
 assertContains(
@@ -256,6 +277,23 @@ assertContains(
   resetRecoverySource,
   'if (recoverActivities) {',
   'activity recovery should still run when the detail refresh fails'
+);
+const streamResetHandlerStart = app.indexOf("streamGate.listen('stream.reset'");
+const streamResetHandlerEnd = app.indexOf("streamGate.listen('session.activity'", streamResetHandlerStart);
+assert(
+  streamResetHandlerStart >= 0 && streamResetHandlerEnd > streamResetHandlerStart,
+  'stream.reset handler should be bounded before session.activity'
+);
+const streamResetHandler = app.slice(streamResetHandlerStart, streamResetHandlerEnd);
+assert(
+  streamResetHandler.includes('sessionStreamResetNeedsDetailRecovery(session)')
+    && streamResetHandler.includes('sessionStreamResetNeedsRecovery(payload.reason)'),
+  'history reset recovery must be gated by live or incomplete-session state'
+);
+assert(
+  streamResetHandler.indexOf('sessionStreamResetNeedsDetailRecovery(session)')
+    < streamResetHandler.indexOf('sessionStreamResetNeedsRecovery(payload.reason)'),
+  'detail recovery gating must happen before evaluating expensive reset recovery branches'
 );
 assertContains(
   app,
@@ -293,8 +331,8 @@ assertContains(
 );
 assertContains(
   activityRecoverySource,
-  'loadSessionActivityRecords(task.session, requestedActivities, { signal })',
-  'large live activity invalidations should recover only their targeted records'
+  'loadSessionActivityRecords(task.session, requestedActivities, { signal, isCurrent })',
+  'large live activity invalidations should recover only their targeted records under the active stream identity'
 );
 assertContains(
   activityRecoverySource,
@@ -364,8 +402,15 @@ assertContains(
   'state.activityProjection.replaceSnapshot(canonicalKey, {',
   'full activity snapshots should remove browser records already evicted by the server'
 );
-const activityHandlerStart = app.indexOf("state.eventSource.addEventListener('session.activity'");
-const activityHandlerEnd = app.indexOf("state.eventSource.addEventListener('session.assistant_projection'", activityHandlerStart);
+const activityHandlerStart = app.indexOf("streamGate.listen('session.activity'") >= 0
+  ? app.indexOf("streamGate.listen('session.activity'")
+  : app.indexOf("state.eventSource.addEventListener('session.activity'");
+const activityHandlerEnd = app.indexOf(
+  "streamGate.listen('session.assistant_projection'",
+  activityHandlerStart
+) >= 0
+  ? app.indexOf("streamGate.listen('session.assistant_projection'", activityHandlerStart)
+  : app.indexOf("state.eventSource.addEventListener('session.assistant_projection'", activityHandlerStart);
 assert(activityHandlerStart >= 0 && activityHandlerEnd > activityHandlerStart);
 const activityHandlerSource = app.slice(activityHandlerStart, activityHandlerEnd);
 assertContains(

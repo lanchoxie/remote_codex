@@ -22,6 +22,7 @@ async function main() {
         provider: 'openai-compatible',
         providerKind: 'custom',
         baseUrl: 'https://api.example.test/v1',
+        nativeResumeCompatibilityKey: 'Shared-Sub2API-Gateway',
         apiKey: 'secret-key-that-must-never-appear-in-envelope',
         sessionDefaults: {
           model: 'private-reasoner',
@@ -64,6 +65,7 @@ async function main() {
         provider: 'openai-compatible',
         providerKind: 'custom',
         baseUrl: 'https://api.example.test/v1',
+        nativeResumeCompatibilityKey: 'shared-sub2api-gateway',
         apiKey: 'secret-key-that-must-never-appear-in-envelope',
         sessionDefaults: {
           model: 'private-reasoner',
@@ -79,6 +81,7 @@ async function main() {
         provider: 'azure',
         providerKind: 'custom',
         baseUrl: 'https://example.openai.azure.com/openai?api-version=2026-01-01',
+        nativeResumeCompatibilityKey: '',
         apiKey: '',
         sessionDefaults: {
           model: '',
@@ -139,6 +142,11 @@ async function main() {
     }],
     hostApiProfiles: {},
   }), /invalid format/);
+  assert.throws(() => validatePayload({
+    ...payload,
+    apiProfiles: [{ ...payload.apiProfiles[0], nativeResumeCompatibilityKey: 'x'.repeat(161) }],
+    hostApiProfiles: {},
+  }), /native resume compatibility key is too long/);
 
   const legacy = validatePayload({
     apiProfiles: [{
@@ -150,6 +158,7 @@ async function main() {
     }],
   });
   assert.strictEqual(legacy.apiProfiles[0].providerKind, 'anthropic');
+  assert.strictEqual(legacy.apiProfiles[0].nativeResumeCompatibilityKey, '');
   assert.deepStrictEqual(legacy.apiProfiles[0].sessionDefaults, {
     model: '',
     effortMode: 'auto',

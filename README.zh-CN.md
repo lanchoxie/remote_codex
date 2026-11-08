@@ -3,11 +3,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <p align="center">
-  <img src="docs/assets/readme/mobile-conversation.jpg" alt="手机端实际运行的 Remote Codex 会话" width="29%" />
-  <img src="docs/assets/readme/windows-desktop-session.png" alt="PC 端实际运行的 Remote Codex 会话" width="68%" />
+  <img src="docs/assets/readme/workspace-mobile-chat-2026.png" alt="手机端对话、推理过程和输入区" width="27%" />
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="桌面端新版工作台和对话界面" width="70%" />
 </p>
 
-同一个 Remote Codex 控制台可以跨手机、桌面、Linux 和 HPC 主机运行。
+新版界面示例使用隔离测试数据。同一个 Remote Codex 控制台可以跨手机、桌面、Linux 和 HPC 主机运行。
 
 中文产品首页：[README.md](README.md)
 English guide: [README.en.md](README.en.md)
@@ -15,7 +15,7 @@ English guide: [README.en.md](README.en.md)
 Mobile Codex Remote 是一个用浏览器控制 Codex 会话的轻量控制台。它可以同时管理本地电脑、远程 Linux 主机和 HPC 集群上的 Codex 会话，让你在桌面浏览器或手机上新建、恢复、派生、打断、引导、审查、导入导出和监控长时间运行的 Codex 工作。
 
 英文 README: [README.en.md](README.en.md)
-本次更新报告: [docs/update-report-2026-06-05.md](docs/update-report-2026-06-05.md)
+本版更新说明: [docs/releases/v2.4.12.md](docs/releases/v2.4.12.md)
 v2.01 阶段说明归档: [README_v2.01.md](README_v2.01.md)
 
 ## 功能概览
@@ -66,10 +66,10 @@ git clone https://github.com/lanchoxie/remote_codex.git
 cd remote_codex
 ```
 
-当前项目主要使用 Node.js 内置模块，通常不需要安装依赖。如果之后加入依赖，再执行：
+首次启动需安装锁定版本的依赖：
 
 ```bash
-npm install
+npm ci
 ```
 
 ## 升级并保留本地数据
@@ -129,13 +129,7 @@ start-windows.bat
 Windows 端和手机端共用同一个网页 UI，只是桌面浏览器更适合同时看导航栏、transcript、文件卡片和设置面板。启动后先在左侧 `当前 HOST` 选择本机 Windows host，例如 `ILLUIN Windows`，再进入对应会话。
 
 <p align="center">
-  <img src="docs/assets/readme/windows-desktop-session.png" alt="Windows 桌面端会话、文件预览和控制栏" width="48%" />
-  <img src="docs/assets/readme/windows-host-manager.png" alt="Windows 端 host 管理和本地重启控制" width="30%" />
-</p>
-<p align="center">
-  <img src="docs/assets/readme/windows-api-profiles.png" alt="Windows 端 API profile 和 host 映射设置" width="32%" />
-  <img src="docs/assets/readme/windows-export-options.png" alt="Windows 端会话导出选项" width="32%" />
-  <img src="docs/assets/readme/windows-history-attachments.png" alt="Windows 端历史导入导出附件" width="32%" />
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="Windows 桌面端新版工作台" width="90%" />
 </p>
 
 常用能力：

@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { makeActivityKey } = require('./thinking-activity');
+const { structuredText } = require('./structured-text');
 
 const DEFAULT_MAX_CONVERSATIONS = 256;
 const DEFAULT_MAX_RECORDS_PER_CONVERSATION = 256;
@@ -20,7 +21,7 @@ function boundedInteger(value, fallback, min, max) {
 }
 
 function boundedText(value, maxLength) {
-  const text = String(value == null ? '' : value);
+  const text = structuredText(value);
   return text.length <= maxLength ? text : text.slice(0, maxLength);
 }
 
@@ -30,13 +31,13 @@ function boundedStructuredValueWithMeta(value, maxBytes) {
   try {
     cloned = clone(value);
   } catch (_) {
-    cloned = String(value);
+    cloned = structuredText(value);
   }
   let serialized;
   try {
     serialized = JSON.stringify(cloned);
   } catch (_) {
-    serialized = JSON.stringify(String(cloned));
+    serialized = JSON.stringify(structuredText(cloned));
   }
   if (Buffer.byteLength(serialized, 'utf8') <= maxBytes) {
     return { value: cloned, truncated: false };
@@ -89,18 +90,22 @@ function makeActivityRecoveryToken(activityKey) {
     .digest('base64url');
 }
 
-function compareScalar(left, right) {
-  const a = String(left ?? '');
-  const b = String(right ?? '');
-  if (a < b) return -1;
-  if (a > b) return 1;
-  return 0;
+function compareSnapshots(left, right) {
+  const leftOrdinal = Number(left.firstObservedOrdinal || 0);
+  const rightOrdinal = Number(right.firstObservedOrdinal || 0);
+  if (leftOrdinal > 0 && rightOrdinal > 0 && leftOrdinal !== rightOrdinal) {
+    return leftOrdinal - rightOrdinal;
+  }
+  if (leftOrdinal > 0 !== rightOrdinal > 0) {
+    return leftOrdinal > 0 ? -1 : 1;
+  }
+  return String(left.activityKey || '').localeCompare(String(right.activityKey || ''));
 }
 
-function compareSnapshots(left, right) {
-  return compareScalar(left.turnId, right.turnId)
-    || compareScalar(left.itemId, right.itemId)
-    || (Number(left.summaryIndex || 0) - Number(right.summaryIndex || 0));
+function terminalSnapshot(snapshot = {}) {
+  if (snapshot.final === true) return true;
+  return /^(?:cancelled|canceled|complete|completed|error|failed|interrupted|rejected|stopped|succeeded|success|timed_out|timeout)$/i
+    .test(String(snapshot.status || '').trim());
 }
 
 class ActivitySnapshotStore {
@@ -152,6 +157,7 @@ class ActivitySnapshotStore {
       records: new Map(),
       bytesByKey: new Map(),
       totalBytes: 0,
+      nextOrdinal: 1,
       revision: ++this.nextRevision,
     };
     this.conversations.set(key, conversation);
@@ -190,7 +196,7 @@ class ActivitySnapshotStore {
     while (preferred && preferred.records.size > this.maxRecordsPerConversation) {
       preferredMembershipChanged = this.deleteRecord(
         preferred,
-        preferred.records.keys().next().value
+        this.sortedRecords(preferredKey)[0]?.activityKey
       ) || preferredMembershipChanged;
     }
     while (this.conversations.size > this.maxConversations) {
@@ -207,7 +213,7 @@ class ActivitySnapshotStore {
       if (!oldest?.records.size) break;
       preferredMembershipChanged = this.deleteRecord(
         oldest,
-        oldest.records.keys().next().value
+        this.sortedRecords(oldestKey)[0]?.activityKey
       ) || preferredMembershipChanged;
     }
     return preferredMembershipChanged;
@@ -227,9 +233,21 @@ class ActivitySnapshotStore {
     if (current && normalized.activityRevision <= current.activityRevision) {
       return null;
     }
+    if (current && terminalSnapshot(current) && !terminalSnapshot(normalized)) {
+      return null;
+    }
     if (current?.startedAt) {
       normalized.startedAt = current.startedAt;
     }
+    if (current?.firstObservedOrdinal) {
+      normalized.firstObservedOrdinal = current.firstObservedOrdinal;
+    } else if (!(normalized.firstObservedOrdinal > 0)) {
+      normalized.firstObservedOrdinal = conversation.nextOrdinal;
+    }
+    conversation.nextOrdinal = Math.max(
+      conversation.nextOrdinal,
+      Number(normalized.firstObservedOrdinal || 0) + 1
+    );
 
     this.deleteRecord(conversation, normalized.activityKey);
     const bytes = recordBytes(normalized);
@@ -354,12 +372,15 @@ class ActivitySnapshotStore {
     const streamEpoch = String(epoch || '');
     const sources = [this.conversations.get(winnerKey), this.conversations.get(loserKey)]
       .filter((conversation) => conversation?.epoch === streamEpoch)
-      .flatMap((conversation) => [...conversation.records.values()]);
+      .flatMap((conversation) => [...conversation.records.values()].sort(compareSnapshots));
     this.deleteConversation(winnerKey);
     this.deleteConversation(loserKey);
     this.createConversation(winnerKey, streamEpoch);
     for (const snapshot of sources) {
-      this.accept(streamEpoch, winnerKey, snapshot);
+      this.accept(streamEpoch, winnerKey, {
+        ...snapshot,
+        firstObservedOrdinal: null,
+      });
     }
     return options.includeSnapshot === false ? [] : this.snapshot(winnerKey);
   }
@@ -393,6 +414,7 @@ class ActivitySnapshotStore {
       canonicalConversationKey: canonicalKey,
       runId: boundedText(snapshot.runId, 512) || null,
       turnId: boundedText(snapshot.turnId, 512) || null,
+      clientRequestId: boundedText(snapshot.clientRequestId, 512) || null,
       itemId,
       callId,
       requestId,
@@ -446,6 +468,10 @@ class ActivitySnapshotStore {
       fileChanges: boundedFileChanges.value,
       fileChangesTruncated: snapshot.fileChangesTruncated === true || boundedFileChanges.truncated,
       activityRevision,
+      firstObservedOrdinal: Number.isSafeInteger(Number(snapshot.firstObservedOrdinal))
+        && Number(snapshot.firstObservedOrdinal) > 0
+        ? Number(snapshot.firstObservedOrdinal)
+        : null,
       final: snapshot.final === true,
       startedAt: boundedText(
         snapshot.startedAt || snapshot.createdAt || snapshot.timestamp || snapshot.updatedAt,

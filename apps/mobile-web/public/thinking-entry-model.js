@@ -39,6 +39,32 @@
     'success',
   ]);
 
+  const structuredTextHelper = (typeof globalThis !== 'undefined'
+    ? globalThis.RemoteCodexStructuredText
+    : null);
+
+  function structuredText(value, options = {}) {
+    if (structuredTextHelper?.toText) return structuredTextHelper.toText(value, options);
+    if (value == null) return '';
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+      return String(value);
+    }
+    const seen = options.seen instanceof WeakSet ? options.seen : new WeakSet();
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    try {
+      if (Array.isArray(value)) return value.map((item) => structuredText(item, { ...options, seen })).filter(Boolean).join('\n');
+      for (const key of ['text', 'output_text', 'outputText', 'input_text', 'inputText', 'content', 'summary', 'message', 'description', 'title', 'label', 'delta', 'value', 'step', 'command', 'query', 'path', 'output', 'stdout', 'stderr', 'reason', 'type', 'status', 'state', 'phase', 'kind', 'name', 'id']) {
+        if (value[key] == null) continue;
+        const text = structuredText(value[key], { ...options, seen }).trim();
+        if (text) return text;
+      }
+      try { return JSON.stringify(value); } catch (_) { return '[Unserializable structured value]'; }
+    } finally {
+      seen.delete(value);
+    }
+  }
+
   function object(value) {
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   }
@@ -60,17 +86,45 @@
   }
 
   function identifier(value) {
-    return String(value == null ? '' : value).trim();
+    if (value == null || value === '') return '';
+    if (typeof value === 'object') {
+      if (structuredTextHelper?.toScalar) return structuredTextHelper.toScalar(value, '').trim();
+      for (const key of ['type', 'status', 'state', 'phase', 'kind', 'name', 'id']) {
+        if (value[key] != null && value[key] !== '') return identifier(value[key]);
+      }
+    }
+    // Keep identity fields textual even when a protocol wrapper reaches this
+    // path. Falling back to String(object) leaks "[object Object]" into
+    // group keys and the Thinking UI.
+    return structuredText(value).trim();
   }
 
   function plainText(value) {
     if (value === undefined || value === null) return '';
-    if (typeof value === 'string') return value;
-    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-    try {
-      return JSON.stringify(value);
-    } catch (_) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
       return String(value);
+    }
+    const hasTextKey = (candidate) => candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+      && [
+        'text', 'output_text', 'outputText', 'input_text', 'inputText',
+        'content', 'summary', 'message', 'description', 'title', 'label',
+        'delta', 'value', 'step',
+      ]
+        .some((key) => candidate[key] != null);
+    if (hasTextKey(value) || (Array.isArray(value) && value.some(hasTextKey))) {
+      return structuredText(value);
+    }
+    if (structuredTextHelper?.safeJson) return structuredTextHelper.safeJson(value) || '';
+    try {
+      const seen = new WeakSet();
+      return JSON.stringify(value, (_, item) => {
+        if (!item || typeof item !== 'object') return item;
+        if (seen.has(item)) return '[Circular]';
+        seen.add(item);
+        return item;
+      });
+    } catch (_) {
+      return structuredText(value);
     }
   }
 
@@ -87,7 +141,7 @@
   }
 
   function looksLikeEncryptedCollaborationPayload(value) {
-    const text = String(value || '').trim();
+    const text = structuredText(value).trim();
     return text.length >= 96
       && /^gAAAAA[A-Za-z0-9_-]+={0,2}$/.test(text);
   }
@@ -165,20 +219,20 @@
   }
 
   function safePrefix(value, length) {
-    let result = String(value || '').slice(0, Math.max(0, length));
+    let result = structuredText(value).slice(0, Math.max(0, length));
     if (result && /[\uD800-\uDBFF]/.test(result.at(-1))) result = result.slice(0, -1);
     return result;
   }
 
   function safeSuffix(value, length) {
-    const text = String(value || '');
+    const text = structuredText(value);
     let start = Math.max(0, text.length - Math.max(0, length));
     if (start > 0 && /[\uDC00-\uDFFF]/.test(text[start])) start += 1;
     return text.slice(start);
   }
 
   function boundPrefix(value, maximum, suffix = TEXT_TRUNCATION_SUFFIX) {
-    const text = String(value || '');
+    const text = structuredText(value);
     if (text.length <= maximum) return { value: text, truncated: false };
     if (maximum <= suffix.length) {
       return { value: safePrefix(suffix, maximum), truncated: true };
@@ -190,7 +244,7 @@
   }
 
   function boundTail(value, maximum, prefix = OUTPUT_TRUNCATION_PREFIX) {
-    const text = String(value || '');
+    const text = structuredText(value);
     if (text.length <= maximum) return { value: text, truncated: false };
     if (maximum <= prefix.length) {
       return { value: safeSuffix(text, maximum), truncated: true };
@@ -253,7 +307,7 @@
   }
 
   function hashText(value) {
-    const text = String(value || '');
+    const text = structuredText(value);
     let hash = 2166136261;
     for (let index = 0; index < text.length; index += 1) {
       hash ^= text.charCodeAt(index);
@@ -655,6 +709,65 @@
     return hasActivityIdentity ? 1 : 0;
   }
 
+  function isDiagnosticEntry(entry) {
+    return /diagnostic/.test([
+      entry.kind,
+      entry.method,
+      entry.source,
+      entry.itemType,
+    ].map(identifier).join(' ').toLowerCase());
+  }
+
+  function structuredActivityKeys(entry) {
+    return [...new Set([
+      entry.activityKey,
+      ...(entry.activityKeys || []),
+    ].map(identifier).filter(Boolean))];
+  }
+
+  function isStructuredTerminalSnapshot(entry) {
+    return entry.terminal
+      && !isDiagnosticEntry(entry)
+      && structuredActivityPriority(entry) > 0;
+  }
+
+  function terminalSnapshotIdentity(entry) {
+    return {
+      revision: Number(entry.revision || 0),
+      activityKeys: structuredActivityKeys(entry),
+      canonicalConversationKey: entry.canonicalConversationKey,
+      runId: entry.runId,
+      turnId: entry.turnId,
+      itemId: entry.itemId,
+      callId: entry.callId,
+      requestId: entry.requestId,
+      processId: entry.processId,
+      summaryIndex: entry.summaryIndex,
+    };
+  }
+
+  function matchesTerminalSnapshot(snapshot, entry) {
+    const incomingActivityKeys = structuredActivityKeys(entry);
+    if (snapshot.activityKeys.length || incomingActivityKeys.length) {
+      return snapshot.activityKeys.some((key) => incomingActivityKeys.includes(key));
+    }
+    return STABLE_ENTITY_FIELDS.some((field) => (
+      snapshot[field]
+      && entry[field]
+      && snapshot[field] === entry[field]
+    ));
+  }
+
+  function canReplaceTerminalSnapshot(group, entry) {
+    const snapshot = group._terminalSnapshot;
+    return Boolean(
+      snapshot
+      && isStructuredTerminalSnapshot(entry)
+      && entry.revision > snapshot.revision
+      && matchesTerminalSnapshot(snapshot, entry)
+    );
+  }
+
   function stableEntityIdentityMatches(group, entry) {
     const identity = group.identity || {};
     return STABLE_ENTITY_FIELDS.some((field) => (
@@ -694,8 +807,8 @@
   }
 
   function mergeBoundedText(current, incoming, mode, maximum, tail = false) {
-    const previous = String(current || '');
-    const next = String(incoming || '');
+    const previous = structuredText(current);
+    const next = structuredText(incoming);
     if (!next) return { value: previous, truncated: false };
     let combined;
     if (mode === 'replace') {
@@ -799,6 +912,7 @@
       _events: [],
       _structuredFieldPriority: Object.create(null),
       _identityFieldPriority: Object.create(null),
+      _terminalSnapshot: null,
     };
   }
 
@@ -836,6 +950,14 @@
 
   function mergeEntryIntoGroup(group, entry, limits, options = {}) {
     if (!options.replay) group._events.push(entry);
+    const replaceTerminalSnapshot = canReplaceTerminalSnapshot(group, entry);
+    if (group._terminalSnapshot && !replaceTerminalSnapshot) {
+      for (const activityKey of entry.activityKeys || []) {
+        if (!group.activityKeys.includes(activityKey)) group.activityKeys.push(activityKey);
+      }
+      return group;
+    }
+
     fillIdentity(group, entry);
     assignPreferredStructuredField(group, entry, 'kind');
     group.category = preferredCategory(group.category, entry.category);
@@ -953,6 +1075,9 @@
         if (entry._present.progress) group.progress = entry.progress;
       }
       group.final ||= entry.final;
+    }
+    if (isStructuredTerminalSnapshot(entry)) {
+      group._terminalSnapshot = terminalSnapshotIdentity(entry);
     }
     if (!group.timestamp && entry.timestamp) group.timestamp = entry.timestamp;
     if (entry.updatedAt || entry.timestamp) group.updatedAt = entry.updatedAt || entry.timestamp;
@@ -1106,7 +1231,7 @@
       entry.completedAt,
       entry.error,
       ...(entry.fileChanges || []).flatMap((change) => [change.path, change.status, change.diff]),
-    ].reduce((sum, value) => sum + String(value || '').length, 0);
+    ].reduce((sum, value) => sum + structuredText(value).length, 0);
   }
 
   function boundRenderedEntryToTotal(entry, maximum) {
@@ -1144,7 +1269,7 @@
     ];
     const tailFields = ['output', 'stdout', 'stderr', 'resultText'];
     for (const field of prefixFields) {
-      const original = String(entry[field] || '');
+      const original = structuredText(entry[field]);
       const bounded = boundPrefix(original, remaining);
       entry[field] = bounded.value;
       if (bounded.truncated) {
@@ -1155,7 +1280,7 @@
       remaining = Math.max(0, remaining - bounded.value.length);
     }
     for (const field of tailFields) {
-      const original = String(entry[field] || '');
+      const original = structuredText(entry[field]);
       const bounded = boundTail(original, remaining);
       entry[field] = bounded.value;
       if (bounded.truncated) {

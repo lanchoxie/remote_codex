@@ -303,6 +303,53 @@
         setReceiptIdState(receipt.unnotifiedAssistantStates, id, true, updatedAt, assistantSeq);
       }
     }
+    const hasAuthoritativeAfterSeq = options.authoritativeAfterSeq !== null
+      && typeof options.authoritativeAfterSeq !== 'undefined'
+      && String(options.authoritativeAfterSeq).trim() !== '';
+    const authoritativeAfterSeqValue = Number(options.authoritativeAfterSeq);
+    const authoritativeAfterSeq = hasAuthoritativeAfterSeq
+      && Number.isSafeInteger(authoritativeAfterSeqValue)
+      && authoritativeAfterSeqValue >= 0
+      && projection.cursorUnknown !== true
+      && projection.hasMore !== true
+      ? authoritativeAfterSeqValue
+      : null;
+    const removedUnnotifiedAssistantIds = [];
+    if (authoritativeAfterSeq !== null) {
+      const retainedIds = new Set((projection.messages || [])
+        .filter((message) => message?.notifiable !== false)
+        .map((message) => text(message?.assistantMessageId))
+        .filter(Boolean));
+      const isCoveredOrUnknown = (state) => {
+        const assistantSeq = normalizeSequence(state?.assistantSeq, aliases);
+        return assistantSeq > authoritativeAfterSeq
+          || (authoritativeAfterSeq === 0 && assistantSeq === 0);
+      };
+      for (const [id, state] of Object.entries(receipt.unreadAssistantStates)) {
+        if (state?.active !== false && isCoveredOrUnknown(state) && !retainedIds.has(id)) {
+          setReceiptIdState(
+            receipt.unreadAssistantStates,
+            id,
+            false,
+            updatedAt,
+            state.assistantSeq
+          );
+        }
+      }
+      for (const [id, state] of Object.entries(receipt.unnotifiedAssistantStates)) {
+        if (state?.active !== false && isCoveredOrUnknown(state) && !retainedIds.has(id)) {
+          if (setReceiptIdState(
+            receipt.unnotifiedAssistantStates,
+            id,
+            false,
+            updatedAt,
+            state.assistantSeq
+          )) {
+            removedUnnotifiedAssistantIds.push(id);
+          }
+        }
+      }
+    }
     receipt.unreadAssistantIds = activeReceiptIds(receipt.unreadAssistantStates);
     receipt.unnotifiedAssistantIds = activeReceiptIds(receipt.unnotifiedAssistantStates);
     receipt.updatedAt = updatedAt;
@@ -311,6 +358,7 @@
       receipt,
       unread: latest > receipt.readThroughAssistantSeq || receipt.unreadAssistantIds.length > 0,
       unnotified: latest > receipt.notifiedThroughAssistantSeq || receipt.unnotifiedAssistantIds.length > 0,
+      removedUnnotifiedAssistantIds,
     };
   }
 
@@ -433,17 +481,73 @@
       options
     );
     const updatedAt = nowIso(options);
-    receipt.readThroughAssistantSeq = normalizeSequence(
-      Math.max(receipt.readThroughAssistantSeq, sequence(projection.latestAssistantSeq)),
-      aliases
-    );
     const visibleIds = new Set((projection.messages || []).map((message) => text(message.assistantMessageId)));
+    const explicitReadIds = Array.isArray(options.readAssistantIds);
+    const readIds = explicitReadIds
+      ? new Set(options.readAssistantIds.map(text).filter(Boolean))
+      : visibleIds;
     for (const [id, state] of Object.entries(receipt.unreadAssistantStates)) {
-      if (options.clearAllUnread === true || visibleIds.has(id)) {
+      if (options.clearAllUnread === true || readIds.has(id)) {
         setReceiptIdState(receipt.unreadAssistantStates, id, false, updatedAt, state.assistantSeq);
       }
     }
+    for (const [id, state] of Object.entries(receipt.unnotifiedAssistantStates)) {
+      if (options.clearAllUnread === true || readIds.has(id)) {
+        setReceiptIdState(receipt.unnotifiedAssistantStates, id, false, updatedAt, state.assistantSeq);
+      }
+    }
+    const projectionMessages = Array.isArray(projection.messages) ? projection.messages : [];
+    const messageSeqById = new Map(projectionMessages.map((message) => [
+      text(message?.assistantMessageId),
+      normalizeSequence(message?.assistantSeq, aliases),
+    ]));
+    const currentCursor = normalizeSequence(receipt.readThroughAssistantSeq, aliases);
+    const hasAuthoritativeAfterSeq = options.authoritativeAfterSeq !== null
+      && typeof options.authoritativeAfterSeq !== 'undefined'
+      && String(options.authoritativeAfterSeq).trim() !== '';
+    const authoritativeAfterSeqValue = Number(options.authoritativeAfterSeq);
+    const authoritativeAfterSeq = hasAuthoritativeAfterSeq
+      && Number.isSafeInteger(authoritativeAfterSeqValue)
+      && authoritativeAfterSeqValue >= 0
+      ? normalizeSequence(authoritativeAfterSeqValue, aliases)
+      : null;
+    const mayAdvanceSelectiveCursor = !explicitReadIds
+      || options.clearAllUnread === true
+      || (authoritativeAfterSeq !== null && authoritativeAfterSeq <= currentCursor);
+    let candidateCursor = options.clearAllUnread === true
+      ? normalizeSequence(projection.latestAssistantSeq, aliases)
+      : currentCursor;
+    for (const id of readIds) {
+      candidateCursor = Math.max(candidateCursor, messageSeqById.get(id) || 0);
+    }
+    for (const state of Object.values(receipt.unreadAssistantStates)) {
+      if (state?.active === false) {
+        candidateCursor = Math.max(
+          candidateCursor,
+          normalizeSequence(state.assistantSeq, aliases)
+        );
+      }
+    }
+    candidateCursor = Math.min(
+      candidateCursor,
+      Math.max(currentCursor, normalizeSequence(projection.latestAssistantSeq, aliases))
+    );
+    if (!mayAdvanceSelectiveCursor) {
+      candidateCursor = currentCursor;
+    }
+    if (options.clearAllUnread !== true) {
+      const blockingSequences = Object.values(receipt.unreadAssistantStates)
+        .filter((state) => state?.active !== false)
+        .map((state) => normalizeSequence(state?.assistantSeq, aliases));
+      if (blockingSequences.some((value) => value <= 0)) {
+        candidateCursor = currentCursor;
+      } else if (blockingSequences.length) {
+        candidateCursor = Math.min(candidateCursor, Math.max(currentCursor, Math.min(...blockingSequences) - 1));
+      }
+    }
+    receipt.readThroughAssistantSeq = Math.max(currentCursor, candidateCursor);
     receipt.unreadAssistantIds = activeReceiptIds(receipt.unreadAssistantStates);
+    receipt.unnotifiedAssistantIds = activeReceiptIds(receipt.unnotifiedAssistantStates);
     receipt.updatedAt = updatedAt;
     return receipt;
   }
@@ -844,18 +948,27 @@
     const canonicalConversationKey = limitedText(value.canonicalConversationKey, 512);
     const assistantMessageId = limitedText(value.assistantMessageId, 512);
     if (!canonicalConversationKey || !assistantMessageId || !alertId) return null;
-    return {
+    const status = value.status === 'presented'
+      ? 'presented'
+      : value.status === 'canceled'
+        ? 'canceled'
+        : 'pending';
+    const identity = {
       alertId,
       canonicalConversationKey,
       assistantMessageId,
+      revision: Math.max(1, sequence(value.revision)),
+      status,
+      updatedAt: limitedText(value.updatedAt, 64) || now,
+    };
+    if (status === 'canceled') return identity;
+    return {
+      ...identity,
       assistantSeq: sequence(value.assistantSeq),
       assistantAt: limitedText(value.assistantAt, 64),
       previewText: limitedText(value.previewText, OUTBOX_PREVIEW_TEXT_LIMIT),
       hostId: limitedText(value.hostId, 256),
       sessionId: limitedText(value.sessionId, 512),
-      revision: Math.max(1, sequence(value.revision)),
-      status: value.status === 'presented' ? 'presented' : 'pending',
-      updatedAt: limitedText(value.updatedAt, 64) || now,
     };
   }
 
@@ -954,7 +1067,7 @@
 
     prunePending(limit = this.pendingLimit) {
       const pending = Object.entries(this.items)
-        .filter(([, item]) => item?.status !== 'presented')
+        .filter(([, item]) => item?.status === 'pending')
         .sort(compareOutboxOldest);
       const removeCount = Math.max(0, pending.length - Math.max(0, limit));
       for (let index = 0; index < removeCount; index += 1) {
@@ -964,18 +1077,20 @@
     }
 
     pruneToByteLimit(limit = this.byteLimit) {
-      let total = serializedOutboxByteLength(this.items);
+      const prunableItems = Object.fromEntries(Object.entries(this.items)
+        .filter(([, item]) => item?.status !== 'canceled'));
+      let total = serializedOutboxByteLength(prunableItems);
       if (total <= limit) return false;
       const candidates = [
         ...Object.entries(this.items)
           .filter(([, item]) => item?.status === 'presented')
           .sort(compareOutboxOldest),
         ...Object.entries(this.items)
-          .filter(([, item]) => item?.status !== 'presented')
+          .filter(([, item]) => item?.status === 'pending')
           .sort(compareOutboxOldest),
       ];
       let changed = false;
-      let count = Object.keys(this.items).length;
+      let count = Object.keys(prunableItems).length;
       for (const [id, item] of candidates) {
         total -= serializedOutboxEntryByteLength(id, item) + (count > 1 ? 1 : 0);
         delete this.items[id];
@@ -1044,15 +1159,17 @@
         const local = this.items[id];
         const durableRevision = sequence(normalizedDurable.revision);
         const localRevision = sequence(local?.revision);
-        if (
-          !local
-          || durableRevision > localRevision
+        const durableCanceled = normalizedDurable.status === 'canceled';
+        const localCanceled = local?.status === 'canceled';
+        const durableWins = !local
+          || durableCanceled && !localCanceled
+          || !durableCanceled && !localCanceled && durableRevision > localRevision
           || (
             durableRevision === localRevision
             && normalizedDurable.status === 'presented'
-            && local.status !== 'presented'
-          )
-        ) {
+            && local.status === 'pending'
+          );
+        if (durableWins) {
           if (
             local
             && durableRevision > localRevision
@@ -1078,25 +1195,14 @@
           quotaRecovered = true;
         } catch (retryError) {
           if (!isQuotaExceededError(retryError)) throw retryError;
+          this.persistenceDisabled = true;
+          this.dirty = false;
           try {
-            this.clear();
+            this.onPersistenceDisabled(retryError);
           } catch {
-            // Clearing an obsolete durable snapshot is best effort.
+            // Storage diagnostics must not break the in-memory outbox.
           }
-          try {
-            this.save(payload);
-            quotaRecovered = true;
-          } catch (finalError) {
-            if (!isQuotaExceededError(finalError)) throw finalError;
-            this.persistenceDisabled = true;
-            this.dirty = false;
-            try {
-              this.onPersistenceDisabled(finalError);
-            } catch {
-              // Storage diagnostics must not break the in-memory outbox.
-            }
-            return false;
-          }
+          return false;
         }
       }
       this.dirty = false;
@@ -1192,6 +1298,9 @@
       const alertId = alertIdFor(canonicalConversationKey, assistantMessageId);
       const current = this.items[alertId];
       let changed = false;
+      if (current?.status === 'canceled' && message.allowCanceled !== true) {
+        return { ...current, changed: false };
+      }
       if (!current || current.status !== 'presented') {
         const next = normalizeOutboxItem({
           ...current,
@@ -1224,7 +1333,37 @@
     }
 
     get(alertId) {
-      return this.items[alertId] ? { ...this.items[alertId] } : null;
+      if (!this.items[alertId] || this.items[alertId].status === 'canceled') return null;
+      return { ...this.items[alertId] };
+    }
+
+    removeMessages(canonicalConversationKey, assistantMessageIds = []) {
+      const canonical = text(canonicalConversationKey);
+      const ids = new Set((Array.isArray(assistantMessageIds)
+        ? assistantMessageIds
+        : [assistantMessageIds]).map(text).filter(Boolean));
+      if (!canonical || !ids.size) return false;
+      let changed = false;
+      const updatedAt = this.now();
+      for (const [alertId, item] of Object.entries(this.items)) {
+        if (
+          item?.status !== 'pending'
+          || item.canonicalConversationKey !== canonical
+          || !ids.has(item.assistantMessageId)
+        ) continue;
+        this.items[alertId] = normalizeOutboxItem({
+          ...item,
+          status: 'canceled',
+          revision: sequence(item.revision) + 1,
+          updatedAt,
+        }, alertId, updatedAt);
+        changed = true;
+      }
+      if (changed) {
+        this.dirty = true;
+        if (this.batchDepth === 0) this.flush();
+      }
+      return changed;
     }
 
     all() {

@@ -1,0 +1,18 @@
+@layer workbench {
+  #composer-permissions { min-width: 0; }
+  .composer-permissions-menu { font-size: 12px; line-height: 1.5; }
+  .composer-permissions-menu > summary {
+    cursor: pointer; color: var(--ui-muted); padding: 6px 0;
+    overflow-wrap: anywhere; min-height: 30px;
+  }
+  .composer-permissions-menu > summary:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+  .composer-permissions-panel {
+    display: grid; gap: 8px; padding: 10px; margin: 4px 0;
+    background: var(--ui-subtle); border: 1px solid var(--ui-border);
+    border-radius: var(--ui-radius-sm); min-width: 0; overflow-wrap: anywhere;
+  }
+  .composer-permissions-panel label { display: grid; gap: 4px; min-width: 0; }
+  .composer-permissions-panel select { width: 100%; min-width: 0; }
+  .composer-permissions-panel p { margin: 0; color: var(--ui-muted); }
+  .composer-permissions-panel button { justify-self: start; }
+}

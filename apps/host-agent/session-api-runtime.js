@@ -14,6 +14,8 @@ const {
   normalizeApiConfig,
   resolveApiBaseUrl,
 } = require('./runtime-utils');
+const { classifyCodexInputCompatibilityError } = require('../../shared/codex-input-errors');
+const { parseReasoningMetadata } = require('../../shared/model-reasoning');
 
 function runtimeError(code, message, details = {}) {
   const error = new Error(message);
@@ -39,16 +41,12 @@ function normalizeProviderModelPage(body = {}, options = {}) {
       if (!id) {
         return null;
       }
-      const capability = reasoningLevels(item);
-      const defaultDeclared = Object.prototype.hasOwnProperty.call(item || {}, 'defaultReasoningEffort')
-        || Object.prototype.hasOwnProperty.call(item || {}, 'default_reasoning_effort');
+      const capability = parseReasoningMetadata(item);
       return {
         id,
-        ...(capability.capabilityKnown ? { reasoningLevels: capability.reasoningLevels } : {}),
-        ...(defaultDeclared ? {
-          defaultReasoningEffort: normalizeReasoningEffort(
-            item.defaultReasoningEffort ?? item.default_reasoning_effort
-          ),
+        ...(capability.declared ? { reasoningLevels: capability.levels } : {}),
+        ...(capability.defaultDeclared ? {
+          defaultReasoningEffort: capability.defaultReasoningEffort,
         } : {}),
       };
     })
@@ -569,19 +567,10 @@ function normalizeReasoningEffort(value) {
 }
 
 function reasoningLevels(raw = {}) {
-  const hasMetadata = Object.prototype.hasOwnProperty.call(raw, 'reasoningLevels')
-    || Object.prototype.hasOwnProperty.call(raw, 'supportedReasoningEfforts')
-    || Object.prototype.hasOwnProperty.call(raw, 'supported_reasoning_efforts');
-  const entries = raw.reasoningLevels
-    || raw.supportedReasoningEfforts
-    || raw.supported_reasoning_efforts
-    || [];
+  const metadata = parseReasoningMetadata(raw);
   return {
-    capabilityKnown: hasMetadata,
-    reasoningLevels: [...new Set(entries
-      .map((entry) => entry?.reasoningEffort || entry?.reasoning_effort || entry)
-      .map(normalizeReasoningEffort)
-      .filter(Boolean))],
+    capabilityKnown: metadata.declared,
+    reasoningLevels: metadata.levels,
   };
 }
 
@@ -618,6 +607,29 @@ function validateModelSelection(capabilities, modelValue, effortValue) {
 
 function classifyNativeThreadError(launchMode, cause) {
   const mode = String(launchMode || '').trim();
+  const rawMessage = String(cause?.message || cause || '').trim();
+  const inputCapabilityError = classifyCodexInputCompatibilityError(rawMessage, []);
+  if (inputCapabilityError?.code === 'session_responses_history_incompatible') {
+    return runtimeError(
+      inputCapabilityError.code,
+      inputCapabilityError.userMessage,
+      {
+        cause,
+        rawMessage,
+        inputCapabilityError,
+        canRebind: true,
+        failureState: 'failed:native-resume-history-incompatible',
+      }
+    );
+  }
+  if (cause?.code === 'codex_rpc_request_timeout') {
+    const operation = mode === 'fork' ? 'fork' : 'resume';
+    return runtimeError(
+      `session_${operation}_confirmation_timeout`,
+      `${operation === 'fork' ? 'Native fork' : 'Native resume'} was observed starting but app-server did not confirm it within ${cause.timeoutMs || 'the configured timeout'}ms.`,
+      { cause, failureState: `failed:${operation}-confirmation-timeout` }
+    );
+  }
   const code = mode === 'fork'
     ? 'session_native_fork_failed'
     : 'session_native_resume_failed';
@@ -625,6 +637,17 @@ function classifyNativeThreadError(launchMode, cause) {
     code,
     `${mode === 'fork' ? 'Native fork' : 'Native resume'} failed: ${cause?.message || cause || 'unknown error'}`,
     { cause }
+  );
+}
+
+function classifyThreadStartError(cause) {
+  if (cause?.code !== 'codex_rpc_request_timeout') {
+    return cause;
+  }
+  return runtimeError(
+    'session_start_confirmation_timeout',
+    `New Session was not confirmed by app-server within ${cause.timeoutMs || 'the configured timeout'}ms.`,
+    { cause, failureState: 'failed:start-confirmation-timeout' }
   );
 }
 
@@ -640,6 +663,7 @@ module.exports = {
   buildProviderModelsUrl,
   classifyProviderModelResponse,
   classifyNativeThreadError,
+  classifyThreadStartError,
   deriveRunBinding,
   readCodexHomeApiIdentity,
   modelCapabilitiesFromList,

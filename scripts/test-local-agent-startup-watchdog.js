@@ -28,13 +28,13 @@ function sourceSlice(source, startMarker, endMarker) {
 
 const mainIndex = agent.indexOf('async function main()');
 const heartbeatStartIndex = agent.indexOf('heartbeatLoop()', mainIndex);
-const pollStartIndex = agent.indexOf('pollCommandsLoop()', mainIndex);
+const pollStartIndex = agent.indexOf('commandPollingCoordinator()', mainIndex);
 const discoveryLoopStartIndex = agent.indexOf('discoveryLoop()', mainIndex);
 const startupDiscoveryCallIndex = agent.indexOf('runStartupDiscovery()', mainIndex);
 const discoveryIndex = agent.indexOf("retryStartupStep('send initial discovery'");
 assert(mainIndex >= 0, 'host-agent main() must exist');
 assert(heartbeatStartIndex >= 0, 'host-agent should start heartbeatLoop() during startup');
-assert(pollStartIndex >= 0, 'host-agent should start pollCommandsLoop() during startup');
+assert(pollStartIndex >= 0, 'host-agent should start commandPollingCoordinator() during startup');
 assert(discoveryLoopStartIndex >= 0, 'host-agent should still start discoveryLoop()');
 assert(discoveryIndex >= 0, 'host-agent should still send initial discovery');
 assert(startupDiscoveryCallIndex >= 0, 'host-agent should start initial discovery as a background startup task');

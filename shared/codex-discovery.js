@@ -7,6 +7,10 @@ const {
   coalesceRolloutAssistantMirrorRows,
   normalizeAssistantObservation,
 } = require('./assistant-message-identity');
+const {
+  structuredScalar,
+  structuredText,
+} = require('./structured-text');
 
 const TRANSCRIPT_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_READ_LIMIT || 12000);
 const TRANSCRIPT_HEAD_READ_LIMIT = Number(process.env.CODEX_DISCOVERY_TRANSCRIPT_HEAD_READ_LIMIT || 500);
@@ -661,7 +665,7 @@ function getPayloadChannel(payload) {
   if (!payload || typeof payload !== 'object') {
     return '';
   }
-  return String(payload.phase || payload.channel || payload.kind || '').trim().toLowerCase();
+  return structuredScalar(payload.phase || payload.channel || payload.kind, '').trim().toLowerCase();
 }
 
 function isInternalAssistantPayload(payload) {
@@ -683,10 +687,10 @@ function getCwdFromRow(row) {
     return null;
   }
   if (row.payload.cwd) {
-    return row.payload.cwd;
+    return structuredText(row.payload.cwd).trim() || null;
   }
   if (row.type === 'turn_context' && row.payload.cwd) {
-    return row.payload.cwd;
+    return structuredText(row.payload.cwd).trim() || null;
   }
 
   const text = extractPayloadText(row.payload);
@@ -697,6 +701,7 @@ function getCwdFromRow(row) {
 function makeTranscriptEntry(row, options = {}) {
   const payload = row.payload || {};
   const timestamp = row.timestamp || null;
+  const turnId = structuredText(payload.turn_id || payload.turnId || '').trim() || null;
 
   if (row.type === 'response_item' && payload.type === 'message') {
     if (payload.role === 'user') {
@@ -704,7 +709,7 @@ function makeTranscriptEntry(row, options = {}) {
       if (!text) {
         return null;
       }
-      return { speaker: 'user', text, timestamp };
+      return { speaker: 'user', text, timestamp, turnId };
     }
     if (payload.role === 'assistant' || payload.role === 'agent') {
       if (isInternalAssistantPayload(payload)) {
@@ -715,7 +720,7 @@ function makeTranscriptEntry(row, options = {}) {
         return null;
       }
       return attachAssistantTranscriptIdentity(
-        { speaker: 'agent', text, timestamp, source: 'codex-jsonl' },
+        { speaker: 'agent', text, timestamp, turnId, source: 'codex-jsonl' },
         row,
         options
       );
@@ -735,6 +740,7 @@ function makeTranscriptEntry(row, options = {}) {
       speaker: 'user',
       text,
       timestamp,
+      turnId,
     };
   }
 
@@ -750,6 +756,7 @@ function makeTranscriptEntry(row, options = {}) {
       speaker: 'agent',
       text,
       timestamp,
+      turnId,
       source: 'codex-jsonl',
     }, row, options);
   }
@@ -895,7 +902,7 @@ function makeDiagnosticEntry(row) {
       text = cleanDiagnosticText(extractPayloadText(payload));
       method = `response_item/message/${channel || 'internal'}`;
     } else if (row.type === 'event_msg' && payload.type === 'agent_message') {
-      text = cleanDiagnosticText(payload.message || '');
+      text = cleanDiagnosticText(structuredText(payload.message));
       method = `event_msg/agent_message/${channel || 'internal'}`;
     }
     if (text) {
@@ -947,7 +954,7 @@ function makeDiagnosticEntry(row) {
   }
 
   if (row.type === 'response_item' && payload.type === 'function_call_output') {
-    const output = cleanDiagnosticText(payload.output || '');
+    const output = cleanDiagnosticText(structuredText(payload.output));
     if (!output) {
       return null;
     }
@@ -970,16 +977,17 @@ function makeDiagnosticEntry(row) {
   }
 
   if (payload.type === 'task_started') {
+    const turnId = structuredScalar(payload.turn_id, '').trim() || null;
     return {
       timestamp,
       severity: 'info',
       source: 'codex-jsonl',
       kind: 'turn',
       method: 'event_msg/task_started',
-      message: `Turn started${payload.turn_id ? `: ${payload.turn_id}` : ''}`,
-      turnId: payload.turn_id || null,
+      message: `Turn started${turnId ? `: ${turnId}` : ''}`,
+      turnId,
       data: {
-        turnId: payload.turn_id || null,
+        turnId,
         startedAt: payload.started_at || timestamp,
         modelContextWindow: payload.model_context_window || null,
         collaborationMode: payload.collaboration_mode_kind || null,
@@ -1006,17 +1014,19 @@ function makeDiagnosticEntry(row) {
   }
 
   if (payload.type === 'turn_aborted') {
+    const turnId = structuredScalar(payload.turn_id, '').trim() || null;
+    const reason = cleanDiagnosticText(payload.reason);
     return {
       timestamp,
       severity: 'warning',
       source: 'codex-jsonl',
       kind: 'turn',
       method: 'event_msg/turn_aborted',
-      message: payload.reason ? `Turn aborted: ${payload.reason}` : 'Turn aborted',
-      turnId: payload.turn_id || null,
+      message: reason ? `Turn aborted: ${reason}` : 'Turn aborted',
+      turnId,
       data: {
-        turnId: payload.turn_id || null,
-        reason: payload.reason || null,
+        turnId,
+        reason: reason || null,
         completedAt: payload.completed_at || timestamp,
         durationMs: payload.duration_ms || null,
       },
@@ -1046,16 +1056,17 @@ function makeDiagnosticEntry(row) {
   }
 
   if (payload.type === 'web_search_end') {
+    const query = cleanDiagnosticText(payload.query);
     return {
       timestamp,
       severity: 'info',
       source: 'codex-jsonl',
       kind: 'web-search',
       method: 'event_msg/web_search_end',
-      message: payload.query ? `Web search: ${limitText(payload.query, 220)}` : 'Web search finished',
+      message: query ? `Web search: ${limitText(query, 220)}` : 'Web search finished',
       data: {
         callId: payload.call_id || null,
-        query: payload.query || null,
+        query: query || null,
         action: payload.action || null,
       },
     };
@@ -1110,33 +1121,7 @@ function extractPayloadText(payload) {
   if (typeof payload === 'string') {
     return payload;
   }
-  if (typeof payload.text === 'string') {
-    return payload.text;
-  }
-  if (typeof payload.message === 'string') {
-    return payload.message;
-  }
-
-  const content = payload.content;
-  if (typeof content === 'string') {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    return '';
-  }
-
-  return content
-    .map((part) => {
-      if (typeof part === 'string') {
-        return part;
-      }
-      if (!part || typeof part !== 'object') {
-        return '';
-      }
-      return part.text || part.content || part.input_text || part.output_text || '';
-    })
-    .filter(Boolean)
-    .join('\n');
+  return structuredText(payload);
 }
 
 function extractReasoningText(payload) {
@@ -1155,50 +1140,41 @@ function extractReasoningText(payload) {
 }
 
 function extractStructuredText(value) {
-  if (!value) {
+  if (value === null || typeof value === 'undefined') {
     return '';
   }
   if (typeof value === 'string') {
     return value;
   }
   if (Array.isArray(value)) {
-    return joinStructuredTextParts(value
-      .map(extractStructuredText)
-      .filter(Boolean));
+    // Rollout reasoning is commonly encoded as token-sized text parts.  Keep
+    // their whitespace semantics instead of forcing every part onto a new
+    // line, while still routing each part through the shared safe converter.
+    function joinStructuredTextParts(parts) {
+      const rawValues = (Array.isArray(parts) ? parts : [])
+        .map((part) => structuredText(part))
+        .filter((part) => part.trim());
+      if (!rawValues.length) {
+        return '';
+      }
+      if (rawValues.some((part) => /\r?\n/.test(part))) {
+        return rawValues.map((part) => part.trim()).join('\n').trim();
+      }
+      if (rawValues.some((part) => /^\s|\s$/.test(part))) {
+        return rawValues.join('').trim();
+      }
+      const values = rawValues.map((part) => part.trim());
+      const cjkOnly = values.every((part) => !/[A-Za-z0-9]/.test(part))
+        && values.some((part) => /[\u3400-\u9fff\uf900-\ufaff]/.test(part));
+      if (cjkOnly) return values.join('');
+      return values.join(' ')
+        .replace(/\s+([,.!?;:\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A])/g, '$1')
+        .replace(/([([{])\s+/g, '$1')
+        .trim();
+    }
+    return joinStructuredTextParts(value);
   }
-  if (typeof value !== 'object') {
-    return String(value);
-  }
-  return value.text
-    || value.content
-    || value.summary
-    || value.delta
-    || value.output_text
-    || value.input_text
-    || '';
-}
-
-function joinStructuredTextParts(parts) {
-  const rawValues = (Array.isArray(parts) ? parts : [])
-    .map((part) => String(part || ''))
-    .filter((part) => part.trim());
-  if (!rawValues.length) {
-    return '';
-  }
-  if (rawValues.some((part) => /\r?\n/.test(part))) {
-    return rawValues.map((part) => part.trim()).join('\n').trim();
-  }
-  if (rawValues.some((part) => /^\s|\s$/.test(part))) {
-    return rawValues.join('').trim();
-  }
-  const values = rawValues.map((part) => part.trim());
-  const cjkOnly = values.every((part) => !/[A-Za-z0-9]/.test(part))
-    && values.some((part) => /[\u3400-\u9fff\uf900-\ufaff]/.test(part));
-  if (cjkOnly) return values.join('');
-  return values.join(' ')
-    .replace(/\s+([,.!?;:，。！？；：])/g, '$1')
-    .replace(/([([{])\s+/g, '$1')
-    .trim();
+  return structuredText(value);
 }
 
 function parseJsonObject(value) {
@@ -1217,7 +1193,7 @@ function parseJsonObject(value) {
 }
 
 function summarizeFunctionCall(payload) {
-  const name = String(payload.name || 'tool').trim();
+  const name = structuredScalar(payload.name, 'tool').trim();
   const args = parseJsonObject(payload.arguments) || {};
   const command = cleanDiagnosticText(args.command || args.cmd || args.text || '');
   const workdir = cleanDiagnosticText(args.workdir || args.cwd || '');
@@ -1247,10 +1223,10 @@ function normalizePatchChanges(changes) {
         return null;
       }
       return {
-        path: change.path || change.file || change.file_path || change.name || 'workspace change',
+        path: structuredText(change.path || change.file || change.file_path || change.name).trim() || 'workspace change',
         additions: Number(change.additions || change.added || change.lines_added || 0) || 0,
         deletions: Number(change.deletions || change.deleted || change.lines_deleted || 0) || 0,
-        diff: change.diff || change.patch || change.unified_diff || '',
+        diff: structuredText(change.diff || change.patch || change.unified_diff),
       };
     })
     .filter(Boolean);
@@ -1308,7 +1284,7 @@ function normalizeRateLimitWindow(value) {
 }
 
 function cleanDiagnosticText(value) {
-  return String(value || '')
+  return structuredText(value)
     .replace(/\r\n?/g, '\n')
     .replace(/\n{4,}/g, '\n\n\n')
     .trim();
@@ -1330,27 +1306,28 @@ function dedupeTranscriptEntries(entries) {
       continue;
     }
 
-    const key = `${entry.speaker || 'system'}|${entry.timestamp || ''}|${canonicalTranscriptText(entry.text)}`;
+    const assistantMessageId = String(entry.assistantMessageId || '').trim();
+    const clientRequestId = String(entry.clientRequestId || '').trim();
+    const key = assistantMessageId
+      ? `assistant|${assistantMessageId}`
+      : clientRequestId
+        ? `request|${entry.speaker || 'system'}|${clientRequestId}`
+        : `${entry.speaker || 'system'}|${entry.turnId || ''}|${entry.timestamp || ''}|${canonicalTranscriptText(entry.text)}`;
     if (seen.has(key)) {
       continue;
     }
     seen.add(key);
-
-    const previous = deduped[deduped.length - 1];
-    if (previous && previous.speaker === entry.speaker && canonicalTranscriptText(previous.text) === canonicalTranscriptText(entry.text)) {
-      continue;
-    }
     deduped.push(entry);
   }
   return deduped;
 }
 
 function cleanPreviewText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  return structuredText(value).replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
 function cleanTranscriptText(value, speaker = '', options = {}) {
-  const text = String(value)
+  const text = structuredText(value)
     .replace(/\r\n?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -1365,7 +1342,7 @@ function cleanTranscriptText(value, speaker = '', options = {}) {
 }
 
 function cleanUserFacingTranscriptText(value, speaker = '') {
-  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  let text = structuredText(value).replace(/\r\n?/g, '\n').trim();
   if (!text || isInternalTranscriptText(text)) {
     return '';
   }
@@ -1384,7 +1361,7 @@ function cleanUserFacingTranscriptText(value, speaker = '') {
 }
 
 function stripTranscriptWrapperText(value) {
-  let text = String(value || '').replace(/\r\n?/g, '\n').trim();
+  let text = structuredText(value).replace(/\r\n?/g, '\n').trim();
   if (!text) {
     return '';
   }
@@ -1406,19 +1383,19 @@ function stripTranscriptWrapperText(value) {
 }
 
 function stripEnvironmentContextText(value) {
-  return String(value || '')
+  return structuredText(value)
     .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, '')
     .trim();
 }
 
 function stripIdeContextText(value) {
-  const text = String(value || '').trim();
+  const text = structuredText(value).trim();
   const requestMatch = text.match(/(?:^|\n)## My request for Codex:\s*([\s\S]*)$/i);
   return requestMatch ? requestMatch[1].trim() : text;
 }
 
 function isInternalTranscriptText(value) {
-  const text = String(value || '').trim();
+  const text = structuredText(value).trim();
   if (!text) {
     return true;
   }
@@ -1444,11 +1421,11 @@ function isInternalTranscriptText(value) {
 }
 
 function canonicalTranscriptText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
+  return structuredText(value).replace(/\s+/g, ' ').trim();
 }
 
 function stripResumeBootstrapText(value, speaker = '') {
-  const text = String(value || '').trim();
+  const text = structuredText(value).trim();
   if (!text) {
     return '';
   }

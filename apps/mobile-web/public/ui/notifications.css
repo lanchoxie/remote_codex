@@ -1,0 +1,27 @@
+/* Notification presentation only: keep the existing renderer, unread state,
+   click handlers and DOM ownership. Global dialogs keep their 40+ layer. */
+@layer workbench {
+  .detail-header:has(.message-notification-panel:not(.hidden)) { z-index: 31; }
+  .detail-actions:has(.message-notification-anchor) { position: relative; max-width: 100%; }
+  .message-notification-anchor { position: static; }
+  .message-notification-panel {
+    /* Anchor to the action row's edge, not the bell: a leftmost bell must not
+       send a 390px panel underneath the navigation rail. */
+    right: 0; left: auto;
+    width: min(390px, 100%);
+    overscroll-behavior: contain;
+  }
+  .message-notification-header > div { min-width: 0; overflow-wrap: anywhere; }
+  .message-notification-header > button { flex: 0 0 auto; white-space: nowrap; }
+  .message-notification-item { min-width: 0; grid-template-columns: minmax(0, 1fr); }
+  .message-notification-title, .message-notification-meta { overflow-wrap: anywhere; }
+  /* Mobile jump controls are portaled to body at z-index 9990. Keep them from
+     covering notification actions; closing the panel restores them unchanged. */
+  body:has(.message-notification-panel:not(.hidden)) .transcript-scroll-controls { visibility: hidden; }
+  @media (max-width: 980px), (pointer: coarse), (hover: none) {
+    .message-notification-panel:not(.hidden) {
+      left: 12px; right: 12px; width: auto;
+      max-height: min(520px, 72dvh, calc(100dvh - 88px));
+    }
+  }
+}

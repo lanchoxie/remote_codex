@@ -196,10 +196,109 @@ assert(
   !projectedThinkingPatch.includes("textNode.textContent = String(activity.text"),
   'raw activity payloads must not overwrite an aggregated reasoning row directly'
 );
+const transcriptTurnIdentity = sliceBetween(
+  'function transcriptEntryStableTurnKey(',
+  'function transcriptViewportKey',
+  'transcriptEntryStableTurnKey'
+);
+assert(
+  transcriptTurnIdentity.indexOf('clientRequestId') < transcriptTurnIdentity.indexOf('turnId')
+    && transcriptTurnIdentity.indexOf('turnId') < transcriptTurnIdentity.indexOf("key.startsWith('time|')"),
+  'Thinking turn keys must prefer clientRequestId, then turnId, before the legacy timestamp alias'
+);
+const transcriptDedupe = sliceBetween(
+  'function dedupeTranscript(',
+  'function getRunnerSummary',
+  'dedupeTranscript'
+);
+mustContain(
+  transcriptDedupe,
+  'turnId',
+  'transcript normalization must preserve explicit native turn identity'
+);
+mustContain(
+  transcriptDedupe,
+  'normalizeTranscriptIdentity(entry.turnId)',
+  'transcript identity fields must use structured scalar normalization'
+);
+mustContain(
+  transcriptDedupe,
+  'clientRequestId: normalized.clientRequestId || previous.clientRequestId || null',
+  'transcript reconciliation must not erase an existing client request identity'
+);
+mustContain(
+  transcriptDedupe,
+  '!explicitTurnIdentityConflict',
+  'near-duplicate transcript compaction must not collapse two explicitly different user turns'
+);
+mustContain(
+  transcriptDedupe,
+  'clientRequestId: previous.clientRequestId || entry.clientRequestId || null',
+  'legacy/current transcript compaction must retain whichever side carries the explicit request identity'
+);
+const projectedThinkingActivities = sliceBetween(
+  'function getProjectedThinkingActivities(',
+  'function mergeProjectedThinkingEntries',
+  'getProjectedThinkingActivities'
+);
+mustContain(
+  projectedThinkingActivities,
+  'state.activityClientRequestIdsByCanonical.get(canonicalKey)?.get(activity.activityKey)',
+  'projected activities must recover clientRequestId after the bounded browser projection normalizes them'
+);
+const activityEvent = sliceBetween(
+  'function applyActivityEvent(',
+  'function applySessionStreamReset',
+  'applyActivityEvent'
+);
+mustContain(
+  activityEvent,
+  'rememberActivityClientRequestIds(canonicalKey, payload)',
+  'live activity events must preserve their client request binding outside the normalized projection'
+);
 mustContain(
   projectedThinkingPatch,
-  "latestUserEntry?.timestamp || 'live'",
-  'activity patches should target the current user-turn Thinking card'
+  'thinkingSegmentStateKey(',
+  'activity patches should derive the exact same state key as transcript Thinking cards'
+);
+
+const thinkingSourceMerge = sliceBetween(
+  'function mergeProjectedThinkingEntries(',
+  'function isUserSuitableThinkingText',
+  'mergeProjectedThinkingEntries'
+);
+assert(
+  !thinkingSourceMerge.includes('projectedReasoning'),
+  'a projected reasoning row must not hide every diagnostic reasoning row'
+);
+mustContain(
+  thinkingSourceMerge,
+  'aggregateThinkingActivityEntries(ordered)',
+  'diagnostic and projected Thinking observations must be reconciled by stable identity'
+);
+assert(
+  !projectedThinkingPatch.includes("::thinking::${latestUserEntry?.timestamp || 'live'}"),
+  'activity patches must not construct a timestamp-only state key'
+);
+const streamReset = sliceBetween(
+  'function applySessionStreamReset(',
+  'function sessionStreamResetNeedsRecovery',
+  'applySessionStreamReset'
+);
+mustContain(
+  streamReset,
+  'activitiesTruncated: payload.activitiesTruncated === true',
+  'truncated activity resets must be identified to the projection instead of clearing it'
+);
+mustContain(
+  streamReset,
+  'rememberActivityClientRequestIds(canonicalKey, payload.activities || [])',
+  'stream resets must restore client request bindings for projected activity history'
+);
+mustContain(
+  streamReset,
+  'incomplete: payload.incomplete === true',
+  'incomplete activity resets must be identified to the projection instead of clearing it'
 );
 const formatThinkingValue = sliceBetween(
   'function formatThinkingValue(',
@@ -526,7 +625,7 @@ mustContain(
 );
 mustContain(
   app,
-  'message.dataset.viewportKey = transcriptViewportKey(entry, fullEntryIndex)',
+  'message.dataset.viewportKey = transcriptViewportKey(entry, view.fullEntryIndex)',
   'rendered transcript messages should expose stable viewport keys for anchor restoration'
 );
 mustContain(
@@ -751,8 +850,8 @@ const thinkingMessagePatch = sliceBetween(
 );
 mustContain(
   thinkingMessagePatch,
-  'patchThinkingHistoryList(existingHistory, nextHistory, patchedStateKey)',
-  'live Thinking refreshes should patch keyed rows instead of replacing the whole card'
+  'patchThinkingScrollerContents(existingScroller, nextScroller, patchedStateKey)',
+  'live Thinking refreshes should patch the existing scroller instead of replacing the whole card'
 );
 assert(
   !thinkingMessagePatch.includes('existingMessage.replaceChildren('),
@@ -763,15 +862,10 @@ mustContain(
   'captureThinkingDisclosureStates(existingMessage, existingStateKey)',
   'tool disclosure state should be captured before live row updates'
 );
-mustContain(
-  thinkingMessagePatch,
-  'captureViewportElementOffset(existingScroller)',
-  'a detached Thinking reader should capture the internal viewport screen position'
-);
-mustContain(
-  thinkingMessagePatch,
-  'restoreViewportElementOffset(thinkingViewportSnapshot)',
-  'summary height changes must not move the Thinking content being read'
+assert(
+  !thinkingMessagePatch.includes('captureTranscriptScrollSnapshot()')
+    && !thinkingMessagePatch.includes('restoreTranscriptScrollSnapshot('),
+  'Thinking row patches must not open a nested outer transcript scroll transaction'
 );
 mustContain(
   app,
@@ -801,6 +895,11 @@ mustContain(
   thinkingMessageElement,
   'details.appendChild(createThinkingScrollRail(details, stateKey))',
   'thinking Top/Bottom controls should live in the side rail next to collapse instead of inside scroll content'
+);
+mustContain(
+  thinkingMessageElement,
+  'stabilizeThinkingSummaryLayout(details)',
+  'live Thinking preview growth should use a stable summary height'
 );
 assert(
   !thinkingMessageElement.includes('content.appendChild(createThinkingScrollActions'),
@@ -928,6 +1027,16 @@ const scheduleMathTypeset = sliceBetween(
 );
 mustContain(
   scheduleMathTypeset,
+  'if (mathTypesetScheduled) return',
+  'multiple MathJax requests in one frame should share one outer scroll transaction'
+);
+mustContain(
+  scheduleMathTypeset,
+  'typesetPromise?.(containers)',
+  'the coalesced MathJax pass should render all connected changed containers together'
+);
+mustContain(
+  scheduleMathTypeset,
   'const scrollSnapshot = captureTranscriptScrollSnapshot()',
   'async MathJax layout changes should capture the current reader anchor before typesetting'
 );
@@ -937,9 +1046,15 @@ mustContain(
   'async MathJax layout changes should restore the current reader anchor after typesetting'
 );
 
+const sessionRequestMarker = app.includes("streamGate.listen('session.request'")
+  ? "streamGate.listen('session.request'"
+  : "state.eventSource.addEventListener('session.request'";
+const requestResolvedMarker = app.includes("streamGate.listen('session.request.resolved'")
+  ? "streamGate.listen('session.request.resolved'"
+  : "state.eventSource.addEventListener('session.request.resolved'";
 const sessionRequestHandler = sliceBetween(
-  "state.eventSource.addEventListener('session.request'",
-  "state.eventSource.addEventListener('session.request.resolved'",
+  sessionRequestMarker,
+  requestResolvedMarker,
   'session.request handler'
 );
 mustContain(
@@ -949,7 +1064,7 @@ mustContain(
 );
 
 const requestResolvedHandler = sliceBetween(
-  "state.eventSource.addEventListener('session.request.resolved'",
+  requestResolvedMarker,
   '});\n}\n\nasync function showSession',
   'session.request.resolved handler'
 );
@@ -986,23 +1101,18 @@ mustContain(
 );
 mustContain(
   renderTranscript,
-  'const scrollSnapshot = captureTranscriptScrollSnapshot()',
-  'transcript rerenders should capture all scroll containers before rebuilding the log'
-);
-mustContain(
-  renderTranscript,
-  'const thinkingViewportSnapshots = captureDetachedThinkingViewportOffsets(log)',
-  'full transcript rerenders should capture visible detached Thinking readers'
+  'const scrollSnapshot = switchingSession ? [] : captureTranscriptScrollSnapshot()',
+  'same-Session transcript reconciliation should capture one outer scroll transaction'
 );
 mustContain(
   renderTranscript,
   'restoreTranscriptScrollSnapshot(scrollSnapshot)',
   'transcript rerenders should restore non-bottom readers across desktop and mobile containers'
 );
-mustContain(
-  renderTranscript,
-  'restoreDetachedThinkingViewportOffsets(log, thinkingViewportSnapshots)',
-  'full transcript rerenders should restore the screen position of detached Thinking readers'
+assert(
+  !renderTranscript.includes('captureDetachedThinkingViewportOffsets(log)')
+    && !renderTranscript.includes('restoreDetachedThinkingViewportOffsets('),
+  'keyed reconciliation must not layer detached-scroller outer corrections on top of the transcript snapshot'
 );
 mustContain(
   renderTranscript,
@@ -1011,8 +1121,13 @@ mustContain(
 );
 mustContain(
   renderTranscript,
-  'if (!shouldStickToBottom && !focus)',
-  'non-bottom transcript rerenders should restore the raw viewport even when updates arrive below'
+  'reconcileTranscriptChildren(log, descriptors, { replaceAll: switchingSession })',
+  'same-Session transcript updates must use keyed child reconciliation'
+);
+mustContain(
+  renderTranscript,
+  '} else if (shouldStickToBottom) {',
+  'outer scroll restoration must choose exactly one focus, follow, or detached path'
 );
 assert(
   !renderTranscript.includes('if (!shouldStickToBottom && options.preserveScroll && !focus)'),

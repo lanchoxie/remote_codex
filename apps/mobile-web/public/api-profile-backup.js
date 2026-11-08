@@ -70,6 +70,10 @@
     return providerKind;
   }
 
+  function normalizeCompatibilityKey(value) {
+    return string(value, 160, 'native resume compatibility key').toLowerCase();
+  }
+
   function normalizeSessionDefaults(value) {
     if (value != null && (!value || typeof value !== 'object' || Array.isArray(value))) {
       throw new BackupError('api_profile_backup_invalid', 'API profile session defaults must be an object');
@@ -106,6 +110,7 @@
       providerKind: normalizeProviderKind(value.providerKind, provider),
       baseUrl: normalizeBaseUrl(value.baseUrl),
       apiKey: string(value.apiKey, 16384, 'API key', { trim: false }),
+      nativeResumeCompatibilityKey: normalizeCompatibilityKey(value.nativeResumeCompatibilityKey),
       sessionDefaults: normalizeSessionDefaults(value.sessionDefaults),
     };
   }

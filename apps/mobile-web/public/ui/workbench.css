@@ -1,0 +1,166 @@
+/* Presentation only. Keep existing DOM, scroll owners, visibility and callbacks. */
+@layer workbench {
+  .shell { grid-template-columns: 316px minmax(0, 1fr); background: var(--ui-canvas); }
+  .shell.navigator-collapsed { grid-template-columns: 0 minmax(0, 1fr); }
+  .sidebar {
+    /* Navigation stays below the global dialog range (40+). */
+    z-index: 30;
+    margin: 0; height: 100vh; height: 100dvh; padding: 20px 14px;
+    background: var(--ui-rail); border: 0; border-right: 1px solid var(--ui-border);
+    border-radius: 0; box-shadow: none; backdrop-filter: none; gap: 24px;
+  }
+  .brand { padding: 0 8px; }
+  .brand h1 { font-size: 23px; font-weight: 650; letter-spacing: -.04em; line-height: 1.35; }
+  .brand .eyebrow { margin-bottom: 7px; }
+  .brand-row h1::before {
+    content: ">_"; display: inline-grid; place-items: center;
+    width: 30px; height: 30px; margin-right: 9px; vertical-align: 2px;
+    border-radius: 8px; background: var(--ui-accent); color: var(--ui-on-accent);
+    font: 600 14px var(--ui-mono); letter-spacing: -.06em;
+  }
+  .selected-host-section { padding: 0; gap: 10px; background: transparent; border: 0; box-shadow: none; border-radius: 0; }
+  .selected-host-heading h2 { font-size: 17px; letter-spacing: -.025em; line-height: 1.4; }
+  .selected-host-section > .section-header { padding: 0 8px; }
+  .host-switcher-row, .collection-toolbar, .session-search-form, .session-sort-form {
+    background: transparent; border: 0; border-radius: 0; padding: 0; gap: 8px;
+  }
+  .host-switcher-row { padding-bottom: 12px; border-bottom: 1px solid var(--ui-border); }
+  .new-session-form { gap: 8px; }
+  .new-session-form :where(input, button), .session-search-form :where(input, select),
+  .host-switcher-row select, .collection-toolbar select, .session-sort-form :where(select, button) {
+    min-height: 36px; padding: 7px 10px; border-radius: var(--ui-radius-sm); font-size: 12px;
+  }
+  .selected-host-section .conversation-list { gap: 6px; padding: 4px 0 16px; }
+  .session-search-form .search-input-wrap input { min-height: 40px; padding-right: 42px; }
+  .session-search-form .search-clear-button {
+    top: 50%; right: 4px; transform: translateY(-50%);
+    width: 32px; height: 32px; min-height: 32px; padding: 0;
+    border: 0; background: transparent; border-radius: var(--ui-radius-sm);
+  }
+  .session-search-form .search-clear-button:hover { transform: translateY(-50%); background: var(--ui-hover); }
+  .session-search-summary { line-height: 1.6; overflow-wrap: anywhere; }
+  .session-search-summary[data-search-phase="pending"],
+  .session-search-summary[data-search-phase="searching"] {
+    color: var(--ui-accent); background: var(--ui-accent-soft); padding: 8px; border-radius: var(--ui-radius-sm);
+  }
+  .session-search-summary[data-search-phase="error"] { color: var(--ui-error-text); }
+  .transcript-search-navigator { background: var(--ui-surface); border-color: var(--ui-border-strong); border-radius: var(--ui-radius); }
+  .transcript-search-label { color: var(--ui-accent); }
+  .conversation-card, .conversation-card.live, .conversation-card.live-idle, .conversation-card.runtime-active {
+    padding: 12px; color: var(--ui-text); background: transparent; border: 1px solid transparent;
+    border-radius: var(--ui-radius); box-shadow: none;
+  }
+  .conversation-card:hover { background: var(--ui-hover); border-color: transparent; box-shadow: none; }
+  .conversation-card.active, .conversation-card.live.active {
+    background: var(--ui-surface); border-color: var(--ui-border); box-shadow: 0 1px 2px var(--ui-border);
+  }
+  .conversation-card::before { content: none; }
+  .conversation-card .title { font-size: 13px; font-weight: 650; line-height: 1.5; color: var(--ui-text); padding-right: 60px; }
+  .conversation-card .sub, .conversation-card .path, .conversation-card .preview { font-size: 11px; line-height: 1.6; }
+  .conversation-card .preview { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+  .conversation-summary { display: flex; }
+  .conversation-card .variant-row { display: flex; }
+  .conversation-stats { font-size: 11px; }
+  .conversation-time-grid span { background: transparent; border: 0; padding: 0; }
+  .conversation-card-actions select, .conversation-card-actions button { border-radius: var(--ui-radius-sm); }
+  .main { padding: 0 28px 18px; gap: 0; }
+  .detail-header {
+    top: 0; padding: 20px 0 16px; gap: 12px; flex-wrap: wrap;
+    background: var(--ui-canvas); border: 0; border-bottom: 1px solid var(--ui-border);
+    border-radius: 0; box-shadow: none; backdrop-filter: none;
+  }
+  .detail-header > div:first-child { flex: 1 1 220px; min-width: 0; }
+  .detail-header h2 { font-size: 20px; line-height: 1.5; font-weight: 650; letter-spacing: -.035em; overflow-wrap: anywhere; }
+  .detail-header .meta { font-size: 11px; overflow-wrap: anywhere; }
+  .detail-actions { justify-content: flex-start; gap: 6px; }
+  .detail-actions button { min-height: 32px; padding: 6px 9px; font-size: 12px; border-radius: var(--ui-radius-sm); }
+  .navigator-toggle-button { min-width: 0; }
+  .unified-session-panel { background: transparent; border: 0; border-radius: 0; padding: 10px 0; box-shadow: none; }
+  .runtime-chip-row { gap: 6px; }
+  .runtime-chip { font-size: 11px; padding: 5px 8px; }
+  .transcript-panel { background: transparent; border: 0; border-radius: 0; padding: 0; box-shadow: none; gap: 10px; }
+  /* Contain composer/slash-menu z-indices in the transcript, not the whole shell:
+     Session Details is a sibling inside .main and must remain above this region.
+     isolation preserves fixed-position coordinates and the existing scroll owner. */
+  .transcript-panel { isolation: isolate; }
+  .log { background: transparent; border: 0; border-radius: 0; gap: 24px; }
+  .bubble { padding: 14px 18px; border-radius: var(--ui-radius-lg); box-shadow: none; font-size: 14px; line-height: 1.8; }
+  .message.agent .bubble { background: transparent; color: var(--ui-text); border-color: transparent; padding-left: 0; }
+  .message.user .bubble { background: var(--ui-accent-soft); color: var(--ui-text); border: 1px solid var(--ui-border); }
+  .message.search-focused-message .bubble { border-color: #d7a928; box-shadow: 0 0 0 3px rgba(215, 169, 40, .18); }
+  .message.search-match-message:not(.search-focused-message) .bubble { border-color: rgba(215, 169, 40, .48); }
+  .message-toolbar { opacity: .85; }
+  .thinking-card, .thinking-card[open] { background: var(--ui-subtle); border-color: var(--ui-border); border-radius: var(--ui-radius); box-shadow: none; }
+  .thinking-summary { padding: 10px 14px; }
+  .thinking-title::before { box-shadow: none; background: var(--ui-muted); }
+  .thinking-operation-code, .markdown-code-card, .thinking-diff-block, .thinking-file-change-card {
+    color: var(--ui-text); background: var(--ui-code); border-color: var(--ui-border); border-radius: var(--ui-radius-sm); box-shadow: none;
+  }
+  .thinking-operation-code, .markdown-code-card code { font-family: var(--ui-mono); color: var(--ui-text); }
+  .thinking-operation-field.failed .thinking-operation-code { color: var(--ui-error-text); }
+  .message-file-card { background: var(--ui-subtle); border-color: var(--ui-border); border-radius: var(--ui-radius); }
+  .composer {
+    width: 100%; justify-self: center;
+    background: var(--ui-surface); border: 1px solid var(--ui-border-strong);
+    border-radius: var(--ui-radius-lg); padding: 12px; box-shadow: 0 3px 14px var(--ui-border); gap: 8px;
+  }
+  .composer-main-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .composer-main-row textarea {
+    background: transparent; border-color: transparent; min-height: 76px; max-height: 30vh;
+    padding: 8px 4px; border-radius: var(--ui-radius-sm); font-size: 14px; line-height: 1.6;
+  }
+  .composer-session-toolbar { border: 0; border-top: 1px solid var(--ui-border); padding-top: 8px; background: transparent; }
+  .composer-session-selection-status { color: var(--ui-muted); font-size: 11px; }
+  .composer-session-selection-status.success { color: var(--ui-accent); }
+  .composer-session-selection-status.warning { color: var(--ui-warning-text); }
+  .composer-session-selection-status.error { color: var(--ui-error-text); }
+  .composer-session-control > span { color: var(--ui-muted); font-size: 10px; }
+  .composer-session-control-fields { gap: 10px; }
+  .composer-session-control select { background: var(--ui-subtle); border-color: transparent; border-radius: var(--ui-radius-sm); min-height: 32px; font-size: 12px; }
+  .composer-action-stack { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .composer-action-stack button { min-width: 0; min-height: 34px; border-radius: var(--ui-radius-sm); padding: 7px 14px; font-size: 12px; }
+  #codex-send-button { margin-left: auto; min-width: 84px; }
+  .composer-attachment-grid { gap: 6px; }
+  .attachment-icon-button { width: 30px; min-width: 30px; min-height: 30px; border-radius: var(--ui-radius-sm); padding: 0; }
+  .log:empty::before { border: 0; min-height: 200px; font-size: 14px; }
+  @media (max-width: 980px), (pointer: coarse), (hover: none) {
+    /* Retain the existing page-flow scroll owner on touch; no fixed composer. */
+    .shell { grid-template-columns: 1fr; }
+    .shell.navigator-collapsed { grid-template-columns: 1fr; }
+    .sidebar { margin: 0; height: auto; padding: 18px 14px; border-right: 0; border-bottom: 1px solid var(--ui-border); }
+    .shell.navigator-collapsed .sidebar { height: 0; min-height: 0; padding: 0; border: 0; margin: 0; }
+    .main { padding: 0 14px 18px; }
+    .detail-header { padding: 16px 0 12px; }
+    .detail-header h2 { font-size: 18px; }
+    .detail-actions button { min-height: 40px; }
+    .log { padding: 18px 0; gap: 18px; }
+    .message, .message.thinking { max-width: 100%; }
+    .message.user { max-width: 92%; }
+    .composer { padding: 10px; }
+    .composer-action-stack button, .composer-session-control select, .composer-control-icon-button {
+      min-height: 44px;
+    }
+    .composer-main-row textarea { font-size: 16px; }
+    .attachment-icon-button { width: 40px; min-width: 40px; min-height: 40px; }
+  }
+}
+
+/* Legacy styles.css is unlayered, so width overrides must also be unlayered. */
+@media (min-width: 981px) {
+  .transcript-panel > .log {
+    padding: 24px max(16px, calc((100% - 1120px) / 2));
+  }
+
+  .transcript-panel .message,
+  .transcript-panel .message.thinking {
+    max-width: min(100%, 1120px);
+  }
+
+  .transcript-panel .message.user {
+    max-width: min(82%, 820px);
+  }
+
+  .transcript-panel > .composer {
+    max-width: 1120px;
+  }
+}

@@ -52,6 +52,110 @@ assert.strictEqual(applied.unnotified, true);
 assert.strictEqual(applied.receipt.readThroughAssistantSeq, 3);
 assert.deepStrictEqual(applied.receipt.unreadAssistantIds.sort(), ['b1', 'n1', 'n1-duplicate-sequence']);
 
+const orphanReceipt = {
+  ...emptyReceipt('host::orphan', now),
+  unreadAssistantIds: ['old-outside-range', 'orphan-in-range'],
+  unreadAssistantStates: {
+    'old-outside-range': { active: true, assistantSeq: 2, updatedAt: now() },
+    'orphan-in-range': { active: true, assistantSeq: 4, updatedAt: now() },
+  },
+  unnotifiedAssistantIds: ['old-unnotified-outside-range', 'orphan-unnotified-in-range'],
+  unnotifiedAssistantStates: {
+    'old-unnotified-outside-range': { active: true, assistantSeq: 2, updatedAt: now() },
+    'orphan-unnotified-in-range': { active: true, assistantSeq: 4, updatedAt: now() },
+  },
+};
+const authoritativeRange = {
+  canonicalConversationKey: 'host::orphan',
+  latestAssistantSeq: 5,
+  projectionRevision: 2,
+  cursorUnknown: false,
+  hasMore: false,
+  messages: [{ assistantMessageId: 'retained-in-range', assistantSeq: 5 }],
+};
+const reconciledOrphan = applyAssistantProjection(orphanReceipt, authoritativeRange, {
+  authoritativeAfterSeq: 3,
+  now,
+});
+assert.deepStrictEqual(
+  reconciledOrphan.receipt.unreadAssistantIds.sort(),
+  ['old-outside-range', 'retained-in-range'],
+  'authoritative reconciliation should clear only missing IDs inside the fetched sequence range'
+);
+assert.strictEqual(
+  reconciledOrphan.receipt.unreadAssistantStates['orphan-in-range'].active,
+  false,
+  'orphan cleanup must retain a remove-wins tombstone'
+);
+assert.strictEqual(
+  reconciledOrphan.receipt.unreadAssistantStates['old-outside-range'].active,
+  true,
+  'an unread ID outside the authoritative range must remain active'
+);
+assert.deepStrictEqual(
+  reconciledOrphan.receipt.unnotifiedAssistantIds,
+  ['old-unnotified-outside-range', 'retained-in-range'],
+  'authoritative reconciliation must also clear deleted notification identities in range'
+);
+assert.strictEqual(
+  reconciledOrphan.receipt.unnotifiedAssistantStates['orphan-unnotified-in-range'].active,
+  false,
+  'deleted notification identities must retain remove-wins tombstones'
+);
+assert.deepStrictEqual(
+  reconciledOrphan.removedUnnotifiedAssistantIds,
+  ['orphan-unnotified-in-range'],
+  'the caller must be told which pending notification outbox items to cancel'
+);
+for (const incompleteProjection of [
+  { ...authoritativeRange, hasMore: true },
+  { ...authoritativeRange, cursorUnknown: true },
+]) {
+  const incomplete = applyAssistantProjection(orphanReceipt, incompleteProjection, {
+    authoritativeAfterSeq: 0,
+    now,
+  });
+  assert(
+    incomplete.receipt.unreadAssistantIds.includes('orphan-in-range'),
+    'partial or unknown projections must fail closed and preserve orphan candidates'
+  );
+}
+const compactOnly = applyAssistantProjection(orphanReceipt, authoritativeRange, {
+  authoritativeAfterSeq: null,
+  now,
+});
+assert(
+  compactOnly.receipt.unreadAssistantIds.includes('orphan-in-range'),
+  'a compact projection without an authoritative range must never clear receipt identities'
+);
+const unknownSequenceReceipt = {
+  ...emptyReceipt('host::unknown-sequence', now),
+  unreadAssistantIds: ['unknown-orphan'],
+  unreadAssistantStates: {
+    'unknown-orphan': { active: true, assistantSeq: 0, updatedAt: now() },
+  },
+};
+const clearedUnknownSequence = applyAssistantProjection(unknownSequenceReceipt, {
+  canonicalConversationKey: 'host::unknown-sequence',
+  latestAssistantSeq: 0,
+  projectionRevision: 2,
+  cursorUnknown: false,
+  hasMore: false,
+  messages: [],
+}, { authoritativeAfterSeq: 0, now });
+assert.deepStrictEqual(clearedUnknownSequence.receipt.unreadAssistantIds, []);
+const staleOrphanMerge = mergeAliasReceipts({
+  canonicalConversationKey: 'host::unknown-sequence',
+  receipts: [clearedUnknownSequence.receipt, unknownSequenceReceipt],
+  messages: [],
+  now,
+});
+assert.deepStrictEqual(
+  staleOrphanMerge.unreadAssistantIds,
+  [],
+  'a stale tab must not resurrect an authoritative orphan tombstone'
+);
+
 let rebasedCursorStorage = JSON.stringify({
   version: 3,
   receipts: {
@@ -93,7 +197,86 @@ assert.strictEqual(reopenedRebasedCursor.sequenceAliases['100'], 50);
 const read = advanceReadReceipt(applied.receipt, projection, { now });
 assert.strictEqual(read.readThroughAssistantSeq, 4, 'losing high-water must normalize through sequence aliases');
 assert.deepStrictEqual(read.unreadAssistantIds, []);
-assert.strictEqual(read.notifiedThroughAssistantSeq, 3, 'reading must not falsify alert presentation state');
+assert.strictEqual(read.notifiedThroughAssistantSeq, 3, 'reading must not falsify alert presentation high-water');
+assert.deepStrictEqual(
+  read.unnotifiedAssistantIds,
+  [],
+  'reading a message must tombstone a pending notification before an outbox drain can present it'
+);
+assert(
+  Object.values(read.unnotifiedAssistantStates).every((state) => state.active === false),
+  'read cancellation must retain remove-wins notification tombstones'
+);
+
+const sharedVariantProjection = {
+  canonicalConversationKey: 'host::shared-variants',
+  latestAssistantSeq: 7,
+  messages: [
+    { assistantMessageId: 'variant-a-6', assistantSeq: 6, lineageKeys: ['host::variant-a'] },
+    { assistantMessageId: 'variant-b-7', assistantSeq: 7, lineageKeys: ['host::variant-b'] },
+  ],
+};
+const sharedVariantUnread = applyAssistantProjection({
+  ...emptyReceipt('host::shared-variants', now),
+  readThroughAssistantSeq: 5,
+}, sharedVariantProjection, { now }).receipt;
+const readOnlyVariantB = advanceReadReceipt(sharedVariantUnread, sharedVariantProjection, {
+  readAssistantIds: ['variant-b-7'],
+  now,
+});
+assert.strictEqual(
+  readOnlyVariantB.readThroughAssistantSeq,
+  5,
+  'reading a later physical variant must not move the canonical cursor across an unread sibling'
+);
+assert.deepStrictEqual(
+  readOnlyVariantB.unreadAssistantIds,
+  ['variant-a-6'],
+  'reading one physical variant must preserve unread identities from sibling variants'
+);
+assert.strictEqual(readOnlyVariantB.unreadAssistantStates['variant-b-7'].active, false);
+const readBothVariants = advanceReadReceipt(readOnlyVariantB, sharedVariantProjection, {
+  readAssistantIds: ['variant-a-6'],
+  authoritativeAfterSeq: 5,
+  now,
+});
+assert.strictEqual(readBothVariants.readThroughAssistantSeq, 7);
+assert.deepStrictEqual(readBothVariants.unreadAssistantIds, []);
+
+const compactVariantReceipt = applyAssistantProjection({
+  ...emptyReceipt('host::compact-variants', now),
+  readThroughAssistantSeq: 5,
+}, {
+  canonicalConversationKey: 'host::compact-variants',
+  latestAssistantSeq: 7,
+  messages: [{ assistantMessageId: 'compact-b-7', assistantSeq: 7 }],
+}, { now }).receipt;
+const compactVariantRead = advanceReadReceipt(compactVariantReceipt, {
+  canonicalConversationKey: 'host::compact-variants',
+  latestAssistantSeq: 7,
+  messages: [{ assistantMessageId: 'compact-b-7', assistantSeq: 7 }],
+}, {
+  readAssistantIds: ['compact-b-7'],
+  now,
+});
+assert.strictEqual(
+  compactVariantRead.readThroughAssistantSeq,
+  5,
+  'selective read must not advance without proof that the projection covers the cursor range'
+);
+const compactVariantCompleted = applyAssistantProjection(compactVariantRead, {
+  canonicalConversationKey: 'host::compact-variants',
+  latestAssistantSeq: 7,
+  messages: [
+    { assistantMessageId: 'compact-a-6', assistantSeq: 6 },
+    { assistantMessageId: 'compact-b-7', assistantSeq: 7 },
+  ],
+}, { now });
+assert.deepStrictEqual(
+  compactVariantCompleted.receipt.unreadAssistantIds,
+  ['compact-a-6'],
+  'a sibling discovered after reading a compact projection must remain unread'
+);
 
 const notified = advanceNotifiedReceipt(read, projection, {
   assistantMessageId: 'n1',

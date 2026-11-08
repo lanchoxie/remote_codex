@@ -133,6 +133,17 @@ renderer.render(output, String.raw`~~~
 assert.strictEqual(output.querySelectorAll('.markdown-math-block').length, 0);
 assert.strictEqual(output.querySelectorAll('.markdown-code-card').length, 1);
 
+// The renderer is also a defensive boundary for raw protocol wrappers.
+renderer.render(output, { content: [{ output_text: 'wrapped response' }] });
+assert(output.textContent.includes('wrapped response'));
+assert(!output.textContent.includes('[object Object]'));
+const circularPayload = { status: { state: 'running' }, details: {} };
+circularPayload.details.parent = circularPayload;
+renderer.render(output, circularPayload);
+assert(output.textContent.includes('running'));
+assert(!output.textContent.includes('[object Object]'));
+assert.strictEqual(renderer.normalizeText({ id: 'structured-id' }), 'structured-id');
+
 renderer.render(output, `    ${String.raw`[ \Delta x_{a} ]`}`);
 assert.strictEqual(output.querySelectorAll('.markdown-math-block').length, 0);
 assert.strictEqual(output.querySelectorAll('.markdown-code-card').length, 1);

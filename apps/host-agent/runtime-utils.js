@@ -22,6 +22,7 @@ function apiConfigWasSubmitted(input) {
     input.apiKey,
     input.profileId,
     input.label,
+    input.nativeResumeCompatibilityKey,
   ].some((value) => String(value || '').trim());
 }
 
@@ -64,6 +65,9 @@ function normalizeApiConfig(input = {}) {
   }
   const profileId = String(input.profileId || '').trim().slice(0, 120);
   const label = String(input.label || '').trim().slice(0, 120);
+  const nativeResumeCompatibilityKey = String(
+    input.nativeResumeCompatibilityKey || ''
+  ).trim().slice(0, 160).toLowerCase();
   const providerPolicy = providerCapabilities.getProviderPolicy(providerKind);
 
   return {
@@ -73,6 +77,7 @@ function normalizeApiConfig(input = {}) {
     apiKey,
     profileId,
     label,
+    ...(nativeResumeCompatibilityKey ? { nativeResumeCompatibilityKey } : {}),
   };
 }
 

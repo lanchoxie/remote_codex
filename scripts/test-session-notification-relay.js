@@ -441,6 +441,103 @@ async function main() {
       1,
       'nearby fallback JSONL mirrors with the same finalized content must render once'
     );
+    catchup = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/native-1/assistant-messages?hostId=${HOST_ID}&afterSeq=0&limit=20`
+    );
+    assert.deepStrictEqual(
+      catchup.body.messages
+        .filter((entry) => [
+          fallbackMirrorA.assistantMessageId,
+          fallbackMirrorB.assistantMessageId,
+        ].includes(entry.assistantMessageId))
+        .map((entry) => entry.assistantMessageId),
+      [fallbackMirrorA.assistantMessageId],
+      'a fallback JSONL mirror must allocate one notification identity as well as one transcript row'
+    );
+
+    const digestMismatchText = 'same nearby JSONL text without matching finalized digests';
+    const digestMismatchA = {
+      ...observation('assistant-digest-mismatch-a', '2099-01-01T00:01:40.000Z', digestMismatchText),
+      sourceIdentity: {
+        ...fallbackMirrorA.sourceIdentity,
+        sourceOffset: 300,
+        sourceTimestamp: '2099-01-01T00:01:40.000Z',
+        finalContentDigest: 'b'.repeat(64),
+      },
+    };
+    const digestMismatchB = {
+      ...observation('assistant-digest-mismatch-b', '2099-01-01T00:01:40.013Z', digestMismatchText),
+      sourceIdentity: {
+        ...digestMismatchA.sourceIdentity,
+        sourceOffset: 400,
+        sourceTimestamp: '2099-01-01T00:01:40.013Z',
+        finalContentDigest: 'c'.repeat(64),
+      },
+    };
+    await postEvents(port, [digestMismatchA, digestMismatchB].map((item) => ({
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: 'native-1',
+      nativeThreadId: 'native-1',
+      source: 'codex-jsonl',
+      speaker: 'assistant',
+      text: digestMismatchText,
+      timestamp: item.assistantAt,
+      assistantObservation: item,
+    })), 'fallback-jsonl-digest-mismatch');
+    updatedDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/native-1/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      updatedDetail.body.transcript.filter((entry) => entry.text === digestMismatchText).length,
+      2,
+      'nearby JSONL replies with different finalized digests must remain distinct'
+    );
+
+    const appServerFallbackText = 'app-server replies must not use JSONL fallback coalescing';
+    const appServerFallbackDigest = 'd'.repeat(64);
+    const appServerFallbackA = {
+      ...observation('assistant-app-server-fallback-a', '2099-01-01T00:01:50.000Z', appServerFallbackText),
+      sourceIdentity: {
+        ...fallbackMirrorA.sourceIdentity,
+        sourceOffset: 500,
+        sourceTimestamp: '2099-01-01T00:01:50.000Z',
+        finalContentDigest: appServerFallbackDigest,
+      },
+    };
+    const appServerFallbackB = {
+      ...observation('assistant-app-server-fallback-b', '2099-01-01T00:01:50.013Z', appServerFallbackText),
+      sourceIdentity: {
+        ...appServerFallbackA.sourceIdentity,
+        sourceOffset: 600,
+        sourceTimestamp: '2099-01-01T00:01:50.013Z',
+      },
+    };
+    await postEvents(port, [appServerFallbackA, appServerFallbackB].map((item) => ({
+      type: 'session.transcript',
+      hostId: HOST_ID,
+      sessionId: 'native-1',
+      nativeThreadId: 'native-1',
+      source: 'codex-app-server',
+      speaker: 'assistant',
+      text: appServerFallbackText,
+      timestamp: item.assistantAt,
+      assistantObservation: item,
+    })), 'app-server-fallback-shaped-identities');
+    updatedDetail = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/native-1/detail?hostId=${HOST_ID}`
+    );
+    assert.strictEqual(
+      updatedDetail.body.transcript.filter((entry) => entry.text === appServerFallbackText).length,
+      2,
+      'codex-app-server replies must remain distinct even when their fallback metadata matches'
+    );
 
     const repeatedText = 'two legitimate messages may have exactly the same text';
     const repeatedA = observation('assistant-repeat-a', '2099-01-01T00:02:00.000Z', repeatedText);
@@ -467,6 +564,63 @@ async function main() {
       )).length,
       2,
       'different assistant IDs must not be collapsed by text equality or containment'
+    );
+
+    const managedNativeId = 'managed-app-server-cursor-only';
+    const cursorOnly = {
+      ...observation(
+        'assistant-managed-cursor-only',
+        '2099-03-01T00:00:00.000Z',
+        'cursor-only copy without a retained live transcript'
+      ),
+      sourceIdentity: {
+        ...observation('assistant-managed-cursor-only', '2099-03-01T00:00:00.000Z', '').sourceIdentity,
+        nativeThreadId: managedNativeId,
+        streamId: `rollout:${managedNativeId}:test.jsonl`,
+      },
+    };
+    await postEvents(port, [{
+      type: 'session.discovery',
+      hostId: HOST_ID,
+      sessions: [{
+        sessionId: managedNativeId,
+        nativeThreadId: managedNativeId,
+        conversationKey: managedNativeId,
+        source: 'imported',
+        live: false,
+        assistantCursor: {
+          observations: [cursorOnly],
+          fileIdentity: `file-${managedNativeId}`,
+          projectionRevision: 1,
+          cursorOffset: 20,
+          cursorUnknown: false,
+        },
+      }, {
+        sessionId: managedNativeId,
+        nativeThreadId: managedNativeId,
+        conversationKey: managedNativeId,
+        source: 'managed',
+        live: true,
+        runId: 'managed-cursor-run',
+        runtime: {
+          runId: 'managed-cursor-run',
+          adapterId: 'codex-app-server',
+          kind: 'codex-app-server',
+          phase: 'idle',
+          busy: false,
+        },
+      }],
+    }], 'managed-app-server-cursor-only');
+    const managedCursorProjection = await requestJson(
+      port,
+      'GET',
+      `/api/sessions/${managedNativeId}/assistant-messages?hostId=${HOST_ID}&afterSeq=0&limit=10`
+    );
+    assert.strictEqual(managedCursorProjection.statusCode, 200);
+    assert.deepStrictEqual(
+      managedCursorProjection.body.messages,
+      [],
+      'a managed app-server Session must not create unread state from a JSONL cursor whose transcript is suppressed'
     );
 
     console.log('session notification Relay assertions passed');

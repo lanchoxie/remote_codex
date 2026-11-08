@@ -48,7 +48,25 @@ assert.strictEqual(terra.defaultReasoningEffort, 'medium');
 const luna = capabilities.getAdvisoryModelCapability('openai', 'gpt-5.6-luna');
 assert.deepStrictEqual(luna.reasoningLevels, ['low', 'medium', 'high', 'xhigh', 'max']);
 assert.strictEqual(luna.defaultReasoningEffort, 'medium');
-assert.strictEqual(capabilities.getAdvisoryModelCapability('openai', 'gpt-5.6'), null);
+const gpt56Alias = capabilities.getAdvisoryModelCapability('openai', 'gpt-5.6');
+assert.deepStrictEqual(gpt56Alias.reasoningLevels, ['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+assert.strictEqual(gpt56Alias.defaultReasoningEffort, 'medium');
+const astra = capabilities.getAdvisoryModelCapability('openai', 'gpt-6-astra');
+assert.deepStrictEqual(astra.reasoningLevels, ['low', 'medium', 'high', 'xhigh', 'max']);
+assert.strictEqual(astra.authority, 'advisory');
+for (const modelId of ['gpt-6', 'gpt-6-astra']) {
+  const declared = capabilities.resolveModelCapability({
+    providerKind: 'openai',
+    modelId,
+    runtimeCapability: {
+      supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }],
+      defaultReasoningEffort: 'low',
+    },
+  });
+  assert.deepStrictEqual(declared.reasoningLevels, ['low', 'medium', 'ultra']);
+  assert.strictEqual(declared.source, 'runtime', 'runtime declarations outrank the bundled advisory');
+}
+assert.strictEqual(capabilities.getAdvisoryModelCapability('openai', 'gpt-6'), null, 'unverified aliases must not inherit capabilities by prefix');
 
 const gpt54 = capabilities.getAdvisoryModelCapability('OpenAI', 'GPT-5.4');
 assert.deepStrictEqual(gpt54.reasoningLevels, ['low', 'medium', 'high', 'xhigh']);
@@ -96,6 +114,20 @@ assert.deepStrictEqual(runtimeExplicitlyEmpty.reasoningLevels, []);
 assert.strictEqual(runtimeExplicitlyEmpty.defaultReasoningEffort, null);
 assert.strictEqual(runtimeExplicitlyEmpty.source, 'runtime');
 assert.strictEqual(runtimeExplicitlyEmpty.allowManualEffort, false);
+const runtimeUnknownEmpty = capabilities.resolveModelCapability({
+  providerKind: 'openai',
+  modelId: 'gpt-6-astra',
+  runtimeCapability: { reasoningLevels: [], reasoningDeclared: false },
+});
+assert.strictEqual(runtimeUnknownEmpty.source, 'advisory');
+assert.deepStrictEqual(runtimeUnknownEmpty.reasoningLevels, astra.reasoningLevels);
+const runtimeDeclaredEmpty = capabilities.resolveModelCapability({
+  providerKind: 'openai',
+  modelId: 'gpt-6-astra',
+  runtimeCapability: { reasoningLevels: [], reasoningDeclared: true },
+});
+assert.strictEqual(runtimeDeclaredEmpty.source, 'runtime');
+assert.deepStrictEqual(runtimeDeclaredEmpty.reasoningLevels, []);
 
 const customUnknown = capabilities.resolveModelCapability({
   providerKind: 'custom',
@@ -158,6 +190,7 @@ assert(!/\bfetch\s*\(/.test(source), 'the bundled registry must not scrape docum
 assert(!/XMLHttpRequest/.test(source), 'the bundled registry must not issue browser network requests');
 
 const browserContext = vm.createContext({});
+vm.runInContext(fs.readFileSync(path.join(root, 'shared/model-reasoning.js'), 'utf8'), browserContext);
 vm.runInContext(source, browserContext, { filename: modulePath });
 assert(browserContext.RemoteCodexProviderCapabilities);
 assert.strictEqual(browserContext.RemoteCodexProviderCapabilities.inferProviderKind('Claude'), 'anthropic');

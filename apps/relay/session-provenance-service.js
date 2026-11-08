@@ -4,6 +4,7 @@ const {
   makeHostEnvironmentBinding,
   makeProfileBinding,
   makeUnknownBinding,
+  assessNativeResumeCompatibility,
   publicBinding,
 } = require('../../shared/api-binding');
 const {
@@ -11,6 +12,7 @@ const {
   redactSecretText,
 } = require('../../shared/secret-redaction');
 const { mergeNotificationRecords } = require('./assistant-notification-ledger');
+const { mergeThinkingHistory } = require('./thinking-activity-persistence');
 
 const SOURCE_STRENGTH = Object.freeze({
   managed: 100,
@@ -24,6 +26,105 @@ const VERIFIED_LEGACY_EVIDENCE_SOURCES = new Set([
   'operator_verified',
   'persisted_managed_summary',
 ]);
+const RUNNER_RETIREMENT_MAX_ATTEMPTS = 6;
+
+function normalizedRetirementAttemptCount(value) {
+  const numeric = Number(value);
+  if (Number.isNaN(numeric) || numeric === Infinity) return RUNNER_RETIREMENT_MAX_ATTEMPTS + 1;
+  if (numeric === -Infinity || numeric < 0) return 0;
+  // Keep corrupt/imported values bounded while preserving the fact that an
+  // intent already exceeded its retry budget.
+  return Math.min(RUNNER_RETIREMENT_MAX_ATTEMPTS + 1, Math.floor(numeric));
+}
+
+function retirementStatusRank(status) {
+  switch (String(status || '').trim().toLowerCase()) {
+    case 'succeeded': return 3;
+    case 'blocked': return 2;
+    case 'pending': return 1;
+    default: return 0;
+  }
+}
+
+function normalizedRetirementCommandId(value) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0) return null;
+  return number;
+}
+
+function parsedTimestampMs(value) {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function chooseEarliestTimestamp(...values) {
+  const parsed = values
+    .map((value) => ({ value, ms: parsedTimestampMs(value) }))
+    .filter((entry) => entry.ms !== null)
+    .sort((left, right) => left.ms - right.ms);
+  return parsed[0]?.value || null;
+}
+
+function chooseLatestTimestamp(...values) {
+  const parsed = values
+    .map((value) => ({ value, ms: parsedTimestampMs(value) }))
+    .filter((entry) => entry.ms !== null)
+    .sort((left, right) => right.ms - left.ms);
+  return parsed[0]?.value || null;
+}
+
+function retirementTemporalScore(retirement = {}) {
+  return Math.max(
+    parsedTimestampMs(retirement.lastAttemptAt) ?? -1,
+    parsedTimestampMs(retirement.completedAt) ?? -1,
+    parsedTimestampMs(retirement.requestedAt) ?? -1,
+    parsedTimestampMs(retirement.nextAttemptAt) ?? -1,
+  );
+}
+
+function mergeRunnerRetirementRecords(stronger = {}, weaker = {}) {
+  const strongerAttempts = normalizedRetirementAttemptCount(stronger.attemptCount);
+  const weakerAttempts = normalizedRetirementAttemptCount(weaker.attemptCount);
+  const strongerScore = retirementTemporalScore(stronger);
+  const weakerScore = retirementTemporalScore(weaker);
+  const strongerRank = retirementStatusRank(stronger.status);
+  const weakerRank = retirementStatusRank(weaker.status);
+  const stateWinner = weakerRank > strongerRank
+    ? weaker
+    : strongerRank > weakerRank
+      ? stronger
+      : weakerAttempts > strongerAttempts
+        || (weakerAttempts === strongerAttempts && weakerScore > strongerScore)
+        ? weaker
+        : stronger;
+  const merged = {
+    ...weaker,
+    ...stronger,
+    retirementId: String(stronger.retirementId || weaker.retirementId || '').trim() || null,
+    runId: String(stronger.runId || weaker.runId || '').trim() || null,
+    replacementRunId: String(stronger.replacementRunId || weaker.replacementRunId || '').trim() || null,
+    status: stateWinner.status || stronger.status || weaker.status || 'pending',
+    attemptCount: Math.max(strongerAttempts, weakerAttempts),
+    requestedAt: chooseEarliestTimestamp(stronger.requestedAt, weaker.requestedAt),
+    lastAttemptAt: chooseLatestTimestamp(stronger.lastAttemptAt, weaker.lastAttemptAt),
+    completedAt: chooseLatestTimestamp(stronger.completedAt, weaker.completedAt),
+    nextAttemptAt: chooseLatestTimestamp(stronger.nextAttemptAt, weaker.nextAttemptAt),
+    commandId: normalizedRetirementCommandId(stateWinner.commandId)
+      || normalizedRetirementCommandId(stronger.commandId)
+      || normalizedRetirementCommandId(weaker.commandId),
+    // A terminal success is authoritative even when it was merged with an
+    // older failed/pending projection.  Do not leak that stale error into the
+    // public record as "succeeded with an error".
+    lastError: stateWinner.lastError || stronger.lastError || weaker.lastError || null,
+  };
+  if (merged.status === 'succeeded') {
+    merged.lastError = null;
+    merged.nextAttemptAt = null;
+  } else if (merged.status === 'blocked') {
+    merged.nextAttemptAt = null;
+  }
+  return merged;
+}
 
 class SessionContractError extends Error {
   constructor(code, message, details = {}) {
@@ -41,6 +142,8 @@ class SessionContractError extends Error {
       sessionBinding: this.sessionBinding || null,
       submittedBinding: this.submittedBinding || null,
       canRebind: Boolean(this.canRebind),
+      canTranscriptFallback: Boolean(this.canTranscriptFallback),
+      requiresExplicitTranscriptFallback: Boolean(this.requiresExplicitTranscriptFallback),
     };
   }
 }
@@ -252,6 +355,29 @@ function mergeRuns(strongerRuns = {}, weakerRuns = {}) {
         rebindFallbackAllowed: true,
       };
     }
+    if (strongerRun.transcriptFallback === true || weakerRun.transcriptFallback === true) {
+      merged[runId] = {
+        ...merged[runId],
+        transcriptFallback: true,
+      };
+    }
+  }
+  return merged;
+}
+
+function mergeRunnerRetirements(stronger = {}, weaker = {}) {
+  const merged = {
+    ...(weaker && typeof weaker === 'object' ? weaker : {}),
+    ...(stronger && typeof stronger === 'object' ? stronger : {}),
+  };
+  for (const retirementId of Object.keys(merged)) {
+    const strong = stronger?.[retirementId];
+    const weak = weaker?.[retirementId];
+    if (!strong || !weak) continue;
+    // A projection can be newer even when it came from a weaker source. Merge
+    // lifecycle state by command/attempt time rather than allowing object
+    // spread order to regress a terminal receipt or retry deadline.
+    merged[retirementId] = mergeRunnerRetirementRecords(strong, weak);
   }
   return merged;
 }
@@ -309,6 +435,10 @@ function mergeRecords(winner, loser, context = {}) {
     cwd: stronger.cwd || weaker.cwd || null,
     title: stronger.title || weaker.title || '',
     runs: mergeRuns(stronger.runs, weaker.runs),
+    runnerRetirements: mergeRunnerRetirements(
+      stronger.runnerRetirements,
+      weaker.runnerRetirements
+    ),
     catalog: {
       ...(weaker.catalog || {}),
       ...(stronger.catalog || {}),
@@ -317,6 +447,11 @@ function mergeRecords(winner, loser, context = {}) {
     activeRunId: stronger.activeRunId || weaker.activeRunId || null,
     latestSuccessfulRunId: stronger.latestSuccessfulRunId || weaker.latestSuccessfulRunId || null,
   };
+  if (winner.thinking || loser.thinking) {
+    merged.thinking = mergeThinkingHistory(winner.thinking, loser.thinking, {
+      canonicalConversationKey: context.winnerKey,
+    });
+  }
   return mergeNotificationRecords(merged, loser, context);
 }
 
@@ -326,7 +461,24 @@ class SessionProvenanceService {
       throw new TypeError('SessionProvenanceService requires a SessionRecordStore');
     }
     this.store = store;
-    this.now = now;
+    this.now = typeof now === 'function' ? now : () => new Date().toISOString();
+  }
+
+  clockNow() {
+    let raw;
+    try {
+      raw = this.now();
+    } catch (_) {
+      raw = null;
+    }
+    if (raw instanceof Date) {
+      const ms = raw.getTime();
+      if (Number.isFinite(ms)) return { iso: raw.toISOString(), ms };
+    }
+    const parsed = parsedTimestampMs(raw);
+    if (parsed !== null) return { iso: String(raw), ms: parsed };
+    const fallbackMs = Date.now();
+    return { iso: new Date(fallbackMs).toISOString(), ms: fallbackMs };
   }
 
   getSessionRecord(identity) {
@@ -435,18 +587,36 @@ class SessionProvenanceService {
         ? null
         : sourceRecord?.latestSuccessfulRunId || sourceRecord?.activeRunId || null;
       const inheritedRun = inheritedRunId ? sourceRecord?.runs?.[inheritedRunId] : null;
+      const submittedBinding = publicBinding(input.submittedBinding);
+      const forceTranscriptFallback = input.forceTranscriptFallback === true;
+      const nativeResumeDecision = assessNativeResumeCompatibility(
+        inheritedRun?.apiBinding,
+        submittedBinding,
+        inheritedRun
+      );
+      // Compatibility fingerprints are advisory. Once an explicit Rebind has
+      // a resumable source run, the Host/app-server is the authority on
+      // whether the target API can actually consume that native rollout.
+      // Do not turn a local fingerprint mismatch into a fresh blank thread.
+      const nativeResumeCandidate = input.explicitRebind === true
+        && Boolean(inheritedRun)
+        && nativeResumeDecision.nativeResumeReady
+        && !forceTranscriptFallback;
       const effectiveLaunchMode = (
         launchMode === 'fresh_rebind'
         && input.explicitRebind === true
-        && inheritedRun?.nativeResumeReady === true
+        && nativeResumeCandidate
       ) ? 'resume' : launchMode;
-      const submittedBinding = publicBinding(input.submittedBinding);
-
+      // Compatibility fingerprints are advisory. An explicit Rebind remains
+      // an adaptive native-resume candidate whenever the source run is ready;
+      // the Host/app-server must perform thread/resume and report a concrete
+      // failure before we ask the user to use transcript fallback.
       if (
         inheritedRun
         && submittedBinding
         && !bindingsEqual(inheritedRun.apiBinding, submittedBinding)
         && !input.explicitRebind
+        && launchMode !== 'transcript_fallback'
       ) {
         throw new SessionContractError(
           'session_api_binding_mismatch',
@@ -489,6 +659,7 @@ class SessionProvenanceService {
           ? inheritedRun?.nativeResumeReady !== false
           : false,
         rebindFallbackAllowed: input.explicitRebind === true,
+        transcriptFallback: forceTranscriptFallback || effectiveLaunchMode === 'transcript_fallback',
         apiBinding: binding,
         requestedSelection: cloneSelection(input.requestedSelection || inheritedSelection),
         effectiveSelection: null,
@@ -568,7 +739,8 @@ class SessionProvenanceService {
       }
       const confirmedLaunchMode = String(input.launchMode || '').trim();
       if (confirmedLaunchMode && confirmedLaunchMode !== run.launchMode) {
-        const isAdaptiveRebind = run.rebindFallbackAllowed === true && (
+        const isAdaptiveRebind = run.rebindFallbackAllowed === true
+          && run.transcriptFallback !== true && (
           (run.launchMode === 'fresh_rebind' && confirmedLaunchMode === 'resume')
           || (run.launchMode === 'resume' && confirmedLaunchMode === 'fresh_rebind')
         );
@@ -585,6 +757,29 @@ class SessionProvenanceService {
       if (parentRun?.status === 'live') {
         parentRun.status = 'stopped';
         parentRun.endedAt = this.now();
+        // Logical supersession and physical runner exit are separate events.
+        // Persist an exact run-id cleanup intent before the caller enqueues the
+        // Host command, so a Relay restart cannot leak the old runner.
+        if (run.launchMode === 'resume') {
+          record.runnerRetirements ||= {};
+          const retirementId = `native-rebind:${run.parentRunId}:${input.runId}`
+            .replace(/[^A-Za-z0-9._:-]/g, '_');
+          if (!record.runnerRetirements[retirementId]) {
+            record.runnerRetirements[retirementId] = {
+              retirementId,
+              runId: String(run.parentRunId || '').trim(),
+              replacementRunId: String(input.runId || '').trim(),
+              status: 'pending',
+              reason: 'native-rebind-confirmed',
+              attemptCount: 0,
+              nextAttemptAt: null,
+              lastAttemptAt: null,
+              lastError: null,
+              requestedAt: this.now(),
+              completedAt: null,
+            };
+          }
+        }
       }
       run.status = 'live';
       if (run.launchMode === 'resume' || run.launchMode === 'fork') {
@@ -662,6 +857,254 @@ class SessionProvenanceService {
         record: structuredClone(record),
         transitioned: true,
       };
+    });
+  }
+
+  listRunnerRetirements(options = {}) {
+    const hostId = String(options.hostId || '').trim();
+    const requestedNowMs = Number(options.nowMs);
+    const nowMs = Number.isFinite(requestedNowMs) ? requestedNowMs : this.clockNow().ms;
+    const result = [];
+    for (const record of this.store.readPendingRunnerRetirementEntries(hostId)) {
+      const { canonicalKey } = record;
+      for (const retirement of Object.values(record?.runnerRetirements || {})) {
+        if (!retirement || retirement.status === 'succeeded' || retirement.status === 'blocked') continue;
+        const nextAt = Date.parse(String(retirement.nextAttemptAt || ''));
+        if (options.dueOnly === true && Number.isFinite(nextAt) && nextAt > nowMs) continue;
+        result.push({
+          ...retirement,
+          canonicalKey,
+          hostId: record.hostId,
+        });
+      }
+    }
+    return result;
+  }
+
+  getRunnerRetirement(input = {}) {
+    const record = this.getSessionRecord(input.identity || input);
+    const retirementId = String(input.retirementId || '').trim();
+    const retirement = retirementId ? record?.runnerRetirements?.[retirementId] : null;
+    return retirement ? structuredClone(retirement) : null;
+  }
+
+  markRunnerRetirementAttempt(input = {}) {
+    return this.store.transact('session.runner_retirement_attempted', (tx) => {
+      const canonicalKey = tx.resolveCanonicalKey(input.identity);
+      const record = tx.getRecord(canonicalKey);
+      const retirementId = String(input.retirementId || '').trim();
+      const retirement = record?.runnerRetirements?.[retirementId];
+      if (!retirement) {
+        throw new SessionContractError('session_runner_retirement_not_found', `Runner retirement ${retirementId} was not found.`, { statusCode: 404 });
+      }
+      const expectedRunId = String(input.runId || '').trim();
+      if (expectedRunId && expectedRunId !== String(retirement.runId || '').trim()) {
+        throw new SessionContractError(
+          'session_runner_retirement_run_mismatch',
+          `Runner retirement ${retirementId} targets a different run.`,
+          { statusCode: 409, expectedRunId, retirementRunId: retirement.runId || null }
+        );
+      }
+      if (retirement.status === 'succeeded' || retirement.status === 'blocked') {
+        return { canonicalKey, retirement: structuredClone(retirement), transitioned: false };
+      }
+      const commandId = normalizedRetirementCommandId(input.commandId);
+      const currentCommandId = normalizedRetirementCommandId(retirement.commandId);
+      if (!commandId && currentCommandId) {
+        return {
+          canonicalKey,
+          retirement: structuredClone(retirement),
+          transitioned: false,
+          stale: true,
+          missingCommandId: true,
+        };
+      }
+      // Re-delivery of the same command (or a delayed receipt from an older
+      // command) must not claim the retirement a second time.
+      if (commandId && currentCommandId && commandId <= currentCommandId) {
+        return {
+          canonicalKey,
+          retirement: structuredClone(retirement),
+          transitioned: false,
+          stale: commandId < currentCommandId,
+        };
+      }
+      const attemptCount = Math.min(
+        RUNNER_RETIREMENT_MAX_ATTEMPTS + 1,
+        normalizedRetirementAttemptCount(retirement.attemptCount) + 1
+      );
+      const clock = this.clockNow();
+      const now = clock.iso;
+      const requestedAckTimeout = Number(input.ackTimeoutMs);
+      const ackTimeoutMs = Number.isFinite(requestedAckTimeout) && requestedAckTimeout > 0
+        ? requestedAckTimeout
+        : 15000;
+      retirement.attemptCount = attemptCount;
+      retirement.lastAttemptAt = now;
+      retirement.status = attemptCount > RUNNER_RETIREMENT_MAX_ATTEMPTS ? 'blocked' : 'pending';
+      retirement.nextAttemptAt = retirement.status === 'blocked'
+        ? null
+        : new Date(clock.ms + Math.max(1000, ackTimeoutMs)).toISOString();
+      retirement.lastError = null;
+      retirement.commandId = commandId || currentCommandId || null;
+      record.updatedAt = now;
+      tx.appendDomainEvent({ type: 'session.runner_retirement_attempted', canonicalKey, retirementId, attemptCount });
+      tx.markDirty(canonicalKey);
+      return { canonicalKey, retirement: structuredClone(retirement), transitioned: true };
+    });
+  }
+
+  markRunnerRetirementSucceeded(input = {}) {
+    return this.store.transact('session.runner_retirement_succeeded', (tx) => {
+      const canonicalKey = tx.resolveCanonicalKey(input.identity);
+      const record = tx.getRecord(canonicalKey);
+      const retirementId = String(input.retirementId || '').trim();
+      const retirement = record?.runnerRetirements?.[retirementId];
+      if (!retirement) {
+        throw new SessionContractError('session_runner_retirement_not_found', `Runner retirement ${retirementId} was not found.`, { statusCode: 404 });
+      }
+      const expectedRunId = String(input.runId || '').trim();
+      if (expectedRunId && expectedRunId !== String(retirement.runId || '').trim()) {
+        throw new SessionContractError(
+          'session_runner_retirement_run_mismatch',
+          `Runner retirement ${retirementId} targets a different run.`,
+          { statusCode: 409, expectedRunId, retirementRunId: retirement.runId || null }
+        );
+      }
+      if (retirement.status === 'succeeded') return { canonicalKey, retirement: structuredClone(retirement), transitioned: false };
+      const receiptCommandId = normalizedRetirementCommandId(input.commandId);
+      const currentCommandId = normalizedRetirementCommandId(retirement.commandId);
+      if (!receiptCommandId && currentCommandId) {
+        return {
+          canonicalKey,
+          retirement: structuredClone(retirement),
+          transitioned: false,
+          stale: true,
+          missingCommandId: true,
+        };
+      }
+      if (receiptCommandId && currentCommandId && receiptCommandId !== currentCommandId) {
+        return {
+          canonicalKey,
+          retirement: structuredClone(retirement),
+          transitioned: false,
+          stale: receiptCommandId < currentCommandId,
+        };
+      }
+      retirement.status = 'succeeded';
+      const clock = this.clockNow();
+      retirement.completedAt = clock.iso;
+      retirement.nextAttemptAt = null;
+      retirement.lastError = null;
+      record.updatedAt = clock.iso;
+      tx.appendDomainEvent({ type: 'session.runner_retirement_succeeded', canonicalKey, retirementId });
+      tx.markDirty(canonicalKey);
+      return { canonicalKey, retirement: structuredClone(retirement), transitioned: true };
+    });
+  }
+
+  reassignRunnerRetirementCommand(input = {}) {
+    return this.store.transact('session.runner_retirement_command_reassigned', (tx) => {
+      const canonicalKey = tx.resolveCanonicalKey(input.identity);
+      const record = tx.getRecord(canonicalKey);
+      const retirementId = String(input.retirementId || '').trim();
+      const retirement = record?.runnerRetirements?.[retirementId];
+      if (!retirement) {
+        throw new SessionContractError('session_runner_retirement_not_found', `Runner retirement ${retirementId} was not found.`, { statusCode: 404 });
+      }
+      const expectedRunId = String(input.runId || '').trim();
+      if (expectedRunId && expectedRunId !== String(retirement.runId || '').trim()) {
+        throw new SessionContractError(
+          'session_runner_retirement_run_mismatch',
+          `Runner retirement ${retirementId} targets a different run.`,
+          { statusCode: 409, expectedRunId, retirementRunId: retirement.runId || null }
+        );
+      }
+      if (retirement.status === 'succeeded' || retirement.status === 'blocked') {
+        return { canonicalKey, retirement: structuredClone(retirement), transitioned: false };
+      }
+      const currentCommandId = normalizedRetirementCommandId(retirement.commandId);
+      const expectedCommandId = normalizedRetirementCommandId(input.expectedCommandId);
+      const commandId = normalizedRetirementCommandId(input.commandId);
+      if (!commandId || (currentCommandId && commandId <= currentCommandId)) {
+        throw new SessionContractError(
+          'session_runner_retirement_command_invalid',
+          `Runner retirement ${retirementId} received an invalid replacement command id.`,
+          { statusCode: 409 }
+        );
+      }
+      if (expectedCommandId && currentCommandId && expectedCommandId !== currentCommandId) {
+        return {
+          canonicalKey,
+          retirement: structuredClone(retirement),
+          transitioned: false,
+          stale: true,
+        };
+      }
+      retirement.commandId = commandId;
+      record.updatedAt = this.now();
+      tx.appendDomainEvent({
+        type: 'session.runner_retirement_command_reassigned',
+        canonicalKey,
+        retirementId,
+        commandId,
+      });
+      tx.markDirty(canonicalKey);
+      return { canonicalKey, retirement: structuredClone(retirement), transitioned: true };
+    });
+  }
+
+  markRunnerRetirementFailed(input = {}) {
+    return this.store.transact('session.runner_retirement_failed', (tx) => {
+      const canonicalKey = tx.resolveCanonicalKey(input.identity);
+      const record = tx.getRecord(canonicalKey);
+      const retirementId = String(input.retirementId || '').trim();
+      const retirement = record?.runnerRetirements?.[retirementId];
+      if (!retirement) {
+        throw new SessionContractError('session_runner_retirement_not_found', `Runner retirement ${retirementId} was not found.`, { statusCode: 404 });
+      }
+      const expectedRunId = String(input.runId || '').trim();
+      if (expectedRunId && expectedRunId !== String(retirement.runId || '').trim()) {
+        throw new SessionContractError(
+          'session_runner_retirement_run_mismatch',
+          `Runner retirement ${retirementId} targets a different run.`,
+          { statusCode: 409, expectedRunId, retirementRunId: retirement.runId || null }
+        );
+      }
+      if (retirement.status === 'succeeded') return { canonicalKey, retirement: structuredClone(retirement), transitioned: false };
+      if (retirement.status === 'blocked') return { canonicalKey, retirement: structuredClone(retirement), transitioned: false };
+      const receiptCommandId = normalizedRetirementCommandId(input.commandId);
+      const currentCommandId = normalizedRetirementCommandId(retirement.commandId);
+      if (!receiptCommandId && currentCommandId) {
+        return {
+          canonicalKey,
+          retirement: structuredClone(retirement),
+          transitioned: false,
+          stale: true,
+          missingCommandId: true,
+        };
+      }
+      if (receiptCommandId && currentCommandId && receiptCommandId !== currentCommandId) {
+        return {
+          canonicalKey,
+          retirement: structuredClone(retirement),
+          transitioned: false,
+          stale: receiptCommandId < currentCommandId,
+        };
+      }
+      const attemptCount = normalizedRetirementAttemptCount(retirement.attemptCount);
+      const backoffMs = Math.min(60_000, 1000 * (2 ** Math.max(0, attemptCount - 1)));
+      retirement.status = attemptCount >= RUNNER_RETIREMENT_MAX_ATTEMPTS ? 'blocked' : 'pending';
+      const clock = this.clockNow();
+      retirement.nextAttemptAt = retirement.status === 'blocked' ? null : new Date(clock.ms + backoffMs).toISOString();
+      retirement.lastError = {
+        code: String(input.code || 'session_runner_retirement_failed'),
+        message: redactSecretText(input.message || 'Host could not stop the superseded runner.'),
+      };
+      record.updatedAt = clock.iso;
+      tx.appendDomainEvent({ type: 'session.runner_retirement_failed', canonicalKey, retirementId, code: retirement.lastError.code });
+      tx.markDirty(canonicalKey);
+      return { canonicalKey, retirement: structuredClone(retirement), transitioned: true };
     });
   }
 

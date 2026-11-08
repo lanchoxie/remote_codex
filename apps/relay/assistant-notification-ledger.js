@@ -2,6 +2,8 @@ const NOTIFICATION_SCHEMA_VERSION = 1;
 const PREVIEW_TEXT_LIMIT = 1000;
 const PROJECTION_LIMIT_MAX = 500;
 const EPOCH_ISO = new Date(0).toISOString();
+const FALLBACK_JSONL_MIRROR_MAX_DELTA_MS = 1000;
+const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/i;
 
 function text(value) {
   return String(value == null ? '' : value).trim();
@@ -26,6 +28,82 @@ function revision(value) {
 
 function boundedPreview(value) {
   return text(value).slice(0, PREVIEW_TEXT_LIMIT);
+}
+
+function normalizedObservationSource(value) {
+  return text(value).toLowerCase();
+}
+
+function inferredLegacyObservationSource(value) {
+  const sourceIdentity = value?.sourceIdentity && typeof value.sourceIdentity === 'object'
+    ? value.sourceIdentity
+    : {};
+  const streamId = text(sourceIdentity.streamId);
+  const finalContentDigest = text(sourceIdentity.finalContentDigest).toLowerCase();
+  if (
+    streamId.startsWith('rollout:')
+    && !text(sourceIdentity.protocolTurnId)
+    && !text(sourceIdentity.protocolItemId)
+    && SHA256_HEX_PATTERN.test(finalContentDigest)
+  ) {
+    return 'codex-jsonl';
+  }
+  return '';
+}
+
+function fallbackJsonlMirrorIdentity(value, source) {
+  if (
+    (normalizedObservationSource(source) || inferredLegacyObservationSource(value)) !== 'codex-jsonl'
+    || value?.finalized !== true
+  ) {
+    return null;
+  }
+  const sourceIdentity = value.sourceIdentity && typeof value.sourceIdentity === 'object'
+    ? value.sourceIdentity
+    : {};
+  if (
+    text(sourceIdentity.protocolTurnId)
+    || text(sourceIdentity.protocolItemId)
+  ) {
+    return null;
+  }
+  const nativeThreadId = text(sourceIdentity.nativeThreadId);
+  const streamId = text(sourceIdentity.streamId);
+  const finalContentDigest = text(sourceIdentity.finalContentDigest).toLowerCase();
+  const previewText = boundedPreview(value.previewText);
+  const assistantAt = validTimestamp(value.assistantAt || sourceIdentity.sourceTimestamp);
+  if (
+    !nativeThreadId
+    || !streamId
+    || !previewText
+    || !assistantAt
+    || !SHA256_HEX_PATTERN.test(finalContentDigest)
+  ) {
+    return null;
+  }
+  return {
+    nativeThreadId,
+    streamId,
+    finalContentDigest,
+    previewText,
+    assistantAt,
+  };
+}
+
+function findFallbackJsonlMirror(notification, observation, source) {
+  const incoming = fallbackJsonlMirrorIdentity(observation, source);
+  if (!incoming) return null;
+  const incomingMs = Date.parse(incoming.assistantAt);
+  return Object.values(notification.ledger || {}).find((entry) => {
+    const existing = fallbackJsonlMirrorIdentity(entry, entry.source);
+    if (!existing) return false;
+    const existingMs = Date.parse(existing.assistantAt);
+    return existing.nativeThreadId === incoming.nativeThreadId
+      && existing.streamId === incoming.streamId
+      && existing.finalContentDigest === incoming.finalContentDigest
+      && existing.previewText === incoming.previewText
+      && Math.abs(incomingMs - existingMs) <= FALLBACK_JSONL_MIRROR_MAX_DELTA_MS;
+  }) || null;
 }
 
 function unique(values) {
@@ -81,6 +159,9 @@ function copyLedger(value) {
       notifiable: rawEntry.notifiable === true,
       finalized: rawEntry.finalized === true,
       previewText: boundedPreview(rawEntry.previewText),
+      source: normalizedObservationSource(rawEntry.source)
+        || inferredLegacyObservationSource(rawEntry)
+        || null,
       sourceIdentity: clone(rawEntry.sourceIdentity) || {},
       lineageKeys: unique(rawEntry.lineageKeys),
     };
@@ -208,7 +289,9 @@ function ingestAssistantObservation(tx, input = {}) {
     input.baselineAt || observation.firstObservedAt
   );
   const lineageKey = text(input.lineageKey || canonicalKey);
-  const existing = notification.ledger[assistantMessageId];
+  const source = normalizedObservationSource(input.source);
+  const existing = notification.ledger[assistantMessageId]
+    || findFallbackJsonlMirror(notification, observation, source);
   if (existing) {
     let changed = false;
     const finalizedNow = existing.finalized !== true && observation.finalized === true;
@@ -246,6 +329,10 @@ function ingestAssistantObservation(tx, input = {}) {
       existing.firstObservedAt = text(observation.firstObservedAt);
       changed = true;
     }
+    if (!existing.source && source) {
+      existing.source = source;
+      changed = true;
+    }
     if (
       (!existing.sourceIdentity || !Object.keys(existing.sourceIdentity).length)
       && observation.sourceIdentity
@@ -281,6 +368,7 @@ function ingestAssistantObservation(tx, input = {}) {
     notifiable,
     finalized: observation.finalized === true,
     previewText: boundedPreview(observation.previewText),
+    source: source || null,
     sourceIdentity: clone(observation.sourceIdentity) || {},
     lineageKeys: unique([lineageKey]),
   };
@@ -372,6 +460,7 @@ function mergedEntry(current, sourceEntry, context, aliases) {
     notifiable: current.notifiable === true || sourceEntry.notifiable === true,
     finalized: current.finalized === true || sourceEntry.finalized === true,
     previewText: boundedPreview(preferredPreview),
+    source: normalizedObservationSource(keep.source || lose.source) || null,
     sourceIdentity: clone(
       Object.keys(keep.sourceIdentity || {}).length
         ? keep.sourceIdentity

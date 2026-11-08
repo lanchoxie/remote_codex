@@ -3,18 +3,25 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <p align="center">
-  <img src="docs/assets/readme/mobile-conversation.jpg" alt="手机端实际运行的 Remote Codex 会话" width="29%" />
-  <img src="docs/assets/readme/windows-desktop-session.png" alt="PC 端实际运行的 Remote Codex 会话" width="68%" />
+  <img src="docs/assets/readme/workspace-mobile-chat-2026.png" alt="手机端对话、推理过程和输入区" width="27%" />
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="桌面端新版工作台和对话界面" width="70%" />
 </p>
 
-手机和 PC/HPC 运行画面：同一个 Remote Codex 控制台可跨设备查看和接管 Codex 长任务。
+新版界面示例使用隔离测试数据：同一个 Remote Codex 控制台可跨设备查看和接管 Codex 长任务。
 
 把 Codex 变成一个可以在手机、Windows、Linux、远程服务器和 HPC 集群之间接力使用的 AI 工作台。
 不用一直守在电脑前：你可以在手机上看进度、接管对话、上传文件、导入历史上下文，并在上下文丢失时一键把当前会话重新附加回 prompt。
 
 > 完整中文手册：[README.zh-CN.md](README.zh-CN.md)
 > English guide: [README.en.md](README.en.md)
-> 本次更新报告：[docs/update-report-2026-06-05.md](docs/update-report-2026-06-05.md)
+> 本版更新说明：[docs/releases/v2.4.12.md](docs/releases/v2.4.12.md)
+
+## v2.4.12 重点更新
+
+- 新建、恢复和切换 API 的 Session 生命周期协调，覆盖普通 HTTP 手机入口和多标签并发。
+- 内置可调整大小的终端，以及 CIF、XYZ、XSF、PDB/PBD、VASP/POSCAR 等结构文件的三维预览。
+- Thinking 历史、未读通知、运行指示和队列状态的同步与展示修复。
+- 远端历史发现分批传输；首次发现遇到网络错误时，Agent 仍可继续心跳和接收命令。
 
 ## 它解决什么问题？
 
@@ -28,9 +35,8 @@
 ## 手机效果
 
 <p align="center">
-  <img src="docs/assets/readme/mobile-navigation.jpg" alt="手机端导航和会话列表" width="30%" />
-  <img src="docs/assets/readme/mobile-conversation.jpg" alt="手机端查看 Codex 对话和运行状态" width="30%" />
-  <img src="docs/assets/readme/mobile-current-import.jpg" alt="手机端 Current 导入当前会话上下文" width="30%" />
+  <img src="docs/assets/readme/workspace-mobile-navigation-2026.png" alt="手机端主机和会话导航" width="32%" />
+  <img src="docs/assets/readme/workspace-mobile-chat-2026.png" alt="手机端对话与推理过程" width="32%" />
 </p>
 
 ## Windows 桌面端使用方法
@@ -38,13 +44,7 @@
 Windows 端和手机端使用同一套网页 UI。双击 `start-windows.bat` 后，在左侧选择本机 host，例如 `ILLUIN Windows`，就可以在桌面浏览器里管理本机、远程 Linux 和 HPC 上的 Codex 会话。
 
 <p align="center">
-  <img src="docs/assets/readme/windows-desktop-session.png" alt="Windows 桌面端会话、文件预览和控制栏" width="48%" />
-  <img src="docs/assets/readme/windows-host-manager.png" alt="Windows 端 host 管理和本地重启控制" width="30%" />
-</p>
-<p align="center">
-  <img src="docs/assets/readme/windows-api-profiles.png" alt="Windows 端 API profile 和 host 映射设置" width="32%" />
-  <img src="docs/assets/readme/windows-export-options.png" alt="Windows 端会话导出选项" width="32%" />
-  <img src="docs/assets/readme/windows-history-attachments.png" alt="Windows 端历史导入导出附件" width="32%" />
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="Windows 桌面端新版工作台" width="90%" />
 </p>
 
 - 文件在线可视化、下载和打开：Codex 输出本机或远端文件路径后，页面会显示文件卡片。图片和 SVG 可以 `Preview`，文件可以 `Open` 或 `Save`；已经缓存到 relay 的图片和文本会一起进入 transcript 和 export。
@@ -91,7 +91,11 @@ npm run dev
 http://127.0.0.1:8787
 ```
 
-当前项目主要使用 Node.js 内置模块，通常不需要 `npm install`。如果未来加入依赖，再执行 `npm install`。
+首次启动需安装锁定版本的依赖：
+
+```bash
+npm ci
+```
 
 ## 适合谁？
 
@@ -228,6 +232,9 @@ http://100.x.y.z:8797
 
 不要把 relay 裸露到公网。需要公网使用时，请至少配置私有网络、反代认证或可信访问控制。
 
+## 小红书一句话版
+
+我把 Codex 做成了手机遥控器：Windows 双击启动，手机看进度，图片和文件直接发给 Codex，还能把一个会话的历史导入另一个会话继续问。长任务不用守电脑了。
 
 ## 文档入口
 

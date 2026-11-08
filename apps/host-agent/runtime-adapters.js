@@ -132,6 +132,7 @@ async function startProcessManagedRuntimeSession({
     conversationKey: conversationKey || originSessionId || sessionId,
     launchMode: launchMode || null,
     stopRequested: false,
+    stopCommandRequested: false,
     stopPromise: null,
     startCompleted: false,
     suppressTerminalEvent: false,
@@ -151,6 +152,9 @@ async function startProcessManagedRuntimeSession({
       child.stdin.write(`${String(text || '')}\n`);
     },
     applyStopOptions(options = {}) {
+      if (options.stopCommandRequested === true) {
+        runner.stopCommandRequested = true;
+      }
       if (options.suppressTerminalEvent === true || options.deferStartupTerminalEvent === true) {
         runner.suppressTerminalEvent = true;
         runner.agentEventsSuppressed = true;
@@ -405,6 +409,7 @@ async function startManagedRuntimeSession(options) {
       launchMode: options.launchMode || null,
       nativeThreadId: options.nativeThreadId || null,
       rebindNativeThreadId: options.rebindNativeThreadId || null,
+      forceTranscriptFallback: options.forceTranscriptFallback === true,
       explicitRebind: options.explicitRebind === true,
       codexHome: options.codexHome,
       apiConfig: options.apiConfig,

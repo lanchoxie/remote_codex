@@ -19,6 +19,23 @@ function extractFunctionSource(name) {
 const sandbox = {
   IMAGE_FILE_EXTENSIONS: new Set(['png']),
   DOWNLOADABLE_FILE_EXTENSIONS: new Set(['csv', 'png', 'zip']),
+  // The extracted browser helpers normally resolve this from app.js.  Keep
+  // the focused VM fixture self-contained while exercising structured text.
+  structuredThinkingText(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map((item) => sandbox.structuredThinkingText(item)).filter(Boolean).join('\n');
+    if (typeof value === 'object') {
+      for (const key of ['text', 'content', 'message', 'path', 'name']) {
+        if (value[key] != null) {
+          const text = sandbox.structuredThinkingText(value[key]);
+          if (text) return text;
+        }
+      }
+      try { return JSON.stringify(value); } catch (_) { return ''; }
+    }
+    return String(value);
+  },
 };
 vm.createContext(sandbox);
 vm.runInContext([

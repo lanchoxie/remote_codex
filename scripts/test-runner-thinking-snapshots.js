@@ -15,10 +15,13 @@ function createRunnerHarness(suffix) {
     conversationKey: `conversation-${suffix}`,
     runId: `run-${suffix}`,
     activeTurnId: `turn-${suffix}`,
+    activeClientRequestId: `request-${suffix}`,
+    clientRequestIdsByTurn: new Map([[`turn-${suffix}`, `request-${suffix}`]]),
     threadId: `thread-${suffix}`,
     turnBuffers: new Map([[`turn-${suffix}`, '']]),
     turnAssistantTranscriptEmitted: new Set(),
     pendingTurnCompletions: new Map(),
+    turnInputTypes: new Map(),
     turnCompletionFallbackGraceMs: 25,
     turnBufferTruncated: new Set(),
     turnModes: new Map(),
@@ -26,6 +29,7 @@ function createRunnerHarness(suffix) {
     runtime: {},
     stopRequested: false,
     startCompleted: true,
+    threadOpenConfirmed: true,
     suppressTerminalEvent: false,
     overlayCleaned: false,
     apiProfileCleanupOwner: null,
@@ -127,6 +131,7 @@ async function verifyExactItemCompletion() {
   assert.strictEqual(final.canonicalConversationKey, 'host-a::conversation-item');
   assert.strictEqual(final.runId, 'run-item');
   assert.strictEqual(final.turnId, 'turn-item');
+  assert.strictEqual(final.clientRequestId, 'request-item');
   assert.strictEqual(final.itemId, 'reasoning-item');
   assert.strictEqual(final.summaryIndex, 0);
   assert.strictEqual(final.kind, 'reasoning');
@@ -141,6 +146,99 @@ async function verifyExactItemCompletion() {
   );
   assert.strictEqual(runner.thinkingActivities.size, 0, 'successful final delivery should release runner tracking');
   assert.strictEqual(runner.thinkingActivityAggregator.debugStats().records, 0);
+}
+
+async function verifyThinkingTurnIdentityPropagation() {
+  const { runner, events } = createRunnerHarness('turn-identity');
+  const normalized = runner.normalizeActivityIdentity({
+    turnId: 'turn-turn-identity',
+    itemId: 'activity-turn-identity',
+    kind: 'commentary',
+  });
+  assert.strictEqual(
+    normalized.clientRequestId,
+    'request-turn-identity',
+    'activity identity should bind the browser request to the native turn'
+  );
+
+  const tracked = runner.trackActivity(normalized);
+  runner.clientRequestIdsByTurn.delete('turn-turn-identity');
+  runner.activeClientRequestId = null;
+  runner.trackActivity({
+    turnId: 'turn-turn-identity',
+    itemId: 'activity-turn-identity',
+    kind: 'commentary',
+  });
+  assert.strictEqual(
+    tracked.identity.clientRequestId,
+    'request-turn-identity',
+    'later activity revisions must retain an already-bound client request identity'
+  );
+
+  runner.clientRequestIdsByTurn.set('turn-turn-identity', 'request-turn-identity');
+  runner.emitActivitySnapshot({
+    activityKey: 'activity-turn-identity',
+    activityRevision: 1,
+    canonicalConversationKey: 'host-a::conversation-turn-identity',
+    runId: 'run-turn-identity',
+    turnId: 'turn-turn-identity',
+    itemId: 'activity-turn-identity',
+    summaryIndex: 0,
+    kind: 'commentary',
+    text: 'Bound to the original user turn',
+    final: false,
+    timestamp: '2026-07-16T00:00:00.000Z',
+  });
+  await runner.waitForActivitySnapshotDelivery();
+  assert.strictEqual(
+    snapshots(events).at(-1).clientRequestId,
+    'request-turn-identity',
+    'emitted snapshots should carry the client request identity even when the raw snapshot omits it'
+  );
+
+  await runner.emitDiagnostic({
+    kind: 'commentary',
+    method: 'item/commentary',
+    message: 'Diagnostic bound to the original user turn',
+    turnId: 'turn-turn-identity',
+  });
+  const diagnostic = events.filter((event) => event.type === 'session.diagnostic').at(-1);
+  assert.strictEqual(
+    diagnostic.clientRequestId,
+    'request-turn-identity',
+    'diagnostics should carry the same client request identity as activity snapshots'
+  );
+}
+
+function verifyLateTurnCannotStealActiveRequestIdentity() {
+  const { runner } = createRunnerHarness('new-active-turn');
+  const lateTurnId = 'turn-previous';
+  assert.strictEqual(runner.bindClientRequestIdToTurn(lateTurnId), null);
+  assert.strictEqual(
+    runner.clientRequestIdsByTurn.has(lateTurnId),
+    false,
+    'a late terminal event must not bind its old turn to the newer active request'
+  );
+  runner.releaseClientRequestIdForTurn(lateTurnId);
+  assert.strictEqual(
+    runner.activeClientRequestId,
+    'request-new-active-turn',
+    'releasing an unrelated late turn must not clear the newer active request identity'
+  );
+
+  runner.activeTurnId = null;
+  runner.rememberTerminalTurnId(lateTurnId);
+  assert.strictEqual(
+    runner.bindClientRequestIdToTurn(lateTurnId),
+    null,
+    'a terminal old turn must not steal a new request during the pending-start gap'
+  );
+  runner.releaseClientRequestIdForTurn(lateTurnId);
+  assert.strictEqual(
+    runner.activeClientRequestId,
+    'request-new-active-turn',
+    'a duplicate terminal event during pending start must not clear the new request identity'
+  );
 }
 
 async function verifyTurnPlanUpdatedWithoutItemId() {
@@ -500,7 +598,9 @@ async function verifyOversizedRetryableErrorControlFields() {
   runner.enqueueNotification({
     method: 'error',
     params: {
-      threadId: `thread-retryable-error-${'t'.repeat(10_000)}`,
+      // Keep the protocol identity on the owning thread; make the error body
+      // oversized so notification compaction is exercised independently.
+      threadId: 'thread-retryable-error',
       turnId: 'turn-retryable-error',
       willRetry: true,
       error: {
@@ -519,6 +619,11 @@ async function verifyOversizedRetryableErrorControlFields() {
   assert(queuedError, 'oversized retryable error should remain queued after compaction');
   assert(queuedError.bytes <= runner.maxNotificationItemBytes);
   assert.strictEqual(queuedError.message.params.willRetry, true, 'compaction must preserve willRetry');
+  assert.strictEqual(
+    queuedError.message.params.threadId,
+    'thread-retryable-error',
+    'compaction must preserve the owning thread identity'
+  );
   assert.strictEqual(queuedError.message.params.turnId, 'turn-retryable-error', 'compaction must preserve turnId');
   assert(queuedError.message.params.error.message, 'compaction must preserve a minimal error message');
   assert.deepStrictEqual(
@@ -545,6 +650,77 @@ async function verifyOversizedRetryableErrorControlFields() {
     events.some((event) => event.type === 'session.error'),
     false,
     'retryable errors must not emit terminal session.error events'
+  );
+}
+
+async function verifyForeignThreadCannotStealActiveTurn() {
+  const { runner, events } = createRunnerHarness('foreign-retryable-error');
+  runner.initializeNotificationQueue({
+    maxItems: 16,
+    maxBytes: 16 * 1024,
+    maxItemBytes: 1024,
+    terminalReservedItems: 2,
+    terminalReservedBytes: 2 * 1024,
+  });
+  runner.runtime = {
+    phase: 'thinking',
+    busy: true,
+    activeTurnId: 'turn-foreign-retryable-error',
+  };
+  runner.enqueueNotification({
+    method: 'error',
+    params: {
+      // A child/review thread must not mutate the parent even if it reuses
+      // the parent's turn id in shared or malformed metadata.
+      threadId: 'child-review-thread',
+      turnId: 'turn-foreign-retryable-error',
+      willRetry: true,
+      error: {
+        message: `child stream disconnected ${'m'.repeat(100_000)}`,
+        additionalDetails: 'd'.repeat(100_000),
+        codexErrorInfo: {
+          responseStreamDisconnected: {
+            httpStatusCode: 503,
+            detail: 'e'.repeat(100_000),
+          },
+        },
+      },
+    },
+  });
+  await runner.drainNotifications();
+
+  await runner.handleNotification({
+    method: 'turn/completed',
+    params: {
+      threadId: 'child-review-thread',
+      turn: {
+        id: 'turn-foreign-retryable-error',
+        status: { type: 'completed' },
+      },
+    },
+  });
+
+  assert.strictEqual(
+    runner.activeTurnId,
+    'turn-foreign-retryable-error',
+    'a foreign-thread error must not replace the active parent Turn'
+  );
+  assert.strictEqual(
+    runner.runtime.phase,
+    'thinking',
+    'foreign-thread control notifications must not change the parent runtime phase'
+  );
+  assert.strictEqual(
+    events.some((event) => event.type === 'session.error'),
+    false,
+    'a foreign-thread error must not emit a terminal parent error'
+  );
+  assert(
+    events.some(
+      (event) => event.type === 'session.diagnostic'
+        && event.method === 'foreign-thread/error'
+    ),
+    'foreign-thread errors should remain visible as diagnostics'
   );
 }
 
@@ -1043,6 +1219,8 @@ async function verifyStructuredActivityBoundsAndOversizedCompaction() {
 
 async function main() {
   await verifyExactItemCompletion();
+  await verifyThinkingTurnIdentityPropagation();
+  verifyLateTurnCannotStealActiveRequestIdentity();
   await verifyTurnPlanUpdatedWithoutItemId();
   await verifyBoundedNotificationQueue();
   await verifyKeyedStateCoalescing();
@@ -1050,6 +1228,7 @@ async function main() {
   await verifyTerminalSurvivesOverflow();
   await verifyCriticalTerminalEvictsItemTerminals();
   await verifyOversizedRetryableErrorControlFields();
+  await verifyForeignThreadCannotStealActiveTurn();
   await verifyTurnBufferByteLimit();
   await verifySlowDeliveryCoalescing();
   await verifyTurnCompletion();

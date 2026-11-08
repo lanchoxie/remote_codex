@@ -60,6 +60,10 @@
           return PROVIDER_KINDS.has(providerKind) ? providerKind : inferProviderKind(provider);
         }
 
+        function normalizeCompatibilityKey(value) {
+          return String(value || '').trim().slice(0, 160).toLowerCase();
+        }
+
         function normalizeSessionDefaults(value) {
           const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
           const effortCandidate = String(input.effort || '').trim();
@@ -87,6 +91,7 @@
             providerKind: normalizeProviderKind(profile.providerKind, provider),
             baseUrl: normalizeBaseUrl(profile.baseUrl),
             apiKey,
+            nativeResumeCompatibilityKey: normalizeCompatibilityKey(profile.nativeResumeCompatibilityKey),
             rememberApiKey: rememberRecoveredKey || profile.rememberApiKey !== false || Boolean(apiKey),
             sessionDefaults: normalizeSessionDefaults(profile.sessionDefaults),
           };

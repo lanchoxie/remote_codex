@@ -6,8 +6,95 @@
     root.RemoteCodexMarkdownRenderer = api;
   }
 }(typeof globalThis !== 'undefined' ? globalThis : this, () => {
+  // Transcript payloads are protocol objects in a few older browser paths.
+  // Keep this boundary defensive even when the caller forgot to normalize a
+  // value first; implicit String(object) would leak `[object Object]` into
+  // the rendered transcript and can also throw for hostile getters.
+  const STRUCTURED_TEXT_KEYS = [
+    'text', 'output_text', 'outputText', 'input_text', 'inputText',
+    'content', 'summary', 'message', 'description', 'title', 'label',
+    'delta', 'value', 'step', 'command', 'query', 'path', 'output',
+    'stdout', 'stderr', 'reason',
+  ];
+  const STRUCTURED_SCALAR_KEYS = ['type', 'status', 'state', 'phase', 'kind', 'name', 'id'];
+
+  function fallbackStructuredText(value, seen = new WeakSet(), depth = 0) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+      return String(value);
+    }
+    if (typeof value !== 'object') return String(value);
+    if (seen.has(value)) return '[Circular]';
+    if (depth >= 8) return '[Nested value omitted]';
+    seen.add(value);
+    try {
+      if (Array.isArray(value)) {
+        return value
+          .slice(0, 64)
+          .map((item) => fallbackStructuredText(item, seen, depth + 1))
+          .filter((item) => item && item.trim())
+          .join('\n')
+          .trim();
+      }
+      for (const key of STRUCTURED_TEXT_KEYS) {
+        let candidate;
+        try {
+          if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+          candidate = value[key];
+        } catch (_) {
+          continue;
+        }
+        const text = fallbackStructuredText(candidate, seen, depth + 1).trim();
+        if (text) return text;
+      }
+      for (const key of STRUCTURED_SCALAR_KEYS) {
+        let candidate;
+        try {
+          if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+          candidate = value[key];
+        } catch (_) {
+          continue;
+        }
+        const text = fallbackStructuredText(candidate, seen, depth + 1).trim();
+        if (text) return text;
+      }
+      try {
+        const jsonSeen = new WeakSet();
+        const serialized = JSON.stringify(value, (key, nested) => {
+          if (nested && typeof nested === 'object') {
+            // JSON.stringify invokes the replacer for the root with an empty
+            // key; permit that first visit before checking for cycles.
+            if (key !== '' && jsonSeen.has(nested)) return '[Circular]';
+            jsonSeen.add(nested);
+          }
+          return nested;
+        });
+        return serialized || '';
+      } catch (_) {
+        return '[Unserializable structured value]';
+      }
+    } finally {
+      seen.delete(value);
+    }
+  }
+
   function normalizeText(value) {
-    return String(value == null ? '' : value).replace(/\r\n?/g, '\n');
+    let text;
+    const helper = typeof globalThis !== 'undefined'
+      ? globalThis.RemoteCodexStructuredText
+      : null;
+    if (helper?.toText) {
+      try {
+        text = helper.toText(value);
+      } catch (_) {
+        text = null;
+      }
+    }
+    if (text == null || text === '') {
+      text = fallbackStructuredText(value);
+    }
+    return String(text == null ? '' : text).replace(/\r\n?/g, '\n');
   }
 
   function containsTexCommand(value) {
@@ -279,7 +366,7 @@
       return { rendered: true, fallback: false };
     }
 
-    return { render };
+    return { render, normalizeText };
   }
 
   let defaultRenderer = null;
@@ -291,6 +378,7 @@
 
   return {
     createMarkdownRenderer,
+    normalizeText,
     normalizeBareDisplayMath,
     render,
   };

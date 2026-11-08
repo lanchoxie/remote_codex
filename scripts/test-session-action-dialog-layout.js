@@ -4,7 +4,7 @@ const path = require('path');
 const { chromium } = require('@playwright/test');
 
 const root = path.join(__dirname, '..');
-const css = fs.readFileSync(path.join(root, 'apps/mobile-web/public/styles.css'), 'utf8');
+const css = require('./ui-style-fixture').readUiStyles();
 const fullSessionId = '019f35ea-7d58-7fc0-905d-5cb971de1184';
 const longPath = '/dm_data/home/spst/example-user/GNN_li-lib/grid_sample_concen7_diff_temp/long_workspace_name_without_breaks';
 const hostGroups = ['dm', 'hkl'].map((hostId, hostIndex) => {

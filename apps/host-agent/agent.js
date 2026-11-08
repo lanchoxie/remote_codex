@@ -1,9 +1,11 @@
 const fs = require('fs');
+const { spawn } = require('child_process');
 const http = require('http');
 const https = require('https');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
+const { createSessionSteerCommandHandler } = require('./session-steer-command');
 const {
   CodexSessionDiscoveryIndex,
   extractSessionDiagnostics,
@@ -20,22 +22,26 @@ const {
 const { deliverAgentEventBatch } = require('../../shared/agent-event-batch');
 const { createCoalescedAsyncTask } = require('../../shared/coalesced-async-task');
 const { makeId, nowIso, normalizeArgs } = require('../../shared/protocol');
+const { planSessionDiscoveryPayloads } = require('../../shared/session-discovery-payload');
 const { normalizePortableSkillId } = require('../../shared/skill-id');
 const { resolveManagedRuntime, startManagedRuntimeSession } = require('./runtime-adapters');
 const {
   abortUnconfirmedRunner,
   buildManagedSessionStartedEvent,
   createManagedSessionStartGate,
+  buildManagedStartDiscoverySession,
   createManagedSessionShutdown,
   createRetryableTerminalReceiptExecutor,
   findRunnerForCommand,
   retainRunnerForStartRetry,
   replayManagedSessionStart,
+  runnerHasSessionStopRequest,
   shouldPublishMissingRunnerStop,
   stopRunnerOnce,
 } = require('./managed-session-lifecycle');
 const {
   cleanupStaleApiProfileCodexHomes,
+  inspectManagedOverlayForRun,
   resolveDefaultCodexBin,
 } = require('./codex-app-server-runner');
 const {
@@ -56,6 +62,7 @@ const {
   removeSessionWatch,
   upsertSessionWatch,
 } = require('./session-watch-registry');
+const { TerminalSessionService } = require('./terminal-session-service');
 
 const RELAY_URL = process.env.RELAY_URL || 'http://127.0.0.1:8787';
 const RELAY_AUTH_TOKEN = loadRelayAuthToken();
@@ -98,9 +105,19 @@ const REMOTE_CODEX_STATE_ROOT = process.env.REMOTE_CODEX_STATE_ROOT || path.join
 const MAX_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_FILE_TRANSFER_BYTES || 128 * 1024 * 1024);
 const MAX_CHUNKED_FILE_TRANSFER_BYTES = Number(process.env.AGENT_MAX_CHUNKED_FILE_TRANSFER_BYTES || 2 * 1024 * 1024 * 1024);
 const MAX_FILE_CHUNK_BYTES = Number(process.env.AGENT_FILE_TRANSFER_CHUNK_BYTES || 4 * 1024 * 1024);
+const TERMINAL_OPEN_RESULT_TTL_MS = 10 * 60 * 1000;
+const TERMINAL_OPEN_RESULT_LIMIT = 256;
 const FETCH_RETRY_ATTEMPTS = Math.max(1, Number(process.env.AGENT_FETCH_RETRY_ATTEMPTS || 3));
 const FETCH_RETRY_BASE_MS = Math.max(50, Number(process.env.AGENT_FETCH_RETRY_BASE_MS || 150));
 const FETCH_REQUEST_TIMEOUT_MS = Number(process.env.AGENT_FETCH_TIMEOUT_MS || 30000);
+// A Stop targeting a Session whose managed runner is still being created must
+// not pin the control polling lane to an unbounded startup promise.  The
+// command remains retryable after this short wait, so a later poll can apply
+// Stop once the runner identity is available.
+const PENDING_START_STOP_WAIT_MS = Math.max(
+  250,
+  Number(process.env.AGENT_PENDING_START_STOP_WAIT_MS || 5000) || 5000
+);
 const SESSION_DETAIL_DIAGNOSTIC_LIMIT = Number(process.env.AGENT_SESSION_DETAIL_DIAGNOSTIC_LIMIT || 400);
 const WINDOWS_DRIVE_PROBE_LETTERS = String(process.env.AGENT_WINDOWS_BROWSE_DRIVES || 'CDE')
   .toUpperCase()
@@ -151,9 +168,20 @@ const liveSessions = new Map();
 const activeSessionInputTasks = new Set();
 const sessionInputReceiptExecutor = createRetryableTerminalReceiptExecutor();
 const sessionInputReceiptKeysByCommandId = new Map();
+const handleSessionSteerCommand = createSessionSteerCommandHandler({
+  hostId: HOST_ID,
+  enqueueControl: (runner, effect) => enqueueRunnerControlEffect(runner, effect),
+  deliver: (receipt, batchId) => postEvents([receipt], { batchId, retryOnTransient: true }),
+});
 const runnerCommandEffectTails = new WeakMap();
+// A server-request response must be able to reach the app-server while a
+// normal turn submission is awaiting its turn/start RPC. Keep control effects
+// serialized with each other, but independent from the long-running command
+// lane so an approval cannot deadlock the turn that is waiting for it.
+const runnerControlCommandEffectTails = new WeakMap();
 const managedSessionStartGate = createManagedSessionStartGate();
 const activeFileUploads = new Map();
+const terminalOpenResults = new Map();
 const watchedHistorySessions = new Map();
 const watchedSessionRevisions = new Map();
 const codexDiscoveryIndexes = new Map();
@@ -180,9 +208,37 @@ let lastCommandId = 0;
 let lastFetchedCommandId = 0;
 const deliveredCommandStates = new Map();
 const deferredCommandRetryIds = new Set();
+// Delivery cursors are lane-specific, but execution identity is not. Retain a
+// bounded same-Relay-epoch ledger so a protocol downgrade can replay the
+// queue for ACK reconstruction without executing completed commands twice.
+const processedCommandStates = new Map();
+// New Relays advertise independent normal/control polling lanes. Keep the
+// legacy cursor variables above for older Relays and source-level consumers;
+// explicit lanes use their own monotonic cursors and ACK ledgers.
+const explicitCommandLaneStates = new Map([
+  ['normal', {
+    lastCommandId: 0,
+    lastFetchedCommandId: 0,
+    deliveredCommandStates: new Map(),
+    deferredCommandRetryIds: new Set(),
+  }],
+  ['control', {
+    lastCommandId: 0,
+    lastFetchedCommandId: 0,
+    deliveredCommandStates: new Map(),
+    deferredCommandRetryIds: new Set(),
+  }],
+]);
+let relaySupportsCommandLanes = false;
+let relaySupportsDiscoveryPreview = false;
 let relayInstanceId = null;
+let relayObservationGeneration = 0;
+let relayResponseRequestSequence = 0;
+let relayCommandLaneObservationSequence = 0;
+let relayLeaseObservationSequence = 0;
 let agentLeaseId = null;
 let agentRegistrationPromise = null;
+let agentRegistrationGeneration = -1;
 let codexRuntimeCache = null;
 let codexRuntimeCachedAt = 0;
 const codexUpdateResults = new Map();
@@ -529,26 +585,155 @@ function scheduleRecoveredCodexUpdateReport() {
     });
 }
 
+function rememberProcessedCommandState(commandId, state) {
+  const normalizedCommandId = Number(commandId || 0);
+  if (!Number.isSafeInteger(normalizedCommandId) || normalizedCommandId <= 0) return false;
+  if (!['pending', 'completed', 'retrying'].includes(state)) {
+    return processedCommandStates.delete(normalizedCommandId);
+  }
+  // Refresh insertion order so the bounded ledger retains commands which are
+  // still receiving late completion callbacks.
+  processedCommandStates.delete(normalizedCommandId);
+  processedCommandStates.set(normalizedCommandId, state);
+  while (processedCommandStates.size > 4096) {
+    processedCommandStates.delete(processedCommandStates.keys().next().value);
+  }
+  return true;
+}
+
+function synchronizeProcessedCommandState(commandId, state) {
+  rememberProcessedCommandState(commandId, state);
+  const ledgers = [
+    { lane: '', state: { deliveredCommandStates } },
+    ...Array.from(explicitCommandLaneStates, ([lane, laneState]) => ({ lane, state: laneState })),
+  ];
+  for (const ledger of ledgers) {
+    if (!ledger.state.deliveredCommandStates.has(commandId)) continue;
+    ledger.state.deliveredCommandStates.set(commandId, state);
+    if (state === 'completed') {
+      advanceAcknowledgedCommandId(ledger.lane);
+    }
+  }
+}
+
+function clearRelayEpochCommandState() {
+  lastCommandId = 0;
+  lastFetchedCommandId = 0;
+  deliveredCommandStates.clear();
+  deferredCommandRetryIds.clear();
+  processedCommandStates.clear();
+  for (const laneState of explicitCommandLaneStates.values()) {
+    laneState.lastCommandId = 0;
+    laneState.lastFetchedCommandId = 0;
+    laneState.deliveredCommandStates.clear();
+    laneState.deferredCommandRetryIds.clear();
+  }
+}
+
+function captureRelayResponseContext() {
+  relayResponseRequestSequence += 1;
+  return {
+    relayInstanceId: String(relayInstanceId || '').trim(),
+    generation: relayObservationGeneration,
+    requestSequence: relayResponseRequestSequence,
+  };
+}
+
+function relayResponseIsStale(body, context = null) {
+  if (!context) return false;
+  const requestGeneration = Number(context.generation);
+  if (!Number.isSafeInteger(requestGeneration) || requestGeneration === relayObservationGeneration) {
+    return false;
+  }
+  const currentRelayInstanceId = String(relayInstanceId || '').trim();
+  if (!currentRelayInstanceId) return false;
+  const responseRelayInstanceId = String(body?.relayInstanceId || '').trim();
+  // Once another response has advanced the observed generation, an older
+  // identity-less response is not allowed to mutate lease/lane state either.
+  return !responseRelayInstanceId || responseRelayInstanceId !== currentRelayInstanceId;
+}
+
+function relayResponseSequence(context = null) {
+  const sequence = Number(context?.requestSequence);
+  if (Number.isSafeInteger(sequence) && sequence > 0) return sequence;
+  relayResponseRequestSequence += 1;
+  return relayResponseRequestSequence;
+}
+
 function observeRelayInstance(body) {
   const nextRelayInstanceId = String(body?.relayInstanceId || '').trim();
   if (!nextRelayInstanceId) return false;
-  const changed = Boolean(relayInstanceId && relayInstanceId !== nextRelayInstanceId);
+  const identityChanged = relayInstanceId !== nextRelayInstanceId;
+  const changed = Boolean(relayInstanceId && identityChanged);
   if (changed) {
-    lastCommandId = 0;
-    lastFetchedCommandId = 0;
-    deliveredCommandStates.clear();
-    deferredCommandRetryIds.clear();
+    clearRelayEpochCommandState();
+  }
+  if (identityChanged) {
+    relayObservationGeneration += 1;
+    relayCommandLaneObservationSequence = 0;
+    relayLeaseObservationSequence = 0;
+    relaySupportsCommandLanes = false;
+    agentLeaseId = null;
   }
   relayInstanceId = nextRelayInstanceId;
   return changed;
 }
 
-function observeAgentLease(body) {
-  const nextLeaseId = String(body?.agentLeaseId || '').trim();
-  if (!nextLeaseId) return false;
+function observeAgentLease(body, sequence, identityChanged = false) {
+  if (!Object.prototype.hasOwnProperty.call(body || {}, 'agentLeaseId')) return false;
+  if (!identityChanged && sequence < relayLeaseObservationSequence) return false;
+  const nextLeaseId = String(body?.agentLeaseId || '').trim() || null;
   const changed = Boolean(agentLeaseId && agentLeaseId !== nextLeaseId);
   agentLeaseId = nextLeaseId;
+  relayLeaseObservationSequence = sequence;
   return changed;
+}
+
+function observeRelayResponse(body, context = null, options = {}) {
+  if (relayResponseIsStale(body, context)) {
+    return {
+      stale: true,
+      relayChanged: false,
+      relayIdentityObserved: false,
+      commandLanesChanged: false,
+      commandLaneObservationAccepted: false,
+      leaseChanged: false,
+    };
+  }
+  const previousRelayInstanceId = String(relayInstanceId || '').trim();
+  const nextRelayInstanceId = String(body?.relayInstanceId || '').trim();
+  const relayIdentityObserved = Boolean(
+    nextRelayInstanceId && nextRelayInstanceId !== previousRelayInstanceId
+  );
+  const sequence = relayResponseSequence(context);
+  const relayChanged = observeRelayInstance(body);
+  let commandLanesChanged = false;
+  let commandLaneObservationAccepted = false;
+  const commandLaneFieldPresent = Object.prototype.hasOwnProperty.call(
+    body || {},
+    'commandLanesV1'
+  );
+  if (
+    options.observeCommandLanes === true
+    && (commandLaneFieldPresent || options.inferLegacyCommandLanes === true)
+    && (relayIdentityObserved || sequence >= relayCommandLaneObservationSequence)
+  ) {
+    const nextSupportsCommandLanes = body?.commandLanesV1 === true;
+    commandLanesChanged = relaySupportsCommandLanes !== nextSupportsCommandLanes;
+    relaySupportsCommandLanes = nextSupportsCommandLanes;
+    relayCommandLaneObservationSequence = sequence;
+    commandLaneObservationAccepted = true;
+  }
+  return {
+    stale: false,
+    relayChanged,
+    relayIdentityObserved,
+    commandLanesChanged,
+    commandLaneObservationAccepted,
+    leaseChanged: options.observeAgentLease === false
+      ? false
+      : observeAgentLease(body, sequence, relayIdentityObserved),
+  };
 }
 
 function managedAgentProcessMetadata() {
@@ -700,6 +885,7 @@ function getCapabilities() {
     discovery: true,
     hostAgentLeaseV1: true,
     managedSessions: true,
+    managedStartPresenceV1: true,
     directoryBrowse: true,
     hostSkills: true,
     hostSkillInventoryV2: true,
@@ -728,10 +914,12 @@ function getCapabilities() {
     imageInput: true,
     fileTransfer: true,
     chunkedFileTransfer: true,
+    openTerminalV1: true,
     agentRuntimes: true,
     realtimeSessionSync: CODEX_TAIL_ENABLED,
     codexJsonlTail: CODEX_TAIL_ENABLED,
     sessionWatchV2: true,
+    commandLanesV1: true,
     demoMode: defaultRuntime.kind === 'demo',
   };
 }
@@ -1130,6 +1318,7 @@ async function postAgentEventPayload(body, label, options = {}) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const headers = managedAgentRequestHeaders();
     const requestLeaseId = String(headers['X-Remote-Codex-Agent-Lease'] || '').trim();
+    const responseContext = captureRelayResponseContext();
     try {
       const result = await fetchJson(`${RELAY_URL}/api/agent/events`, {
         method: 'POST',
@@ -1137,17 +1326,28 @@ async function postAgentEventPayload(body, label, options = {}) {
         retryOnTransient: options.retryOnTransient !== false,
         headers,
       });
+      const observation = observeRelayResponse(result.body, responseContext, {
+        observeCommandLanes: false,
+        observeAgentLease: false,
+      });
+      if (observation.stale) {
+        return result;
+      }
       if (result.body?.dismissed) {
         throw makeRelayHostDismissedError();
       }
-      observeRelayInstance(result.body);
-      observeAgentLease(result.body);
+      if (observation.relayChanged) {
+        // Event ingestion does not establish a Host lease. If it is the first
+        // response to reveal a restarted Relay, complete registration before
+        // any other loop continues with the new epoch.
+        await ensureHostRegistration();
+      }
       return result;
     } catch (error) {
       lastError = error;
       if (attempt === 0) {
         try {
-          if (await recoverAgentLeaseForRequest(error, requestLeaseId)) {
+          if (await recoverAgentLeaseForRequest(error, requestLeaseId, responseContext)) {
             continue;
           }
         } catch (recoveryError) {
@@ -1236,42 +1436,82 @@ hostSkillDeployment = new HostSkillDeploymentService({
 });
 
 async function registerHost() {
-  const result = await fetchJson(`${RELAY_URL}/api/agent/register`, {
-    method: 'POST',
-    retryOnTransient: true,
-    headers: managedAgentRequestHeaders(),
-    body: {
-      hostId: HOST_ID,
-      agentInstanceId: AGENT_INSTANCE_ID,
-      label: HOST_LABEL,
-      platform: process.platform,
-      codexHome: CODEX_HOME,
-      codexRuntime: getCodexRuntime(),
-      codexMaintenance: publicCodexMaintenanceState(),
-      skillsRevision: hostSkillInventory.snapshot()?.revision || null,
-      capabilities: getCapabilities(),
-      agentProcess: managedAgentProcessMetadata(),
-    },
+  const responseContext = captureRelayResponseContext();
+  let result;
+  try {
+    result = await fetchJson(`${RELAY_URL}/api/agent/register`, {
+      method: 'POST',
+      retryOnTransient: true,
+      headers: managedAgentRequestHeaders(),
+      body: {
+        hostId: HOST_ID,
+        agentInstanceId: AGENT_INSTANCE_ID,
+        label: HOST_LABEL,
+        platform: process.platform,
+        codexHome: CODEX_HOME,
+        codexRuntime: getCodexRuntime(),
+        codexMaintenance: publicCodexMaintenanceState(),
+        skillsRevision: hostSkillInventory.snapshot()?.revision || null,
+        capabilities: getCapabilities(),
+        agentProcess: managedAgentProcessMetadata(),
+      },
+    });
+  } catch (error) {
+    error.relayResponseContext = responseContext;
+    throw error;
+  }
+  const observation = observeRelayResponse(result.body, responseContext, {
+    observeCommandLanes: true,
+    inferLegacyCommandLanes: true,
+    observeAgentLease: true,
   });
+  if (observation.stale) return false;
+  relaySupportsDiscoveryPreview = result.body?.discoveryPreviewV1 === true;
   if (result.body?.dismissed) {
     throw makeRelayHostDismissedError();
   }
-  observeRelayInstance(result.body);
-  observeAgentLease(result.body);
+  agentRegistrationGeneration = relayObservationGeneration;
+  return true;
 }
 
 function ensureHostRegistration() {
+  if (agentRegistrationGeneration === relayObservationGeneration) {
+    return Promise.resolve(true);
+  }
   if (!agentRegistrationPromise) {
-    agentRegistrationPromise = registerHost().finally(() => {
+    agentRegistrationPromise = (async () => {
+      while (agentRegistrationGeneration !== relayObservationGeneration) {
+        await registerHost();
+      }
+      return true;
+    })().finally(() => {
       agentRegistrationPromise = null;
     });
   }
-  return agentRegistrationPromise;
+  return agentRegistrationPromise.then((registered) => {
+    if (agentRegistrationGeneration !== relayObservationGeneration) {
+      return ensureHostRegistration();
+    }
+    return registered;
+  });
 }
 
-async function recoverAgentLeaseForRequest(error, requestLeaseId = '') {
+async function recoverAgentLeaseForRequest(
+  error,
+  requestLeaseId = '',
+  responseContext = error?.relayResponseContext || null,
+  options = {}
+) {
+  if (relayResponseIsStale(error?.body, responseContext)) {
+    return true;
+  }
   const code = String(error?.body?.code || '').trim();
-  const relayChanged = observeRelayInstance(error?.body);
+  const observation = observeRelayResponse(error?.body, responseContext, {
+    observeCommandLanes: options.observeCommandLanes === true,
+    observeAgentLease: false,
+  });
+  if (observation.stale) return true;
+  const relayChanged = observation.relayChanged;
   const leaseRotated = Boolean(
     requestLeaseId
     && agentLeaseId
@@ -1291,29 +1531,43 @@ async function recoverAgentLeaseForRequest(error, requestLeaseId = '') {
 }
 
 async function heartbeat() {
-  const result = await fetchJson(`${RELAY_URL}/api/agent/heartbeat`, {
-    method: 'POST',
-    retryOnTransient: true,
-    headers: managedAgentRequestHeaders(),
-    body: {
-      hostId: HOST_ID,
-      agentInstanceId: AGENT_INSTANCE_ID,
-      label: HOST_LABEL,
-      platform: process.platform,
-      codexHome: CODEX_HOME,
-      codexRuntime: getCodexRuntime(),
-      codexMaintenance: publicCodexMaintenanceState(),
-      skillsRevision: hostSkillInventory.snapshot()?.revision || null,
-      capabilities: getCapabilities(),
-      agentProcess: managedAgentProcessMetadata(),
-      time: nowIso(),
-    },
+  const responseContext = captureRelayResponseContext();
+  let result;
+  try {
+    result = await fetchJson(`${RELAY_URL}/api/agent/heartbeat`, {
+      method: 'POST',
+      retryOnTransient: true,
+      headers: managedAgentRequestHeaders(),
+      body: {
+        hostId: HOST_ID,
+        agentInstanceId: AGENT_INSTANCE_ID,
+        label: HOST_LABEL,
+        platform: process.platform,
+        codexHome: CODEX_HOME,
+        codexRuntime: getCodexRuntime(),
+        codexMaintenance: publicCodexMaintenanceState(),
+        skillsRevision: hostSkillInventory.snapshot()?.revision || null,
+        capabilities: getCapabilities(),
+        agentProcess: managedAgentProcessMetadata(),
+        time: nowIso(),
+      },
+    });
+  } catch (error) {
+    error.relayResponseContext = responseContext;
+    throw error;
+  }
+  const observation = observeRelayResponse(result.body, responseContext, {
+    observeCommandLanes: true,
+    inferLegacyCommandLanes: true,
+    observeAgentLease: true,
   });
+  if (observation.stale) return false;
   if (result.body?.dismissed) {
     throw makeRelayHostDismissedError();
   }
-  observeRelayInstance(result.body);
-  observeAgentLease(result.body);
+  // Heartbeat has the same lease/Host upsert semantics as registration.
+  agentRegistrationGeneration = relayObservationGeneration;
+  return true;
 }
 
 async function releaseAgentLease() {
@@ -1444,6 +1698,21 @@ async function performDiscovery() {
     });
   }
 
+  for (const activeStart of managedSessionStartGate.snapshotActiveStarts()) {
+    if (!activeStart.runner || seenRunners.has(activeStart.runner)) {
+      continue;
+    }
+    const pendingSession = buildManagedStartDiscoverySession(activeStart, {
+      cwd: MANAGED_CWD,
+      updatedAt: nowIso(),
+    });
+    if (!pendingSession) {
+      continue;
+    }
+    seenRunners.add(activeStart.runner);
+    sessions.push(pendingSession);
+  }
+
   const addedWorkspaceRoots = hostSkillInventory.addWorkspaceRoots(
     sessions.map((session) => session.cwd).filter(Boolean)
   );
@@ -1452,16 +1721,24 @@ async function performDiscovery() {
   });
 
   const discoveryId = makeId();
-  await postEvents([{
-    type: 'session.discovery',
+  const payloads = planSessionDiscoveryPayloads({
     hostId: HOST_ID,
     discoveryId,
     discoveredAt: nowIso(),
     sessions,
-  }], {
-    batchId: `session.discovery:${discoveryId}`,
-    retryOnTransient: true,
+    maxBytes: Number(process.env.AGENT_DISCOVERY_MAX_PAYLOAD_BYTES || 6 * 1024 * 1024),
   });
+  if (payloads.length > 1 && !relaySupportsDiscoveryPreview) {
+    const error = new Error('Relay does not support bounded Session discovery previews; update the Relay first.');
+    error.code = 'discovery_preview_transport_unsupported';
+    throw error;
+  }
+  if (payloads.length > 1) {
+    logAgentNotice(`[agent] discovery split into ${payloads.length} bounded payloads for ${sessions.length} Session(s)`);
+  }
+  for (const { batchId, event } of payloads) {
+    await postEvents([event], { batchId, retryOnTransient: true });
+  }
   discoveryRecord.index.acknowledge(discoveryScan);
   assistantCursorIndex.acknowledgeMany(publishedCursorResults);
   for (const cursor of publishedCursorResults) {
@@ -1491,6 +1768,40 @@ function collectSessionIdentityCandidates(input = {}) {
   ].map((value) => String(value || '').trim()).filter(Boolean);
 }
 
+function managedTurnOwnershipRevision(runner) {
+  if (!runner) {
+    return null;
+  }
+  const mapKeys = (value) => value instanceof Map
+    ? Array.from(value.keys()).map((key) => String(key || '').trim()).filter(Boolean).sort()
+    : [];
+  const setValues = (value) => value instanceof Set
+    ? Array.from(value).map((key) => String(key || '').trim()).filter(Boolean).sort()
+    : [];
+  const parentEntries = runner.subagentParentTurns instanceof Map
+    ? Array.from(runner.subagentParentTurns.entries())
+      .map(([threadId, parentTurnId]) => [String(threadId || '').trim(), String(parentTurnId || '').trim()])
+      .filter(([threadId, parentTurnId]) => threadId && parentTurnId)
+      .sort((left, right) => left[0].localeCompare(right[0]))
+    : [];
+  // Include only collections consulted by managedTurnOwner and foreign
+  // notification routing. Ordinary runtime progress must not trigger a
+  // full historical seed scan every tail poll.
+  return JSON.stringify({
+    lifecycleGeneration: Number(runner.turnLifecycleGeneration || 0),
+    activeLifecycleId: String(runner.activeTurnLifecycleId || '').trim() || null,
+    activeTurnId: String(runner.activeTurnId || '').trim() || null,
+    activeClientRequestId: String(runner.activeClientRequestId || '').trim() || null,
+    terminalTurnIds: setValues(runner.terminalTurnIds),
+    clientRequestTurns: mapKeys(runner.clientRequestIdsByTurn),
+    turnBuffers: mapKeys(runner.turnBuffers),
+    turnModes: mapKeys(runner.turnModes),
+    pendingTurnCompletions: mapKeys(runner.pendingTurnCompletions),
+    systemErrors: mapKeys(runner.systemErrorsByTurn),
+    subagentParents: parentEntries,
+  });
+}
+
 function managedTailSession(found, runner) {
   if (!found?.rolloutPath || !runner) {
     return found;
@@ -1499,6 +1810,7 @@ function managedTailSession(found, runner) {
     ...found,
     live: true,
     transcriptOwner: 'managed-runner',
+    managedTurnOwnershipRevision: managedTurnOwnershipRevision(runner),
     ...(runner.runId ? { runId: runner.runId } : {}),
     managedRuntimeActive: Boolean(
       runner.activeTurnId
@@ -2639,6 +2951,223 @@ async function handleDirectoryList(command) {
   }
 }
 
+function terminalOpenError(code, message, cause = null) {
+  const error = new Error(message);
+  error.code = code;
+  if (cause) error.cause = cause;
+  return error;
+}
+
+function validateTerminalCwd(value) {
+  const requestedCwd = String(value || '').trim();
+  if (!requestedCwd) {
+    throw terminalOpenError('terminal_cwd_missing', 'Session working directory is unavailable.');
+  }
+  const cwd = path.resolve(resolveManagedCwd(requestedCwd));
+  let stats;
+  try {
+    stats = fs.statSync(cwd);
+  } catch (cause) {
+    throw terminalOpenError(
+      'terminal_cwd_unavailable',
+      `Session working directory does not exist or cannot be accessed: ${cwd}`,
+      cause
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw terminalOpenError('terminal_cwd_not_directory', `Session working directory is not a directory: ${cwd}`);
+  }
+  return cwd;
+}
+
+function terminalLaunchCandidates(cwd, platform = process.platform, env = process.env) {
+  if (platform === 'win32') {
+    const systemRoot = String(env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows').trim() || 'C:\\Windows';
+    return [{
+      command: path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+      args: ['-NoLogo', '-NoExit'],
+      terminal: 'PowerShell',
+    }, {
+      command: String(env.ComSpec || path.join(systemRoot, 'System32', 'cmd.exe')),
+      args: ['/d', '/k'],
+      terminal: 'Command Prompt',
+    }];
+  }
+
+  if (platform === 'darwin') {
+    if (env.SSH_CONNECTION || env.SSH_TTY) {
+      throw terminalOpenError(
+        'terminal_gui_unavailable',
+        'Cannot open Terminal from a headless macOS SSH Host Agent.'
+      );
+    }
+    return [{
+      command: '/usr/bin/open',
+      args: ['-a', 'Terminal', cwd],
+      terminal: 'Terminal',
+    }];
+  }
+
+  if (platform === 'linux') {
+    if (!env.DISPLAY && !env.WAYLAND_DISPLAY) {
+      throw terminalOpenError(
+        'terminal_gui_unavailable',
+        'Cannot open a terminal because this Linux Host Agent has no graphical display.'
+      );
+    }
+    return [{
+      command: '/usr/bin/x-terminal-emulator',
+      args: ['--working-directory', cwd],
+      terminal: 'x-terminal-emulator',
+    }, {
+      command: '/usr/bin/gnome-terminal',
+      args: ['--working-directory', cwd],
+      terminal: 'GNOME Terminal',
+    }, {
+      command: '/usr/bin/konsole',
+      args: ['--workdir', cwd],
+      terminal: 'Konsole',
+    }, {
+      command: '/usr/bin/xfce4-terminal',
+      args: ['--working-directory', cwd],
+      terminal: 'Xfce Terminal',
+    }];
+  }
+
+  throw terminalOpenError(
+    'terminal_platform_unsupported',
+    `Opening a terminal is not supported on ${platform || 'this platform'}.`
+  );
+}
+
+function spawnDetachedTerminal(candidate, cwd) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(candidate.command, candidate.args, {
+        cwd,
+        detached: true,
+        shell: false,
+        stdio: 'ignore',
+        windowsHide: false,
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref?.();
+      resolve({
+        terminal: candidate.terminal,
+        pid: Number(child.pid || 0) || null,
+      });
+    });
+  });
+}
+
+async function openTerminalAtCwd(cwd) {
+  const candidates = terminalLaunchCandidates(cwd);
+  const failures = [];
+  for (const candidate of candidates) {
+    try {
+      return await spawnDetachedTerminal(candidate, cwd);
+    } catch (error) {
+      failures.push(`${candidate.terminal}: ${error.message || error}`);
+    }
+  }
+  throw terminalOpenError(
+    'terminal_launcher_unavailable',
+    `No supported terminal application could be started. ${failures.join('; ')}`
+  );
+}
+
+function pruneTerminalOpenResults(now = Date.now()) {
+  for (const [requestId, record] of terminalOpenResults.entries()) {
+    if (!record || Number(record.expiresAt || 0) <= now) {
+      terminalOpenResults.delete(requestId);
+    }
+  }
+  while (terminalOpenResults.size > TERMINAL_OPEN_RESULT_LIMIT) {
+    const oldest = terminalOpenResults.keys().next().value;
+    if (!oldest) break;
+    terminalOpenResults.delete(oldest);
+  }
+}
+
+async function handleOpenTerminal(command) {
+  pruneTerminalOpenResults();
+  const providedRequestId = String(command.requestId || '').trim().slice(0, 160);
+  const requestId = providedRequestId || makeId();
+  const requestedCwd = String(command.cwd || '').trim();
+  const sessionId = String(command.sessionId || '').trim() || null;
+  const cached = terminalOpenResults.get(requestId);
+  let event;
+
+  if (cached) {
+    if (cached.requestedCwd !== requestedCwd || cached.sessionId !== sessionId) {
+      event = {
+        type: 'host.terminal_error',
+        hostId: HOST_ID,
+        requestId,
+        sessionId,
+        cwd: requestedCwd || null,
+        code: 'terminal_request_id_conflict',
+        error: 'The terminal request ID was already used for another Session or directory.',
+        timestamp: nowIso(),
+      };
+    } else {
+      event = cached.event;
+    }
+  } else {
+    try {
+      const cwd = validateTerminalCwd(requestedCwd);
+      const launched = await openTerminalAtCwd(cwd);
+      event = {
+        type: 'host.terminal_opened',
+        hostId: HOST_ID,
+        requestId,
+        sessionId,
+        ok: true,
+        opened: true,
+        cwd,
+        platform: process.platform,
+        terminal: launched.terminal,
+        pid: launched.pid,
+        timestamp: nowIso(),
+      };
+    } catch (error) {
+      event = {
+        type: 'host.terminal_error',
+        hostId: HOST_ID,
+        requestId,
+        sessionId,
+        ok: false,
+        opened: false,
+        cwd: requestedCwd || null,
+        platform: process.platform,
+        code: error.code || 'terminal_open_failed',
+        error: error.message || String(error),
+        timestamp: nowIso(),
+      };
+    }
+    terminalOpenResults.set(requestId, {
+      requestedCwd,
+      sessionId,
+      event,
+      expiresAt: Date.now() + TERMINAL_OPEN_RESULT_TTL_MS,
+    });
+    pruneTerminalOpenResults();
+  }
+
+  try {
+    await postEvent(event, { retryOnTransient: true });
+  } catch (error) {
+    error.retryCommand = true;
+    throw error;
+  }
+}
+
 function buildResumeBootstrap(command) {
   const transcript = Array.isArray(command.resumeTranscript) ? command.resumeTranscript : [];
   const lines = transcript
@@ -2711,6 +3240,17 @@ async function failManagedSession(sessionId, cwd, message, state = 'failed', run
 }
 
 function buildSessionCommandFailureEvent(command, error, operation, runner = null, timestamp = nowIso()) {
+  const inputCapabilityError = error?.inputCapabilityError
+    && typeof error.inputCapabilityError === 'object'
+    ? error.inputCapabilityError
+    : null;
+  const rawError = inputCapabilityError?.rawMessage
+    || error?.rawMessage
+    || error?.message
+    || String(error || 'Session command failed.');
+  const userFacingError = inputCapabilityError?.userMessage
+    || error?.userFacingMessage
+    || null;
   return {
     type: 'session.command_failed',
     hostId: HOST_ID,
@@ -2720,9 +3260,28 @@ function buildSessionCommandFailureEvent(command, error, operation, runner = nul
     commandId: command.id || null,
     clientRequestId: command.clientRequestId || null,
     stopRequestId: command.stopRequestId || null,
+    // Preserve the durable parent-run cleanup identity.  Unlike a user Stop,
+    // retirement commands target a deliberately stale parent run; Relay must
+    // be able to process a failure receipt without projecting it onto the
+    // replacement child.
+    retirementId: command.retirementId || null,
     operation,
     code: error?.code || 'session_command_failed',
-    error: error?.message || String(error || 'Session command failed.'),
+    error: userFacingError || error?.message || String(error || 'Session command failed.'),
+    ...(inputCapabilityError
+      ? {
+        inputCapabilityError: {
+          code: inputCapabilityError.code || null,
+          kind: inputCapabilityError.kind || null,
+          inputTypes: Array.isArray(inputCapabilityError.inputTypes)
+            ? inputCapabilityError.inputTypes.slice(0, 8)
+            : [],
+          userMessage: inputCapabilityError.userMessage || userFacingError || null,
+          rawMessage: rawError,
+        },
+        rawError,
+      }
+      : {}),
     canRebind: Boolean(error?.canRebind),
     timestamp,
   };
@@ -2740,6 +3299,26 @@ async function postSessionCommandFailure(command, error, operation, runner = nul
       deliveryError.code = deliveryError.code || 'session_terminal_delivery_failed';
     }
     throw deliveryError;
+  }
+}
+
+async function postSessionCommandSuccess(command, operation, runner = null) {
+  if (!command?.retirementId) return;
+  try {
+    await postEvent({
+      type: 'session.command_succeeded',
+      hostId: HOST_ID,
+      sessionId: command.requestedSessionId || command.sessionId || runner?.sessionId || null,
+      runId: runner?.runId || command.runId || null,
+      commandId: command.id || null,
+      retirementId: command.retirementId,
+      operation,
+      timestamp: nowIso(),
+    }, { retryOnTransient: true });
+  } catch (error) {
+    error.retryCommand = true;
+    error.code = error.code || 'session_terminal_delivery_failed';
+    throw error;
   }
 }
 
@@ -2780,6 +3359,13 @@ function buildSessionInputRuntimeEvent(command, runner, patch, timestamp = nowIs
   const runtimeClientRequestId = Object.prototype.hasOwnProperty.call(patch, 'clientRequestId')
     ? patch.clientRequestId
     : command.clientRequestId || null;
+  const runtimePatch = {
+    ...patch,
+    ...(typeof runner?.runtime?.nativeResumeReady === 'boolean'
+      && !Object.prototype.hasOwnProperty.call(patch, 'nativeResumeReady')
+      ? { nativeResumeReady: runner.runtime.nativeResumeReady }
+      : {}),
+  };
   const runtimeRevision = typeof runner?.reserveRuntimeRevision === 'function'
     ? runner.reserveRuntimeRevision()
     : null;
@@ -2794,7 +3380,7 @@ function buildSessionInputRuntimeEvent(command, runner, patch, timestamp = nowIs
     clientRequestId: runtimeClientRequestId,
     ...(runtimeRevision ? { runtimeRevision } : {}),
     patch: {
-      ...patch,
+      ...runtimePatch,
       clientRequestId: runtimeClientRequestId,
       runId: runner?.runId || command.runId || null,
       ...(runtimeRevision ? { runtimeRevision } : {}),
@@ -2848,6 +3434,10 @@ async function deliverSessionInterruptResult(command, runner, result) {
 function buildFailedSessionInputReceipt(command, runner, error) {
   const timestamp = nowIso();
   const runnerRuntime = currentRunnerActiveRuntime(runner);
+  const inputCapabilityError = error?.inputCapabilityError
+    && typeof error.inputCapabilityError === 'object'
+    ? error.inputCapabilityError
+    : null;
   const activeTurnId = runnerRuntime.activeTurnId;
   const activeClientRequestId = activeTurnId
     ? runner?.clientRequestIdForTurn?.(activeTurnId) || runner?.activeClientRequestId || null
@@ -2869,7 +3459,9 @@ function buildFailedSessionInputReceipt(command, runner, error) {
     phase: 'error',
     currentTurnStatus: 'failed',
     pendingInputSummary: null,
-    lastCodexError: error?.message || String(error),
+    lastError: inputCapabilityError?.userMessage || error?.message || String(error),
+    lastCodexError: inputCapabilityError?.code || error?.code || error?.message || String(error),
+    userFacingError: inputCapabilityError?.userMessage || error?.userFacingMessage || null,
   };
   const failureEvent = buildSessionCommandFailureEvent(command, error, 'input', runner, timestamp);
   if (error?.code === 'session_input_cancelled_by_stop') {
@@ -2886,18 +3478,25 @@ function buildFailedSessionInputReceipt(command, runner, error) {
   ];
 }
 
-function enqueueRunnerCommandEffect(runner, effect) {
+function enqueueRunnerCommandEffect(runner, effect, options = {}) {
   if (!runner) return Promise.resolve().then(effect);
-  const previous = runnerCommandEffectTails.get(runner) || Promise.resolve();
+  const tails = options.priority === 'control'
+    ? runnerControlCommandEffectTails
+    : runnerCommandEffectTails;
+  const previous = tails.get(runner) || Promise.resolve();
   const current = previous.catch(() => {}).then(effect);
   const tail = current.catch(() => {});
-  runnerCommandEffectTails.set(runner, tail);
+  tails.set(runner, tail);
   void tail.finally(() => {
-    if (runnerCommandEffectTails.get(runner) === tail) {
-      runnerCommandEffectTails.delete(runner);
+    if (tails.get(runner) === tail) {
+      tails.delete(runner);
     }
   });
   return current;
+}
+
+function enqueueRunnerControlEffect(runner, effect) {
+  return enqueueRunnerCommandEffect(runner, effect, { priority: 'control' });
 }
 
 async function executeSessionInputCommand(command, runner) {
@@ -2958,25 +3557,36 @@ async function executeSessionInputCommand(command, runner) {
     }
     if (failure.code === 'session_input_acceptance_unknown') {
       const runnerRuntime = currentRunnerActiveRuntime(runner);
+      const unresolvedPhase = String(runner?.runtime?.phase || '').trim() || 'submitting-turn';
       const submissionPending = !runnerRuntime.activeTurnId
         && runner?.activeClientRequestId === command.clientRequestId
         && runner?.runtime?.busy === true
-        && runner?.runtime?.phase === 'submitting-turn';
+        && (
+          Boolean(runner?.pendingSubmissionReconciliation)
+          || ['submitting-turn', 'runtime-unknown', 'interrupting'].includes(unresolvedPhase)
+        );
       return [buildSessionInputRuntimeEvent(command, runner, {
         activeTurnId: runnerRuntime.activeTurnId,
         busy: runnerRuntime.busy || submissionPending,
         phase: runnerRuntime.activeTurnId
           ? runnerRuntime.phase || 'thinking'
-          : submissionPending ? 'submitting-turn' : 'idle',
+          : submissionPending ? unresolvedPhase : 'idle',
         currentTurnStatus: runnerRuntime.activeTurnId
           ? runnerRuntime.currentTurnStatus || 'inProgress'
-          : submissionPending ? 'submitting' : 'idle',
+          : submissionPending
+            ? runner?.runtime?.currentTurnStatus || 'submitting'
+            : 'idle',
         queuedCommandId: null,
-        pendingClientRequestId: command.clientRequestId || null,
+        pendingClientRequestId: runnerRuntime.activeTurnId
+          ? null
+          : submissionPending ? command.clientRequestId || null : null,
         queuedInputAt: null,
         pendingInputSummary: (runnerRuntime.activeTurnId || submissionPending)
           ? runner.runtime?.pendingInputSummary || String(command.text || '').slice(0, 240)
           : null,
+        submissionReconciliation: runnerRuntime.activeTurnId
+          ? null
+          : runner?.runtime?.submissionReconciliation || null,
         lastError: null,
         lastCodexError: null,
       }, nowIso(), { inputOutcome: 'acceptance_unknown' })];
@@ -3096,7 +3706,7 @@ async function startManagedSession(command) {
   const settleUserStoppedStart = async () => {
     if (!runner) return bridgeSessionId;
     try {
-      await stopRunnerOnce(runner);
+      await stopRunnerOnce(runner, { stopCommandRequested: true });
       removeRunnerIndexes();
     } catch {
       // The Stop command owns its structured failure. Keep the runner indexed
@@ -3181,6 +3791,7 @@ async function startManagedSession(command) {
       launchMode: command.launchMode || null,
       nativeThreadId: command.nativeThreadId || null,
       rebindNativeThreadId: command.rebindNativeThreadId || null,
+      forceTranscriptFallback: command.forceTranscriptFallback === true,
       explicitRebind: command.explicitRebind === true,
       codexHome: CODEX_HOME,
       apiConfig,
@@ -3202,7 +3813,7 @@ async function startManagedSession(command) {
     if (managedSessionStartGate.isShuttingDown()) {
       return await cancelStartForShutdown();
     }
-    if (runner.stopRequested) {
+    if (runnerHasSessionStopRequest(runner)) {
       return await settleUserStoppedStart();
     }
     runner.createdAt = runner.createdAt || createdAt;
@@ -3237,7 +3848,7 @@ async function startManagedSession(command) {
     if (error?.code === 'host_agent_shutting_down' || managedSessionStartGate.isShuttingDown()) {
       return await cancelStartForShutdown();
     }
-    if (runner?.stopRequested) {
+    if (runnerHasSessionStopRequest(runner)) {
       return await settleUserStoppedStart();
     }
     if (retainRunnerForStartRetry(liveSessions, runner, {
@@ -3659,6 +4270,11 @@ async function handleCommand(command) {
     return;
   }
 
+  if (command.type === 'host.open_terminal') {
+    await handleOpenTerminal(command);
+    return;
+  }
+
   if (command.type === 'host.file_upload') {
     await handleFileUpload(command);
     return;
@@ -3781,22 +4397,73 @@ async function handleCommand(command) {
     }
 
     if (command.type === 'session.stop') {
-      const pendingRunner = managedSessionStartGate.waitForRunner(command);
+      const pendingRunner = managedSessionStartGate.waitForRunner(command, {
+        timeoutMs: PENDING_START_STOP_WAIT_MS,
+      });
       if (pendingRunner) {
         const startedRunner = await pendingRunner;
         if (startedRunner) {
           try {
-            await stopRunnerOnce(startedRunner, {
+            const stopped = await stopRunnerOnce(startedRunner, {
               suppressTerminalEvent: command.suppressTerminalEvent === true,
+              stopCommandRequested: true,
             });
+            if (command.retirementId) {
+              if (stopped === false) {
+                const error = new Error('The superseded runner could not be stopped.');
+                error.code = 'session_retirement_stop_incomplete';
+                await postSessionCommandFailure(command, error, 'stop', startedRunner, {
+                  bestEffort: false,
+                  retryCommand: true,
+                });
+              } else {
+                await postSessionCommandSuccess(command, 'stop', startedRunner);
+              }
+            }
           } catch (cause) {
             const stopError = cause instanceof Error
               ? cause
               : new Error(String(cause || 'Managed Session stop failed.'));
             stopError.code = stopError.code || 'session_stop_incomplete';
-            await postSessionCommandFailure(command, stopError, 'stop', startedRunner);
+            if (command.retirementId) {
+              await postSessionCommandFailure(command, stopError, 'stop', startedRunner, {
+                bestEffort: false,
+                retryCommand: true,
+              });
+            } else {
+              await postSessionCommandFailure(command, stopError, 'stop', startedRunner);
+            }
           }
+        } else if (command.retirementId) {
+          await postSessionCommandSuccess(command, 'stop', null);
         }
+        return;
+      }
+      if (command.retirementId) {
+        // The in-memory index can be lost across an Agent restart while an
+        // app-server child remains alive in its managed overlay. Probe the
+        // exact run before deciding that a missing runner is gone.
+        const orphanProbe = inspectManagedOverlayForRun(CODEX_HOME, command.runId);
+        if (orphanProbe.status !== 'absent') {
+          const error = new Error(
+            orphanProbe.status === 'active'
+              ? 'The superseded runner is still alive outside the Host Agent index.'
+              : 'The superseded runner could not be verified as stopped.'
+          );
+          error.code = orphanProbe.status === 'active'
+            ? 'session_retirement_runner_orphaned'
+            : 'session_retirement_runner_unverified';
+          error.retryCommand = true;
+          await postSessionCommandFailure(command, error, 'stop', null, {
+            bestEffort: false,
+            retryCommand: true,
+          });
+          return;
+        }
+        // No managed overlay exists for this exact run. The runner was
+        // already cleaned up (or never reached overlay creation), so the
+        // retirement receipt is safely idempotent.
+        await postSessionCommandSuccess(command, 'stop', null);
         return;
       }
       if (!shouldPublishMissingRunnerStop(command)) return;
@@ -3816,6 +4483,10 @@ async function handleCommand(command) {
       return {
         deferAcknowledgement: startSessionInputCommand(command),
       };
+    }
+
+    if (command.type === 'session.steer') {
+      return { deferAcknowledgement: handleSessionSteerCommand(command, null) };
     }
 
     if (command.type === 'session.interrupt') {
@@ -3944,11 +4615,14 @@ async function handleCommand(command) {
   if (command.type === 'session.interrupt') {
     if (typeof runner.interruptTurn === 'function') {
       try {
-        const result = await runner.interruptTurn({
+        // Keep the native interrupt on the runner's control effect lane.  A
+        // normal prompt/review may be awaiting an unresolved turn/start, but
+        // interrupt must still reach the app-server immediately.
+        const result = await enqueueRunnerControlEffect(runner, () => runner.interruptTurn({
           interruptRequestId: command.interruptRequestId || null,
           expectedTurnId: command.expectedTurnId || null,
           expectedClientRequestId: command.expectedClientRequestId || null,
-        });
+        }));
         await deliverSessionInterruptResult(command, runner, result);
       } catch (error) {
         await deliverSessionInterruptResult(command, runner, {
@@ -3969,19 +4643,7 @@ async function handleCommand(command) {
   }
 
   if (command.type === 'session.steer') {
-    if (typeof runner.steerTurn === 'function') {
-      await enqueueRunnerCommandEffect(runner, () => runner.steerTurn(String(command.text || '')));
-      return;
-    }
-
-    await postEvent({
-      type: 'session.error',
-      hostId: HOST_ID,
-      sessionId: command.sessionId,
-      message: 'This runner does not support turn steering.',
-      timestamp: nowIso(),
-    });
-    return;
+    return { deferAcknowledgement: handleSessionSteerCommand(command, runner) };
   }
 
   if (command.type === 'session.compact') {
@@ -4082,12 +4744,10 @@ async function handleCommand(command) {
 
   if (command.type === 'session.review_start') {
     if (typeof runner.startReview === 'function') {
-      try {
-        await runner.startReview({
-          target: command.target || { type: 'uncommittedChanges' },
-          delivery: command.delivery || 'inline',
-        });
-      } catch (error) {
+      const reviewTask = enqueueRunnerCommandEffect(runner, () => runner.startReview({
+        target: command.target || { type: 'uncommittedChanges' },
+        delivery: command.delivery || 'inline',
+      })).catch(async (error) => {
         await postEvent({
           type: 'session.error',
           hostId: HOST_ID,
@@ -4095,8 +4755,13 @@ async function handleCommand(command) {
           message: `Unable to start Codex review: ${error.message}`,
           timestamp: nowIso(),
         });
-      }
-      return;
+      });
+      return {
+        // Review stays ordered on the normal runner lane, but it must not
+        // block command polling from delivering an approval response to the
+        // independent control lane.
+        deferAcknowledgement: reviewTask,
+      };
     }
 
     await postEvent({
@@ -4127,7 +4792,10 @@ async function handleCommand(command) {
 
   if (command.type === 'session.request.respond') {
     if (typeof runner.respondToRequest === 'function') {
-      await runner.respondToRequest(command.requestId, command.response || null);
+      await enqueueRunnerControlEffect(
+        runner,
+        () => runner.respondToRequest(command.requestId, command.response || null)
+      );
       return;
     }
 
@@ -4143,15 +4811,35 @@ async function handleCommand(command) {
 
   if (command.type === 'session.stop') {
     try {
-      await stopRunnerOnce(runner, {
+      const stopped = await enqueueRunnerControlEffect(runner, () => stopRunnerOnce(runner, {
         suppressTerminalEvent: command.suppressTerminalEvent === true,
-      });
+        stopCommandRequested: true,
+      }));
+      if (command.retirementId) {
+        if (stopped === false) {
+          const error = new Error('The superseded runner could not be stopped.');
+          error.code = 'session_retirement_stop_incomplete';
+          await postSessionCommandFailure(command, error, 'stop', runner, {
+            bestEffort: false,
+            retryCommand: true,
+          });
+        } else {
+          await postSessionCommandSuccess(command, 'stop', runner);
+        }
+      }
     } catch (cause) {
       const stopError = cause instanceof Error
         ? cause
         : new Error(String(cause || 'Managed Session stop failed.'));
       stopError.code = stopError.code || 'session_stop_incomplete';
-      await postSessionCommandFailure(command, stopError, 'stop', runner);
+      if (command.retirementId) {
+        await postSessionCommandFailure(command, stopError, 'stop', runner, {
+          bestEffort: false,
+          retryCommand: true,
+        });
+      } else {
+        await postSessionCommandFailure(command, stopError, 'stop', runner);
+      }
     }
     return;
   }
@@ -4196,13 +4884,33 @@ async function postCommandFailure(command, error) {
   }
 }
 
-function requestDeferredCommandRetry(commandId, error = null) {
+function explicitCommandLaneState(lane = '') {
+  const normalized = String(lane || '').trim().toLowerCase();
+  return explicitCommandLaneStates.get(normalized) || null;
+}
+
+function requestDeferredCommandRetry(commandId, error = null, lane = '') {
   const normalizedCommandId = Number(commandId || 0);
   if (normalizedCommandId <= 0) return;
-  if (deliveredCommandStates.get(normalizedCommandId) === 'pending') {
-    deliveredCommandStates.delete(normalizedCommandId);
+  rememberProcessedCommandState(normalizedCommandId, 'retrying');
+  const laneState = explicitCommandLaneState(lane);
+  const targetState = laneState || {
+    deliveredCommandStates,
+    deferredCommandRetryIds,
+  };
+  const deliveryStates = [
+    targetState,
+    { deliveredCommandStates, deferredCommandRetryIds },
+    ...explicitCommandLaneStates.values(),
+  ];
+  // Retain the command in the ordered ledger while its terminal receipt is
+  // being retried. Removing it would let a later completed command advance
+  // the through-ACK across the retry gap and lose the command permanently.
+  for (const state of new Set(deliveryStates)) {
+    if (state !== targetState && !state.deliveredCommandStates.has(normalizedCommandId)) continue;
+    state.deliveredCommandStates.set(normalizedCommandId, 'retrying');
+    state.deferredCommandRetryIds.add(normalizedCommandId);
   }
-  deferredCommandRetryIds.add(normalizedCommandId);
   if (error) {
     logAgentTransient(
       `[agent] command ${normalizedCommandId} terminal receipt was not delivered; retrying command:`,
@@ -4211,32 +4919,75 @@ function requestDeferredCommandRetry(commandId, error = null) {
   }
 }
 
-function nextCommandFetchAfter() {
-  if (!deferredCommandRetryIds.size) return lastFetchedCommandId;
+function nextCommandFetchAfter(lane = '') {
+  const laneState = explicitCommandLaneState(lane);
+  const deferred = laneState?.deferredCommandRetryIds || deferredCommandRetryIds;
+  const fetched = laneState?.lastFetchedCommandId ?? lastFetchedCommandId;
+  if (!deferred.size) return fetched;
   let earliestRetryId = Number.MAX_SAFE_INTEGER;
-  for (const commandId of deferredCommandRetryIds) {
+  for (const commandId of deferred) {
     earliestRetryId = Math.min(earliestRetryId, commandId);
   }
-  return Math.min(lastFetchedCommandId, Math.max(0, earliestRetryId - 1));
+  return Math.min(fetched, Math.max(0, earliestRetryId - 1));
 }
 
-async function processPolledCommand(command, expectedRelayInstanceId = '') {
+async function processPolledCommand(
+  command,
+  expectedRelayInstanceId = '',
+  lane = '',
+  expectedRelayGeneration = null
+) {
+  const laneState = explicitCommandLaneState(lane);
+  const delivered = laneState?.deliveredCommandStates || deliveredCommandStates;
+  const deferred = laneState?.deferredCommandRetryIds || deferredCommandRetryIds;
   const commandId = Number(command?.id || 0);
-  if (commandId > 0 && deliveredCommandStates.has(commandId)) {
+  // Do this check before invoking a runner. A command batch can arrive just as
+  // another request observes a Relay restart; executing the old batch would
+  // create a side effect that the later epoch cannot safely acknowledge.
+  if (
+    expectedRelayInstanceId
+    && relayInstanceId
+    && relayInstanceId !== expectedRelayInstanceId
+  ) {
+    return false;
+  }
+  const hasExpectedRelayGeneration = expectedRelayGeneration !== null
+    && typeof expectedRelayGeneration !== 'undefined'
+    && expectedRelayGeneration !== '';
+  if (
+    hasExpectedRelayGeneration
+    && Number.isSafeInteger(Number(expectedRelayGeneration))
+    && Number(expectedRelayGeneration) !== relayObservationGeneration
+  ) {
+    return false;
+  }
+  const deliveryState = commandId > 0 ? delivered.get(commandId) : null;
+  const processedState = commandId > 0 ? processedCommandStates.get(commandId) : null;
+  if (processedState === 'pending' || processedState === 'completed') {
+    delivered.set(commandId, processedState);
+    if (processedState === 'completed') {
+      if (laneState) advanceAcknowledgedCommandId(lane);
+      else advanceAcknowledgedCommandId();
+    }
     return true;
   }
-  if (commandId > 0) deferredCommandRetryIds.delete(commandId);
+  if (deliveryState && deliveryState !== 'retrying') {
+    return true;
+  }
+  if (commandId > 0) deferred.delete(commandId);
   let result = null;
   try {
     result = await handleCommand(command);
   } catch (error) {
     if (error?.retryCommand) {
-      requestDeferredCommandRetry(commandId, error);
+      if (laneState) requestDeferredCommandRetry(commandId, error, lane);
+      else requestDeferredCommandRetry(commandId, error);
       return false;
     }
     if (command?.type === 'host.skills.deployment.apply') {
       logAgentTransient('[agent] will retry deployment result delivery:', error);
-      requestDeferredCommandRetry(commandId);
+      if (laneState) requestDeferredCommandRetry(commandId, null, lane);
+      else requestDeferredCommandRetry(commandId);
       return false;
     }
     await postCommandFailure(command, error);
@@ -4249,90 +5000,164 @@ async function processPolledCommand(command, expectedRelayInstanceId = '') {
     // A response from the previous Relay epoch may contain commands that have
     // already been acknowledged or replaced. Do not advance the new cursor
     // with an old command id.
-    lastCommandId = 0;
-    lastFetchedCommandId = 0;
-    deliveredCommandStates.clear();
-    deferredCommandRetryIds.clear();
+    if (laneState) {
+      laneState.lastCommandId = 0;
+      laneState.lastFetchedCommandId = 0;
+      laneState.deliveredCommandStates.clear();
+      laneState.deferredCommandRetryIds.clear();
+    } else {
+      lastCommandId = 0;
+      lastFetchedCommandId = 0;
+      deliveredCommandStates.clear();
+      deferredCommandRetryIds.clear();
+    }
     return false;
   }
   if (commandId > 0) {
     if (result?.deferAcknowledgement && typeof result.deferAcknowledgement.then === 'function') {
-      deliveredCommandStates.set(commandId, 'pending');
+      delivered.set(commandId, 'pending');
+      rememberProcessedCommandState(commandId, 'pending');
       const deliveryEpoch = expectedRelayInstanceId || relayInstanceId || '';
       const completeDeferredCommand = () => {
         if (deliveryEpoch && relayInstanceId && deliveryEpoch !== relayInstanceId) return;
-        if (deliveredCommandStates.get(commandId) !== 'pending') return;
-        deliveredCommandStates.set(commandId, 'completed');
-        advanceAcknowledgedCommandId();
+        if (delivered.get(commandId) !== 'pending') return;
+        synchronizeProcessedCommandState(commandId, 'completed');
       };
       const retryDeferredCommand = (error) => {
         if (deliveryEpoch && relayInstanceId && deliveryEpoch !== relayInstanceId) return;
-        requestDeferredCommandRetry(commandId, error);
+        requestDeferredCommandRetry(commandId, error, lane);
       };
       result.deferAcknowledgement.then(completeDeferredCommand, retryDeferredCommand);
     } else {
-      deliveredCommandStates.set(commandId, 'completed');
-      advanceAcknowledgedCommandId();
+      rememberProcessedCommandState(commandId, 'completed');
+      delivered.set(commandId, 'completed');
+      if (laneState) advanceAcknowledgedCommandId(lane);
+      else advanceAcknowledgedCommandId();
     }
   }
   return true;
 }
 
-function advanceAcknowledgedCommandId() {
-  const ordered = Array.from(deliveredCommandStates.keys())
-    .filter((commandId) => commandId > lastCommandId)
+function advanceAcknowledgedCommandId(lane = '') {
+  const laneState = explicitCommandLaneState(lane);
+  const delivered = laneState?.deliveredCommandStates || deliveredCommandStates;
+  const previousAck = laneState?.lastCommandId ?? lastCommandId;
+  const ordered = Array.from(delivered.keys())
+    .filter((commandId) => commandId > previousAck)
     .sort((left, right) => left - right);
-  let throughId = lastCommandId;
+  let throughId = previousAck;
   for (const commandId of ordered) {
-    if (deliveredCommandStates.get(commandId) !== 'completed') break;
+    if (delivered.get(commandId) !== 'completed') break;
     throughId = commandId;
   }
-  if (throughId <= lastCommandId) return lastCommandId;
-  lastCommandId = throughId;
+  if (throughId <= previousAck) return previousAck;
+  if (laneState) laneState.lastCommandId = throughId;
+  else lastCommandId = throughId;
   for (const commandId of ordered) {
-    if (commandId <= throughId) deliveredCommandStates.delete(commandId);
+    if (commandId <= throughId) delivered.delete(commandId);
   }
-  return lastCommandId;
+  return throughId;
 }
 
-async function acknowledgeCommandsBeforeShutdown() {
-  const throughId = Number(lastCommandId || 0);
+async function acknowledgeCommandsBeforeShutdown(lane = '') {
+  const laneState = explicitCommandLaneState(lane);
+  const throughId = Number(laneState?.lastCommandId ?? lastCommandId) || 0;
   if (throughId <= 0) return true;
-  const result = await fetchJson(
-    `${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${Number.MAX_SAFE_INTEGER}&ack=${throughId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}`,
-    {
-      retryOnTransient: true,
-      headers: managedAgentRequestHeaders(),
-    }
-  );
-  if (observeRelayInstance(result.body)) {
+  const laneQuery = laneState ? `&lane=${encodeURIComponent(lane)}` : '';
+  const responseContext = captureRelayResponseContext();
+  let result;
+  try {
+    result = await fetchJson(
+      `${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${Number.MAX_SAFE_INTEGER}&ack=${throughId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}${laneQuery}`,
+      {
+        retryOnTransient: true,
+        headers: managedAgentRequestHeaders(),
+      }
+    );
+  } catch (error) {
+    error.relayResponseContext = responseContext;
+    throw error;
+  }
+  const observation = observeRelayResponse(result.body, responseContext, {
+    observeCommandLanes: true,
+    inferLegacyCommandLanes: true,
+    observeAgentLease: true,
+  });
+  if (observation.stale) return false;
+  if (observation.relayChanged) {
     await ensureHostRegistration();
     return false;
   }
-  forgetAcknowledgedSessionInputReceipts(throughId);
+  if (!laneState || lane === 'normal') {
+    forgetAcknowledgedSessionInputReceipts(throughId);
+  }
   return true;
 }
 
-async function pollCommandsLoop() {
+async function pollCommandsLoop(lane = '') {
+  const laneState = explicitCommandLaneState(lane);
+  const laneLabel = laneState ? lane : 'legacy';
   while (true) {
     if (managedSessionStartGate.isShuttingDown() && !hostAgentShutdownRetryPending) {
+      return;
+    }
+    if ((laneState && !relaySupportsCommandLanes) || (!laneState && relaySupportsCommandLanes)) {
       return;
     }
     let requestLeaseId = '';
     try {
       const headers = managedAgentRequestHeaders();
       requestLeaseId = String(headers['X-Remote-Codex-Agent-Lease'] || '').trim();
-      const acknowledgedThroughId = lastCommandId;
-      const fetchAfterId = nextCommandFetchAfter();
-      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${fetchAfterId}&ack=${acknowledgedThroughId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}`, {
+      const responseContext = captureRelayResponseContext();
+      const requestRelayInstanceId = responseContext.relayInstanceId;
+      const acknowledgedThroughId = laneState?.lastCommandId ?? lastCommandId;
+      const fetchAfterId = laneState
+        ? nextCommandFetchAfter(laneLabel)
+        : nextCommandFetchAfter();
+      const laneQuery = laneState ? `&lane=${encodeURIComponent(laneLabel)}` : '';
+      const result = await fetchJson(`${RELAY_URL}/api/agent/commands?hostId=${encodeURIComponent(HOST_ID)}&after=${fetchAfterId}&ack=${acknowledgedThroughId}&relayInstanceId=${encodeURIComponent(relayInstanceId || '')}${laneQuery}`, {
         retryOnTransient: true,
         headers,
       });
-      const relayEpochChanged = observeRelayInstance(result.body);
+      const responseRelayInstanceId = String(result.body?.relayInstanceId || '').trim();
+      if (
+        requestRelayInstanceId
+        && relayInstanceId
+        && requestRelayInstanceId !== relayInstanceId
+        && responseRelayInstanceId === requestRelayInstanceId
+      ) {
+        // The other poll lane already adopted a newer Relay epoch. Ignore this
+        // late response instead of reverting the shared epoch and replaying an
+        // obsolete command batch.
+        continue;
+      }
+      const relayObservation = observeRelayResponse(result.body, responseContext, {
+        observeCommandLanes: true,
+        inferLegacyCommandLanes: true,
+        observeAgentLease: true,
+      });
+      if (relayObservation.stale) {
+        continue;
+      }
+      const relayEpochChanged = relayObservation.relayChanged;
       if (relayEpochChanged) {
         await ensureHostRegistration();
-      } else {
+      } else if (!laneState || laneLabel === 'normal') {
         forgetAcknowledgedSessionInputReceipts(acknowledgedThroughId);
+      }
+      if (
+        laneState
+        && relayObservation.commandLaneObservationAccepted
+        && (
+          result.body?.commandLanesV1 !== true
+          || String(result.body?.lane || '').trim().toLowerCase() !== laneLabel
+        )
+      ) {
+        // A Relay older than the lane protocol may ignore the query and return
+        // the complete queue. Stop this worker; the caller will continue with
+        // the legacy single-lane worker after registration refresh.
+        relaySupportsCommandLanes = false;
+        return;
       }
       const batchRelayInstanceId = String(
         result.body?.relayInstanceId || relayInstanceId || ''
@@ -4348,24 +5173,47 @@ async function pollCommandsLoop() {
           && relayInstanceId
           && relayInstanceId !== batchRelayInstanceId
         ) {
-          lastCommandId = 0;
-          lastFetchedCommandId = 0;
-          deliveredCommandStates.clear();
-          deferredCommandRetryIds.clear();
+          if (laneState) {
+            laneState.lastCommandId = 0;
+            laneState.lastFetchedCommandId = 0;
+            laneState.deliveredCommandStates.clear();
+            laneState.deferredCommandRetryIds.clear();
+          } else {
+            lastCommandId = 0;
+            lastFetchedCommandId = 0;
+            deliveredCommandStates.clear();
+            deferredCommandRetryIds.clear();
+          }
           await ensureHostRegistration();
           break;
         }
         if (
           command?.type === 'host.shutdown'
-          && !(await acknowledgeCommandsBeforeShutdown())
+          && !(await acknowledgeCommandsBeforeShutdown(laneLabel === 'legacy' ? '' : laneLabel))
         ) {
           break;
         }
-        const processed = await processPolledCommand(command, batchRelayInstanceId);
+        const processed = await processPolledCommand(
+          command,
+          batchRelayInstanceId,
+          laneLabel === 'legacy' ? '' : laneLabel,
+          responseContext.generation
+        );
         if (!processed) {
-          break;
+          // A retrying command remains an ACK barrier in the lane ledger, but
+          // it must not starve later Stop/Interrupt/approval work in the same
+          // fetched batch. Completed commands after the gap are remembered and
+          // cannot advance the through-ACK until the retry succeeds.
+          continue;
         }
-        lastFetchedCommandId = Math.max(lastFetchedCommandId, Number(command?.id || 0));
+        if (laneState) {
+          laneState.lastFetchedCommandId = Math.max(
+            laneState.lastFetchedCommandId,
+            Number(command?.id || 0)
+          );
+        } else {
+          lastFetchedCommandId = Math.max(lastFetchedCommandId, Number(command?.id || 0));
+        }
         if (command?.type === 'host.shutdown') {
           return;
         }
@@ -4373,7 +5221,9 @@ async function pollCommandsLoop() {
       await sleep(POLL_INTERVAL_MS);
     } catch (error) {
       try {
-        if (await recoverAgentLeaseForRequest(error, requestLeaseId)) {
+        if (await recoverAgentLeaseForRequest(error, requestLeaseId, error?.relayResponseContext || null, {
+          observeCommandLanes: true,
+        })) {
           continue;
         }
       } catch (recoveryError) {
@@ -4387,9 +5237,33 @@ async function pollCommandsLoop() {
         await shutdownForRelayOwnershipLoss(error);
         return;
       }
-      logAgentTransient('[agent] command poll failed:', error);
+      logAgentTransient(`[agent] ${laneLabel} command poll failed:`, error);
       await sleep(Math.max(POLL_INTERVAL_MS, 3000));
     }
+  }
+}
+
+// Negotiate the lane protocol once during registration, then keep two polling
+// workers alive. If the Relay is older (or changes epoch without advertising
+// lanes), fall back to the original single FIFO worker so legacy deployments
+// remain fully compatible.
+async function commandPollingCoordinator() {
+  while (true) {
+    if (managedSessionStartGate.isShuttingDown() && !hostAgentShutdownRetryPending) {
+      return;
+    }
+    if (relaySupportsCommandLanes) {
+      await Promise.all([
+        pollCommandsLoop('normal'),
+        pollCommandsLoop('control'),
+      ]);
+    } else {
+      await pollCommandsLoop();
+    }
+    if (managedSessionStartGate.isShuttingDown() && !hostAgentShutdownRetryPending) {
+      return;
+    }
+    await sleep(100);
   }
 }
 
@@ -4463,7 +5337,12 @@ async function heartbeatLoop() {
       await sleep(5000);
     } catch (error) {
       try {
-        if (await recoverAgentLeaseForRequest(error, requestLeaseId)) {
+        if (await recoverAgentLeaseForRequest(
+          error,
+          requestLeaseId,
+          error?.relayResponseContext || null,
+          { observeCommandLanes: true }
+        )) {
           continue;
         }
       } catch (recoveryError) {
@@ -4488,7 +5367,21 @@ function sleep(ms) {
 }
 
 async function runStartupDiscovery() {
-  await retryStartupStep('send initial discovery', sendDiscovery);
+  try {
+    await sendDiscovery();
+  } catch (error) {
+    const recoverable = isTransientFetchError(error)
+      || Number(error?.statusCode || 0) === 413
+      || new Set([
+        'discovery_metadata_too_large',
+        'discovery_preview_too_large',
+        'discovery_preview_transport_unsupported',
+      ]).has(error?.code);
+    if (!recoverable || isRelayHostDismissedError(error) || isRelayOwnershipRevokedError(error)) {
+      throw error;
+    }
+    logAgentError('[agent] initial discovery failed; heartbeat and command polling will continue:', error.message);
+  }
 }
 
 async function runStartupTailPrime() {
@@ -4548,7 +5441,7 @@ async function main() {
   hostSkillInventory.start();
   await runStartupDiscovery();
 
-  const loops = [pollCommandsLoop(), heartbeatTask, discoveryLoop(), codexTailLoop()];
+  const loops = [commandPollingCoordinator(), heartbeatTask, discoveryLoop(), codexTailLoop()];
   void runStartupTailPrime();
   void runStartupAutoStart();
 
