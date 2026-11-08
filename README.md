@@ -1,169 +1,304 @@
-# Remote Codex：手机也能控制 Codex 长任务
+# Mobile Codex Remote
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <p align="center">
-  <img src="docs/assets/readme/workspace-mobile-chat-2026.png" alt="手机端对话、推理过程和输入区" width="27%" />
-  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="桌面端新版工作台和对话界面" width="70%" />
+  <img src="docs/assets/readme/workspace-mobile-chat-2026.png" alt="Mobile conversation, reasoning, and composer" width="27%" />
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="Updated desktop workspace and conversation" width="70%" />
 </p>
 
-新版界面示例使用隔离测试数据：同一个 Remote Codex 控制台可跨设备查看和接管 Codex 长任务。
+These updated UI screenshots use isolated sample data. The same Remote Codex control plane runs across phone, desktop, Linux, and HPC hosts.
 
-把 Codex 变成一个可以在手机、Windows、Linux、远程服务器和 HPC 集群之间接力使用的 AI 工作台。
-不用一直守在电脑前：你可以在手机上看进度、接管对话、上传文件、导入历史上下文，并在上下文丢失时一键把当前会话重新附加回 prompt。
+Chinese guide: [README.zh-CN.md](README.zh-CN.md)
+Release notes: [docs/releases/v2.4.12.md](docs/releases/v2.4.12.md)
 
-> 完整中文手册：[README.zh-CN.md](README.zh-CN.md)
-> English guide: [README.en.md](README.en.md)
-> 本版更新说明：[docs/releases/v2.4.12.md](docs/releases/v2.4.12.md)
+Mobile Codex Remote is a browser control plane for Codex sessions running on local computers, remote Linux hosts, and HPC clusters. It gives you one web UI for starting, resuming, forking, steering, interrupting, reviewing, exporting, importing, and monitoring Codex work from a desktop browser or phone.
 
-## v2.4.12 重点更新
+## What's New in v2.4.12
 
-- 新建、恢复和切换 API 的 Session 生命周期协调，覆盖普通 HTTP 手机入口和多标签并发。
-- 内置可调整大小的终端，以及 CIF、XYZ、XSF、PDB/PBD、VASP/POSCAR 等结构文件的三维预览。
-- Thinking 历史、未读通知、运行指示和队列状态的同步与展示修复。
-- 远端历史发现分批传输；首次发现遇到网络错误时，Agent 仍可继续心跳和接收命令。
+- Coordinated Session start, resume, and API switching across browser tabs and ordinary LAN/Tailscale HTTP access.
+- Added a resizable in-page terminal and 3D previews for CIF, XYZ, XSF, PDB/PBD, and VASP/POSCAR structures.
+- Improved Thinking history, unread notifications, runtime indicators, and queue state.
+- Batched remote Session discovery so initial network errors do not block Agent heartbeats or commands.
 
-## 它解决什么问题？
+v2.01 notes archive: [README_v2.01.md](README_v2.01.md)
 
-- Codex 跑长任务时，你不用一直坐在工位电脑前。
-- 手机可以直接看 thinking、输出、报错、文件、请求确认和运行状态。
-- 图片、本地文本文件、远程生成文件都能进入同一条可见附件链路。
-- 对话之间可以互相导入内容：把一个会话的历史、thinking、图片、文件附加到另一个会话继续问。
-- 上下文丢失或 compact 后不放心时，可以点 `Current`，一键把当前会话导出并重新附加到输入栏。
-- Windows 可以一键启动；远程 Linux/HPC 可以用 host-agent 或 connector 接入。
+## Features
 
-## 手机效果
+- Multi-host control for local PCs, remote Linux machines, and HPC login nodes.
+- Session discovery from each host's Codex home, usually `~/.codex`.
+- Managed Codex app-server sessions with new, resume, fork, stop, interrupt, steer, compact, plan, and review controls.
+- Conversation search by keyword, path, title-like metadata, and message content.
+- Conversation sorting by created time, recently updated time, or message count.
+- Real-time Codex rollout JSONL tailing for imported history, runtime status, token usage, diagnostics, requests, and transcript updates.
+- Composer attachments for local files, images, host image paths, prompt cards, skills, and imported conversation history.
+- Conversation export to Markdown, JSON, or Zip bundle, with filters for date range, thinking/activity, images, files, extensions, and selected files.
+- Conversation import from the current session or multiple other sessions, each with per-session thinking/images/files options.
+- Browser-to-host file transfer, chunked large uploads, cached inline image/text handling, and remote file cards for generated outputs.
+- Model and skill list controls with retry cooldowns to avoid repeated background timeout spam.
+- Request-user-input UI for plan-mode/model prompts that ask the user to choose options or enter custom text.
+- Per-host API profiles for OpenAI-compatible API keys and base URLs.
+- Isolated managed Codex homes to reduce conflicts with an interactive local Codex CLI.
+- Mobile-friendly navigator, transcript controls, image preview, status windows, alerts, and compact runtime chips.
+- HPC connector profiles with SSH key, password, keyboard-interactive, OTP/MFA, gateway/jump host, tmux bootstrap, and detached fallback.
 
-<p align="center">
-  <img src="docs/assets/readme/workspace-mobile-navigation-2026.png" alt="手机端主机和会话导航" width="32%" />
-  <img src="docs/assets/readme/workspace-mobile-chat-2026.png" alt="手机端对话与推理过程" width="32%" />
-</p>
-
-## Windows 桌面端使用方法
-
-Windows 端和手机端使用同一套网页 UI。双击 `start-windows.bat` 后，在左侧选择本机 host，例如 `ILLUIN Windows`，就可以在桌面浏览器里管理本机、远程 Linux 和 HPC 上的 Codex 会话。
-
-<p align="center">
-  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="Windows 桌面端新版工作台" width="90%" />
-</p>
-
-- 文件在线可视化、下载和打开：Codex 输出本机或远端文件路径后，页面会显示文件卡片。图片和 SVG 可以 `Preview`，文件可以 `Open` 或 `Save`；已经缓存到 relay 的图片和文本会一起进入 transcript 和 export。
-- 自动扫描所有对话并导入：host-agent 会扫描对应 host 的 Codex home，通常是 `%USERPROFILE%\.codex\sessions` 或 `~/.codex/sessions`，把历史会话自动导入左侧列表。`Current` 可以把当前会话重新附加到输入框，`Others` 可以多选其他会话作为上下文。
-- API 切换：在 `Settings -> API profiles` 新建 OpenAI 兼容 profile，填写 Base URL 和 API Key，再在 Host API 映射里给 Windows、Linux 或 HPC 分别指定 profile。新建或重启 managed session 后生效，已经运行的 session 会继续使用启动时的 API 环境。
-- 对话历史导入导出：`Export` 支持 Markdown、JSON 和 Zip bundle，可以按日期范围、具体日期、thinking/activity、图片、文件扩展名和具体文件筛选。导出的 `.history.md` 和 `.history.zip` 可以继续作为附件放回 composer。
-- 跨平台导入导出：Windows、远程 Linux 和 HPC 会话都在同一个 relay 里展示。你可以从一个 host 导出历史和文件，再附加到另一个 host 的会话继续问；Zip 里会保留已缓存的图片和文件，原始路径也会保留便于回到对应机器查找。
-
-## 30 秒启动
-
-### Windows 用户
-
-双击仓库根目录的：
+## Architecture
 
 ```text
-start-windows.bat
+phone/browser -> relay web/API server -> host-agent -> Codex app-server
+                                      -> local files / HPC workspace
 ```
 
-它会自动：
+- `apps/relay` serves the web UI, stores lightweight state, relays commands/events, caches received files, and exports session bundles.
+- `apps/host-agent` runs on each controlled host and owns managed runtimes such as Codex app-server.
+- `apps/mobile-web` is the browser UI used by desktop and phone clients.
+- `shared` contains protocol, connector, discovery, transcript, and storage helpers.
 
-- 启动 relay；
-- 启动本地 host-agent；
-- 打开浏览器；
-- 默认使用 `http://127.0.0.1:8797`；
-- 日志写入 `tmp/windows-start/`。
+The relay is intended for trusted private networks. For phone access outside the same LAN, use a private network such as Tailscale rather than exposing the relay directly to the public internet.
 
-也可以手动指定端口：
+## Requirements
 
-```powershell
-.\start-windows.bat -Port 8797
-```
+- Node.js 22 or newer is recommended.
+- Git.
+- Codex CLI installed on each host you want to control.
+- OpenSSH on the relay machine if you want to bootstrap remote or HPC hosts.
+- PowerShell on Windows if you use the one-click launcher.
 
-### macOS / Linux / 通用 Node 启动
+## Install
 
 ```bash
 git clone https://github.com/lanchoxie/remote_codex.git
 cd remote_codex
-npm run dev
 ```
 
-然后打开：
-
-```text
-http://127.0.0.1:8787
-```
-
-首次启动需安装锁定版本的依赖：
+Install the locked dependencies before the first start:
 
 ```bash
 npm ci
 ```
 
-## 适合谁？
+## Updating Without Losing Local Data
 
-- 经常让 Codex 跑长任务、改代码、看日志的人。
-- 想用手机盯进度，而不是一直开着电脑的人。
-- 有远程 Linux、实验室服务器、学校 HPC 集群的人。
-- 经常让 Codex 读图片、实验结果、Markdown、代码文件的人。
-- 需要把一个会话的历史和文件导入另一个会话继续分析的人。
-- 担心 compact 或上下文丢失，希望能一键恢复当前会话上下文的人。
+When updating in the same repository directory, pull the latest code and restart the relay/agent:
 
-## 核心功能
-
-### 手机远程控制 Codex
-
-在电脑或服务器上跑 Codex，用手机打开网页就能看：
-
-- 当前 host 和会话；
-- Codex thinking / runtime 状态；
-- token usage、alerts、requests；
-- 输出文件、图片、报错；
-- 需要你确认的 approval 或问题选项。
-
-### 对话之间互相导入
-
-这是这一版最重要的能力之一。
-
-- `Current`：把当前会话导出成 history 附件，直接放进 composer。上下文丢了、compact 后不放心、或者想让模型重新参考当前会话时，点一下就能恢复。
-- `Others`：选择其他一个或多个会话，把它们的历史附加到当前 prompt。
-- 每个会话都可以单独选择是否包含 `Thinking / Images / Files`。
-- 小的历史会作为 Markdown 文本附件；包含图片/文件时会额外生成 Zip bundle。
-
-### 文件和图片直接发给 Codex
-
-- 拖拽文件到输入框；
-- 粘贴或上传图片；
-- 本地文本文件会作为可见附件进入 transcript；
-- 远程生成文件会显示成文件卡片，可打开或保存；
-- 大文件支持分片上传，但超大数据集仍建议放在 host 文件系统里，让 Codex 读路径。
-
-### Plan mode 和选择框
-
-Plan mode 下，如果模型需要你选择方案或输入自定义内容，页面会弹出表单。
-支持选项单选、`Other` 自定义输入、提交状态和移动端适配。
-
-### Windows、本地、远程 Linux、HPC
-
-结构很简单：
-
-```text
-浏览器/手机 -> relay -> host-agent -> Codex app-server
+```bash
+git pull --ff-only
 ```
 
-- Windows 本地：双击 `start-windows.bat`。
-- 同局域网 Linux：Linux 上运行 host-agent，连到 Windows relay。
-- 学校集群不互通：推荐把 relay 跑在集群上，然后 Windows 用 SSH tunnel 打开网页。
-- 有公网/实验室中转机器：relay 跑在中转机器，Windows 和集群都连它。
+Windows launcher users can restart with:
 
-更详细的远程和 HPC 设置看：[README.zh-CN.md](README.zh-CN.md#添加远程主机或-hpc)。
+```powershell
+.\scripts\start-windows.ps1 -Restart
+```
 
-## 安装要求
+Collections, Trash, manual titles, and local logs are not tracked by git, so a normal `git pull` does not overwrite them. By default they live in:
 
-- Node.js 22 或更新版本。
-- Git。
-- Codex CLI。
-- Windows 一键启动需要 PowerShell。
-- 远程/HPC bootstrap 需要 OpenSSH。
+- `tmp/session-collections.json`: collections, Trash, and collection membership.
+- `tmp/session-metadata.json`: manual titles and other session metadata.
+- `tmp/session-logs.json`: relay-side session logs.
+- `tmp/session-diagnostics.json`: diagnostics cache.
 
-Codex CLI 远程安装示例：
+If you clone into a new directory, stop the old relay first, then copy those `tmp/session-*.json` files into the new clone's `tmp/` directory. You can also point a new checkout at the old files with `SESSION_COLLECTIONS_PATH`, `SESSION_METADATA_PATH`, `SESSION_LOGS_PATH`, and `SESSION_DIAGNOSTICS_PATH`.
+
+## Quick Start
+
+### Windows one-click launcher
+
+Double-click:
+
+```text
+start-windows.bat
+```
+
+The launcher runs `scripts/start-windows.ps1`. By default it:
+
+- uses port `8797` unless `PORT` or `-Port` is set;
+- starts the relay in one PowerShell window;
+- starts a local host-agent in another PowerShell window;
+- writes logs to `tmp/windows-start/`;
+- opens `http://127.0.0.1:8797` in the browser.
+
+Examples:
+
+```powershell
+.\start-windows.bat
+.\start-windows.bat -Port 8787
+.\start-windows.bat -Port 8797 -HostId my-pc -HostLabel "My PC" -NoBrowser
+.\scripts\start-windows.ps1 -DryRun
+```
+
+Keep the relay and host-agent windows open while using the app.
+
+### Windows desktop workflow
+
+The Windows desktop UI is the same browser app used on phones, but the wider layout shows the navigator, transcript, file cards, and settings at the same time. After launching, choose your local Windows host, for example `ILLUIN Windows`, from the left `Current Host` selector.
+
+<p align="center">
+  <img src="docs/assets/readme/workspace-desktop-2026.png" alt="Updated Windows desktop workspace" width="90%" />
+</p>
+
+Common Windows-side workflows:
+
+- Online file preview, download, and open: when Codex outputs a local or remote file path, the transcript renders a file card. Images and SVG files can be previewed with `Preview`, local files can be opened with `Open`, and any file can be downloaded with `Save`. Files already cached by the relay stay available in transcript/export bundles; very large files should remain on the host filesystem and be referenced by path.
+- Automatic conversation scan and import: the host-agent scans the host Codex home, usually `%USERPROFILE%\.codex\sessions` on Windows or `~/.codex/sessions` on Linux/HPC, then imports those history sessions into the left conversation list. Use search, sorting, collections, `Current`, `Others`, or `Resume From History` to reuse that context.
+- API switching: open `Settings -> API profiles`, create an OpenAI-compatible profile with Base URL and API Key, then map each host to the profile it should use. `Ping` tests the selected host/profile pair. Profile changes apply to newly started or restarted managed Codex app-server sessions; already running sessions keep the API environment they started with.
+- Conversation history import/export: `Export` creates Markdown, JSON, or Zip bundles with date range filters, per-date multi-select, `Select all dates`, thinking/activity, images, files, extension filters, and specific file selection. `Current` attaches the selected conversation export back to the composer, while `Others` can import multiple other conversations with per-session options.
+- Cross-platform import/export: Windows, remote Linux, and HPC sessions appear in the same relay. You can export a `.history.md` plus `.history.zip` from one host and attach it to a session on another host. Zip bundles include cached files, while Markdown keeps original host paths so you can still find files on the machine that produced them.
+
+### npm scripts
+
+Start the relay and one local host-agent:
+
+```bash
+npm run dev
+```
+
+Open:
+
+```text
+http://127.0.0.1:8787
+```
+
+Useful scripts:
+
+```bash
+npm run dev
+npm run relay
+npm run agent
+npm run test:managed
+```
+
+- `npm run dev` starts relay plus a local host-agent.
+- `npm run relay` starts only the relay server.
+- `npm run agent` starts only the current machine's host-agent.
+- `npm run test:managed` runs a managed-session and file-transfer smoke test.
+
+Custom port:
+
+```bash
+PORT=8797 npm run relay
+```
+
+Windows PowerShell:
+
+```powershell
+$env:PORT = "8797"
+npm run relay
+```
+
+## Browser Usage
+
+Common actions:
+
+- `New In Directory` starts Codex in a selected host directory.
+- `Resume From History` turns an imported history session into a live managed session.
+- `Fork New Branch` starts a new branch from the selected conversation.
+- `Stop Session` stops the current live process while preserving history.
+- `Interrupt` interrupts the current Codex turn.
+- `Steer` adds guidance to the active turn when supported.
+- `Plan` toggles persistent plan-only sending until you exit plan mode.
+- `Review` starts Codex review for the current workspace.
+- `Compact Context` uses the Codex app-server native compact flow.
+- `Export` saves conversation history as Markdown, JSON, or Zip bundle.
+- `Current` / `Others` in the composer import conversation exports into the attachment bar.
+
+Composer shortcuts:
+
+- `Enter` sends the message.
+- `Shift+Enter` inserts a newline.
+- Type `/` to open the command menu.
+- Use `+`, drag-and-drop, or paste to attach files/images.
+
+## History Export And Import
+
+Export supports:
+
+- Markdown, JSON, or Zip bundle.
+- Date range filtering.
+- Optional thinking/activity.
+- Optional images and non-image files.
+- File extension filters.
+- Specific file selection.
+
+Import supports:
+
+- `Current`: attach the selected conversation export to the current composer.
+- `Others`: select multiple other conversations and choose thinking/images/files per conversation.
+
+Each imported conversation adds a Markdown history attachment. If images or files are included, a Zip bundle is also attached. Small Markdown history files are inlined as text attachments; larger history files are uploaded as normal files.
+
+## File Transfer
+
+- Browser file uploads go to the selected host.
+- Large files use chunked relay-to-agent upload.
+- Inline images and text files are cached by the relay so they show as file cards in transcript/export views.
+- Generated or received remote files can be opened or saved from message cards.
+- Very large datasets should stay on the host filesystem; send Codex the path instead of uploading through the browser.
+
+## Phone Access
+
+If your phone and relay machine are on the same LAN, open the relay machine's LAN IP:
+
+```text
+http://192.168.1.20:8787
+```
+
+Replace the IP and port with your actual relay address.
+
+## Tailscale Access
+
+Tailscale download:
+
+```text
+https://tailscale.com/download
+```
+
+Recommended flow:
+
+1. Install Tailscale on the relay machine and phone.
+2. Sign both devices into the same tailnet.
+3. Start the relay and host-agent on the relay machine.
+4. Find the relay machine's Tailscale IP, usually `100.x.y.z`.
+5. Open this from the phone:
+
+```text
+http://100.x.y.z:8787
+```
+
+If you run the relay on another port, replace `8787` with that port.
+
+## Add A Remote Or HPC Host
+
+Open:
+
+```text
+Settings -> Hosts and connectors -> Manage HPC
+```
+
+Create a connector profile with:
+
+- `Label`: display name such as `dm`, `hkl`, or `lab-gpu`.
+- `Relay URL`: the relay URL reachable from the remote host.
+- `Target host`: remote login node or server address.
+- `Target port`: SSH port.
+- `Login username`: SSH username.
+- `CODEX_HOME`: usually `~/.codex`.
+- `Workspace roots`: browseable root directories, one per line.
+- `Remote agent directory`: for example `~/mobile-codex-remote`.
+- `tmux session name`: for example `codex-remote`; if `tmux` is missing, `Start Agent` falls back to a detached process with a pid file.
+
+Then use:
+
+- `Run Test` to validate SSH login.
+- `Start Agent` to deploy and start the remote host-agent.
+- `Restart Agent` after updating this repository.
+- `Check Status` to inspect the remote tmux session or detached agent process.
+
+If the cluster uses OTP/MFA, the connector flow prompts for fresh interactive values when SSH asks for them.
+
+## Install Codex CLI On Remote Hosts
+
+For HPC/conda environments:
 
 ```bash
 conda create -n codex-node -c conda-forge nodejs=20 -y
@@ -172,73 +307,53 @@ npm install -g @openai/codex
 codex --help
 ```
 
-## Windows setup helpers
-
-For a fresh Windows checkout, double-click:
-
-```text
-Setup and Start Remote Codex.bat
-```
-
-This runs `download-runtimes.bat` first. The downloader fetches the two release runtime assets directly
-(`node-v16.20.2-linux-x64.tar.xz` and `codex-linux-x86_64.zip`) and fills the local runtime cache under `tmp/`:
-
-```text
-tmp/node-v16.20.2-linux-x64.tar.xz
-tmp/codex-linux-x86_64/
-```
-
-Then it starts `scripts/start-windows.ps1`. Advanced users can double-click `Start Remote Codex.bat` after the runtime cache already exists.
-
-Release maintainers can generate those direct runtime assets from the local `tmp/` cache with:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\prepare-runtime-release-assets.ps1
-```
-
-Install-helper defaults live in `config/remote-codex.defaults.json`. The future interactive helper should copy user-specific overrides to `config/remote-codex.local.json`; that local file is ignored by Git and can store machine-specific Codex paths such as `CODEX_HOME` or a custom remote `codex` binary hint.
-
-## 常用命令
+For a personal Linux server:
 
 ```bash
-npm run dev            # relay + 本地 host-agent
-npm run relay          # 只启动 relay
-npm run agent          # 只启动 host-agent
-npm run test:managed   # smoke test
+curl -fsSL https://fnm.vercel.app/install | bash
+source ~/.bashrc
+fnm install 20
+fnm use 20
+npm install -g @openai/codex
+codex --help
 ```
 
-检查代码：
+After installing Codex CLI, restart the remote host-agent.
+
+## API Profiles
+
+Open:
+
+```text
+Settings -> API profiles
+```
+
+You can create multiple OpenAI-compatible API profiles and map different hosts to different profiles. Profile changes apply when starting or restarting managed Codex app-server sessions. Already running sessions keep the API environment they started with.
+
+Managed sessions use isolated Codex homes so API profiles and app-server state do not overwrite the host's default interactive Codex configuration.
+
+## Development Checks
 
 ```bash
 node --check apps/relay/server.js
 node --check apps/host-agent/agent.js
 node --check apps/host-agent/codex-app-server-runner.js
 node --check apps/mobile-web/public/app.js
+npm run test:managed
 ```
 
-## 手机访问
+## Troubleshooting
 
-同一局域网下，用电脑的局域网 IP：
+- If model or skill lists time out, restart the selected managed session and host-agent, then use the manual refresh button.
+- If API key or base URL changes do not apply, restart the affected managed session.
+- If a Windows launcher window closes immediately, run `.\scripts\start-windows.ps1 -DryRun` or inspect `tmp/windows-start/*.log`.
+- If a remote connector starts stale code, use `Restart Agent` after pulling the repository update on the relay machine.
+- If a browser upload is too large, keep the file on the host and send Codex its path.
 
-```text
-http://192.168.1.20:8797
-```
+## Current Limitations
 
-跨网络推荐 Tailscale：
-
-```text
-http://100.x.y.z:8797
-```
-
-不要把 relay 裸露到公网。需要公网使用时，请至少配置私有网络、反代认证或可信访问控制。
-
-## 小红书一句话版
-
-我把 Codex 做成了手机遥控器：Windows 双击启动，手机看进度，图片和文件直接发给 Codex，还能把一个会话的历史导入另一个会话继续问。长任务不用守电脑了。
-
-## 文档入口
-
-- 完整中文使用手册：[README.zh-CN.md](README.zh-CN.md)
-- English guide: [README.en.md](README.en.md)
-- 更新报告：[docs/update-report-2026-06-05.md](docs/update-report-2026-06-05.md)
-- 旧版 v2.01 说明：[README_v2.01.md](README_v2.01.md)
+- Runtime state is lightweight and mostly relay-local; host-agents rehydrate live state after reconnecting.
+- Imported history sessions become interactive only after resume or fork.
+- Active controls such as stop, interrupt, and queued prompts require a managed Codex app-server session.
+- HPC SSH/MFA policies vary by cluster, so connector profiles may need cluster-specific tuning.
+- Browser transfer is convenient for working files, not a replacement for host-side datasets.

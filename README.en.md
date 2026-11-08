@@ -9,11 +9,17 @@
 
 These updated UI screenshots use isolated sample data. The same Remote Codex control plane runs across phone, desktop, Linux, and HPC hosts.
 
-Chinese landing page: [README.md](README.md)
-Detailed Chinese guide: [README.zh-CN.md](README.zh-CN.md)
+Chinese guide: [README.zh-CN.md](README.zh-CN.md)
 Release notes: [docs/releases/v2.4.12.md](docs/releases/v2.4.12.md)
 
 Mobile Codex Remote is a browser control plane for Codex sessions running on local computers, remote Linux hosts, and HPC clusters. It gives you one web UI for starting, resuming, forking, steering, interrupting, reviewing, exporting, importing, and monitoring Codex work from a desktop browser or phone.
+
+## What's New in v2.4.12
+
+- Coordinated Session start, resume, and API switching across browser tabs and ordinary LAN/Tailscale HTTP access.
+- Added a resizable in-page terminal and 3D previews for CIF, XYZ, XSF, PDB/PBD, and VASP/POSCAR structures.
+- Improved Thinking history, unread notifications, runtime indicators, and queue state.
+- Batched remote Session discovery so initial network errors do not block Agent heartbeats or commands.
 
 v2.01 notes archive: [README_v2.01.md](README_v2.01.md)
 
