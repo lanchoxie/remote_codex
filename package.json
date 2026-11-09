@@ -12,7 +12,8 @@
     "test:managed": "node scripts/test-managed-session.js",
     "test:open-terminal": "node scripts/test-open-terminal.js && node scripts/test-open-terminal-ui.js",
     "test:ui-modules": "node scripts/test-mobile-ui-modules.js && node scripts/test-session-stream-client.js",
-    "test:structure-preview": "node scripts/test-structure-preview.js && node scripts/test-structure-preview-ui.js",
+    "test:structure-preview": "node scripts/test-crystal-geometry.js && node scripts/test-structure-preview.js && node scripts/test-structure-preview-ui.js",
+    "test:structure-preview:browser": "node scripts/test-structure-preview-browser.js",
     "test:host-agent-lease": "node scripts/test-host-agent-instance-lease.js",
     "test:session-record-store": "node scripts/test-atomic-file-replace.js && node scripts/test-session-record-store.js",
     "test:session-api-model:unit": "node scripts/test-session-record-store.js && node scripts/test-session-store-projection-queries.js && node scripts/test-session-provenance.js && node scripts/test-input-command-outbox.js && node scripts/test-model-catalog-service.js && node scripts/test-rebind-catalog-reuse.js && node scripts/test-provider-capabilities.js && node scripts/test-composer-model-inference.js && node scripts/test-jsonl-utf8-chunks.js",
@@ -58,6 +59,8 @@
   },
   "devDependencies": {
     "@playwright/test": "1.54.1",
-    "jsdom": "26.1.0"
+    "jsdom": "26.1.0",
+    "ngl": "2.5.0",
+    "three": "0.158.0"
   }
 }

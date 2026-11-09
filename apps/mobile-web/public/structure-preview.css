@@ -12,7 +12,7 @@
 .structure-preview-overlay.hidden { display: none; }
 
 .structure-preview-modal {
-  width: min(960px, 100%);
+  width: min(1100px, 100%);
   max-height: min(92vh, 820px);
   display: grid;
   grid-template-rows: auto auto minmax(260px, 1fr) auto auto;
@@ -40,8 +40,21 @@
 .structure-preview-status,
 .structure-preview-legend { color: var(--muted, #9aa8c2); font-size: 12px; }
 .structure-preview-toolbar { justify-content: flex-start; flex-wrap: wrap; }
+.structure-preview-mode { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid rgba(134, 167, 255, .28); border-radius: 6px; }
+.structure-preview-mode.hidden { display: none; }
+.structure-preview-mode button { min-width: 74px; border: 0; border-radius: 4px; }
+.structure-preview-mode button[aria-pressed="true"] { background: rgba(95, 174, 145, .24); color: var(--text, #e7edff); }
+.structure-preview-mode button.hidden { display: none; }
+.structure-preview-coordination { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.structure-preview-coordination.hidden { display: none; }
+.structure-preview-coordination label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted, #9aa8c2); font-size: 12px; }
+.structure-preview-coordination select { max-width: 66px; min-height: 30px; padding: 3px 5px; color: #263734; background: #f5f8f6; border: 1px solid #b9c8c2; border-radius: 4px; }
+.structure-preview-coordination input[type="range"] { width: 84px; accent-color: #5fae91; }
+.structure-preview-coordination output { min-width: 42px; color: var(--text, #e7edff); }
+.structure-preview-toolbar #structure-preview-labels-button.hidden { display: none; }
 .structure-preview-toolbar .structure-preview-status { margin-left: auto; }
 .structure-preview-canvas-wrap {
+  position: relative;
   min-height: 260px;
   height: min(62vh, 560px);
   overflow: hidden;
@@ -51,6 +64,16 @@
 }
 .structure-preview-canvas-wrap canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
 .structure-preview-canvas-wrap canvas:active { cursor: grabbing; }
+.structure-preview-canvas-wrap canvas.hidden { display: none; }
+.structure-preview-protein { width: 100%; height: 100%; touch-action: none; }
+.structure-preview-protein.hidden { display: none; }
+.structure-preview-crystal { width: 100%; height: 100%; touch-action: none; }
+.structure-preview-crystal.hidden { display: none; }
+.structure-preview-crystal canvas { display: block; width: 100%; height: 100%; }
+.structure-preview-confirm { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; background: #08101f; color: #edf4ff; text-align: center; }
+.structure-preview-confirm.hidden { display: none; }
+.structure-preview-confirm p { max-width: 32ch; margin: 0; color: #b9c6d8; }
+.structure-preview-confirm > div { display: flex; gap: 8px; }
 .structure-preview-error { padding: 10px 12px; border: 1px solid rgba(255, 110, 130, .35); border-radius: 8px; color: #ffabb5; background: rgba(255, 90, 110, .08); }
 .structure-preview-error.hidden { display: none; }
 
@@ -60,4 +83,5 @@
   .structure-preview-canvas-wrap { height: 58vh; }
   .structure-preview-toolbar .structure-preview-status { margin-left: 0; width: 100%; }
   .structure-preview-header { align-items: flex-start; }
+  .structure-preview-coordination { width: 100%; gap: 8px; }
 }

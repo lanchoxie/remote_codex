@@ -1,4 +1,6 @@
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const viewer = require('../apps/mobile-web/public/structure-preview.js');
 
 assert(viewer.isSupportedFile('sample.xsf'));
@@ -27,10 +29,29 @@ assert.strictEqual(pdb.format, 'pdb');
 assert.strictEqual(pdb.atoms.length, 2);
 assert.deepStrictEqual(pdb.bonds, [[0, 1]]);
 assert.deepStrictEqual(pdb.cell[0], [10, 0, 0]);
+assert.strictEqual(viewer.displayFormatFor('water.pbd', pdb), 'PBD (PDB-compatible)');
+assert.strictEqual(viewer.defaultMode(pdb), 'atoms');
+
+const protein = viewer.parse([
+  'HELIX    1   1 ALA A    1  GLY A    3  1                                   3',
+  'ATOM      1  CA  ALA A   1      50.000  60.000  70.000  1.00 20.00           C',
+  'ATOM      2  CA  GLY A   2      51.000  60.000  70.000  1.00 20.00           C',
+  'ATOM      3  CA  GLY A   3      52.000  60.000  70.000  1.00 20.00           C',
+  'CRYST1  200.000 200.000 200.000  90.00  90.00  90.00 P 1           1',
+].join('\n'), 'protein.pdb');
+assert.strictEqual(protein.metadata.isProtein, true);
+assert.strictEqual(viewer.defaultMode(protein), 'cartoon');
+assert.deepStrictEqual(viewer.fitToAtoms(protein.atoms).center, { x: 51, y: 60, z: 70 }, 'PDB crystal cell must not move the rotation pivot away from the molecule');
+assert.strictEqual(viewer.needsConfirmation(5000), false);
+assert.strictEqual(viewer.needsConfirmation(5001), true);
+const depositedProtein = viewer.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'structure-preview-1crn.pdb'), 'utf8'), '1crn.pdb');
+assert.strictEqual(depositedProtein.metadata.isProtein, true);
+assert(depositedProtein.bonds.length > 100, 'PDB CONECT records must not suppress the rest of the protein bonds');
 
 const xsf = viewer.parse('CRYSTAL\nPRIMVEC\n2 0 0\n0 2 0\n0 0 2\nPRIMCOORD\n2 1\n8 0 0 0\n1 0.96 0 0', 'cell.xsf');
 assert.strictEqual(xsf.atoms[0].element, 'O');
 assert.deepStrictEqual(xsf.cell[1], [0, 2, 0]);
+assert.strictEqual(viewer.displayFormatFor('cell.xsf', xsf), 'XSF');
 
 const cif = viewer.parse([
   'data_water',
@@ -52,6 +73,30 @@ const cif = viewer.parse([
 assert.strictEqual(cif.atoms.length, 2);
 assert(Math.abs(cif.atoms[1].x - 0.96) < 1e-8, 'CIF fractional coordinates should use the unit cell');
 assert.strictEqual(cif.metadata.fractionalCoordinates, true);
+const symmetricCif = viewer.parse([
+  'data_symmetric', '_cell_length_a 4', '_cell_length_b 4', '_cell_length_c 4',
+  'loop_', '_space_group_symop_operation_xyz', "'x, y, z'", "'-x+1/2, y+1/2, -z'",
+  'loop_', '_atom_site_label', '_atom_site_type_symbol', '_atom_site_fract_x',
+  '_atom_site_fract_y', '_atom_site_fract_z', 'Ti1 Ti 0.1 0.2 0.3',
+].join('\n'), 'symmetric.cif');
+assert.strictEqual(symmetricCif.atoms.length, 2, 'CIF symmetry should expand the asymmetric unit');
+assert.deepStrictEqual(symmetricCif.atoms.map((atom) => [atom.x, atom.y, atom.z].map((value) => Number(value.toFixed(5)))),
+  [[0.4, 0.8, 1.2], [1.6, 2.8, 2.8]]);
+assert.strictEqual(symmetricCif.metadata.symmetryOperations, 2);
+const duplicateSymmetry = viewer.parse([
+  'data_duplicate', '_cell_length_a 4', '_cell_length_b 4', '_cell_length_c 4',
+  'loop_', '_space_group_symop_operation_xyz', "'x,y,z'", "'x+1,y,z'",
+  'loop_', '_atom_site_label', '_atom_site_type_symbol', '_atom_site_fract_x',
+  '_atom_site_fract_y', '_atom_site_fract_z', 'O1 O 0 0 0',
+].join('\n'), 'duplicate.cif');
+assert.strictEqual(duplicateSymmetry.atoms.length, 1, 'equivalent periodic sites should not duplicate atoms');
+assert.throws(() => viewer.parse([
+  'data_unsupported', '_cell_length_a 4', '_cell_length_b 4', '_cell_length_c 4',
+  'loop_', '_space_group_symop_operation_xyz', "'x,y,z'", "'sin(x),y,z'",
+  'loop_', '_atom_site_label', '_atom_site_type_symbol', '_atom_site_fract_x',
+  '_atom_site_fract_y', '_atom_site_fract_z', 'O1 O 0 0 0',
+].join('\n'), 'unsupported.cif'), /Unsupported CIF symmetry/,
+'unsupported symmetry must not silently drop equivalent atoms');
 const uncertainCif = viewer.parse([
   'data_uncertain',
   '_cell_length_a 10.123(4)',

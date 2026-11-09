@@ -5,6 +5,8 @@
   // Node tests; the UI controller is only activated when a browser DOM exists.
   var SUPPORTED_EXTENSIONS = new Set(['xsf', 'pdb', 'pbd', 'xyz', 'cif', 'vasp', 'poscar', 'contcar']);
   var MAX_SOURCE_BYTES = 24 * 1024 * 1024;
+  var LARGE_ATOM_THRESHOLD = 5000;
+  var PROTEIN_RESIDUES = new Set(['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL', 'MSE']);
   var ELEMENT_COLORS = Object.freeze({
     H: '#ffffff', He: '#d9ffff', Li: '#cc80ff', Be: '#c2ff00', B: '#ffb5b5',
     C: '#909090', N: '#3050f8', O: '#ff0d0d', F: '#90e050', Ne: '#b3e3f5',
@@ -57,6 +59,26 @@
   }
   function splitWhitespace(line) { return String(line || '').trim().split(/\s+/).filter(Boolean); }
   function distanceSquared(a, b) { var x = a.x - b.x, y = a.y - b.y, z = a.z - b.z; return x * x + y * y + z * z; }
+  function displayFormatFor(name, structure) {
+    var extension = extensionOf(name);
+    if (extension === 'pbd') return 'PBD (PDB-compatible)';
+    if (extension === 'pdb') return 'PDB';
+    if (extension === 'vasp' || extension === 'poscar' || extension === 'contcar') return extension.toUpperCase();
+    return String(structure?.format || extension || 'structure').toUpperCase();
+  }
+  function defaultMode(structure) { return structure?.format === 'pdb' && structure?.metadata?.isProtein ? 'cartoon' : 'atoms'; }
+  function needsConfirmation(atomCount) { return Number(atomCount) > LARGE_ATOM_THRESHOLD; }
+  function fitToAtoms(atoms) {
+    var bounds = atoms.reduce(function (acc, point) {
+      acc.minX = Math.min(acc.minX, point.x); acc.maxX = Math.max(acc.maxX, point.x);
+      acc.minY = Math.min(acc.minY, point.y); acc.maxY = Math.max(acc.maxY, point.y);
+      acc.minZ = Math.min(acc.minZ, point.z); acc.maxZ = Math.max(acc.maxZ, point.z);
+      return acc;
+    }, { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity });
+    var center = { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2, z: (bounds.minZ + bounds.maxZ) / 2 };
+    var radius = atoms.reduce(function (max, point) { return Math.max(max, Math.hypot(point.x - center.x, point.y - center.y, point.z - center.z)); }, 1);
+    return { center: center, radius: radius };
+  }
 
   function inferBonds(atoms) {
     if (!Array.isArray(atoms) || atoms.length < 2 || atoms.length > 5000) return [];
@@ -105,7 +127,12 @@
       var left = Math.min(a, b), right = Math.max(a, b), key = left + ':' + right;
       if (!seen.has(key)) { seen.add(key); outBonds.push([left, right]); }
     });
-    if (!outBonds.length) outBonds = inferBonds(normalized);
+    if (!outBonds.length || (format === 'pdb' && outBonds.length < normalized.length / 2)) {
+      inferBonds(normalized).forEach(function (pair) {
+        var key = pair[0] + ':' + pair[1];
+        if (!seen.has(key)) { seen.add(key); outBonds.push(pair); }
+      });
+    }
     return { format: String(format || 'unknown').toLowerCase(), atoms: normalized, bonds: outBonds, cell: normalizeCell(cell), metadata: metadata || {} };
   }
 
@@ -121,7 +148,7 @@
   }
 
   function parsePdb(text) {
-    var lines = String(text || '').split(/\r?\n/), atoms = [], serials = new Map(), conect = [], cell = null, modelSeen = false, modelFinished = false;
+    var lines = String(text || '').split(/\r?\n/), atoms = [], serials = new Map(), conect = [], cell = null, modelSeen = false, modelFinished = false, proteinResidues = new Set();
     lines.forEach(function (line) {
       var record = line.slice(0, 6).trim().toUpperCase();
       if (record === 'MODEL') { if (modelSeen) modelFinished = true; else modelSeen = true; return; }
@@ -135,9 +162,11 @@
       if ([x, y, z].some(function (v) { return v === null; })) { var fallback = splitWhitespace(line); x = numberOrNull(fallback[6]); y = numberOrNull(fallback[7]); z = numberOrNull(fallback[8]); }
       if ([x, y, z].some(function (v) { return v === null; })) return;
       var serial = Number.parseInt(line.slice(6, 11).trim(), 10), atomName = line.slice(12, 16).trim(), element = line.slice(76, 78).trim() || atomName.replace(/[0-9]/g, '');
+      var residueName = line.slice(17, 20).trim().toUpperCase();
+      if (record === 'ATOM' && PROTEIN_RESIDUES.has(residueName)) proteinResidues.add(line.slice(21, 27));
       var index = atoms.length; atoms.push({ element: element, label: atomName, x: x, y: y, z: z, charge: line.slice(78, 80).trim() }); if (Number.isInteger(serial)) serials.set(serial, index);
     });
-    return finalizeStructure('pdb', atoms, conect.map(function (pair) { return [serials.get(pair[0]), serials.get(pair[1])]; }), cell);
+    return finalizeStructure('pdb', atoms, conect.map(function (pair) { return [serials.get(pair[0]), serials.get(pair[1])]; }), cell, { isProtein: proteinResidues.size >= 3, proteinResidueCount: proteinResidues.size });
   }
 
   function parseXsf(text) {
@@ -222,6 +251,33 @@
     }
     return tokens;
   }
+  function symmetryNumber(value) {
+    var parts = String(value || '').split('/');
+    var numerator = Number(parts[0]);
+    var denominator = parts.length === 2 ? Number(parts[1]) : 1;
+    return Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0
+      ? numerator / denominator : null;
+  }
+  function applyCifSymmetry(operation, coordinates) {
+    var expressions = String(operation || '').replace(/\s/g, '').toLowerCase().split(',');
+    if (expressions.length !== 3) return null;
+    var axes = { x: coordinates[0], y: coordinates[1], z: coordinates[2] };
+    var output = expressions.map(function (expression) {
+      var terms = expression.match(/[+-]?[^+-]+/g);
+      if (!terms || terms.join('') !== expression) return null;
+      var value = 0;
+      for (var term of terms) {
+        var sign = term.charAt(0) === '-' ? -1 : 1;
+        var unsigned = term.replace(/^[+-]/, '');
+        var variable = /^((?:\d+(?:\.\d*)?|\.\d+)(?:\/\d+(?:\.\d*)?)?)?([xyz])$/.exec(unsigned);
+        var coefficient = variable ? (variable[1] ? symmetryNumber(variable[1]) : 1) : symmetryNumber(unsigned);
+        if (coefficient == null) return null;
+        value += sign * coefficient * (variable ? axes[variable[2]] : 1);
+      }
+      return value;
+    });
+    return output.every(Number.isFinite) ? output : null;
+  }
   function parseCif(text) {
     var lines = String(text || '').split(/\r?\n/), scalar = {}, loops = [];
     for (var i = 0; i < lines.length; i += 1) {
@@ -238,9 +294,55 @@
     var cell = { a: scalarNumber('_cell_length_a', null), b: scalarNumber('_cell_length_b', null), c: scalarNumber('_cell_length_c', null), alpha: scalarNumber('_cell_angle_alpha', 90), beta: scalarNumber('_cell_angle_beta', 90), gamma: scalarNumber('_cell_angle_gamma', 90) };
     var loop = loops.find(function (candidate) { return candidate.tags.some(function (tag) { return tag.indexOf('_atom_site_') === 0; }); }); if (!loop) return finalizeStructure('cif', [], [], cell);
     function indexOf() { var names = Array.prototype.slice.call(arguments); for (var n = 0; n < names.length; n += 1) { var idx = loop.tags.indexOf(names[n]); if (idx >= 0) return idx; } return -1; }
-    var elementIndex = indexOf('_atom_site_type_symbol', '_atom_site_label'), labelIndex = indexOf('_atom_site_label'), cart = [indexOf('_atom_site_cartn_x'), indexOf('_atom_site_cartn_y'), indexOf('_atom_site_cartn_z')], fract = [indexOf('_atom_site_fract_x'), indexOf('_atom_site_fract_y'), indexOf('_atom_site_fract_z')], chargeIndex = indexOf('_atom_site_charge'), vectors = normalizeCell(cell), atoms = [];
-    for (var offset = 0; offset + loop.tags.length <= loop.values.length; offset += loop.tags.length) { var row = loop.values.slice(offset, offset + loop.tags.length), coords = cart.every(function (idx) { return idx >= 0; }) ? cart.map(function (idx) { return numberOrNull(row[idx]); }) : fract.map(function (idx) { return numberOrNull(row[idx]); }); if (coords.some(function (v) { return v === null; })) continue; if (!cart.every(function (idx) { return idx >= 0; }) && vectors) { var va = vectors[0], vb = vectors[1], vc = vectors[2], fx = coords[0], fy = coords[1], fz = coords[2]; coords = [fx * va[0] + fy * vb[0] + fz * vc[0], fx * va[1] + fy * vb[1] + fz * vc[1], fx * va[2] + fy * vb[2] + fz * vc[2]]; } atoms.push({ element: row[elementIndex] || 'X', label: labelIndex >= 0 ? row[labelIndex] : row[elementIndex], x: coords[0], y: coords[1], z: coords[2], charge: chargeIndex >= 0 ? row[chargeIndex] : null }); }
-    return finalizeStructure('cif', atoms, [], cell, { fractionalCoordinates: !cart.every(function (idx) { return idx >= 0; }) });
+    var elementIndex = indexOf('_atom_site_type_symbol', '_atom_site_label');
+    var labelIndex = indexOf('_atom_site_label'), chargeIndex = indexOf('_atom_site_charge');
+    var cart = [indexOf('_atom_site_cartn_x'), indexOf('_atom_site_cartn_y'), indexOf('_atom_site_cartn_z')];
+    var fract = [indexOf('_atom_site_fract_x'), indexOf('_atom_site_fract_y'), indexOf('_atom_site_fract_z')];
+    var hasCartesian = cart.every(function (idx) { return idx >= 0; });
+    var vectors = normalizeCell(cell), atoms = [], sites = [];
+    for (var offset = 0; offset + loop.tags.length <= loop.values.length; offset += loop.tags.length) {
+      var row = loop.values.slice(offset, offset + loop.tags.length);
+      var coords = (hasCartesian ? cart : fract).map(function (idx) { return numberOrNull(row[idx]); });
+      if (coords.some(function (v) { return v === null; })) continue;
+      var site = { element: row[elementIndex] || 'X', label: labelIndex >= 0 ? row[labelIndex] : row[elementIndex],
+        charge: chargeIndex >= 0 ? row[chargeIndex] : null, coords: coords };
+      if (hasCartesian || !vectors) atoms.push({ element: site.element, label: site.label,
+        x: coords[0], y: coords[1], z: coords[2], charge: site.charge });
+      else sites.push(site);
+    }
+    var symmetryTags = ['_space_group_symop_operation_xyz', '_symmetry_equiv_pos_as_xyz'];
+    var operations = [];
+    loops.forEach(function (candidate) {
+      var column = candidate.tags.findIndex(function (tag) { return symmetryTags.includes(tag); });
+      if (column < 0) return;
+      for (var at = column; at < candidate.values.length; at += candidate.tags.length) operations.push(candidate.values[at]);
+    });
+    if (!operations.length) operations = symmetryTags.map(function (tag) { return scalar[tag]; }).filter(Boolean);
+    if (!operations.length) operations = ['x,y,z'];
+    if (sites.length * operations.length > 2000000) throw new Error('CIF symmetry expansion is too large to preview. Export a smaller unit cell.');
+    if (sites.length && operations.some(function (operation) { return !applyCifSymmetry(operation, [0.13, 0.27, 0.39]); })) {
+      throw new Error('Unsupported CIF symmetry expression. Export the expanded unit cell as P1 CIF or POSCAR.');
+    }
+    var seen = new Set();
+    sites.forEach(function (site) {
+      operations.forEach(function (operation) {
+        var transformed = applyCifSymmetry(operation, site.coords);
+        if (!transformed) return;
+        var wrapped = transformed.map(function (value) { var result = value - Math.floor(value); return result > 1 - 1e-6 ? 0 : result; });
+        var key = normalizeElement(site.element) + ':' + wrapped.map(function (value) { return Math.round(value * 1e5); }).join(',');
+        if (seen.has(key)) return;
+        seen.add(key);
+        if (atoms.length >= 50000) throw new Error('CIF symmetry expands beyond 50,000 atoms. Export a smaller unit cell.');
+        var fx = wrapped[0], fy = wrapped[1], fz = wrapped[2];
+        atoms.push({ element: site.element, label: site.label,
+          x: fx * vectors[0][0] + fy * vectors[1][0] + fz * vectors[2][0],
+          y: fx * vectors[0][1] + fy * vectors[1][1] + fz * vectors[2][1],
+          z: fx * vectors[0][2] + fy * vectors[1][2] + fz * vectors[2][2], charge: site.charge });
+      });
+    });
+    return finalizeStructure('cif', atoms, [], cell, {
+      fractionalCoordinates: !hasCartesian, symmetryOperations: operations.length,
+    });
   }
 
   function parse(text, filename) {
@@ -266,12 +368,27 @@
         + '<div class="structure-preview-header"><div><div class="eyebrow">Structure Preview</div><div id="structure-preview-title" class="structure-preview-title">Structure</div><div id="structure-preview-subtitle" class="structure-preview-subtitle"></div></div>'
         + '<button id="structure-preview-close-button" type="button" class="secondary-button" aria-label="Close structure preview">Close</button></div>'
         + '<div class="structure-preview-toolbar" role="toolbar" aria-label="Structure viewer controls">'
+        + '<div id="structure-preview-mode" class="structure-preview-mode" role="group" aria-label="Representation">'
+        + '<button id="structure-preview-mode-cartoon" type="button" class="secondary-button" aria-pressed="false" title="Protein ribbons, helices, and sheets">Cartoon</button>'
+        + '<button id="structure-preview-mode-atoms" type="button" class="secondary-button" aria-pressed="true" title="Element-colored balls and bonds">Ball-stick</button>'
+        + '<button id="structure-preview-mode-wire" type="button" class="secondary-button" aria-pressed="false" title="Thin element-colored bonds">Wireframe</button>'
+        + '<button id="structure-preview-mode-polyhedra" type="button" class="secondary-button" aria-pressed="false" title="Coordination polyhedra">Polyhedra</button></div>'
+        + '<div id="structure-preview-coordination" class="structure-preview-coordination hidden">'
+        + '<label>Center <select id="structure-preview-center"></select></label>'
+        + '<label>Ligand <select id="structure-preview-ligand"></select></label>'
+        + '<label>Cutoff <input id="structure-preview-cutoff" type="range" min="1" max="5" step="0.1" value="2.8"><output id="structure-preview-cutoff-value">2.8 Å</output></label></div>'
         + '<button id="structure-preview-fit-button" type="button" class="secondary-button" title="Fit structure">Fit</button>'
         + '<button id="structure-preview-labels-button" type="button" class="secondary-button" aria-pressed="false" title="Toggle atom labels">Labels</button>'
         + '<span id="structure-preview-status" class="structure-preview-status" aria-live="polite"></span></div>'
-        + '<div class="structure-preview-canvas-wrap"><canvas id="structure-preview-canvas" aria-label="Interactive molecular structure"></canvas></div>'
+        + '<div class="structure-preview-canvas-wrap"><canvas id="structure-preview-canvas" aria-label="Interactive molecular structure"></canvas>'
+        + '<div id="structure-preview-protein" class="structure-preview-protein hidden" aria-label="Interactive protein structure"></div>'
+        + '<div id="structure-preview-crystal" class="structure-preview-crystal hidden" aria-label="Interactive crystal structure"></div>'
+        + '<div id="structure-preview-confirm" class="structure-preview-confirm hidden" role="alertdialog" aria-labelledby="structure-preview-confirm-title">'
+        + '<strong id="structure-preview-confirm-title">Large structure</strong><p id="structure-preview-confirm-message"></p>'
+        + '<div><button id="structure-preview-confirm-cancel" type="button" class="secondary-button">Cancel</button>'
+        + '<button id="structure-preview-confirm-render" type="button" class="primary-button">Render structure</button></div></div></div>'
         + '<div id="structure-preview-error" class="structure-preview-error hidden" role="alert"></div>'
-        + '<div class="structure-preview-legend"><span>Drag to rotate / Wheel to zoom</span><span id="structure-preview-cell-label"></span></div></div>';
+        + '<div class="structure-preview-legend"><span id="structure-preview-cell-label"></span></div></div>';
       documentRef.body.appendChild(overlay);
     }
     var canvas = overlay.querySelector('#structure-preview-canvas');
@@ -279,11 +396,20 @@
     if (canvas.__remoteCodexStructureViewer) return canvas.__remoteCodexStructureViewer;
     var ctx = canvas.getContext && canvas.getContext('2d');
     if (!ctx) return null;
-    var viewer = { overlay: overlay, canvas: canvas, ctx: ctx, structure: null, name: '', yaw: -0.55, pitch: 0.35, zoom: 1, labels: false, dragging: false, lastX: 0, lastY: 0 };
+    var viewer = { overlay: overlay, canvas: canvas, ctx: ctx, proteinContainer: overlay.querySelector('#structure-preview-protein'), protein: null, proteinPending: null, crystalContainer: overlay.querySelector('#structure-preview-crystal'), crystal: null, crystalPending: null, sourceText: '', structure: null, name: '', mode: 'atoms', confirmed: false, generation: 0, yaw: -0.55, pitch: 0.35, zoom: 1, labels: false, dragging: false, lastX: 0, lastY: 0 };
     canvas.__remoteCodexStructureViewer = viewer;
     overlay.querySelector('#structure-preview-close-button').addEventListener('click', close);
-    overlay.querySelector('#structure-preview-fit-button').addEventListener('click', function () { viewer.yaw = -0.55; viewer.pitch = 0.35; viewer.zoom = 1; draw(viewer); });
-    overlay.querySelector('#structure-preview-labels-button').addEventListener('click', function (event) { viewer.labels = !viewer.labels; event.currentTarget.setAttribute('aria-pressed', String(viewer.labels)); draw(viewer); });
+    overlay.querySelector('#structure-preview-fit-button').addEventListener('click', function () { if (viewer.crystal) viewer.crystal.fit(); else if (viewer.protein) viewer.protein.fit(); else { viewer.yaw = -0.55; viewer.pitch = 0.35; viewer.zoom = 1; draw(viewer); } });
+    overlay.querySelector('#structure-preview-labels-button').addEventListener('click', function (event) { viewer.labels = !viewer.labels; event.currentTarget.setAttribute('aria-pressed', String(viewer.labels)); if (viewer.protein) viewer.protein.show(viewer.mode, viewer.labels); else draw(viewer); });
+    ['cartoon', 'atoms', 'wire', 'polyhedra'].forEach(function (mode) { overlay.querySelector('#structure-preview-mode-' + mode).addEventListener('click', function () { viewer.mode = mode; updateModeControls(viewer); render(viewer); }); });
+    ['center', 'ligand'].forEach(function (field) { overlay.querySelector('#structure-preview-' + field).addEventListener('change', function () { render(viewer); }); });
+    overlay.querySelector('#structure-preview-cutoff').addEventListener('input', function (event) {
+      overlay.querySelector('#structure-preview-cutoff-value').textContent = Number(event.target.value).toFixed(1) + ' Å';
+      global.clearTimeout(viewer.coordinationTimer);
+      viewer.coordinationTimer = global.setTimeout(function () { viewer.coordinationTimer = null; render(viewer); }, 120);
+    });
+    overlay.querySelector('#structure-preview-confirm-render').addEventListener('click', function () { viewer.confirmed = true; overlay.querySelector('#structure-preview-confirm').classList.add('hidden'); render(viewer); });
+    overlay.querySelector('#structure-preview-confirm-cancel').addEventListener('click', close);
     overlay.addEventListener('click', function (event) { if (event.target === overlay) close(); });
     if (global.addEventListener) global.addEventListener('keydown', function (event) { if (event.key === 'Escape' && activeViewer === viewer) close(); });
     canvas.addEventListener('pointerdown', function (event) { viewer.dragging = true; viewer.lastX = event.clientX; viewer.lastY = event.clientY; if (canvas.setPointerCapture) canvas.setPointerCapture(event.pointerId); });
@@ -295,7 +421,7 @@
     });
     ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (eventName) { canvas.addEventListener(eventName, function () { viewer.dragging = false; }); });
     canvas.addEventListener('wheel', function (event) { event.preventDefault(); viewer.zoom = Math.max(0.25, Math.min(8, viewer.zoom * Math.exp(-event.deltaY * 0.001))); draw(viewer); }, { passive: false });
-    if (global.addEventListener) global.addEventListener('resize', function () { if (!viewer.overlay.classList.contains('hidden')) draw(viewer); });
+    if (global.addEventListener) global.addEventListener('resize', function () { if (!viewer.overlay.classList.contains('hidden') && viewer.confirmed) { if (viewer.crystal) viewer.crystal.resize(); else if (viewer.protein) viewer.protein.resize(); else draw(viewer); } });
     return viewer;
   }
 
@@ -306,7 +432,7 @@
   }
 
   function draw(viewer) {
-    if (!viewer || !viewer.structure) return;
+    if (!viewer || !viewer.structure || !viewer.confirmed) return;
     var canvas = viewer.canvas, ctx = viewer.ctx;
     var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { width: 760, height: 460 };
     var width = Math.max(260, Math.floor(rect.width || canvas.clientWidth || 760));
@@ -317,24 +443,13 @@
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, width, height);
     ctx.fillStyle = '#08101f'; ctx.fillRect(0, 0, width, height);
-    var atoms = viewer.structure.atoms, fitPoints = atoms.map(function (atom) { return { x: atom.x, y: atom.y, z: atom.z }; });
-    if (viewer.structure.cell) {
-      var fitCell = viewer.structure.cell;
-      for (var fitMask = 0; fitMask < 8; fitMask += 1) fitPoints.push({
-        x: (fitMask & 1 ? fitCell[0][0] : 0) + (fitMask & 2 ? fitCell[1][0] : 0) + (fitMask & 4 ? fitCell[2][0] : 0),
-        y: (fitMask & 1 ? fitCell[0][1] : 0) + (fitMask & 2 ? fitCell[1][1] : 0) + (fitMask & 4 ? fitCell[2][1] : 0),
-        z: (fitMask & 1 ? fitCell[0][2] : 0) + (fitMask & 2 ? fitCell[1][2] : 0) + (fitMask & 4 ? fitCell[2][2] : 0),
-      });
-    }
-    var bounds = fitPoints.reduce(function (acc, point) { acc.minX = Math.min(acc.minX, point.x); acc.maxX = Math.max(acc.maxX, point.x); acc.minY = Math.min(acc.minY, point.y); acc.maxY = Math.max(acc.maxY, point.y); acc.minZ = Math.min(acc.minZ, point.z); acc.maxZ = Math.max(acc.maxZ, point.z); return acc; }, { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity });
-    var center = { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2, z: (bounds.minZ + bounds.maxZ) / 2 };
-    var rotatedCenter = rotatePoint(viewer, center), radius = 1;
-    fitPoints.forEach(function (point) { radius = Math.max(radius, Math.hypot(point.x - center.x, point.y - center.y, point.z - center.z)); });
+    var atoms = viewer.structure.atoms, fit = fitToAtoms(atoms);
+    var rotatedCenter = rotatePoint(viewer, fit.center), radius = fit.radius;
     var scale = Math.min(width, height) * 0.38 / radius * viewer.zoom;
     function project(point) { var rotated = rotatePoint(viewer, point); return { x: width / 2 + (rotated.x - rotatedCenter.x) * scale, y: height / 2 - (rotated.y - rotatedCenter.y) * scale, z: rotated.z }; }
     var projected = atoms.map(project);
 
-    if (viewer.structure.cell) {
+    if (viewer.structure.cell && viewer.structure.format !== 'pdb') {
       var cell = viewer.structure.cell, corners = [];
       for (var mask = 0; mask < 8; mask += 1) {
         corners.push(project({
@@ -349,10 +464,10 @@
     }
 
     viewer.structure.bonds.map(function (pair) { return [projected[pair[0]], projected[pair[1]]]; }).filter(function (pair) { return pair[0] && pair[1]; }).sort(function (a, b) { return a[0].z + a[1].z - b[0].z - b[1].z; }).forEach(function (pair) {
-      ctx.save(); ctx.lineCap = 'round'; ctx.lineWidth = Math.max(2, Math.min(10, scale * 0.08)); ctx.strokeStyle = 'rgba(211,221,238,.68)'; ctx.beginPath(); ctx.moveTo(pair[0].x, pair[0].y); ctx.lineTo(pair[1].x, pair[1].y); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.lineCap = 'round'; ctx.lineWidth = viewer.mode === 'wire' ? 1.3 : Math.max(2, Math.min(10, scale * 0.08)); ctx.strokeStyle = 'rgba(211,221,238,.68)'; ctx.beginPath(); ctx.moveTo(pair[0].x, pair[0].y); ctx.lineTo(pair[1].x, pair[1].y); ctx.stroke(); ctx.restore();
     });
     projected.map(function (point, index) { return { point: point, atom: atoms[index] }; }).sort(function (a, b) { return a.point.z - b.point.z; }).forEach(function (entry) {
-      var point = entry.point, atom = entry.atom, atomRadius = Math.max(4, Math.min(24, scale * (COVALENT_RADII[atom.element] || 0.77) * 0.30));
+      var point = entry.point, atom = entry.atom, atomRadius = viewer.mode === 'wire' ? 3 : Math.max(4, Math.min(24, scale * (COVALENT_RADII[atom.element] || 0.77) * 0.30));
       var gradient = ctx.createRadialGradient(point.x - atomRadius * 0.35, point.y - atomRadius * 0.4, atomRadius * 0.1, point.x, point.y, atomRadius);
       gradient.addColorStop(0, '#ffffff'); gradient.addColorStop(0.18, colorForElement(atom.element)); gradient.addColorStop(1, 'rgba(0,0,0,.58)');
       ctx.fillStyle = gradient; ctx.beginPath(); ctx.arc(point.x, point.y, atomRadius, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,.46)'; ctx.lineWidth = 1; ctx.stroke();
@@ -360,10 +475,124 @@
     });
   }
 
+  function updateModeControls(viewer) {
+    ['cartoon', 'atoms', 'wire', 'polyhedra'].forEach(function (mode) {
+      viewer.overlay.querySelector('#structure-preview-mode-' + mode).setAttribute('aria-pressed', String(viewer.mode === mode));
+    });
+  }
+
+  async function render(viewer) {
+    var generation = ++viewer.generation;
+    if (!viewer.confirmed || activeViewer !== viewer) return;
+    var errorNode = viewer.overlay.querySelector('#structure-preview-error');
+    errorNode.classList.add('hidden');
+    if (global.RemoteCodexCrystalGeometry?.isPeriodicStructure(viewer.structure)) {
+      viewer.canvas.classList.add('hidden');
+      viewer.proteinContainer.classList.add('hidden');
+      viewer.crystalContainer.classList.remove('hidden');
+      try {
+        if (!viewer.crystal) {
+          var crystalPending = viewer.crystalPending;
+          if (!crystalPending) {
+            crystalPending = global.RemoteCodexCrystalStructureViewer.create(viewer.crystalContainer, viewer.structure);
+            viewer.crystalPending = crystalPending;
+          }
+          var crystal = await crystalPending;
+          if (generation !== viewer.generation || activeViewer !== viewer) {
+            if (viewer.crystalPending !== crystalPending) crystal.dispose();
+            return;
+          }
+          viewer.crystalPending = null;
+          viewer.crystal = crystal;
+        }
+        var model = viewer.crystal.show(viewer.mode, {
+          center: viewer.overlay.querySelector('#structure-preview-center').value,
+          ligand: viewer.overlay.querySelector('#structure-preview-ligand').value,
+          cutoff: viewer.overlay.querySelector('#structure-preview-cutoff').value,
+        });
+        if (viewer.mode === 'polyhedra') {
+          viewer.overlay.querySelector('#structure-preview-status').textContent = model.polyhedra.length + ' polyhedra / ' + model.atoms.length + ' atoms';
+          if (!model.polyhedra.length || model.polyhedraLimited) {
+            errorNode.textContent = !model.polyhedra.length ? 'No closed coordination polyhedra for this selection.' : 'Showing the first 256 polyhedra.';
+            errorNode.classList.remove('hidden');
+          }
+        } else {
+          viewer.overlay.querySelector('#structure-preview-status').textContent = model.atoms.length + ' atoms / ' + model.bonds.length + ' bond segments';
+        }
+        if (generation === viewer.generation && viewer.crystal.model === model && !viewer.crystalFitted) {
+          viewer.crystal.fit(); viewer.crystalFitted = true;
+        }
+      } catch (error) {
+        if (generation !== viewer.generation || activeViewer !== viewer) return;
+        viewer.crystalPending = null;
+        viewer.crystalContainer.classList.add('hidden');
+        viewer.canvas.classList.remove('hidden');
+        errorNode.textContent = 'Crystal view unavailable: ' + (error.message || String(error));
+        errorNode.classList.remove('hidden');
+        draw(viewer);
+      }
+      return;
+    }
+    viewer.crystalContainer.classList.add('hidden');
+    if (!(viewer.structure.metadata?.isProtein && viewer.sourceText)) {
+      viewer.proteinContainer.classList.add('hidden');
+      viewer.canvas.classList.remove('hidden');
+      draw(viewer);
+      return;
+    }
+    viewer.canvas.classList.add('hidden');
+    viewer.proteinContainer.classList.remove('hidden');
+    try {
+      if (!viewer.protein) {
+        var pending = viewer.proteinPending;
+        if (!pending) {
+          pending = global.RemoteCodexProteinStructureViewer.create(viewer.proteinContainer, viewer.sourceText);
+          viewer.proteinPending = pending;
+        }
+        var protein = await pending;
+        if (generation !== viewer.generation || activeViewer !== viewer) {
+          if (viewer.proteinPending !== pending) protein.dispose();
+          return;
+        }
+        viewer.proteinPending = null;
+        viewer.protein = protein;
+        protein.show(viewer.mode, viewer.labels);
+        protein.fit();
+      } else {
+        viewer.protein.show(viewer.mode, viewer.labels);
+        viewer.protein.resize();
+      }
+    } catch (error) {
+      if (generation !== viewer.generation || activeViewer !== viewer) return;
+      viewer.proteinPending = null;
+      viewer.mode = 'atoms';
+      updateModeControls(viewer);
+      viewer.proteinContainer.classList.add('hidden');
+      viewer.canvas.classList.remove('hidden');
+      errorNode.textContent = 'Cartoon view unavailable: ' + (error.message || String(error));
+      errorNode.classList.remove('hidden');
+      draw(viewer);
+    }
+  }
+
   function open(options) {
     options = options || {};
     var viewer = ensureViewer(global.document);
     if (!viewer) return false;
+    global.clearTimeout(viewer.coordinationTimer);
+    viewer.coordinationTimer = null;
+    viewer.generation += 1;
+    if (viewer.protein) { viewer.protein.dispose(); viewer.protein = null; }
+    viewer.proteinPending = null;
+    if (viewer.crystal) { viewer.crystal.dispose(); viewer.crystal = null; }
+    viewer.crystalPending = null;
+    viewer.crystalContainer.replaceChildren();
+    viewer.crystalFitted = false;
+    viewer.proteinContainer.replaceChildren();
+    viewer.structure = null;
+    viewer.confirmed = false;
+    viewer.ctx.clearRect(0, 0, viewer.canvas.width, viewer.canvas.height);
+    activeViewer = viewer;
     var structure = options.structure;
     try {
       if (typeof structure === 'string') structure = parse(structure, options.name || options.filename || '');
@@ -374,17 +603,53 @@
       return false;
     }
     if (!structure || !structure.atoms || !structure.atoms.length) return false;
-    viewer.structure = structure; viewer.name = String(options.name || 'Structure'); viewer.yaw = -0.55; viewer.pitch = 0.35; viewer.zoom = 1;
+    viewer.structure = structure; viewer.sourceText = typeof options.structure === 'string' ? options.structure : '';
+    viewer.name = String(options.name || 'Structure'); viewer.yaw = -0.55; viewer.pitch = 0.35; viewer.zoom = 1; viewer.labels = false;
+    viewer.mode = viewer.sourceText ? defaultMode(structure) : 'atoms';
+    var periodicForConfirmation = Boolean(global.RemoteCodexCrystalGeometry?.isPeriodicStructure(structure));
+    viewer.confirmed = !needsConfirmation(structure.atoms.length * (periodicForConfirmation ? 4 : 1));
     viewer.overlay.querySelector('#structure-preview-title').textContent = viewer.name;
-    viewer.overlay.querySelector('#structure-preview-subtitle').textContent = String(options.source || (structure.format.toUpperCase() + ' structure'));
+    viewer.overlay.querySelector('#structure-preview-subtitle').textContent = displayFormatFor(viewer.name, structure) + (options.source ? ' | ' + String(options.source) : '');
     viewer.overlay.querySelector('#structure-preview-status').textContent = structure.atoms.length + ' atoms / ' + structure.bonds.length + ' bonds';
-    viewer.overlay.querySelector('#structure-preview-cell-label').textContent = structure.cell ? 'Unit cell shown' : '';
+    viewer.overlay.querySelector('#structure-preview-cell-label').textContent = structure.cell && structure.format !== 'pdb' ? 'Unit cell shown' : '';
+    var periodic = Boolean(global.RemoteCodexCrystalGeometry?.isPeriodicStructure(structure));
+    viewer.overlay.querySelector('#structure-preview-mode').classList.remove('hidden');
+    viewer.overlay.querySelector('#structure-preview-mode-cartoon').classList.toggle('hidden', !structure.metadata?.isProtein);
+    viewer.overlay.querySelector('#structure-preview-mode-polyhedra').classList.toggle('hidden', !periodic);
+    viewer.overlay.querySelector('#structure-preview-coordination').classList.toggle('hidden', !periodic);
+    viewer.overlay.querySelector('#structure-preview-labels-button').classList.toggle('hidden', periodic);
+    if (periodic) {
+      var elements = Array.from(new Set(structure.atoms.map(function (atom) { return atom.element; })));
+      var defaults = global.RemoteCodexCrystalGeometry.defaultCoordination(structure);
+      ['center', 'ligand'].forEach(function (field) {
+        var select = viewer.overlay.querySelector('#structure-preview-' + field);
+        select.replaceChildren();
+        elements.forEach(function (element) { var option = global.document.createElement('option'); option.value = element; option.textContent = element; select.appendChild(option); });
+        select.value = defaults[field];
+      });
+      viewer.overlay.querySelector('#structure-preview-cutoff').value = String(defaults.cutoff);
+      viewer.overlay.querySelector('#structure-preview-cutoff-value').textContent = defaults.cutoff.toFixed(1) + ' Å';
+    }
+    viewer.overlay.querySelector('#structure-preview-labels-button').setAttribute('aria-pressed', 'false');
+    updateModeControls(viewer);
     viewer.overlay.querySelector('#structure-preview-error').classList.add('hidden');
-    viewer.overlay.classList.remove('hidden'); viewer.overlay.setAttribute('aria-hidden', 'false'); activeViewer = viewer; draw(viewer);
-    viewer.overlay.querySelector('#structure-preview-close-button').focus(); return true;
+    var confirmation = viewer.overlay.querySelector('#structure-preview-confirm');
+    confirmation.classList.toggle('hidden', viewer.confirmed);
+    if (!viewer.confirmed) viewer.overlay.querySelector('#structure-preview-confirm-message').textContent = structure.atoms.length.toLocaleString() + (periodicForConfirmation ? ' atoms plus periodic images' : ' atoms') + ' may take time and memory to render. Continue?';
+    viewer.overlay.classList.remove('hidden'); viewer.overlay.setAttribute('aria-hidden', 'false');
+    if (viewer.confirmed) render(viewer);
+    viewer.overlay.querySelector(viewer.confirmed ? '#structure-preview-close-button' : '#structure-preview-confirm-render').focus(); return true;
   }
   function close() {
     if (!activeViewer) return;
+    global.clearTimeout(activeViewer.coordinationTimer);
+    activeViewer.coordinationTimer = null;
+    activeViewer.generation += 1;
+    if (activeViewer.protein) { activeViewer.protein.dispose(); activeViewer.protein = null; }
+    if (activeViewer.crystal) { activeViewer.crystal.dispose(); activeViewer.crystal = null; }
+    activeViewer.crystalPending = null;
+    activeViewer.proteinPending = null;
+    activeViewer.proteinContainer.replaceChildren();
     activeViewer.overlay.classList.add('hidden'); activeViewer.overlay.setAttribute('aria-hidden', 'true'); activeViewer = null;
   }
   async function openFromUrl(options) {
@@ -393,10 +658,12 @@
     if (!response.ok) throw new Error('Unable to load ' + (options.name || 'structure file') + ' (' + response.status + ').');
     var length = Number(response.headers.get('content-length') || 0);
     if (length > MAX_SOURCE_BYTES) throw new Error('Structure file is too large to preview.');
-    var text = await response.text(); return open(Object.assign({}, options, { structure: text }));
+    var text = await response.text();
+    if (new Blob([text]).size > MAX_SOURCE_BYTES) throw new Error('Structure file is too large to preview.');
+    return open(Object.assign({}, options, { structure: text }));
   }
 
-  var api = { SUPPORTED_EXTENSIONS: SUPPORTED_EXTENSIONS, ELEMENT_COLORS: ELEMENT_COLORS, MAX_SOURCE_BYTES: MAX_SOURCE_BYTES, isSupportedFile: isSupportedFile, normalizeElement: normalizeElement, colorForElement: colorForElement, inferBonds: inferBonds, parse: parse, parseXYZ: parseXYZ, parsePdb: parsePdb, parseXsf: parseXsf, parseCif: parseCif, parseVasp: parseVasp, open: open, openFromUrl: openFromUrl, close: close };
+  var api = { SUPPORTED_EXTENSIONS: SUPPORTED_EXTENSIONS, ELEMENT_COLORS: ELEMENT_COLORS, MAX_SOURCE_BYTES: MAX_SOURCE_BYTES, LARGE_ATOM_THRESHOLD: LARGE_ATOM_THRESHOLD, isSupportedFile: isSupportedFile, normalizeElement: normalizeElement, colorForElement: colorForElement, displayFormatFor: displayFormatFor, defaultMode: defaultMode, needsConfirmation: needsConfirmation, fitToAtoms: fitToAtoms, inferBonds: inferBonds, parse: parse, parseXYZ: parseXYZ, parsePdb: parsePdb, parseXsf: parseXsf, parseCif: parseCif, parseVasp: parseVasp, open: open, openFromUrl: openFromUrl, close: close };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.RemoteCodexStructurePreview = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
